@@ -1,0 +1,201 @@
+// Journal crash and corruption tests. Expected outcomes follow from the recovery invariants in
+// journal.cee, not from running the code.
+
+/// A fresh, empty directory for one test.
+fn scratchDirectory(name: StringView) -> String {
+    let base = Directory.temporary()!;
+    var path = String.create();
+    path.append(base.view())!;
+    path.append("/cosmostore-test-")!;
+    path.append(name)!;
+    removeTree(path.view());
+    Fs.ensureDirectory(path.view())!;
+    return path;
+}
+
+/// Removes a flat directory and its files (test directories have no subdirectories).
+fn removeTree(path: StringView) {
+    match (Directory.list(path)) {
+        Ok(names) => {
+            for (i in 0..names.length) {
+                var child = String.create();
+                child.append(path)!;
+                child.append("/")!;
+                child.append(names[i].view())!;
+                let _ = Fs.unlink(child.view());
+            }
+            let _ = Directory.remove(path);
+        }
+        Err(_) => {}
+    }
+}
+
+fn smallConfig() -> JournalConfig => JournalConfig { segmentTargetBytes: 1048576, maxBatchBytes: 4096, shardId: 0 };
+
+/// Opens the journal in `dir` and returns the LSNs it replays, or the error.
+fn replay(dir: StringView, config: JournalConfig) -> Result<Vector<u64>, JournalError> {
+    var lsns = Vector<u64>.create();
+    let journal = Journal.open(dir, config, (segment, offset, header, bytes) => { lsns.push(header.lsn)!; })?;
+    return Ok(lsns);
+}
+
+fn payloadFor(i: u64, into: borrow mut Vector<u8>) {
+    into.clear();
+    let n = (i * 37) % 300;
+    for (k in 0..n) { into.push(truncate<u8>(k + i))!; }
+}
+
+/// Writes `batches` batches of `perBatch` records each; returns the segment file's bytes and
+/// the end offset of each record.
+fn writeJournal(dir: StringView, batches: u64, perBatch: u64, ends: borrow mut Vector<u64>) {
+    var j = Journal.open(dir, smallConfig(), (s, o, h, b) => {})!;
+    var payload = Vector<u8>.create();
+    var lsn: u64 = 1;
+    for (b in 0..batches) {
+        for (r in 0..perBatch) {
+            payloadFor(lsn, mut payload);
+            let meta = "bucket\0key";
+            let pos = j.stage(RecordType.PutInline, meta.bytes(), payload.view())!;
+            ends.push(pos.offset + recordLength(meta.length, payload.length) as u64)!;
+            lsn += 1;
+        }
+        j.commit()!;
+    }
+}
+
+fn readWhole(path: StringView) -> Vector<u8> {
+    let f = DurableFile.openRead(path)!;
+    var bytes = Vector<u8>.create();
+    bytes.resize(f.size()! as usize, 0)!;
+    f.readExactAt(mut bytes.viewMut(), 0)!;
+    return bytes;
+}
+
+fn writeWhole(path: StringView, bytes: Slice<u8>) {
+    let _ = Fs.unlink(path);
+    let f = DurableFile.createNew(path)!;
+    f.writeAt(bytes, 0)!;
+}
+
+@test
+fn journalReopenReplaysEverything() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("reopen");
+    var ends = Vector<u64>.create();
+    writeJournal(dir.view(), 5, 4, mut ends);
+    let lsns = replay(dir.view(), smallConfig())!;
+    Check.equalU64(20, lsns.length as u64)?;
+    for (i in 0..lsns.length) { Check.equalU64(i as u64 + 1, lsns[i])?; }
+    // Appending after a reopen continues the LSN sequence.
+    {
+        var j = Journal.open(dir.view(), smallConfig(), (s, o, h, b) => {})!;
+        Check.equalU64(21, j.upcomingLsn())?;
+        let meta = "m";
+        j.stage(RecordType.PutInline, meta.bytes(), meta.bytes())!;
+        j.commit()!;
+    }
+    Check.equalU64(21, replay(dir.view(), smallConfig())!.length as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn journalTornTailAtEveryByte() -> Result<void, TestFailure> {
+    // Write one journal, then for every possible crash length L of the segment file, recovery
+    // must give exactly the records that end at or before L: a prefix, never a partial record.
+    let source = scratchDirectory("torn-source");
+    var ends = Vector<u64>.create();
+    writeJournal(source.view(), 3, 3, mut ends);
+    let segment = segmentPath(source.view(), 1)!;
+    let whole = readWhole(segment.view());
+    let dir = scratchDirectory("torn");
+    let target = segmentPath(dir.view(), 1)!;
+    for (cut in SEGMENT_HEADER_LEN..whole.length + 1) {
+        writeWhole(target.view(), whole.view()[0..cut]);
+        var expected: u64 = 0;
+        for (i in 0..ends.length) {
+            if (ends[i] <= cut as u64) { expected = i as u64 + 1; }
+        }
+        let lsns = replay(dir.view(), smallConfig())!;
+        Check.equalU64(expected, lsns.length as u64)?;
+        // Recovery truncated the torn tail: a second recovery gives the same records.
+        Check.equalU64(expected, replay(dir.view(), smallConfig())!.length as u64)?;
+    }
+    removeTree(source.view());
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn journalCorruptionBeforeAcknowledgedBatchFails() -> Result<void, TestFailure> {
+    // Enough batches that more than maxBatchBytes of valid records follow the first record.
+    let source = scratchDirectory("corrupt");
+    var ends = Vector<u64>.create();
+    writeJournal(source.view(), 12, 4, mut ends);
+    let segment = segmentPath(source.view(), 1)!;
+    var bytes = readWhole(segment.view());
+    Check.isTrue(bytes.length > SEGMENT_HEADER_LEN + 2 * 4096, "the journal is long enough")?;
+    // Flip one payload byte of the first record: a later, acknowledged batch proves it was
+    // durable, so recovery must refuse to truncate it away.
+    bytes[SEGMENT_HEADER_LEN + RECORD_HEADER_LEN + 12] = bytes[SEGMENT_HEADER_LEN + RECORD_HEADER_LEN + 12] ^ 0x40;
+    writeWhole(segment.view(), bytes.view());
+    match (replay(source.view(), smallConfig())) {
+        Ok(_) => { return Check.fail("corruption in an acknowledged batch must not be truncated"); }
+        Err(JournalError.Corrupt(id, offset)) => {
+            Check.equalU64(1, id)?;
+            Check.equalU64(SEGMENT_HEADER_LEN as u64, offset)?;
+        }
+        Err(_) => { return Check.fail("expected Corrupt"); }
+    }
+    removeTree(source.view());
+    return Ok();
+}
+
+@test
+fn journalRotatesAndReplaysAcrossSegments() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("rotate");
+    let config = JournalConfig { segmentTargetBytes: 2048, maxBatchBytes: 4096, shardId: 0 };
+    var payload = Vector<u8>.create();
+    {
+        var j = Journal.open(dir.view(), config, (s, o, h, b) => {})!;
+        for (i in 0u64..40) {
+            payloadFor(i, mut payload);
+            j.stage(RecordType.PutInline, payload.view(), payload.view())!;
+            j.commit()!;
+        }
+        Check.isTrue(j.activeSegment() > 3, "the journal rotated")?;
+    }
+    let lsns = replay(dir.view(), config)!;
+    Check.equalU64(40, lsns.length as u64)?;
+    // Corruption in a sealed segment is never truncated.
+    let first = segmentPath(dir.view(), 1)!;
+    var bytes = readWhole(first.view());
+    let last = bytes.length - 1;
+    bytes[last] = bytes[last] ^ 1;
+    writeWhole(first.view(), bytes.view());
+    match (replay(dir.view(), config)) {
+        Err(JournalError.Corrupt(id, _)) => { Check.equalU64(1, id)?; }
+        _ => { return Check.fail("a corrupt sealed segment must fail recovery"); }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn journalPayloadReadBack() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("readback");
+    var j = Journal.open(dir.view(), smallConfig(), (s, o, h, b) => {})!;
+    let meta = "meta";
+    let payload = "small object payload";
+    let pos = j.stage(RecordType.PutInline, meta.bytes(), payload.bytes())!;
+    j.commit()!;
+    let at = PayloadLocator {
+        segmentId: pos.segmentId,
+        offset: pos.offset + (RECORD_HEADER_LEN + meta.length) as u64,
+        length: truncate<u32>(payload.length),
+    };
+    let read = j.readPayload(at)!;
+    Check.equalBytes(payload.bytes(), read.view())?;
+    Check.equalU64(1, j.syncCount())?;
+    removeTree(dir.view());
+    return Ok();
+}

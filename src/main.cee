@@ -1,0 +1,147 @@
+// cosmostore: command-line entry point.
+//
+//   cosmostore bench <dir> <objects> <size-bytes> <batch>
+//       Writes <objects> objects of <size-bytes> each, committing <batch> per sync (1 = one
+//       sync per PUT), then reopens the store and verifies every byte.
+
+fn usage() -> never {
+    Console.writeErrorLine("usage: cosmostore bench <dir> <objects> <size-bytes> <batch>");
+    Process.exit(2);
+}
+
+fn die(message: StringView) -> never {
+    Console.writeErrorLine(message);
+    Process.exit(1);
+}
+
+fn argU64(i: usize) -> u64 {
+    let text = Process.argument(i) ?? "";
+    return match (text.parseInt<u64>()) {
+        Some(v) => v,
+        null => { usage(); }
+    };
+}
+
+fn describe(e: StoreError) -> StringView => match (e) {
+    StoreError.Journal(JournalError.Io(f)) => ioOpName(f.op),
+    StoreError.Journal(JournalError.Corrupt(_, _)) => "journal corrupt",
+    StoreError.Journal(_) => "journal error",
+    StoreError.BadMeta(_, _) => "bad record meta",
+    StoreError.OutOfMemory => "out of memory",
+    StoreError.NoSuchBucket => "no such bucket",
+    StoreError.NoSuchKey => "no such key",
+    StoreError.EntityTooLarge => "entity too large",
+    _ => "store error",
+};
+
+fn objectName(into: borrow mut String, i: u64) {
+    into.clear();
+    into.append("obj/")!;
+    into.appendNumber(i % 97)!;
+    into.append("/")!;
+    into.appendNumber(i)!;
+}
+
+fn fillPayload(into: borrow mut Vector<u8>, i: u64, size: u64) {
+    into.clear();
+    var x = i.wrappingMul(0x9E3779B97F4A7C15).wrappingAdd(1);
+    for (k in 0u64..size) {
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        into.push(truncate<u8>(x))!;
+    }
+}
+
+fn writeRate(label: StringView, count: u64, millis: i64) {
+    Console.write(label);
+    Console.write(": ");
+    Console.write(count);
+    Console.write(" in ");
+    Console.write(millis);
+    Console.write(" ms");
+    if (millis > 0) {
+        Console.write(" = ");
+        Console.write(count * 1000 / truncate<u64>(millis));
+        Console.write(" ops/s");
+    }
+    Console.writeLine("");
+}
+
+fn bench() {
+    let dir = Process.argument(2) ?? "";
+    if (dir.length == 0) { usage(); }
+    let count = argU64(3);
+    let size = argU64(4);
+    let batch = argU64(5);
+    if (batch == 0) { usage(); }
+    var config = StoreConfig.defaults();
+    config.inlineMaxBytes = 4194304;
+    var payload = Vector<u8>.create();
+    var name = String.create();
+    let ctype = "application/octet-stream";
+    var syncs: u64 = 0;
+    {
+        var store = match (ObjectStore.open(dir, config)) {
+            Ok(s) => s,
+            Err(e) => { die(describe(e)); }
+        };
+        match (store.createBucket("bench")) {
+            Ok() => {}
+            Err(StoreError.BucketAlreadyExists) => {}
+            Err(e) => { die(describe(e)); }
+        }
+        let before = store.journalSyncs();
+        let start = Clock.unixMillis();
+        for (i in 0u64..count) {
+            objectName(mut name, i);
+            fillPayload(mut payload, i, size);
+            match (store.stagePut("bench", name.view(), ctype, payload.view())) {
+                Ok(_) => {}
+                Err(e) => { die(describe(e)); }
+            }
+            if ((i + 1) % batch == 0) {
+                match (store.commitStaged()) {
+                    Ok(_) => {}
+                    Err(e) => { die(describe(e)); }
+                }
+            }
+        }
+        match (store.commitStaged()) {
+            Ok(_) => {}
+            Err(e) => { die(describe(e)); }
+        }
+        let elapsed = Clock.unixMillis() - start;
+        syncs = store.journalSyncs() - before;
+        writeRate("put", count, elapsed);
+        Console.write("syncs: ");
+        Console.writeLine(syncs);
+    }
+    // Reopen (full recovery) and verify every byte.
+    let start = Clock.unixMillis();
+    let store = match (ObjectStore.open(dir, config)) {
+        Ok(s) => s,
+        Err(e) => { die(describe(e)); }
+    };
+    writeRate("recover", store.recordsApplied(), Clock.unixMillis() - start);
+    let readStart = Clock.unixMillis();
+    for (i in 0u64..count) {
+        objectName(mut name, i);
+        fillPayload(mut payload, i, size);
+        let got = match (store.getObject("bench", name.view())) {
+            Ok(v) => v,
+            Err(e) => { die(describe(e)); }
+        };
+        if (got.view() != payload.view()) { die("verification failed: bytes differ"); }
+    }
+    writeRate("get+verify", count, Clock.unixMillis() - readStart);
+}
+
+fn main() {
+    let command = Process.argument(1) ?? "";
+    if (command == "bench") {
+        bench();
+        return;
+    }
+    usage();
+}

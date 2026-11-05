@@ -1,0 +1,258 @@
+// ObjectStore tests: semantics, listing, conditional writes, recovery.
+
+fn storeConfig() -> StoreConfig => StoreConfig {
+    journal: JournalConfig { segmentTargetBytes: 1048576, maxBatchBytes: 65536, shardId: 0 },
+    inlineMaxBytes: 16384,
+};
+
+fn putText(s: borrow mut ObjectStore, bucket: StringView, key: StringView, body: StringView) -> u64 {
+    let ctype = "text/plain";
+    return s.putObject(bucket, key, ctype, body.bytes(), PutCondition.None)!.generation;
+}
+
+fn text(v: borrow Vector<u8>) -> StringView => StringView.fromUtf8(v.view())!;
+
+fn checkText(expected: StringView, v: Vector<u8>) -> Result<void, TestFailure> =>
+    Check.equalBytes(expected.bytes(), v.view());
+
+@test
+fn storePutGetHeadDelete() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("store-basic");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("photos")!;
+    putText(mut s, "photos", "a/1.txt", "first");
+    let got = s.getObject("photos", "a/1.txt")!;
+    Check.equalText("first", text(borrow got))?;
+    let info = s.headObject("photos", "a/1.txt")!;
+    Check.equalU64(5, info.size)?;
+    let expected = Md5.of("first".bytes());
+    Check.equalBytes(expected[..], info.md5[..])?;
+    // Overwrite replaces the null version.
+    putText(mut s, "photos", "a/1.txt", "second!");
+    checkText("second!", s.getObject("photos", "a/1.txt")!)?;
+    Check.equalU64(1, s.objectCount() as u64)?;
+    // Range read.
+    checkText("eco", s.getObjectRange("photos", "a/1.txt", 1, 4)!)?;
+    // Delete, then a missing key.
+    s.deleteObject("photos", "a/1.txt")!;
+    match (s.getObject("photos", "a/1.txt")) {
+        Err(StoreError.NoSuchKey) => {}
+        _ => { return Check.fail("deleted key must be NoSuchKey"); }
+    }
+    s.deleteObject("photos", "a/1.txt")!; // deleting a missing key succeeds
+    match (s.getObject("nope", "x")) {
+        Err(StoreError.NoSuchBucket) => {}
+        _ => { return Check.fail("missing bucket must be NoSuchBucket"); }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn storeBuckets() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("store-buckets");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("zeta")!;
+    s.createBucket("alpha")!;
+    match (s.createBucket("alpha")) {
+        Err(StoreError.BucketAlreadyExists) => {}
+        _ => { return Check.fail("duplicate bucket"); }
+    }
+    match (s.createBucket("Bad_Name")) {
+        Err(StoreError.InvalidBucketName) => {}
+        _ => { return Check.fail("invalid bucket name"); }
+    }
+    let names = s.listBuckets()!;
+    Check.equalU64(2, names.length as u64)?;
+    Check.equalText("alpha", text(borrow names[0]))?;
+    putText(mut s, "alpha", "k", "v");
+    match (s.deleteBucket("alpha")) {
+        Err(StoreError.BucketNotEmpty) => {}
+        _ => { return Check.fail("a non-empty bucket cannot be deleted"); }
+    }
+    s.deleteObject("alpha", "k")!;
+    s.deleteBucket("alpha")!;
+    Check.isTrue(!s.bucketExists("alpha")!, "deleted bucket is gone")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn storeConditionalWrites() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("store-cond");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    let body = "x";
+    let ctype = "text/plain";
+    let first = s.putObject("bkt", "lock", ctype, body.bytes(), PutCondition.IfAbsent)!;
+    match (s.putObject("bkt", "lock", ctype, body.bytes(), PutCondition.IfAbsent)) {
+        Err(StoreError.PreconditionFailed) => {}
+        _ => { return Check.fail("If-None-Match: * on an existing key fails"); }
+    }
+    match (s.putObject("bkt", "lock", ctype, body.bytes(), PutCondition.IfGeneration(first.generation + 1000))) {
+        Err(StoreError.PreconditionFailed) => {}
+        _ => { return Check.fail("a stale generation fails"); }
+    }
+    let second = s.putObject("bkt", "lock", ctype, body.bytes(), PutCondition.IfGeneration(first.generation))!;
+    Check.isTrue(second.generation > first.generation, "generations increase")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn storeListingWithDelimiterAndPages() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("store-list");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    let keys = ["b/2", "a", "b/1", "c/x/y", "c/z", "d", "ab"];
+    for (k in keys) { putText(mut s, "bkt", k, "v"); }
+    let empty = [0u8; 1];
+    // No delimiter: every key, in byte order.
+    let all = s.listObjects("bkt", "", "", empty[0..0], false, 100)!;
+    Check.equalU64(7, all.keys.length as u64)?;
+    Check.equalText("a", text(borrow all.keys[0]))?;
+    Check.equalText("ab", text(borrow all.keys[1]))?;
+    Check.equalText("d", text(borrow all.keys[6]))?;
+    // Delimiter "/": a, ab, d as keys; b/ and c/ as common prefixes.
+    let rolled = s.listObjects("bkt", "", "/", empty[0..0], false, 100)!;
+    Check.equalU64(3, rolled.keys.length as u64)?;
+    Check.equalU64(2, rolled.commonPrefixes.length as u64)?;
+    Check.equalText("b/", text(borrow rolled.commonPrefixes[0]))?;
+    Check.equalText("c/", text(borrow rolled.commonPrefixes[1]))?;
+    // Prefix "c/" with delimiter: c/x/ rolled up, c/z a key.
+    let inC = s.listObjects("bkt", "c/", "/", empty[0..0], false, 100)!;
+    Check.equalU64(1, inC.keys.length as u64)?;
+    Check.equalText("c/z", text(borrow inC.keys[0]))?;
+    Check.equalText("c/x/", text(borrow inC.commonPrefixes[0]))?;
+    // Paging two at a time with a delimiter visits a, ab, b/, c/, d exactly once.
+    var seen: usize = 0;
+    var marker = Vector<u8>.create();
+    var markerIsPrefix = false;
+    var pages: u64 = 0;
+    while (true) {
+        let page = s.listObjects("bkt", "", "/", marker.view(), markerIsPrefix, 2)!;
+        seen += page.keys.length + page.commonPrefixes.length;
+        pages += 1;
+        if (!page.truncated) { break; }
+        marker.clear();
+        marker.extend(page.nextMarker.view())!;
+        markerIsPrefix = page.nextMarkerIsPrefix;
+    }
+    Check.equalU64(5, seen as u64)?;
+    Check.equalU64(3, pages)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn storeRecoversAfterReopen() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("store-reopen");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        putText(mut s, "bkt", "keep", "kept");
+        putText(mut s, "bkt", "gone", "deleted");
+        putText(mut s, "bkt", "over", "v1");
+        putText(mut s, "bkt", "over", "v2");
+        s.deleteObject("bkt", "gone")!;
+    }
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(2, s.objectCount() as u64)?;
+    checkText("kept", s.getObject("bkt", "keep")!)?;
+    checkText("v2", s.getObject("bkt", "over")!)?;
+    match (s.getObject("bkt", "gone")) {
+        Err(StoreError.NoSuchKey) => {}
+        _ => { return Check.fail("a deleted key stays deleted after recovery"); }
+    }
+    // Space accounting: superseded and deleted records are not live.
+    let usage = s.segmentUsage(1);
+    Check.isTrue(usage.liveBytes < usage.totalBytes, "dead records are counted")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn storeCrashAtEveryByteIsConsistent() -> Result<void, TestFailure> {
+    // For every crash point, the recovered store must hold, for each key, exactly the value of
+    // the last write to it that was wholly durable, and every object's bytes must match its MD5.
+    let source = scratchDirectory("store-crash-source");
+    {
+        var s = ObjectStore.open(source.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        putText(mut s, "bkt", "k1", "one");
+        putText(mut s, "bkt", "k2", "two");
+        putText(mut s, "bkt", "k1", "uno");
+        s.deleteObject("bkt", "k2")!;
+        putText(mut s, "bkt", "k3", "three");
+    }
+    let segment = segmentPath(source.view(), 1)!;
+    let whole = readWhole(segment.view());
+    let dir = scratchDirectory("store-crash");
+    let target = segmentPath(dir.view(), 1)!;
+    var lastCount: u64 = 0;
+    for (cut in SEGMENT_HEADER_LEN..whole.length + 1) {
+        writeWhole(target.view(), whole.view()[0..cut]);
+        let s = ObjectStore.open(dir.view(), storeConfig())!;
+        let records = s.recordsApplied();
+        Check.isTrue(records >= lastCount, "recovery never goes backwards as the cut grows")?;
+        lastCount = records;
+        // Expected state after `records` records, by construction of the sequence above.
+        let bucket = records >= 1;
+        Check.isTrue(s.bucketExists("bkt")! == bucket, "bucket")?;
+        if (!bucket) { continue; }
+        let k1 = if (records >= 4) "uno" else if (records >= 2) "one" else "";
+        let k2 = if (records == 3 || records == 4) "two" else "";
+        let k3 = if (records >= 6) "three" else "";
+        let expected = [k1, k2, k3];
+        let names = ["k1", "k2", "k3"];
+        for (i in 0..3) {
+            match (s.getObject("bkt", names[i])) {
+                Ok(v) => {
+                    Check.equalText(expected[i], text(borrow v))?;
+                    let info = s.headObject("bkt", names[i])!;
+                    let digest = Md5.of(v.view());
+                    Check.equalBytes(info.md5[..], digest[..])?;
+                }
+                Err(StoreError.NoSuchKey) => { Check.equalU64(0, expected[i].length as u64)?; }
+                Err(_) => { return Check.fail("unexpected error"); }
+            }
+        }
+    }
+    Check.equalU64(6, lastCount)?;
+    removeTree(source.view());
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn storeGroupCommitOneSyncPerBatch() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("store-batch");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    let before = s.journalSyncs();
+    let ctype = "application/octet-stream";
+    let body = "0123456789";
+    var name = String.create();
+    for (i in 0u64..100) {
+        name.clear();
+        name.append("obj-")!;
+        name.appendNumber(i)!;
+        s.stagePut("bkt", name.view(), ctype, body.bytes())!;
+    }
+    // Staged writes are invisible until committed.
+    match (s.headObject("bkt", "obj-0")) {
+        Err(StoreError.NoSuchKey) => {}
+        _ => { return Check.fail("a staged write must not be visible before commit"); }
+    }
+    Check.equalU64(100, s.commitStaged()! as u64)?;
+    Check.equalU64(1, s.journalSyncs() - before)?;
+    Check.equalU64(100, s.objectCount() as u64)?;
+    // A conditional write sees staged writes (it commits them first).
+    s.stagePut("bkt", "late", ctype, body.bytes())!;
+    match (s.putObject("bkt", "late", ctype, body.bytes(), PutCondition.IfAbsent)) {
+        Err(StoreError.PreconditionFailed) => {}
+        _ => { return Check.fail("If-None-Match must see a staged write"); }
+    }
+    removeTree(dir.view());
+    return Ok();
+}

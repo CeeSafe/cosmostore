@@ -1,0 +1,337 @@
+// The object model and its record encodings (ADR-001 §meta). Versions are first-class from
+// the start: an unversioned bucket's objects carry the null version id (all zero bytes).
+
+const VERSION_ID_LEN: usize = 16;
+const META_FORMAT_VERSION: u8 = 1;
+const MAX_BUCKET_NAME: usize = 63;
+const MAX_KEY_BYTES: usize = 1024;
+const MAX_CONTENT_TYPE: usize = 1024;
+
+/// The null version id, used by unversioned buckets.
+fn nullVersionId() -> [u8; 16] => [0u8; 16];
+
+/// Byte-wise lexicographic order, as S3 lists keys (UTF-8 binary order).
+fn compareBytes(a: Slice<u8>, b: Slice<u8>) -> i32 {
+    let n = if (a.length < b.length) a.length else b.length;
+    for (i in 0..n) {
+        if (a[i] != b[i]) { return if (a[i] < b[i]) -1 else 1; }
+    }
+    if (a.length == b.length) { return 0; }
+    return if (a.length < b.length) -1 else 1;
+}
+
+fn startsWithBytes(s: Slice<u8>, prefix: Slice<u8>) -> bool {
+    if (prefix.length > s.length) { return false; }
+    for (i in 0..prefix.length) {
+        if (s[i] != prefix[i]) { return false; }
+    }
+    return true;
+}
+
+/// Where `needle` first occurs in `s` at or after `from`.
+fn findBytes(s: Slice<u8>, needle: Slice<u8>, from: usize) -> usize? {
+    if (needle.length == 0 || needle.length > s.length) { return null; }
+    var i = from;
+    while (i + needle.length <= s.length) {
+        if (startsWithBytes(s[i..], needle)) { return i; }
+        i += 1;
+    }
+    return null;
+}
+
+fn copyBytes(s: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var v = Vector<u8>.create();
+    v.extend(s)?;
+    return Ok(v);
+}
+
+/// A key of the object index: bucket and object key.
+struct IndexKey {
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+}
+
+impl HashKey<IndexKey> for IndexKey {
+    fn hash(borrow this, h: borrow mut Hasher) {
+        h.u64(this.bucket.length as u64);
+        h.bytes(this.bucket.view());
+        h.bytes(this.key.view());
+    }
+
+    fn sameAs(borrow this, other: borrow IndexKey) -> bool =>
+        this.bucket.view() == other.bucket.view() && this.key.view() == other.key.view();
+}
+
+/// A bucket's name as a map key.
+struct BucketKey {
+    name: Vector<u8>;
+}
+
+impl HashKey<BucketKey> for BucketKey {
+    fn hash(borrow this, h: borrow mut Hasher) {
+        h.bytes(this.name.view());
+    }
+
+    fn sameAs(borrow this, other: borrow BucketKey) -> bool => this.name.view() == other.name.view();
+}
+
+enum VersionKind {
+    Object,
+    DeleteMarker,
+}
+
+/// One version of a key, as the index holds it.
+struct ObjectVersion {
+    versionId: [u8; 16];
+    /// The LSN of the record that created it: also the key's generation for conditional writes.
+    lsn: u64;
+    kind: VersionKind;
+    size: u64;
+    mtimeMillis: i64;
+    md5: [u8; 16];
+    contentType: Vector<u8>;
+    payload: PayloadLocator;
+    /// The whole record, for space accounting.
+    recordSegment: u64;
+    recordLength: u32;
+}
+
+/// Decoded meta of a PutInline record.
+struct PutMeta {
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    versionId: [u8; 16];
+    mtimeMillis: i64;
+    size: u64;
+    md5: [u8; 16];
+    contentType: Vector<u8>;
+}
+
+/// Decoded meta of a DeleteVersion or DeleteMarker record.
+struct DeleteMeta {
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    versionId: [u8; 16];
+    mtimeMillis: i64;
+}
+
+enum MetaFault {
+    Short,
+    BadVersion,
+    TooLong,
+    OutOfMemory,
+}
+
+fn metaAlloc<T>(r: Result<T, AllocError>) -> Result<T, MetaFault> => match (r) {
+    Ok(v) => Ok(v),
+    Err(_) => Err(MetaFault.OutOfMemory),
+};
+
+fn pushText16(out: borrow mut Vector<u8>, s: Slice<u8>) -> Result<void, AllocError> {
+    out.pushLE(truncate<u16>(s.length))?;
+    out.extend(s)?;
+    return Ok();
+}
+
+/// PutInline / PutExtent meta v1:
+///   u8 format version, u16+bytes bucket, u16+bytes key, 16 version id, i64 mtime ms,
+///   u64 size, 16 md5, u16+bytes content type, u16 user metadata pairs (each u16+bytes, u16+bytes).
+fn encodePutMeta(
+    out: borrow mut Vector<u8>,
+    bucket: Slice<u8>,
+    key: Slice<u8>,
+    versionId: [u8; 16],
+    mtimeMillis: i64,
+    size: u64,
+    md5: [u8; 16],
+    contentType: Slice<u8>,
+) -> Result<void, AllocError> {
+    out.pushLE(META_FORMAT_VERSION)?;
+    pushText16(out, bucket)?;
+    pushText16(out, key)?;
+    out.extend(versionId[..])?;
+    out.pushLE(mtimeMillis)?;
+    out.pushLE(size)?;
+    out.extend(md5[..])?;
+    pushText16(out, contentType)?;
+    out.pushLE(0u16)?; // user metadata: none yet
+    return Ok();
+}
+
+/// DeleteVersion / DeleteMarker meta v1: u8 format version, u16+bytes bucket, u16+bytes key,
+/// 16 version id, i64 mtime ms.
+fn encodeDeleteMeta(
+    out: borrow mut Vector<u8>,
+    bucket: Slice<u8>,
+    key: Slice<u8>,
+    versionId: [u8; 16],
+    mtimeMillis: i64,
+) -> Result<void, AllocError> {
+    out.pushLE(META_FORMAT_VERSION)?;
+    pushText16(out, bucket)?;
+    pushText16(out, key)?;
+    out.extend(versionId[..])?;
+    out.pushLE(mtimeMillis)?;
+    return Ok();
+}
+
+/// BucketCreate / BucketDelete meta v1: u8 format version, u16+bytes name, i64 mtime ms.
+fn encodeBucketMeta(out: borrow mut Vector<u8>, name: Slice<u8>, mtimeMillis: i64) -> Result<void, AllocError> {
+    out.pushLE(META_FORMAT_VERSION)?;
+    pushText16(out, name)?;
+    out.pushLE(mtimeMillis)?;
+    return Ok();
+}
+
+fn need(bytes: Slice<u8>, at: usize, n: usize) -> Result<void, MetaFault> {
+    if (at + n > bytes.length) { return Err(MetaFault.Short); }
+    return Ok();
+}
+
+fn readText16(bytes: Slice<u8>, at: borrow mut usize) -> Result<Vector<u8>, MetaFault> {
+    need(bytes, at, 2)?;
+    let n = bytes.readLE<u16>(at) as usize;
+    at += 2;
+    need(bytes, at, n)?;
+    let v = metaAlloc(copyBytes(bytes[at..at + n]))?;
+    at += n;
+    return Ok(v);
+}
+
+fn readId16(bytes: Slice<u8>, at: borrow mut usize) -> Result<[u8; 16], MetaFault> {
+    need(bytes, at, 16)?;
+    var id = [0u8; 16];
+    id[..].copyFrom(bytes[at..at + 16]);
+    at += 16;
+    return Ok(id);
+}
+
+fn readU64(bytes: Slice<u8>, at: borrow mut usize) -> Result<u64, MetaFault> {
+    need(bytes, at, 8)?;
+    let v = bytes.readLE<u64>(at);
+    at += 8;
+    return Ok(v);
+}
+
+fn readI64(bytes: Slice<u8>, at: borrow mut usize) -> Result<i64, MetaFault> {
+    need(bytes, at, 8)?;
+    let v = bytes.readLE<i64>(at);
+    at += 8;
+    return Ok(v);
+}
+
+fn checkVersion(bytes: Slice<u8>, at: borrow mut usize) -> Result<void, MetaFault> {
+    need(bytes, at, 1)?;
+    if (bytes[at] != META_FORMAT_VERSION) { return Err(MetaFault.BadVersion); }
+    at += 1;
+    return Ok();
+}
+
+fn decodePutMeta(bytes: Slice<u8>) -> Result<PutMeta, MetaFault> {
+    var at: usize = 0;
+    checkVersion(bytes, mut at)?;
+    let bucket = readText16(bytes, mut at)?;
+    let key = readText16(bytes, mut at)?;
+    let versionId = readId16(bytes, mut at)?;
+    let mtime = readI64(bytes, mut at)?;
+    let size = readU64(bytes, mut at)?;
+    let md5 = readId16(bytes, mut at)?;
+    let contentType = readText16(bytes, mut at)?;
+    return Ok(PutMeta {
+        bucket: bucket,
+        key: key,
+        versionId: versionId,
+        mtimeMillis: mtime,
+        size: size,
+        md5: md5,
+        contentType: contentType,
+    });
+}
+
+fn decodeDeleteMeta(bytes: Slice<u8>) -> Result<DeleteMeta, MetaFault> {
+    var at: usize = 0;
+    checkVersion(bytes, mut at)?;
+    let bucket = readText16(bytes, mut at)?;
+    let key = readText16(bytes, mut at)?;
+    let versionId = readId16(bytes, mut at)?;
+    let mtime = readI64(bytes, mut at)?;
+    return Ok(DeleteMeta { bucket: bucket, key: key, versionId: versionId, mtimeMillis: mtime });
+}
+
+fn decodeBucketName(bytes: Slice<u8>) -> Result<Vector<u8>, MetaFault> {
+    var at: usize = 0;
+    checkVersion(bytes, mut at)?;
+    return readText16(bytes, mut at);
+}
+
+/// S3 general-purpose bucket naming rules (3-63 chars; lowercase letters, digits, '.', '-';
+/// starts and ends with a letter or digit; no "..", not an IPv4 address).
+fn isValidBucketName(name: Slice<u8>) -> bool {
+    if (name.length < 3 || name.length > MAX_BUCKET_NAME) { return false; }
+    var dotsOnlyDigits = true;
+    var dots = 0;
+    for (i in 0..name.length) {
+        let c = name[i];
+        let lower = c >= 'a' && c <= 'z';
+        let digit = c >= '0' && c <= '9';
+        if (!(lower || digit || c == '.' || c == '-')) { return false; }
+        if ((i == 0 || i + 1 == name.length) && !(lower || digit)) { return false; }
+        if (c == '.') {
+            dots += 1;
+            if (i > 0 && name[i - 1] == '.') { return false; }
+        } else if (!digit) {
+            dotsOnlyDigits = false;
+        }
+    }
+    return !(dotsOnlyDigits && dots == 3);
+}
+
+@test
+fn putMetaRoundTrip() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    let bucket = "photos";
+    let key = "2026/11/06/cat.jpg";
+    let ctype = "image/jpeg";
+    var vid = nullVersionId();
+    vid[3] = 9;
+    let md5 = Md5.of(key.bytes());
+    encodePutMeta(mut out, bucket.bytes(), key.bytes(), vid, 1700000000000, 12345, md5, ctype.bytes())!;
+    let m = match (decodePutMeta(out.view())) {
+        Ok(m) => m,
+        Err(_) => { return Check.fail("decodes"); }
+    };
+    Check.equalBytes(bucket.bytes(), m.bucket.view())?;
+    Check.equalBytes(key.bytes(), m.key.view())?;
+    Check.equalBytes(vid[..], m.versionId[..])?;
+    Check.equalU64(12345, m.size)?;
+    Check.equalBytes(md5[..], m.md5[..])?;
+    Check.equalBytes(ctype.bytes(), m.contentType.view())?;
+    // Every truncation is rejected, never misread.
+    for (n in 0..out.length - 2) {
+        match (decodePutMeta(out.view()[0..n])) {
+            Ok(_) => { return Check.fail("a truncated meta must not decode"); }
+            Err(_) => {}
+        }
+    }
+    return Ok();
+}
+
+@test
+fn bucketNames() -> Result<void, TestFailure> {
+    let good = ["abc", "my-bucket", "my.bucket.2", "a1b"];
+    for (n in good) { Check.isTrue(isValidBucketName(n.bytes()), "valid bucket name")?; }
+    let bad = ["ab", "-abc", "abc-", "ABC", "a..b", "192.168.1.1", "a_b", "abc."];
+    for (n in bad) { Check.isTrue(!isValidBucketName(n.bytes()), "invalid bucket name")?; }
+    return Ok();
+}
+
+@test
+fn byteOrdering() -> Result<void, TestFailure> {
+    let a = "a";
+    let ab = "ab";
+    let b = "b";
+    Check.isTrue(compareBytes(a.bytes(), ab.bytes()) < 0, "a < ab")?;
+    Check.isTrue(compareBytes(ab.bytes(), b.bytes()) < 0, "ab < b")?;
+    Check.isTrue(compareBytes(b.bytes(), b.bytes()) == 0, "b == b")?;
+    return Ok();
+}

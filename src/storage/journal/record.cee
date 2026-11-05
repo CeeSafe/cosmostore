@@ -1,0 +1,229 @@
+// Journal record format v1 (ADR-001). All integers little-endian.
+//
+// Header (48 bytes):
+//   0  u32 magic = RECORD_MAGIC
+//   4  u8  type (RecordType code)
+//   5  u8  flags (bit 0: payload encrypted; others reserved, 0)
+//   6  u16 header length = 48
+//   8  u32 total length = header + meta + payload + trailer
+//  12  u32 meta length
+//  16  u32 payload length
+//  20  u32 body crc32c (meta bytes then payload bytes)
+//  24  u64 lsn (log sequence number, strictly increasing within a shard)
+//  32  u64 term (consensus term; 0 on a single node)
+//  40  u32 reserved, 0
+//  44  u32 header crc32c (bytes 0..44)
+// Meta (meta length bytes), payload (payload length bytes)
+// Trailer (8 bytes):
+//   0  u32 TRAILER_MAGIC
+//   4  u32 total length again
+//
+// A record is valid only if the header crc, the length fields, the body crc and the trailer
+// all check. Anything else is a torn or corrupt record.
+
+const RECORD_MAGIC: u32 = 0x43524543;  // "CERC" in file order
+const TRAILER_MAGIC: u32 = 0x444E4543; // "CEND" in file order
+const RECORD_HEADER_LEN: usize = 48;
+const RECORD_TRAILER_LEN: usize = 8;
+/// The largest record accepted: 16 MiB. Inline payloads are far smaller (ADR-001 §thresholds).
+const MAX_RECORD_LEN: usize = 16777216;
+
+/// What a record means.
+enum RecordType {
+    /// An object version whose payload is inline in this record.
+    PutInline,
+    /// An object version whose payload is in extent files named by the meta.
+    PutExtent,
+    /// A delete marker becomes the current version of a key.
+    DeleteMarker,
+    /// One version of a key is permanently removed.
+    DeleteVersion,
+    BucketCreate,
+    BucketDelete,
+    /// The index was flushed up to an LSN.
+    Checkpoint,
+}
+
+fn recordTypeCode(t: RecordType) -> u8 => match (t) {
+    RecordType.PutInline => 1,
+    RecordType.PutExtent => 2,
+    RecordType.DeleteMarker => 3,
+    RecordType.DeleteVersion => 4,
+    RecordType.BucketCreate => 5,
+    RecordType.BucketDelete => 6,
+    RecordType.Checkpoint => 7,
+};
+
+fn recordTypeFromCode(code: u8) -> RecordType? => match (code) {
+    1 => RecordType.PutInline,
+    2 => RecordType.PutExtent,
+    3 => RecordType.DeleteMarker,
+    4 => RecordType.DeleteVersion,
+    5 => RecordType.BucketCreate,
+    6 => RecordType.BucketDelete,
+    7 => RecordType.Checkpoint,
+    _ => null,
+};
+
+/// Why bytes are not a valid record.
+enum RecordFault {
+    /// Fewer bytes than a header, or than the header's total length.
+    Short,
+    BadMagic,
+    BadHeaderCrc,
+    BadLength,
+    UnknownType,
+    BadBodyCrc,
+    BadTrailer,
+}
+
+/// A decoded, checked header.
+struct RecordHeader {
+    kind: RecordType;
+    flags: u8;
+    totalLen: u32;
+    metaLen: u32;
+    payloadLen: u32;
+    bodyCrc: u32;
+    lsn: u64;
+    term: u64;
+
+    /// Offset of the meta bytes from the start of the record.
+    fn metaOffset(borrow this) -> usize => RECORD_HEADER_LEN;
+
+    /// Offset of the payload bytes from the start of the record.
+    fn payloadOffset(borrow this) -> usize => RECORD_HEADER_LEN + this.metaLen as usize;
+}
+
+/// The encoded length of a record with these parts.
+fn recordLength(metaLen: usize, payloadLen: usize) -> usize =>
+    RECORD_HEADER_LEN + metaLen + payloadLen + RECORD_TRAILER_LEN;
+
+/// Appends one encoded record to `out`.
+fn encodeRecord(
+    out: borrow mut Vector<u8>,
+    kind: RecordType,
+    flags: u8,
+    lsn: u64,
+    term: u64,
+    meta: Slice<u8>,
+    payload: Slice<u8>,
+) -> Result<void, AllocError> {
+    let total = recordLength(meta.length, payload.length);
+    // Callers keep records under MAX_RECORD_LEN (Journal.stage checks); the u32 fields cannot hold more.
+    var body = Crc32c.create();
+    body.update(meta);
+    body.update(payload);
+    let start = out.length;
+    out.reserve(total)?;
+    out.pushLE(RECORD_MAGIC)?;
+    out.pushLE(recordTypeCode(kind))?;
+    out.pushLE(flags)?;
+    out.pushLE(truncate<u16>(RECORD_HEADER_LEN))?;
+    out.pushLE(checkedTruncate<u32>(total)!)?;
+    out.pushLE(truncate<u32>(meta.length))?;
+    out.pushLE(truncate<u32>(payload.length))?;
+    out.pushLE(body.value())?;
+    out.pushLE(lsn)?;
+    out.pushLE(term)?;
+    out.pushLE(0u32)?;
+    let headerCrc = Crc32c.of(out.view()[start..start + 44]);
+    out.pushLE(headerCrc)?;
+    out.extend(meta)?;
+    out.extend(payload)?;
+    out.pushLE(TRAILER_MAGIC)?;
+    out.pushLE(checkedTruncate<u32>(total)!)?;
+    return Ok();
+}
+
+/// Decodes and checks the 48-byte header at the start of `bytes`.
+fn decodeHeader(bytes: Slice<u8>) -> Result<RecordHeader, RecordFault> {
+    if (bytes.length < RECORD_HEADER_LEN) { return Err(RecordFault.Short); }
+    if (bytes.readLE<u32>(0) != RECORD_MAGIC) { return Err(RecordFault.BadMagic); }
+    if (bytes.readLE<u32>(44) != Crc32c.of(bytes[0..44])) { return Err(RecordFault.BadHeaderCrc); }
+    if (bytes.readLE<u16>(6) as usize != RECORD_HEADER_LEN) { return Err(RecordFault.BadLength); }
+    let kind = match (recordTypeFromCode(bytes.readLE<u8>(4))) {
+        Some(k) => k,
+        null => { return Err(RecordFault.UnknownType); }
+    };
+    let total = bytes.readLE<u32>(8);
+    let metaLen = bytes.readLE<u32>(12);
+    let payloadLen = bytes.readLE<u32>(16);
+    let expected = recordLength(metaLen as usize, payloadLen as usize);
+    if (total as usize != expected || expected > MAX_RECORD_LEN) { return Err(RecordFault.BadLength); }
+    return Ok(RecordHeader {
+        kind: kind,
+        flags: bytes.readLE<u8>(5),
+        totalLen: total,
+        metaLen: metaLen,
+        payloadLen: payloadLen,
+        bodyCrc: bytes.readLE<u32>(20),
+        lsn: bytes.readLE<u64>(24),
+        term: bytes.readLE<u64>(32),
+    });
+}
+
+/// Checks the body and trailer of a whole record (`record.length == header.totalLen`).
+fn verifyRecordBody(header: borrow RecordHeader, record: Slice<u8>) -> Result<void, RecordFault> {
+    let total = header.totalLen as usize;
+    if (record.length < total) { return Err(RecordFault.Short); }
+    let trailerAt = total - RECORD_TRAILER_LEN;
+    if (record.readLE<u32>(trailerAt) != TRAILER_MAGIC || record.readLE<u32>(trailerAt + 4) != header.totalLen) {
+        return Err(RecordFault.BadTrailer);
+    }
+    if (Crc32c.of(record[RECORD_HEADER_LEN..trailerAt]) != header.bodyCrc) { return Err(RecordFault.BadBodyCrc); }
+    return Ok();
+}
+
+/// Decodes and fully checks one record at the start of `bytes`.
+fn decodeRecord(bytes: Slice<u8>) -> Result<RecordHeader, RecordFault> {
+    let header = decodeHeader(bytes)?;
+    verifyRecordBody(borrow header, bytes)?;
+    return Ok(header);
+}
+
+/// Whether `bytes` starts with one whole, valid record.
+fn isValidRecord(bytes: Slice<u8>) -> bool => match (decodeRecord(bytes)) {
+    Ok(_) => true,
+    Err(_) => false,
+};
+
+@test
+fn recordRoundTrip() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    let meta = "bucket/key";
+    let payload = "hello, cosmostore";
+    encodeRecord(mut out, RecordType.PutInline, 0, 42, 0, meta.bytes(), payload.bytes())!;
+    Check.equalU64(recordLength(meta.length, payload.length) as u64, out.length as u64)?;
+    let header = match (decodeRecord(out.view())) {
+        Ok(h) => h,
+        Err(_) => { return Check.fail("a fresh record decodes"); }
+    };
+    Check.equalU64(42, header.lsn)?;
+    let p = header.payloadOffset();
+    Check.equalBytes(payload.bytes(), out.view()[p..p + header.payloadLen as usize])?;
+    return Ok();
+}
+
+@test
+fn recordEveryFlipIsDetected() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    let meta = "m";
+    let payload = "the payload of a small object";
+    encodeRecord(mut out, RecordType.PutInline, 0, 7, 0, meta.bytes(), payload.bytes())!;
+    // Flip every bit of every byte: no corrupted record may decode as valid.
+    for (i in 0..out.length) {
+        for (bit in 0..8) {
+            let mask = truncate<u8>(1u32 << truncate<u32>(bit));
+            out[i] = out[i] ^ mask;
+            let ok = isValidRecord(out.view());
+            out[i] = out[i] ^ mask;
+            Check.isTrue(!ok, "a flipped bit is detected")?;
+        }
+    }
+    // Every strict prefix is rejected too (torn writes).
+    for (n in 0..out.length) {
+        Check.isTrue(!isValidRecord(out.view()[0..n]), "a torn record is rejected")?;
+    }
+    return Ok();
+}

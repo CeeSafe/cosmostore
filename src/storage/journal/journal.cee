@@ -1,0 +1,447 @@
+// The per-shard journal: the single write-ahead log and the home of small payloads (ADR-001).
+//
+// A journal is a directory of segment files `seg-<16 hex digits>.cj`. Records are appended to
+// the newest segment. Callers stage records, then `commit` writes the batch with one positional
+// write and one data sync. Only after `commit` returns Ok may a caller publish or acknowledge
+// any record of the batch.
+//
+// Recovery invariants:
+// - Sealed segments (every segment but the newest) were fully synced before the next one was
+//   created, so any invalid record in one is corruption: opening fails.
+// - The newest segment may end in a torn batch. A batch is written only after the previous
+//   batch's sync succeeded, and a batch is at most `maxBatchBytes`. So if the first invalid
+//   record is at X, every valid record at or after X + maxBatchBytes belongs to a later,
+//   acknowledged batch: that is corruption, and opening fails. Otherwise the tail from X is
+//   unacknowledged and is truncated.
+// - A failed write or sync puts the journal in the failed state: nothing more is accepted
+//   until it is reopened, because after a failed fsync the OS may have dropped dirty pages.
+
+const SEGMENT_MAGIC: u64 = 0x31304745534A5343; // "CSJSEG01" in file order
+const SEGMENT_HEADER_LEN: usize = 64;
+const SEGMENT_FORMAT_VERSION: u16 = 1;
+
+struct JournalConfig {
+    /// A segment is sealed and a new one started once it reaches this size.
+    segmentTargetBytes: u64;
+    /// The most bytes one commit writes; also the torn-tail window of recovery.
+    maxBatchBytes: usize;
+    shardId: u32;
+
+    fn defaults() -> JournalConfig => JournalConfig {
+        segmentTargetBytes: 134217728,
+        maxBatchBytes: 33554432,
+        shardId: 0,
+    };
+}
+
+enum JournalError {
+    Io(IoFailure),
+    OutOfMemory,
+    /// An invalid record where only valid ones may be: (segment id, offset).
+    Corrupt(u64, u64),
+    BadSegmentHeader(u64),
+    /// A record larger than MAX_RECORD_LEN, or a batch larger than maxBatchBytes.
+    TooLarge,
+    /// A previous write or sync failed; reopen the journal.
+    Failed,
+}
+
+/// `r` with an I/O failure as a JournalError (CeeSafe's `?` does not convert errors: CEESAFE_GAPS.md G7).
+fn jio<T>(r: Result<T, IoFailure>) -> Result<T, JournalError> => match (r) {
+    Ok(v) => Ok(v),
+    Err(e) => Err(JournalError.Io(e)),
+};
+
+/// `r` with an allocation failure as a JournalError.
+fn jalloc<T>(r: Result<T, AllocError>) -> Result<T, JournalError> => match (r) {
+    Ok(v) => Ok(v),
+    Err(_) => Err(JournalError.OutOfMemory),
+};
+
+/// Where a staged record will be: its segment, its offset there, and its LSN.
+struct RecordPosition {
+    segmentId: u64;
+    offset: u64;
+    lsn: u64;
+}
+
+/// The bytes of a payload inside a segment.
+struct PayloadLocator {
+    segmentId: u64;
+    offset: u64;
+    length: u32;
+}
+
+struct Journal {
+    private dir: String;
+    private file: DurableFile;
+    private segmentId: u64;
+    /// The end of the last durable batch in the active segment.
+    private writeOffset: u64;
+    private nextLsn: u64;
+    private pending: Vector<u8>;
+    private pendingCount: u32;
+    private failed: bool;
+    private config: JournalConfig;
+    /// Stats: data syncs performed and records committed.
+    private syncs: u64;
+    private committed: u64;
+
+    /// Opens (or creates) the journal in `dir`, replaying every valid record through `visit`
+    /// in LSN order: visit(segment id, record offset, header, whole record bytes).
+    fn open(
+        dir: StringView,
+        config: JournalConfig,
+        visit: borrow mut fn(u64, u64, borrow RecordHeader, Slice<u8>),
+    ) -> Result<Journal, JournalError> {
+        jio(Fs.ensureDirectory(dir))?;
+        var ids = listSegmentIds(dir)?;
+        var nextLsn: u64 = 1;
+        var buffer = Vector<u8>.create();
+        if (ids.length == 0) {
+            let first = Journal.createSegment(dir, 1, nextLsn, config.shardId)?;
+            return Ok(Journal.make(dir, first, 1, SEGMENT_HEADER_LEN as u64, nextLsn, config)?);
+        }
+        for (i in 0..ids.length) {
+            let id = ids[i];
+            let last = i + 1 == ids.length;
+            let path = segmentPath(dir, id)?;
+            let file = jio(DurableFile.openReadWrite(path.view()))?;
+            let size = jio(file.size())?;
+            let headerOk = readSegmentHeader(borrow file, size, id);
+            if (!headerOk) {
+                if (!last) { return Err(JournalError.BadSegmentHeader(id)); }
+                // The newest segment's creation was torn: start it again.
+                jio(file.truncateTo(0))?;
+                writeSegmentHeader(borrow file, id, nextLsn, config.shardId)?;
+                jio(file.syncData())?;
+                return Ok(Journal.make(dir, file, id, SEGMENT_HEADER_LEN as u64, nextLsn, config)?);
+            }
+            let end = scanSegment(borrow file, id, size, last, config.maxBatchBytes, mut nextLsn, mut buffer, visit)?;
+            if (last) {
+                if (end != size) {
+                    jio(file.truncateTo(end))?;
+                    jio(file.syncData())?;
+                }
+                return Ok(Journal.make(dir, file, id, end, nextLsn, config)?);
+            }
+        }
+        return Err(JournalError.Corrupt(0, 0)); // unreachable: the loop returns on the last segment
+    }
+
+    fn make(
+        dir: StringView,
+        file: DurableFile,
+        segmentId: u64,
+        writeOffset: u64,
+        nextLsn: u64,
+        config: JournalConfig,
+    ) -> Result<Journal, JournalError> {
+        var d = String.create();
+        jalloc(d.append(dir))?;
+        return Ok(Journal {
+            dir: d,
+            file: file,
+            segmentId: segmentId,
+            writeOffset: writeOffset,
+            nextLsn: nextLsn,
+            pending: Vector<u8>.create(),
+            pendingCount: 0,
+            failed: false,
+            config: config,
+            syncs: 0,
+            committed: 0,
+        });
+    }
+
+    /// Creates segment `id` with its header, durably (file and directory entry).
+    fn createSegment(dir: StringView, id: u64, firstLsn: u64, shardId: u32) -> Result<DurableFile, JournalError> {
+        let path = segmentPath(dir, id)?;
+        let file = jio(DurableFile.createNew(path.view()))?;
+        writeSegmentHeader(borrow file, id, firstLsn, shardId)?;
+        jio(file.syncData())?;
+        jio(Fs.syncDirectory(dir))?;
+        return Ok(file);
+    }
+
+    /// The LSN the next staged record gets.
+    fn upcomingLsn(borrow this) -> u64 => this.nextLsn;
+
+    /// Records staged and not yet committed.
+    fn pendingRecords(borrow this) -> u32 => this.pendingCount;
+
+    /// Bytes staged and not yet committed.
+    fn pendingBytes(borrow this) -> usize => this.pending.length;
+
+    fn syncCount(borrow this) -> u64 => this.syncs;
+
+    fn committedCount(borrow this) -> u64 => this.committed;
+
+    fn activeSegment(borrow this) -> u64 => this.segmentId;
+
+    /// Adds a record to the current batch. It is not durable until `commit` returns Ok.
+    fn stage(
+        borrow mut this,
+        kind: RecordType,
+        meta: Slice<u8>,
+        payload: Slice<u8>,
+    ) -> Result<RecordPosition, JournalError> {
+        if (this.failed) { return Err(JournalError.Failed); }
+        let length = recordLength(meta.length, payload.length);
+        if (length > MAX_RECORD_LEN) { return Err(JournalError.TooLarge); }
+        if (this.pending.length + length > this.config.maxBatchBytes) { return Err(JournalError.TooLarge); }
+        let position = RecordPosition {
+            segmentId: this.segmentId,
+            offset: this.writeOffset + this.pending.length as u64,
+            lsn: this.nextLsn,
+        };
+        jalloc(encodeRecord(mut this.pending, kind, 0, this.nextLsn, 0, meta, payload))?;
+        this.nextLsn += 1;
+        this.pendingCount += 1;
+        return Ok(position);
+    }
+
+    /// Whether staging `metaLen` + `payloadLen` more bytes would overflow the batch.
+    fn wouldOverflow(borrow this, metaLen: usize, payloadLen: usize) -> bool =>
+        this.pending.length + recordLength(metaLen, payloadLen) > this.config.maxBatchBytes;
+
+    /// Makes every staged record durable with one write and one sync, then rotates the
+    /// segment if it is full. On error the journal is failed and nothing staged is durable.
+    fn commit(borrow mut this) -> Result<void, JournalError> {
+        if (this.failed) { return Err(JournalError.Failed); }
+        if (this.pendingCount == 0) { return Ok(); }
+        match (this.file.writeAt(this.pending.view(), this.writeOffset)) {
+            Ok() => {}
+            Err(e) => { return this.fail(e); }
+        }
+        match (this.file.syncData()) {
+            Ok() => {}
+            Err(e) => { return this.fail(e); }
+        }
+        this.syncs += 1;
+        this.committed += this.pendingCount as u64;
+        this.writeOffset += this.pending.length as u64;
+        this.pending.clear();
+        this.pendingCount = 0;
+        if (this.writeOffset >= this.config.segmentTargetBytes) {
+            this.rotate()?;
+        }
+        return Ok();
+    }
+
+    /// Discards the staged records (used when a batch cannot be built).
+    fn discardPending(borrow mut this) {
+        this.nextLsn -= this.pendingCount as u64;
+        this.pending.clear();
+        this.pendingCount = 0;
+    }
+
+    fn fail(borrow mut this, e: IoFailure) -> Result<void, JournalError> {
+        this.failed = true;
+        this.pending.clear();
+        this.pendingCount = 0;
+        return Err(JournalError.Io(e));
+    }
+
+    fn rotate(borrow mut this) -> Result<void, JournalError> {
+        let id = this.segmentId + 1;
+        match (Journal.createSegment(this.dir.view(), id, this.nextLsn, this.config.shardId)) {
+            Ok(file) => {
+                this.file = file;
+                this.segmentId = id;
+                this.writeOffset = SEGMENT_HEADER_LEN as u64;
+                return Ok();
+            }
+            Err(e) => {
+                this.failed = true;
+                return Err(e);
+            }
+        }
+    }
+
+    /// Reads committed bytes of a segment: `into.length` bytes at `offset`.
+    fn readAt(borrow this, segmentId: u64, offset: u64, into: SliceMut<u8>) -> Result<void, JournalError> {
+        if (segmentId == this.segmentId) {
+            if (offset + into.length as u64 > this.writeOffset) { return Err(JournalError.Corrupt(segmentId, offset)); }
+            return jio(this.file.readExactAt(into, offset));
+        }
+        let path = segmentPath(this.dir.view(), segmentId)?;
+        let file = jio(DurableFile.openRead(path.view()))?;
+        return jio(file.readExactAt(into, offset));
+    }
+
+    /// Reads a payload into a new vector and checks nothing more: the record was verified when
+    /// it was written or recovered. (Scrub re-verifies whole records.)
+    fn readPayload(borrow this, at: PayloadLocator) -> Result<Vector<u8>, JournalError> {
+        var out = Vector<u8>.create();
+        jalloc(out.resize(at.length as usize, 0))?;
+        this.readAt(at.segmentId, at.offset, mut out.viewMut())?;
+        return Ok(out);
+    }
+}
+
+/// `<dir>/seg-<id as 16 hex digits>.cj`
+fn segmentPath(dir: StringView, id: u64) -> Result<String, JournalError> {
+    var s = String.create();
+    jalloc(s.append(dir))?;
+    jalloc(s.append("/seg-"))?;
+    jalloc(appendHex16(mut s, id))?;
+    jalloc(s.append(".cj"))?;
+    return Ok(s);
+}
+
+fn appendHex16(s: borrow mut String, value: u64) -> Result<void, AllocError> {
+    let digits = "0123456789abcdef";
+    var buffer = [0u8; 16];
+    for (i in 0..16) {
+        let shift = truncate<u64>((15 - i) * 4);
+        let nibble = (value >> shift) & 0xF;
+        buffer[i] = digits.bytes()[nibble as usize];
+    }
+    s.append(StringView.fromUtf8(buffer[..])!)?;
+    return Ok();
+}
+
+/// The segment ids in `dir`, ascending.
+fn listSegmentIds(dir: StringView) -> Result<Vector<u64>, JournalError> {
+    let names = match (Directory.list(dir)) {
+        Ok(n) => n,
+        Err(_) => { return Err(JournalError.Io(IoFailure { op: IoOp.Open, errno: 0 })); }
+    };
+    var ids = Vector<u64>.create();
+    for (i in 0..names.length) {
+        let name = names[i].view();
+        if (name.length == 23 && name.startsWith("seg-") && name.endsWith(".cj")) {
+            match (name[4..20].parseIntRadix<u64>(16)) {
+                Some(id) => { jalloc(ids.push(id))?; }
+                null => {}
+            }
+        }
+    }
+    ids.viewMut().sortBy((a, b) => if (a < b) -1 else if (a > b) 1 else 0);
+    return Ok(ids);
+}
+
+fn writeSegmentHeader(file: borrow DurableFile, id: u64, firstLsn: u64, shardId: u32) -> Result<void, JournalError> {
+    var h = [0u8; 64];
+    {
+        let w = borrow mut h[..];
+        w.writeLE(0, SEGMENT_MAGIC);
+        w.writeLE(8, SEGMENT_FORMAT_VERSION);
+        w.writeLE(10, truncate<u16>(SEGMENT_HEADER_LEN));
+        w.writeLE(12, 0u32);
+        w.writeLE(16, id);
+        w.writeLE(24, firstLsn);
+        w.writeLE(32, shardId);
+        w.writeLE(40, Clock.unixMillis());
+    }
+    let crc = Crc32c.of(h[0..60]);
+    {
+        let w = borrow mut h[..];
+        w.writeLE(60, crc);
+    }
+    jio(file.writeAt(h[..], 0))?;
+    return Ok();
+}
+
+/// Whether the segment starts with a valid header for `id`.
+fn readSegmentHeader(file: borrow DurableFile, size: u64, id: u64) -> bool {
+    if (size < SEGMENT_HEADER_LEN as u64) { return false; }
+    var h = [0u8; 64];
+    match (file.readExactAt(mut h[..], 0)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    let r = h[..];
+    if (r.readLE<u32>(60) != Crc32c.of(r[0..60])) { return false; }
+    return r.readLE<u64>(0) == SEGMENT_MAGIC && r.readLE<u16>(8) == SEGMENT_FORMAT_VERSION && r.readLE<u64>(16) == id;
+}
+
+/// Replays one segment's valid records. Returns the end of the last valid record.
+fn scanSegment(
+    file: borrow DurableFile,
+    id: u64,
+    size: u64,
+    last: bool,
+    maxBatchBytes: usize,
+    nextLsn: borrow mut u64,
+    buffer: borrow mut Vector<u8>,
+    visit: borrow mut fn(u64, u64, borrow RecordHeader, Slice<u8>),
+) -> Result<u64, JournalError> {
+    var offset = SEGMENT_HEADER_LEN as u64;
+    var header = [0u8; 48];
+    while (offset < size) {
+        let fault = match (readRecordAt(file, offset, size, mut header, buffer)) {
+            Ok(h) => {
+                if (h.lsn < nextLsn) { return Err(JournalError.Corrupt(id, offset)); }
+                visit(id, offset, borrow h, buffer.view());
+                nextLsn = h.lsn + 1;
+                offset += h.totalLen as u64;
+                false
+            }
+            Err(JournalError.Corrupt(_, _)) => true,
+            Err(e) => { return Err(e); }
+        };
+        if (fault) {
+            if (!last) { return Err(JournalError.Corrupt(id, offset)); }
+            if (laterAcknowledgedRecord(file, offset, size, maxBatchBytes, buffer)?) {
+                return Err(JournalError.Corrupt(id, offset));
+            }
+            return Ok(offset);
+        }
+    }
+    return Ok(offset);
+}
+
+/// Reads and verifies the record at `offset` into `buffer`. An invalid or torn record is
+/// Corrupt(0, offset); I/O failures are Io.
+fn readRecordAt(
+    file: borrow DurableFile,
+    offset: u64,
+    size: u64,
+    header: borrow mut [u8; 48],
+    buffer: borrow mut Vector<u8>,
+) -> Result<RecordHeader, JournalError> {
+    if (size - offset < RECORD_HEADER_LEN as u64) { return Err(JournalError.Corrupt(0, offset)); }
+    jio(file.readExactAt(mut header[..], offset))?;
+    let h = match (decodeHeader(header[..])) {
+        Ok(h) => h,
+        Err(_) => { return Err(JournalError.Corrupt(0, offset)); }
+    };
+    if (size - offset < h.totalLen as u64) { return Err(JournalError.Corrupt(0, offset)); }
+    buffer.clear();
+    jalloc(buffer.resize(h.totalLen as usize, 0))?;
+    jio(file.readExactAt(mut buffer.viewMut(), offset))?;
+    match (verifyRecordBody(borrow h, buffer.view())) {
+        Ok() => {}
+        Err(_) => { return Err(JournalError.Corrupt(0, offset)); }
+    }
+    return Ok(h);
+}
+
+/// Whether a valid record starts at or after `torn + maxBatchBytes`: proof that the invalid
+/// record at `torn` was in an acknowledged batch (see the recovery invariants above).
+fn laterAcknowledgedRecord(
+    file: borrow DurableFile,
+    torn: u64,
+    size: u64,
+    maxBatchBytes: usize,
+    buffer: borrow mut Vector<u8>,
+) -> Result<bool, JournalError> {
+    let from = torn + maxBatchBytes as u64;
+    if (from >= size) { return Ok(false); }
+    let length = match (checkedTruncate<usize>(size - from)) {
+        Some(n) => n,
+        null => { return Err(JournalError.TooLarge); }
+    };
+    buffer.clear();
+    jalloc(buffer.resize(length, 0))?;
+    jio(file.readExactAt(mut buffer.viewMut(), from))?;
+    let bytes = buffer.view();
+    var i: usize = 0;
+    while (i + RECORD_HEADER_LEN <= bytes.length) {
+        if (bytes.readLE<u32>(i) == RECORD_MAGIC && isValidRecord(bytes[i..])) { return Ok(true); }
+        i += 1;
+    }
+    return Ok(false);
+}
