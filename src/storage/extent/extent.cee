@@ -1,0 +1,358 @@
+// Extents: the data files of objects too large to inline in the journal (ADR-0003).
+//
+// An extent file `ext-<16 hex id>.ce` is a 64-byte header followed by raw object bytes. Ids are
+// random 64-bit values, so writers need no coordination (a collision is an O_EXCL failure,
+// retried with a new id). An object's extents are listed in its PutExtent record's manifest,
+// each with its length and the CRC32C of its bytes.
+//
+// Ordering (ADR-0001 rule): every extent is synced, and the extent directory is synced, before
+// the PutExtent record that names them is staged.
+
+const EXTENT_MAGIC: u64 = 0x3130305458455343; // "CSEXT001" in file order
+const EXTENT_HEADER_LEN: u64 = 64;
+/// Writes to an extent are buffered up to this many bytes.
+const EXTENT_WRITE_BUFFER: usize = 1048576;
+
+/// One extent of an object.
+struct ExtentRef {
+    id: u64;
+    length: u64;
+    crc: u32;
+}
+
+/// `<dir>/ext-<id>.ce`
+fn extentPath(dir: StringView, id: u64) -> Result<String, AllocError> {
+    var s = String.create();
+    s.append(dir)?;
+    s.append("/ext-")?;
+    appendHex16Text(mut s, id)?;
+    s.append(".ce")?;
+    return Ok(s);
+}
+
+fn appendHex16Text(s: borrow mut String, value: u64) -> Result<void, AllocError> {
+    var bytes = [0u8; 8];
+    {
+        let w = borrow mut bytes[..];
+        w.writeBE(0, value);
+    }
+    return appendHex(s, bytes[..]);
+}
+
+/// The extent id named by a directory entry, or null for other files.
+fn extentIdFromName(name: StringView) -> u64? {
+    if (name.length != 23 || !name.startsWith("ext-") || !name.endsWith(".ce")) { return null; }
+    return name[4..20].parseIntRadix<u64>(16);
+}
+
+/// Manifest v1 (the payload of a PutExtent record): u32 count, then per extent
+/// u64 id, u64 length, u32 crc32c.
+fn encodeManifest(out: borrow mut Vector<u8>, extents: Slice<ExtentRef>) -> Result<void, AllocError> {
+    out.pushLE(truncate<u32>(extents.length))?;
+    for (i in 0..extents.length) {
+        out.pushLE(extents[i].id)?;
+        out.pushLE(extents[i].length)?;
+        out.pushLE(extents[i].crc)?;
+    }
+    return Ok();
+}
+
+fn decodeManifest(bytes: Slice<u8>) -> Result<Vector<ExtentRef>, MetaFault> {
+    if (bytes.length < 4) { return Err(MetaFault.Short); }
+    let n = bytes.readLE<u32>(0) as usize;
+    if (bytes.length != 4 + n * 20) { return Err(MetaFault.Short); }
+    var out = Vector<ExtentRef>.create();
+    metaAlloc(out.reserve(n))?;
+    for (i in 0..n) {
+        let at = 4 + i * 20;
+        metaAlloc(
+            out.push(
+                ExtentRef {
+                    id: bytes.readLE<u64>(at),
+                    length: bytes.readLE<u64>(at + 8),
+                    crc: bytes.readLE<u32>(at + 16),
+                },
+            ),
+        )?;
+    }
+    return Ok(out);
+}
+
+fn writeExtentHeader(file: borrow DurableFile, id: u64) -> Result<void, IoFailure> {
+    var h = [0u8; 64];
+    {
+        let w = borrow mut h[..];
+        w.writeLE(0, EXTENT_MAGIC);
+        w.writeLE(8, id);
+        w.writeLE(16, Clock.unixMillis());
+    }
+    let crc = Crc32c.of(h[0..60]);
+    {
+        let w = borrow mut h[..];
+        w.writeLE(60, crc);
+    }
+    return file.writeAt(h[..], 0);
+}
+
+fn randomExtentId() -> u64 {
+    var bytes = [0u8; 8];
+    Random.fill(mut bytes[..])!;
+    let id = bytes[..].readLE<u64>(0);
+    return if (id == 0) 1 else id;
+}
+
+/// Creates a new extent file with its header; returns its id and file.
+fn createExtent(dir: StringView, id: borrow mut u64) -> Result<DurableFile, IoFailure> {
+    for (attempt in 0..8) {
+        id = randomExtentId();
+        let path = match (extentPath(dir, id)) {
+            Ok(p) => p,
+            Err(_) => { return Err(IoFailure { op: IoOp.OutOfMemory, errno: 0 }); }
+        };
+        match (DurableFile.createNew(path.view())) {
+            Ok(file) => {
+                writeExtentHeader(borrow file, id)?;
+                return Ok(file);
+            }
+            Err(e) => {
+                if (!e.isAlreadyExists()) { return Err(e); }
+            }
+        }
+    }
+    return Err(IoFailure { op: IoOp.Open, errno: ERRNO_EEXIST });
+}
+
+/// Removes an extent file; a missing one is fine.
+fn removeExtent(dir: StringView, id: u64) {
+    match (extentPath(dir, id)) {
+        Ok(p) => { let _ = Fs.unlink(p.view()); }
+        Err(_) => {}
+    }
+}
+
+/// What an object's bytes are once written.
+enum ObjectBody {
+    Inline(Vector<u8>),
+    Extents(Vector<ExtentRef>),
+}
+
+/// A fully written object, ready to be committed by the store.
+struct FinishedObject {
+    body: ObjectBody;
+    size: u64;
+    md5: [u8; 16];
+}
+
+/// Streams an object's bytes. Up to `inlineMax` bytes are kept in memory, and the object is
+/// inline if it ends there. Past that it spills into extents of at most `extentMax` bytes.
+/// Dropping a writer that was not finished removes the extents it created.
+struct ObjectWriter {
+    private dir: String;
+    private inlineMax: usize;
+    private extentMax: u64;
+    private buffer: Vector<u8>;
+    private spilled: bool;
+    private file: DurableFile?;
+    private currentId: u64;
+    private currentLength: u64;
+    private currentCrc: Crc32c;
+    private done: Vector<ExtentRef>;
+    private md5: Md5;
+    private size: u64;
+    private finished: bool;
+
+    fn create(extentDir: StringView, inlineMax: usize, extentMax: u64) -> Result<ObjectWriter, AllocError> {
+        var dir = String.create();
+        dir.append(extentDir)?;
+        return Ok(ObjectWriter {
+            dir: dir,
+            inlineMax: inlineMax,
+            extentMax: extentMax,
+            buffer: Vector<u8>.create(),
+            spilled: false,
+            file: null,
+            currentId: 0,
+            currentLength: 0,
+            currentCrc: Crc32c.create(),
+            done: Vector<ExtentRef>.create(),
+            md5: Md5.create(),
+            size: 0,
+            finished: false,
+        });
+    }
+
+    fn written(borrow this) -> u64 => this.size;
+
+    /// Appends bytes to the object.
+    fn write(borrow mut this, data: Slice<u8>) -> Result<void, IoFailure> {
+        this.md5.update(data);
+        this.size += data.length as u64;
+        if (!this.spilled) {
+            if (this.buffer.length + data.length <= this.inlineMax) {
+                oom(this.buffer.extend(data))?;
+                return Ok();
+            }
+            this.spilled = true;
+            // Move what was buffered into the first extent.
+            // CeeSafe cannot move the buffer out of `this` (CEESAFE_GAPS.md G19): copy it.
+            var held = Vector<u8>.create();
+            oom(held.extend(this.buffer.view()))?;
+            this.buffer.clear();
+            this.appendToExtents(held.view())?;
+        }
+        return this.appendToExtents(data);
+    }
+
+    /// Writes `data` into extents, rolling to a new extent at extentMax.
+    fn appendToExtents(borrow mut this, data: Slice<u8>) -> Result<void, IoFailure> {
+        var at: usize = 0;
+        while (at < data.length) {
+            if (this.file.isNull()) {
+                var id: u64 = 0;
+                this.file = createExtent(this.dir.view(), mut id)?;
+                this.currentId = id;
+                this.currentLength = 0;
+                this.currentCrc = Crc32c.create();
+            }
+            let room = this.extentMax - this.currentLength - this.buffer.length as u64;
+            let left = (data.length - at) as u64;
+            let take = if (left < room) data.length - at else truncate<usize>(room);
+            oom(this.buffer.extend(data[at..at + take]))?;
+            at += take;
+            if (this.buffer.length >= EXTENT_WRITE_BUFFER) { this.flushBuffer()?; }
+            if (this.currentLength + this.buffer.length as u64 == this.extentMax) { this.sealExtent()?; }
+        }
+        return Ok();
+    }
+
+    fn flushBuffer(borrow mut this) -> Result<void, IoFailure> {
+        if (this.buffer.length == 0) { return Ok(); }
+        match (this.file.asBorrow()) {
+            Some(f) => { f.writeAt(this.buffer.view(), EXTENT_HEADER_LEN + this.currentLength)?; }
+            null => { return Err(IoFailure { op: IoOp.Write, errno: 0 }); }
+        }
+        this.currentCrc.update(this.buffer.view());
+        this.currentLength += this.buffer.length as u64;
+        this.buffer.clear();
+        return Ok();
+    }
+
+    /// Flushes, syncs and closes the current extent, and records it.
+    fn sealExtent(borrow mut this) -> Result<void, IoFailure> {
+        this.flushBuffer()?;
+        match (this.file.asBorrow()) {
+            Some(f) => { f.syncData()?; }
+            null => { return Ok(); }
+        }
+        this.file = null;
+        oom(
+            this.done.push(ExtentRef { id: this.currentId, length: this.currentLength, crc: this.currentCrc.value() }),
+        )?;
+        return Ok();
+    }
+
+    /// Completes the object: every extent and the extent directory are durable when this
+    /// returns. The writer is spent.
+    fn finish(borrow mut this) -> Result<FinishedObject, IoFailure> {
+        let digest = this.md5.finish();
+        if (!this.spilled) {
+            this.finished = true;
+            var data = Vector<u8>.create();
+            oom(data.extend(this.buffer.view()))?; // G19: a copy, at most inlineMax bytes
+            this.buffer.clear();
+            return Ok(FinishedObject { body: ObjectBody.Inline(data), size: this.size, md5: digest });
+        }
+        if (this.file.isSome()) { this.sealExtent()?; }
+        Fs.syncDirectory(this.dir.view())?;
+        var extents = Vector<ExtentRef>.create();
+        oom(extents.extend(this.done.view()))?;
+        this.finished = true;
+        return Ok(FinishedObject { body: ObjectBody.Extents(extents), size: this.size, md5: digest });
+    }
+
+    /// Safety-free cleanup: an unfinished writer's extents are garbage.
+    drop {
+        if (this.finished) { return; }
+        this.file = null;
+        if (this.currentId != 0) { removeExtent(this.dir.view(), this.currentId); }
+        for (i in 0..this.done.length) { removeExtent(this.dir.view(), this.done[i].id); }
+    }
+}
+
+fn oom<T>(r: Result<T, AllocError>) -> Result<T, IoFailure> => match (r) {
+    Ok(v) => Ok(v),
+    Err(_) => Err(IoFailure { op: IoOp.OutOfMemory, errno: 0 }),
+};
+
+/// Reads a byte range of an extent-backed object sequentially. An extent read whole, from its
+/// first byte to its last, is checked against its CRC32C.
+struct ExtentReader {
+    private dir: String;
+    private extents: Vector<ExtentRef>;
+    /// Position in the object, and the end of the range.
+    private position: u64;
+    private end: u64;
+    private index: usize;
+    private extentStart: u64;
+    private file: DurableFile?;
+    private crc: Crc32c;
+    private verifying: bool;
+
+    fn create(dir: StringView, extents: Vector<ExtentRef>, from: u64, to: u64) -> Result<ExtentReader, AllocError> {
+        var d = String.create();
+        d.append(dir)?;
+        return Ok(ExtentReader {
+            dir: d,
+            extents: extents,
+            position: from,
+            end: to,
+            index: 0,
+            extentStart: 0,
+            file: null,
+            crc: Crc32c.create(),
+            verifying: false,
+        });
+    }
+
+    fn remaining(borrow this) -> u64 => this.end - this.position;
+
+    /// Reads the next bytes into `into`; 0 at the end of the range. A CRC mismatch is an
+    /// IoFailure with op Read and errno -1 (EBADMSG-like).
+    fn read(borrow mut this, into: SliceMut<u8>) -> Result<usize, IoFailure> {
+        if (this.position >= this.end || into.length == 0) { return Ok(0); }
+        // Find the extent holding `position`.
+        while (this.index < this.extents.length &&
+            this.position >= this.extentStart + this.extents[this.index].length) {
+            this.extentStart += this.extents[this.index].length;
+            this.index += 1;
+            this.file = null;
+        }
+        if (this.index >= this.extents.length) { return Ok(0); }
+        let ext = this.extents[this.index];
+        if (this.file.isNull()) {
+            let path = oom(extentPath(this.dir.view(), ext.id))?;
+            this.file = DurableFile.openRead(path.view())?;
+            this.crc = Crc32c.create();
+            this.verifying = this.position == this.extentStart && this.end >= this.extentStart + ext.length;
+        }
+        let within = this.position - this.extentStart;
+        let extentLeft = ext.length - within;
+        let rangeLeft = this.end - this.position;
+        var want = into.length as u64;
+        if (want > extentLeft) { want = extentLeft; }
+        if (want > rangeLeft) { want = rangeLeft; }
+        let n = want as usize;
+        match (this.file.asBorrow()) {
+            Some(f) => { f.readExactAt(mut into[0..n], EXTENT_HEADER_LEN + within)?; }
+            null => { return Err(IoFailure { op: IoOp.Read, errno: 0 }); }
+        }
+        if (this.verifying) {
+            this.crc.update(into[0..n]);
+            if (within + want == ext.length && this.crc.value() != ext.crc) {
+                return Err(IoFailure { op: IoOp.Read, errno: -1 });
+            }
+        }
+        this.position += want;
+        return Ok(n);
+    }
+}

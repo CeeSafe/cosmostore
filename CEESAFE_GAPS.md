@@ -27,6 +27,8 @@ boilerplate; **P2** ergonomics.
 | G16 | P2 | tooling | Package C files are compiled from a temp copy, so `#include "x.h"` beside them fails |
 | G17 | P2 | diagnostics | An N0247 error elsewhere in a function surfaces as a misleading N0265 (cannot infer `T`) |
 | G18 | P2 | core | `Vector` has no `insert(at)`/`remove(at)` (needed for sorted vectors) |
+| G19 | P1 | language | No way to move a value out of a `borrow mut` place (no `replace`/`take`/`swap` of values) |
+| G20 | P2 | parser | `a as u64 < b` parses `<` as generic arguments (N0100 "expected '>'") |
 
 ## Details
 
@@ -143,6 +145,30 @@ diagnostic itself says is allowed. Workaround: `let k = m.keyAt(0); k.name.view(
   disappeared once the N0247s were fixed, so this is a cascade, and those follow-on diagnostics should be
   suppressed.
 - **G18.** `Vector` has `push`, `pop`, `truncate` and `swap`, but no `insert(at, x)` or `remove(at)`.
+
+### G19: moving out of a mutable place (P1)
+
+Repro (0.18.1):
+```ceesafe
+struct W { buf: Vector<u8>; }
+fn takeIt(w: borrow mut W) -> Vector<u8> {
+    let held = w.buf;              // error[N0251]: cannot move a 'Vector<u8>' out of the value 'w' refers to
+    w.buf = Vector<u8>.create();
+    return held;
+}
+```
+Vectors have no `swapWith`, and there is no `replace(place, value)` or `take(place)` (the equivalent of
+Rust's `mem::replace`/`mem::take`). A type with a `drop` block also can't give fields up by value (N0252), so
+a consuming `finish(this)` is impossible. `ObjectWriter.finish` (`src/storage/extent/extent.cee`) therefore
+**copies** its inline buffer (up to 128 KiB) and extent list instead of moving them. Suggested: a built-in
+`replace(borrow mut place, value) -> T` (with `take` for types that have a default), which is sound because
+the place is never left empty.
+
+### G20: `as` followed by `<` (P2)
+
+`fn f(a: usize, b: u64) -> bool => a as u64 < b;` is `error[N0100]: expected '>', found ';'`: the `<` after the
+type is read as the start of generic arguments. `(a as u64) < b` works. Either parse `as T <` as a
+comparison when `T` takes no type parameters, or give a diagnostic that suggests the parentheses.
 
 ## Not gaps (checked)
 

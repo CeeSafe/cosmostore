@@ -13,7 +13,7 @@ ones. Recovery could not order a small PUT against a large PUT of the same key (
    object versions, deletes, bucket changes, multipart steps and checkpoints. Recovery order is LSN order.
 2. **Small payloads live inside their record** (`PutInline`). Sealed journal segments *are* the packs, so no
    second copy exists. Large payloads go to extent files that are synced *before* their `PutExtent` record is
-   staged (not yet implemented).
+   staged (ADR-0003).
 3. **Group commit.** Records are staged into a batch, which is written with one positional write and made
    durable with one data sync. Nothing in a batch is applied to the index or acknowledged before that sync
    returns. A batch is at most `maxBatchBytes`, and batch N+1 is written only after batch N's sync.

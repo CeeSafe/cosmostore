@@ -6,11 +6,19 @@
 
 struct StoreConfig {
     journal: JournalConfig;
-    /// Objects up to this size are stored inline in the journal. Larger objects need extents
-    /// (not yet implemented) and are refused.
+    /// Objects up to this size are stored inline in the journal; larger ones go to extents.
     inlineMaxBytes: usize;
+    /// The largest extent file (ADR-0003).
+    extentMaxBytes: u64;
+    /// The largest object a single PUT may store (S3: 5 GiB).
+    maxObjectBytes: u64;
 
-    fn defaults() -> StoreConfig => StoreConfig { journal: JournalConfig.defaults(), inlineMaxBytes: 1048576 };
+    fn defaults() -> StoreConfig => StoreConfig {
+        journal: JournalConfig.defaults(),
+        inlineMaxBytes: 131072,
+        extentMaxBytes: 67108864,
+        maxObjectBytes: 5368709120,
+    };
 }
 
 enum StoreError {
@@ -26,7 +34,16 @@ enum StoreError {
     NoSuchKey,
     EntityTooLarge,
     PreconditionFailed,
+    /// Extent or directory I/O failed.
+    Io(IoFailure),
+    /// Stored bytes do not match their checksum.
+    DataCorrupt,
 }
+
+fn sio<T>(r: Result<T, IoFailure>) -> Result<T, StoreError> => match (r) {
+    Ok(v) => Ok(v),
+    Err(e) => Err(if (e.op == IoOp.Read && e.errno == -1) StoreError.DataCorrupt else StoreError.Io(e)),
+};
 
 fn sj<T>(r: Result<T, JournalError>) -> Result<T, StoreError> => match (r) {
     Ok(v) => Ok(v),
@@ -89,13 +106,26 @@ struct StoreState {
     buckets: HashMap<BucketKey, BucketInfo>;
     segments: HashMap<u64, SegmentUsage>;
     records: u64;
+    /// Extents of versions superseded or deleted by applied records; the store removes the
+    /// files once the records are durable (they always are when applied).
+    deadExtents: Vector<u64>;
 
     fn create() -> StoreState => StoreState {
         index: HashMap<IndexKey, ObjectVersion>.create(),
         buckets: HashMap<BucketKey, BucketInfo>.create(),
         segments: HashMap<u64, SegmentUsage>.create(),
         records: 0,
+        deadExtents: Vector<u64>.create(),
     };
+
+    /// Releases a superseded or deleted version: its record bytes and its extents.
+    fn retire(borrow mut this, old: borrow ObjectVersion) -> Result<void, StoreError> {
+        this.releaseRecord(old.recordSegment, old.recordLength);
+        for (i in 0..old.extents.length) {
+            salloc(this.deadExtents.push(old.extents[i].id))?;
+        }
+        return Ok();
+    }
 
     fn hasBucket(borrow this, name: Slice<u8>) -> Result<bool, StoreError> {
         let k = BucketKey { name: salloc(copyBytes(name))? };
@@ -136,6 +166,7 @@ struct StoreState {
 
 /// Applies one committed record to the state. Recovery and live writes both call this.
 /// `meta` is the record's meta bytes; the payload starts right after it in the segment.
+/// `manifest` is the payload of a PutExtent record (empty otherwise).
 fn applyRecord(
     state: borrow mut StoreState,
     kind: RecordType,
@@ -145,38 +176,29 @@ fn applyRecord(
     totalLen: u32,
     meta: Slice<u8>,
     payloadLen: u32,
+    manifest: Slice<u8>,
 ) -> Result<void, StoreError> {
     state.records += 1;
-    match (kind) {
-        RecordType.PutInline => {
-            let m = match (decodePutMeta(meta)) {
-                Ok(m) => m,
+    let isPut = match (kind) {
+        RecordType.PutInline => true,
+        RecordType.PutExtent => true,
+        _ => false,
+    };
+    if (isPut) {
+        let m = match (decodePutMeta(meta)) {
+            Ok(m) => m,
+            Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+        };
+        let extents = match (kind) {
+            RecordType.PutExtent => match (decodeManifest(manifest)) {
+                Ok(e) => e,
                 Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
-            };
-            state.addSegmentBytes(segment, totalLen as u64, totalLen as u64)?;
-            let bucketCopy = salloc(copyBytes(m.bucket.view()))?;
-            let version = ObjectVersion {
-                versionId: m.versionId,
-                lsn: lsn,
-                kind: VersionKind.Object,
-                size: m.size,
-                mtimeMillis: m.mtimeMillis,
-                md5: m.md5,
-                contentType: m.contentType,
-                payload: PayloadLocator {
-                    segmentId: segment,
-                    offset: offset + (RECORD_HEADER_LEN + meta.length) as u64,
-                    length: payloadLen,
-                },
-                recordSegment: segment,
-                recordLength: totalLen,
-            };
-            let key = IndexKey { bucket: m.bucket, key: m.key };
-            match (salloc(state.index.put(key, version))?) {
-                Some(old) => { state.releaseRecord(old.recordSegment, old.recordLength); }
-                null => { state.bumpObjects(bucketCopy.view(), true)?; }
-            }
-        }
+            },
+            _ => Vector<ExtentRef>.create(),
+        };
+        return applyPut(state, m, extents, lsn, segment, offset, totalLen, meta.length, payloadLen);
+    }
+    match (kind) {
         RecordType.DeleteVersion => {
             // The delete record itself is garbage as soon as it is applied, except as a
             // tombstone until the segments holding older versions are compacted.
@@ -188,7 +210,7 @@ fn applyRecord(
             let key = IndexKey { bucket: m.bucket, key: m.key };
             match (state.index.remove(borrow key)) {
                 Some(old) => {
-                    state.releaseRecord(old.recordSegment, old.recordLength);
+                    state.retire(borrow old)?;
                     state.bumpObjects(key.bucket.view(), false)?;
                 }
                 null => {}
@@ -218,6 +240,45 @@ fn applyRecord(
     return Ok();
 }
 
+/// Applies a PutInline or PutExtent record whose meta is `m`.
+fn applyPut(
+    state: borrow mut StoreState,
+    m: PutMeta,
+    extents: Vector<ExtentRef>,
+    lsn: u64,
+    segment: u64,
+    offset: u64,
+    totalLen: u32,
+    metaLen: usize,
+    payloadLen: u32,
+) -> Result<void, StoreError> {
+    state.addSegmentBytes(segment, totalLen as u64, totalLen as u64)?;
+    let bucketCopy = salloc(copyBytes(m.bucket.view()))?;
+    let version = ObjectVersion {
+        versionId: m.versionId,
+        lsn: lsn,
+        kind: VersionKind.Object,
+        size: m.size,
+        mtimeMillis: m.mtimeMillis,
+        md5: m.md5,
+        contentType: m.contentType,
+        payload: PayloadLocator {
+            segmentId: segment,
+            offset: offset + (RECORD_HEADER_LEN + metaLen) as u64,
+            length: payloadLen,
+        },
+        recordSegment: segment,
+        recordLength: totalLen,
+        extents: extents,
+    };
+    let key = IndexKey { bucket: m.bucket, key: m.key };
+    match (salloc(state.index.put(key, version))?) {
+        Some(old) => { state.retire(borrow old)?; }
+        null => { state.bumpObjects(bucketCopy.view(), true)?; }
+    }
+    return Ok();
+}
+
 /// A staged write waiting for its batch to commit before it is applied.
 struct PendingApply {
     kind: RecordType;
@@ -227,6 +288,8 @@ struct PendingApply {
     total: u32;
     meta: Vector<u8>;
     payloadLen: u32;
+    /// The PutExtent manifest (empty for other records).
+    manifest: Vector<u8>;
 }
 
 struct ObjectStore {
@@ -235,6 +298,7 @@ struct ObjectStore {
     private config: StoreConfig;
     private scratch: Vector<u8>;
     private pendingApplies: Vector<PendingApply>;
+    private extentDir: String;
 
     /// Opens the store in `dir`, replaying the journal.
     fn open(dir: StringView, config: StoreConfig) -> Result<ObjectStore, StoreError> {
@@ -243,6 +307,12 @@ struct ObjectStore {
         let journal = sj(Journal.open(dir, config.journal, (segment, offset, header, bytes) => {
             if (failure.isSome()) { return; }
             let metaEnd = RECORD_HEADER_LEN + header.metaLen as usize;
+            let payloadEnd = metaEnd + header.payloadLen as usize;
+            let isExtent = match (header.kind) {
+                RecordType.PutExtent => true,
+                _ => false,
+            };
+            let manifest = if (isExtent) bytes[metaEnd..payloadEnd] else bytes[0..0];
             match (applyRecord(
                 mut state,
                 header.kind,
@@ -252,6 +322,7 @@ struct ObjectStore {
                 header.totalLen,
                 bytes[RECORD_HEADER_LEN..metaEnd],
                 header.payloadLen,
+                manifest,
             )) {
                 Ok() => {}
                 Err(e) => { failure = e; }
@@ -261,15 +332,74 @@ struct ObjectStore {
             Some(e) => { return Err(e); }
             null => {}
         }
-        return Ok(
-            ObjectStore {
-                journal: journal,
-                state: state,
-                config: config,
-                scratch: Vector<u8>.create(),
-                pendingApplies: Vector<PendingApply>.create(),
-            },
-        );
+        var extentDir = String.create();
+        salloc(extentDir.append(dir))?;
+        salloc(extentDir.append("/extents"))?;
+        sio(Fs.ensureDirectory(extentDir.view()))?;
+        var store = ObjectStore {
+            journal: journal,
+            state: state,
+            config: config,
+            scratch: Vector<u8>.create(),
+            pendingApplies: Vector<PendingApply>.create(),
+            extentDir: extentDir,
+        };
+        // Every extent not referenced by a live version is garbage: superseded or deleted
+        // versions, and uploads that never committed (ADR-0003).
+        store.state.deadExtents.clear();
+        store.sweepOrphanExtents()?;
+        return Ok(store);
+    }
+
+    /// Removes extent files that no live version references. Only safe while no writer is
+    /// in progress, so it runs at open.
+    fn sweepOrphanExtents(borrow mut this) -> Result<usize, StoreError> {
+        var live = HashMap<u64, bool>.create();
+        for (i in 0..this.state.index.length()) {
+            let v = this.state.index.valueAt(i);
+            for (k in 0..v.extents.length) {
+                let _ = salloc(live.put(v.extents[k].id, true))?;
+            }
+        }
+        let names = match (Directory.list(this.extentDir.view())) {
+            Ok(n) => n,
+            Err(_) => { return Err(StoreError.Io(IoFailure { op: IoOp.Open, errno: 0 })); }
+        };
+        var removed: usize = 0;
+        for (i in 0..names.length) {
+            match (extentIdFromName(names[i].view())) {
+                Some(id) => {
+                    if (!live.contains(borrow id)) {
+                        removeExtent(this.extentDir.view(), id);
+                        removed += 1;
+                    }
+                }
+                null => {}
+            }
+        }
+        return Ok(removed);
+    }
+
+    /// Removes the extent files of versions retired by records that are now durable.
+    fn reapExtents(borrow mut this) {
+        for (i in 0..this.state.deadExtents.length) {
+            removeExtent(this.extentDir.view(), this.state.deadExtents[i]);
+        }
+        this.state.deadExtents.clear();
+    }
+
+    /// A writer for a new object's bytes; commit it with `putFinished` or `stageFinished`.
+    fn newWriter(borrow this) -> Result<ObjectWriter, StoreError> =>
+        salloc(ObjectWriter.create(this.extentDir.view(), this.config.inlineMaxBytes, this.config.extentMaxBytes));
+
+    /// Removes the extents of a finished object that will not be committed.
+    fn discardFinished(borrow this, obj: borrow FinishedObject) {
+        match (borrow obj.body) {
+            ObjectBody.Extents(extents) => {
+                for (i in 0..extents.length) { removeExtent(this.extentDir.view(), extents[i].id); }
+            }
+            ObjectBody.Inline(_) => {}
+        }
     }
 
     /// Stages one record, commits it durably, and applies it. Any staged batch commits with it.
@@ -287,7 +417,9 @@ struct ObjectStore {
             total,
             this.scratch.view(),
             truncate<u32>(payload.length),
+            payload[0..0],
         )?;
+        this.reapExtents();
         return Ok(pos.lsn);
     }
 
@@ -353,12 +485,58 @@ struct ObjectStore {
         data: Slice<u8>,
         condition: PutCondition,
     ) -> Result<PutOutcome, StoreError> {
+        let obj = this.writeAll(data)?;
+        return this.putFinished(bucket, key, contentType, borrow obj, condition);
+    }
+
+    /// Runs `data` through a writer: inline if small, extents if not.
+    fn writeAll(borrow this, data: Slice<u8>) -> Result<FinishedObject, StoreError> {
+        if (data.length as u64 > this.config.maxObjectBytes) { return Err(StoreError.EntityTooLarge); }
+        var w = this.newWriter()?;
+        sio(w.write(data))?;
+        return sio(w.finish());
+    }
+
+    /// Commits a finished object as the key's current version, if `condition` holds. On a
+    /// refusal its extents are removed; after a journal failure they are left for the orphan
+    /// sweep, since the record may have reached the disk.
+    fn putFinished(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        contentType: StringView,
+        obj: borrow FinishedObject,
+        condition: PutCondition,
+    ) -> Result<PutOutcome, StoreError> {
         // Staged writes must be visible to the precondition check.
+        match (this.commitStaged()) {
+            Ok(_) => {}
+            Err(e) => { return Err(e); }
+        }
+        match (this.checkPut(bucket, key, contentType, obj, condition)) {
+            Ok() => {}
+            Err(e) => {
+                this.discardFinished(obj);
+                return Err(e);
+            }
+        }
+        let lsn = this.stageFinished(bucket, key, contentType, obj)?;
         this.commitStaged()?;
+        return Ok(PutOutcome { md5: obj.md5, generation: lsn });
+    }
+
+    fn checkPut(
+        borrow this,
+        bucket: StringView,
+        key: StringView,
+        contentType: StringView,
+        obj: borrow FinishedObject,
+        condition: PutCondition,
+    ) -> Result<void, StoreError> {
         ObjectStore.checkKey(key)?;
         if (contentType.length > MAX_CONTENT_TYPE) { return Err(StoreError.InvalidKey); }
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        if (data.length > this.config.inlineMaxBytes) { return Err(StoreError.EntityTooLarge); }
+        if (obj.size > this.config.maxObjectBytes) { return Err(StoreError.EntityTooLarge); }
         let current = this.currentGeneration(bucket, key)?;
         match (condition) {
             PutCondition.None => {}
@@ -369,22 +547,7 @@ struct ObjectStore {
                 if ((current ?? 0) != g) { return Err(StoreError.PreconditionFailed); }
             }
         }
-        let md5 = Md5.of(data);
-        this.scratch.clear();
-        salloc(
-            encodePutMeta(
-                mut this.scratch,
-                bucket.bytes(),
-                key.bytes(),
-                nullVersionId(),
-                Clock.unixMillis(),
-                data.length as u64,
-                md5,
-                contentType.bytes(),
-            ),
-        )?;
-        let lsn = this.commitOne(RecordType.PutInline, data)?;
-        return Ok(PutOutcome { md5: md5, generation: lsn });
+        return Ok();
     }
 
     /// Stages an unconditional PUT into the current batch (group commit). It is neither durable
@@ -396,11 +559,39 @@ struct ObjectStore {
         contentType: StringView,
         data: Slice<u8>,
     ) -> Result<[u8; 16], StoreError> {
-        ObjectStore.checkKey(key)?;
-        if (contentType.length > MAX_CONTENT_TYPE) { return Err(StoreError.InvalidKey); }
-        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        if (data.length > this.config.inlineMaxBytes) { return Err(StoreError.EntityTooLarge); }
-        let md5 = Md5.of(data);
+        let obj = this.writeAll(data)?;
+        this.stageObject(bucket, key, contentType, borrow obj)?;
+        return Ok(obj.md5);
+    }
+
+    /// Stages an unconditional PUT of a finished object into the current batch; on a refusal
+    /// its extents are removed.
+    fn stageObject(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        contentType: StringView,
+        obj: borrow FinishedObject,
+    ) -> Result<u64, StoreError> {
+        match (this.checkPut(bucket, key, contentType, obj, PutCondition.None)) {
+            Ok() => {}
+            Err(e) => {
+                this.discardFinished(obj);
+                return Err(e);
+            }
+        }
+        return this.stageFinished(bucket, key, contentType, obj);
+    }
+
+    /// Stages the record that publishes a finished object; returns its LSN (its generation).
+    /// The object's extents are already durable (ObjectWriter.finish), as ADR-0001 requires.
+    fn stageFinished(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        contentType: StringView,
+        obj: borrow FinishedObject,
+    ) -> Result<u64, StoreError> {
         var meta = Vector<u8>.create();
         salloc(
             encodePutMeta(
@@ -409,27 +600,41 @@ struct ObjectStore {
                 key.bytes(),
                 nullVersionId(),
                 Clock.unixMillis(),
-                data.length as u64,
-                md5,
+                obj.size,
+                obj.md5,
                 contentType.bytes(),
             ),
         )?;
-        if (this.journal.wouldOverflow(meta.length, data.length)) {
+        var manifest = Vector<u8>.create();
+        let kind = match (borrow obj.body) {
+            ObjectBody.Inline(_) => RecordType.PutInline,
+            ObjectBody.Extents(extents) => {
+                salloc(encodeManifest(mut manifest, extents.view()))?;
+                RecordType.PutExtent
+            }
+        };
+        let payload = match (borrow obj.body) {
+            ObjectBody.Inline(data) => data.view(),
+            ObjectBody.Extents(_) => manifest.view(),
+        };
+        if (this.journal.wouldOverflow(meta.length, payload.length)) {
             this.commitStaged()?;
         }
         salloc(this.pendingApplies.reserve(1))?;
-        let pos = sj(this.journal.stage(RecordType.PutInline, meta.view(), data))?;
-        let total = truncate<u32>(recordLength(meta.length, data.length));
+        let pos = sj(this.journal.stage(kind, meta.view(), payload))?;
+        let total = truncate<u32>(recordLength(meta.length, payload.length));
+        let payloadLen = truncate<u32>(payload.length);
         salloc(this.pendingApplies.push(PendingApply {
-            kind: RecordType.PutInline,
+            kind: kind,
             lsn: pos.lsn,
             segment: pos.segmentId,
             offset: pos.offset,
             total: total,
             meta: meta,
-            payloadLen: truncate<u32>(data.length),
+            payloadLen: payloadLen,
+            manifest: manifest,
         }))?;
-        return Ok(md5);
+        return Ok(pos.lsn);
     }
 
     /// Commits the staged batch with one write and one sync, then publishes it. Returns how
@@ -446,9 +651,20 @@ struct ObjectStore {
         let n = this.pendingApplies.length;
         for (i in 0..n) {
             let p = borrow this.pendingApplies[i];
-            applyRecord(mut this.state, p.kind, p.lsn, p.segment, p.offset, p.total, p.meta.view(), p.payloadLen)?;
+            applyRecord(
+                mut this.state,
+                p.kind,
+                p.lsn,
+                p.segment,
+                p.offset,
+                p.total,
+                p.meta.view(),
+                p.payloadLen,
+                p.manifest.view(),
+            )?;
         }
         this.pendingApplies.clear();
+        this.reapExtents();
         return Ok(n);
     }
 
@@ -469,7 +685,38 @@ struct ObjectStore {
         }
     }
 
-    /// The object's bytes `[from, to)` (the whole object for 0, size).
+    /// A reader of the current version's bytes `[from, to)`, clamped to the object's size.
+    fn openReader(
+        borrow this,
+        bucket: StringView,
+        key: StringView,
+        from: u64,
+        to: u64,
+    ) -> Result<ObjectReader, StoreError> {
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        let k = IndexKey { bucket: salloc(copyBytes(bucket.bytes()))?, key: salloc(copyBytes(key.bytes()))? };
+        let v = match (this.state.index.get(borrow k)) {
+            Some(v) => v,
+            null => { return Err(StoreError.NoSuchKey); }
+        };
+        let end = if (to > v.size) v.size else to;
+        let start = if (from > end) end else from;
+        if (v.extents.length == 0) {
+            let part = PayloadLocator {
+                segmentId: v.payload.segmentId,
+                offset: v.payload.offset + start,
+                length: truncate<u32>(end - start),
+            };
+            let bytes = sj(this.journal.readPayload(part))?;
+            return Ok(ObjectReader { inline: bytes, inlinePosition: 0, extents: null });
+        }
+        var refs = Vector<ExtentRef>.create();
+        salloc(refs.extend(v.extents.view()))?;
+        let reader = salloc(ExtentReader.create(this.extentDir.view(), refs, start, end))?;
+        return Ok(ObjectReader { inline: Vector<u8>.create(), inlinePosition: 0, extents: reader });
+    }
+
+    /// The object's bytes `[from, to)` in memory (the whole object for 0, u64 max).
     fn getObjectRange(
         borrow this,
         bucket: StringView,
@@ -477,20 +724,16 @@ struct ObjectStore {
         from: u64,
         to: u64,
     ) -> Result<Vector<u8>, StoreError> {
-        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        let k = IndexKey { bucket: salloc(copyBytes(bucket.bytes()))?, key: salloc(copyBytes(key.bytes()))? };
-        let at = match (this.state.index.get(borrow k)) {
-            Some(v) => v.payload,
-            null => { return Err(StoreError.NoSuchKey); }
-        };
-        let end = if (to > at.length as u64) at.length as u64 else to;
-        let start = if (from > end) end else from;
-        let part = PayloadLocator {
-            segmentId: at.segmentId,
-            offset: at.offset + start,
-            length: truncate<u32>(end - start),
-        };
-        return sj(this.journal.readPayload(part));
+        var reader = this.openReader(bucket, key, from, to)?;
+        var out = Vector<u8>.create();
+        var chunk = Vector<u8>.create();
+        salloc(chunk.resize(65536, 0))?;
+        while (true) {
+            let n = reader.read(mut chunk.viewMut())?;
+            if (n == 0) { break; }
+            salloc(out.extend(chunk.view()[0..n]))?;
+        }
+        return Ok(out);
     }
 
     fn getObject(borrow this, bucket: StringView, key: StringView) -> Result<Vector<u8>, StoreError> =>
@@ -603,4 +846,24 @@ struct ObjectStore {
         Some(u) => SegmentUsage { totalBytes: u.totalBytes, liveBytes: u.liveBytes },
         null => SegmentUsage { totalBytes: 0, liveBytes: 0 },
     };
+}
+
+/// Streams an object's bytes, from the journal (inline) or its extents.
+struct ObjectReader {
+    private inline: Vector<u8>;
+    private inlinePosition: usize;
+    private extents: ExtentReader?;
+
+    /// Reads the next bytes; 0 at the end.
+    fn read(borrow mut this, into: SliceMut<u8>) -> Result<usize, StoreError> {
+        match (this.extents.asBorrowMut()) {
+            Some(r) => { return sio(r.read(into)); }
+            null => {}
+        }
+        let left = this.inline.length - this.inlinePosition;
+        let n = if (into.length < left) into.length else left;
+        into[0..n].copyFrom(this.inline.view()[this.inlinePosition..this.inlinePosition + n]);
+        this.inlinePosition += n;
+        return Ok(n);
+    }
 }

@@ -31,6 +31,8 @@ fn describe(e: StoreError) -> StringView => match (e) {
     StoreError.NoSuchBucket => "no such bucket",
     StoreError.NoSuchKey => "no such key",
     StoreError.EntityTooLarge => "entity too large",
+    StoreError.DataCorrupt => "data corrupt",
+    StoreError.Io(f) => ioOpName(f.op),
     _ => "store error",
 };
 
@@ -42,18 +44,34 @@ fn objectName(into: borrow mut String, i: u64) {
     into.appendNumber(i)!;
 }
 
-fn fillPayload(into: borrow mut Vector<u8>, i: u64, size: u64) {
-    into.clear();
-    var x = i.wrappingMul(0x9E3779B97F4A7C15).wrappingAdd(1);
-    for (k in 0u64..size) {
-        x = x ^ (x << 13);
-        x = x ^ (x >> 7);
-        x = x ^ (x << 17);
-        into.push(truncate<u8>(x))!;
+/// A deterministic byte stream per object (xorshift64), produced in chunks.
+struct Pattern {
+    x: u64;
+
+    fn forObject(i: u64) -> Pattern => Pattern { x: i.wrappingMul(0x9E3779B97F4A7C15).wrappingAdd(1) };
+
+    /// Fills `into` with the next bytes of the stream, 8 at a time.
+    fn fill(borrow mut this, into: SliceMut<u8>) {
+        var k: usize = 0;
+        while (k < into.length) {
+            this.x = this.x ^ (this.x << 13);
+            this.x = this.x ^ (this.x >> 7);
+            this.x = this.x ^ (this.x << 17);
+            var word = [0u8; 8];
+            {
+                let w = borrow mut word[..];
+                w.writeLE(0, this.x);
+            }
+            let n = if (into.length - k < 8) into.length - k else 8;
+            into[k..k + n].copyFrom(word[0..n]);
+            k += n;
+        }
     }
 }
 
-fn writeRate(label: StringView, count: u64, millis: i64) {
+const CHUNK: u64 = 1048576;
+
+fn writeRate(label: StringView, count: u64, size: u64, millis: i64) {
     Console.write(label);
     Console.write(": ");
     Console.write(count);
@@ -61,9 +79,15 @@ fn writeRate(label: StringView, count: u64, millis: i64) {
     Console.write(millis);
     Console.write(" ms");
     if (millis > 0) {
+        let ms = truncate<u64>(millis);
         Console.write(" = ");
-        Console.write(count * 1000 / truncate<u64>(millis));
+        Console.write(count * 1000 / ms);
         Console.write(" ops/s");
+        if (size > 0) {
+            Console.write(", ");
+            Console.write(count * size / 1048576 * 1000 / ms);
+            Console.write(" MiB/s");
+        }
     }
     Console.writeLine("");
 }
@@ -75,12 +99,13 @@ fn bench() {
     let size = argU64(4);
     let batch = argU64(5);
     if (batch == 0) { usage(); }
-    var config = StoreConfig.defaults();
-    config.inlineMaxBytes = 4194304;
-    var payload = Vector<u8>.create();
+    let config = StoreConfig.defaults();
+    var chunk = Vector<u8>.create();
+    chunk.resize(CHUNK as usize, 0)!;
+    var expected = Vector<u8>.create();
+    expected.resize(CHUNK as usize, 0)!;
     var name = String.create();
     let ctype = "application/octet-stream";
-    var syncs: u64 = 0;
     {
         var store = match (ObjectStore.open(dir, config)) {
             Ok(s) => s,
@@ -95,8 +120,27 @@ fn bench() {
         let start = Clock.unixMillis();
         for (i in 0u64..count) {
             objectName(mut name, i);
-            fillPayload(mut payload, i, size);
-            match (store.stagePut("bench", name.view(), ctype, payload.view())) {
+            // Stream the object through a writer in chunks: inline if small, extents if not.
+            var writer = match (store.newWriter()) {
+                Ok(w) => w,
+                Err(e) => { die(describe(e)); }
+            };
+            var pattern = Pattern.forObject(i);
+            var left = size;
+            while (left > 0) {
+                let n = if (left < CHUNK) left else CHUNK;
+                pattern.fill(mut chunk.viewMut()[0..n as usize]);
+                match (writer.write(chunk.view()[0..n as usize])) {
+                    Ok() => {}
+                    Err(f) => { die(ioOpName(f.op)); }
+                }
+                left -= n;
+            }
+            let obj = match (writer.finish()) {
+                Ok(o) => o,
+                Err(f) => { die(ioOpName(f.op)); }
+            };
+            match (store.stageObject("bench", name.view(), ctype, borrow obj)) {
                 Ok(_) => {}
                 Err(e) => { die(describe(e)); }
             }
@@ -112,29 +156,43 @@ fn bench() {
             Err(e) => { die(describe(e)); }
         }
         let elapsed = Clock.unixMillis() - start;
-        syncs = store.journalSyncs() - before;
-        writeRate("put", count, elapsed);
-        Console.write("syncs: ");
-        Console.writeLine(syncs);
+        writeRate("put", count, size, elapsed);
+        Console.write("journal syncs: ");
+        Console.writeLine(store.journalSyncs() - before);
     }
-    // Reopen (full recovery) and verify every byte.
+    // Reopen (full recovery) and stream-verify every byte.
     let start = Clock.unixMillis();
     let store = match (ObjectStore.open(dir, config)) {
         Ok(s) => s,
         Err(e) => { die(describe(e)); }
     };
-    writeRate("recover", store.recordsApplied(), Clock.unixMillis() - start);
+    writeRate("recover", store.recordsApplied(), 0, Clock.unixMillis() - start);
     let readStart = Clock.unixMillis();
     for (i in 0u64..count) {
         objectName(mut name, i);
-        fillPayload(mut payload, i, size);
-        let got = match (store.getObject("bench", name.view())) {
-            Ok(v) => v,
+        var reader = match (store.openReader("bench", name.view(), 0, size)) {
+            Ok(r) => r,
             Err(e) => { die(describe(e)); }
         };
-        if (got.view() != payload.view()) { die("verification failed: bytes differ"); }
+        var pattern = Pattern.forObject(i);
+        var left = size;
+        while (left > 0) {
+            let n = if (left < CHUNK) left else CHUNK;
+            pattern.fill(mut expected.viewMut()[0..n as usize]);
+            var got: usize = 0;
+            while (got < n as usize) {
+                let r = match (reader.read(mut chunk.viewMut()[got..n as usize])) {
+                    Ok(r) => r,
+                    Err(e) => { die(describe(e)); }
+                };
+                if (r == 0) { die("verification failed: object too short"); }
+                got += r;
+            }
+            if (chunk.view()[0..got] != expected.view()[0..got]) { die("verification failed: bytes differ"); }
+            left -= n;
+        }
     }
-    writeRate("get+verify", count, Clock.unixMillis() - readStart);
+    writeRate("get+verify", count, size, Clock.unixMillis() - readStart);
 }
 
 fn main() {

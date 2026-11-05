@@ -336,9 +336,47 @@ Measured on a macOS laptop SSD (release not tuned, one thread):
 | 20k × 64 KiB, 64 per sync | 1,691 (bench generator-bound) | 313 | 16k rec/s | 5.3k/s |
 
 Not done yet / next:
-1. Large objects (`PutExtent`), which are refused above `inlineMaxBytes` for now.
+1. ~~Large objects~~ (done below).
 2. Concurrent leader/follower group commit (needs threads or async plus async file I/O, CEESAFE_GAPS.md G6).
 3. A fault-injecting I/O layer (short write, EIO, failed sync) behind `DurableFile`.
 4. Checkpoints, plus M2's compaction and GC using `SegmentUsage`.
 5. The CeeSafe.Web streaming spike and 24h soak, then the S3 HTTP layer (M3).
 6. The ordered index, since LIST is O(objects) in v0 (CEESAFE_GAPS.md G8).
+
+### 6 Nov 2026: large objects (ADR-0003)
+
+Done (`ceesafec test`: 28 passed, 0 failed):
+- `src/storage/extent/extent.cee`:
+  - extent files with random ids;
+  - the manifest codec;
+  - `ObjectWriter` (one streaming write path: inline up to 128 KiB, otherwise 64 MiB extents, each synced,
+    then a directory sync), whose `drop` removes an abandoned writer's extents;
+  - `ExtentReader` (byte ranges across extents; CRC check on whole-extent reads).
+- Store:
+  - `PutExtent` records;
+  - `newWriter` / `putFinished` / `stageObject` / `openReader`;
+  - extents reaped after the retiring record is durable;
+  - an orphan sweep at open;
+  - a 5 GiB PUT limit;
+  - a new `DataCorrupt` error.
+- Tests: boundaries, ranges, reaping, orphans, abandoned writers, corruption, and crash at every journal byte
+  with every extent present.
+- The bench streams every object through the writer and reader in 1 MiB chunks.
+
+| Workload | PUT | GET + verify |
+|---|---|---|
+| 100k × 1 KiB, 256 per sync | 32,916/s | 452k/s |
+| 2,000 × 1 MiB, 16 per sync | 70/s (70 MiB/s) | 420 MiB/s |
+| 200 × 8 MiB | 149 MiB/s | 539 MiB/s |
+| 8 × 128 MiB | 161 MiB/s | 548 MiB/s |
+
+Findings to act on:
+- **Medium objects (128 KiB to a few MiB) are sync-bound**: about 14 ms of `F_FULLFSYNC` per PUT, for the
+  extent and the directory. Candidate fixes for M4: a pre-synced extent-file pool, shared medium-object packs
+  committed per batch, or a higher inline threshold.
+- **Large PUTs** are probably limited by software MD5 and CRC32C on one thread. This is a hypothesis; profile
+  it first.
+- **Reaping does not yet wait for in-flight readers.** It must before concurrent GETs exist (M2/M3).
+
+Next: fault-injecting I/O layer → checkpoints + compaction (M2) → CeeSafe.Web spike → S3 HTTP layer (M3), with
+multipart built on the extent manifest.
