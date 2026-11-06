@@ -76,6 +76,8 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
   holding it has been synced (ADR-0001).
 - All file and directory I/O goes through `DurableFile`/`Fs` (`src/storage/io/durable.cee`), so the fault
   injector and crash model of ADR-0004 cover it. A durability change needs a fault sweep.
+- **Toolchain: ceesafec 0.19.1 or later** (`ceesafec --version`). 0.19.0 rejects `durable.cee` (File's positional
+  methods took `borrow mut this` there); 0.18 has no durable file API. The manifest cannot say so (CEESAFE_GAPS G23).
 - CosmoStore calls no C and has no `unsafe` (since CeeSafe 0.19). A CeeSafe limitation goes in `CEESAFE_GAPS.md`
   (with evidence and a repro) for the CeeSafe repo, not around it with C or `unsafe`.
 - CRC32C and MD5 are lib/std's; `src/storage/checksums/checksums.cee` pins the values the on-disk formats use.

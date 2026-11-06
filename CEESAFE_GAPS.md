@@ -31,6 +31,7 @@ boilerplate; **P2** ergonomics.
 | G20 | P2 | parser | `a as u64 < b` parses `<` as generic arguments (N0100 "expected '>'") |
 | G21 | P1 | language/std | No safe process-wide table: arrays of atomics are rejected (N0259) and `Mutex` has no constant constructor |
 | G22 | P2 | parser | No explicit dereference: `let id = *m.keyAt(0);` is N0102, even though spec §13.3 writes `*r` |
+| G23 | P2 | tooling | `ceesafe.toml` cannot require a compiler version, so an older ceesafec gives type errors instead of "needs 0.19.1" |
 
 ## Status (2026-11-06)
 
@@ -54,8 +55,8 @@ Not used yet:
 - `AsyncFiles` (G6), for the async server.
 
 The migration found that `File`'s positional methods needed `borrow mut this`, which CosmoStore's shared read paths
-can't give. CeeSafe's main tree relaxes them to `borrow this` (ADR 0075 §8, after 0.19.0), so CosmoStore currently
-needs a ceesafec built from that tree, until the next release.
+can't give. CeeSafe 0.19.1 (ADR 0075 §8) relaxes them to `borrow this`, so CosmoStore needs ceesafec 0.19.1 or
+later; G23 covers the manifest's missing way to say so.
 
 ## Details
 
@@ -230,6 +231,20 @@ let id: u64 = m.keyAt(0);      // works: auto-deref where a u64 is expected (§1
 Auto-deref covers most cases. But copying a `Copy` value out of a reference into an un-annotated `let` needs a
 type annotation, which is easy to miss because the spec's own prose spells the read as `*r`. Suggested: accept
 prefix `*` on a reference to a `Copy` type, or add a diagnostic that suggests the annotation.
+
+### G23: a package cannot require a compiler version (P2)
+
+Found with CeeSafe 0.19.1 on 2026-11-06. CosmoStore needs 0.19.1, because `File.readAt` and the others take
+`borrow this` from that release on. With 0.19.0, `ceesafec check` reports 12 errors in `src/storage/io/durable.cee`,
+the first being `error[N0248]: cannot borrow 'this.file' as mutable: it is behind a shared reference`. Nothing in them
+says that a newer compiler would accept the package. The manifest's `[package]` keys are `name`, `version`, `kind`,
+`profile`, `float`, `kernel`, `trusted`, `sources`, `tests` and `c` (`src/packages/manifest.cee` around line 316).
+None of them names a compiler version.
+
+Repro: run `~/.ceesafe/bin/ceesafec-0.19.0 check` in this repository at f5a3d9f.
+
+Suggested: a `ceesafec = ">=0.19.1"` key in `[package]`. A compiler older than the requirement then stops with one
+diagnostic naming both versions, before checking anything. `ceesafec fetch` could also check it for dependencies.
 
 ## Not gaps (checked)
 

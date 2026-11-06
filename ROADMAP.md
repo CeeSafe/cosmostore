@@ -465,5 +465,5 @@ Next: the rest of M2 (space reserve, fsck), or the CeeSafe.Web spike → S3 HTTP
   model and messages read as before.
 - **Tests:** 53 pass. `md5StreamingMatchesOneShot` is gone because lib/std tests MD5 streaming; the RFC vectors stay
   as a format guard.
-- **Toolchain:** needs ceesafec from CeeSafe's main tree (`File.readAt` and the others take `borrow this` there) until
-  CeeSafe's next release.
+- **Toolchain:** ceesafec 0.19.1 or later (released 6 Nov 2026), whose `File.readAt` and the others take `borrow this`.
+  With the released 0.19.1 on PATH, check, fmt and the 53 tests pass; 0.19.0 reports 12 errors in `durable.cee`.
