@@ -493,7 +493,26 @@ struct ObjectStore {
             null => {}
         }
         let unscanned = journal.unscannedSegments();
-        for (i in 0..unscanned.length) { state.addSegmentBytes(unscanned[i].id, unscanned[i].size, 0)?; }
+        for (i in 0..unscanned.length) {
+            // Records only, as the live store counts a segment: its header is not part of it.
+            let header = SEGMENT_HEADER_LEN as u64;
+            let records = if (unscanned[i].size > header) unscanned[i].size - header else 0;
+            state.addSegmentBytes(unscanned[i].id, records, 0)?;
+        }
+        // The checkpoint can name records in segments that compaction removed after it: Relocate records later in
+        // the journal, now replayed, moved those versions out. Such a segment is accounted for with nothing in it,
+        // and it must not be kept, or compaction would try to remove its file again (ADR-0005; found by the soak).
+        var gone = Vector<u64>.create();
+        for (i in 0..state.segments.length()) {
+            let id: u64 = state.segments.keyAt(i);
+            if (id >= start.segment) { continue; }
+            var present = false;
+            for (u in unscanned) {
+                if (u.id == id) { present = true; }
+            }
+            if (!present) { gone.push(id)?; }
+        }
+        for (id in gone.view()) { let _ = state.segments.remove(borrow id); }
         if (complete.length > 0) { removeCheckpoints(dir, start.lsn, false); }
         var root = String.create();
         root.append(dir)?;
@@ -1246,6 +1265,16 @@ struct ObjectStore {
     }
 
     fn segmentCount(borrow this) -> usize => this.state.segments.length();
+
+    /// The segments the store accounts for (a new active segment with no record yet is not among them).
+    fn segmentIds(borrow this) -> Vector<u64> {
+        var ids = Vector<u64>.create();
+        for (i in 0..this.state.segments.length()) {
+            let id: u64 = this.state.segments.keyAt(i);
+            ids.push(id)!;
+        }
+        return ids;
+    }
 
     /// The LSN the newest checkpoint covers (0: none).
     fn lastCheckpoint(borrow this) -> u64 => this.checkpointLsn;

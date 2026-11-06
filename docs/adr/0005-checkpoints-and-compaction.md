@@ -94,3 +94,25 @@ instead: compaction then simply doesn't delete.
   about 400k/s.
 - Not done yet from M2: a disk-space reserve with write rejection, an `fsck` tool, the 24h churn soak, and
   making reaping wait for in-flight readers.
+
+## Amendment (6 Nov 2026): a removed segment still accounted for after recovery
+
+The 24-hour soak (ROADMAP M2) failed on its first restart, with `maintain: unlink`.
+- **What happened:**
+  1. A checkpoint named inline versions in segment N.
+  2. Compaction relocated them and removed N.
+  3. The process was killed before the next checkpoint.
+  4. On recovery, loading the checkpoint accounted for N because of those versions. Replaying the `Relocate` records
+     moved them out, so N was left accounted for with nothing in it and no file.
+  5. The first compaction after the restart chose N and failed to remove its file.
+- **No data was at risk.** The restart's check of every key and fsck both passed.
+- **The fix.** After replay, `ObjectStore.open` drops the accounting of any segment before the checkpoint's first
+  replayed segment that the journal does not hold. Unscanned segments are now counted as records only, without
+  their 64-byte header, as the live store counts them. Before, recovery could make a segment at exactly 50% live look
+  like a compaction candidate.
+- **Why the sweeps missed it.** They checked the recovered data, not maintenance on the recovered store. Now:
+  - each sweep, after recovery, checks that every accounted segment has its file, then compacts, checkpoints and
+    compacts again;
+  - `compactionRelocatesAndKeepsGenerations` compacts after its reopen.
+
+  With the fix disabled, four of the six checkpoint sweeps fail.

@@ -493,3 +493,14 @@ Next: the rest of M2 (space reserve, fsck), or the CeeSafe.Web spike → S3 HTTP
 - **Gap:** CEESAFE_GAPS G24, no free-space query, so the capacity is configured.
 - **Tests:** 57 pass.
 - **M2 left:** the 24h churn soak (the exit test), and reaping that waits for in-flight readers.
+
+### 6 Nov 2026: the 24-hour soak (M2 exit test)
+
+`cosmostore soak` (`src/soak.cee`) and `tools/soak.sh` run a 24-hour churn with SIGKILL every 1-15 minutes.
+- **Workload:** 5,000 keys; 60% overwrites (sizes up to 1.5 MiB), 25% deletes, 15% verified reads; maintenance on
+  its schedule; a 1.2 GB capacity.
+- **Each restart** checks every key against the soak's intent/ack log, then runs fsck.
+- **Where:** a Debian 12 box (x86_64, NVMe), with ceesafec 0.20.0.
+- **The first run failed** on its first restart (`maintain: unlink`: a removed segment still accounted for after
+  recovery; ADR-0005's amendment). Fixed, with stronger sweeps.
+- **The second run** started at 16:20 UTC; its results follow when it ends.

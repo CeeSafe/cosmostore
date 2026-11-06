@@ -32,7 +32,8 @@ boilerplate; **P2** ergonomics.
 | G21 | P1 | language/std | No safe process-wide table: arrays of atomics are rejected (N0259) and `Mutex` has no constant constructor |
 | G22 | P2 | parser | No explicit dereference: `let id = *m.keyAt(0);` is N0102, even though spec §13.3 writes `*r` |
 | G23 | P2 | tooling | `ceesafe.toml` cannot require a compiler version, so an older ceesafec gives type errors instead of "needs 0.19.1". **Fixed in CeeSafe 0.20.0** (ADR 0076): CosmoStore's manifest says `ceesafec = ">=0.20.0"` |
-| G24 | P1 | std/files | No free-space query (`statvfs`, `GetDiskFreeSpaceExW`): a store cannot learn how much room its volume has |
+| G24 | P1 | std/files | No free-space query (`statvfs`, `GetDiskFreeSpaceExW`): a store cannot learn how much room its volume has **Fixed in CeeSafe 0.21.0** (ADR 0077: `Directory.space`, `Console.flush`) |
+| G25 | P2 | std/console | No `Console.flush()`: standard output written before a SIGKILL is lost when it is redirected **Fixed in CeeSafe 0.21.0** (ADR 0077) |
 
 ## Status (2026-11-06)
 
@@ -260,6 +261,21 @@ Workaround: `StoreConfig.capacityBytes`, set by the operator (ADR-0006).
 Suggested: `Directory.space(path) -> Result<VolumeSpace, IoError>` in lib/std, with `VolumeSpace { total: u64, free:
 u64, available: u64 }` (`available` being what an unprivileged process may use). It would be `statvfs` on POSIX and
 `GetDiskFreeSpaceExW` on Windows, with an async form in `AsyncFiles`.
+
+### G25: no way to flush standard output (P2)
+
+Found with CeeSafe 0.20.0 on 2026-11-06. Lines that the soak test wrote with `Console.writeLine`, redirected to a file
+and followed by a SIGKILL, were all lost: three killed runs left 0-byte output files. The only flush is implicit:
+`Console.writeError` flushes standard output first (type-system.md §26.3), and there is no `Console.flush()`. A
+long-running server that is killed loses its last log lines in the same way.
+
+Repro: a program that does `Console.writeLine("x");` and then loops forever, run as `prog > out &`, then `kill -9`;
+`out` is empty.
+
+Workaround: the soak writes its lines to standard error (`soakEmit` in `src/soak.cee`).
+
+Suggested: `Console.flush()` and `AsyncConsole.flush()`. Line buffering when standard output is not a terminal would
+also do, at a throughput cost.
 
 ## Not gaps (checked)
 
