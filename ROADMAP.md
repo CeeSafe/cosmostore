@@ -467,3 +467,11 @@ Next: the rest of M2 (space reserve, fsck), or the CeeSafe.Web spike → S3 HTTP
   as a format guard.
 - **Toolchain:** ceesafec 0.19.1 or later (released 6 Nov 2026), whose `File.readAt` and the others take `borrow this`.
   With the released 0.19.1 on PATH, check, fmt and the 53 tests pass; 0.19.0 reports 12 errors in `durable.cee`.
+
+### 6 Nov 2026: pinned to ceesafec 0.20.0
+
+`ceesafe.toml` says `ceesafec = ">=0.20.0"`, using CeeSafe 0.20.0's new field (its ADR 0076, from CEESAFE_GAPS G23).
+- **ceesafec 0.20.0** (installed from the release, checksum and signature checked): check, fmt and the 53 tests pass.
+- **0.19.1 and 0.19.0:** both stop at that line of the manifest (`unknown field 'ceesafec'`), rather than at 12 type
+  errors in `durable.cee`.
+- **A later compiler** that does not satisfy the field names both versions.
