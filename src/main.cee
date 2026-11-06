@@ -3,9 +3,13 @@
 //   cosmostore bench <dir> <objects> <size-bytes> <batch>
 //       Writes <objects> objects of <size-bytes> each, committing <batch> per sync (1 = one
 //       sync per PUT), then reopens the store and verifies every byte.
+//   cosmostore fsck <dir>
+//       Opens the store (recovery) and verifies every live object's records, extents and MD5
+//       (ADR-0006). Exit status 1 if anything is wrong.
 
 fn usage() -> never {
     Console.writeErrorLine("usage: cosmostore bench <dir> <objects> <size-bytes> <batch>");
+    Console.writeErrorLine("       cosmostore fsck <dir>");
     Process.exit(2);
 }
 
@@ -33,6 +37,7 @@ fn describe(e: StoreError) -> StringView => match (e) {
     StoreError.EntityTooLarge => "entity too large",
     StoreError.DataCorrupt => "data corrupt",
     StoreError.CheckpointCorrupt => "checkpoint corrupt",
+    StoreError.InsufficientStorage => "insufficient storage",
     StoreError.Io(f) => ioOpName(f.op),
     _ => "store error",
 };
@@ -214,7 +219,51 @@ fn main() {
         bench();
         return;
     }
+    if (command == "fsck") {
+        Process.exit(fsck());
+    }
     usage();
+}
+
+fn faultName(f: borrow VerifyFault) -> StringView => match (f) {
+    VerifyFault.Corrupt => "corrupt",
+    VerifyFault.Missing => "missing extent",
+    VerifyFault.Mismatch => "size or MD5 mismatch",
+    VerifyFault.Unreadable => "unreadable",
+};
+
+/// `cosmostore fsck <dir>`: one line per problem, then a summary; 1 if anything is wrong.
+fn fsck() -> i32 {
+    let dir = Process.argument(2) ?? "";
+    if (dir.length == 0) { usage(); }
+    let store = match (ObjectStore.open(dir, StoreConfig.defaults())) {
+        Ok(s) => s,
+        Err(e) => {
+            Console.write("cannot open the store: ");
+            Console.writeLine(describe(e));
+            return 1;
+        }
+    };
+    let report = match (store.verify()) {
+        Ok(r) => r,
+        Err(e) => { die(describe(e)); }
+    };
+    for (p in report.problems.view()) {
+        Console.write(StringView.fromUtf8(p.bucket.view()) ?? "?");
+        Console.write("/");
+        Console.write(StringView.fromUtf8(p.key.view()) ?? "?");
+        Console.write(": ");
+        Console.writeLine(faultName(borrow p.fault));
+    }
+    Console.write("objects ");
+    Console.write(report.objects);
+    Console.write(", bytes ");
+    Console.write(report.bytes);
+    Console.write(", problems ");
+    Console.write(report.problems.length);
+    Console.write(", orphan extents ");
+    Console.writeLine(report.orphanExtents);
+    return if (report.problems.length == 0) 0 else 1;
 }
 
 /// Milliseconds on the monotonic clock, for the benchmark's durations (a wall-clock jump cannot skew them).

@@ -32,6 +32,7 @@ boilerplate; **P2** ergonomics.
 | G21 | P1 | language/std | No safe process-wide table: arrays of atomics are rejected (N0259) and `Mutex` has no constant constructor |
 | G22 | P2 | parser | No explicit dereference: `let id = *m.keyAt(0);` is N0102, even though spec §13.3 writes `*r` |
 | G23 | P2 | tooling | `ceesafe.toml` cannot require a compiler version, so an older ceesafec gives type errors instead of "needs 0.19.1". **Fixed in CeeSafe 0.20.0** (ADR 0076): CosmoStore's manifest says `ceesafec = ">=0.20.0"` |
+| G24 | P1 | std/files | No free-space query (`statvfs`, `GetDiskFreeSpaceExW`): a store cannot learn how much room its volume has |
 
 ## Status (2026-11-06)
 
@@ -245,6 +246,20 @@ Repro: run `~/.ceesafe/bin/ceesafec-0.19.0 check` in this repository at f5a3d9f.
 
 Suggested: a `ceesafec = ">=0.19.1"` key in `[package]`. A compiler older than the requirement then stops with one
 diagnostic naming both versions, before checking anything. `ceesafec fetch` could also check it for dependencies.
+
+### G24: no free-space query (P1)
+
+Found with CeeSafe 0.20.0 on 2026-11-06 while building ADR-0006's space reserve. The guide's `File` and `Directory`
+tables, and type-system.md §26.3 and §26.10, list no way to ask how many bytes a volume has free or in total.
+`grep -rn "statvfs\|statfs\|GetDiskFreeSpace" runtime/ lib/` in CeeSafe finds nothing. A storage engine has to stop
+writing before `ENOSPC` while there is still room to write deletes and compaction copies. Without this, CosmoStore
+can only take a configured `capacityBytes`, which is wrong whenever the volume is shared or resized.
+
+Workaround: `StoreConfig.capacityBytes`, set by the operator (ADR-0006).
+
+Suggested: `Directory.space(path) -> Result<VolumeSpace, IoError>` in lib/std, with `VolumeSpace { total: u64, free:
+u64, available: u64 }` (`available` being what an unprivileged process may use). It would be `statvfs` on POSIX and
+`GetDiskFreeSpaceExW` on Windows, with an async form in `AsyncFiles`.
 
 ## Not gaps (checked)
 

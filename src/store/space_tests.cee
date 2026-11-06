@@ -1,0 +1,187 @@
+// Space safety and fsck (ADR-0006): admission against a capacity and its reserve, usage that survives recovery, and
+// verification that finds rotted, missing and mismatched data.
+
+fn spaceConfig(capacity: u64, reserve: u64) -> StoreConfig {
+    var config = faultStoreConfig();
+    config.journal = JournalConfig { segmentTargetBytes: 262144, maxBatchBytes: 65536, shardId: 0 };
+    config.capacityBytes = capacity;
+    config.reserveBytes = reserve;
+    return config;
+}
+
+/// The extent files' ids under `dir`/extents, in name order.
+fn extentIds(dir: StringView) -> Vector<u64> {
+    var path = String.create();
+    path.append(dir)!;
+    path.append("/extents")!;
+    var ids = Vector<u64>.create();
+    for (name in Directory.list(path.view())!.view()) {
+        match (extentIdFromName(name.view())) {
+            Some(id) => { ids.push(id)!; }
+            null => {}
+        }
+    }
+    return ids;
+}
+
+fn fileOfExtent(dir: StringView, id: u64) -> String {
+    var path = String.create();
+    path.append(dir)!;
+    path.append("/extents")!;
+    return extentPath(path.view(), id)!;
+}
+
+@test
+fn capacityRejectsWritesButNotDeletes() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("space-full");
+    let capacity: u64 = 4 * 1048576;
+    let reserve: u64 = 1048576;
+    var s = ObjectStore.open(dir.view(), spaceConfig(capacity, reserve))!;
+    s.createBucket("bkt")!;
+    var name = String.create();
+    var stored: u64 = 0;
+    var refused = false;
+    for (k in 0u64..20) {
+        name.clear();
+        name.append("k")!;
+        name.appendNumber(k)!;
+        match (s.putObject("bkt", name.view(), "", patterned(300000, k).view(), PutCondition.None)) {
+            Ok(_) => { stored += 1; }
+            Err(StoreError.InsufficientStorage) => {
+                refused = true;
+                break;
+            }
+            Err(e) => { return Check.fail("a write failed with something other than InsufficientStorage"); }
+        }
+    }
+    Check.isTrue(refused, "the store must refuse writes before the capacity")?;
+    Check.isTrue(stored >= 8, "the store must admit writes up to the reserve")?;
+    Check.isTrue(s.usedBytes() + reserve <= capacity, "accepted writes stay out of the reserve")?;
+    // Nothing was left behind by the refused write.
+    Check.equalU64(s.objectCount() as u64, extentIds(dir.view()).length as u64 / 5)?;
+    // Deletes, checkpoints and compaction need no admission, and deleting frees room for a write.
+    s.deleteObject("bkt", "k0")!;
+    s.deleteObject("bkt", "k1")!;
+    s.checkpoint()!;
+    let _ = s.compact(67108864)!;
+    s.putObject("bkt", "again", "", patterned(300000, 99).view(), PutCondition.None)!;
+    Check.equalBytes(patterned(300000, 99).view(), s.getObject("bkt", "again")!.view())?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn usageSurvivesRecovery() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("space-usage");
+    let config = spaceConfig(0, 0);
+    var before: u64 = 0;
+    var extentsBefore: u64 = 0;
+    {
+        var s = ObjectStore.open(dir.view(), config)!;
+        s.createBucket("bkt")!;
+        s.putObject("bkt", "big", "", patterned(200000, 1).view(), PutCondition.None)!;
+        s.putObject("bkt", "small", "", patterned(100, 2).view(), PutCondition.None)!;
+        s.putObject("bkt", "big", "", patterned(150000, 3).view(), PutCondition.None)!; // retires the first
+        s.putObject("bkt", "gone", "", patterned(100000, 4).view(), PutCondition.None)!;
+        s.deleteObject("bkt", "gone")!;
+        before = s.usedBytes();
+        extentsBefore = before - s.journalBytes();
+        // Two extents of 64 KiB and one of 21,072 bytes for "big", each with a 64-byte header.
+        Check.equalU64(150000 + 3 * 64, extentsBefore)?;
+    }
+    {
+        let s = ObjectStore.open(dir.view(), config)!;
+        Check.equalU64(before, s.usedBytes())?;
+    }
+    {
+        var s = ObjectStore.open(dir.view(), config)!;
+        s.checkpoint()!;
+    }
+    let s = ObjectStore.open(dir.view(), config)!;
+    Check.equalU64(extentsBefore, s.usedBytes() - s.journalBytes())?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn fsckPassesAHealthyStore() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("fsck-clean");
+    {
+        var s = ObjectStore.open(dir.view(), spaceConfig(0, 0))!;
+        s.createBucket("bkt")!;
+        s.putObject("bkt", "inline", "", patterned(500, 1).view(), PutCondition.None)!;
+        s.putObject("bkt", "extents", "", patterned(200000, 2).view(), PutCondition.None)!;
+        s.checkpoint()!;
+        s.putObject("bkt", "after", "", patterned(700, 3).view(), PutCondition.None)!;
+    }
+    let s = ObjectStore.open(dir.view(), spaceConfig(0, 0))!;
+    let report = s.verify()!;
+    Check.equalU64(3, report.objects)?;
+    Check.equalU64(500 + 200000 + 700, report.bytes)?;
+    Check.equalU64(0, report.problems.length as u64)?;
+    Check.equalU64(0, report.orphanExtents as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+fn onlyFault(report: VerifyReport, key: StringView, expected: VerifyFault) -> Result<void, TestFailure> {
+    Check.equalU64(1, report.problems.length as u64)?;
+    Check.equalBytes(key.bytes(), report.problems[0].key.view())?;
+    let same = match (report.problems[0].fault) {
+        VerifyFault.Corrupt => match (expected) {
+            VerifyFault.Corrupt => true,
+            _ => false,
+        },
+        VerifyFault.Missing => match (expected) {
+            VerifyFault.Missing => true,
+            _ => false,
+        },
+        VerifyFault.Mismatch => match (expected) {
+            VerifyFault.Mismatch => true,
+            _ => false,
+        },
+        VerifyFault.Unreadable => match (expected) {
+            VerifyFault.Unreadable => true,
+            _ => false,
+        },
+    };
+    return Check.isTrue(same, "fsck reported another fault");
+}
+
+@test
+fn fsckFindsRotAndLoss() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("fsck-damage");
+    let config = spaceConfig(0, 0);
+    {
+        var s = ObjectStore.open(dir.view(), config)!;
+        s.createBucket("bkt")!;
+        s.putObject("bkt", "a", "", patterned(200000, 1).view(), PutCondition.None)!;
+        s.putObject("bkt", "b", "", patterned(300, 2).view(), PutCondition.None)!;
+        s.checkpoint()!; // so recovery no longer reads b's record, and only fsck would notice its rot
+    }
+    let ids = extentIds(dir.view());
+    Check.equalU64(4, ids.length as u64)?;
+    // A flipped byte in the middle of an extent's data.
+    let first = fileOfExtent(dir.view(), ids[0]);
+    flipByteAt(first.view(), 1000);
+    {
+        let s = ObjectStore.open(dir.view(), config)!;
+        onlyFault(s.verify()!, "a", VerifyFault.Corrupt)?;
+    }
+    flipByteAt(first.view(), 1000); // repaired
+    // A missing extent.
+    let last = fileOfExtent(dir.view(), ids[3]);
+    let kept = readWhole(last.view());
+    File.remove(last.view())!;
+    {
+        let s = ObjectStore.open(dir.view(), config)!;
+        onlyFault(s.verify()!, "a", VerifyFault.Missing)?;
+    }
+    writeWhole(last.view(), kept.view());
+    // A rotted inline record, in a segment the checkpoint covers.
+    flipByteAt(segmentPath(dir.view(), 1)!.view(), 20);
+    let s = ObjectStore.open(dir.view(), config)!;
+    onlyFault(s.verify()!, "b", VerifyFault.Corrupt)?;
+    removeTree(dir.view());
+    return Ok();
+}

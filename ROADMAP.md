@@ -206,10 +206,11 @@ and no storage code depends on undocumented FS behavior.
 - A segment compactor that rewrites live records and atomically swaps locators, then
   retires old segments after a grace period.
 - Orphan extent sweeper.
-- Disk-space reserve with write rejection before it is reached.
+- Disk-space reserve with write rejection before it is reached. **Done** (ADR-0006; the capacity is configured until
+  CeeSafe has a free-space query, CEESAFE_GAPS G24).
 - Checkpoint rotation so recovery time stays bounded. **Done** (ADR-0005).
 - Segment compaction with locator swaps (`Relocate` records). **Done** (ADR-0005).
-- An `fsck` tool that verifies every locator and checksum.
+- An `fsck` tool that verifies every locator and checksum. **Done** (`cosmostore fsck`, ADR-0006).
 
 **Exit:** a 24h overwrite/delete churn test keeps disk usage within 1.5× live bytes,
 crashes during compaction are safe, recovery time stays bounded, and disk-full never
@@ -475,3 +476,20 @@ Next: the rest of M2 (space reserve, fsck), or the CeeSafe.Web spike → S3 HTTP
 - **0.19.1 and 0.19.0:** both stop at that line of the manifest (`unknown field 'ceesafec'`), rather than at 12 type
   errors in `durable.cee`.
 - **A later compiler** that does not satisfy the field names both versions.
+
+### 6 Nov 2026: space reserve and fsck (ADR-0006)
+
+- **Space accounting:** `usedBytes()` is the journal plus the live extent files, counted by the same apply/retire code
+  recovery replays. It is equal after a reopen, with or without a checkpoint.
+- **Admission:** with `capacityBytes`, a write that would take the store into `reserveBytes` is refused with
+  `InsufficientStorage`. It is checked before any extent byte is written, and again for streamed objects. Deletes,
+  checkpoints and compaction never need admission, so a full store can always free itself (tested).
+- **fsck:** `ObjectStore.verify()` and `cosmostore fsck <dir>` read every live object, checking the record CRCs, the
+  extent CRCs, missing or short extents, and size and MD5. They report Corrupt, Missing, Mismatch or Unreadable, and
+  change nothing.
+  - Tests: a clean store; a flipped extent byte; a deleted extent; a rotted inline record in a segment the
+    checkpoint covers.
+  - By hand: 20,000 objects in 0.34 s, and one flipped bit found.
+- **Gap:** CEESAFE_GAPS G24, no free-space query, so the capacity is configured.
+- **Tests:** 57 pass.
+- **M2 left:** the 24h churn soak (the exit test), and reaping that waits for in-flight readers.

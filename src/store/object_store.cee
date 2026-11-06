@@ -20,6 +20,12 @@ struct StoreConfig {
     compactBelowLivePercent: u64;
     /// The most live bytes one `compact` call copies.
     compactMaxCopyBytes: u64;
+    /// The most bytes the store may occupy, journal and extents together (0: no limit). Set it below the volume's
+    /// free space: CeeSafe has no free-space query yet (CEESAFE_GAPS G24). ADR-0006.
+    capacityBytes: u64;
+    /// Kept free below `capacityBytes` for what frees space or keeps the store recoverable: deletes, checkpoints
+    /// and compaction never count against it, writes do (ADR-0006).
+    reserveBytes: u64;
 
     fn defaults() -> StoreConfig => StoreConfig {
         journal: JournalConfig.defaults(),
@@ -29,6 +35,8 @@ struct StoreConfig {
         checkpointEveryBytes: 67108864,
         compactBelowLivePercent: 50,
         compactMaxCopyBytes: 67108864,
+        capacityBytes: 0,
+        reserveBytes: 268435456,
     };
 }
 
@@ -51,6 +59,8 @@ enum StoreError {
     DataCorrupt,
     /// The newest checkpoint fails its checks (ADR-0005).
     CheckpointCorrupt,
+    /// The write would take the store into its reserve (ADR-0006); deletes still work.
+    InsufficientStorage,
 }
 
 fn sio<T>(r: Result<T, IoFailure>) -> Result<T, StoreError> => match (r) {
@@ -141,6 +151,8 @@ struct StoreState {
     /// Extents of versions superseded or deleted by applied records; the store removes the
     /// files once the records are durable (they always are when applied).
     deadExtents: Vector<u64>;
+    /// The bytes of the live versions' extent files, headers included (ADR-0006).
+    extentBytes: u64;
 
     fn create() -> StoreState => StoreState {
         index: HashMap<IndexKey, ObjectVersion>.create(),
@@ -148,10 +160,13 @@ struct StoreState {
         segments: HashMap<u64, SegmentUsage>.create(),
         records: 0,
         deadExtents: Vector<u64>.create(),
+        extentBytes: 0,
     };
 
     /// Releases a superseded or deleted version: its record bytes and its extents.
     fn retire(borrow mut this, old: borrow ObjectVersion) -> Result<void, StoreError> {
+        let freed = extentFileBytes(old);
+        this.extentBytes = if (this.extentBytes > freed) this.extentBytes - freed else 0;
         if (old.extents.length == 0) { this.releaseRecord(old.recordSegment, old.recordLength); }
         for (i in 0..old.extents.length) {
             this.deadExtents.push(old.extents[i].id)?;
@@ -194,6 +209,15 @@ struct StoreState {
         }
         return Ok();
     }
+}
+
+/// The bytes a version's extent files occupy: each extent's data and its header.
+fn extentFileBytes(v: borrow ObjectVersion) -> u64 {
+    var total: u64 = 0;
+    for (i in 0..v.extents.length) {
+        total += v.extents[i].length + EXTENT_HEADER_LEN;
+    }
+    return total;
 }
 
 /// Applies one committed record to the state. Recovery and live writes both call this.
@@ -343,6 +367,7 @@ fn applyPut(
         extents: extents,
     };
     let key = IndexKey { bucket: m.bucket, key: m.key };
+    state.extentBytes += extentFileBytes(borrow version);
     match (state.index.put(key, version)?) {
         Some(old) => { state.retire(borrow old)?; }
         null => { state.bumpObjects(bucketCopy.view(), true)?; }
@@ -362,6 +387,44 @@ struct PendingApply {
     /// The PutExtent manifest (empty for other records).
     manifest: Vector<u8>;
 }
+
+/// What fsck found wrong with one object (ADR-0006).
+enum VerifyFault {
+    /// A record or extent fails its CRC, or an extent is short.
+    Corrupt,
+    /// An extent file is missing.
+    Missing,
+    /// The bytes read back are not the object's size or MD5.
+    Mismatch,
+    /// Another I/O error.
+    Unreadable,
+}
+
+struct VerifyProblem {
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    fault: VerifyFault;
+}
+
+/// What `ObjectStore.verify` found.
+struct VerifyReport {
+    objects: u64;
+    bytes: u64;
+    problems: Vector<VerifyProblem>;
+    orphanExtents: usize;
+}
+
+fn verifyFault(e: StoreError) -> VerifyFault => match (e) {
+    StoreError.DataCorrupt => VerifyFault.Corrupt,
+    StoreError.Journal(JournalError.Corrupt(_, _)) => VerifyFault.Corrupt,
+    StoreError.Io(f) =>
+        if (f.isNotFound()) VerifyFault.Missing else if (f.op ==
+            IoOp.Read) VerifyFault.Corrupt else VerifyFault.Unreadable,
+    _ => VerifyFault.Unreadable,
+};
+
+/// What admission adds for a write's journal record and the extent headers of a small object (ADR-0006).
+const ADMIT_RECORD_BYTES: u64 = 4096;
 
 struct ObjectStore {
     private journal: Journal;
@@ -460,6 +523,15 @@ struct ObjectStore {
     /// Removes extent files that no live version references. Only safe while no writer is
     /// in progress, so it runs at open.
     fn sweepOrphanExtents(borrow mut this) -> Result<usize, StoreError> {
+        let orphans = this.orphanExtents()?;
+        for (id in orphans.view()) {
+            removeExtent(this.extentDir.view(), id);
+        }
+        return Ok(orphans.length);
+    }
+
+    /// The extent files that no live version references.
+    fn orphanExtents(borrow this) -> Result<Vector<u64>, StoreError> {
         var live = HashMap<u64, bool>.create();
         for (i in 0..this.state.index.length()) {
             let v = this.state.index.valueAt(i);
@@ -471,19 +543,75 @@ struct ObjectStore {
             Ok(n) => n,
             Err(_) => { return Err(StoreError.Io(IoFailure { op: IoOp.Open, errno: 0 })); }
         };
-        var removed: usize = 0;
+        var orphans = Vector<u64>.create();
         for (i in 0..names.length) {
             match (extentIdFromName(names[i].view())) {
                 Some(id) => {
-                    if (!live.contains(borrow id)) {
-                        removeExtent(this.extentDir.view(), id);
-                        removed += 1;
-                    }
+                    if (!live.contains(borrow id)) { orphans.push(id)?; }
                 }
                 null => {}
             }
         }
-        return Ok(removed);
+        return Ok(orphans);
+    }
+
+    /// fsck (ADR-0006): reads every live object through the reader, which verifies each journal record and each
+    /// extent's CRC, and compares the bytes' MD5 with the stored one. Also counts extent files that no version
+    /// references. Changes nothing.
+    fn verify(borrow this) -> Result<VerifyReport, StoreError> {
+        var report = VerifyReport {
+            objects: 0,
+            bytes: 0,
+            problems: Vector<VerifyProblem>.create(),
+            orphanExtents: this.orphanExtents()?.length,
+        };
+        var chunk = Vector<u8>.create();
+        chunk.resize(65536, 0)?;
+        for (i in 0..this.state.index.length()) {
+            let k = this.state.index.keyAt(i);
+            let v = this.state.index.valueAt(i);
+            report.objects += 1;
+            let bucket = StringView.fromUtf8(k.bucket.view()) ?? "";
+            let key = StringView.fromUtf8(k.key.view()) ?? "";
+            var fault: VerifyFault? = null;
+            match (this.openReader(bucket, key, 0, 0xFFFFFFFFFFFFFFFF)) {
+                Ok(reader) => {
+                    var r = reader;
+                    var md5 = Md5.create();
+                    var size: u64 = 0;
+                    loop {
+                        match (r.read(mut chunk.viewMut())) {
+                            Ok(n) => {
+                                if (n == 0) { break; }
+                                md5.update(chunk.view()[0..n]);
+                                size += n as u64;
+                            }
+                            Err(e) => {
+                                fault = verifyFault(e);
+                                break;
+                            }
+                        }
+                    }
+                    report.bytes += size;
+                    if (fault.isNull()) {
+                        let digest = md5.finish();
+                        if (size != v.size || digest[..] != v.md5[..]) { fault = VerifyFault.Mismatch; }
+                    }
+                }
+                Err(e) => { fault = verifyFault(e); }
+            }
+            match (fault) {
+                Some(f) => {
+                    report.problems.push(VerifyProblem {
+                        bucket: copyBytes(k.bucket.view())?,
+                        key: copyBytes(k.key.view())?,
+                        fault: f,
+                    })?;
+                }
+                null => {}
+            }
+        }
+        return Ok(report);
     }
 
     /// Removes the extent files of versions retired by records that are now durable.
@@ -535,6 +663,20 @@ struct ObjectStore {
     /// not even one that would change nothing, such as deleting a key that looks missing.
     fn checkWritable(borrow this) -> Result<void, StoreError> {
         if (this.journal.isFailed()) { return Err(StoreError.Journal(JournalError.Failed)); }
+        return Ok();
+    }
+
+    /// The bytes the store occupies: every journal segment and every live extent file (ADR-0006). Extents of
+    /// retired versions are removed as soon as their records commit, so they are not counted.
+    fn usedBytes(borrow this) -> u64 => this.journalBytes() + this.state.extentBytes;
+
+    /// Admits a write of `incoming` object bytes, plus its record, unless it would take the store into its
+    /// reserve: InsufficientStorage. Deletes, checkpoints and compaction never ask (ADR-0006).
+    fn admit(borrow this, incoming: u64) -> Result<void, StoreError> {
+        let capacity = this.config.capacityBytes;
+        if (capacity == 0) { return Ok(); }
+        let need = this.usedBytes() + incoming + ADMIT_RECORD_BYTES + this.config.reserveBytes;
+        if (need > capacity) { return Err(StoreError.InsufficientStorage); }
         return Ok();
     }
 
@@ -609,6 +751,7 @@ struct ObjectStore {
     /// Runs `data` through a writer: inline if small, extents if not.
     fn writeAll(borrow this, data: Slice<u8>) -> Result<FinishedObject, StoreError> {
         if (data.length as u64 > this.config.maxObjectBytes) { return Err(StoreError.EntityTooLarge); }
+        this.admit(data.length as u64)?; // before any byte reaches an extent
         var w = this.newWriter()?;
         sio(w.write(data))?;
         return sio(w.finish());
@@ -655,6 +798,7 @@ struct ObjectStore {
         if (contentType.length > MAX_CONTENT_TYPE) { return Err(StoreError.InvalidKey); }
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         if (obj.size > this.config.maxObjectBytes) { return Err(StoreError.EntityTooLarge); }
+        this.admit(obj.size)?;
         let current = this.currentGeneration(bucket, key)?;
         match (condition) {
             PutCondition.None => {}
