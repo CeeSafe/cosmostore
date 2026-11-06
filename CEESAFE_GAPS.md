@@ -29,6 +29,7 @@ boilerplate; **P2** ergonomics.
 | G18 | P2 | core | `Vector` has no `insert(at)`/`remove(at)` (needed for sorted vectors) |
 | G19 | P1 | language | No way to move a value out of a `borrow mut` place (no `replace`/`take`/`swap` of values) |
 | G20 | P2 | parser | `a as u64 < b` parses `<` as generic arguments (N0100 "expected '>'") |
+| G21 | P1 | language/std | No safe process-wide table: arrays of atomics are rejected (N0259) and `Mutex` has no constant constructor |
 
 ## Details
 
@@ -170,6 +171,28 @@ the place is never left empty.
 type is read as the start of generic arguments. `(a as u64) < b` works. Either parse `as T <` as a
 comparison when `T` takes no type parameters, or give a diagnostic that suggests the parentheses.
 
+### G21: a process-wide table without `unsafe` (P1)
+
+Repro (0.18.1):
+```ceesafe
+static SLOTS: [AtomicU64; 4] = [AtomicU64.constant(0); 4];
+// error[N0259]: array and slice elements must be Copy types in v0; 'AtomicU64' is not Copy
+static TABLE: Mutex<Vector<u64>> = Mutex<Vector<u64>>.create(Vector<u64>.create());
+// error[N0205]: expected 'Mutex<Vector<u64>>', found 'Result<Mutex<Vector<u64>>, AllocError>'
+```
+Scalar statics of atomics work (`static N: AtomicU64 = AtomicU64.constant(0)`). But a *table* of shared state has
+two ways in, and both are blocked: an array of atomics, or a `Mutex` around a collection. Neither is a static
+initialiser (spec §39.4). CosmoStore's fault-injection registry (`src/storage/io/faults.cee`, ADR-0004) is
+therefore a `static mut` struct of plain arrays. Every access goes through an accessor whose `unsafe` block argues
+single-threaded use. That argument is true today, but it is what CeeSafe exists to check.
+
+Suggested:
+- allow arrays of non-`Copy` element types in statics when the repeat operand is a `@constant` call (each element
+  is built at compile time, so there is no copy);
+- give `Mutex<T>` an `@constant` constructor for a `T` that has one. An empty `Vector` needs no allocation, so
+  `Vector.empty()` could be `@constant`;
+- or offer `@threadLocal static` for single-thread state like this.
+
 ## Not gaps (checked)
 
 Things that worked well and are worth keeping:
@@ -181,3 +204,6 @@ Things that worked well and are worth keeping:
 - `@test` with leak detection, which caught nothing because nothing leaked.
 - `ceesafec fmt`.
 - Closures that capture state mutably across `Journal.open`'s replay callback.
+- Scalar `static` atomics as failpoints (`static ARMED: AtomicU32 = AtomicU32.constant(0)`): no `unsafe`, and
+  `ceesafec test` runs each test in its own process, so they don't leak between tests.
+- `ceesafec check` checks `@test` functions too.

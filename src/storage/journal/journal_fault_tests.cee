@@ -1,0 +1,226 @@
+// Journal fault-injection tests (ADR-0004). Each sweep fails every I/O operation of a workload
+// in turn. The invariants come from ADR-0001:
+// - every acknowledged record survives;
+// - recovery yields LSNs 1..k with no gaps, and k is at most the number of records staged;
+// - the journal refuses everything after a failure until it is reopened.
+
+/// A rotating configuration: a segment fills after about two batches.
+fn faultJournalConfig() -> JournalConfig => JournalConfig { segmentTargetBytes: 700, maxBatchBytes: 4096, shardId: 0 };
+
+/// How a sweep injects faults: once, from then on, from then on with a torn write, or from
+/// then on followed by the crash model (only synced data survives).
+enum SweepMode {
+    Once,
+    Sticky,
+    StickyTorn,
+    Crash,
+}
+
+fn armMode(mode: borrow SweepMode, n: u64) {
+    match (mode) {
+        SweepMode.Once => { Faults.failAt(n, false, false); }
+        SweepMode.Sticky => { Faults.failAt(n, true, false); }
+        SweepMode.StickyTorn => { Faults.failAt(n, true, true); }
+        SweepMode.Crash => {
+            Faults.track();
+            Faults.failAt(n, true, false);
+        }
+    }
+}
+
+fn isCrash(mode: borrow SweepMode) -> bool => match (mode) {
+    SweepMode.Crash => true,
+    _ => false,
+};
+
+/// Stages 3 records per batch for 6 batches; returns how many were acknowledged, and sets
+/// `staged` to how many were staged. Stops at the first error.
+fn journalWorkload(dir: StringView, staged: borrow mut u64) -> u64 {
+    var acked: u64 = 0;
+    var j = match (Journal.open(dir, faultJournalConfig(), (s, o, h, b) => {})) {
+        Ok(j) => j,
+        Err(_) => { return 0; }
+    };
+    var payload = Vector<u8>.create();
+    var lsn: u64 = 1;
+    for (b in 0..6) {
+        for (r in 0..3) {
+            payloadFor(lsn, mut payload);
+            let meta = "bucket\0key";
+            match (j.stage(RecordType.PutInline, meta.bytes(), payload.view())) {
+                Ok(_) => {
+                    staged = lsn;
+                    lsn += 1;
+                }
+                Err(_) => { return acked; }
+            }
+        }
+        match (j.commit()) {
+            Ok() => { acked = lsn - 1; }
+            Err(_) => {
+                // Fail-stop: nothing more is accepted.
+                match (j.stage(RecordType.PutInline, "m".bytes(), payload.view())) {
+                    Err(JournalError.Failed) => {}
+                    _ => {
+                        staged = 0xFFFFFFFFFFFFFFFF; // makes the check below fail
+                    }
+                }
+                return acked;
+            }
+        }
+    }
+    return acked;
+}
+
+fn checkContiguous(lsns: borrow Vector<u64>, atLeast: u64, atMost: u64) -> Result<void, TestFailure> {
+    for (i in 0..lsns.length) { Check.equalU64(i as u64 + 1, lsns[i])?; }
+    let k = lsns.length as u64;
+    Check.isTrue(k >= atLeast, "an acknowledged record was lost")?;
+    Check.isTrue(k <= atMost, "a record that was never staged was recovered")?;
+    return Ok();
+}
+
+fn sweepJournalWrites(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    Faults.countOperations();
+    var staged: u64 = 0;
+    let all = journalWorkload(dir.view(), mut staged);
+    Faults.disarm();
+    Check.equalU64(18, all)?;
+    let points = Faults.seen();
+    Check.isTrue(points > 20, "the workload performs I/O")?;
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        armMode(borrow mode, n);
+        staged = 0;
+        let acked = journalWorkload(dir.view(), mut staged);
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired().min(1))?;
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        let lsns = replay(dir.view(), faultJournalConfig())!;
+        checkContiguous(borrow lsns, acked, staged)?;
+        // The recovered journal accepts writes again.
+        var lsn = lsns.length as u64 + 1;
+        {
+            var j = Journal.open(dir.view(), faultJournalConfig(), (s, o, h, b) => {})!;
+            var payload = Vector<u8>.create();
+            payloadFor(lsn, mut payload);
+            let pos = j.stage(RecordType.PutInline, "bucket\0key".bytes(), payload.view())!;
+            Check.equalU64(lsn, pos.lsn)?;
+            j.commit()!;
+        }
+        let again = replay(dir.view(), faultJournalConfig())!;
+        checkContiguous(borrow again, lsn, lsn)?;
+    }
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn journalFaultsOnceDuringWrites() -> Result<void, TestFailure> => sweepJournalWrites("jfault-once", SweepMode.Once);
+
+@test
+fn journalFaultsStickyDuringWrites() -> Result<void, TestFailure> =>
+    sweepJournalWrites("jfault-sticky", SweepMode.Sticky);
+
+@test
+fn journalFaultsTornDuringWrites() -> Result<void, TestFailure> =>
+    sweepJournalWrites("jfault-torn", SweepMode.StickyTorn);
+
+@test
+fn journalFaultsCrashDuringWrites() -> Result<void, TestFailure> => sweepJournalWrites("jfault-crash", SweepMode.Crash);
+
+fn sweepJournalRecovery(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    // A journal of 18 acknowledged records whose newest segment ends in a torn batch. Faults
+    // during recovery may fail the open, but never lose an acknowledged record.
+    Faults.elideSyncs(true);
+    let source = scratchDirectory(name);
+    var staged: u64 = 0;
+    let acked = journalWorkload(source.view(), mut staged);
+    Check.equalU64(18, acked)?;
+    let ids = listSegmentIds(source.view())!;
+    Check.isTrue(ids.length > 2, "the workload rotated")?;
+    var snapshot = FileSnapshot { names: Vector<String>.create(), contents: Vector<Vector<u8>>.create() };
+    snapshotFiles(source.view(), mut snapshot);
+    {
+        // The torn batch: half of a record after the last one.
+        let newest = ids[ids.length - 1];
+        for (i in 0..snapshot.names.length) {
+            let segment = segmentPath(source.view(), newest)!;
+            var full = String.create();
+            full.append(source.view())!;
+            full.append("/")!;
+            full.append(snapshot.names[i].view())!;
+            if (full.view() == segment.view()) {
+                var record = Vector<u8>.create();
+                encodeRecord(mut record, RecordType.PutInline, 0, 19, 0, "m".bytes(), "torn".bytes())!;
+                snapshot.contents[i].extend(record.view()[0..record.length / 2])!;
+            }
+        }
+    }
+    let dir = scratchDirectory(name);
+    Faults.countOperations();
+    restoreFiles(dir.view(), borrow snapshot);
+    let clean = replay(dir.view(), faultJournalConfig())!;
+    let points = Faults.seen();
+    Faults.disarm();
+    Check.equalU64(18, clean.length as u64)?;
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        restoreFiles(dir.view(), borrow snapshot);
+        armMode(borrow mode, n);
+        let _ = replay(dir.view(), faultJournalConfig());
+        Faults.disarm();
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        let lsns = replay(dir.view(), faultJournalConfig())!;
+        checkContiguous(borrow lsns, 18, 18)?;
+    }
+    removeTree(dir.view());
+    removeTree(source.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn journalFaultsOnceDuringRecovery() -> Result<void, TestFailure> =>
+    sweepJournalRecovery("jfault-recover-once", SweepMode.Once);
+
+@test
+fn journalFaultsCrashDuringRecovery() -> Result<void, TestFailure> =>
+    sweepJournalRecovery("jfault-recover-crash", SweepMode.Crash);
+
+@test
+fn journalRotationFailureStillAcknowledges() -> Result<void, TestFailure> {
+    // The batch that fills a segment is synced before the next segment is created. If creating
+    // it fails, the batch is still durable, so commit is Ok and the next commit fails.
+    let dir = scratchDirectory("jfault-rotate");
+    let config = JournalConfig { segmentTargetBytes: 100, maxBatchBytes: 4096, shardId: 0 };
+    {
+        var j = Journal.open(dir.view(), config, (s, o, h, b) => {})!;
+        var payload = Vector<u8>.create();
+        payloadFor(1, mut payload);
+        j.stage(RecordType.PutInline, "bucket\0key".bytes(), payload.view())!;
+        Faults.failAt(3, false, false); // 1 write, 2 sync, 3 open of the next segment
+        j.commit()!;
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired())?;
+        match (j.stage(RecordType.PutInline, "bucket\0key".bytes(), payload.view())) {
+            Err(JournalError.Failed) => {}
+            _ => { return Check.fail("a journal whose rotation failed must refuse writes"); }
+        }
+    }
+    let lsns = replay(dir.view(), config)!;
+    checkContiguous(borrow lsns, 1, 1)?;
+    removeTree(dir.view());
+    return Ok();
+}

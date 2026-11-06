@@ -67,10 +67,15 @@ Segments are replayed in id order, and records must have strictly increasing LSN
   X + `maxBatchBytes`, it belongs to a later batch, which was only written after X's batch was synced and
   acknowledged. That is corruption, so open fails. Otherwise everything from X on is an unacknowledged torn
   batch: it is truncated and the file is synced.
-- **A newest segment with a torn or missing header** (crash during rotation) is reinitialised.
+- **A newest segment with a torn or missing header** (crash during rotation) is reinitialised. A header that
+  could not be *read* is an I/O error, and the open fails. Treating it as torn would wipe the segment
+  (ADR-0004, bug 1).
+- **A rotation that fails after its batch was synced** does not un-acknowledge the batch. `commit` returns Ok,
+  and the journal is failed, so the next commit reports the error (ADR-0004, bug 4).
 
 Tests: `journal_tests.cee` truncates at every byte, flips bits in sealed and acknowledged regions, and checks
 rotation. `object_store_tests.cee` has the store-level crash-at-every-byte consistency test.
+`journal_fault_tests.cee` fails every I/O operation of writing and of recovery in turn (ADR-0004).
 
 ## Consequences
 

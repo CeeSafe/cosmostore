@@ -108,7 +108,7 @@ struct Journal {
             let path = segmentPath(dir, id)?;
             let file = jio(DurableFile.openReadWrite(path.view()))?;
             let size = jio(file.size())?;
-            let headerOk = readSegmentHeader(borrow file, size, id);
+            let headerOk = readSegmentHeader(borrow file, size, id)?;
             if (!headerOk) {
                 if (!last) { return Err(JournalError.BadSegmentHeader(id)); }
                 // The newest segment's creation was torn: start it again.
@@ -175,6 +175,9 @@ struct Journal {
 
     fn syncCount(borrow this) -> u64 => this.syncs;
 
+    /// Whether a write, sync or rotation failed; the journal refuses records until reopened.
+    fn isFailed(borrow this) -> bool => this.failed;
+
     fn committedCount(borrow this) -> u64 => this.committed;
 
     fn activeSegment(borrow this) -> u64 => this.segmentId;
@@ -206,7 +209,8 @@ struct Journal {
         this.pending.length + recordLength(metaLen, payloadLen) > this.config.maxBatchBytes;
 
     /// Makes every staged record durable with one write and one sync, then rotates the
-    /// segment if it is full. On error the journal is failed and nothing staged is durable.
+    /// segment if it is full. On error the journal is failed; the batch may or may not have
+    /// reached the disk, and must not be published.
     fn commit(borrow mut this) -> Result<void, JournalError> {
         if (this.failed) { return Err(JournalError.Failed); }
         if (this.pendingCount == 0) { return Ok(); }
@@ -223,8 +227,10 @@ struct Journal {
         this.writeOffset += this.pending.length as u64;
         this.pending.clear();
         this.pendingCount = 0;
+        // The batch is durable, so it is acknowledged even if the rotation fails: the caller
+        // must publish it. A failed rotation fails the journal, so the next commit reports it.
         if (this.writeOffset >= this.config.segmentTargetBytes) {
-            this.rotate()?;
+            let _ = this.rotate();
         }
         return Ok();
     }
@@ -345,16 +351,18 @@ fn writeSegmentHeader(file: borrow DurableFile, id: u64, firstLsn: u64, shardId:
 }
 
 /// Whether the segment starts with a valid header for `id`.
-fn readSegmentHeader(file: borrow DurableFile, size: u64, id: u64) -> bool {
-    if (size < SEGMENT_HEADER_LEN as u64) { return false; }
+/// Whether the segment's header is valid. A read error is an error, not an invalid header:
+/// recovery reinitialises a newest segment whose header is invalid, which must never happen
+/// to one that merely could not be read.
+fn readSegmentHeader(file: borrow DurableFile, size: u64, id: u64) -> Result<bool, JournalError> {
+    if (size < SEGMENT_HEADER_LEN as u64) { return Ok(false); }
     var h = [0u8; 64];
-    match (file.readExactAt(mut h[..], 0)) {
-        Ok() => {}
-        Err(_) => { return false; }
-    }
+    jio(file.readExactAt(mut h[..], 0))?;
     let r = h[..];
-    if (r.readLE<u32>(60) != Crc32c.of(r[0..60])) { return false; }
-    return r.readLE<u64>(0) == SEGMENT_MAGIC && r.readLE<u16>(8) == SEGMENT_FORMAT_VERSION && r.readLE<u64>(16) == id;
+    if (r.readLE<u32>(60) != Crc32c.of(r[0..60])) { return Ok(false); }
+    return Ok(
+        r.readLE<u64>(0) == SEGMENT_MAGIC && r.readLE<u16>(8) == SEGMENT_FORMAT_VERSION && r.readLE<u64>(16) == id,
+    );
 }
 
 /// Replays one segment's valid records. Returns the end of the last valid record.

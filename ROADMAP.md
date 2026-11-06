@@ -176,7 +176,7 @@ of M3, about 5 to 7 months in.
 | Primitives | Binary codec, CRC32C, CRC64NVME, SHA-256, MD5, secure random IDs, metrics counters/histograms |
 | CeeSafe.Web spike | Streaming request/response bodies, backpressure, cancellation, TLS, keep-alive; **24h soak** (#9) |
 | Compatibility matrix v0 | Spreadsheet of Tier A operations, each marked planned/M-number |
-| Fault-injection FS layer | An `Io` trait with a crash/short-write/EIO injector, used by every later test |
+| Fault-injection FS layer | **Done** (ADR-0004): failpoints (once, sticky, torn) on every `DurableFile`/`Fs` op, plus a crash model that keeps only synced data; used by every later test |
 
 **Exit:** soak passes, durability API is tested on Linux and macOS, ADRs are approved,
 and no storage code depends on undocumented FS behavior.
@@ -380,3 +380,37 @@ Findings to act on:
 
 Next: fault-injecting I/O layer → checkpoints + compaction (M2) → CeeSafe.Web spike → S3 HTTP layer (M3), with
 multipart built on the extent manifest.
+
+### 6 Nov 2026: fault-injecting I/O layer (ADR-0004)
+
+Done (`ceesafec test`: 42 passed, 0 failed, about 32 s):
+- `src/storage/io/faults.cee`:
+  - failpoints on every `DurableFile`/`Fs` operation, failing once, sticky, or with a torn write;
+  - a crash model: only synced bytes survive, and only entries whose directory was synced. Writes below a
+    synced length are counted as violations;
+  - `elideSyncs`, which keeps sweeps fast.
+
+  No new C.
+- Sweeps that fail every I/O operation in turn:
+  - journal writes, in all four modes;
+  - journal recovery from a torn tail;
+  - store workloads (buckets, inline and extent PUTs, a staged batch, overwrites that reap, a delete, a GET),
+    in all four modes;
+  - store open with a torn tail and an orphan extent.
+
+  The store sweeps check each key against a model of what it must or may hold, and check the extent directory
+  for orphans and missing files.
+- The crash sweeps were run against four mutants (no extent sync, no extent directory sync, no parent sync after
+  `mkdir`, no journal sync), and each one failed them.
+
+Bugs found and fixed (details in ADR-0004):
+1. One read error during recovery could wipe the newest journal segment, because it was treated as a torn header.
+2. After a journal failure, `deleteObject` could acknowledge a DELETE that a restart would undo. All mutations
+   now refuse once the journal has failed.
+3. The `extents/` directory entry was never synced into its parent, so a power cut could lose every extent.
+4. A failed segment rotation after a durable batch reported failure, and the store dropped the batch from memory.
+
+CeeSafe: G21, no safe process-wide table (the registry needs `static mut`).
+
+Next: checkpoints + compaction (M2), whose renames the crash model must learn first → CeeSafe.Web spike → S3
+HTTP layer (M3), with multipart built on the extent manifest.

@@ -1,4 +1,5 @@
-// Durable file primitives: a safe wrapper over durable_shim.c (ADR-002).
+// Durable file primitives: a safe wrapper over durable_shim.c (ADR-0002). Every operation
+// passes through the fault-injection hooks of faults.cee (ADR-0004).
 //
 // Everything that must survive a crash goes through DurableFile. The rules:
 // - `writeAt` places bytes; they are not durable until `syncData` returns Ok.
@@ -104,8 +105,12 @@ struct Fs {
     /// Safety: the CPath buffer is NUL-terminated and outlives the call.
     fn syncDirectory(dir: StringView) -> Result<void, IoFailure> {
         let p = CPath.from(dir)?;
-        let r = unsafe { cosmo_sync_dir(p.pointer()) };
-        if (r < 0) { return Err(IoFailure.os(IoOp.SyncDir, r as i64)); }
+        if (faultHit(IoOp.SyncDir)) { return Err(injected(IoOp.SyncDir)); }
+        if (!syncsElided()) {
+            let r = unsafe { cosmo_sync_dir(p.pointer()) };
+            if (r < 0) { return Err(IoFailure.os(IoOp.SyncDir, r as i64)); }
+        }
+        trackDirectorySynced(dir);
         return Ok();
     }
 
@@ -114,6 +119,7 @@ struct Fs {
     fn rename(from: StringView, to: StringView) -> Result<void, IoFailure> {
         let a = CPath.from(from)?;
         let b = CPath.from(to)?;
+        if (faultHit(IoOp.Rename)) { return Err(injected(IoOp.Rename)); }
         let r = unsafe { cosmo_rename(a.pointer(), b.pointer()) };
         if (r < 0) { return Err(IoFailure.os(IoOp.Rename, r as i64)); }
         return Ok();
@@ -123,24 +129,45 @@ struct Fs {
     /// Safety: the CPath buffer is NUL-terminated and outlives the call.
     fn unlink(path: StringView) -> Result<void, IoFailure> {
         let p = CPath.from(path)?;
+        if (faultHit(IoOp.Unlink)) { return Err(injected(IoOp.Unlink)); }
         let r = unsafe { cosmo_unlink(p.pointer()) };
         if (r < 0) { return Err(IoFailure.os(IoOp.Unlink, r as i64)); }
+        trackRemoved(path);
         return Ok();
     }
 
-    /// Creates a directory if it does not exist.
+    /// Creates a directory if it does not exist. A new directory's entry is made durable by
+    /// syncing the directory that holds it.
     /// Safety: the CPath buffer is NUL-terminated and outlives the call.
     fn ensureDirectory(path: StringView) -> Result<void, IoFailure> {
         let p = CPath.from(path)?;
+        if (faultHit(IoOp.Mkdir)) { return Err(injected(IoOp.Mkdir)); }
         let r = unsafe { cosmo_mkdir(p.pointer()) };
-        if (r < 0 && r != 0 - ERRNO_EEXIST) { return Err(IoFailure.os(IoOp.Mkdir, r as i64)); }
-        return Ok();
+        if (r == 0 - ERRNO_EEXIST) { return Ok(); }
+        if (r < 0) { return Err(IoFailure.os(IoOp.Mkdir, r as i64)); }
+        let _ = trackCreated(path, true);
+        return Fs.syncDirectory(Fs.parentOf(path));
+    }
+
+    /// The directory part of a path: everything before the last '/', or "." if there is none.
+    fn parentOf(path: StringView) -> StringView {
+        let bytes = path.bytes();
+        var cut = bytes.length;
+        while (cut > 0) {
+            if (bytes[cut - 1] == 0x2F) { break; }
+            cut -= 1;
+        }
+        if (cut == 0) { return "."; }
+        if (cut == 1) { return "/"; }
+        return StringView.fromUtf8(bytes[0..cut - 1]) ?? ".";
     }
 }
 
 /// An open file with positional I/O and explicit durability.
 struct DurableFile {
     private fd: i32;
+    /// The crash model's registry slot (faults.cee), or NO_SLOT.
+    private slot: u32;
 
     /// Opens an existing file for reading.
     fn openRead(path: StringView) -> Result<DurableFile, IoFailure> => DurableFile.openWith(path, O_READ);
@@ -154,15 +181,25 @@ struct DurableFile {
     /// Safety: the CPath buffer is NUL-terminated and outlives the call.
     fn openWith(path: StringView, flags: i32) -> Result<DurableFile, IoFailure> {
         let p = CPath.from(path)?;
+        if (faultHit(IoOp.Open)) { return Err(injected(IoOp.Open)); }
         let fd = unsafe { cosmo_open(p.pointer(), flags) };
         if (fd < 0) { return Err(IoFailure.os(IoOp.Open, fd as i64)); }
-        return Ok(DurableFile { fd: fd });
+        var file = DurableFile { fd: fd, slot: NO_SLOT };
+        if (tracking()) {
+            if (flags == O_RW_CREATE_EXCL) {
+                file.slot = trackCreated(path, false);
+            } else if (flags == O_RW_CREATE) {
+                file.slot = trackOpened(path, file.rawSize()?);
+            }
+        }
+        return Ok(file);
     }
 
     /// Reads up to `into.length` bytes at `offset`; returns how many were read (0 at the end).
     /// Safety: the pointer and length come from one live SliceMut.
     fn readAt(borrow this, into: SliceMut<u8>, offset: u64) -> Result<usize, IoFailure> {
         if (into.length == 0) { return Ok(0); }
+        if (faultHit(IoOp.Read)) { return Err(injected(IoOp.Read)); }
         let n = unsafe { cosmo_pread(this.fd, into.ptr, into.length, offset) };
         if (n < 0) { return Err(IoFailure.os(IoOp.Read, n)); }
         return Ok(checkedTruncate<usize>(n)!);
@@ -183,6 +220,16 @@ struct DurableFile {
     /// Safety: the pointer and length come from one live Slice.
     fn writeAt(borrow this, bytes: Slice<u8>, offset: u64) -> Result<void, IoFailure> {
         if (bytes.length == 0) { return Ok(); }
+        trackWrite(this.slot, offset);
+        if (faultHit(IoOp.Write)) {
+            if (tornWrites() && bytes.length > 1) { let _ = this.rawWriteAt(bytes[0..bytes.length / 2], offset); }
+            return Err(injected(IoOp.Write));
+        }
+        return this.rawWriteAt(bytes, offset);
+    }
+
+    /// Safety: the pointer and length come from one live Slice.
+    fn rawWriteAt(borrow this, bytes: Slice<u8>, offset: u64) -> Result<void, IoFailure> {
         let n = unsafe { cosmo_pwrite_all(this.fd, bytes.ptr, bytes.length, offset) };
         if (n < 0) { return Err(IoFailure.os(IoOp.Write, n)); }
         return Ok();
@@ -191,14 +238,24 @@ struct DurableFile {
     /// Makes written data, and the size needed to read it, durable (F_FULLFSYNC on macOS).
     /// Safety: the descriptor is owned by this value and open.
     fn syncData(borrow this) -> Result<void, IoFailure> {
-        let r = unsafe { cosmo_sync_data(this.fd) };
-        if (r < 0) { return Err(IoFailure.os(IoOp.Sync, r as i64)); }
+        if (faultHit(IoOp.Sync)) { return Err(injected(IoOp.Sync)); }
+        if (!syncsElided()) {
+            let r = unsafe { cosmo_sync_data(this.fd) };
+            if (r < 0) { return Err(IoFailure.os(IoOp.Sync, r as i64)); }
+        }
+        if (this.slot != NO_SLOT) { trackSynced(this.slot, this.rawSize()?); }
         return Ok();
     }
 
     /// The file's size in bytes.
     /// Safety: the descriptor is owned by this value and open.
     fn size(borrow this) -> Result<u64, IoFailure> {
+        if (faultHit(IoOp.Size)) { return Err(injected(IoOp.Size)); }
+        return this.rawSize();
+    }
+
+    /// Safety: the descriptor is owned by this value and open.
+    fn rawSize(borrow this) -> Result<u64, IoFailure> {
         let n = unsafe { cosmo_size(this.fd) };
         if (n < 0) { return Err(IoFailure.os(IoOp.Size, n)); }
         return Ok(checkedTruncate<u64>(n)!);
@@ -207,8 +264,10 @@ struct DurableFile {
     /// Cuts or extends the file to `length` bytes.
     /// Safety: the descriptor is owned by this value and open.
     fn truncateTo(borrow this, length: u64) -> Result<void, IoFailure> {
+        if (faultHit(IoOp.Truncate)) { return Err(injected(IoOp.Truncate)); }
         let r = unsafe { cosmo_truncate(this.fd, length) };
         if (r < 0) { return Err(IoFailure.os(IoOp.Truncate, r as i64)); }
+        trackTruncated(this.slot, length);
         return Ok();
     }
 

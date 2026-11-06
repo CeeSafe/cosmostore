@@ -1,0 +1,370 @@
+// Fault injection and a crash model for the durable I/O layer (ADR-0004).
+//
+// Every operation of DurableFile and Fs first asks `faultHit`. Tests arm a plan that fails the
+// n-th operation, either once or from then on (a dead disk or a power cut). Writes can be torn:
+// the first half lands, then the write fails.
+//
+// The crash model tracks what each file would hold after a power cut:
+// - only bytes that a successful syncData covered, and
+// - only files and directories whose entry a successful directory sync covered.
+// `Faults.crash(root)` then cuts the tree under `root` down to that state. It assumes that files
+// are only appended to between syncs, which is how the journal and extents write. A write below
+// a file's synced length is counted as a violation, so tests can check the assumption. An
+// unlink whose directory was never synced might come back after a real crash; the model
+// ignores this, and the orphan sweep would remove such an extent anyway.
+//
+// The state is process-wide atomics. `ceesafec test` runs each test in its own process, and the
+// store is single-threaded. With nothing armed, each hook is one atomic load.
+
+const FAULT_EIO: i32 = 5;
+const TRACK_SLOTS: usize = 512;
+const NO_SLOT: u32 = 0xFFFFFFFF;
+
+// ARMED bits.
+const ARM_FAULTS: u32 = 1;
+const ARM_TRACK: u32 = 2;
+const ARM_ELIDE_SYNC: u32 = 4;
+
+// TRACK_FLAGS bits.
+const SLOT_USED: u32 = 1;
+const SLOT_ENTRY_DURABLE: u32 = 2;
+const SLOT_DIRECTORY: u32 = 4;
+
+static ARMED: AtomicU32 = AtomicU32.constant(0);
+static FAIL_AT: AtomicU64 = AtomicU64.constant(0);
+static STICKY: AtomicBool = AtomicBool.constant(false);
+static TORN: AtomicBool = AtomicBool.constant(false);
+static SEEN: AtomicU64 = AtomicU64.constant(0);
+static FIRED: AtomicU64 = AtomicU64.constant(0);
+static VIOLATIONS: AtomicU64 = AtomicU64.constant(0);
+static FIRST_OP: AtomicU32 = AtomicU32.constant(0);
+
+/// The crash model's registry: one slot per tracked file or directory, keyed by path hash.
+/// A `static mut`, because arrays of atomics are not allowed (CEESAFE_GAPS G21). Only the
+/// accessors below touch it.
+struct TrackTable {
+    count: usize;
+    path: [u64; 512];
+    parent: [u64; 512];
+    synced: [u64; 512];
+    flags: [u32; 512];
+}
+
+static mut TRACK: TrackTable = TrackTable {
+    count: 0,
+    path: [0u64; 512],
+    parent: [0u64; 512],
+    synced: [0u64; 512],
+    flags: [0u32; 512],
+};
+
+// The accessors' safety argument: TRACK is used only by the single thread that does the store's
+// I/O. Tests run one per process, and the store has no I/O threads. Each access is a whole read
+// or write of one integer, and no reference to TRACK outlives the call.
+/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
+fn slotCount() -> usize => unsafe { TRACK.count };
+
+/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
+fn setSlotCount(n: usize) { unsafe { TRACK.count = n; } }
+
+/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
+fn slotPath(i: usize) -> u64 => unsafe { TRACK.path[i] };
+
+/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
+fn slotParent(i: usize) -> u64 => unsafe { TRACK.parent[i] };
+
+/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
+fn slotSynced(i: usize) -> u64 => unsafe { TRACK.synced[i] };
+
+/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
+fn slotFlags(i: usize) -> u32 => unsafe { TRACK.flags[i] };
+
+/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
+fn setSlot(i: usize, path: u64, parent: u64, synced: u64, flags: u32) {
+    unsafe {
+        TRACK.path[i] = path;
+        TRACK.parent[i] = parent;
+        TRACK.synced[i] = synced;
+        TRACK.flags[i] = flags;
+    }
+}
+
+/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
+fn setSlotSynced(i: usize, synced: u64) { unsafe { TRACK.synced[i] = synced; } }
+
+/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
+fn setSlotFlags(i: usize, flags: u32) { unsafe { TRACK.flags[i] = flags; } }
+
+/// Whether operation `op` fails by injection. Counts the operation when faults are armed.
+fn faultHit(op: IoOp) -> bool {
+    if ((ARMED.load() & ARM_FAULTS) == 0) { return false; }
+    let n = SEEN.fetchAdd(1) + 1;
+    let at = FAIL_AT.load();
+    if (at == 0) { return false; }
+    let hit = n == at || (STICKY.load() && n > at);
+    if (hit) {
+        if (FIRED.fetchAdd(1) == 0) { FIRST_OP.store(ioOpCode(op)); }
+    }
+    return hit;
+}
+
+fn ioOpCode(op: IoOp) -> u32 => match (op) {
+    IoOp.Open => 1,
+    IoOp.Read => 2,
+    IoOp.Write => 3,
+    IoOp.Sync => 4,
+    IoOp.SyncDir => 5,
+    IoOp.Size => 6,
+    IoOp.Truncate => 7,
+    IoOp.Rename => 8,
+    IoOp.Unlink => 9,
+    IoOp.Mkdir => 10,
+    _ => 0,
+};
+
+fn ioOpFromCode(code: u32) -> IoOp? => match (code) {
+    1 => IoOp.Open,
+    2 => IoOp.Read,
+    3 => IoOp.Write,
+    4 => IoOp.Sync,
+    5 => IoOp.SyncDir,
+    6 => IoOp.Size,
+    7 => IoOp.Truncate,
+    8 => IoOp.Rename,
+    9 => IoOp.Unlink,
+    10 => IoOp.Mkdir,
+    _ => null,
+};
+
+fn injected(op: IoOp) -> IoFailure => IoFailure { op: op, errno: FAULT_EIO };
+
+fn tornWrites() -> bool => TORN.load();
+
+fn syncsElided() -> bool => (ARMED.load() & ARM_ELIDE_SYNC) != 0;
+
+fn tracking() -> bool => (ARMED.load() & ARM_TRACK) != 0;
+
+/// FNV-1a over the path's bytes; never 0, which marks a free slot.
+fn pathHash(bytes: Slice<u8>) -> u64 {
+    var h: u64 = 0xCBF29CE484222325;
+    for (i in 0..bytes.length) {
+        h = (h ^ bytes[i] as u64).wrappingMul(0x100000001B3);
+    }
+    return if (h == 0) 1 else h;
+}
+
+/// The hash of the directory that holds `path` (everything before the last '/').
+fn parentHash(bytes: Slice<u8>) -> u64 {
+    var cut = bytes.length;
+    while (cut > 0) {
+        if (bytes[cut - 1] == 0x2F) { break; }
+        cut -= 1;
+    }
+    if (cut == 0) { return pathHash(".".bytes()); }
+    return pathHash(bytes[0..cut - 1]);
+}
+
+fn findSlot(hash: u64) -> u32 {
+    for (i in 0..slotCount()) {
+        if ((slotFlags(i) & SLOT_USED) != 0 && slotPath(i) == hash) { return truncate<u32>(i); }
+    }
+    return NO_SLOT;
+}
+
+fn addSlot(path: Slice<u8>, flags: u32, synced: u64) -> u32 {
+    let i = slotCount();
+    if (i >= TRACK_SLOTS) {
+        VIOLATIONS.fetchAdd(1); // the model is incomplete; the test must not trust it
+        return NO_SLOT;
+    }
+    setSlotCount(i + 1);
+    setSlot(i, pathHash(path), parentHash(path), synced, flags | SLOT_USED);
+    return truncate<u32>(i);
+}
+
+/// A file or directory this run created: nothing of it is durable yet.
+fn trackCreated(path: StringView, isDirectory: bool) -> u32 {
+    if (!tracking()) { return NO_SLOT; }
+    let old = findSlot(pathHash(path.bytes()));
+    if (old != NO_SLOT) { setSlotFlags(old as usize, 0); }
+    return addSlot(path.bytes(), if (isDirectory) SLOT_DIRECTORY else 0, 0);
+}
+
+/// A file opened for writing that may predate tracking: what it holds now counts as durable.
+fn trackOpened(path: StringView, size: u64) -> u32 {
+    if (!tracking()) { return NO_SLOT; }
+    let old = findSlot(pathHash(path.bytes()));
+    if (old != NO_SLOT) { return old; }
+    return addSlot(path.bytes(), SLOT_ENTRY_DURABLE, size);
+}
+
+fn trackWrite(slot: u32, offset: u64) {
+    if (slot == NO_SLOT || !tracking()) { return; }
+    if (offset < slotSynced(slot as usize)) { VIOLATIONS.fetchAdd(1); }
+}
+
+fn trackSynced(slot: u32, size: u64) {
+    if (slot == NO_SLOT || !tracking()) { return; }
+    setSlotSynced(slot as usize, size);
+}
+
+fn trackTruncated(slot: u32, length: u64) {
+    if (slot == NO_SLOT || !tracking()) { return; }
+    if (length < slotSynced(slot as usize)) { setSlotSynced(slot as usize, length); }
+}
+
+fn trackDirectorySynced(dir: StringView) {
+    if (!tracking()) { return; }
+    let h = pathHash(dir.bytes());
+    for (i in 0..slotCount()) {
+        let f = slotFlags(i);
+        if ((f & SLOT_USED) != 0 && slotParent(i) == h) { setSlotFlags(i, f | SLOT_ENTRY_DURABLE); }
+    }
+}
+
+fn trackRemoved(path: StringView) {
+    if (!tracking()) { return; }
+    let slot = findSlot(pathHash(path.bytes()));
+    if (slot != NO_SLOT) { setSlotFlags(slot as usize, 0); }
+}
+
+fn listFailure() -> IoFailure => IoFailure { op: IoOp.Open, errno: 0 };
+
+fn childPath(dir: StringView, name: StringView) -> Result<String, IoFailure> {
+    var p = String.create();
+    oomIo(p.append(dir))?;
+    oomIo(p.append("/"))?;
+    oomIo(p.append(name))?;
+    return Ok(p);
+}
+
+fn oomIo<T>(r: Result<T, AllocError>) -> Result<T, IoFailure> => match (r) {
+    Ok(v) => Ok(v),
+    Err(_) => Err(IoFailure { op: IoOp.OutOfMemory, errno: 0 }),
+};
+
+fn isDirectoryPath(path: StringView) -> bool => match (File.kind(path)) {
+    Ok(Some(PathKind.Directory)) => true,
+    _ => false,
+};
+
+fn removeTreeAt(path: StringView) {
+    if (isDirectoryPath(path)) {
+        match (Directory.list(path)) {
+            Ok(names) => {
+                for (i in 0..names.length) {
+                    match (childPath(path, names[i].view())) {
+                        Ok(child) => { removeTreeAt(child.view()); }
+                        Err(_) => {}
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        let _ = Directory.remove(path);
+    } else {
+        let _ = Fs.unlink(path);
+    }
+}
+
+/// Applies the crash model to every entry below `dir`; returns how many entries it changed.
+fn crashTree(dir: StringView) -> Result<u64, IoFailure> {
+    let names = match (Directory.list(dir)) {
+        Ok(n) => n,
+        Err(_) => { return Err(listFailure()); }
+    };
+    var changed: u64 = 0;
+    for (i in 0..names.length) {
+        let child = childPath(dir, names[i].view())?;
+        let slot = findSlot(pathHash(child.bytes()));
+        let isDir = isDirectoryPath(child.view());
+        if (slot != NO_SLOT) {
+            let s = slot as usize;
+            if ((slotFlags(s) & SLOT_ENTRY_DURABLE) == 0) {
+                removeTreeAt(child.view());
+                changed += 1;
+                continue;
+            }
+            if (!isDir) {
+                let file = DurableFile.openReadWrite(child.view())?;
+                let synced = slotSynced(s);
+                if (file.size()? > synced) {
+                    file.truncateTo(synced)?;
+                    changed += 1;
+                }
+            }
+        }
+        if (isDir) { changed += crashTree(child.view())?; }
+    }
+    return Ok(changed);
+}
+
+fn resetTracking() {
+    for (i in 0..slotCount()) { setSlotFlags(i, 0); }
+    setSlotCount(0);
+}
+
+/// The test-facing control of fault injection and the crash model.
+struct Faults {
+    /// Counts operations without failing any; read the count with `seen`.
+    fn countOperations() {
+        FAIL_AT.store(0);
+        FIRST_OP.store(0);
+        SEEN.store(0);
+        FIRED.store(0);
+        ARMED.store(ARMED.load() | ARM_FAULTS);
+    }
+
+    /// Fails the n-th operation from now (1-based). With `sticky`, every later one fails too.
+    /// With `torn`, a failing write first writes half of its bytes.
+    fn failAt(n: u64, sticky: bool, torn: bool) {
+        FAIL_AT.store(n);
+        STICKY.store(sticky);
+        TORN.store(torn);
+        FIRST_OP.store(0);
+        SEEN.store(0);
+        FIRED.store(0);
+        ARMED.store(ARMED.load() | ARM_FAULTS);
+    }
+
+    /// Stops injecting; the counters keep their values.
+    fn disarm() { ARMED.store(ARMED.load() & (ARM_FAULTS ^ 0xFFFFFFFF)); }
+
+    /// Operations seen since the plan was armed.
+    fn seen() -> u64 => SEEN.load();
+
+    /// Failures injected since the plan was armed.
+    fn fired() -> u64 => FIRED.load();
+
+    /// The operation of the first injected failure, for diagnostics.
+    fn firstFailure() -> IoOp? => ioOpFromCode(FIRST_OP.load());
+
+    /// Skips the OS sync calls (they still count, can fail, and mark data synced in the crash
+    /// model). For fast sweeps; durability itself is not being tested then.
+    fn elideSyncs(on: bool) {
+        if (on) {
+            ARMED.store(ARMED.load() | ARM_ELIDE_SYNC);
+        } else {
+            ARMED.store(ARMED.load() & (ARM_ELIDE_SYNC ^ 0xFFFFFFFF));
+        }
+    }
+
+    /// Starts the crash model with an empty registry: what exists now counts as durable.
+    fn track() {
+        resetTracking();
+        VIOLATIONS.store(0);
+        ARMED.store(ARMED.load() | ARM_TRACK);
+    }
+
+    /// Writes below a file's synced length, or a full registry, since `track`.
+    fn violations() -> u64 => VIOLATIONS.load();
+
+    /// Simulates a power cut: stops faults and tracking, then cuts every tracked entry below
+    /// `root` to its durable state. Close every file first. Returns how many entries changed.
+    fn crash(root: StringView) -> Result<u64, IoFailure> {
+        ARMED.store(ARMED.load() & ARM_ELIDE_SYNC); // the model's own I/O is neither faulted nor tracked
+        let changed = crashTree(root);
+        resetTracking();
+        return changed;
+    }
+}

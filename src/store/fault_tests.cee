@@ -1,0 +1,386 @@
+// ObjectStore fault-injection sweeps (ADR-0004). A fixed workload runs once per I/O operation,
+// with that operation failing. A model tracks, for each key, the version it must have and the
+// one it may have instead. The second is set only by a journal I/O error, because only then
+// can a write that was not acknowledged still be on disk. After reopening, and after the crash
+// model where it applies:
+// - every key holds one of its two allowed versions, byte for byte;
+// - the extent directory holds exactly the extents of the live versions (no orphans, none
+//   missing);
+// - the store accepts writes again.
+
+const FKEYS: usize = 5;
+
+fn faultStoreConfig() -> StoreConfig => StoreConfig {
+    journal: JournalConfig { segmentTargetBytes: 4096, maxBatchBytes: 65536, shardId: 0 },
+    inlineMaxBytes: 16384,
+    extentMaxBytes: 65536,
+    maxObjectBytes: 5368709120,
+};
+
+/// Seed 0 means no object. The others: inline or extent-backed sizes.
+fn seedSize(seed: u64) -> usize => match (seed) {
+    1 => 100,
+    2 => 70000,
+    3 => 300,
+    4 => 90000,
+    5 => 20000,
+    6 => 50,
+    7 => 5000,
+    8 => 140000,
+    _ => 1,
+};
+
+fn seedExtents(seed: u64) -> u64 {
+    if (seed == 0) { return 0; }
+    let size = seedSize(seed) as u64;
+    if (size <= 16384) { return 0; }
+    return (size + 65535) / 65536;
+}
+
+fn keyName(k: usize) -> StringView => match (k) {
+    0 => "k0",
+    1 => "k1",
+    2 => "k2",
+    3 => "dir/k3",
+    _ => "dir/k4",
+};
+
+/// What a key, or the bucket, must hold, and what it may hold instead.
+struct FaultModel {
+    bucket: bool;
+    bucketAlt: bool;
+    cur: [u64; 5];
+    alt: [u64; 5];
+    /// Staged, not yet committed (0: nothing staged for the key).
+    pending: [u64; 5];
+    hasPending: [bool; 5];
+
+    fn create() -> FaultModel => FaultModel {
+        bucket: false,
+        bucketAlt: false,
+        cur: [0u64; 5],
+        alt: [0u64; 5],
+        pending: [0u64; 5],
+        hasPending: [false; 5],
+    };
+
+    fn succeeded(borrow mut this, k: usize, seed: u64) {
+        this.cur[k] = seed;
+        this.alt[k] = seed;
+    }
+
+    /// An operation on key `k` failed with `e`; with a journal I/O error it may be durable,
+    /// and so may everything staged.
+    fn failed(borrow mut this, k: usize, seed: u64, e: borrow StoreError) {
+        if (!mayBeDurable(e)) { return; }
+        if (k < FKEYS) { this.alt[k] = seed; }
+        for (i in 0..FKEYS) {
+            if (this.hasPending[i]) { this.alt[i] = this.pending[i]; }
+        }
+        this.dropPending();
+    }
+
+    fn committed(borrow mut this) {
+        for (i in 0..FKEYS) {
+            if (this.hasPending[i]) { this.succeeded(i, this.pending[i]); }
+        }
+        this.dropPending();
+    }
+
+    fn dropPending(borrow mut this) {
+        for (i in 0..FKEYS) { this.hasPending[i] = false; }
+    }
+}
+
+fn mayBeDurable(e: borrow StoreError) -> bool => match (e) {
+    StoreError.Journal(JournalError.Io(_)) => true,
+    _ => false,
+};
+
+fn putSeed(s: borrow mut ObjectStore, k: usize, seed: u64) -> Result<void, StoreError> {
+    let data = patterned(seedSize(seed), seed);
+    s.putObject("bkt", keyName(k), "application/octet-stream", data.view(), PutCondition.None)?;
+    return Ok();
+}
+
+fn stageSeed(s: borrow mut ObjectStore, k: usize, seed: u64) -> Result<void, StoreError> {
+    let data = patterned(seedSize(seed), seed);
+    let obj = s.writeAll(data.view())?;
+    s.stageObject("bkt", keyName(k), "application/octet-stream", borrow obj)?;
+    return Ok();
+}
+
+/// The seed whose bytes the key holds: one of `a`, `b`, or 99 for anything else.
+fn heldSeed(s: borrow ObjectStore, k: usize, a: u64, b: u64) -> u64 {
+    let got = match (s.getObject("bkt", keyName(k))) {
+        Ok(v) => v,
+        Err(StoreError.NoSuchKey) => { return 0; }
+        Err(StoreError.NoSuchBucket) => { return 0; }
+        Err(_) => { return 99; }
+    };
+    if (a != 0 && got.view() == patterned(seedSize(a), a).view()) { return a; }
+    if (b != 0 && got.view() == patterned(seedSize(b), b).view()) { return b; }
+    return 99;
+}
+
+/// Runs the workload, updating `m` with what each step's outcome allows.
+fn storeWorkload(dir: StringView, m: borrow mut FaultModel) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    match (s.createBucket("bkt")) {
+        Ok() => {
+            m.bucket = true;
+            m.bucketAlt = true;
+        }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.bucketAlt = true; }
+        }
+    }
+    // Puts: inline, then extent-backed.
+    let puts = [0usize, 1];
+    let putSeeds = [1u64, 2];
+    for (i in 0..2) {
+        match (putSeed(mut s, puts[i], putSeeds[i])) {
+            Ok() => { m.succeeded(puts[i], putSeeds[i]); }
+            Err(e) => { m.failed(puts[i], putSeeds[i], borrow e); }
+        }
+    }
+    // One batch of two writes.
+    let staged = [2usize, 3];
+    let stagedSeeds = [3u64, 4];
+    for (i in 0..2) {
+        match (stageSeed(mut s, staged[i], stagedSeeds[i])) {
+            Ok() => {
+                m.pending[staged[i]] = stagedSeeds[i];
+                m.hasPending[staged[i]] = true;
+            }
+            Err(e) => { m.failed(staged[i], stagedSeeds[i], borrow e); }
+        }
+    }
+    match (s.commitStaged()) {
+        Ok(_) => { m.committed(); }
+        Err(e) => { m.failed(FKEYS, 0, borrow e); }
+    }
+    // Overwrites: inline to extent, extent to inline (reaps), extent to extent (reaps).
+    let overs = [0usize, 1, 3];
+    let overSeeds = [5u64, 6, 8];
+    for (i in 0..3) {
+        match (putSeed(mut s, overs[i], overSeeds[i])) {
+            Ok() => { m.succeeded(overs[i], overSeeds[i]); }
+            Err(e) => { m.failed(overs[i], overSeeds[i], borrow e); }
+        }
+    }
+    // A read under faults must give an allowed version or an error.
+    match (s.getObject("bkt", keyName(2))) {
+        Ok(v) => {
+            let okCur = m.cur[2] != 0 && v.view() == patterned(seedSize(m.cur[2]), m.cur[2]).view();
+            let okAlt = m.alt[2] != 0 && v.view() == patterned(seedSize(m.alt[2]), m.alt[2]).view();
+            if (!okCur && !okAlt) { m.cur[2] = 99; } // the check after reopening reports it
+        }
+        Err(_) => {}
+    }
+    match (s.deleteObject("bkt", keyName(3))) {
+        Ok() => { m.succeeded(3, 0); }
+        Err(e) => { m.failed(3, 0, borrow e); }
+    }
+    match (putSeed(mut s, 4, 7)) {
+        Ok() => { m.succeeded(4, 7); }
+        Err(e) => { m.failed(4, 7, borrow e); }
+    }
+}
+
+/// Checks a reopened store against the model; returns the extents its live versions need.
+fn checkStore(s: borrow ObjectStore, m: borrow FaultModel) -> Result<u64, TestFailure> {
+    let hasBucket = s.bucketExists("bkt")!;
+    Check.isTrue(hasBucket == m.bucket || hasBucket == m.bucketAlt, "the bucket is in an allowed state")?;
+    var extents: u64 = 0;
+    for (k in 0..FKEYS) {
+        let held = heldSeed(s, k, m.cur[k], m.alt[k]);
+        if (!hasBucket) {
+            Check.equalU64(0, held)?;
+            continue;
+        }
+        Check.isTrue(held == m.cur[k] || held == m.alt[k], "a key holds an allowed version")?;
+        extents += seedExtents(held);
+    }
+    return Ok(extents);
+}
+
+fn sweepStore(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    var model = FaultModel.create();
+    Faults.countOperations();
+    storeWorkload(dir.view(), mut model);
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 40, "the workload performs I/O")?;
+    let expected = [5u64, 6, 3, 0, 7];
+    for (k in 0..FKEYS) { Check.equalU64(expected[k], model.cur[k])?; }
+    var outcomes: u64 = 0;
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        var m = FaultModel.create();
+        armMode(borrow mode, n);
+        storeWorkload(dir.view(), mut m);
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired().min(1))?;
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        {
+            var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+            let extents = checkStore(borrow s, borrow m)?;
+            Check.equalU64(extents, extentFiles(dir.view()))?;
+            if (!s.bucketExists("bkt")!) { s.createBucket("bkt")!; }
+            putSeed(mut s, 0, 2)!; // writable again
+        }
+        let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        Check.equalU64(2, heldSeed(borrow s, 0, 2, 2))?;
+        if (m.cur[1] == 6) { outcomes += 1; }
+    }
+    Check.isTrue(outcomes > 0, "some runs got past the overwrites")?;
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn storeFaultsOnce() -> Result<void, TestFailure> => sweepStore("sfault-once", SweepMode.Once);
+
+@test
+fn storeFaultsSticky() -> Result<void, TestFailure> => sweepStore("sfault-sticky", SweepMode.Sticky);
+
+@test
+fn storeFaultsTorn() -> Result<void, TestFailure> => sweepStore("sfault-torn", SweepMode.StickyTorn);
+
+@test
+fn storeFaultsCrash() -> Result<void, TestFailure> => sweepStore("sfault-crash", SweepMode.Crash);
+
+fn sweepStoreOpen(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    // A store after the whole workload, plus an orphan extent and a torn journal tail. Faults
+    // while opening it may fail the open, but never change what it holds.
+    Faults.elideSyncs(true);
+    let source = scratchDirectory(name);
+    var full = FaultModel.create();
+    storeWorkload(source.view(), mut full);
+    {
+        let s = ObjectStore.open(source.view(), faultStoreConfig())!;
+        var w = s.newWriter()!;
+        w.write(patterned(100000, 77).view())!;
+        let orphan = w.finish()!; // finished, never committed
+    }
+    var root = FileSnapshot { names: Vector<String>.create(), contents: Vector<Vector<u8>>.create() };
+    var extents = FileSnapshot { names: Vector<String>.create(), contents: Vector<Vector<u8>>.create() };
+    var sourceExtents = String.create();
+    sourceExtents.append(source.view())!;
+    sourceExtents.append("/extents")!;
+    snapshotFiles(sourceExtents.view(), mut extents);
+    removeTree(sourceExtents.view());
+    snapshotFiles(source.view(), mut root);
+    {
+        let ids = listSegmentIds(source.view())!;
+        let newest = segmentPath(source.view(), ids[ids.length - 1])!;
+        for (i in 0..root.names.length) {
+            var path = String.create();
+            path.append(source.view())!;
+            path.append("/")!;
+            path.append(root.names[i].view())!;
+            if (path.view() == newest.view()) {
+                var record = Vector<u8>.create();
+                encodeRecord(mut record, RecordType.BucketCreate, 0, 1000, 0, "m".bytes(), "torn".bytes())!;
+                root.contents[i].extend(record.view()[0..record.length - 3])!;
+            }
+        }
+    }
+    let dir = scratchDirectory(name);
+    var targetExtents = String.create();
+    targetExtents.append(dir.view())!;
+    targetExtents.append("/extents")!;
+    var points: u64 = 0;
+    var n: u64 = 0;
+    while (n <= points) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        restoreFiles(dir.view(), borrow root);
+        Fs.ensureDirectory(targetExtents.view())!;
+        restoreFiles(targetExtents.view(), borrow extents);
+        if (n == 0) {
+            Faults.countOperations();
+        } else {
+            armMode(borrow mode, n);
+        }
+        var m = full;
+        match (ObjectStore.open(dir.view(), faultStoreConfig())) {
+            Ok(opened) => {
+                var s = opened;
+                match (putSeed(mut s, 4, 3)) {
+                    Ok() => { m.succeeded(4, 3); }
+                    Err(e) => { m.failed(4, 3, borrow e); }
+                }
+            }
+            Err(_) => {}
+        }
+        Faults.disarm();
+        if (n == 0) {
+            points = Faults.seen();
+            Check.isTrue(points > 10, "opening performs I/O")?;
+        } else {
+            Check.equalU64(1, Faults.fired().min(1))?;
+        }
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        let live = checkStore(borrow s, borrow m)?;
+        Check.equalU64(live, extentFiles(dir.view()))?;
+        n += 1;
+    }
+    removeTree(dir.view());
+    removeTree(source.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn storeFaultsOnceDuringOpen() -> Result<void, TestFailure> => sweepStoreOpen("sfault-open-once", SweepMode.Once);
+
+@test
+fn storeFaultsCrashDuringOpen() -> Result<void, TestFailure> => sweepStoreOpen("sfault-open-crash", SweepMode.Crash);
+
+@test
+fn storeRefusesWritesAfterJournalFailure() -> Result<void, TestFailure> {
+    // A batch whose sync fails may still be on disk, but it is not applied in memory. A delete
+    // of a key it wrote must not be acknowledged as "already absent": after a restart the key
+    // can be there.
+    let dir = scratchDirectory("sfault-refuse");
+    {
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        s.createBucket("bkt")!;
+        stageSeed(mut s, 0, 1)!;
+        Faults.failAt(2, false, false); // 1 the batch's write, 2 its sync
+        match (s.commitStaged()) {
+            Err(StoreError.Journal(JournalError.Io(_))) => {}
+            _ => { return Check.fail("the injected sync failure is reported"); }
+        }
+        Faults.disarm();
+        match (s.deleteObject("bkt", keyName(0))) {
+            Err(StoreError.Journal(JournalError.Failed)) => {}
+            _ => { return Check.fail("a failed store must refuse a delete"); }
+        }
+        match (putSeed(mut s, 1, 1)) {
+            Err(StoreError.Journal(JournalError.Failed)) => {}
+            _ => { return Check.fail("a failed store must refuse a put"); }
+        }
+        Check.equalU64(0, extentFiles(dir.view()))?;
+    }
+    let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+    Check.equalU64(1, heldSeed(borrow s, 0, 1, 1))?; // the write reached the disk before the sync failed
+    removeTree(dir.view());
+    return Ok();
+}
