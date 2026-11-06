@@ -207,7 +207,8 @@ and no storage code depends on undocumented FS behavior.
   retires old segments after a grace period.
 - Orphan extent sweeper.
 - Disk-space reserve with write rejection before it is reached.
-- Checkpoint rotation so recovery time stays bounded.
+- Checkpoint rotation so recovery time stays bounded. **Done** (ADR-0005).
+- Segment compaction with locator swaps (`Relocate` records). **Done** (ADR-0005).
 - An `fsck` tool that verifies every locator and checksum.
 
 **Exit:** a 24h overwrite/delete churn test keeps disk usage within 1.5× live bytes,
@@ -414,3 +415,55 @@ CeeSafe: G21, no safe process-wide table (the registry needs `static mut`).
 
 Next: checkpoints + compaction (M2), whose renames the crash model must learn first → CeeSafe.Web spike → S3
 HTTP layer (M3), with multipart built on the extent manifest.
+
+### 6 Nov 2026: checkpoints and compaction (ADR-0005)
+
+Done (`ceesafec test`: 54 passed, 0 failed, about 39 s):
+- **Checkpoints** (`src/store/checkpoint.cee`):
+  - the whole state after LSN L is published by temp file, sync, rename, then directory sync;
+  - the journal is sealed first, so a checkpoint covers whole segments;
+  - recovery loads the newest one and scans only later segments (`Journal.openFrom`);
+  - a damaged checkpoint fails the open, and a missing replay segment is `MissingSegment`.
+- **Compaction** (`ObjectStore.compact`, and `maintain` for scheduling): only covered segments that are empty
+  or less than 50% live are compacted. Live inline payloads are verified and copied into `Relocate` records,
+  which keep the generation, and the segments are deleted once the copies are durable.
+- **Live bytes now mean inline payloads only.** Extent manifests and buckets are in the checkpoint.
+- **Inline GETs verify the whole record**, because recovery no longer reads covered segments. A read handle is
+  cached for each sealed segment.
+- **The crash model tracks `rename`.** The fault sweeps cover a workload with checkpoints and compaction (6 new
+  sweeps), and three ordering mutants fail them.
+
+| Objects (1 KiB) | Full replay | Checkpoint | Recovery from checkpoint |
+|---|---|---|---|
+| 100k | 254 ms | 44 ms | 44 ms |
+| 1M | 2,546 ms | 273 ms | 485 ms |
+
+The churn test (80 rounds of overwrites, `maintain` after each) keeps the journal under 64 KiB while about
+800 KB is written.
+
+Limits:
+- one file descriptor per sealed segment (needs an LRU later);
+- each checkpoint rewrites the whole index;
+- inline GETs pay a record CRC (452k/s → about 400k/s).
+
+CeeSafe: G22, no explicit dereference.
+
+Still open in M2: a disk-space reserve with write rejection, an `fsck` tool, the 24h churn soak, and reaping
+that waits for readers.
+
+Next: the rest of M2 (space reserve, fsck), or the CeeSafe.Web spike → S3 HTTP layer (M3).
+
+### 6 Nov 2026: on CeeSafe 0.19 (its ADR 0075, from this repo's CEESAFE_GAPS.md)
+
+- **Removed:**
+  - the C shim (`durable_shim.c`/`.h`) and the manifest's `c`/`include-dirs`, so CosmoStore is pure CeeSafe;
+  - every `unsafe` block, along with the `static mut` fault registry (now arrays of atomics);
+  - the error adapters (now `@from` variants);
+  - the CRC32C/MD5 implementations and `tools/gen_crc32c.py`, replaced by lib/std's;
+  - the copies in `ObjectWriter` (now `replace`).
+- **Unchanged:** the I/O failure codes. `IoFailure` keeps its errno values, mapped from `IoError`, so the fault
+  model and messages read as before.
+- **Tests:** 53 pass. `md5StreamingMatchesOneShot` is gone because lib/std tests MD5 streaming; the RFC vectors stay
+  as a format guard.
+- **Toolchain:** needs ceesafec from CeeSafe's main tree (`File.readAt` and the others take `borrow this` there) until
+  CeeSafe's next release.

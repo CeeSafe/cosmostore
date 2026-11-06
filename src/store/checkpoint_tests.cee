@@ -1,0 +1,311 @@
+// Checkpoint and compaction tests (ADR-0005). The fault sweeps reuse fault_tests.cee's model.
+
+fn countFiles(dir: StringView, prefix: StringView, suffix: StringView) -> u64 {
+    let names = Directory.list(dir)!;
+    var n: u64 = 0;
+    for (i in 0..names.length) {
+        let name = names[i].view();
+        if (name.startsWith(prefix) && name.endsWith(suffix)) { n += 1; }
+    }
+    return n;
+}
+
+fn numberedName(i: u64) -> String {
+    var name = String.create();
+    name.append("obj-")!;
+    name.appendNumber(i)!;
+    return name;
+}
+
+fn objectSize(i: u64) -> usize => truncate<usize>(200 + i * 37);
+
+@test
+fn checkpointBoundsReplay() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("ckpt-replay");
+    let ctype = "application/octet-stream";
+    var generation: u64 = 0;
+    {
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        s.createBucket("bkt")!;
+        s.createBucket("other")!;
+        for (i in 0u64..60) {
+            let name = numberedName(i);
+            s.putObject("bkt", name.view(), ctype, patterned(objectSize(i), i).view(), PutCondition.None)!;
+        }
+        s.putObject("bkt", "big", ctype, patterned(150000, 99).view(), PutCondition.None)!;
+        for (i in 0u64..10) { s.deleteObject("bkt", numberedName(i).view())!; }
+        for (i in 10u64..20) {
+            let name = numberedName(i);
+            s.putObject("bkt", name.view(), ctype, patterned(objectSize(i), i + 1000).view(), PutCondition.None)!;
+        }
+        generation = s.headObject("bkt", numberedName(20).view())!.generation;
+        Check.isTrue(s.checkpoint()!, "a checkpoint is written")?;
+        Check.isFalse(s.checkpoint()!, "nothing new: no second checkpoint")?;
+        s.putObject("bkt", "after", ctype, "tail".bytes(), PutCondition.None)!;
+    }
+    Check.equalU64(1, countFiles(dir.view(), "ckpt-", ".ck"))?;
+    var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+    Check.equalU64(1, s.recordsApplied())?; // only the record after the checkpoint
+    for (i in 0u64..60) {
+        let name = numberedName(i);
+        match (s.getObject("bkt", name.view())) {
+            Ok(v) => {
+                Check.isTrue(i >= 10, "a deleted key stays deleted")?;
+                let seed = if (i < 20) i + 1000 else i;
+                Check.equalBytes(patterned(objectSize(i), seed).view(), v.view())?;
+            }
+            Err(StoreError.NoSuchKey) => { Check.isTrue(i < 10, "a live key survives")?; }
+            Err(_) => { return Check.fail("unexpected error"); }
+        }
+    }
+    Check.equalBytes(patterned(150000, 99).view(), s.getObject("bkt", "big")!.view())?;
+    Check.equalBytes("tail".bytes(), s.getObject("bkt", "after")!.view())?;
+    Check.equalU64(generation, s.headObject("bkt", numberedName(20).view())!.generation)?;
+    Check.equalU64(52, s.objectCount() as u64)?;
+    match (s.deleteBucket("bkt")) {
+        Err(StoreError.BucketNotEmpty) => {}
+        _ => { return Check.fail("object counts are rebuilt from the checkpoint"); }
+    }
+    s.deleteBucket("other")!;
+    Check.equalU64(3, extentFiles(dir.view()))?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn compactionRelocatesAndKeepsGenerations() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("ckpt-compact");
+    let ctype = "application/octet-stream";
+    var kept: u64 = 0;
+    {
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        s.createBucket("bkt")!;
+        kept = s.putObject("bkt", "keep", ctype, patterned(300, 1).view(), PutCondition.None)!.generation;
+        for (r in 0u64..40) {
+            for (k in 0u64..10) {
+                var name = String.create();
+                name.append("hot-")!;
+                name.appendNumber(k)!;
+                s.putObject("bkt", name.view(), ctype, patterned(900, r * 100 + k).view(), PutCondition.None)!;
+            }
+        }
+        let before = s.journalBytes();
+        Check.isTrue(s.checkpoint()!, "checkpoint")?;
+        let stats = s.compact(1073741824)!;
+        Check.isTrue(stats.segmentsRemoved > 5, "garbage segments are removed")?;
+        Check.isTrue(stats.relocated > 0, "live payloads in them are copied")?;
+        Check.isTrue(s.journalBytes() * 3 < before, "most of the space comes back")?;
+        Check.equalU64(s.segmentCount() as u64, countFiles(dir.view(), "seg-", ".cj"))?;
+        Check.equalU64(kept, s.headObject("bkt", "keep")!.generation)?;
+        Check.equalBytes(patterned(300, 1).view(), s.getObject("bkt", "keep")!.view())?;
+        // Nothing left to do.
+        Check.equalU64(0, s.compact(1073741824)!.segmentsRemoved)?;
+    }
+    var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+    Check.equalU64(kept, s.headObject("bkt", "keep")!.generation)?;
+    Check.equalBytes(patterned(300, 1).view(), s.getObject("bkt", "keep")!.view())?;
+    for (k in 0u64..10) {
+        var name = String.create();
+        name.append("hot-")!;
+        name.appendNumber(k)!;
+        Check.equalBytes(patterned(900, 3900 + k).view(), s.getObject("bkt", name.view())!.view())?;
+    }
+    // The generation still guards conditional writes.
+    s.putObject("bkt", "keep", ctype, "next".bytes(), PutCondition.IfGeneration(kept))!;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn churnStaysWithinBoundedSpace() -> Result<void, TestFailure> {
+    // Overwrite churn with periodic maintenance: the journal stays a small multiple of the
+    // live data however much is written (ROADMAP M2 exit criterion, in miniature).
+    let dir = scratchDirectory("ckpt-churn");
+    let ctype = "application/octet-stream";
+    var config = faultStoreConfig();
+    config.checkpointEveryBytes = 16384;
+    var s = ObjectStore.open(dir.view(), config)!;
+    s.createBucket("bkt")!;
+    var written: u64 = 0;
+    var largest: u64 = 0;
+    for (r in 0u64..80) {
+        for (k in 0u64..10) {
+            var name = String.create();
+            name.append("k")!;
+            name.appendNumber(k)!;
+            s.putObject("bkt", name.view(), ctype, patterned(1000, r * 10 + k).view(), PutCondition.None)!;
+            written += 1000;
+        }
+        let _ = s.maintain()!;
+        let now = s.journalBytes();
+        if (now > largest) { largest = now; }
+    }
+    // Live: 10 records of about 1.1 KB. Allowed: twice that in half-live segments, plus the
+    // segments since the last checkpoint (16 KiB) and the active one (4 KiB), with slack.
+    Check.isTrue(largest < 65536, "the journal stays bounded")?;
+    Check.isTrue(written > 10 * largest, "far more was written than is kept")?;
+    Check.isTrue(countFiles(dir.view(), "ckpt-", ".ck") <= 1, "old checkpoints are removed")?;
+    for (k in 0u64..10) {
+        var name = String.create();
+        name.append("k")!;
+        name.appendNumber(k)!;
+        Check.equalBytes(patterned(1000, 790 + k).view(), s.getObject("bkt", name.view())!.view())?;
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+fn flipByteAt(path: StringView, fromEnd: usize) {
+    var bytes = readWhole(path);
+    let at = bytes.length - fromEnd;
+    bytes[at] = bytes[at] ^ 0x01;
+    writeWhole(path, bytes.view());
+}
+
+@test
+fn inlineCorruptionIsDetected() -> Result<void, TestFailure> {
+    // A checkpoint means recovery no longer reads the segments it covers, so GET and compaction
+    // must verify every inline record they read.
+    let dir = scratchDirectory("ckpt-rot");
+    var config = faultStoreConfig();
+    config.compactBelowLivePercent = 101; // every covered segment is a candidate
+    {
+        var s = ObjectStore.open(dir.view(), config)!;
+        s.createBucket("bkt")!;
+        s.putObject("bkt", "k", "text/plain", patterned(300, 3).view(), PutCondition.None)!;
+        s.checkpoint()!;
+    }
+    flipByteAt(segmentPath(dir.view(), 1)!.view(), 20); // inside k's payload, the segment's last record
+    var s = ObjectStore.open(dir.view(), config)!;
+    match (s.getObject("bkt", "k")) {
+        Err(StoreError.DataCorrupt) => {}
+        _ => { return Check.fail("a rotted inline payload must not be served"); }
+    }
+    match (s.compact(1073741824)) {
+        Err(StoreError.DataCorrupt) => {}
+        _ => { return Check.fail("compaction must not copy a rotted payload under a new checksum"); }
+    }
+    Check.equalU64(2, countFiles(dir.view(), "seg-", ".cj"))?; // nothing was removed
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn checkpointDamageFailsOpen() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("ckpt-damage");
+    {
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        s.createBucket("bkt")!;
+        s.putObject("bkt", "k", "text/plain", "v".bytes(), PutCondition.None)!;
+        s.checkpoint()!;
+    }
+    let lsns = listCheckpoints(dir.view(), false)!;
+    Check.equalU64(1, lsns.length as u64)?;
+    let path = checkpointPath(dir.view(), lsns[0], false)!;
+    let good = readWhole(path.view());
+    // A leftover of an interrupted checkpoint is removed at open.
+    let leftover = checkpointPath(dir.view(), lsns[0] + 5, true)!;
+    writeWhole(leftover.view(), "partial".bytes());
+    {
+        let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        Check.equalBytes("v".bytes(), s.getObject("bkt", "k")!.view())?;
+    }
+    Check.equalU64(0, countFiles(dir.view(), "ckpt-", ".tmp"))?;
+    // Any damaged byte of a complete checkpoint fails the open: segments it covered may be gone.
+    for (at in 1..good.length + 1) {
+        writeWhole(path.view(), good.view());
+        flipByteAt(path.view(), at);
+        match (ObjectStore.open(dir.view(), faultStoreConfig())) {
+            Err(StoreError.CheckpointCorrupt) => {}
+            _ => { return Check.fail("a damaged checkpoint must fail the open"); }
+        }
+    }
+    writeWhole(path.view(), good.view());
+    // The segment replay starts from must exist.
+    let ids = listSegmentIds(dir.view())!;
+    let _ = Fs.unlink(segmentPath(dir.view(), ids[ids.length - 1])!.view());
+    match (ObjectStore.open(dir.view(), faultStoreConfig())) {
+        Err(StoreError.Journal(JournalError.MissingSegment(_))) => {}
+        _ => { return Check.fail("a missing replay segment must fail the open"); }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// What `checkpointWorkload` leaves each key holding when nothing fails.
+const CHECKPOINT_WORKLOAD_RESULT: [u64; 5] = [7u64, 3, 6, 5, 2];
+
+fn putStep(s: borrow mut ObjectStore, m: borrow mut FaultModel, k: usize, seed: u64) {
+    match (putSeed(s, k, seed)) {
+        Ok() => { m.succeeded(k, seed); }
+        Err(e) => { m.failed(k, seed, borrow e); }
+    }
+}
+
+/// Puts and overwrites around two checkpoints and two compactions. Neither changes what a
+/// key holds, so their outcomes do not change the model.
+fn checkpointWorkload(dir: StringView, m: borrow mut FaultModel) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    match (s.createBucket("bkt")) {
+        Ok() => {
+            m.bucket = true;
+            m.bucketAlt = true;
+        }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.bucketAlt = true; }
+        }
+    }
+    let keys = [0usize, 1, 2, 3, 4, 0, 1];
+    let seeds = [7u64, 7, 3, 1, 2, 1, 3];
+    for (i in 0..7) { putStep(mut s, m, keys[i], seeds[i]); }
+    let _ = s.checkpoint();
+    putStep(mut s, m, 2, 6);
+    let _ = s.compact(1073741824);
+    putStep(mut s, m, 0, 7);
+    let _ = s.checkpoint();
+    let _ = s.compact(1073741824);
+    putStep(mut s, m, 3, 5);
+}
+
+@test
+fn checkpointWorkloadCompacts() -> Result<void, TestFailure> {
+    // The sweeps below are only meaningful if the workload's compactions remove segments.
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory("ckpt-workload");
+    var m = FaultModel.create();
+    checkpointWorkload(dir.view(), mut m);
+    for (k in 0..FKEYS) { Check.equalU64(CHECKPOINT_WORKLOAD_RESULT[k], m.cur[k])?; }
+    let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+    Check.isTrue(s.lastCheckpoint() > 0, "checkpointed")?;
+    Check.isTrue(listSegmentIds(dir.view())!.view()[0] > 1, "the first segments were compacted away")?;
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn checkpointFaultsOnce() -> Result<void, TestFailure> =>
+    sweepStore("cfault-once", SweepMode.Once, checkpointWorkload, CHECKPOINT_WORKLOAD_RESULT);
+
+@test
+fn checkpointFaultsSticky() -> Result<void, TestFailure> =>
+    sweepStore("cfault-sticky", SweepMode.Sticky, checkpointWorkload, CHECKPOINT_WORKLOAD_RESULT);
+
+@test
+fn checkpointFaultsTorn() -> Result<void, TestFailure> =>
+    sweepStore("cfault-torn", SweepMode.StickyTorn, checkpointWorkload, CHECKPOINT_WORKLOAD_RESULT);
+
+@test
+fn checkpointFaultsCrash() -> Result<void, TestFailure> =>
+    sweepStore("cfault-crash", SweepMode.Crash, checkpointWorkload, CHECKPOINT_WORKLOAD_RESULT);
+
+@test
+fn checkpointFaultsOnceDuringOpen() -> Result<void, TestFailure> =>
+    sweepStoreOpen("cfault-open-once", SweepMode.Once, checkpointWorkload);
+
+@test
+fn checkpointFaultsCrashDuringOpen() -> Result<void, TestFailure> =>
+    sweepStoreOpen("cfault-open-crash", SweepMode.Crash, checkpointWorkload);

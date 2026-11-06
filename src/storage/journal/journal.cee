@@ -35,8 +35,8 @@ struct JournalConfig {
 }
 
 enum JournalError {
-    Io(IoFailure),
-    OutOfMemory,
+    @from Io(IoFailure),
+    @from OutOfMemory(AllocError),
     /// An invalid record where only valid ones may be: (segment id, offset).
     Corrupt(u64, u64),
     BadSegmentHeader(u64),
@@ -44,19 +44,28 @@ enum JournalError {
     TooLarge,
     /// A previous write or sync failed; reopen the journal.
     Failed,
+    /// Recovery from a checkpoint needs this segment, and it is missing.
+    MissingSegment(u64),
+    /// The active segment cannot be removed.
+    ActiveSegment,
 }
 
-/// `r` with an I/O failure as a JournalError (CeeSafe's `?` does not convert errors: CEESAFE_GAPS.md G7).
-fn jio<T>(r: Result<T, IoFailure>) -> Result<T, JournalError> => match (r) {
-    Ok(v) => Ok(v),
-    Err(e) => Err(JournalError.Io(e)),
-};
+/// Where recovery starts. Segments before `segment` are covered by a checkpoint whose last LSN
+/// is `lsn` (ADR-0005). They are not scanned, and are kept only for the inline payloads that
+/// live versions still point to.
+struct JournalStart {
+    segment: u64;
+    lsn: u64;
 
-/// `r` with an allocation failure as a JournalError.
-fn jalloc<T>(r: Result<T, AllocError>) -> Result<T, JournalError> => match (r) {
-    Ok(v) => Ok(v),
-    Err(_) => Err(JournalError.OutOfMemory),
-};
+    /// No checkpoint: scan everything.
+    fn beginning() -> JournalStart => JournalStart { segment: 0, lsn: 0 };
+}
+
+/// A sealed segment that recovery did not scan, and its size.
+struct SegmentFile {
+    id: u64;
+    size: u64;
+}
 
 /// Where a staged record will be: its segment, its offset there, and its LSN.
 struct RecordPosition {
@@ -86,6 +95,11 @@ struct Journal {
     /// Stats: data syncs performed and records committed.
     private syncs: u64;
     private committed: u64;
+    /// Sealed segments that recovery skipped (before the checkpoint's segment), with sizes.
+    private unscanned: Vector<SegmentFile>;
+    /// Read handles of sealed segments, so a GET of an inline object does not open a file.
+    /// A cache: a segment missing from it is opened per read.
+    private sealedFiles: HashMap<u64, DurableFile>;
 
     /// Opens (or creates) the journal in `dir`, replaying every valid record through `visit`
     /// in LSN order: visit(segment id, record offset, header, whole record bytes).
@@ -93,38 +107,65 @@ struct Journal {
         dir: StringView,
         config: JournalConfig,
         visit: borrow mut fn(u64, u64, borrow RecordHeader, Slice<u8>),
+    ) -> Result<Journal, JournalError> => Journal.openFrom(dir, config, JournalStart.beginning(), visit);
+
+    /// Opens the journal, replaying only the records after `start` (ADR-0005). The segment
+    /// `start.segment` must exist, and its records must follow `start.lsn`.
+    fn openFrom(
+        dir: StringView,
+        config: JournalConfig,
+        start: JournalStart,
+        visit: borrow mut fn(u64, u64, borrow RecordHeader, Slice<u8>),
     ) -> Result<Journal, JournalError> {
-        jio(Fs.ensureDirectory(dir))?;
+        Fs.ensureDirectory(dir)?;
         var ids = listSegmentIds(dir)?;
-        var nextLsn: u64 = 1;
+        var nextLsn: u64 = start.lsn + 1;
         var buffer = Vector<u8>.create();
+        var unscanned = Vector<SegmentFile>.create();
+        var sealedFiles = HashMap<u64, DurableFile>.create();
         if (ids.length == 0) {
+            if (start.segment > 0) { return Err(JournalError.MissingSegment(start.segment)); }
             let first = Journal.createSegment(dir, 1, nextLsn, config.shardId)?;
-            return Ok(Journal.make(dir, first, 1, SEGMENT_HEADER_LEN as u64, nextLsn, config)?);
+            return Ok(Journal.make(dir, first, 1, SEGMENT_HEADER_LEN as u64, nextLsn, config, unscanned, sealedFiles)?);
         }
+        var scanning = false;
         for (i in 0..ids.length) {
             let id = ids[i];
             let last = i + 1 == ids.length;
             let path = segmentPath(dir, id)?;
-            let file = jio(DurableFile.openReadWrite(path.view()))?;
-            let size = jio(file.size())?;
+            if (id < start.segment) {
+                if (last) { return Err(JournalError.MissingSegment(start.segment)); }
+                let sealed = DurableFile.openRead(path.view())?;
+                unscanned.push(SegmentFile { id: id, size: sealed.size()? })?;
+                let _ = sealedFiles.put(id, sealed)?;
+                continue;
+            }
+            if (!scanning && start.segment > 0 && id != start.segment) {
+                return Err(JournalError.MissingSegment(start.segment));
+            }
+            scanning = true;
+            let file = DurableFile.openReadWrite(path.view())?;
+            let size = file.size()?;
             let headerOk = readSegmentHeader(borrow file, size, id)?;
             if (!headerOk) {
                 if (!last) { return Err(JournalError.BadSegmentHeader(id)); }
                 // The newest segment's creation was torn: start it again.
-                jio(file.truncateTo(0))?;
+                file.truncateTo(0)?;
                 writeSegmentHeader(borrow file, id, nextLsn, config.shardId)?;
-                jio(file.syncData())?;
-                return Ok(Journal.make(dir, file, id, SEGMENT_HEADER_LEN as u64, nextLsn, config)?);
+                file.syncData()?;
+                return Ok(
+                    Journal.make(dir, file, id, SEGMENT_HEADER_LEN as u64, nextLsn, config, unscanned, sealedFiles)?,
+                );
             }
             let end = scanSegment(borrow file, id, size, last, config.maxBatchBytes, mut nextLsn, mut buffer, visit)?;
             if (last) {
                 if (end != size) {
-                    jio(file.truncateTo(end))?;
-                    jio(file.syncData())?;
+                    file.truncateTo(end)?;
+                    file.syncData()?;
                 }
-                return Ok(Journal.make(dir, file, id, end, nextLsn, config)?);
+                return Ok(Journal.make(dir, file, id, end, nextLsn, config, unscanned, sealedFiles)?);
             }
+            let _ = sealedFiles.put(id, file)?;
         }
         return Err(JournalError.Corrupt(0, 0)); // unreachable: the loop returns on the last segment
     }
@@ -136,9 +177,11 @@ struct Journal {
         writeOffset: u64,
         nextLsn: u64,
         config: JournalConfig,
+        unscanned: Vector<SegmentFile>,
+        sealedFiles: HashMap<u64, DurableFile>,
     ) -> Result<Journal, JournalError> {
         var d = String.create();
-        jalloc(d.append(dir))?;
+        d.append(dir)?;
         return Ok(Journal {
             dir: d,
             file: file,
@@ -151,16 +194,18 @@ struct Journal {
             config: config,
             syncs: 0,
             committed: 0,
+            unscanned: unscanned,
+            sealedFiles: sealedFiles,
         });
     }
 
     /// Creates segment `id` with its header, durably (file and directory entry).
     fn createSegment(dir: StringView, id: u64, firstLsn: u64, shardId: u32) -> Result<DurableFile, JournalError> {
         let path = segmentPath(dir, id)?;
-        let file = jio(DurableFile.createNew(path.view()))?;
+        let file = DurableFile.createNew(path.view())?;
         writeSegmentHeader(borrow file, id, firstLsn, shardId)?;
-        jio(file.syncData())?;
-        jio(Fs.syncDirectory(dir))?;
+        file.syncData()?;
+        Fs.syncDirectory(dir)?;
         return Ok(file);
     }
 
@@ -198,7 +243,7 @@ struct Journal {
             offset: this.writeOffset + this.pending.length as u64,
             lsn: this.nextLsn,
         };
-        jalloc(encodeRecord(mut this.pending, kind, 0, this.nextLsn, 0, meta, payload))?;
+        encodeRecord(mut this.pending, kind, 0, this.nextLsn, 0, meta, payload)?;
         this.nextLsn += 1;
         this.pendingCount += 1;
         return Ok(position);
@@ -253,6 +298,16 @@ struct Journal {
         let id = this.segmentId + 1;
         match (Journal.createSegment(this.dir.view(), id, this.nextLsn, this.config.shardId)) {
             Ok(file) => {
+                // Keep a read handle of the segment being sealed (best effort: a cache).
+                match (segmentPath(this.dir.view(), this.segmentId)) {
+                    Ok(path) => {
+                        match (DurableFile.openRead(path.view())) {
+                            Ok(sealed) => { let _ = this.sealedFiles.put(this.segmentId, sealed); }
+                            Err(_) => {}
+                        }
+                    }
+                    Err(_) => {}
+                }
                 this.file = file;
                 this.segmentId = id;
                 this.writeOffset = SEGMENT_HEADER_LEN as u64;
@@ -269,18 +324,62 @@ struct Journal {
     fn readAt(borrow this, segmentId: u64, offset: u64, into: SliceMut<u8>) -> Result<void, JournalError> {
         if (segmentId == this.segmentId) {
             if (offset + into.length as u64 > this.writeOffset) { return Err(JournalError.Corrupt(segmentId, offset)); }
-            return jio(this.file.readExactAt(into, offset));
+            return Ok(this.file.readExactAt(into, offset)?);
+        }
+        match (this.sealedFiles.get(borrow segmentId)) {
+            Some(f) => { return Ok(f.readExactAt(into, offset)?); }
+            null => {}
         }
         let path = segmentPath(this.dir.view(), segmentId)?;
-        let file = jio(DurableFile.openRead(path.view()))?;
-        return jio(file.readExactAt(into, offset));
+        let file = DurableFile.openRead(path.view())?;
+        return Ok(file.readExactAt(into, offset)?);
+    }
+
+    /// Sealed segments that recovery skipped, with their sizes.
+    fn unscannedSegments(borrow this) -> Slice<SegmentFile> => this.unscanned.view();
+
+    /// Commits anything staged, then seals the active segment and starts the next one, unless
+    /// the active segment holds no records. Returns the active segment id afterwards: every
+    /// record committed so far is in an earlier segment.
+    fn sealActive(borrow mut this) -> Result<u64, JournalError> {
+        this.commit()?;
+        if (this.failed) { return Err(JournalError.Failed); }
+        if (this.writeOffset > SEGMENT_HEADER_LEN as u64) { this.rotate()?; }
+        return Ok(this.segmentId);
+    }
+
+    /// Removes a sealed segment's file. Sync the directory afterwards (`syncDirectory`).
+    fn removeSegment(borrow mut this, id: u64) -> Result<void, JournalError> {
+        if (id >= this.segmentId) { return Err(JournalError.ActiveSegment); }
+        let path = segmentPath(this.dir.view(), id)?;
+        let _ = this.sealedFiles.remove(borrow id);
+        return Ok(Fs.unlink(path.view())?);
+    }
+
+    /// Makes created and removed segment files durable.
+    fn syncDirectory(borrow this) -> Result<void, JournalError> => Ok(Fs.syncDirectory(this.dir.view())?);
+
+    /// Reads the whole record at `offset` and verifies it: header, body CRC and trailer, and its
+    /// length is `totalLen`. Compaction copies payloads only through this, so corruption is never
+    /// copied under a fresh checksum.
+    fn readRecord(borrow this, segmentId: u64, offset: u64, totalLen: u32) -> Result<Vector<u8>, JournalError> {
+        var out = Vector<u8>.create();
+        out.resize(totalLen as usize, 0)?;
+        this.readAt(segmentId, offset, mut out.viewMut())?;
+        match (decodeRecord(out.view())) {
+            Ok(h) => {
+                if (h.totalLen != totalLen) { return Err(JournalError.Corrupt(segmentId, offset)); }
+            }
+            Err(_) => { return Err(JournalError.Corrupt(segmentId, offset)); }
+        }
+        return Ok(out);
     }
 
     /// Reads a payload into a new vector and checks nothing more: the record was verified when
     /// it was written or recovered. (Scrub re-verifies whole records.)
     fn readPayload(borrow this, at: PayloadLocator) -> Result<Vector<u8>, JournalError> {
         var out = Vector<u8>.create();
-        jalloc(out.resize(at.length as usize, 0))?;
+        out.resize(at.length as usize, 0)?;
         this.readAt(at.segmentId, at.offset, mut out.viewMut())?;
         return Ok(out);
     }
@@ -289,10 +388,10 @@ struct Journal {
 /// `<dir>/seg-<id as 16 hex digits>.cj`
 fn segmentPath(dir: StringView, id: u64) -> Result<String, JournalError> {
     var s = String.create();
-    jalloc(s.append(dir))?;
-    jalloc(s.append("/seg-"))?;
-    jalloc(appendHex16(mut s, id))?;
-    jalloc(s.append(".cj"))?;
+    s.append(dir)?;
+    s.append("/seg-")?;
+    appendHex16(mut s, id)?;
+    s.append(".cj")?;
     return Ok(s);
 }
 
@@ -319,7 +418,7 @@ fn listSegmentIds(dir: StringView) -> Result<Vector<u64>, JournalError> {
         let name = names[i].view();
         if (name.length == 23 && name.startsWith("seg-") && name.endsWith(".cj")) {
             match (name[4..20].parseIntRadix<u64>(16)) {
-                Some(id) => { jalloc(ids.push(id))?; }
+                Some(id) => { ids.push(id)?; }
                 null => {}
             }
         }
@@ -330,23 +429,17 @@ fn listSegmentIds(dir: StringView) -> Result<Vector<u64>, JournalError> {
 
 fn writeSegmentHeader(file: borrow DurableFile, id: u64, firstLsn: u64, shardId: u32) -> Result<void, JournalError> {
     var h = [0u8; 64];
-    {
-        let w = borrow mut h[..];
-        w.writeLE(0, SEGMENT_MAGIC);
-        w.writeLE(8, SEGMENT_FORMAT_VERSION);
-        w.writeLE(10, truncate<u16>(SEGMENT_HEADER_LEN));
-        w.writeLE(12, 0u32);
-        w.writeLE(16, id);
-        w.writeLE(24, firstLsn);
-        w.writeLE(32, shardId);
-        w.writeLE(40, Clock.unixMillis());
-    }
+    h.writeLE(0, SEGMENT_MAGIC);
+    h.writeLE(8, SEGMENT_FORMAT_VERSION);
+    h.writeLE(10, truncate<u16>(SEGMENT_HEADER_LEN));
+    h.writeLE(12, 0u32);
+    h.writeLE(16, id);
+    h.writeLE(24, firstLsn);
+    h.writeLE(32, shardId);
+    h.writeLE(40, Clock.unixMillis());
     let crc = Crc32c.of(h[0..60]);
-    {
-        let w = borrow mut h[..];
-        w.writeLE(60, crc);
-    }
-    jio(file.writeAt(h[..], 0))?;
+    h.writeLE(60, crc);
+    file.writeAt(h[..], 0)?;
     return Ok();
 }
 
@@ -357,7 +450,7 @@ fn writeSegmentHeader(file: borrow DurableFile, id: u64, firstLsn: u64, shardId:
 fn readSegmentHeader(file: borrow DurableFile, size: u64, id: u64) -> Result<bool, JournalError> {
     if (size < SEGMENT_HEADER_LEN as u64) { return Ok(false); }
     var h = [0u8; 64];
-    jio(file.readExactAt(mut h[..], 0))?;
+    file.readExactAt(mut h[..], 0)?;
     let r = h[..];
     if (r.readLE<u32>(60) != Crc32c.of(r[0..60])) { return Ok(false); }
     return Ok(
@@ -411,15 +504,15 @@ fn readRecordAt(
     buffer: borrow mut Vector<u8>,
 ) -> Result<RecordHeader, JournalError> {
     if (size - offset < RECORD_HEADER_LEN as u64) { return Err(JournalError.Corrupt(0, offset)); }
-    jio(file.readExactAt(mut header[..], offset))?;
+    file.readExactAt(mut header[..], offset)?;
     let h = match (decodeHeader(header[..])) {
         Ok(h) => h,
         Err(_) => { return Err(JournalError.Corrupt(0, offset)); }
     };
     if (size - offset < h.totalLen as u64) { return Err(JournalError.Corrupt(0, offset)); }
     buffer.clear();
-    jalloc(buffer.resize(h.totalLen as usize, 0))?;
-    jio(file.readExactAt(mut buffer.viewMut(), offset))?;
+    buffer.resize(h.totalLen as usize, 0)?;
+    file.readExactAt(mut buffer.viewMut(), offset)?;
     match (verifyRecordBody(borrow h, buffer.view())) {
         Ok() => {}
         Err(_) => { return Err(JournalError.Corrupt(0, offset)); }
@@ -443,8 +536,8 @@ fn laterAcknowledgedRecord(
         null => { return Err(JournalError.TooLarge); }
     };
     buffer.clear();
-    jalloc(buffer.resize(length, 0))?;
-    jio(file.readExactAt(mut buffer.viewMut(), from))?;
+    buffer.resize(length, 0)?;
+    file.readExactAt(mut buffer.viewMut(), from)?;
     let bytes = buffer.view();
     var i: usize = 0;
     while (i + RECORD_HEADER_LEN <= bytes.length) {

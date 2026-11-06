@@ -15,6 +15,9 @@ fn faultStoreConfig() -> StoreConfig => StoreConfig {
     inlineMaxBytes: 16384,
     extentMaxBytes: 65536,
     maxObjectBytes: 5368709120,
+    checkpointEveryBytes: 0,
+    compactBelowLivePercent: 50,
+    compactMaxCopyBytes: 67108864,
 };
 
 /// Seed 0 means no object. The others: inline or extent-backed sizes.
@@ -123,6 +126,9 @@ fn heldSeed(s: borrow ObjectStore, k: usize, a: u64, b: u64) -> u64 {
     return 99;
 }
 
+/// What `storeWorkload` leaves each key holding when nothing fails.
+const STORE_WORKLOAD_RESULT: [u64; 5] = [5u64, 6, 3, 0, 7];
+
 /// Runs the workload, updating `m` with what each step's outcome allows.
 fn storeWorkload(dir: StringView, m: borrow mut FaultModel) {
     var s = match (ObjectStore.open(dir, faultStoreConfig())) {
@@ -208,24 +214,29 @@ fn checkStore(s: borrow ObjectStore, m: borrow FaultModel) -> Result<u64, TestFa
     return Ok(extents);
 }
 
-fn sweepStore(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+/// Sweeps `workload`, whose clean run must leave the keys holding `expected`.
+fn sweepStore(
+    name: StringView,
+    mode: SweepMode,
+    workload: fn(StringView, borrow mut FaultModel),
+    expected: [u64; 5],
+) -> Result<void, TestFailure> {
     Faults.elideSyncs(true);
     let dir = scratchDirectory(name);
     var model = FaultModel.create();
     Faults.countOperations();
-    storeWorkload(dir.view(), mut model);
+    workload(dir.view(), mut model);
     Faults.disarm();
     let points = Faults.seen();
     Check.isTrue(points > 40, "the workload performs I/O")?;
-    let expected = [5u64, 6, 3, 0, 7];
     for (k in 0..FKEYS) { Check.equalU64(expected[k], model.cur[k])?; }
-    var outcomes: u64 = 0;
+    var furthest: usize = 0;
     for (n in 1..points + 1) {
         removeTree(dir.view());
         Fs.ensureDirectory(dir.view())!;
         var m = FaultModel.create();
         armMode(borrow mode, n);
-        storeWorkload(dir.view(), mut m);
+        workload(dir.view(), mut m);
         Faults.disarm();
         Check.equalU64(1, Faults.fired().min(1))?;
         if (isCrash(borrow mode)) {
@@ -241,33 +252,45 @@ fn sweepStore(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
         }
         let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
         Check.equalU64(2, heldSeed(borrow s, 0, 2, 2))?;
-        if (m.cur[1] == 6) { outcomes += 1; }
+        var reached: usize = 0;
+        for (k in 0..FKEYS) {
+            if (m.cur[k] == expected[k]) { reached += 1; }
+        }
+        if (reached > furthest) { furthest = reached; }
     }
-    Check.isTrue(outcomes > 0, "some runs got past the overwrites")?;
+    Check.isTrue(furthest + 1 >= FKEYS, "some faulted runs got through most of the workload")?;
     removeTree(dir.view());
     Faults.elideSyncs(false);
     return Ok();
 }
 
 @test
-fn storeFaultsOnce() -> Result<void, TestFailure> => sweepStore("sfault-once", SweepMode.Once);
+fn storeFaultsOnce() -> Result<void, TestFailure> =>
+    sweepStore("sfault-once", SweepMode.Once, storeWorkload, STORE_WORKLOAD_RESULT);
 
 @test
-fn storeFaultsSticky() -> Result<void, TestFailure> => sweepStore("sfault-sticky", SweepMode.Sticky);
+fn storeFaultsSticky() -> Result<void, TestFailure> =>
+    sweepStore("sfault-sticky", SweepMode.Sticky, storeWorkload, STORE_WORKLOAD_RESULT);
 
 @test
-fn storeFaultsTorn() -> Result<void, TestFailure> => sweepStore("sfault-torn", SweepMode.StickyTorn);
+fn storeFaultsTorn() -> Result<void, TestFailure> =>
+    sweepStore("sfault-torn", SweepMode.StickyTorn, storeWorkload, STORE_WORKLOAD_RESULT);
 
 @test
-fn storeFaultsCrash() -> Result<void, TestFailure> => sweepStore("sfault-crash", SweepMode.Crash);
+fn storeFaultsCrash() -> Result<void, TestFailure> =>
+    sweepStore("sfault-crash", SweepMode.Crash, storeWorkload, STORE_WORKLOAD_RESULT);
 
-fn sweepStoreOpen(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+fn sweepStoreOpen(
+    name: StringView,
+    mode: SweepMode,
+    workload: fn(StringView, borrow mut FaultModel),
+) -> Result<void, TestFailure> {
     // A store after the whole workload, plus an orphan extent and a torn journal tail. Faults
     // while opening it may fail the open, but never change what it holds.
     Faults.elideSyncs(true);
     let source = scratchDirectory(name);
     var full = FaultModel.create();
-    storeWorkload(source.view(), mut full);
+    workload(source.view(), mut full);
     {
         let s = ObjectStore.open(source.view(), faultStoreConfig())!;
         var w = s.newWriter()!;
@@ -348,10 +371,12 @@ fn sweepStoreOpen(name: StringView, mode: SweepMode) -> Result<void, TestFailure
 }
 
 @test
-fn storeFaultsOnceDuringOpen() -> Result<void, TestFailure> => sweepStoreOpen("sfault-open-once", SweepMode.Once);
+fn storeFaultsOnceDuringOpen() -> Result<void, TestFailure> =>
+    sweepStoreOpen("sfault-open-once", SweepMode.Once, storeWorkload);
 
 @test
-fn storeFaultsCrashDuringOpen() -> Result<void, TestFailure> => sweepStoreOpen("sfault-open-crash", SweepMode.Crash);
+fn storeFaultsCrashDuringOpen() -> Result<void, TestFailure> =>
+    sweepStoreOpen("sfault-open-crash", SweepMode.Crash, storeWorkload);
 
 @test
 fn storeRefusesWritesAfterJournalFailure() -> Result<void, TestFailure> {

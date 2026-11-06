@@ -12,20 +12,31 @@ struct StoreConfig {
     extentMaxBytes: u64;
     /// The largest object a single PUT may store (S3: 5 GiB).
     maxObjectBytes: u64;
+    /// `maintain` checkpoints once this many journal bytes were committed since the last
+    /// checkpoint (0: never). It bounds recovery's replay (ADR-0005).
+    checkpointEveryBytes: u64;
+    /// A sealed segment covered by the checkpoint is compacted when its live inline bytes are
+    /// below this percentage of its size.
+    compactBelowLivePercent: u64;
+    /// The most live bytes one `compact` call copies.
+    compactMaxCopyBytes: u64;
 
     fn defaults() -> StoreConfig => StoreConfig {
         journal: JournalConfig.defaults(),
         inlineMaxBytes: 131072,
         extentMaxBytes: 67108864,
         maxObjectBytes: 5368709120,
+        checkpointEveryBytes: 67108864,
+        compactBelowLivePercent: 50,
+        compactMaxCopyBytes: 67108864,
     };
 }
 
 enum StoreError {
-    Journal(JournalError),
+    @from Journal(JournalError),
     /// A journal record whose meta does not decode: (segment, offset).
     BadMeta(u64, u64),
-    OutOfMemory,
+    @from OutOfMemory(AllocError),
     InvalidBucketName,
     InvalidKey,
     NoSuchBucket,
@@ -38,21 +49,13 @@ enum StoreError {
     Io(IoFailure),
     /// Stored bytes do not match their checksum.
     DataCorrupt,
+    /// The newest checkpoint fails its checks (ADR-0005).
+    CheckpointCorrupt,
 }
 
 fn sio<T>(r: Result<T, IoFailure>) -> Result<T, StoreError> => match (r) {
     Ok(v) => Ok(v),
     Err(e) => Err(if (e.op == IoOp.Read && e.errno == -1) StoreError.DataCorrupt else StoreError.Io(e)),
-};
-
-fn sj<T>(r: Result<T, JournalError>) -> Result<T, StoreError> => match (r) {
-    Ok(v) => Ok(v),
-    Err(e) => Err(StoreError.Journal(e)),
-};
-
-fn salloc<T>(r: Result<T, AllocError>) -> Result<T, StoreError> => match (r) {
-    Ok(v) => Ok(v),
-    Err(_) => Err(StoreError.OutOfMemory),
 };
 
 /// A write's precondition, checked atomically with the write.
@@ -69,10 +72,39 @@ struct BucketInfo {
     objects: u64;
 }
 
-/// Space use of one segment, for compaction (ADR-001 §space).
+/// Space use of one segment, for compaction (ADR-0005). `liveBytes` counts the records that
+/// hold the inline payload of a current version: once a checkpoint covers the segment, they are
+/// all that must be copied before it can be removed.
 struct SegmentUsage {
     totalBytes: u64;
     liveBytes: u64;
+}
+
+/// What `compact` did.
+struct CompactStats {
+    segmentsRemoved: u64;
+    bytesFreed: u64;
+    /// Live inline payloads copied into Relocate records, and their bytes.
+    relocated: u64;
+    bytesCopied: u64;
+}
+
+/// What `maintain` did.
+struct MaintenanceReport {
+    checkpointed: bool;
+    compaction: CompactStats;
+}
+
+/// A live inline version that compaction copies.
+struct Relocation {
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    versionId: [u8; 16];
+    generation: u64;
+    segment: u64;
+    recordOffset: u64;
+    recordLength: u32;
+    payloadLength: u32;
 }
 
 /// What HEAD returns.
@@ -120,15 +152,15 @@ struct StoreState {
 
     /// Releases a superseded or deleted version: its record bytes and its extents.
     fn retire(borrow mut this, old: borrow ObjectVersion) -> Result<void, StoreError> {
-        this.releaseRecord(old.recordSegment, old.recordLength);
+        if (old.extents.length == 0) { this.releaseRecord(old.recordSegment, old.recordLength); }
         for (i in 0..old.extents.length) {
-            salloc(this.deadExtents.push(old.extents[i].id))?;
+            this.deadExtents.push(old.extents[i].id)?;
         }
         return Ok();
     }
 
     fn hasBucket(borrow this, name: Slice<u8>) -> Result<bool, StoreError> {
-        let k = BucketKey { name: salloc(copyBytes(name))? };
+        let k = BucketKey { name: copyBytes(name)? };
         return Ok(this.buckets.contains(borrow k));
     }
 
@@ -141,19 +173,19 @@ struct StoreState {
             }
             null => {}
         }
-        salloc(this.segments.put(segment, SegmentUsage { totalBytes: total, liveBytes: live }))?;
+        this.segments.put(segment, SegmentUsage { totalBytes: total, liveBytes: live })?;
         return Ok();
     }
 
     fn releaseRecord(borrow mut this, segment: u64, length: u32) {
         match (this.segments.getMut(borrow segment)) {
-            Some(u) => { u.liveBytes -= length as u64; }
+            Some(u) => { u.liveBytes = if (u.liveBytes > length as u64) u.liveBytes - length as u64 else 0; }
             null => {}
         }
     }
 
     fn bumpObjects(borrow mut this, bucket: Slice<u8>, up: bool) -> Result<void, StoreError> {
-        let k = BucketKey { name: salloc(copyBytes(bucket))? };
+        let k = BucketKey { name: copyBytes(bucket)? };
         match (this.buckets.getMut(borrow k)) {
             Some(b) => {
                 if (up) { b.objects += 1; } else { b.objects -= 1; }
@@ -217,12 +249,48 @@ fn applyRecord(
             }
         }
         RecordType.BucketCreate => {
-            state.addSegmentBytes(segment, totalLen as u64, totalLen as u64)?;
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
             let name = match (decodeBucketName(meta)) {
                 Ok(n) => n,
                 Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
             };
-            let _ = salloc(state.buckets.put(BucketKey { name: name }, BucketInfo { createdMillis: 0, objects: 0 }))?;
+            let created = match (decodeBucketMillis(meta)) {
+                Ok(t) => t,
+                Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+            };
+            let info = BucketInfo { createdMillis: created, objects: 0 };
+            let _ = state.buckets.put(BucketKey { name: name }, info)?;
+        }
+        RecordType.Relocate => {
+            let m = match (decodeRelocateMeta(meta)) {
+                Ok(m) => m,
+                Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+            };
+            // The copy takes over only if the version it copied is still current; otherwise
+            // it is garbage from the moment it is written.
+            let key = IndexKey { bucket: m.bucket, key: m.key };
+            var moved = false;
+            var oldSegment: u64 = 0;
+            var oldLength: u32 = 0;
+            match (state.index.getMut(borrow key)) {
+                Some(v) => {
+                    if (v.lsn == m.generation && v.versionId[..] == m.versionId[..] && v.extents.length == 0) {
+                        oldSegment = v.recordSegment;
+                        oldLength = v.recordLength;
+                        v.payload = PayloadLocator {
+                            segmentId: segment,
+                            offset: offset + (RECORD_HEADER_LEN + meta.length) as u64,
+                            length: payloadLen,
+                        };
+                        v.recordSegment = segment;
+                        v.recordLength = totalLen;
+                        moved = true;
+                    }
+                }
+                null => {}
+            }
+            if (moved) { state.releaseRecord(oldSegment, oldLength); }
+            state.addSegmentBytes(segment, totalLen as u64, if (moved) totalLen as u64 else 0)?;
         }
         RecordType.BucketDelete => {
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
@@ -252,8 +320,11 @@ fn applyPut(
     metaLen: usize,
     payloadLen: u32,
 ) -> Result<void, StoreError> {
-    state.addSegmentBytes(segment, totalLen as u64, totalLen as u64)?;
-    let bucketCopy = salloc(copyBytes(m.bucket.view()))?;
+    // Only an inline payload keeps its record live: an extent manifest is in the index, and
+    // in every checkpoint (ADR-0005).
+    let live = if (extents.length == 0) totalLen as u64 else 0;
+    state.addSegmentBytes(segment, totalLen as u64, live)?;
+    let bucketCopy = copyBytes(m.bucket.view())?;
     let version = ObjectVersion {
         versionId: m.versionId,
         lsn: lsn,
@@ -272,7 +343,7 @@ fn applyPut(
         extents: extents,
     };
     let key = IndexKey { bucket: m.bucket, key: m.key };
-    match (salloc(state.index.put(key, version))?) {
+    match (state.index.put(key, version)?) {
         Some(old) => { state.retire(borrow old)?; }
         null => { state.bumpObjects(bucketCopy.view(), true)?; }
     }
@@ -299,12 +370,38 @@ struct ObjectStore {
     private scratch: Vector<u8>;
     private pendingApplies: Vector<PendingApply>;
     private extentDir: String;
+    private dir: String;
+    /// The newest durable checkpoint: its LSN and the first segment it does not cover
+    /// (0, 0: none). Only segments before `checkpointSegment` may be compacted.
+    private checkpointLsn: u64;
+    private checkpointSegment: u64;
+    /// Journal bytes committed since that checkpoint.
+    private sinceCheckpoint: u64;
 
-    /// Opens the store in `dir`, replaying the journal.
+    /// Opens the store in `dir`: loads the newest checkpoint, if any, then replays the journal
+    /// records after it.
     fn open(dir: StringView, config: StoreConfig) -> Result<ObjectStore, StoreError> {
+        sio(Fs.ensureDirectory(dir))?;
+        removeCheckpoints(dir, 0, true); // interrupted checkpoint writes
+        let complete = listCheckpoints(dir, false)?;
         var state = StoreState.create();
+        var start = JournalStart.beginning();
+        if (complete.length > 0) {
+            let loaded = readCheckpoint(dir, complete[complete.length - 1])?;
+            start = JournalStart { segment: loaded.segment, lsn: loaded.lsn };
+            state = loaded.state;
+            // The checkpointed versions' inline records are live in the segments they cover.
+            var live = Vector<SegmentFile>.create();
+            for (i in 0..state.index.length()) {
+                let v = state.index.valueAt(i);
+                if (v.extents.length == 0) {
+                    live.push(SegmentFile { id: v.recordSegment, size: v.recordLength as u64 })?;
+                }
+            }
+            for (i in 0..live.length) { state.addSegmentBytes(live[i].id, 0, live[i].size)?; }
+        }
         var failure: StoreError? = null;
-        let journal = sj(Journal.open(dir, config.journal, (segment, offset, header, bytes) => {
+        let journal = Journal.openFrom(dir, config.journal, start, (segment, offset, header, bytes) => {
             if (failure.isSome()) { return; }
             let metaEnd = RECORD_HEADER_LEN + header.metaLen as usize;
             let payloadEnd = metaEnd + header.payloadLen as usize;
@@ -327,14 +424,19 @@ struct ObjectStore {
                 Ok() => {}
                 Err(e) => { failure = e; }
             }
-        }))?;
+        })?;
         match (failure) {
             Some(e) => { return Err(e); }
             null => {}
         }
+        let unscanned = journal.unscannedSegments();
+        for (i in 0..unscanned.length) { state.addSegmentBytes(unscanned[i].id, unscanned[i].size, 0)?; }
+        if (complete.length > 0) { removeCheckpoints(dir, start.lsn, false); }
+        var root = String.create();
+        root.append(dir)?;
         var extentDir = String.create();
-        salloc(extentDir.append(dir))?;
-        salloc(extentDir.append("/extents"))?;
+        extentDir.append(dir)?;
+        extentDir.append("/extents")?;
         sio(Fs.ensureDirectory(extentDir.view()))?;
         var store = ObjectStore {
             journal: journal,
@@ -343,6 +445,10 @@ struct ObjectStore {
             scratch: Vector<u8>.create(),
             pendingApplies: Vector<PendingApply>.create(),
             extentDir: extentDir,
+            dir: root,
+            checkpointLsn: start.lsn,
+            checkpointSegment: start.segment,
+            sinceCheckpoint: 0,
         };
         // Every extent not referenced by a live version is garbage: superseded or deleted
         // versions, and uploads that never committed (ADR-0003).
@@ -358,7 +464,7 @@ struct ObjectStore {
         for (i in 0..this.state.index.length()) {
             let v = this.state.index.valueAt(i);
             for (k in 0..v.extents.length) {
-                let _ = salloc(live.put(v.extents[k].id, true))?;
+                let _ = live.put(v.extents[k].id, true)?;
             }
         }
         let names = match (Directory.list(this.extentDir.view())) {
@@ -390,7 +496,7 @@ struct ObjectStore {
 
     /// A writer for a new object's bytes; commit it with `putFinished` or `stageFinished`.
     fn newWriter(borrow this) -> Result<ObjectWriter, StoreError> =>
-        salloc(ObjectWriter.create(this.extentDir.view(), this.config.inlineMaxBytes, this.config.extentMaxBytes));
+        Ok(ObjectWriter.create(this.extentDir.view(), this.config.inlineMaxBytes, this.config.extentMaxBytes)?);
 
     /// Removes the extents of a finished object that will not be committed.
     fn discardFinished(borrow this, obj: borrow FinishedObject) {
@@ -405,9 +511,10 @@ struct ObjectStore {
     /// Stages one record, commits it durably, and applies it. Any staged batch commits with it.
     fn commitOne(borrow mut this, kind: RecordType, payload: Slice<u8>) -> Result<u64, StoreError> {
         this.commitStaged()?;
-        let pos = sj(this.journal.stage(kind, this.scratch.view(), payload))?;
-        sj(this.journal.commit())?;
+        let pos = this.journal.stage(kind, this.scratch.view(), payload)?;
+        this.journal.commit()?;
         let total = truncate<u32>(recordLength(this.scratch.length, payload.length));
+        this.sinceCheckpoint += total as u64;
         applyRecord(
             mut this.state,
             kind,
@@ -436,7 +543,7 @@ struct ObjectStore {
         if (!isValidBucketName(name.bytes())) { return Err(StoreError.InvalidBucketName); }
         if (this.state.hasBucket(name.bytes())?) { return Err(StoreError.BucketAlreadyExists); }
         this.scratch.clear();
-        salloc(encodeBucketMeta(mut this.scratch, name.bytes(), Clock.unixMillis()))?;
+        encodeBucketMeta(mut this.scratch, name.bytes(), Clock.unixMillis())?;
         let empty = [0u8; 1];
         this.commitOne(RecordType.BucketCreate, empty[0..0])?;
         return Ok();
@@ -444,7 +551,7 @@ struct ObjectStore {
 
     fn deleteBucket(borrow mut this, name: StringView) -> Result<void, StoreError> {
         this.checkWritable()?;
-        let k = BucketKey { name: salloc(copyBytes(name.bytes()))? };
+        let k = BucketKey { name: copyBytes(name.bytes())? };
         match (this.state.buckets.get(borrow k)) {
             Some(b) => {
                 if (b.objects > 0) { return Err(StoreError.BucketNotEmpty); }
@@ -452,7 +559,7 @@ struct ObjectStore {
             null => { return Err(StoreError.NoSuchBucket); }
         }
         this.scratch.clear();
-        salloc(encodeBucketMeta(mut this.scratch, name.bytes(), Clock.unixMillis()))?;
+        encodeBucketMeta(mut this.scratch, name.bytes(), Clock.unixMillis())?;
         let empty = [0u8; 1];
         this.commitOne(RecordType.BucketDelete, empty[0..0])?;
         return Ok();
@@ -465,7 +572,7 @@ struct ObjectStore {
         var names = Vector<Vector<u8>>.create();
         for (i in 0..this.state.buckets.length()) {
             let k = this.state.buckets.keyAt(i);
-            salloc(names.push(salloc(copyBytes(k.name.view()))?))?;
+            names.push(copyBytes(k.name.view())?)?;
         }
         names.viewMut().sortBy((a, b) => compareBytes(a.view(), b.view()));
         return Ok(names);
@@ -478,7 +585,7 @@ struct ObjectStore {
 
     /// The current version's generation, or null if the key has no object.
     fn currentGeneration(borrow this, bucket: StringView, key: StringView) -> Result<u64?, StoreError> {
-        let k = IndexKey { bucket: salloc(copyBytes(bucket.bytes()))?, key: salloc(copyBytes(key.bytes()))? };
+        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
         return Ok(match (this.state.index.get(borrow k)) {
             Some(v) => v.lsn,
             null => null,
@@ -604,23 +711,22 @@ struct ObjectStore {
         obj: borrow FinishedObject,
     ) -> Result<u64, StoreError> {
         var meta = Vector<u8>.create();
-        salloc(
-            encodePutMeta(
-                mut meta,
-                bucket.bytes(),
-                key.bytes(),
-                nullVersionId(),
-                Clock.unixMillis(),
-                obj.size,
-                obj.md5,
-                contentType.bytes(),
-            ),
+
+        encodePutMeta(
+            mut meta,
+            bucket.bytes(),
+            key.bytes(),
+            nullVersionId(),
+            Clock.unixMillis(),
+            obj.size,
+            obj.md5,
+            contentType.bytes(),
         )?;
         var manifest = Vector<u8>.create();
         let kind = match (borrow obj.body) {
             ObjectBody.Inline(_) => RecordType.PutInline,
             ObjectBody.Extents(extents) => {
-                salloc(encodeManifest(mut manifest, extents.view()))?;
+                encodeManifest(mut manifest, extents.view())?;
                 RecordType.PutExtent
             }
         };
@@ -631,11 +737,11 @@ struct ObjectStore {
         if (this.journal.wouldOverflow(meta.length, payload.length)) {
             this.commitStaged()?;
         }
-        salloc(this.pendingApplies.reserve(1))?;
-        let pos = sj(this.journal.stage(kind, meta.view(), payload))?;
+        this.pendingApplies.reserve(1)?;
+        let pos = this.journal.stage(kind, meta.view(), payload)?;
         let total = truncate<u32>(recordLength(meta.length, payload.length));
         let payloadLen = truncate<u32>(payload.length);
-        salloc(this.pendingApplies.push(PendingApply {
+        this.pendingApplies.push(PendingApply {
             kind: kind,
             lsn: pos.lsn,
             segment: pos.segmentId,
@@ -644,7 +750,7 @@ struct ObjectStore {
             meta: meta,
             payloadLen: payloadLen,
             manifest: manifest,
-        }))?;
+        })?;
         return Ok(pos.lsn);
     }
 
@@ -662,6 +768,7 @@ struct ObjectStore {
         let n = this.pendingApplies.length;
         for (i in 0..n) {
             let p = borrow this.pendingApplies[i];
+            this.sinceCheckpoint += p.total as u64;
             applyRecord(
                 mut this.state,
                 p.kind,
@@ -681,7 +788,7 @@ struct ObjectStore {
 
     fn headObject(borrow this, bucket: StringView, key: StringView) -> Result<ObjectInfo, StoreError> {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        let k = IndexKey { bucket: salloc(copyBytes(bucket.bytes()))?, key: salloc(copyBytes(key.bytes()))? };
+        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
         match (this.state.index.get(borrow k)) {
             Some(v) => {
                 return Ok(ObjectInfo {
@@ -689,7 +796,7 @@ struct ObjectStore {
                     mtimeMillis: v.mtimeMillis,
                     md5: v.md5,
                     generation: v.lsn,
-                    contentType: salloc(copyBytes(v.contentType.view()))?,
+                    contentType: copyBytes(v.contentType.view())?,
                 });
             }
             null => { return Err(StoreError.NoSuchKey); }
@@ -705,7 +812,7 @@ struct ObjectStore {
         to: u64,
     ) -> Result<ObjectReader, StoreError> {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        let k = IndexKey { bucket: salloc(copyBytes(bucket.bytes()))?, key: salloc(copyBytes(key.bytes()))? };
+        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
         let v = match (this.state.index.get(borrow k)) {
             Some(v) => v,
             null => { return Err(StoreError.NoSuchKey); }
@@ -713,17 +820,17 @@ struct ObjectStore {
         let end = if (to > v.size) v.size else to;
         let start = if (from > end) end else from;
         if (v.extents.length == 0) {
-            let part = PayloadLocator {
-                segmentId: v.payload.segmentId,
-                offset: v.payload.offset + start,
-                length: truncate<u32>(end - start),
-            };
-            let bytes = sj(this.journal.readPayload(part))?;
+            // The whole record is read and verified, so a GET never serves rotted bytes:
+            // recovery no longer scans the segments a checkpoint covers (ADR-0005).
+            let record = this.readLiveRecord(v)?;
+            let payloadStart = v.recordLength as usize - RECORD_TRAILER_LEN - v.payload.length as usize;
+            var bytes = Vector<u8>.create();
+            bytes.extend(record.view()[payloadStart + start as usize..payloadStart + end as usize])?;
             return Ok(ObjectReader { inline: bytes, inlinePosition: 0, extents: null });
         }
         var refs = Vector<ExtentRef>.create();
-        salloc(refs.extend(v.extents.view()))?;
-        let reader = salloc(ExtentReader.create(this.extentDir.view(), refs, start, end))?;
+        refs.extend(v.extents.view())?;
+        let reader = ExtentReader.create(this.extentDir.view(), refs, start, end)?;
         return Ok(ObjectReader { inline: Vector<u8>.create(), inlinePosition: 0, extents: reader });
     }
 
@@ -738,11 +845,11 @@ struct ObjectStore {
         var reader = this.openReader(bucket, key, from, to)?;
         var out = Vector<u8>.create();
         var chunk = Vector<u8>.create();
-        salloc(chunk.resize(65536, 0))?;
+        chunk.resize(65536, 0)?;
         while (true) {
             let n = reader.read(mut chunk.viewMut())?;
             if (n == 0) { break; }
-            salloc(out.extend(chunk.view()[0..n]))?;
+            out.extend(chunk.view()[0..n])?;
         }
         return Ok(out);
     }
@@ -758,7 +865,7 @@ struct ObjectStore {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         if (this.currentGeneration(bucket, key)?.isNull()) { return Ok(); }
         this.scratch.clear();
-        salloc(encodeDeleteMeta(mut this.scratch, bucket.bytes(), key.bytes(), nullVersionId(), Clock.unixMillis()))?;
+        encodeDeleteMeta(mut this.scratch, bucket.bytes(), key.bytes(), nullVersionId(), Clock.unixMillis())?;
         let empty = [0u8; 1];
         this.commitOne(RecordType.DeleteVersion, empty[0..0])?;
         return Ok();
@@ -788,7 +895,7 @@ struct ObjectStore {
                 if (compareBytes(key, startAfter) <= 0) { continue; }
                 if (startAfterIsPrefix && startsWithBytes(key, startAfter)) { continue; }
             }
-            salloc(matches.push(i))?;
+            matches.push(i)?;
         }
         let index = borrow this.state.index;
         matches.viewMut().sortBy((a, b) => {
@@ -824,9 +931,9 @@ struct ObjectStore {
                         page.truncated = true;
                         break;
                     }
-                    salloc(page.commonPrefixes.push(salloc(copyBytes(cp))?))?;
+                    page.commonPrefixes.push(copyBytes(cp)?)?;
                     page.nextMarker.clear();
-                    salloc(page.nextMarker.extend(cp))?;
+                    page.nextMarker.extend(cp)?;
                     page.nextMarkerIsPrefix = true;
                 }
                 null => {
@@ -834,10 +941,10 @@ struct ObjectStore {
                         page.truncated = true;
                         break;
                     }
-                    salloc(page.keys.push(salloc(copyBytes(key))?))?;
-                    salloc(page.sizes.push(index.valueAt(matches[m]).size))?;
+                    page.keys.push(copyBytes(key)?)?;
+                    page.sizes.push(index.valueAt(matches[m]).size)?;
                     page.nextMarker.clear();
-                    salloc(page.nextMarker.extend(key))?;
+                    page.nextMarker.extend(key)?;
                     page.nextMarkerIsPrefix = false;
                 }
             }
@@ -846,8 +953,158 @@ struct ObjectStore {
         return Ok(page);
     }
 
+    /// Writes a checkpoint of the current state, so recovery replays only what follows it,
+    /// and removes the previous checkpoint. Seals the active journal segment first, so the
+    /// checkpoint covers whole segments (ADR-0005). Returns whether one was written (false when
+    /// nothing was committed since the last one).
+    fn checkpoint(borrow mut this) -> Result<bool, StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        let segment = this.journal.sealActive()?;
+        let lsn = this.journal.upcomingLsn() - 1;
+        if (lsn == this.checkpointLsn) { return Ok(false); }
+        writeCheckpoint(this.dir.view(), lsn, segment, borrow this.state)?;
+        // Durable now: segments before `segment` may be compacted, and older checkpoints go.
+        this.checkpointLsn = lsn;
+        this.checkpointSegment = segment;
+        this.sinceCheckpoint = 0;
+        removeCheckpoints(this.dir.view(), lsn, false);
+        return Ok(true);
+    }
+
+    /// Reclaims sealed segments that the checkpoint covers and that are mostly garbage. Their
+    /// live inline payloads are copied into Relocate records (keeping each version's generation),
+    /// and once those are durable the segments are removed. Copies at most `maxCopyBytes` of
+    /// live data, but always removes segments with nothing live.
+    fn compact(borrow mut this, maxCopyBytes: u64) -> Result<CompactStats, StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        var stats = CompactStats { segmentsRemoved: 0, bytesFreed: 0, relocated: 0, bytesCopied: 0 };
+        // Candidates, fewest live bytes first.
+        var candidates = Vector<SegmentFile>.create();
+        for (i in 0..this.state.segments.length()) {
+            let id: u64 = this.state.segments.keyAt(i);
+            let u = this.state.segments.valueAt(i);
+            if (id >= this.checkpointSegment) { continue; }
+            if (u.liveBytes == 0 || u.liveBytes * 100 < u.totalBytes * this.config.compactBelowLivePercent) {
+                candidates.push(SegmentFile { id: id, size: u.liveBytes })?;
+            }
+        }
+        if (candidates.length == 0) { return Ok(stats); }
+        candidates.viewMut().sortBy((a, b) => if (a.size < b.size) -1 else if (a.size > b.size) 1 else 0);
+        var chosen = HashMap<u64, bool>.create();
+        var budget: u64 = 0;
+        for (i in 0..candidates.length) {
+            let c = borrow candidates[i];
+            if (c.size > 0 && budget + c.size > maxCopyBytes && chosen.length() > 0) { break; }
+            budget += c.size;
+            let _ = chosen.put(c.id, true)?;
+        }
+        // The live inline versions in the chosen segments.
+        var plan = Vector<Relocation>.create();
+        for (i in 0..this.state.index.length()) {
+            let k = this.state.index.keyAt(i);
+            let v = this.state.index.valueAt(i);
+            if (v.extents.length != 0 || !chosen.contains(borrow v.recordSegment)) { continue; }
+            plan.push(Relocation {
+                bucket: copyBytes(k.bucket.view())?,
+                key: copyBytes(k.key.view())?,
+                versionId: v.versionId,
+                generation: v.lsn,
+                segment: v.recordSegment,
+                recordOffset: v.payload.offset +
+                    v.payload.length as u64 + RECORD_TRAILER_LEN as u64 - v.recordLength as u64,
+                recordLength: v.recordLength,
+                payloadLength: v.payload.length,
+            })?;
+        }
+        for (i in 0..plan.length) {
+            match (this.stageRelocation(borrow plan[i])) {
+                Ok() => {}
+                Err(e) => {
+                    this.journal.discardPending();
+                    this.pendingApplies.clear();
+                    return Err(e);
+                }
+            }
+            stats.relocated += 1;
+            stats.bytesCopied += plan[i].payloadLength as u64;
+        }
+        this.commitStaged()?;
+        // Every copy is durable and applied: the chosen segments hold nothing live.
+        for (i in 0..chosen.length()) {
+            let id: u64 = chosen.keyAt(i);
+            let usage = this.segmentUsage(id);
+            if (usage.liveBytes != 0) { continue; }
+            this.journal.removeSegment(id)?;
+            let _ = this.state.segments.remove(borrow id);
+            stats.segmentsRemoved += 1;
+            stats.bytesFreed += usage.totalBytes;
+        }
+        if (stats.segmentsRemoved > 0) { this.journal.syncDirectory()?; }
+        return Ok(stats);
+    }
+
+    /// The verified record that holds an inline version's payload.
+    fn readLiveRecord(borrow this, v: borrow ObjectVersion) -> Result<Vector<u8>, StoreError> {
+        let offset = v.payload.offset + v.payload.length as u64 + RECORD_TRAILER_LEN as u64 - v.recordLength as u64;
+        return match (this.journal.readRecord(v.recordSegment, offset, v.recordLength)) {
+            Ok(bytes) => Ok(bytes),
+            Err(JournalError.Corrupt(_, _)) => Err(StoreError.DataCorrupt),
+            Err(e) => Err(StoreError.Journal(e)),
+        };
+    }
+
+    /// Reads and verifies one live record, then stages its Relocate copy.
+    fn stageRelocation(borrow mut this, r: borrow Relocation) -> Result<void, StoreError> {
+        let record = match (this.journal.readRecord(r.segment, r.recordOffset, r.recordLength)) {
+            Ok(bytes) => bytes,
+            Err(JournalError.Corrupt(_, _)) => { return Err(StoreError.DataCorrupt); }
+            Err(e) => { return Err(StoreError.Journal(e)); }
+        };
+        let end = r.recordLength as usize - RECORD_TRAILER_LEN;
+        let payload = record.view()[end - r.payloadLength as usize..end];
+        var meta = Vector<u8>.create();
+        encodeRelocateMeta(mut meta, r.bucket.view(), r.key.view(), r.versionId, r.generation)?;
+        if (this.journal.wouldOverflow(meta.length, payload.length)) { this.commitStaged()?; }
+        this.pendingApplies.reserve(1)?;
+        let pos = this.journal.stage(RecordType.Relocate, meta.view(), payload)?;
+        this.pendingApplies.push(PendingApply {
+            kind: RecordType.Relocate,
+            lsn: pos.lsn,
+            segment: pos.segmentId,
+            offset: pos.offset,
+            total: truncate<u32>(recordLength(meta.length, payload.length)),
+            meta: meta,
+            payloadLen: truncate<u32>(payload.length),
+            manifest: Vector<u8>.create(),
+        })?;
+        return Ok();
+    }
+
+    /// Background upkeep: a checkpoint when one is due, then compaction.
+    fn maintain(borrow mut this) -> Result<MaintenanceReport, StoreError> {
+        var checkpointed = false;
+        let every = this.config.checkpointEveryBytes;
+        if (every > 0 && this.sinceCheckpoint >= every) { checkpointed = this.checkpoint()?; }
+        let compaction = this.compact(this.config.compactMaxCopyBytes)?;
+        return Ok(MaintenanceReport { checkpointed: checkpointed, compaction: compaction });
+    }
+
     // Statistics.
     fn objectCount(borrow this) -> usize => this.state.index.length();
+
+    /// Bytes in journal segments (records and recovered segment files), and their number.
+    fn journalBytes(borrow this) -> u64 {
+        var total: u64 = 0;
+        for (i in 0..this.state.segments.length()) { total += this.state.segments.valueAt(i).totalBytes; }
+        return total;
+    }
+
+    fn segmentCount(borrow this) -> usize => this.state.segments.length();
+
+    /// The LSN the newest checkpoint covers (0: none).
+    fn lastCheckpoint(borrow this) -> u64 => this.checkpointLsn;
 
     fn recordsApplied(borrow this) -> u64 => this.state.records;
 

@@ -1,32 +1,10 @@
-// Durable file primitives: a safe wrapper over durable_shim.c (ADR-0002). Every operation
-// passes through the fault-injection hooks of faults.cee (ADR-0004).
+// Durable file primitives over CeeSafe's File and Directory (ADR-0002; the durable file API of CeeSafe ADR 0075,
+// which replaced durable_shim.c). Every operation passes through the fault-injection hooks of faults.cee (ADR-0004).
 //
 // Everything that must survive a crash goes through DurableFile. The rules:
 // - `writeAt` places bytes; they are not durable until `syncData` returns Ok.
 // - A newly created or renamed file is not durable until its directory is synced
 //   with `Fs.syncDirectory`.
-
-extern "C" {
-    @effects()
-    fn cosmo_open(path: *CChar, flags: i32) -> i32;
-    @effects()
-    fn cosmo_close(fd: i32) -> i32;
-    fn cosmo_pread(fd: i32, buf: *mut u8, len: usize, offset: u64) -> i64;
-    fn cosmo_pwrite_all(fd: i32, buf: *u8, len: usize, offset: u64) -> i64;
-    fn cosmo_sync_data(fd: i32) -> i32;
-    fn cosmo_sync_dir(path: *CChar) -> i32;
-    @effects()
-    fn cosmo_size(fd: i32) -> i64;
-    fn cosmo_truncate(fd: i32, length: u64) -> i32;
-    fn cosmo_rename(from: *CChar, to: *CChar) -> i32;
-    fn cosmo_unlink(path: *CChar) -> i32;
-    fn cosmo_mkdir(path: *CChar) -> i32;
-}
-
-const O_READ: i32 = 1;
-// The shim's flags (durable_shim.c): READ 1, RW 2, CREATE 4, EXCL 8.
-const O_RW_CREATE: i32 = 6;
-const O_RW_CREATE_EXCL: i32 = 14;
 
 const ERRNO_ENOENT: i32 = 2;
 const ERRNO_EEXIST: i32 = 17;
@@ -47,17 +25,30 @@ enum IoOp {
     OutOfMemory,
 }
 
-/// A failed I/O operation: the operation and the OS error number (0 when not an OS error).
+/// A failed I/O operation: the operation and the OS error number (0 when not an OS error, -1 for corrupt data).
 struct IoFailure {
     op: IoOp;
     errno: i32;
 
-    fn os(op: IoOp, code: i64) -> IoFailure => IoFailure { op: op, errno: truncate<i32>(0 - code) };
+    fn of(op: IoOp, error: IoError) -> IoFailure => IoFailure { op: op, errno: errnoOf(error) };
 
     fn isNotFound(borrow this) -> bool => this.errno == ERRNO_ENOENT;
 
     fn isAlreadyExists(borrow this) -> bool => this.errno == ERRNO_EEXIST;
 }
+
+/// The POSIX number of an IoError, so failures read as they did over the C shim.
+fn errnoOf(error: IoError) -> i32 => match (error) {
+    IoError.NotFound => ERRNO_ENOENT,
+    IoError.PermissionDenied => 13,
+    IoError.AlreadyExists => ERRNO_EEXIST,
+    IoError.IsDirectory => 21,
+    IoError.NotDirectory => 20,
+    IoError.InvalidInput => 22,
+    IoError.OutOfMemory => 12,
+    IoError.Other(code) => code,
+    _ => 5, // EIO
+};
 
 fn ioOpName(op: IoOp) -> StringView => match (op) {
     IoOp.Open => "open",
@@ -74,77 +65,52 @@ fn ioOpName(op: IoOp) -> StringView => match (op) {
     IoOp.OutOfMemory => "out of memory",
 };
 
-const PATH_MAX_BYTES: usize = 4095;
-
-/// A path copied into a NUL-terminated buffer for C.
-struct CPath {
-    bytes: [u8; 4096];
-    length: usize;
-
-    fn from(path: StringView) -> Result<CPath, IoFailure> {
-        if (path.length > PATH_MAX_BYTES) {
-            return Err(IoFailure { op: IoOp.PathTooLong, errno: 0 });
-        }
-        var p = CPath { bytes: [0u8; 4096], length: path.length };
-        let src = path.bytes();
-        for (i in 0..src.length) {
-            if (src[i] == 0) {
-                return Err(IoFailure { op: IoOp.PathTooLong, errno: 0 });
-            }
-            p.bytes[i] = src[i];
-        }
-        return Ok(p);
-    }
-
-    fn pointer(borrow this) -> *CChar => borrow this.bytes[0] as *u8 as *CChar;
-}
-
 /// Filesystem operations on paths.
 struct Fs {
     /// Makes created, renamed and removed entries of `dir` durable.
-    /// Safety: the CPath buffer is NUL-terminated and outlives the call.
     fn syncDirectory(dir: StringView) -> Result<void, IoFailure> {
-        let p = CPath.from(dir)?;
         if (faultHit(IoOp.SyncDir)) { return Err(injected(IoOp.SyncDir)); }
         if (!syncsElided()) {
-            let r = unsafe { cosmo_sync_dir(p.pointer()) };
-            if (r < 0) { return Err(IoFailure.os(IoOp.SyncDir, r as i64)); }
+            match (Directory.sync(dir)) {
+                Ok() => {}
+                Err(e) => { return Err(IoFailure.of(IoOp.SyncDir, e)); }
+            }
         }
         trackDirectorySynced(dir);
         return Ok();
     }
 
     /// Atomically replaces `to` with `from`. Sync the directory afterwards.
-    /// Safety: both CPath buffers are NUL-terminated and outlive the call.
     fn rename(from: StringView, to: StringView) -> Result<void, IoFailure> {
-        let a = CPath.from(from)?;
-        let b = CPath.from(to)?;
         if (faultHit(IoOp.Rename)) { return Err(injected(IoOp.Rename)); }
-        let r = unsafe { cosmo_rename(a.pointer(), b.pointer()) };
-        if (r < 0) { return Err(IoFailure.os(IoOp.Rename, r as i64)); }
+        match (File.rename(from, to)) {
+            Ok() => {}
+            Err(e) => { return Err(IoFailure.of(IoOp.Rename, e)); }
+        }
+        trackRenamed(from, to);
         return Ok();
     }
 
     /// Removes a file.
-    /// Safety: the CPath buffer is NUL-terminated and outlives the call.
     fn unlink(path: StringView) -> Result<void, IoFailure> {
-        let p = CPath.from(path)?;
         if (faultHit(IoOp.Unlink)) { return Err(injected(IoOp.Unlink)); }
-        let r = unsafe { cosmo_unlink(p.pointer()) };
-        if (r < 0) { return Err(IoFailure.os(IoOp.Unlink, r as i64)); }
+        match (File.remove(path)) {
+            Ok() => {}
+            Err(e) => { return Err(IoFailure.of(IoOp.Unlink, e)); }
+        }
         trackRemoved(path);
         return Ok();
     }
 
     /// Creates a directory if it does not exist. A new directory's entry is made durable by
     /// syncing the directory that holds it.
-    /// Safety: the CPath buffer is NUL-terminated and outlives the call.
     fn ensureDirectory(path: StringView) -> Result<void, IoFailure> {
-        let p = CPath.from(path)?;
         if (faultHit(IoOp.Mkdir)) { return Err(injected(IoOp.Mkdir)); }
-        let r = unsafe { cosmo_mkdir(p.pointer()) };
-        if (r == 0 - ERRNO_EEXIST) { return Ok(); }
-        if (r < 0) { return Err(IoFailure.os(IoOp.Mkdir, r as i64)); }
+        match (Directory.create(path)) {
+            Ok() => {}
+            Err(IoError.AlreadyExists) => { return Ok(); }
+            Err(e) => { return Err(IoFailure.of(IoOp.Mkdir, e)); }
+        }
         let _ = trackCreated(path, true);
         return Fs.syncDirectory(Fs.parentOf(path));
     }
@@ -163,46 +129,58 @@ struct Fs {
     }
 }
 
+/// How DurableFile opens a file.
+enum OpenMode {
+    Read,
+    ReadWriteCreate,
+    CreateNew,
+}
+
 /// An open file with positional I/O and explicit durability.
 struct DurableFile {
-    private fd: i32;
+    private file: File;
     /// The crash model's registry slot (faults.cee), or NO_SLOT.
     private slot: u32;
 
     /// Opens an existing file for reading.
-    fn openRead(path: StringView) -> Result<DurableFile, IoFailure> => DurableFile.openWith(path, O_READ);
+    fn openRead(path: StringView) -> Result<DurableFile, IoFailure> => DurableFile.openWith(path, OpenMode.Read);
 
     /// Opens a file for reading and writing, creating it if missing.
-    fn openReadWrite(path: StringView) -> Result<DurableFile, IoFailure> => DurableFile.openWith(path, O_RW_CREATE);
+    fn openReadWrite(path: StringView) -> Result<DurableFile, IoFailure> =>
+        DurableFile.openWith(path, OpenMode.ReadWriteCreate);
 
     /// Creates a new file for reading and writing; fails if it exists.
-    fn createNew(path: StringView) -> Result<DurableFile, IoFailure> => DurableFile.openWith(path, O_RW_CREATE_EXCL);
+    fn createNew(path: StringView) -> Result<DurableFile, IoFailure> => DurableFile.openWith(path, OpenMode.CreateNew);
 
-    /// Safety: the CPath buffer is NUL-terminated and outlives the call.
-    fn openWith(path: StringView, flags: i32) -> Result<DurableFile, IoFailure> {
-        let p = CPath.from(path)?;
+    fn openWith(path: StringView, mode: OpenMode) -> Result<DurableFile, IoFailure> {
         if (faultHit(IoOp.Open)) { return Err(injected(IoOp.Open)); }
-        let fd = unsafe { cosmo_open(p.pointer(), flags) };
-        if (fd < 0) { return Err(IoFailure.os(IoOp.Open, fd as i64)); }
-        var file = DurableFile { fd: fd, slot: NO_SLOT };
+        let opened = match (mode) {
+            OpenMode.Read => File.open(path),
+            OpenMode.ReadWriteCreate => File.openOrCreate(path),
+            OpenMode.CreateNew => File.createNew(path),
+        };
+        var file = match (opened) {
+            Ok(f) => DurableFile { file: f, slot: NO_SLOT },
+            Err(e) => { return Err(IoFailure.of(IoOp.Open, e)); }
+        };
         if (tracking()) {
-            if (flags == O_RW_CREATE_EXCL) {
-                file.slot = trackCreated(path, false);
-            } else if (flags == O_RW_CREATE) {
-                file.slot = trackOpened(path, file.rawSize()?);
+            match (mode) {
+                OpenMode.CreateNew => { file.slot = trackCreated(path, false); }
+                OpenMode.ReadWriteCreate => { file.slot = trackOpened(path, file.rawSize()?); }
+                OpenMode.Read => {}
             }
         }
         return Ok(file);
     }
 
     /// Reads up to `into.length` bytes at `offset`; returns how many were read (0 at the end).
-    /// Safety: the pointer and length come from one live SliceMut.
     fn readAt(borrow this, into: SliceMut<u8>, offset: u64) -> Result<usize, IoFailure> {
         if (into.length == 0) { return Ok(0); }
         if (faultHit(IoOp.Read)) { return Err(injected(IoOp.Read)); }
-        let n = unsafe { cosmo_pread(this.fd, into.ptr, into.length, offset) };
-        if (n < 0) { return Err(IoFailure.os(IoOp.Read, n)); }
-        return Ok(checkedTruncate<usize>(n)!);
+        return match (this.file.readAt(into, offset)) {
+            Ok(n) => Ok(n),
+            Err(e) => Err(IoFailure.of(IoOp.Read, e)),
+        };
     }
 
     /// Reads exactly `into.length` bytes at `offset`; a short file is an error (EIO-like, errno 0).
@@ -217,7 +195,6 @@ struct DurableFile {
     }
 
     /// Writes all of `bytes` at `offset`. Not durable until `syncData`.
-    /// Safety: the pointer and length come from one live Slice.
     fn writeAt(borrow this, bytes: Slice<u8>, offset: u64) -> Result<void, IoFailure> {
         if (bytes.length == 0) { return Ok(); }
         trackWrite(this.slot, offset);
@@ -228,51 +205,44 @@ struct DurableFile {
         return this.rawWriteAt(bytes, offset);
     }
 
-    /// Safety: the pointer and length come from one live Slice.
-    fn rawWriteAt(borrow this, bytes: Slice<u8>, offset: u64) -> Result<void, IoFailure> {
-        let n = unsafe { cosmo_pwrite_all(this.fd, bytes.ptr, bytes.length, offset) };
-        if (n < 0) { return Err(IoFailure.os(IoOp.Write, n)); }
-        return Ok();
-    }
+    fn rawWriteAt(borrow this, bytes: Slice<u8>, offset: u64) -> Result<void, IoFailure> =>
+        match (this.file.writeAt(bytes, offset)) {
+            Ok() => Ok(),
+            Err(e) => Err(IoFailure.of(IoOp.Write, e)),
+        };
 
     /// Makes written data, and the size needed to read it, durable (F_FULLFSYNC on macOS).
-    /// Safety: the descriptor is owned by this value and open.
     fn syncData(borrow this) -> Result<void, IoFailure> {
         if (faultHit(IoOp.Sync)) { return Err(injected(IoOp.Sync)); }
         if (!syncsElided()) {
-            let r = unsafe { cosmo_sync_data(this.fd) };
-            if (r < 0) { return Err(IoFailure.os(IoOp.Sync, r as i64)); }
+            match (this.file.syncData()) {
+                Ok() => {}
+                Err(e) => { return Err(IoFailure.of(IoOp.Sync, e)); }
+            }
         }
         if (this.slot != NO_SLOT) { trackSynced(this.slot, this.rawSize()?); }
         return Ok();
     }
 
     /// The file's size in bytes.
-    /// Safety: the descriptor is owned by this value and open.
     fn size(borrow this) -> Result<u64, IoFailure> {
         if (faultHit(IoOp.Size)) { return Err(injected(IoOp.Size)); }
         return this.rawSize();
     }
 
-    /// Safety: the descriptor is owned by this value and open.
-    fn rawSize(borrow this) -> Result<u64, IoFailure> {
-        let n = unsafe { cosmo_size(this.fd) };
-        if (n < 0) { return Err(IoFailure.os(IoOp.Size, n)); }
-        return Ok(checkedTruncate<u64>(n)!);
-    }
+    fn rawSize(borrow this) -> Result<u64, IoFailure> => match (this.file.length()) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(IoFailure.of(IoOp.Size, e)),
+    };
 
     /// Cuts or extends the file to `length` bytes.
-    /// Safety: the descriptor is owned by this value and open.
     fn truncateTo(borrow this, length: u64) -> Result<void, IoFailure> {
         if (faultHit(IoOp.Truncate)) { return Err(injected(IoOp.Truncate)); }
-        let r = unsafe { cosmo_truncate(this.fd, length) };
-        if (r < 0) { return Err(IoFailure.os(IoOp.Truncate, r as i64)); }
+        match (this.file.setLength(length)) {
+            Ok() => {}
+            Err(e) => { return Err(IoFailure.of(IoOp.Truncate, e)); }
+        }
         trackTruncated(this.slot, length);
         return Ok();
-    }
-
-    /// Safety: the descriptor is owned by this value and closed exactly once, here.
-    drop {
-        unsafe { cosmo_close(this.fd); }
     }
 }

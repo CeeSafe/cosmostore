@@ -13,8 +13,8 @@
 // unlink whose directory was never synced might come back after a real crash; the model
 // ignores this, and the orphan sweep would remove such an extent anyway.
 //
-// The state is process-wide atomics. `ceesafec test` runs each test in its own process, and the
-// store is single-threaded. With nothing armed, each hook is one atomic load.
+// The state is process-wide atomics, the registry included, with no `unsafe`. `ceesafec test` runs each test in its
+// own process, and the store is single-threaded. With nothing armed, each hook is one atomic load.
 
 const FAULT_EIO: i32 = 5;
 const TRACK_SLOTS: usize = 512;
@@ -39,61 +39,37 @@ static FIRED: AtomicU64 = AtomicU64.constant(0);
 static VIOLATIONS: AtomicU64 = AtomicU64.constant(0);
 static FIRST_OP: AtomicU32 = AtomicU32.constant(0);
 
-/// The crash model's registry: one slot per tracked file or directory, keyed by path hash.
-/// A `static mut`, because arrays of atomics are not allowed (CEESAFE_GAPS G21). Only the
-/// accessors below touch it.
-struct TrackTable {
-    count: usize;
-    path: [u64; 512];
-    parent: [u64; 512];
-    synced: [u64; 512];
-    flags: [u32; 512];
-}
+/// The crash model's registry: one slot per tracked file or directory, keyed by path hash, as static tables of
+/// atomics (CeeSafe 0.19, ADR 0075 §2.15). Plain loads and stores: the slots are written only by the thread doing
+/// the store's I/O; atomics make the tables shareable without `unsafe`.
+static TRACK_COUNT: AtomicUSize = AtomicUSize.constant(0);
+static TRACK_PATH: [AtomicU64; 512] = [AtomicU64.constant(0); 512];
+static TRACK_PARENT: [AtomicU64; 512] = [AtomicU64.constant(0); 512];
+static TRACK_SYNCED: [AtomicU64; 512] = [AtomicU64.constant(0); 512];
+static TRACK_FLAGS: [AtomicU32; 512] = [AtomicU32.constant(0); 512];
 
-static mut TRACK: TrackTable = TrackTable {
-    count: 0,
-    path: [0u64; 512],
-    parent: [0u64; 512],
-    synced: [0u64; 512],
-    flags: [0u32; 512],
-};
+fn slotCount() -> usize => TRACK_COUNT.load();
 
-// The accessors' safety argument: TRACK is used only by the single thread that does the store's
-// I/O. Tests run one per process, and the store has no I/O threads. Each access is a whole read
-// or write of one integer, and no reference to TRACK outlives the call.
-/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
-fn slotCount() -> usize => unsafe { TRACK.count };
+fn setSlotCount(n: usize) { TRACK_COUNT.store(n); }
 
-/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
-fn setSlotCount(n: usize) { unsafe { TRACK.count = n; } }
+fn slotPath(i: usize) -> u64 => TRACK_PATH[i].load();
 
-/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
-fn slotPath(i: usize) -> u64 => unsafe { TRACK.path[i] };
+fn slotParent(i: usize) -> u64 => TRACK_PARENT[i].load();
 
-/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
-fn slotParent(i: usize) -> u64 => unsafe { TRACK.parent[i] };
+fn slotSynced(i: usize) -> u64 => TRACK_SYNCED[i].load();
 
-/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
-fn slotSynced(i: usize) -> u64 => unsafe { TRACK.synced[i] };
+fn slotFlags(i: usize) -> u32 => TRACK_FLAGS[i].load();
 
-/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
-fn slotFlags(i: usize) -> u32 => unsafe { TRACK.flags[i] };
-
-/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
 fn setSlot(i: usize, path: u64, parent: u64, synced: u64, flags: u32) {
-    unsafe {
-        TRACK.path[i] = path;
-        TRACK.parent[i] = parent;
-        TRACK.synced[i] = synced;
-        TRACK.flags[i] = flags;
-    }
+    TRACK_PATH[i].store(path);
+    TRACK_PARENT[i].store(parent);
+    TRACK_SYNCED[i].store(synced);
+    TRACK_FLAGS[i].store(flags);
 }
 
-/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
-fn setSlotSynced(i: usize, synced: u64) { unsafe { TRACK.synced[i] = synced; } }
+fn setSlotSynced(i: usize, synced: u64) { TRACK_SYNCED[i].store(synced); }
 
-/// Safety: one integer of TRACK, from the single I/O thread (see TRACK).
-fn setSlotFlags(i: usize, flags: u32) { unsafe { TRACK.flags[i] = flags; } }
+fn setSlotFlags(i: usize, flags: u32) { TRACK_FLAGS[i].store(flags); }
 
 /// Whether operation `op` fails by injection. Counts the operation when faults are armed.
 fn faultHit(op: IoOp) -> bool {
@@ -226,6 +202,21 @@ fn trackRemoved(path: StringView) {
     if (!tracking()) { return; }
     let slot = findSlot(pathHash(path.bytes()));
     if (slot != NO_SLOT) { setSlotFlags(slot as usize, 0); }
+}
+
+/// A rename moves the source's synced length to the new name, whose entry is not durable
+/// until its directory is synced. If the crash comes first, the model drops the file under
+/// both names. That is harsher than a real crash, where the old name would survive, but it is
+/// safe for testing: CosmoStore renames only temporary files, which recovery discards anyway.
+fn trackRenamed(from: StringView, to: StringView) {
+    if (!tracking()) { return; }
+    let source = findSlot(pathHash(from.bytes()));
+    // An untracked source predates tracking: all of it counts as synced.
+    let synced = if (source == NO_SLOT) 0xFFFFFFFFFFFFFFFF else slotSynced(source as usize);
+    if (source != NO_SLOT) { setSlotFlags(source as usize, 0); }
+    let old = findSlot(pathHash(to.bytes()));
+    if (old != NO_SLOT) { setSlotFlags(old as usize, 0); }
+    let _ = addSlot(to.bytes(), 0, synced);
 }
 
 fn listFailure() -> IoFailure => IoFailure { op: IoOp.Open, errno: 0 };

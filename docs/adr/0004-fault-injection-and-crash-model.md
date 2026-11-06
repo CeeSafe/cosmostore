@@ -80,8 +80,9 @@ they keep every extent file. So three questions were untested:
 ## Consequences
 
 - New I/O must go through `DurableFile`/`Fs`. Anything else escapes both the failpoints and the crash model.
-- The registry is a `static mut` table behind a few accessor functions that use `unsafe`. CeeSafe has no
-  arrays of atomics and no constant `Mutex` (CEESAFE_GAPS G21).
-- The model does not cover reordering *within* a file between syncs, which is harmless for append-only files,
-  or `rename` (which is not used yet). Checkpoints (M2) will rename. Before then the model must track renames
-  as "durable once the directory is synced".
+- The registry is static tables of atomics (`[AtomicU64; 512]` and the like), with no `unsafe`. It was a
+  `static mut` table behind `unsafe` accessors until CeeSafe 0.19 allowed arrays of atomics in statics
+  (CEESAFE_GAPS G21).
+- The model does not cover reordering *within* a file between syncs, which is harmless for append-only files.
+- Since ADR-0005, the model tracks `rename`: the new name is durable once its directory is synced. If the crash
+  comes first, both names are dropped, which is harsher than a real crash.

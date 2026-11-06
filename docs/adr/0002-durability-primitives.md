@@ -1,6 +1,8 @@
 # ADR-0002: Durability primitives
 
-**Status:** accepted (implemented in `src/storage/io/`), 6 Nov 2026
+**Status:** accepted, 6 Nov 2026; **the shim is gone**: since CeeSafe 0.19 (its ADR 0075), `durable.cee` is built
+on CeeSafe's own `File.openOrCreate`/`createNew`, `readAt`/`writeAt`, `syncData` (F_FULLFSYNC on macOS), `length`,
+`setLength`, `File.rename` and `Directory.sync`, and CosmoStore calls no C. The semantics below still hold.
 
 ## Context
 

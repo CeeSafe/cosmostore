@@ -30,6 +30,32 @@ boilerplate; **P2** ergonomics.
 | G19 | P1 | language | No way to move a value out of a `borrow mut` place (no `replace`/`take`/`swap` of values) |
 | G20 | P2 | parser | `a as u64 < b` parses `<` as generic arguments (N0100 "expected '>'") |
 | G21 | P1 | language/std | No safe process-wide table: arrays of atomics are rejected (N0259) and `Mutex` has no constant constructor |
+| G22 | P2 | parser | No explicit dereference: `let id = *m.keyAt(0);` is N0102, even though spec §13.3 writes `*r` |
+
+## Status (2026-11-06)
+
+CeeSafe 0.19.0 (its ADR 0075) addressed every finding, and CosmoStore now uses the fixes:
+- `durable_shim.c` is gone: `durable.cee` is built on `File`/`Directory` (G1–G5).
+- `@from` variants replaced the `jio`/`jalloc`/`sj`/`salloc`/`metaAlloc` adapters (G7). `sio` stays, because it
+  maps a corrupt read to `DataCorrupt`.
+- lib/std's `Crc32c` and `Md5` replaced CosmoStore's own, and the generated table is gone (G9).
+- The fault registry is static arrays of atomics, with no `unsafe` (G21).
+- `replace` removed `ObjectWriter`'s copies (G19), arrays call `writeLE` directly (G14), and the benchmark times
+  with `Clock.monotonicNanos` (G10).
+
+Where CeeSafe differs from the suggestions below:
+- G7 has no `map`/`mapErr`.
+- G13 is `[]` as an empty slice, not `[T; 0]`.
+- G21 has no `Mutex.constant`.
+- G15 counts unwraps anywhere in a test file as the tests' own.
+
+Not used yet:
+- `OrderedMap` (G8), for the LIST index (ROADMAP M4).
+- `AsyncFiles` (G6), for the async server.
+
+The migration found that `File`'s positional methods needed `borrow mut this`, which CosmoStore's shared read paths
+can't give. CeeSafe's main tree relaxes them to `borrow this` (ADR 0075 §8, after 0.19.0), so CosmoStore currently
+needs a ceesafec built from that tree, until the next release.
 
 ## Details
 
@@ -193,6 +219,18 @@ Suggested:
   `Vector.empty()` could be `@constant`;
 - or offer `@threadLocal static` for single-thread state like this.
 
+### G22: explicit dereference (P2)
+
+```ceesafe
+var m = HashMap<u64, bool>.create();
+m.put(7, true)!;
+let id = *m.keyAt(0);          // error[N0102]: expected expression, found '*'
+let id: u64 = m.keyAt(0);      // works: auto-deref where a u64 is expected (§13.3)
+```
+Auto-deref covers most cases. But copying a `Copy` value out of a reference into an un-annotated `let` needs a
+type annotation, which is easy to miss because the spec's own prose spells the read as `*r`. Suggested: accept
+prefix `*` on a reference to a `Copy` type, or add a diagnostic that suggests the annotation.
+
 ## Not gaps (checked)
 
 Things that worked well and are worth keeping:
@@ -207,3 +245,6 @@ Things that worked well and are worth keeping:
 - Scalar `static` atomics as failpoints (`static ARMED: AtomicU32 = AtomicU32.constant(0)`): no `unsafe`, and
   `ceesafec test` runs each test in its own process, so they don't leak between tests.
 - `ceesafec check` checks `@test` functions too.
+- Passing a named function as a `fn(StringView, borrow mut T)` parameter: this is how the fault sweeps take
+  their workload.
+- Moving a field out of a local struct that has no `drop` (`state = loaded.state`).

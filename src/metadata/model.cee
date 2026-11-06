@@ -109,6 +109,15 @@ struct PutMeta {
     contentType: Vector<u8>;
 }
 
+/// Decoded meta of a Relocate record: which version the copied payload belongs to.
+struct RelocateMeta {
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    versionId: [u8; 16];
+    /// The version's generation (the LSN of the record that created it).
+    generation: u64;
+}
+
 /// Decoded meta of a DeleteVersion or DeleteMarker record.
 struct DeleteMeta {
     bucket: Vector<u8>;
@@ -121,13 +130,8 @@ enum MetaFault {
     Short,
     BadVersion,
     TooLong,
-    OutOfMemory,
+    @from OutOfMemory(AllocError),
 }
-
-fn metaAlloc<T>(r: Result<T, AllocError>) -> Result<T, MetaFault> => match (r) {
-    Ok(v) => Ok(v),
-    Err(_) => Err(MetaFault.OutOfMemory),
-};
 
 fn pushText16(out: borrow mut Vector<u8>, s: Slice<u8>) -> Result<void, AllocError> {
     out.pushLE(truncate<u16>(s.length))?;
@@ -185,6 +189,23 @@ fn encodeBucketMeta(out: borrow mut Vector<u8>, name: Slice<u8>, mtimeMillis: i6
     return Ok();
 }
 
+/// Relocate meta v1: u8 format version, u16+bytes bucket, u16+bytes key, 16 version id,
+/// u64 generation. The payload is the version's inline bytes.
+fn encodeRelocateMeta(
+    out: borrow mut Vector<u8>,
+    bucket: Slice<u8>,
+    key: Slice<u8>,
+    versionId: [u8; 16],
+    generation: u64,
+) -> Result<void, AllocError> {
+    out.pushLE(META_FORMAT_VERSION)?;
+    pushText16(out, bucket)?;
+    pushText16(out, key)?;
+    out.extend(versionId[..])?;
+    out.pushLE(generation)?;
+    return Ok();
+}
+
 fn need(bytes: Slice<u8>, at: usize, n: usize) -> Result<void, MetaFault> {
     if (at + n > bytes.length) { return Err(MetaFault.Short); }
     return Ok();
@@ -195,7 +216,7 @@ fn readText16(bytes: Slice<u8>, at: borrow mut usize) -> Result<Vector<u8>, Meta
     let n = bytes.readLE<u16>(at) as usize;
     at += 2;
     need(bytes, at, n)?;
-    let v = metaAlloc(copyBytes(bytes[at..at + n]))?;
+    let v = copyBytes(bytes[at..at + n])?;
     at += n;
     return Ok(v);
 }
@@ -260,10 +281,28 @@ fn decodeDeleteMeta(bytes: Slice<u8>) -> Result<DeleteMeta, MetaFault> {
     return Ok(DeleteMeta { bucket: bucket, key: key, versionId: versionId, mtimeMillis: mtime });
 }
 
+fn decodeRelocateMeta(bytes: Slice<u8>) -> Result<RelocateMeta, MetaFault> {
+    var at: usize = 0;
+    checkVersion(bytes, mut at)?;
+    let bucket = readText16(bytes, mut at)?;
+    let key = readText16(bytes, mut at)?;
+    let versionId = readId16(bytes, mut at)?;
+    let generation = readU64(bytes, mut at)?;
+    return Ok(RelocateMeta { bucket: bucket, key: key, versionId: versionId, generation: generation });
+}
+
 fn decodeBucketName(bytes: Slice<u8>) -> Result<Vector<u8>, MetaFault> {
     var at: usize = 0;
     checkVersion(bytes, mut at)?;
     return readText16(bytes, mut at);
+}
+
+/// The mtime of BucketCreate / BucketDelete meta.
+fn decodeBucketMillis(bytes: Slice<u8>) -> Result<i64, MetaFault> {
+    var at: usize = 0;
+    checkVersion(bytes, mut at)?;
+    let _ = readText16(bytes, mut at)?;
+    return readI64(bytes, mut at);
 }
 
 /// S3 general-purpose bucket naming rules (3-63 chars; lowercase letters, digits, '.', '-';

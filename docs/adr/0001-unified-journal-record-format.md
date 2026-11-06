@@ -34,7 +34,7 @@ The header is 48 bytes:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `CERC` |
-| 4 | 1 | type: 1 PutInline, 2 PutExtent, 3 DeleteMarker, 4 DeleteVersion, 5 BucketCreate, 6 BucketDelete, 7 Checkpoint |
+| 4 | 1 | type: 1 PutInline, 2 PutExtent, 3 DeleteMarker, 4 DeleteVersion, 5 BucketCreate, 6 BucketDelete, 7 reserved (checkpoints are files), 8 Relocate (ADR-0005) |
 | 5 | 1 | flags; bit 0 means the payload is encrypted (reserved for SSE) |
 | 6 | 2 | header length (48) |
 | 8 | 4 | total length |
@@ -61,7 +61,9 @@ content type and a user-metadata count, which is 0 for now.
 
 ## Recovery
 
-Segments are replayed in id order, and records must have strictly increasing LSNs.
+Segments are replayed in id order, and records must have strictly increasing LSNs. With a checkpoint (ADR-0005),
+replay starts at the checkpoint's segment and LSN, and earlier segments are not scanned. Segment ids may have
+gaps where compaction removed segments.
 - **Any invalid record in a sealed segment** (any segment but the newest) is corruption, so open fails.
 - **The first invalid record at offset X in the newest segment**: if any valid record starts at or after
   X + `maxBatchBytes`, it belongs to a later batch, which was only written after X's batch was synced and
@@ -82,5 +84,4 @@ rotation. `object_store_tests.cee` has the store-level crash-at-every-byte consi
 - One sync per batch. Measured on a macOS laptop SSD with `F_FULLFSYNC`, 1 KiB objects: 216 PUT/s at one
   sync per PUT, and 28k PUT/s at 256 per batch.
 - Replay rebuilds the in-memory index: about 480k records/s, including CRC checks.
-- Overwrites and deletes leave dead records. Per-segment live-byte accounting exists (`SegmentUsage`), and
-  compaction is ROADMAP M2.
+- Overwrites and deletes leave dead records. Compaction reclaims them (ADR-0005).

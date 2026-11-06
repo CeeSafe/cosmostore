@@ -27,11 +27,12 @@ fn describe(e: StoreError) -> StringView => match (e) {
     StoreError.Journal(JournalError.Corrupt(_, _)) => "journal corrupt",
     StoreError.Journal(_) => "journal error",
     StoreError.BadMeta(_, _) => "bad record meta",
-    StoreError.OutOfMemory => "out of memory",
+    StoreError.OutOfMemory(_) => "out of memory",
     StoreError.NoSuchBucket => "no such bucket",
     StoreError.NoSuchKey => "no such key",
     StoreError.EntityTooLarge => "entity too large",
     StoreError.DataCorrupt => "data corrupt",
+    StoreError.CheckpointCorrupt => "checkpoint corrupt",
     StoreError.Io(f) => ioOpName(f.op),
     _ => "store error",
 };
@@ -58,10 +59,7 @@ struct Pattern {
             this.x = this.x ^ (this.x >> 7);
             this.x = this.x ^ (this.x << 17);
             var word = [0u8; 8];
-            {
-                let w = borrow mut word[..];
-                w.writeLE(0, this.x);
-            }
+            word.writeLE(0, this.x);
             let n = if (into.length - k < 8) into.length - k else 8;
             into[k..k + n].copyFrom(word[0..n]);
             k += n;
@@ -117,7 +115,7 @@ fn bench() {
             Err(e) => { die(describe(e)); }
         }
         let before = store.journalSyncs();
-        let start = Clock.unixMillis();
+        let start = elapsedMillis();
         for (i in 0u64..count) {
             objectName(mut name, i);
             // Stream the object through a writer in chunks: inline if small, extents if not.
@@ -155,19 +153,34 @@ fn bench() {
             Ok(_) => {}
             Err(e) => { die(describe(e)); }
         }
-        let elapsed = Clock.unixMillis() - start;
+        let elapsed = elapsedMillis() - start;
         writeRate("put", count, size, elapsed);
         Console.write("journal syncs: ");
         Console.writeLine(store.journalSyncs() - before);
     }
-    // Reopen (full recovery) and stream-verify every byte.
-    let start = Clock.unixMillis();
+    // Reopen (full recovery), checkpoint, reopen from the checkpoint, then stream-verify
+    // every byte.
+    {
+        let start = elapsedMillis();
+        var full = match (ObjectStore.open(dir, config)) {
+            Ok(s) => s,
+            Err(e) => { die(describe(e)); }
+        };
+        writeRate("recover (full replay)", full.recordsApplied(), 0, elapsedMillis() - start);
+        let written = elapsedMillis();
+        match (full.checkpoint()) {
+            Ok(_) => {}
+            Err(e) => { die(describe(e)); }
+        }
+        writeRate("checkpoint", full.objectCount() as u64, 0, elapsedMillis() - written);
+    }
+    let start = elapsedMillis();
     let store = match (ObjectStore.open(dir, config)) {
         Ok(s) => s,
         Err(e) => { die(describe(e)); }
     };
-    writeRate("recover", store.recordsApplied(), 0, Clock.unixMillis() - start);
-    let readStart = Clock.unixMillis();
+    writeRate("recover (checkpoint)", store.objectCount() as u64, 0, elapsedMillis() - start);
+    let readStart = elapsedMillis();
     for (i in 0u64..count) {
         objectName(mut name, i);
         var reader = match (store.openReader("bench", name.view(), 0, size)) {
@@ -192,7 +205,7 @@ fn bench() {
             left -= n;
         }
     }
-    writeRate("get+verify", count, size, Clock.unixMillis() - readStart);
+    writeRate("get+verify", count, size, elapsedMillis() - readStart);
 }
 
 fn main() {
@@ -203,3 +216,6 @@ fn main() {
     }
     usage();
 }
+
+/// Milliseconds on the monotonic clock, for the benchmark's durations (a wall-clock jump cannot skew them).
+fn elapsedMillis() -> i64 => saturatingTruncate<i64>(Clock.monotonicNanos() / 1000000);

@@ -32,10 +32,7 @@ fn extentPath(dir: StringView, id: u64) -> Result<String, AllocError> {
 
 fn appendHex16Text(s: borrow mut String, value: u64) -> Result<void, AllocError> {
     var bytes = [0u8; 8];
-    {
-        let w = borrow mut bytes[..];
-        w.writeBE(0, value);
-    }
+    bytes.writeBE(0, value);
     return appendHex(s, bytes[..]);
 }
 
@@ -62,17 +59,16 @@ fn decodeManifest(bytes: Slice<u8>) -> Result<Vector<ExtentRef>, MetaFault> {
     let n = bytes.readLE<u32>(0) as usize;
     if (bytes.length != 4 + n * 20) { return Err(MetaFault.Short); }
     var out = Vector<ExtentRef>.create();
-    metaAlloc(out.reserve(n))?;
+    out.reserve(n)?;
     for (i in 0..n) {
         let at = 4 + i * 20;
-        metaAlloc(
-            out.push(
-                ExtentRef {
-                    id: bytes.readLE<u64>(at),
-                    length: bytes.readLE<u64>(at + 8),
-                    crc: bytes.readLE<u32>(at + 16),
-                },
-            ),
+
+        out.push(
+            ExtentRef {
+                id: bytes.readLE<u64>(at),
+                length: bytes.readLE<u64>(at + 8),
+                crc: bytes.readLE<u32>(at + 16),
+            },
         )?;
     }
     return Ok(out);
@@ -80,17 +76,11 @@ fn decodeManifest(bytes: Slice<u8>) -> Result<Vector<ExtentRef>, MetaFault> {
 
 fn writeExtentHeader(file: borrow DurableFile, id: u64) -> Result<void, IoFailure> {
     var h = [0u8; 64];
-    {
-        let w = borrow mut h[..];
-        w.writeLE(0, EXTENT_MAGIC);
-        w.writeLE(8, id);
-        w.writeLE(16, Clock.unixMillis());
-    }
+    h.writeLE(0, EXTENT_MAGIC);
+    h.writeLE(8, id);
+    h.writeLE(16, Clock.unixMillis());
     let crc = Crc32c.of(h[0..60]);
-    {
-        let w = borrow mut h[..];
-        w.writeLE(60, crc);
-    }
+    h.writeLE(60, crc);
     return file.writeAt(h[..], 0);
 }
 
@@ -194,10 +184,7 @@ struct ObjectWriter {
             }
             this.spilled = true;
             // Move what was buffered into the first extent.
-            // CeeSafe cannot move the buffer out of `this` (CEESAFE_GAPS.md G19): copy it.
-            var held = Vector<u8>.create();
-            oom(held.extend(this.buffer.view()))?;
-            this.buffer.clear();
+            let held = replace(mut this.buffer, Vector<u8>.create());
             this.appendToExtents(held.view())?;
         }
         return this.appendToExtents(data);
@@ -246,7 +233,7 @@ struct ObjectWriter {
         }
         this.file = null;
         oom(
-            this.done.push(ExtentRef { id: this.currentId, length: this.currentLength, crc: this.currentCrc.value() }),
+            this.done.push(ExtentRef { id: this.currentId, length: this.currentLength, crc: this.currentCrc.finish() }),
         )?;
         return Ok();
     }
@@ -257,15 +244,12 @@ struct ObjectWriter {
         let digest = this.md5.finish();
         if (!this.spilled) {
             this.finished = true;
-            var data = Vector<u8>.create();
-            oom(data.extend(this.buffer.view()))?; // G19: a copy, at most inlineMax bytes
-            this.buffer.clear();
+            let data = replace(mut this.buffer, Vector<u8>.create());
             return Ok(FinishedObject { body: ObjectBody.Inline(data), size: this.size, md5: digest });
         }
         if (this.file.isSome()) { this.sealExtent()?; }
         Fs.syncDirectory(this.dir.view())?;
-        var extents = Vector<ExtentRef>.create();
-        oom(extents.extend(this.done.view()))?;
+        let extents = replace(mut this.done, Vector<ExtentRef>.create());
         this.finished = true;
         return Ok(FinishedObject { body: ObjectBody.Extents(extents), size: this.size, md5: digest });
     }
@@ -348,7 +332,7 @@ struct ExtentReader {
         }
         if (this.verifying) {
             this.crc.update(into[0..n]);
-            if (within + want == ext.length && this.crc.value() != ext.crc) {
+            if (within + want == ext.length && this.crc.finish() != ext.crc) {
                 return Err(IoFailure { op: IoOp.Read, errno: -1 });
             }
         }

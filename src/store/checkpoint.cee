@@ -1,0 +1,361 @@
+// Checkpoint files (ADR-0005). A checkpoint is the store's whole state (buckets and the current
+// version of every key, with locators) after LSN `lsn`. It is taken right after the journal
+// sealed its active segment, so every record up to `lsn` is in a segment before `segment`.
+// Recovery loads the newest checkpoint and replays only segments from `segment` on.
+//
+// File `ckpt-<lsn as 16 hex>.ck` in the store directory. It is written as `ckpt-<lsn>.tmp`,
+// synced, renamed, and then the directory is synced, so a file with the final name is
+// complete. A final-named checkpoint that fails its checks is corruption: open fails rather
+// than fall back, because segments it covered may already be gone. Little-endian:
+//
+// Header (64 bytes):
+//   0 u64 magic "CSCKPT01"   8 u16 format (1)   10 u16 header length (64)   12 u32 flags (0)
+//  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count   48 i64 created ms
+//  56 u32 reserved   60 u32 crc32c of bytes 0..60
+// Entries, buckets first: u8 kind (1 bucket, 2 object), u32 body length, body.
+//   bucket: u16+bytes name, i64 created ms
+//   object: u16+bytes bucket, u16+bytes key, 16 version id, u64 lsn, u64 size, i64 mtime ms,
+//           16 md5, u16+bytes content type, u64 payload segment, u64 payload offset,
+//           u32 payload length, u64 record segment, u32 record length, manifest (u32 count,
+//           then u64 id, u64 length, u32 crc32c per extent)
+// Trailer (16 bytes): u32 "CKND", u32 crc32c of every entry byte, u64 entry count.
+
+const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
+const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
+const CHECKPOINT_HEADER_LEN: usize = 64;
+const CHECKPOINT_TRAILER_LEN: usize = 16;
+const CHECKPOINT_FORMAT: u16 = 1;
+const CHECKPOINT_BUCKET: u8 = 1;
+const CHECKPOINT_OBJECT: u8 = 2;
+const CHECKPOINT_IO_CHUNK: usize = 1048576;
+/// No single entry is larger: a key and content type of at most 1 KiB each, and a manifest
+/// of at most 5 GiB / 64 KiB extents.
+const CHECKPOINT_MAX_ENTRY: usize = 2097152;
+
+/// `<dir>/ckpt-<lsn>.ck`, or `.tmp` while it is being written.
+fn checkpointPath(dir: StringView, lsn: u64, temporary: bool) -> Result<String, AllocError> {
+    var s = String.create();
+    s.append(dir)?;
+    s.append("/ckpt-")?;
+    appendHex16Text(mut s, lsn)?;
+    s.append(if (temporary) ".tmp" else ".ck")?;
+    return Ok(s);
+}
+
+/// The checkpoint files in `dir`: complete ones (`temporary` false), or leftovers of
+/// interrupted writes. Ascending LSN.
+fn listCheckpoints(dir: StringView, temporary: bool) -> Result<Vector<u64>, StoreError> {
+    let names = match (Directory.list(dir)) {
+        Ok(n) => n,
+        Err(_) => { return Err(StoreError.Io(IoFailure { op: IoOp.Open, errno: 0 })); }
+    };
+    let suffix = if (temporary) ".tmp" else ".ck";
+    var lsns = Vector<u64>.create();
+    for (i in 0..names.length) {
+        let name = names[i].view();
+        if (name.length == 21 + suffix.length && name.startsWith("ckpt-") && name.endsWith(suffix)) {
+            match (name[5..21].parseIntRadix<u64>(16)) {
+                Some(lsn) => { lsns.push(lsn)?; }
+                null => {}
+            }
+        }
+    }
+    lsns.viewMut().sortBy((a, b) => if (a < b) -1 else if (a > b) 1 else 0);
+    return Ok(lsns);
+}
+
+/// Removes checkpoint files: every complete one older than `keep`, or every leftover `.tmp`.
+/// Best effort; a file that survives is harmless and removed next time.
+fn removeCheckpoints(dir: StringView, keep: u64, temporary: bool) {
+    let lsns = match (listCheckpoints(dir, temporary)) {
+        Ok(l) => l,
+        Err(_) => { return; }
+    };
+    var removed = false;
+    for (i in 0..lsns.length) {
+        if (temporary || lsns[i] < keep) {
+            match (checkpointPath(dir, lsns[i], temporary)) {
+                Ok(p) => {
+                    let _ = Fs.unlink(p.view());
+                    removed = true;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    if (removed) { let _ = Fs.syncDirectory(dir); }
+}
+
+/// Appends checkpoint bytes to a file through a buffer, keeping the entry CRC.
+struct CheckpointWriter {
+    file: DurableFile;
+    offset: u64;
+    buffer: Vector<u8>;
+    crc: Crc32c;
+    entries: u64;
+
+    fn add(borrow mut this, kind: u8, body: Slice<u8>) -> Result<void, StoreError> {
+        let start = this.buffer.length;
+        this.buffer.pushLE(kind)?;
+        this.buffer.pushLE(truncate<u32>(body.length))?;
+        this.buffer.extend(body)?;
+        this.crc.update(this.buffer.view()[start..]);
+        this.entries += 1;
+        if (this.buffer.length >= CHECKPOINT_IO_CHUNK) { this.flush()?; }
+        return Ok();
+    }
+
+    fn flush(borrow mut this) -> Result<void, StoreError> {
+        sio(this.file.writeAt(this.buffer.view(), this.offset))?;
+        this.offset += this.buffer.length as u64;
+        this.buffer.clear();
+        return Ok();
+    }
+}
+
+fn encodeCheckpointHeader(lsn: u64, segment: u64, buckets: u64, objects: u64) -> [u8; 64] {
+    var h = [0u8; 64];
+    h.writeLE(0, CHECKPOINT_MAGIC);
+    h.writeLE(8, CHECKPOINT_FORMAT);
+    h.writeLE(10, truncate<u16>(CHECKPOINT_HEADER_LEN));
+    h.writeLE(12, 0u32);
+    h.writeLE(16, lsn);
+    h.writeLE(24, segment);
+    h.writeLE(32, buckets);
+    h.writeLE(40, objects);
+    h.writeLE(48, Clock.unixMillis());
+    let crc = Crc32c.of(h[0..60]);
+    h.writeLE(60, crc);
+    return h;
+}
+
+fn encodeObjectEntry(
+    out: borrow mut Vector<u8>,
+    k: borrow IndexKey,
+    v: borrow ObjectVersion,
+) -> Result<void, AllocError> {
+    out.clear();
+    pushText16(out, k.bucket.view())?;
+    pushText16(out, k.key.view())?;
+    out.extend(v.versionId[..])?;
+    out.pushLE(v.lsn)?;
+    out.pushLE(v.size)?;
+    out.pushLE(v.mtimeMillis)?;
+    out.extend(v.md5[..])?;
+    pushText16(out, v.contentType.view())?;
+    out.pushLE(v.payload.segmentId)?;
+    out.pushLE(v.payload.offset)?;
+    out.pushLE(v.payload.length)?;
+    out.pushLE(v.recordSegment)?;
+    out.pushLE(v.recordLength)?;
+    encodeManifest(out, v.extents.view())?;
+    return Ok();
+}
+
+/// Writes a checkpoint of `state` as of `lsn`, whose replay starts at `segment`, durably.
+/// Returns the file's size.
+fn writeCheckpoint(dir: StringView, lsn: u64, segment: u64, state: borrow StoreState) -> Result<u64, StoreError> {
+    let tmp = checkpointPath(dir, lsn, true)?;
+    let done = checkpointPath(dir, lsn, false)?;
+    let _ = Fs.unlink(tmp.view()); // a leftover of an interrupted attempt
+    match (writeCheckpointFile(tmp.view(), lsn, segment, state)) {
+        Ok(size) => {
+            match (Fs.rename(tmp.view(), done.view())) {
+                Ok() => {}
+                Err(e) => {
+                    let _ = Fs.unlink(tmp.view());
+                    return Err(StoreError.Io(e));
+                }
+            }
+            // Until this sync returns, a crash may lose the new name: recovery then uses the
+            // previous checkpoint, whose segments are all still there.
+            sio(Fs.syncDirectory(dir))?;
+            return Ok(size);
+        }
+        Err(e) => {
+            let _ = Fs.unlink(tmp.view());
+            return Err(e);
+        }
+    }
+}
+
+fn writeCheckpointFile(path: StringView, lsn: u64, segment: u64, state: borrow StoreState) -> Result<u64, StoreError> {
+    let file = sio(DurableFile.createNew(path))?;
+    let header = encodeCheckpointHeader(lsn, segment, state.buckets.length() as u64, state.index.length() as u64);
+    sio(file.writeAt(header[..], 0))?;
+    var w = CheckpointWriter {
+        file: file,
+        offset: CHECKPOINT_HEADER_LEN as u64,
+        buffer: Vector<u8>.create(),
+        crc: Crc32c.create(),
+        entries: 0,
+    };
+    var body = Vector<u8>.create();
+    for (i in 0..state.buckets.length()) {
+        let k = state.buckets.keyAt(i);
+        let b = state.buckets.valueAt(i);
+        body.clear();
+        pushText16(mut body, k.name.view())?;
+        body.pushLE(b.createdMillis)?;
+        w.add(CHECKPOINT_BUCKET, body.view())?;
+    }
+    for (i in 0..state.index.length()) {
+        let k = state.index.keyAt(i);
+        let v = state.index.valueAt(i);
+        encodeObjectEntry(mut body, k, v)?;
+        w.add(CHECKPOINT_OBJECT, body.view())?;
+    }
+    w.buffer.pushLE(CHECKPOINT_TRAILER_MAGIC)?;
+    w.buffer.pushLE(w.crc.finish())?;
+    w.buffer.pushLE(w.entries)?;
+    w.flush()?;
+    sio(w.file.syncData())?;
+    return Ok(w.offset);
+}
+
+/// A loaded checkpoint: where replay starts, and the state to replay onto.
+struct LoadedCheckpoint {
+    lsn: u64;
+    segment: u64;
+    state: StoreState;
+}
+
+/// Reads a file sequentially through a buffer.
+struct ChunkReader {
+    file: DurableFile;
+    size: u64;
+    /// File offset of the byte after the buffer's last.
+    next: u64;
+    buffer: Vector<u8>;
+    position: usize;
+
+    /// Makes at least `n` unread bytes available, or fails if the file ends first.
+    fn ensure(borrow mut this, n: usize) -> Result<void, StoreError> {
+        if (this.buffer.length - this.position >= n) { return Ok(); }
+        var kept = Vector<u8>.create();
+        kept.extend(this.buffer.view()[this.position..])?;
+        this.buffer = kept;
+        this.position = 0;
+        while (this.buffer.length < n) {
+            let left = this.size - this.next;
+            if (left == 0) { return Err(StoreError.CheckpointCorrupt); }
+            let want = if (left < CHECKPOINT_IO_CHUNK as u64) truncate<usize>(left) else CHECKPOINT_IO_CHUNK;
+            let at = this.buffer.length;
+            this.buffer.resize(at + want, 0)?;
+            sio(this.file.readExactAt(mut this.buffer.viewMut()[at..], this.next))?;
+            this.next += want as u64;
+        }
+        return Ok();
+    }
+
+    /// The next `n` bytes, after `ensure(n)`.
+    fn take(borrow mut this, n: usize) -> Slice<u8> {
+        let start = this.position;
+        this.position += n;
+        return this.buffer.view()[start..start + n];
+    }
+
+    fn atEnd(borrow this) -> bool => this.position == this.buffer.length && this.next == this.size;
+}
+
+fn corrupt<T>(r: Result<T, MetaFault>) -> Result<T, StoreError> => match (r) {
+    Ok(v) => Ok(v),
+    Err(MetaFault.OutOfMemory(e)) => Err(StoreError.OutOfMemory(e)),
+    Err(_) => Err(StoreError.CheckpointCorrupt),
+};
+
+fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState) -> Result<void, StoreError> {
+    var at: usize = 0;
+    let bucket = corrupt(readText16(bytes, mut at))?;
+    let key = corrupt(readText16(bytes, mut at))?;
+    let versionId = corrupt(readId16(bytes, mut at))?;
+    let lsn = corrupt(readU64(bytes, mut at))?;
+    let size = corrupt(readU64(bytes, mut at))?;
+    let mtime = corrupt(readI64(bytes, mut at))?;
+    let md5 = corrupt(readId16(bytes, mut at))?;
+    let contentType = corrupt(readText16(bytes, mut at))?;
+    corrupt(need(bytes, at, 32))?;
+    let payloadSegment = bytes.readLE<u64>(at);
+    let payloadOffset = bytes.readLE<u64>(at + 8);
+    let payloadLength = bytes.readLE<u32>(at + 16);
+    let recordSegment = bytes.readLE<u64>(at + 20);
+    let recordLength = bytes.readLE<u32>(at + 28);
+    at += 32;
+    let extents = corrupt(decodeManifest(bytes[at..]))?;
+    if (!state.hasBucket(bucket.view())?) { return Err(StoreError.CheckpointCorrupt); }
+    state.bumpObjects(bucket.view(), true)?;
+    let version = ObjectVersion {
+        versionId: versionId,
+        lsn: lsn,
+        kind: VersionKind.Object,
+        size: size,
+        mtimeMillis: mtime,
+        md5: md5,
+        contentType: contentType,
+        payload: PayloadLocator { segmentId: payloadSegment, offset: payloadOffset, length: payloadLength },
+        recordSegment: recordSegment,
+        recordLength: recordLength,
+        extents: extents,
+    };
+    match (state.index.put(IndexKey { bucket: bucket, key: key }, version)?) {
+        Some(_) => { return Err(StoreError.CheckpointCorrupt); } // a key twice
+        null => {}
+    }
+    return Ok();
+}
+
+/// Loads and verifies the checkpoint of `lsn`.
+fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreError> {
+    let path = checkpointPath(dir, lsn, false)?;
+    let file = sio(DurableFile.openRead(path.view()))?;
+    let size = sio(file.size())?;
+    var r = ChunkReader { file: file, size: size, next: 0, buffer: Vector<u8>.create(), position: 0 };
+    r.ensure(CHECKPOINT_HEADER_LEN)?;
+    let h = r.take(CHECKPOINT_HEADER_LEN);
+    if (h.readLE<u32>(60) != Crc32c.of(h[0..60])) { return Err(StoreError.CheckpointCorrupt); }
+    if (h.readLE<u64>(0) != CHECKPOINT_MAGIC || h.readLE<u16>(8) != CHECKPOINT_FORMAT) {
+        return Err(StoreError.CheckpointCorrupt);
+    }
+    if (h.readLE<u64>(16) != lsn) { return Err(StoreError.CheckpointCorrupt); }
+    let segment = h.readLE<u64>(24);
+    let buckets = h.readLE<u64>(32);
+    let objects = h.readLE<u64>(40);
+    var state = StoreState.create();
+    var crc = Crc32c.create();
+    var entries: u64 = 0;
+    while (entries < buckets + objects) {
+        r.ensure(5)?;
+        let prefix = r.take(5);
+        let kind = prefix[0];
+        let length = prefix.readLE<u32>(1) as usize;
+        crc.update(prefix);
+        if (length > CHECKPOINT_MAX_ENTRY) { return Err(StoreError.CheckpointCorrupt); }
+        let expected = if (entries < buckets) CHECKPOINT_BUCKET else CHECKPOINT_OBJECT;
+        if (kind != expected) { return Err(StoreError.CheckpointCorrupt); }
+        r.ensure(length)?;
+        let body = r.take(length);
+        crc.update(body);
+        if (kind == CHECKPOINT_BUCKET) {
+            var at: usize = 0;
+            let name = corrupt(readText16(body, mut at))?;
+            let created = corrupt(readI64(body, mut at))?;
+            let info = BucketInfo { createdMillis: created, objects: 0 };
+            match (state.buckets.put(BucketKey { name: name }, info)?) {
+                Some(_) => { return Err(StoreError.CheckpointCorrupt); }
+                null => {}
+            }
+        } else {
+            decodeObjectEntry(body, mut state)?;
+        }
+        entries += 1;
+    }
+    r.ensure(CHECKPOINT_TRAILER_LEN)?;
+    let t = r.take(CHECKPOINT_TRAILER_LEN);
+    if (t.readLE<u32>(
+        0,
+    ) != CHECKPOINT_TRAILER_MAGIC || t.readLE<u32>(4) != crc.finish() || t.readLE<u64>(8) != entries) {
+        return Err(StoreError.CheckpointCorrupt);
+    }
+    if (!r.atEnd()) { return Err(StoreError.CheckpointCorrupt); }
+    return Ok(LoadedCheckpoint { lsn: lsn, segment: segment, state: state });
+}
