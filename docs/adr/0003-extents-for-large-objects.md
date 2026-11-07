@@ -65,7 +65,7 @@
 - **Concurrency (M3+).** An extent is unlinked as soon as the superseding record is durable. A reader that
   has an extent open keeps reading it (POSIX), but one that has not opened its next extent yet would fail.
   Before concurrent readers exist, reaping must wait for in-flight readers (a reference count or grace
-  period, M2).
+  period, M2). Done: readers pin their extents (ADR-0007).
 - **Multipart upload** will store each part as one or more extents. `CompleteMultipartUpload` then writes a
   single `PutExtent` record with the concatenated manifest, and its ETag is the MD5 of the part MD5s plus
   `-N`, which the manifest needs an S3 ETag field for.

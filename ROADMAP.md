@@ -205,16 +205,17 @@ and no storage code depends on undocumented FS behavior.
 - A discard table updated in the same commit that supersedes or deletes a version (#3).
 - A segment compactor that rewrites live records and atomically swaps locators, then
   retires old segments after a grace period.
-- Orphan extent sweeper.
+- Orphan extent sweeper. **Done** (at open, ADR-0003).
 - Disk-space reserve with write rejection before it is reached. **Done** (ADR-0006; the capacity is configured until
   CeeSafe has a free-space query, CEESAFE_GAPS G24).
 - Checkpoint rotation so recovery time stays bounded. **Done** (ADR-0005).
 - Segment compaction with locator swaps (`Relocate` records). **Done** (ADR-0005).
 - An `fsck` tool that verifies every locator and checksum. **Done** (`cosmostore fsck`, ADR-0006).
+- Reaping that waits for in-flight readers. **Done** (ADR-0007).
 
 **Exit:** a 24h overwrite/delete churn test keeps disk usage within 1.5× live bytes,
 crashes during compaction are safe, recovery time stays bounded, and disk-full never
-deadlocks.
+deadlocks. **Passed** (7 Nov 2026: 186 SIGKILLs, used/live at most 119%, recovery at most 191 ms).
 
 ### M3: S3 core compatibility, the first alpha (8–10 wk)
 
@@ -511,3 +512,21 @@ Next: the rest of M2 (space reserve, fsck), or the CeeSafe.Web spike → S3 HTTP
   - Space: used peaked at 1.046 GB against the 1.2 GB capacity. Used/live stayed between 100% and 119%. Admission
     refused writes near the limit, and deletes, checkpoints and compaction brought the store back under it.
 - **M2 exit test: passed.** M2 left: reaping that waits for in-flight readers.
+
+### 7 Nov 2026: reaping waits for readers (ADR-0007); M2 complete
+
+- **The problem:** a reader opened before an overwrite or delete failed when it reached an extent it had not yet
+  opened, because reaping had already unlinked it.
+- **The fix:** `openReader` pins the version's extents (`src/store/pins.cee`, a count per extent id behind an
+  `Arc<Mutex<…>>`), and dropping the reader releases them.
+  - Reaping moves a pinned extent to a deferred list instead of unlinking it. The next commit or `maintain` after
+    its last reader is dropped removes it.
+  - Deferred extents count in `usedBytes`, and fsck does not report them as orphans.
+  - A crash forgets the list, and the orphan sweep at open removes the files.
+- **Tests** (`src/store/pin_tests.cee`):
+  - readers across an overwrite and across a delete;
+  - an abandoned reader, and two readers of one version;
+  - deferred extents swept at reopen.
+  - With the pin check removed, all three tests fail.
+- **Tests:** 60 pass.
+- **M2 is complete.** Next: M3, the S3 HTTP layer. It must drop a reader when its client disconnects.

@@ -1,0 +1,130 @@
+// Reaping waits for in-flight readers (ADR-0007). storeConfig has 64 KiB extents.
+
+/// Reads what is left of `reader` into `out`, 1000 bytes at a time.
+fn drain(reader: borrow mut ObjectReader, out: borrow mut Vector<u8>) -> Result<void, StoreError> {
+    var chunk = [0u8; 1000];
+    while (true) {
+        let n = reader.read(mut chunk[..])?;
+        if (n == 0) { break; }
+        out.extend(chunk[0..n])?;
+    }
+    return Ok();
+}
+
+/// Drops a reader, releasing its pins.
+fn close(reader: ObjectReader) {}
+
+@test
+fn pinReaderOutlivesOverwriteAndDelete() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("pin-overwrite");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    let ctype = "application/octet-stream";
+    let old = patterned(200000, 5); // 4 extents
+    s.putObject("bkt", "k", ctype, old.view(), PutCondition.None)!;
+    let usedBefore = s.usedBytes();
+
+    // Read the first extent only, so the reader has not opened the others yet.
+    var reader = s.openReader("bkt", "k", 0, 0xFFFFFFFFFFFFFFFF)!;
+    var got = Vector<u8>.create();
+    var first = [0u8; 1000];
+    let n = reader.read(mut first[..])!;
+    got.extend(first[0..n])!;
+    Check.equalU64(4, s.pinnedExtentCount() as u64)?;
+
+    // The overwrite retires all 4 extents; none may go while the reader may open them.
+    let fresh = patterned(70000, 6); // 2 extents
+    s.putObject("bkt", "k", ctype, fresh.view(), PutCondition.None)!;
+    Check.equalU64(6, extentFiles(dir.view()))?;
+    Check.equalU64(4, s.deferredExtentCount() as u64)?;
+    Check.isTrue(s.usedBytes() > usedBefore, "deferred extents count as used space")?;
+    let report = s.verify()!;
+    Check.equalU64(0, report.orphanExtents as u64)?;
+
+    // The old reader still reads the old bytes to the end (each whole extent CRC-checked).
+    drain(mut reader, mut got)!;
+    Check.equalBytes(old.view(), got.view())?;
+    Check.equalBytes(fresh.view(), s.getObject("bkt", "k")!.view())?;
+    close(reader);
+    Check.equalU64(0, s.pinnedExtentCount() as u64)?;
+
+    // The next commit removes them.
+    s.putObject("bkt", "other", ctype, "x".bytes(), PutCondition.None)!;
+    Check.equalU64(0, s.deferredExtentCount() as u64)?;
+    Check.equalU64(2, extentFiles(dir.view()))?;
+
+    // A delete under a reader: the same, and `maintain` reaps once it is dropped.
+    var reader2 = s.openReader("bkt", "k", 0, 0xFFFFFFFFFFFFFFFF)!;
+    s.deleteObject("bkt", "k")!;
+    Check.equalU64(2, extentFiles(dir.view()))?;
+    var got2 = Vector<u8>.create();
+    drain(mut reader2, mut got2)!;
+    Check.equalBytes(fresh.view(), got2.view())?;
+    close(reader2);
+    s.maintain()!;
+    Check.equalU64(0, extentFiles(dir.view()))?;
+    Check.equalU64(0, s.deferredExtentCount() as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn pinAbandonedAndSharedReaders() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("pin-shared");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    let ctype = "application/octet-stream";
+    let old = patterned(150000, 7); // 3 extents
+    s.putObject("bkt", "k", ctype, old.view(), PutCondition.None)!;
+    let usedBefore = s.usedBytes();
+
+    // A reader dropped half way releases its pins.
+    var half = s.openReader("bkt", "k", 0, 0xFFFFFFFFFFFFFFFF)!;
+    var buf = [0u8; 1000];
+    let _ = half.read(mut buf[..])!;
+    close(half);
+    Check.equalU64(0, s.pinnedExtentCount() as u64)?;
+
+    // Two readers of the same version: the extents stay until both are dropped.
+    var a = s.openReader("bkt", "k", 0, 0xFFFFFFFFFFFFFFFF)!;
+    var b = s.openReader("bkt", "k", 70000, 150000)!;
+    Check.equalU64(3, s.pinnedExtentCount() as u64)?;
+    s.putObject("bkt", "k", ctype, "small".bytes(), PutCondition.None)!;
+    Check.equalU64(3, s.deferredExtentCount() as u64)?;
+    var gotA = Vector<u8>.create();
+    drain(mut a, mut gotA)!;
+    Check.equalBytes(old.view(), gotA.view())?;
+    close(a);
+    s.maintain()!;
+    Check.equalU64(3, extentFiles(dir.view()))?;
+    var gotB = Vector<u8>.create();
+    drain(mut b, mut gotB)!;
+    Check.equalBytes(old.view()[70000..150000], gotB.view())?;
+    close(b);
+    s.maintain()!;
+    Check.equalU64(0, extentFiles(dir.view()))?;
+    Check.isTrue(s.usedBytes() < usedBefore, "reaped extents leave the used count")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn pinDeferredExtentsAreSweptAtOpen() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("pin-crash");
+    var reader: ObjectReader? = null;
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        s.putObject("bkt", "k", "", patterned(150000, 8).view(), PutCondition.None)!;
+        reader = s.openReader("bkt", "k", 0, 0xFFFFFFFFFFFFFFFF)!;
+        s.deleteObject("bkt", "k")!;
+        Check.equalU64(3, extentFiles(dir.view()))?;
+        // The store goes away (as in a crash) with its extents still deferred.
+    }
+    reader = null;
+    let s2 = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(0, extentFiles(dir.view()))?;
+    Check.equalU64(0, s2.objectCount() as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}

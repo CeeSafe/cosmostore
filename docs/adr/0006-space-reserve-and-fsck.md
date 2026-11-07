@@ -61,4 +61,4 @@ had a flipped bit.
 - fsck reads every byte: about 250 MB/s on this laptop, single-threaded.
 - The 24-hour churn soak passed with a 1.2 GB capacity (ROADMAP, 7 Nov 2026). Over 186 SIGKILLs, used space
   peaked at 1.046 GB, and no restart found an fsck problem.
-- Not done from M2: making reaping wait for in-flight readers.
+- Reaping now waits for in-flight readers (ADR-0007). Extents that wait count as used space.

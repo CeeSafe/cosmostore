@@ -150,7 +150,7 @@ struct StoreState {
     records: u64;
     /// Extents of versions superseded or deleted by applied records; the store removes the
     /// files once the records are durable (they always are when applied).
-    deadExtents: Vector<u64>;
+    deadExtents: Vector<ExtentRef>;
     /// The bytes of the live versions' extent files, headers included (ADR-0006).
     extentBytes: u64;
 
@@ -159,7 +159,7 @@ struct StoreState {
         buckets: HashMap<BucketKey, BucketInfo>.create(),
         segments: HashMap<u64, SegmentUsage>.create(),
         records: 0,
-        deadExtents: Vector<u64>.create(),
+        deadExtents: Vector<ExtentRef>.create(),
         extentBytes: 0,
     };
 
@@ -169,7 +169,7 @@ struct StoreState {
         this.extentBytes = if (this.extentBytes > freed) this.extentBytes - freed else 0;
         if (old.extents.length == 0) { this.releaseRecord(old.recordSegment, old.recordLength); }
         for (i in 0..old.extents.length) {
-            this.deadExtents.push(old.extents[i].id)?;
+            this.deadExtents.push(old.extents[i])?;
         }
         return Ok();
     }
@@ -440,6 +440,10 @@ struct ObjectStore {
     private checkpointSegment: u64;
     /// Journal bytes committed since that checkpoint.
     private sinceCheckpoint: u64;
+    /// Extents that open readers may still read (ADR-0007), and the retired ones that wait for them.
+    private pins: ExtentPins;
+    private deferred: Vector<DeferredExtent>;
+    private deferredBytes: u64;
 
     /// Opens the store in `dir`: loads the newest checkpoint, if any, then replays the journal
     /// records after it.
@@ -531,6 +535,9 @@ struct ObjectStore {
             checkpointLsn: start.lsn,
             checkpointSegment: start.segment,
             sinceCheckpoint: 0,
+            pins: ExtentPins.create()?,
+            deferred: Vector<DeferredExtent>.create(),
+            deferredBytes: 0,
         };
         // Every extent not referenced by a live version is garbage: superseded or deleted
         // versions, and uploads that never committed (ADR-0003).
@@ -566,12 +573,20 @@ struct ObjectStore {
         for (i in 0..names.length) {
             match (extentIdFromName(names[i].view())) {
                 Some(id) => {
-                    if (!live.contains(borrow id)) { orphans.push(id)?; }
+                    if (!live.contains(borrow id) && !this.isDeferred(id)) { orphans.push(id)?; }
                 }
                 null => {}
             }
         }
         return Ok(orphans);
+    }
+
+    /// Whether extent `id` is retired and waits for its readers (ADR-0007).
+    fn isDeferred(borrow this, id: u64) -> bool {
+        for (d in this.deferred.view()) {
+            if (d.id == id) { return true; }
+        }
+        return false;
     }
 
     /// fsck (ADR-0006): reads every live object through the reader, which verifies each journal record and each
@@ -633,12 +648,39 @@ struct ObjectStore {
         return Ok(report);
     }
 
-    /// Removes the extent files of versions retired by records that are now durable.
+    /// Removes the extent files of versions retired by records that are now durable. An extent that an open reader
+    /// pins waits in `deferred` until the reader is dropped (ADR-0007).
     fn reapExtents(borrow mut this) {
+        this.reapDeferred();
         for (i in 0..this.state.deadExtents.length) {
-            removeExtent(this.extentDir.view(), this.state.deadExtents[i]);
+            let ext = this.state.deadExtents[i];
+            if (!this.pins.isPinned(ext.id)) {
+                removeExtent(this.extentDir.view(), ext.id);
+                continue;
+            }
+            let fileBytes = ext.length + EXTENT_HEADER_LEN;
+            match (this.deferred.push(DeferredExtent { id: ext.id, fileBytes: fileBytes })) {
+                Ok() => { this.deferredBytes += fileBytes; }
+                // Never unlinked under its reader: the file is left for the next open's orphan sweep.
+                Err(_) => {}
+            }
         }
         this.state.deadExtents.clear();
+    }
+
+    /// Removes the deferred extents that no reader pins any more.
+    fn reapDeferred(borrow mut this) {
+        var i: usize = 0;
+        while (i < this.deferred.length) {
+            let d = this.deferred[i];
+            if (this.pins.isPinned(d.id)) {
+                i += 1;
+                continue;
+            }
+            removeExtent(this.extentDir.view(), d.id);
+            this.deferredBytes = if (this.deferredBytes > d.fileBytes) this.deferredBytes - d.fileBytes else 0;
+            let _ = this.deferred.swapRemove(i);
+        }
     }
 
     /// A writer for a new object's bytes; commit it with `putFinished` or `stageFinished`.
@@ -687,7 +729,7 @@ struct ObjectStore {
 
     /// The bytes the store occupies: every journal segment and every live extent file (ADR-0006). Extents of
     /// retired versions are removed as soon as their records commit, so they are not counted.
-    fn usedBytes(borrow this) -> u64 => this.journalBytes() + this.state.extentBytes;
+    fn usedBytes(borrow this) -> u64 => this.journalBytes() + this.state.extentBytes + this.deferredBytes;
 
     /// Admits a write of `incoming` object bytes, plus its record, unless it would take the store into its
     /// reserve: InsufficientStorage. Deletes, checkpoints and compaction never ask (ADR-0006).
@@ -989,12 +1031,14 @@ struct ObjectStore {
             let payloadStart = v.recordLength as usize - RECORD_TRAILER_LEN - v.payload.length as usize;
             var bytes = Vector<u8>.create();
             bytes.extend(record.view()[payloadStart + start as usize..payloadStart + end as usize])?;
-            return Ok(ObjectReader { inline: bytes, inlinePosition: 0, extents: null });
+            return Ok(ObjectReader { inline: bytes, inlinePosition: 0, extents: null, pin: null });
         }
+        // Pinned before the store is released, so no reap can unlink them while the reader may open them (ADR-0007).
+        let pin = this.pins.pin(v.extents.view())?;
         var refs = Vector<ExtentRef>.create();
         refs.extend(v.extents.view())?;
         let reader = ExtentReader.create(this.extentDir.view(), refs, start, end)?;
-        return Ok(ObjectReader { inline: Vector<u8>.create(), inlinePosition: 0, extents: reader });
+        return Ok(ObjectReader { inline: Vector<u8>.create(), inlinePosition: 0, extents: reader, pin: pin });
     }
 
     /// The object's bytes `[from, to)` in memory (the whole object for 0, u64 max).
@@ -1247,6 +1291,7 @@ struct ObjectStore {
 
     /// Background upkeep: a checkpoint when one is due, then compaction.
     fn maintain(borrow mut this) -> Result<MaintenanceReport, StoreError> {
+        this.reapDeferred();
         var checkpointed = false;
         let every = this.config.checkpointEveryBytes;
         if (every > 0 && this.sinceCheckpoint >= every) { checkpointed = this.checkpoint()?; }
@@ -1265,6 +1310,10 @@ struct ObjectStore {
     }
 
     fn segmentCount(borrow this) -> usize => this.state.segments.length();
+
+    /// Retired extents that wait for readers, and extents that open readers pin (ADR-0007).
+    fn deferredExtentCount(borrow this) -> usize => this.deferred.length;
+    fn pinnedExtentCount(borrow this) -> usize => this.pins.pinnedCount();
 
     /// The segments the store accounts for (a new active segment with no record yet is not among them).
     fn segmentIds(borrow this) -> Vector<u64> {
@@ -1295,6 +1344,8 @@ struct ObjectReader {
     private inline: Vector<u8>;
     private inlinePosition: usize;
     private extents: ExtentReader?;
+    /// The extents' pins, released when the reader is dropped (ADR-0007).
+    private pin: ReadPin?;
 
     /// Reads the next bytes; 0 at the end.
     fn read(borrow mut this, into: SliceMut<u8>) -> Result<usize, StoreError> {

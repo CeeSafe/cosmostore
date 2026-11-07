@@ -1,0 +1,89 @@
+// Extent pins (ADR-0007): readers count up the extents they may still open, and the store
+// does not unlink a retired extent while its count is above zero.
+
+/// Open readers per extent id. An id with no reader is not in the map.
+struct PinTable {
+    counts: HashMap<u64, u32>;
+}
+
+/// The store's side: makes pins and asks whether an extent has one.
+struct ExtentPins {
+    private table: Arc<Mutex<PinTable>>;
+
+    fn create() -> Result<ExtentPins, AllocError> {
+        let table = Mutex<PinTable>.create(PinTable { counts: HashMap<u64, u32>.create() })?;
+        return Ok(ExtentPins { table: Arc<Mutex<PinTable>>.create(table)? });
+    }
+
+    /// Pins every extent in `extents` for one reader.
+    fn pin(borrow this, extents: Slice<ExtentRef>) -> Result<ReadPin, AllocError> {
+        // `pin` is declared before `guard`, so on an early return the guard unlocks before the pin's drop locks.
+        var pin = ReadPin { table: this.table.clone(), ids: Vector<u64>.create() };
+        var guard = this.table.get().lock();
+        let t = guard.data();
+        for (i in 0..extents.length) {
+            let id = extents[i].id;
+            // The pin lists only what it counted, so a failure part way releases exactly that.
+            pin.ids.push(id)?;
+            var counted = false;
+            match (t.counts.getMut(borrow id)) {
+                Some(c) => {
+                    * c += 1;
+                    counted = true;
+                }
+                null => {}
+            }
+            if (!counted) {
+                match (t.counts.put(id, 1)) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = pin.ids.pop();
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        return Ok(pin);
+    }
+
+    /// Whether a reader may still open extent `id`.
+    fn isPinned(borrow this, id: u64) -> bool {
+        var guard = this.table.get().lock();
+        return guard.data().counts.contains(borrow id);
+    }
+
+    /// The number of pinned extents.
+    fn pinnedCount(borrow this) -> usize {
+        var guard = this.table.get().lock();
+        return guard.data().counts.length();
+    }
+}
+
+/// One reader's pins; dropping it releases them. It does no I/O: the store unlinks what is left.
+@noncopy
+struct ReadPin {
+    private table: Arc<Mutex<PinTable>>;
+    private ids: Vector<u64>;
+
+    drop {
+        var guard = this.table.get().lock();
+        let t = guard.data();
+        for (id in this.ids.view()) {
+            var zero = false;
+            match (t.counts.getMut(borrow id)) {
+                Some(c) => {
+                    * c -= 1;
+                    zero = * c == 0;
+                }
+                null => {}
+            }
+            if (zero) { let _ = t.counts.remove(borrow id); }
+        }
+    }
+}
+
+/// A retired extent that a reader still pins, and the bytes its file occupies.
+struct DeferredExtent {
+    id: u64;
+    fileBytes: u64;
+}
