@@ -59,4 +59,6 @@ had a flipped bit.
 - Streamed writers do not reserve space while they write; the store is single-threaded today. The HTTP layer will
   admit on the declared `Content-Length` before streaming.
 - fsck reads every byte: about 250 MB/s on this laptop, single-threaded.
-- Not done from M2: the 24-hour churn soak, and making reaping wait for in-flight readers.
+- The 24-hour churn soak passed with a 1.2 GB capacity (ROADMAP, 7 Nov 2026). Over 186 SIGKILLs, used space
+  peaked at 1.046 GB, and no restart found an fsck problem.
+- Not done from M2: making reaping wait for in-flight readers.

@@ -503,4 +503,11 @@ Next: the rest of M2 (space reserve, fsck), or the CeeSafe.Web spike → S3 HTTP
 - **Where:** a Debian 12 box (x86_64, NVMe), with ceesafec 0.20.0.
 - **The first run failed** on its first restart (`maintain: unlink`: a removed segment still accounted for after
   recovery; ADR-0005's amendment). Fixed, with stronger sweeps.
-- **The second run** started at 16:20 UTC; its results follow when it ends.
+- **The second run passed** (16:20 UTC 6 Nov to 16:20 UTC 7 Nov):
+  - 186 SIGKILLs and 187 starts. Every start's model check agreed with the store, and every start's fsck found 0
+    problems. No operation failed.
+  - The final fsck found 3,457 objects (884 MB), 0 problems and 0 orphan extents.
+  - Recovery took at most 191 ms, and the model check (5,000 keys) at most 4.9 s.
+  - Space: used peaked at 1.046 GB against the 1.2 GB capacity. Used/live stayed between 100% and 119%. Admission
+    refused writes near the limit, and deletes, checkpoints and compaction brought the store back under it.
+- **M2 exit test: passed.** M2 left: reaping that waits for in-flight readers.
