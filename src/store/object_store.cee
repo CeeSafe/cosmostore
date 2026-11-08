@@ -26,6 +26,10 @@ struct StoreConfig {
     /// Kept free below `capacityBytes` for what frees space or keeps the store recoverable: deletes, checkpoints
     /// and compaction never count against it, writes do (ADR-0006).
     reserveBytes: u64;
+    /// The least size of a multipart upload's parts, all but the last (S3: 5 MiB), and the largest object an upload
+    /// may complete (S3: 5 TiB). ADR-0009.
+    minPartBytes: u64;
+    maxUploadBytes: u64;
 
     fn defaults() -> StoreConfig => StoreConfig {
         journal: JournalConfig.defaults(),
@@ -37,6 +41,8 @@ struct StoreConfig {
         compactMaxCopyBytes: 67108864,
         capacityBytes: 0,
         reserveBytes: 268435456,
+        minPartBytes: 5242880,
+        maxUploadBytes: 5497558138880,
     };
 }
 
@@ -61,6 +67,13 @@ enum StoreError {
     CheckpointCorrupt,
     /// The write would take the store into its reserve (ADR-0006); deletes still work.
     InsufficientStorage,
+    /// Multipart (ADR-0009): no such upload for this bucket and key; a named part is missing or has another ETag;
+    /// parts not in ascending order; a part other than the last below `minPartBytes`; a part number outside 1-10000.
+    NoSuchUpload,
+    InvalidPart,
+    InvalidPartOrder,
+    EntityTooSmall,
+    InvalidPartNumber,
 }
 
 fn sio<T>(r: Result<T, IoFailure>) -> Result<T, StoreError> => match (r) {
@@ -124,17 +137,25 @@ struct ObjectInfo {
     md5: [u8; 16];
     generation: u64;
     contentType: Vector<u8>;
+    /// A multipart object's part count (its ETag is `md5-parts`), else 0.
+    parts: u32;
 }
 
 struct PutOutcome {
     md5: [u8; 16];
     generation: u64;
+    parts: u32;
 }
 
 /// One page of a listing: keys and rolled-up common prefixes, both in byte order.
 struct ListPage {
     keys: Vector<Vector<u8>>;
     sizes: Vector<u64>;
+    /// Each key's MD5 (its ETag) and modification time, in Unix milliseconds.
+    md5s: Vector<[u8; 16]>;
+    mtimes: Vector<i64>;
+    /// Each key's part count (0: not multipart).
+    parts: Vector<u32>;
     commonPrefixes: Vector<Vector<u8>>;
     truncated: bool;
     /// The last key or prefix returned, for the next page's `startAfter`.
@@ -151,8 +172,10 @@ struct StoreState {
     /// Extents of versions superseded or deleted by applied records; the store removes the
     /// files once the records are durable (they always are when applied).
     deadExtents: Vector<ExtentRef>;
-    /// The bytes of the live versions' extent files, headers included (ADR-0006).
+    /// The bytes of the live versions' and the uploads' extent files, headers included (ADR-0006).
     extentBytes: u64;
+    /// Multipart uploads in progress (ADR-0009).
+    uploads: HashMap<UploadKey, Upload>;
 
     fn create() -> StoreState => StoreState {
         index: HashMap<IndexKey, ObjectVersion>.create(),
@@ -161,6 +184,7 @@ struct StoreState {
         records: 0,
         deadExtents: Vector<ExtentRef>.create(),
         extentBytes: 0,
+        uploads: HashMap<UploadKey, Upload>.create(),
     };
 
     /// Releases a superseded or deleted version: its record bytes and its extents.
@@ -252,9 +276,40 @@ fn applyRecord(
             },
             _ => Vector<ExtentRef>.create(),
         };
-        return applyPut(state, m, extents, lsn, segment, offset, totalLen, meta.length, payloadLen);
+        state.extentBytes += extentRefBytes(extents.view());
+        return applyPut(state, m, extents, 0, lsn, segment, offset, totalLen, meta.length, payloadLen);
     }
     match (kind) {
+        RecordType.UploadComplete => {
+            let c = match (decodeUploadCompleteMeta(meta)) {
+                Ok(c) => c,
+                Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+            };
+            let extents = match (decodeManifest(manifest)) {
+                Ok(e) => e,
+                Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+            };
+            if (!takeCompletedUpload(state, c.id, extents.view())?) {
+                state.extentBytes += extentRefBytes(extents.view());
+            }
+            return applyPut(state, c.put, extents, c.parts, lsn, segment, offset, totalLen, meta.length, payloadLen);
+        }
+        RecordType.UploadCreate => {
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
+            if (applyUploadCreate(state, meta).isErr()) { return Err(StoreError.BadMeta(segment, offset)); }
+        }
+        RecordType.UploadPart => {
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
+            let extents = match (decodeManifest(manifest)) {
+                Ok(e) => e,
+                Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+            };
+            if (applyUploadPart(state, meta, extents).isErr()) { return Err(StoreError.BadMeta(segment, offset)); }
+        }
+        RecordType.UploadAbort => {
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
+            if (applyUploadAbort(state, meta).isErr()) { return Err(StoreError.BadMeta(segment, offset)); }
+        }
         RecordType.DeleteVersion => {
             // The delete record itself is garbage as soon as it is applied, except as a
             // tombstone until the segments holding older versions are compacted.
@@ -322,6 +377,7 @@ fn applyRecord(
                 Ok(n) => n,
                 Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
             };
+            dropBucketUploads(state, name.view())?;
             let gone = BucketKey { name: name };
             let _ = state.buckets.remove(borrow gone);
         }
@@ -332,11 +388,13 @@ fn applyRecord(
     return Ok();
 }
 
-/// Applies a PutInline or PutExtent record whose meta is `m`.
+/// Applies a PutInline, PutExtent or UploadComplete record whose meta is `m`. Its extents are already counted in
+/// `extentBytes`.
 fn applyPut(
     state: borrow mut StoreState,
     m: PutMeta,
     extents: Vector<ExtentRef>,
+    parts: u32,
     lsn: u64,
     segment: u64,
     offset: u64,
@@ -365,9 +423,9 @@ fn applyPut(
         recordSegment: segment,
         recordLength: totalLen,
         extents: extents,
+        parts: parts,
     };
     let key = IndexKey { bucket: m.bucket, key: m.key };
-    state.extentBytes += extentFileBytes(borrow version);
     match (state.index.put(key, version)?) {
         Some(old) => { state.retire(borrow old)?; }
         null => { state.bumpObjects(bucketCopy.view(), true)?; }
@@ -426,6 +484,9 @@ fn verifyFault(e: StoreError) -> VerifyFault => match (e) {
 /// What admission adds for a write's journal record and the extent headers of a small object (ADR-0006).
 const ADMIT_RECORD_BYTES: u64 = 4096;
 
+/// Abandoned extents queued between reaps; more are left to the orphan sweep at open.
+const ABANDONED_CAPACITY: usize = 4096;
+
 struct ObjectStore {
     private journal: Journal;
     private state: StoreState;
@@ -444,6 +505,9 @@ struct ObjectStore {
     private pins: ExtentPins;
     private deferred: Vector<DeferredExtent>;
     private deferredBytes: u64;
+    /// Extents of writers dropped unfinished, for the store to remove: a drop may run in async code, which must not
+    /// do I/O, so it only queues them here.
+    private abandoned: Channel<u64>;
 
     /// Opens the store in `dir`: loads the newest checkpoint, if any, then replays the journal
     /// records after it.
@@ -472,11 +536,7 @@ struct ObjectStore {
             if (failure.isSome()) { return; }
             let metaEnd = RECORD_HEADER_LEN + header.metaLen as usize;
             let payloadEnd = metaEnd + header.payloadLen as usize;
-            let isExtent = match (header.kind) {
-                RecordType.PutExtent => true,
-                _ => false,
-            };
-            let manifest = if (isExtent) bytes[metaEnd..payloadEnd] else bytes[0..0];
+            let manifest = if (carriesManifest(header.kind)) bytes[metaEnd..payloadEnd] else bytes[0..0];
             match (applyRecord(
                 mut state,
                 header.kind,
@@ -535,7 +595,8 @@ struct ObjectStore {
             checkpointLsn: start.lsn,
             checkpointSegment: start.segment,
             sinceCheckpoint: 0,
-            pins: ExtentPins.create()?,
+            pins: ExtentPins.create(),
+            abandoned: Channel<u64>.create(ABANDONED_CAPACITY)?,
             deferred: Vector<DeferredExtent>.create(),
             deferredBytes: 0,
         };
@@ -563,6 +624,12 @@ struct ObjectStore {
             let v = this.state.index.valueAt(i);
             for (k in 0..v.extents.length) {
                 let _ = live.put(v.extents[k].id, true)?;
+            }
+        }
+        for (i in 0..this.state.uploads.length()) {
+            let u = this.state.uploads.valueAt(i);
+            for (p in 0..u.parts.length) {
+                for (e in u.parts[p].extents.view()) { let _ = live.put(e.id, true)?; }
             }
         }
         let names = match (Directory.list(this.extentDir.view())) {
@@ -608,7 +675,7 @@ struct ObjectStore {
             let bucket = StringView.fromUtf8(k.bucket.view()) ?? "";
             let key = StringView.fromUtf8(k.key.view()) ?? "";
             var fault: VerifyFault? = null;
-            match (this.openReader(bucket, key, 0, 0xFFFFFFFFFFFFFFFF)) {
+            match (this.openUnpinned(bucket, key, 0, 0xFFFFFFFFFFFFFFFF)) {
                 Ok(reader) => {
                     var r = reader;
                     var md5 = Md5.create();
@@ -629,7 +696,10 @@ struct ObjectStore {
                     report.bytes += size;
                     if (fault.isNull()) {
                         let digest = md5.finish();
-                        if (size != v.size || digest[..] != v.md5[..]) { fault = VerifyFault.Mismatch; }
+                        // A multipart object's MD5 is its ETag's, not its bytes' (ADR-0009): its extents' CRCs cover it.
+                        if (size != v.size || (v.parts == 0 && digest[..] != v.md5[..])) {
+                            fault = VerifyFault.Mismatch;
+                        }
                     }
                 }
                 Err(e) => { fault = verifyFault(e); }
@@ -652,6 +722,7 @@ struct ObjectStore {
     /// pins waits in `deferred` until the reader is dropped (ADR-0007).
     fn reapExtents(borrow mut this) {
         this.reapDeferred();
+        this.reapAbandoned();
         for (i in 0..this.state.deadExtents.length) {
             let ext = this.state.deadExtents[i];
             if (!this.pins.isPinned(ext.id)) {
@@ -666,6 +737,16 @@ struct ObjectStore {
             }
         }
         this.state.deadExtents.clear();
+    }
+
+    /// Removes the extents that dropped writers queued.
+    fn reapAbandoned(borrow mut this) {
+        while (true) {
+            match (this.abandoned.tryRecv()) {
+                Some(id) => { removeExtent(this.extentDir.view(), id); }
+                null => { return; }
+            }
+        }
     }
 
     /// Removes the deferred extents that no reader pins any more.
@@ -685,7 +766,12 @@ struct ObjectStore {
 
     /// A writer for a new object's bytes; commit it with `putFinished` or `stageFinished`.
     fn newWriter(borrow this) -> Result<ObjectWriter, StoreError> =>
-        Ok(ObjectWriter.create(this.extentDir.view(), this.config.inlineMaxBytes, this.config.extentMaxBytes)?);
+        Ok(ObjectWriter.create(
+            this.extentDir.view(),
+            this.config.inlineMaxBytes,
+            this.config.extentMaxBytes,
+            this.abandoned.clone(),
+        )?);
 
     /// Removes the extents of a finished object that will not be committed.
     fn discardFinished(borrow this, obj: borrow FinishedObject) {
@@ -713,7 +799,7 @@ struct ObjectStore {
             total,
             this.scratch.view(),
             truncate<u32>(payload.length),
-            payload[0..0],
+            if (carriesManifest(kind)) payload else payload[0..0],
         )?;
         this.reapExtents();
         return Ok(pos.lsn);
@@ -843,7 +929,7 @@ struct ObjectStore {
         }
         let lsn = this.stageFinished(bucket, key, contentType, obj)?;
         this.commitStaged()?;
-        return Ok(PutOutcome { md5: obj.md5, generation: lsn });
+        return Ok(PutOutcome { md5: obj.md5, generation: lsn, parts: 0 });
     }
 
     fn checkPut(
@@ -1002,6 +1088,7 @@ struct ObjectStore {
                     md5: v.md5,
                     generation: v.lsn,
                     contentType: copyBytes(v.contentType.view())?,
+                    parts: v.parts,
                 });
             }
             null => { return Err(StoreError.NoSuchKey); }
@@ -1010,6 +1097,26 @@ struct ObjectStore {
 
     /// A reader of the current version's bytes `[from, to)`, clamped to the object's size.
     fn openReader(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        from: u64,
+        to: u64,
+    ) -> Result<ObjectReader, StoreError> {
+        var reader = this.openUnpinned(bucket, key, from, to)?;
+        if (reader.extents.isSome()) {
+            let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+            match (this.state.index.get(borrow k)) {
+                Some(v) => { reader.pin = this.pins.pin(v.extents.view())?; }
+                null => {}
+            }
+        }
+        return Ok(reader);
+    }
+
+    /// A reader that does not pin its extents: only for reads that end before the store is released (fsck,
+    /// `getObjectRange`), since no reap can run while the store is borrowed.
+    fn openUnpinned(
         borrow this,
         bucket: StringView,
         key: StringView,
@@ -1033,12 +1140,10 @@ struct ObjectStore {
             bytes.extend(record.view()[payloadStart + start as usize..payloadStart + end as usize])?;
             return Ok(ObjectReader { inline: bytes, inlinePosition: 0, extents: null, pin: null });
         }
-        // Pinned before the store is released, so no reap can unlink them while the reader may open them (ADR-0007).
-        let pin = this.pins.pin(v.extents.view())?;
         var refs = Vector<ExtentRef>.create();
         refs.extend(v.extents.view())?;
         let reader = ExtentReader.create(this.extentDir.view(), refs, start, end)?;
-        return Ok(ObjectReader { inline: Vector<u8>.create(), inlinePosition: 0, extents: reader, pin: pin });
+        return Ok(ObjectReader { inline: Vector<u8>.create(), inlinePosition: 0, extents: reader, pin: null });
     }
 
     /// The object's bytes `[from, to)` in memory (the whole object for 0, u64 max).
@@ -1049,7 +1154,7 @@ struct ObjectStore {
         from: u64,
         to: u64,
     ) -> Result<Vector<u8>, StoreError> {
-        var reader = this.openReader(bucket, key, from, to)?;
+        var reader = this.openUnpinned(bucket, key, from, to)?;
         var out = Vector<u8>.create();
         var chunk = Vector<u8>.create();
         chunk.resize(65536, 0)?;
@@ -1076,6 +1181,307 @@ struct ObjectStore {
         let empty = [0u8; 1];
         this.commitOne(RecordType.DeleteVersion, empty[0..0])?;
         return Ok();
+    }
+
+    // ---- Multipart uploads (ADR-0009) ----
+
+    /// Begins a multipart upload of `key`; returns its id.
+    fn createUpload(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        contentType: StringView,
+    ) -> Result<[u8; 16], StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        ObjectStore.checkKey(key)?;
+        if (contentType.length > MAX_CONTENT_TYPE) { return Err(StoreError.InvalidKey); }
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        this.admit(0)?;
+        var id = [0u8; 16];
+        while (true) {
+            Random.fill(mut id[..])!;
+            let uk = UploadKey { id: id };
+            if (!this.state.uploads.contains(borrow uk)) { break; }
+        }
+        this.scratch.clear();
+        encodeUploadCreateMeta(
+            mut this.scratch,
+            id,
+            bucket.bytes(),
+            key.bytes(),
+            Clock.unixMillis(),
+            contentType.bytes(),
+        )?;
+        let empty = [0u8; 1];
+        this.commitOne(RecordType.UploadCreate, empty[0..0])?;
+        return Ok(id);
+    }
+
+    /// Whether `id` is an upload of this bucket and key.
+    fn findUpload(borrow this, bucket: StringView, key: StringView, id: [u8; 16]) -> Result<void, StoreError> {
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        let uk = UploadKey { id: id };
+        match (this.state.uploads.get(borrow uk)) {
+            Some(u) => {
+                if (u.bucket.view() != bucket.bytes() || u.key.view() != key.bytes()) {
+                    return Err(StoreError.NoSuchUpload);
+                }
+                return Ok();
+            }
+            null => { return Err(StoreError.NoSuchUpload); }
+        }
+    }
+
+    /// A writer for one part: it has no inline buffer, so every byte goes to extents.
+    fn newPartWriter(borrow this) -> Result<ObjectWriter, StoreError> =>
+        Ok(ObjectWriter.create(this.extentDir.view(), 0, this.config.extentMaxBytes, this.abandoned.clone())?);
+
+    /// Checks that a part of `size` bytes may be uploaded: the upload exists and the size is admitted.
+    fn checkPart(
+        borrow this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16],
+        number: u32,
+        size: u64,
+    ) -> Result<void, StoreError> {
+        this.checkWritable()?;
+        if (number < 1 || number > MAX_PART_NUMBER) { return Err(StoreError.InvalidPartNumber); }
+        this.findUpload(bucket, key, id)?;
+        if (size > this.config.maxObjectBytes) { return Err(StoreError.EntityTooLarge); }
+        this.admit(size)?;
+        return Ok();
+    }
+
+    /// Commits a finished part of an upload, replacing a part of the same number; returns its MD5. On a refusal its
+    /// extents are removed.
+    fn putPart(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16],
+        number: u32,
+        obj: borrow FinishedObject,
+    ) -> Result<[u8; 16], StoreError> {
+        this.commitStaged()?;
+        var manifest = Vector<u8>.create();
+        let checked = match (borrow obj.body) {
+            ObjectBody.Extents(extents) => {
+                encodeManifest(mut manifest, extents.view())?;
+                this.checkPart(bucket, key, id, number, obj.size)
+            }
+            ObjectBody.Inline(data) => {
+                // A part writer spills every byte, so only an empty part is inline.
+                encodeManifest(mut manifest, Vector<ExtentRef>.create().view())?;
+                if (data.length != 0) Err(StoreError.InvalidPart) else this.checkPart(bucket, key, id, number, 0)
+            }
+        };
+        match (checked) {
+            Ok() => {}
+            Err(e) => {
+                this.discardFinished(obj);
+                return Err(e);
+            }
+        }
+        this.scratch.clear();
+        encodeUploadPartMeta(mut this.scratch, id, number, obj.size, obj.md5, Clock.unixMillis())?;
+        this.commitOne(RecordType.UploadPart, manifest.view())?;
+        return Ok(obj.md5);
+    }
+
+    /// Discards an upload and its parts.
+    fn abortUpload(borrow mut this, bucket: StringView, key: StringView, id: [u8; 16]) -> Result<void, StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        this.findUpload(bucket, key, id)?;
+        this.scratch.clear();
+        encodeUploadAbortMeta(mut this.scratch, id, Clock.unixMillis())?;
+        let empty = [0u8; 1];
+        this.commitOne(RecordType.UploadAbort, empty[0..0])?;
+        return Ok();
+    }
+
+    /// Makes the named parts, in order, the key's current version, and ends the upload. Parts it does not name are
+    /// removed. The outcome's MD5 is the multipart ETag's digest.
+    fn completeUpload(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16],
+        chosen: Slice<PartChoice>,
+    ) -> Result<PutOutcome, StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        var manifest = Vector<u8>.create();
+        var meta = Vector<u8>.create();
+        {
+            this.findUpload(bucket, key, id)?;
+            let uk = UploadKey { id: id };
+            let u = match (this.state.uploads.get(borrow uk)) {
+                Some(u) => u,
+                null => { return Err(StoreError.NoSuchUpload); }
+            };
+            if (chosen.length == 0) { return Err(StoreError.InvalidPart); }
+            var extents = Vector<ExtentRef>.create();
+            var md5s = Vector<[u8; 16]>.create();
+            var size: u64 = 0;
+            var next: usize = 0;
+            for (c in 1..chosen.length) {
+                if (chosen[c].number <= chosen[c - 1].number) { return Err(StoreError.InvalidPartOrder); }
+            }
+            for (c in 0..chosen.length) {
+                let want = borrow chosen[c];
+                // Parts are in ascending number, as are the choices: one pass finds them all.
+                while (next < u.parts.length && u.parts[next].number < want.number) { next += 1; }
+                if (next == u.parts.length || u.parts[next].number != want.number) {
+                    return Err(StoreError.InvalidPart);
+                }
+                let part = borrow u.parts[next];
+                if (part.md5[..] != want.md5[..]) { return Err(StoreError.InvalidPart); }
+                if (c + 1 < chosen.length && part.size < this.config.minPartBytes) {
+                    return Err(StoreError.EntityTooSmall);
+                }
+                size += part.size;
+                extents.extend(part.extents.view())?;
+                md5s.push(part.md5)?;
+            }
+            if (size > this.config.maxUploadBytes) { return Err(StoreError.EntityTooLarge); }
+            encodeManifest(mut manifest, extents.view())?;
+            encodeUploadCompleteMeta(
+                mut meta,
+                bucket.bytes(),
+                key.bytes(),
+                Clock.unixMillis(),
+                size,
+                multipartEtag(md5s.view()),
+                u.contentType.view(),
+                id,
+                truncate<u32>(chosen.length),
+            )?;
+        }
+        this.scratch.clear();
+        this.scratch.extend(meta.view())?;
+        let lsn = this.commitOne(RecordType.UploadComplete, manifest.view())?;
+        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+        let md5 = match (this.state.index.get(borrow k)) {
+            Some(v) => v.md5,
+            null => [0u8; 16],
+        };
+        return Ok(PutOutcome { md5: md5, generation: lsn, parts: truncate<u32>(chosen.length) });
+    }
+
+    /// The uploads of `bucket` whose keys start with `prefix`, in key order, then by initiation. The listing starts
+    /// after `keyMarker`, or, with `idMarker`, after that upload of `keyMarker`.
+    fn listUploads(
+        borrow this,
+        bucket: StringView,
+        prefix: Slice<u8>,
+        keyMarker: Slice<u8>,
+        idMarker: [u8; 16]?,
+        maxUploads: usize,
+    ) -> Result<UploadListing, StoreError> {
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        let uploads = borrow this.state.uploads;
+        // Where the marker upload sorts, if it is one of this key's.
+        var markerAt: i64? = null;
+        match (idMarker) {
+            Some(mid) => {
+                let uk = UploadKey { id: mid };
+                match (uploads.get(borrow uk)) {
+                    Some(u) => {
+                        if (u.key.view() == keyMarker) { markerAt = u.initiatedMillis; }
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        var matches = Vector<usize>.create();
+        for (i in 0..uploads.length()) {
+            let u = uploads.valueAt(i);
+            if (u.bucket.view() != bucket.bytes() || !startsWithBytes(u.key.view(), prefix)) { continue; }
+            let order = compareBytes(u.key.view(), keyMarker);
+            if (keyMarker.length > 0 && order < 0) { continue; }
+            if (keyMarker.length > 0 && order == 0) {
+                match (markerAt) {
+                    Some(t) => {
+                        let id = uploads.keyAt(i).id;
+                        let after = u.initiatedMillis > t ||
+                            (u.initiatedMillis == t && compareBytes(id[..], (idMarker ?? [0u8; 16])[..]) > 0);
+                        if (!after) { continue; }
+                    }
+                    null => { continue; }
+                }
+            }
+            matches.push(i)?;
+        }
+        matches.viewMut().sortBy((a, b) => {
+            let ua = uploads.valueAt(a);
+            let ub = uploads.valueAt(b);
+            let byKey = compareBytes(ua.key.view(), ub.key.view());
+            if (byKey != 0) { return byKey; }
+            if (ua.initiatedMillis != ub.initiatedMillis) {
+                return if (ua.initiatedMillis < ub.initiatedMillis) -1 else 1;
+            }
+            let ia = uploads.keyAt(a).id;
+            let ib = uploads.keyAt(b).id;
+            return compareBytes(ia[..], ib[..]);
+        });
+        var listing = UploadListing { uploads: Vector<UploadSummary>.create(), truncated: false };
+        for (m in matches.view()) {
+            if (listing.uploads.length == maxUploads) {
+                listing.truncated = true;
+                break;
+            }
+            let u = uploads.valueAt(m);
+            listing.uploads.push(UploadSummary {
+                key: copyBytes(u.key.view())?,
+                id: uploads.keyAt(m).id,
+                initiatedMillis: u.initiatedMillis,
+            })?;
+        }
+        return Ok(listing);
+    }
+
+    /// The parts of an upload after part number `after`, at most `maxParts`.
+    fn listParts(
+        borrow this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16],
+        after: u32,
+        maxParts: usize,
+    ) -> Result<PartListing, StoreError> {
+        this.findUpload(bucket, key, id)?;
+        let uk = UploadKey { id: id };
+        let u = match (this.state.uploads.get(borrow uk)) {
+            Some(u) => u,
+            null => { return Err(StoreError.NoSuchUpload); }
+        };
+        var listing = PartListing { parts: Vector<PartSummary>.create(), truncated: false };
+        for (i in 0..u.parts.length) {
+            let p = borrow u.parts[i];
+            if (p.number <= after) { continue; }
+            if (listing.parts.length == maxParts) {
+                listing.truncated = true;
+                break;
+            }
+            listing.parts.push(PartSummary { number: p.number, size: p.size, md5: p.md5, mtimeMillis: p.mtimeMillis })?;
+        }
+        return Ok(listing);
+    }
+
+    fn uploadCount(borrow this) -> usize => this.state.uploads.length();
+
+    /// The extent files the uploads' parts hold.
+    fn uploadExtentCount(borrow this) -> u64 {
+        var n: u64 = 0;
+        for (i in 0..this.state.uploads.length()) {
+            let u = this.state.uploads.valueAt(i);
+            for (p in 0..u.parts.length) { n += u.parts[p].extents.length as u64; }
+        }
+        return n;
     }
 
     /// Lists keys of `bucket` that start with `prefix` and sort after `startAfter`, rolling up
@@ -1113,6 +1519,9 @@ struct ObjectStore {
         var page = ListPage {
             keys: Vector<Vector<u8>>.create(),
             sizes: Vector<u64>.create(),
+            md5s: Vector<[u8; 16]>.create(),
+            mtimes: Vector<i64>.create(),
+            parts: Vector<u32>.create(),
             commonPrefixes: Vector<Vector<u8>>.create(),
             truncated: false,
             nextMarker: Vector<u8>.create(),
@@ -1149,7 +1558,11 @@ struct ObjectStore {
                         break;
                     }
                     page.keys.push(copyBytes(key)?)?;
-                    page.sizes.push(index.valueAt(matches[m]).size)?;
+                    let v = index.valueAt(matches[m]);
+                    page.sizes.push(v.size)?;
+                    page.md5s.push(v.md5)?;
+                    page.mtimes.push(v.mtimeMillis)?;
+                    page.parts.push(v.parts)?;
                     page.nextMarker.clear();
                     page.nextMarker.extend(key)?;
                     page.nextMarkerIsPrefix = false;
@@ -1292,6 +1705,8 @@ struct ObjectStore {
     /// Background upkeep: a checkpoint when one is due, then compaction.
     fn maintain(borrow mut this) -> Result<MaintenanceReport, StoreError> {
         this.reapDeferred();
+        this.reapAbandoned();
+        this.pins.prune();
         var checkpointed = false;
         let every = this.config.checkpointEveryBytes;
         if (every > 0 && this.sinceCheckpoint >= every) { checkpointed = this.checkpoint()?; }

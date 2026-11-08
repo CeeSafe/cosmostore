@@ -1,0 +1,163 @@
+#!/bin/sh
+# The M3 end-to-end test (ADR-0008, ADR-0009): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
+# against `cosmostore serve` on a fresh store. Prints one line per check; exit status 1 if any fails.
+#
+# usage: tools/s3_smoke.sh [COSMOSTORE] [PORT]     (defaults: out/cosmostore, 9311)
+set -u
+bin=$(cd "$(dirname "${1:-out/cosmostore}")" && pwd)/$(basename "${1:-out/cosmostore}")
+port=${2:-9311}
+here=$(cd "$(dirname "$0")" && pwd)
+work=$(mktemp -d)
+trap 'kill "$server" 2>/dev/null; rm -rf "$work"' EXIT
+
+export AWS_ACCESS_KEY_ID=AKIASMOKETEST0000001
+export AWS_SECRET_ACCESS_KEY=smoke/secret/0123456789abcdefghijkl
+export AWS_DEFAULT_REGION=us-east-1
+export AWS_EC2_METADATA_DISABLED=true
+export AWS_ENDPOINT_URL="http://127.0.0.1:$port"
+echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > "$work/credentials"
+
+"$bin" serve "$work/store" "$port" "$work/credentials" 2> "$work/server.log" &
+server=$!
+sleep 1
+
+failed=0
+pass() { echo "ok   $1"; }
+fail() { echo "FAIL $1"; failed=1; }
+check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1: expected [$3], got [$2]"; fi; }
+code() { aws "$@" 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9]*\)).*/\1/p' | head -1; }
+
+cd "$work"
+printf 'hello cosmostore\n' > small.txt
+head -c 3000000 /dev/urandom > big.bin
+small_etag='"5680aecbbcbe9d3d2f700cf49dbe9cd4"'
+
+# Buckets.
+aws s3api create-bucket --bucket smoke > /dev/null 2>&1 || fail "create-bucket"
+check "create-bucket twice" "$(code s3api create-bucket --bucket smoke)" BucketAlreadyOwnedByYou
+check "invalid bucket name" "$(code s3api create-bucket --bucket NO_)" InvalidBucketName
+check "list-buckets" "$(aws s3api list-buckets --query 'Buckets[].Name' --output text)" smoke
+aws s3api head-bucket --bucket smoke > /dev/null 2>&1 && pass "head-bucket" || fail "head-bucket"
+check "head-bucket missing" "$(code s3api head-bucket --bucket missing)" 404
+
+# Objects: inline, extent-backed, with the CLI's default checksum and without one.
+check "put small" "$(aws s3api put-object --bucket smoke --key a/small.txt --body small.txt --query ETag --output text)" "$small_etag"
+aws s3api put-object --bucket smoke --key a/big.bin --body big.bin > /dev/null 2>&1 || fail "put big"
+aws s3api get-object --bucket smoke --key a/big.bin got.bin > /dev/null 2>&1
+cmp -s got.bin big.bin && pass "get big" || fail "get big"
+AWS_REQUEST_CHECKSUM_CALCULATION=when_required aws s3api put-object --bucket smoke --key a/plain.bin --body big.bin \
+    > /dev/null 2>&1 || fail "put with a signed SHA-256 payload"
+aws s3 cp big.bin s3://smoke/b/cp.bin > /dev/null 2>&1 && aws s3 cp s3://smoke/b/cp.bin cp.bin > /dev/null 2>&1
+cmp -s cp.bin big.bin && pass "s3 cp both ways" || fail "s3 cp both ways"
+check "head-object size" "$(aws s3api head-object --bucket smoke --key a/big.bin --query ContentLength)" 3000000
+
+# Signed aws-chunked (the Java and Go SDKs' form), and a changed chunk.
+check "signed chunked put" "$(python3 -I "$here/s3_raw.py" chunked-put "$AWS_ENDPOINT_URL" smoke c/chunked.bin big.bin | head -1 | cut -d' ' -f1)" 200
+aws s3api get-object --bucket smoke --key c/chunked.bin got.bin > /dev/null 2>&1
+cmp -s got.bin big.bin && pass "get chunked" || fail "get chunked"
+check "changed chunk refused" "$(python3 -I "$here/s3_raw.py" bad-chunk "$AWS_ENDPOINT_URL" smoke c/bad.bin big.bin | head -1 | cut -d' ' -f1)" 403
+check "changed chunk not stored" "$(code s3api head-object --bucket smoke --key c/bad.bin)" 404
+
+# Integrity.
+check "wrong CRC32" "$(code s3api put-object --bucket smoke --key bad --body small.txt --checksum-crc32 AAAAAA==)" BadDigest
+check "wrong Content-MD5" "$(code s3api put-object --bucket smoke --key bad --body small.txt --content-md5 AAAAAAAAAAAAAAAAAAAAAA==)" BadDigest
+check "refused body not stored" "$(code s3api head-object --bucket smoke --key bad)" 404
+
+# Ranges and conditions.
+aws s3api get-object --bucket smoke --key a/small.txt --range bytes=6-9 r.txt > /dev/null 2>&1
+check "range" "$(cat r.txt)" cosm
+aws s3api get-object --bucket smoke --key a/small.txt --range bytes=-5 r.txt > /dev/null 2>&1
+check "suffix range" "$(cat r.txt)" "tore"
+check "range past the end" "$(code s3api get-object --bucket smoke --key a/small.txt --range bytes=100-200 r.txt)" InvalidRange
+check "If-None-Match * on a key" "$(code s3api put-object --bucket smoke --key a/small.txt --body small.txt --if-none-match '*')" PreconditionFailed
+check "If-Match right ETag" "$(aws s3api put-object --bucket smoke --key a/small.txt --body small.txt --if-match "$small_etag" --query ETag --output text)" "$small_etag"
+check "If-Match wrong ETag" "$(code s3api put-object --bucket smoke --key a/small.txt --body small.txt --if-match '"00000000000000000000000000000000"')" PreconditionFailed
+check "GET If-None-Match" "$(code s3api get-object --bucket smoke --key a/small.txt --if-none-match "$small_etag" x)" 304
+check "GET If-Match wrong" "$(code s3api get-object --bucket smoke --key a/small.txt --if-match '"00000000000000000000000000000000"' x)" PreconditionFailed
+
+# Keys that need encoding.
+for k in "sp ace/ü+plus&amp=x.txt" "a//double" "tilde~(1)!*'"; do
+    aws s3api put-object --bucket smoke --key "$k" --body small.txt > /dev/null 2>&1
+    aws s3api get-object --bucket smoke --key "$k" o.txt > /dev/null 2>&1
+    cmp -s o.txt small.txt && pass "key [$k]" || fail "key [$k]"
+done
+
+# Listing.
+check "v2 delimiter" "$(aws s3api list-objects-v2 --bucket smoke --delimiter / --query 'CommonPrefixes[].Prefix' --output text)" "a/	b/	c/	sp ace/"
+check "v2 pages of 1" "$(aws s3api list-objects-v2 --bucket smoke --prefix a/ --page-size 1 --query 'length(Contents)')" 4
+check "v1 prefix" "$(aws s3api list-objects --bucket smoke --prefix b/ --query 'Contents[].Key' --output text)" b/cp.bin
+check "v1 pages of 1" "$(aws s3api list-objects --bucket smoke --page-size 1 --query 'length(Contents)')" 8
+check "s3 ls (url encoding)" "$(aws s3 ls s3://smoke/sp\ ace/ | awk '{print $4}')" "ü+plus&amp=x.txt"
+
+# Multipart (ADR-0009): the CLI's own above 8 MB (8 MiB parts), then each call by hand.
+head -c 20000000 /dev/urandom > huge.bin
+aws s3 cp huge.bin s3://smoke/m/huge.bin > /dev/null 2>&1 && aws s3 cp s3://smoke/m/huge.bin huge.got > /dev/null 2>&1
+cmp -s huge.got huge.bin && pass "s3 cp multipart both ways" || fail "s3 cp multipart both ways"
+huge_etag=$(python3 -I -c '
+import hashlib, sys
+data = open(sys.argv[1], "rb").read()
+step = 8 * 1024 * 1024
+parts = [hashlib.md5(data[i:i + step]).digest() for i in range(0, len(data), step)]
+print("\"%s-%d\"" % (hashlib.md5(b"".join(parts)).hexdigest(), len(parts)))' huge.bin)
+check "multipart ETag" "$(aws s3api head-object --bucket smoke --key m/huge.bin --query ETag --output text)" "$huge_etag"
+check "multipart ETag listed" "$(aws s3api list-objects-v2 --bucket smoke --prefix m/huge --query 'Contents[0].ETag' --output text)" "$huge_etag"
+aws s3api get-object --bucket smoke --key m/huge.bin --range bytes=8388000-8389000 r.bin > /dev/null 2>&1
+dd if=huge.bin of=r.want bs=1 skip=8388000 count=1001 2> /dev/null
+cmp -s r.bin r.want && pass "range across parts" || fail "range across parts"
+check "GET If-Match multipart ETag" "$(aws s3api get-object --bucket smoke --key m/huge.bin --if-match "$huge_etag" --range bytes=0-0 x --query ETag --output text)" "$huge_etag"
+
+head -c 5242880 /dev/urandom > p1.bin
+id=$(aws s3api create-multipart-upload --bucket smoke --key m/manual --content-type text/x-test --query UploadId --output text)
+e1=$(aws s3api upload-part --bucket smoke --key m/manual --upload-id "$id" --part-number 1 --body p1.bin --query ETag --output text | tr -d '"')
+e2=$(aws s3api upload-part --bucket smoke --key m/manual --upload-id "$id" --part-number 2 --body small.txt --query ETag --output text | tr -d '"')
+e3=$(aws s3api upload-part --bucket smoke --key m/manual --upload-id "$id" --part-number 3 --body small.txt --query ETag --output text | tr -d '"')
+check "upload-part ETag" "$e2" "$(echo "$small_etag" | tr -d '"')"
+check "list-parts" "$(aws s3api list-parts --bucket smoke --key m/manual --upload-id "$id" --query 'Parts[].PartNumber' --output text)" "1	2	3"
+check "list-parts page" "$(aws s3api list-parts --bucket smoke --key m/manual --upload-id "$id" --max-parts 1 --part-number-marker 1 --query 'Parts[].Size' --output text)" 17
+check "list-multipart-uploads" "$(aws s3api list-multipart-uploads --bucket smoke --query 'Uploads[].Key' --output text)" m/manual
+check "complete: wrong ETag" "$(code s3api complete-multipart-upload --bucket smoke --key m/manual --upload-id "$id" --multipart-upload "{\"Parts\":[{\"ETag\":\"$e2\",\"PartNumber\":1}]}")" InvalidPart
+check "complete: small part first" "$(code s3api complete-multipart-upload --bucket smoke --key m/manual --upload-id "$id" --multipart-upload "{\"Parts\":[{\"ETag\":\"$e2\",\"PartNumber\":2},{\"ETag\":\"$e3\",\"PartNumber\":3}]}")" EntityTooSmall
+check "complete: out of order" "$(code s3api complete-multipart-upload --bucket smoke --key m/manual --upload-id "$id" --multipart-upload "{\"Parts\":[{\"ETag\":\"$e2\",\"PartNumber\":2},{\"ETag\":\"$e1\",\"PartNumber\":1}]}")" InvalidPartOrder
+manual_etag=$(aws s3api complete-multipart-upload --bucket smoke --key m/manual --upload-id "$id" \
+    --multipart-upload "{\"Parts\":[{\"ETag\":\"$e1\",\"PartNumber\":1},{\"ETag\":\"$e2\",\"PartNumber\":2}]}" --query ETag --output text)
+check "complete ETag" "$manual_etag" "$(python3 -I -c '
+import hashlib, sys
+print("\"%s-2\"" % hashlib.md5(bytes.fromhex(sys.argv[1]) + bytes.fromhex(sys.argv[2])).hexdigest())' "$e1" "$e2")"
+aws s3api get-object --bucket smoke --key m/manual got.bin > /dev/null 2>&1
+cat p1.bin small.txt > want.bin
+cmp -s got.bin want.bin && pass "completed object" || fail "completed object"
+check "completed content type" "$(aws s3api head-object --bucket smoke --key m/manual --query ContentType --output text)" text/x-test
+check "completed upload gone" "$(code s3api list-parts --bucket smoke --key m/manual --upload-id "$id")" NoSuchUpload
+id=$(aws s3api create-multipart-upload --bucket smoke --key m/aborted --query UploadId --output text)
+aws s3api upload-part --bucket smoke --key m/aborted --upload-id "$id" --part-number 1 --body p1.bin > /dev/null 2>&1
+aws s3api abort-multipart-upload --bucket smoke --key m/aborted --upload-id "$id" > /dev/null 2>&1 && pass "abort" || fail "abort"
+check "aborted upload gone" "$(code s3api upload-part --bucket smoke --key m/aborted --upload-id "$id" --part-number 2 --body small.txt)" NoSuchUpload
+check "no uploads left" "$(aws s3api list-multipart-uploads --bucket smoke --query 'length(Uploads || `[]`)')" 0
+check "unknown upload id" "$(code s3api abort-multipart-upload --bucket smoke --key m/x --upload-id nope)" NoSuchUpload
+
+# A GET dropped half way releases its pins: the overwritten extents go on the next commits.
+for i in 1 2 3; do python3 -I "$here/s3_raw.py" abort-get "$AWS_ENDPOINT_URL" smoke a/big.bin 100000 > /dev/null; done
+aws s3api put-object --bucket smoke --key a/big.bin --body small.txt > /dev/null 2>&1
+aws s3api delete-object --bucket smoke --key a/nothing > /dev/null 2>&1
+
+# Errors and auth.
+check "no such key" "$(code s3api get-object --bucket smoke --key nope x)" NoSuchKey
+check "no such bucket" "$(code s3api get-object --bucket missing --key nope x)" NoSuchBucket
+check "bucket not empty" "$(code s3api delete-bucket --bucket smoke)" BucketNotEmpty
+check "wrong secret" "$(AWS_SECRET_ACCESS_KEY=wrong code s3api list-buckets)" SignatureDoesNotMatch
+check "unknown key id" "$(AWS_ACCESS_KEY_ID=AKIAUNKNOWN code s3api list-buckets)" InvalidAccessKeyId
+check "anonymous" "$(code s3api list-buckets --no-sign-request)" AccessDenied
+check "not implemented (copy)" "$(code s3api copy-object --bucket smoke --key copy --copy-source smoke/a/small.txt)" NotImplemented
+
+# Deletes free the space.
+aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1
+aws s3api delete-bucket --bucket smoke > /dev/null 2>&1 && pass "delete-bucket" || fail "delete-bucket"
+aws s3api create-bucket --bucket after > /dev/null 2>&1 # a commit, which reaps what readers held
+check "no extents left" "$(ls store/extents | wc -l | tr -d ' ')" 0
+
+kill "$server"
+wait "$server" 2> /dev/null
+"$bin" fsck store > fsck.out 2>&1 && pass "fsck" || { fail "fsck"; cat fsck.out; }
+if [ -s server.log ] && grep -q "Internal\|Unavailable" server.log; then fail "server logged errors"; cat server.log; fi
+[ "$failed" = 0 ] && echo "s3 smoke: all passed" || echo "s3 smoke: FAILED"
+exit "$failed"

@@ -1,0 +1,235 @@
+// The aws-chunked body encoding (ADR-0008 §6), decoded incrementally from pieces of any size:
+//
+//   hex-size [;chunk-signature=<64 hex>] CRLF  data CRLF  ...  0 [;chunk-signature=...] CRLF  trailer-lines  CRLF
+//
+// With a signer, every chunk's signature is checked when its data ends, and a trailer's `x-amz-trailer-signature`
+// against the trailer fields before it. Trailer fields are kept for the caller (the `x-amz-checksum-*` value).
+
+enum ChunkFault {
+    /// Not aws-chunked as written above (IncompleteBody or InvalidRequest).
+    Malformed,
+    /// A chunk or trailer signature differs (SignatureDoesNotMatch).
+    BadSignature,
+    @from OutOfMemory(AllocError),
+}
+
+enum ChunkState {
+    /// Reading a size line.
+    SizeLine,
+    /// Reading `left` data bytes.
+    Data,
+    /// The CRLF after a chunk's data: `seen` of its 2 bytes.
+    DataEnd,
+    /// Reading trailer lines after the last chunk.
+    Trailer,
+    Done,
+}
+
+/// The longest size line or trailer line accepted.
+const CHUNK_LINE_MAX: usize = 4096;
+
+struct ChunkDecoder {
+    private state: ChunkState;
+    private line: Vector<u8>;
+    private left: u64;
+    private crlfSeen: usize;
+    private signer: ChunkSigner?;
+    /// The signature the current chunk declared, and the hash of its data.
+    private declared: Vector<u8>;
+    private dataHash: Sha256;
+    /// Trailer fields, `name:value\n` each, as signed; the signature line is not among them.
+    private trailerText: Vector<u8>;
+    private trailerSignature: Vector<u8>;
+    /// The decoded bytes so far.
+    private decoded: u64;
+
+    fn create(signer: ChunkSigner?) -> ChunkDecoder => ChunkDecoder {
+        state: ChunkState.SizeLine,
+        line: Vector<u8>.create(),
+        left: 0,
+        crlfSeen: 0,
+        signer: signer,
+        declared: Vector<u8>.create(),
+        dataHash: Sha256.create(),
+        trailerText: Vector<u8>.create(),
+        trailerSignature: Vector<u8>.create(),
+        decoded: 0,
+    };
+
+    fn isDone(borrow this) -> bool => match (this.state) {
+        ChunkState.Done => true,
+        _ => false,
+    };
+
+    fn decodedLength(borrow this) -> u64 => this.decoded;
+
+    /// The trailer fields, each `name:value\n`.
+    fn trailers(borrow this) -> Slice<u8> => this.trailerText.view();
+
+    /// Decodes `input`, appending the data bytes to `out`.
+    fn feed(borrow mut this, input: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, ChunkFault> {
+        var i: usize = 0;
+        while (i < input.length) {
+            match (this.state) {
+                ChunkState.SizeLine => {
+                    let c = input[i];
+                    i += 1;
+                    if (c != '\n') {
+                        if (this.line.length >= CHUNK_LINE_MAX) { return Err(ChunkFault.Malformed); }
+                        this.line.push(c)?;
+                        continue;
+                    }
+                    this.sizeLine()?;
+                }
+                ChunkState.Data => {
+                    let room = (input.length - i) as u64;
+                    let n = (if (room < this.left) room else this.left) as usize;
+                    let piece = input[i..i + n];
+                    out.extend(piece)?;
+                    if (this.signer.isSome()) { this.dataHash.update(piece); }
+                    this.left -= n as u64;
+                    this.decoded += n as u64;
+                    i += n;
+                    if (this.left == 0) {
+                        this.state = ChunkState.DataEnd;
+                        this.crlfSeen = 0;
+                    }
+                }
+                ChunkState.DataEnd => {
+                    let want: u8 = if (this.crlfSeen == 0) 13 else 10;
+                    if (input[i] != want) { return Err(ChunkFault.Malformed); }
+                    i += 1;
+                    this.crlfSeen += 1;
+                    if (this.crlfSeen == 2) {
+                        this.checkChunk()?;
+                        this.state = ChunkState.SizeLine;
+                    }
+                }
+                ChunkState.Trailer => {
+                    let c = input[i];
+                    i += 1;
+                    if (c != '\n') {
+                        if (this.line.length >= CHUNK_LINE_MAX) { return Err(ChunkFault.Malformed); }
+                        this.line.push(c)?;
+                        continue;
+                    }
+                    this.trailerLine()?;
+                }
+                ChunkState.Done => {
+                    // Anything after the final CRLF is not part of the body.
+                    return Err(ChunkFault.Malformed);
+                }
+            }
+        }
+        return Ok();
+    }
+
+    /// A complete size line (its LF consumed, `line` without it).
+    fn sizeLine(borrow mut this) -> Result<void, ChunkFault> {
+        var end = this.line.length;
+        if (end == 0 || this.line[end - 1] != '\r') { return Err(ChunkFault.Malformed); }
+        end -= 1;
+        let text = this.line.view()[0..end];
+        let semi = pieceEnd(text, 0, ';');
+        if (semi == 0 || semi > 16) { return Err(ChunkFault.Malformed); }
+        var size: u64 = 0;
+        for (k in 0..semi) {
+            match (hexValue(text[k])) {
+                Some(d) => { size = (size << 4) | d as u64; }
+                null => { return Err(ChunkFault.Malformed); }
+            }
+        }
+        this.declared.clear();
+        if (semi < text.length) {
+            let ext = text[semi + 1..];
+            let name = "chunk-signature=".bytes();
+            if (ext.length != name.length + 64 || ext[0..name.length] != name) { return Err(ChunkFault.Malformed); }
+            this.declared.extend(ext[name.length..])?;
+        }
+        if (this.signer.isSome() && this.declared.length == 0) { return Err(ChunkFault.BadSignature); }
+        this.line.clear();
+        this.dataHash = Sha256.create();
+        this.left = size;
+        if (size == 0) {
+            // The last chunk carries a signature over empty data, then the trailer follows.
+            this.checkChunk()?;
+            this.state = ChunkState.Trailer;
+        } else {
+            this.state = ChunkState.Data;
+        }
+        return Ok();
+    }
+
+    /// Checks the chunk that just ended against the signature it declared.
+    fn checkChunk(borrow mut this) -> Result<void, ChunkFault> {
+        match (this.signer.asBorrowMut()) {
+            Some(signer) => {
+                let hash = this.dataHash.finish();
+                var expected = Vector<u8>.create();
+                signer.next(hash, mut expected)?;
+                if (!sameSignature(expected.view(), this.declared.view())) { return Err(ChunkFault.BadSignature); }
+            }
+            null => {}
+        }
+        return Ok();
+    }
+
+    /// A complete trailer line; the empty one ends the body.
+    fn trailerLine(borrow mut this) -> Result<void, ChunkFault> {
+        var end = this.line.length;
+        if (end > 0 && this.line[end - 1] == '\r') { end -= 1; }
+        if (end == 0) {
+            this.line.clear();
+            this.finishTrailer()?;
+            this.state = ChunkState.Done;
+            return Ok();
+        }
+        let text = this.line.view()[0..end];
+        let colon = pieceEnd(text, 0, ':');
+        if (colon == 0 || colon == text.length) { return Err(ChunkFault.Malformed); }
+        let name = text[0..colon];
+        if (equalsIgnoreCase(name, "x-amz-trailer-signature".bytes())) {
+            this.trailerSignature.clear();
+            this.trailerSignature.extend(trimSpaces(text[colon + 1..]))?;
+        } else {
+            for (k in 0..colon) { this.trailerText.push(lowerAscii(name[k]))?; }
+            this.trailerText.push(':')?;
+            this.trailerText.extend(trimSpaces(text[colon + 1..]))?;
+            this.trailerText.push('\n')?;
+        }
+        this.line.clear();
+        return Ok();
+    }
+
+    /// With a signer, a trailer must carry its signature, and it must match.
+    fn finishTrailer(borrow mut this) -> Result<void, ChunkFault> {
+        match (this.signer.asBorrowMut()) {
+            Some(signer) => {
+                if (this.trailerText.length == 0) { return Ok(); }
+                var expected = Vector<u8>.create();
+                signer.trailer(this.trailerText.view(), mut expected)?;
+                if (!sameSignature(expected.view(), this.trailerSignature.view())) {
+                    return Err(ChunkFault.BadSignature);
+                }
+            }
+            null => {}
+        }
+        return Ok();
+    }
+}
+
+/// The value of trailer field `name` (lowercase) in `trailers` (`name:value\n` each).
+fn trailerValue(trailers: Slice<u8>, name: StringView, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    var at: usize = 0;
+    while (at < trailers.length) {
+        let end = pieceEnd(trailers, at, '\n');
+        let line = trailers[at..end];
+        at = end + 1;
+        let colon = pieceEnd(line, 0, ':');
+        if (colon < line.length && line[0..colon] == name.bytes()) {
+            out.extend(line[colon + 1..])?;
+            return Ok(true);
+        }
+    }
+    return Ok(false);
+}

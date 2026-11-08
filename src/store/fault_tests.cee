@@ -20,6 +20,8 @@ fn faultStoreConfig() -> StoreConfig => StoreConfig {
     compactMaxCopyBytes: 67108864,
     capacityBytes: 0,
     reserveBytes: 0,
+    minPartBytes: 50000,
+    maxUploadBytes: 5497558138880,
 };
 
 /// Seed 0 means no object. The others: inline or extent-backed sizes.
@@ -32,11 +34,13 @@ fn seedSize(seed: u64) -> usize => match (seed) {
     6 => 50,
     7 => 5000,
     8 => 140000,
+    9 => 100000, // the completed upload of `uploadWorkload`: parts of 70000 and 30000 bytes
     _ => 1,
 };
 
 fn seedExtents(seed: u64) -> u64 {
     if (seed == 0) { return 0; }
+    if (seed == 9) { return 3; } // each part in its own extents: 2 for 70000 bytes, then 1
     let size = seedSize(seed) as u64;
     if (size <= 16384) { return 0; }
     return (size + 65535) / 65536;
@@ -248,7 +252,9 @@ fn sweepStore(
         {
             var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
             let extents = checkStore(borrow s, borrow m)?;
-            Check.equalU64(extents, extentFiles(dir.view()))?;
+            // Exactly the live versions' and the uploads' extents: none missing, no orphans.
+            Check.equalU64(extents + s.uploadExtentCount(), extentFiles(dir.view()))?;
+            Check.equalU64(0, s.verify()!.orphanExtents as u64)?;
             if (!s.bucketExists("bkt")!) { s.createBucket("bkt")!; }
             putSeed(mut s, 0, 2)!; // writable again
             // Maintenance works on the recovered store: its segments are the files on disk, and compaction and a
@@ -292,6 +298,109 @@ fn storeFaultsTorn() -> Result<void, TestFailure> =>
 @test
 fn storeFaultsCrash() -> Result<void, TestFailure> =>
     sweepStore("sfault-crash", SweepMode.Crash, storeWorkload, STORE_WORKLOAD_RESULT);
+
+/// What `uploadWorkload` leaves each key holding when nothing fails.
+const UPLOAD_WORKLOAD_RESULT: [u64; 5] = [1u64, 9, 0, 0, 0];
+
+/// The parts of seed 9 for key k1: part 1, part 2 sent twice (the second replaces the first), and a part 3 that the
+/// completion leaves out. Returns the two named parts' MD5s.
+fn uploadSeedParts(s: borrow mut ObjectStore, id: [u8; 16]) -> Result<[[u8; 16]; 2], StoreError> {
+    let whole = patterned(seedSize(9), 9);
+    let m1 = sendPart(s, "bkt", keyName(1), id, 1, whole.view()[0..70000])?;
+    let _ = sendPart(s, "bkt", keyName(1), id, 2, patterned(20000, 5).view())?;
+    let m2 = sendPart(s, "bkt", keyName(1), id, 2, whole.view()[70000..])?;
+    let _ = sendPart(s, "bkt", keyName(1), id, 3, patterned(20000, 6).view())?;
+    return Ok([m1, m2]);
+}
+
+/// Multipart under faults (ADR-0009): an upload completed over an extent-backed version, an aborted upload, and one
+/// left in progress, whose parts must survive.
+fn uploadWorkload(dir: StringView, m: borrow mut FaultModel) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    match (s.createBucket("bkt")) {
+        Ok() => {
+            m.bucket = true;
+            m.bucketAlt = true;
+        }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.bucketAlt = true; }
+        }
+    }
+    match (putSeed(mut s, 1, 2)) {
+        Ok() => { m.succeeded(1, 2); }
+        Err(e) => { m.failed(1, 2, borrow e); }
+    }
+    // Only the completion can change k1; a failed part leaves it as it was.
+    match (s.createUpload("bkt", keyName(1), "application/octet-stream")) {
+        Ok(id) => {
+            match (uploadSeedParts(mut s, id)) {
+                Ok(md5s) => {
+                    let chosen = [
+                        PartChoice { number: 1, md5: md5s[0] },
+                        PartChoice { number: 2, md5: md5s[1] },
+                    ];
+                    match (s.completeUpload("bkt", keyName(1), id, chosen[..])) {
+                        Ok(_) => { m.succeeded(1, 9); }
+                        Err(e) => { m.failed(1, 9, borrow e); }
+                    }
+                }
+                Err(e) => { m.failed(FKEYS, 0, borrow e); }
+            }
+        }
+        Err(e) => { m.failed(FKEYS, 0, borrow e); }
+    }
+    // An aborted upload of k2, and one of k3 left in progress: neither touches its key.
+    match (s.createUpload("bkt", keyName(2), "")) {
+        Ok(id) => {
+            match (sendPart(mut s, "bkt", keyName(2), id, 1, patterned(70000, 3).view())) {
+                Ok(_) => {
+                    match (s.abortUpload("bkt", keyName(2), id)) {
+                        Ok() => {}
+                        Err(e) => { m.failed(FKEYS, 0, borrow e); }
+                    }
+                }
+                Err(e) => { m.failed(FKEYS, 0, borrow e); }
+            }
+        }
+        Err(e) => { m.failed(FKEYS, 0, borrow e); }
+    }
+    match (s.createUpload("bkt", keyName(3), "")) {
+        Ok(id) => {
+            match (sendPart(mut s, "bkt", keyName(3), id, 1, patterned(70000, 4).view())) {
+                Ok(_) => {}
+                Err(e) => { m.failed(FKEYS, 0, borrow e); }
+            }
+        }
+        Err(e) => { m.failed(FKEYS, 0, borrow e); }
+    }
+    match (putSeed(mut s, 0, 1)) {
+        Ok() => { m.succeeded(0, 1); }
+        Err(e) => { m.failed(0, 1, borrow e); }
+    }
+}
+
+@test
+fn uploadFaultsOnce() -> Result<void, TestFailure> =>
+    sweepStore("ufault-once", SweepMode.Once, uploadWorkload, UPLOAD_WORKLOAD_RESULT);
+
+@test
+fn uploadFaultsSticky() -> Result<void, TestFailure> =>
+    sweepStore("ufault-sticky", SweepMode.Sticky, uploadWorkload, UPLOAD_WORKLOAD_RESULT);
+
+@test
+fn uploadFaultsTorn() -> Result<void, TestFailure> =>
+    sweepStore("ufault-torn", SweepMode.StickyTorn, uploadWorkload, UPLOAD_WORKLOAD_RESULT);
+
+@test
+fn uploadFaultsCrash() -> Result<void, TestFailure> =>
+    sweepStore("ufault-crash", SweepMode.Crash, uploadWorkload, UPLOAD_WORKLOAD_RESULT);
+
+@test
+fn uploadFaultsCrashDuringOpen() -> Result<void, TestFailure> =>
+    sweepStoreOpen("ufault-open-crash", SweepMode.Crash, uploadWorkload);
 
 fn sweepStoreOpen(
     name: StringView,
@@ -374,7 +483,7 @@ fn sweepStoreOpen(
         }
         let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
         let live = checkStore(borrow s, borrow m)?;
-        Check.equalU64(live, extentFiles(dir.view()))?;
+        Check.equalU64(live + s.uploadExtentCount(), extentFiles(dir.view()))?;
         n += 1;
     }
     removeTree(dir.view());

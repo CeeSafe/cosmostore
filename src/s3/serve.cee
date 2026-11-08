@@ -1,0 +1,103 @@
+// `cosmostore serve <dir> <port> <credentials-file>` (ADR-0008 §1): the store behind S3 on 127.0.0.1:<port>.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+/// Reads the credentials file through `Fs` (all file I/O goes through it).
+fn readCredentials(path: StringView) -> Result<Vector<Credential>, StringView> {
+    let file = match (DurableFile.openRead(path)) {
+        Ok(f) => f,
+        Err(_) => { return Err("cannot open the credentials file"); }
+    };
+    let size = match (file.size()) {
+        Ok(n) => n,
+        Err(_) => { return Err("cannot read the credentials file"); }
+    };
+    if (size > 1048576) { return Err("the credentials file is larger than 1 MiB"); }
+    var text = Vector<u8>.create();
+    match (text.resize(size as usize, 0)) {
+        Ok() => {}
+        Err(_) => { return Err("out of memory"); }
+    }
+    match (file.readExactAt(text.viewMut(), 0)) {
+        Ok() => {}
+        Err(_) => { return Err("cannot read the credentials file"); }
+    }
+    let creds = match (parseCredentials(text.view())) {
+        Ok(c) => c,
+        Err(_) => { return Err("out of memory"); }
+    };
+    if (creds.length == 0) { return Err("the credentials file has no `access-key secret-key` line"); }
+    return Ok(creds);
+}
+
+fn s3Handler() -> Result<Box<dyn Handler<S3App> + Send>, RouteError> {
+    match (Box.create(S3Handler {})) {
+        Ok(h) => {
+            let d: Box<dyn Handler<S3App> + Send> = h;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+/// The server: every path and method goes to the one S3 handler, which reads the path itself (bucket, key).
+fn s3Server(app: S3App) -> Result<Server<S3App>, RouteError> {
+    var limits = Limits.defaults();
+    // A 5 GiB object, plus aws-chunked framing.
+    limits.maxBodyBytes = 6442450944;
+    var server = Server<S3App>.create(app, limits)?;
+    server.router().get("/*path", s3Handler()?)?;
+    server.router().put("/*path", s3Handler()?)?;
+    server.router().post("/*path", s3Handler()?)?;
+    server.router().delete("/*path", s3Handler()?)?;
+    return Ok(server);
+}
+
+async fn serveOn(server: Server<S3App>, port: u16) -> Result<ServerReport, NetError> {
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = Listener.bindWith(SocketAddresses.v4Loopback(port), options)?;
+    let drain = Drain.create()?;
+    match (await AsyncConsole.writeError("cosmostore: serving S3 on 127.0.0.1\n")) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    return await server.run(listener, PlainAcceptor {}, ConnectionLimits.defaults(), drain);
+}
+
+/// `cosmostore serve`: returns the exit status.
+fn serve() -> i32 {
+    let dir = Process.argument(2) ?? "";
+    let portText = Process.argument(3) ?? "";
+    let credentialsPath = Process.argument(4) ?? "";
+    if (dir.length == 0 || credentialsPath.length == 0) { usage(); }
+    let port = match (portText.parseInt<u16>()) {
+        Some(p) => p,
+        null => { usage(); }
+    };
+    let credentials = match (readCredentials(credentialsPath)) {
+        Ok(c) => c,
+        Err(message) => { die(message); }
+    };
+    let store = match (ObjectStore.open(dir, StoreConfig.defaults())) {
+        Ok(s) => s,
+        Err(e) => { die(describe(e)); }
+    };
+    let locked = match (AsyncMutex<ObjectStore>.create(store)) {
+        Ok(m) => m,
+        Err(_) => { die("out of memory"); }
+    };
+    let app = S3App { store: locked, credentials: credentials, requests: AtomicU64.create(0) };
+    let server = match (s3Server(app)) {
+        Ok(s) => s,
+        Err(_) => { die("cannot build the routes"); }
+    };
+    match (Async.run(serveOn(server, port))) {
+        Ok(_) => { return 0; }
+        Err(e) => {
+            Console.writeErrorLine(NetErrors.describe(e));
+            return 1;
+        }
+    }
+}

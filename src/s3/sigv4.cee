@@ -1,0 +1,327 @@
+// AWS Signature Version 4, header form (ADR-0008 §5-6): the canonical request, the signing key, the seed signature,
+// and the chained signatures of aws-chunked bodies and their trailers.
+
+/// One request field, its name lowercased.
+struct HeaderPair {
+    name: Vector<u8>;
+    value: Vector<u8>;
+}
+
+/// The value of `name` (lowercase); several fields of that name are joined with `,`, as SigV4 does.
+fn headerValue(headers: Slice<HeaderPair>, name: StringView, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    var found = false;
+    for (i in 0..headers.length) {
+        if (headers[i].name.view() != name.bytes()) { continue; }
+        if (found) { out.push(',')?; }
+        appendCollapsed(out, trimSpaces(headers[i].value.view()))?;
+        found = true;
+    }
+    return Ok(found);
+}
+
+/// Appends `bytes` with each run of spaces collapsed to one.
+fn appendCollapsed(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    var lastSpace = false;
+    for (i in 0..bytes.length) {
+        let c = bytes[i];
+        if (c == ' ') {
+            if (lastSpace) { continue; }
+            lastSpace = true;
+        } else {
+            lastSpace = false;
+        }
+        out.push(c)?;
+    }
+    return Ok();
+}
+
+/// The parts of an `Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=..., Signature=...` value.
+struct AuthHeader {
+    accessKey: Vector<u8>;
+    /// `date/region/service/aws4_request`.
+    scope: Vector<u8>;
+    date: Vector<u8>;
+    region: Vector<u8>;
+    service: Vector<u8>;
+    signedHeaders: Vector<u8>;
+    signature: Vector<u8>;
+}
+
+/// Why a request is not authenticated.
+enum AuthFault {
+    /// No Authorization header: anonymous (AccessDenied).
+    Missing,
+    /// An Authorization header SigV4 cannot read (AuthorizationHeaderMalformed).
+    Malformed,
+    /// An unknown access key (InvalidAccessKeyId).
+    UnknownKey,
+    /// The signature differs (SignatureDoesNotMatch).
+    Mismatch,
+    /// x-amz-date too far from the server's clock (RequestTimeTooSkewed).
+    Skewed,
+    @from OutOfMemory(AllocError),
+}
+
+/// Splits `text` at the first `sep`: the part after it, or null.
+fn afterFirst(text: Slice<u8>, sep: u8) -> usize? {
+    for (i in 0..text.length) {
+        if (text[i] == sep) { return i; }
+    }
+    return null;
+}
+
+/// The end of the piece of `text` that starts at `at` and ends before the next `sep` (or at the end).
+fn pieceEnd(text: Slice<u8>, at: usize, sep: u8) -> usize {
+    var i = at;
+    while (i < text.length && text[i] != sep) { i += 1; }
+    return i;
+}
+
+fn parseAuthorization(value: Slice<u8>) -> Result<AuthHeader, AuthFault> {
+    let algorithm = "AWS4-HMAC-SHA256 ".bytes();
+    if (value.length < algorithm.length || value[0..algorithm.length] != algorithm) { return Err(AuthFault.Malformed); }
+    var auth = AuthHeader {
+        accessKey: Vector<u8>.create(),
+        scope: Vector<u8>.create(),
+        date: Vector<u8>.create(),
+        region: Vector<u8>.create(),
+        service: Vector<u8>.create(),
+        signedHeaders: Vector<u8>.create(),
+        signature: Vector<u8>.create(),
+    };
+    var at = algorithm.length;
+    while (at < value.length) {
+        let end = pieceEnd(value, at, ',');
+        let part = trimSpaces(value[at..end]);
+        at = end + 1;
+        let eq = match (afterFirst(part, '=')) {
+            Some(e) => e,
+            null => { return Err(AuthFault.Malformed); }
+        };
+        let name = part[0..eq];
+        let v = part[eq + 1..];
+        if (name == "Credential".bytes()) {
+            // AKID/20130524/us-east-1/s3/aws4_request
+            let slash = afterFirst(v, '/') ?? v.length;
+            if (slash == v.length) { return Err(AuthFault.Malformed); }
+            auth.accessKey.extend(v[0..slash])?;
+            auth.scope.extend(v[slash + 1..])?;
+        } else if (name == "SignedHeaders".bytes()) {
+            auth.signedHeaders.extend(v)?;
+        } else if (name == "Signature".bytes()) {
+            auth.signature.extend(v)?;
+        }
+    }
+    // The scope: date/region/service/aws4_request.
+    let scope = auth.scope.view();
+    let a = afterFirst(scope, '/') ?? scope.length;
+    if (a == scope.length) { return Err(AuthFault.Malformed); }
+    let afterDate = scope[a + 1..];
+    let b = afterFirst(afterDate, '/') ?? afterDate.length;
+    if (b == afterDate.length) { return Err(AuthFault.Malformed); }
+    let afterRegion = afterDate[b + 1..];
+    let c = afterFirst(afterRegion, '/') ?? afterRegion.length;
+    if (c == afterRegion.length || afterRegion[c + 1..] != "aws4_request".bytes()) { return Err(AuthFault.Malformed); }
+    auth.date.extend(scope[0..a])?;
+    auth.region.extend(afterDate[0..b])?;
+    auth.service.extend(afterRegion[0..c])?;
+    if (auth.accessKey.length == 0 || auth.signedHeaders.length == 0 || auth.signature.length != 64 ||
+        auth.date.length != 8) {
+        return Err(AuthFault.Malformed);
+    }
+    return Ok(auth);
+}
+
+/// One query parameter, URI-encoded as SigV4 wants it.
+struct QueryParam {
+    name: Vector<u8>;
+    value: Vector<u8>;
+}
+
+/// The query's parameters, each decoded and encoded again the SigV4 way, sorted by name and then value.
+fn canonicalQuery(raw: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var params = Vector<QueryParam>.create();
+    var at: usize = 0;
+    while (at < raw.length) {
+        let end = pieceEnd(raw, at, '&');
+        let part = raw[at..end];
+        at = end + 1;
+        if (part.length == 0) { continue; }
+        let eq = afterFirst(part, '=') ?? part.length;
+        var p = QueryParam { name: Vector<u8>.create(), value: Vector<u8>.create() };
+        var decoded = Vector<u8>.create();
+        if (!percentDecodeInto(mut decoded, part[0..eq], false)?) {
+            decoded.clear();
+            decoded.extend(part[0..eq])?;
+        }
+        appendUriEncoded(mut p.name, decoded.view(), false)?;
+        decoded.clear();
+        let v = if (eq < part.length) part[eq + 1..] else part[0..0];
+        if (!percentDecodeInto(mut decoded, v, false)?) {
+            decoded.clear();
+            decoded.extend(v)?;
+        }
+        appendUriEncoded(mut p.value, decoded.view(), false)?;
+        params.push(p)?;
+    }
+    params.viewMut().sortBy((a, b) => {
+        let byName = compareBytes(a.name.view(), b.name.view());
+        return if (byName != 0) byName else compareBytes(a.value.view(), b.value.view());
+    });
+    for (i in 0..params.length) {
+        if (i > 0) { out.push('&')?; }
+        out.extend(params[i].name.view())?;
+        out.push('=')?;
+        out.extend(params[i].value.view())?;
+    }
+    return Ok();
+}
+
+/// The canonical request (SigV4 task 1). `path` is the path as sent: S3 does not normalize or encode it again.
+fn canonicalRequest(
+    method: Slice<u8>,
+    path: Slice<u8>,
+    rawQuery: Slice<u8>,
+    headers: Slice<HeaderPair>,
+    signedHeaders: Slice<u8>,
+    payloadHash: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    out.extend(method)?;
+    out.push('\n')?;
+    out.extend(if (path.length == 0) "/".bytes() else path)?;
+    out.push('\n')?;
+    canonicalQuery(rawQuery, out)?;
+    out.push('\n')?;
+    var at: usize = 0;
+    var name = String.create();
+    while (at < signedHeaders.length) {
+        let end = pieceEnd(signedHeaders, at, ';');
+        let one = signedHeaders[at..end];
+        at = end + 1;
+        name.clear();
+        match (StringView.fromUtf8(one)) {
+            Some(t) => { name.append(t)?; }
+            null => { return Ok(false); }
+        }
+        out.extend(one)?;
+        out.push(':')?;
+        if (!headerValue(headers, name.view(), out)?) { return Ok(false); }
+        out.push('\n')?;
+    }
+    out.push('\n')?;
+    out.extend(signedHeaders)?;
+    out.push('\n')?;
+    out.extend(payloadHash)?;
+    return Ok(true);
+}
+
+/// The signing key: HMAC chain over the date, region, service and "aws4_request".
+fn signingKey(
+    secret: Slice<u8>,
+    date: Slice<u8>,
+    region: Slice<u8>,
+    service: Slice<u8>,
+) -> Result<[u8; 32], AllocError> {
+    var k = Vector<u8>.create();
+    k.extend("AWS4".bytes())?;
+    k.extend(secret)?;
+    let kDate = HmacSha256.of(k.view(), date);
+    let kRegion = HmacSha256.of(kDate[..], region);
+    let kService = HmacSha256.of(kRegion[..], service);
+    return Ok(HmacSha256.of(kService[..], "aws4_request".bytes()));
+}
+
+/// The hex signature of a string to sign made of `kind`, the date, the scope, and `lines`.
+fn signLines(
+    key: borrow [u8; 32],
+    kind: StringView,
+    amzDate: Slice<u8>,
+    scope: Slice<u8>,
+    lines: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    var sts = Vector<u8>.create();
+    sts.extend(kind.bytes())?;
+    sts.push('\n')?;
+    sts.extend(amzDate)?;
+    sts.push('\n')?;
+    sts.extend(scope)?;
+    sts.push('\n')?;
+    sts.extend(lines)?;
+    let mac = HmacSha256.of(key[..], sts.view());
+    out.clear();
+    appendHexBytes(out, mac[..])?;
+    return Ok();
+}
+
+/// The seed signature of a request: its canonical request hashed and signed.
+fn seedSignature(
+    key: borrow [u8; 32],
+    amzDate: Slice<u8>,
+    scope: Slice<u8>,
+    canonical: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let hash = Sha256.of(canonical);
+    var line = Vector<u8>.create();
+    appendHexBytes(mut line, hash[..])?;
+    return signLines(key, "AWS4-HMAC-SHA256", amzDate, scope, line.view(), out);
+}
+
+/// Hex SHA-256 of nothing.
+const EMPTY_SHA256: StringView = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// What signs an aws-chunked body: each chunk's signature chains from the one before (the seed first).
+struct ChunkSigner {
+    key: [u8; 32];
+    amzDate: Vector<u8>;
+    scope: Vector<u8>;
+    previous: Vector<u8>;
+
+    /// The signature chunk data with SHA-256 `dataHash` must have, which becomes the previous one.
+    fn next(borrow mut this, dataHash: [u8; 32], out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        var lines = Vector<u8>.create();
+        lines.extend(this.previous.view())?;
+        lines.push('\n')?;
+        lines.extend(EMPTY_SHA256.bytes())?;
+        lines.push('\n')?;
+        appendHexBytes(mut lines, dataHash[..])?;
+        signLines(
+            borrow this.key,
+            "AWS4-HMAC-SHA256-PAYLOAD",
+            this.amzDate.view(),
+            this.scope.view(),
+            lines.view(),
+            out,
+        )?;
+        this.previous.clear();
+        this.previous.extend(out.view())?;
+        return Ok();
+    }
+
+    /// The signature of the trailer fields (each `name:value\n`).
+    fn trailer(borrow mut this, trailerText: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        var lines = Vector<u8>.create();
+        lines.extend(this.previous.view())?;
+        lines.push('\n')?;
+        let hash = Sha256.of(trailerText);
+        appendHexBytes(mut lines, hash[..])?;
+        return signLines(
+            borrow this.key,
+            "AWS4-HMAC-SHA256-TRAILER",
+            this.amzDate.view(),
+            this.scope.view(),
+            lines.view(),
+            out,
+        );
+    }
+}
+
+/// Constant-time equality of two signatures.
+fn sameSignature(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) { return false; }
+    var diff: u8 = 0;
+    for (i in 0..a.length) { diff = diff | (a[i] ^ b[i]); }
+    return diff == 0;
+}

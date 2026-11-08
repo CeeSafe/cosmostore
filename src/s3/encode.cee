@@ -1,0 +1,361 @@
+import web_http;
+
+// Text encodings the S3 layer needs (ADR-0008): lowercase hex, S3's URI encoding, XML escaping, base64, and the
+// three time formats (x-amz-date, ISO 8601 with milliseconds, and the HTTP date).
+
+const HEX_DIGITS: StringView = "0123456789abcdef";
+const HEX_UPPER: StringView = "0123456789ABCDEF";
+
+/// Appends `bytes` as lowercase hex.
+fn appendHexBytes(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    let digits = HEX_DIGITS.bytes();
+    for (i in 0..bytes.length) {
+        out.push(digits[(bytes[i] >> 4) as usize])?;
+        out.push(digits[(bytes[i] & 15) as usize])?;
+    }
+    return Ok();
+}
+
+/// The value of one hex digit, either case.
+fn hexValue(c: u8) -> u8? {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return null;
+}
+
+/// Whether S3's URI encoding leaves `c` as it is (RFC 3986's unreserved set).
+fn isUnreserved(c: u8) -> bool =>
+    (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+        c == '~';
+
+/// Appends `bytes` URI-encoded as SigV4 and S3 listings do: every byte but the unreserved ones as `%XX`, uppercase;
+/// `/` too unless `keepSlash`.
+fn appendUriEncoded(out: borrow mut Vector<u8>, bytes: Slice<u8>, keepSlash: bool) -> Result<void, AllocError> {
+    let digits = HEX_UPPER.bytes();
+    for (i in 0..bytes.length) {
+        let c = bytes[i];
+        if (isUnreserved(c) || (keepSlash && c == '/')) {
+            out.push(c)?;
+        } else {
+            out.push('%')?;
+            out.push(digits[(c >> 4) as usize])?;
+            out.push(digits[(c & 15) as usize])?;
+        }
+    }
+    return Ok();
+}
+
+/// Decodes `%XX` escapes (and, in a query, `+` as a space); false for a malformed escape.
+fn percentDecodeInto(out: borrow mut Vector<u8>, bytes: Slice<u8>, plusIsSpace: bool) -> Result<bool, AllocError> {
+    var i: usize = 0;
+    while (i < bytes.length) {
+        let c = bytes[i];
+        if (c == '%') {
+            if (i + 2 >= bytes.length) { return Ok(false); }
+            let hi = hexValue(bytes[i + 1]);
+            let lo = hexValue(bytes[i + 2]);
+            if (hi.isNull() || lo.isNull()) { return Ok(false); }
+            out.push(((hi ?? 0) << 4) | (lo ?? 0))?;
+            i += 3;
+            continue;
+        }
+        out.push(if (plusIsSpace && c == '+') ' ' as u8 else c)?;
+        i += 1;
+    }
+    return Ok(true);
+}
+
+/// Appends `bytes` with XML's five special characters escaped.
+fn appendXmlEscaped(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    for (i in 0..bytes.length) {
+        let c = bytes[i];
+        if (c == '&') {
+            out.extend("&amp;".bytes())?;
+        } else if (c == '<') {
+            out.extend("&lt;".bytes())?;
+        } else if (c == '>') {
+            out.extend("&gt;".bytes())?;
+        } else if (c == '"') {
+            out.extend("&quot;".bytes())?;
+        } else if (c == '\'') {
+            out.extend("&apos;".bytes())?;
+        } else if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') {
+            // XML 1.0 cannot carry other control characters; S3 escapes them as character references.
+            out.extend("&#".bytes())?;
+            appendDecimal(out, c as u64)?;
+            out.push(';')?;
+        } else {
+            out.push(c)?;
+        }
+    }
+    return Ok();
+}
+
+/// Appends `v` in decimal.
+fn appendDecimal(out: borrow mut Vector<u8>, v: u64) -> Result<void, AllocError> {
+    var digits = [0u8; 20];
+    var n = v;
+    var i: usize = 20;
+    while (true) {
+        i -= 1;
+        digits[i] = truncate<u8>(48 + n % 10);
+        n /= 10;
+        if (n == 0) { break; }
+    }
+    out.extend(digits[i..20])?;
+    return Ok();
+}
+
+/// Appends `v` in decimal, at least `width` digits.
+fn appendPadded(out: borrow mut Vector<u8>, v: u64, width: usize) -> Result<void, AllocError> {
+    var digits = 1usize;
+    var t = v;
+    while (t >= 10) {
+        t /= 10;
+        digits += 1;
+    }
+    while (digits < width) {
+        out.push('0')?;
+        digits += 1;
+    }
+    return appendDecimal(out, v);
+}
+
+/// An unsigned decimal of at most 19 digits; null for anything else.
+fn parseDecimal(bytes: Slice<u8>) -> u64? {
+    if (bytes.length == 0 || bytes.length > 19) { return null; }
+    var v: u64 = 0;
+    for (i in 0..bytes.length) {
+        let c = bytes[i];
+        if (c < '0' || c > '9') { return null; }
+        v = v * 10 + (c - '0') as u64;
+    }
+    return v;
+}
+
+const BASE64: StringView = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Appends `bytes` in base64 with padding.
+fn appendBase64(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    let table = BASE64.bytes();
+    var i: usize = 0;
+    while (i + 3 <= bytes.length) {
+        let v = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+        out.push(table[((v >> 18) & 63) as usize])?;
+        out.push(table[((v >> 12) & 63) as usize])?;
+        out.push(table[((v >> 6) & 63) as usize])?;
+        out.push(table[(v & 63) as usize])?;
+        i += 3;
+    }
+    let left = bytes.length - i;
+    if (left == 1) {
+        let v = (bytes[i] as u32) << 16;
+        out.push(table[((v >> 18) & 63) as usize])?;
+        out.push(table[((v >> 12) & 63) as usize])?;
+        out.extend("==".bytes())?;
+    } else if (left == 2) {
+        let v = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(table[((v >> 18) & 63) as usize])?;
+        out.push(table[((v >> 12) & 63) as usize])?;
+        out.push(table[((v >> 6) & 63) as usize])?;
+        out.push('=')?;
+    }
+    return Ok();
+}
+
+fn base64Value(c: u8) -> u32? {
+    if (c >= 'A' && c <= 'Z') { return (c - 'A') as u32; }
+    if (c >= 'a' && c <= 'z') { return (c - 'a') as u32 + 26; }
+    if (c >= '0' && c <= '9') { return (c - '0') as u32 + 52; }
+    if (c == '+') { return 62; }
+    if (c == '/') { return 63; }
+    return null;
+}
+
+/// Decodes padded base64 into `out`; false if `text` is not that.
+fn decodeBase64(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    if (text.length % 4 != 0) { return Ok(false); }
+    var i: usize = 0;
+    while (i < text.length) {
+        let last = i + 4 == text.length;
+        var v: u32 = 0;
+        var pad: usize = 0;
+        for (k in 0..4) {
+            let c = text[i + k];
+            if (c == '=' && last && k >= 2) {
+                pad += 1;
+                v = v << 6;
+                continue;
+            }
+            if (pad > 0) { return Ok(false); }
+            match (base64Value(c)) {
+                Some(d) => { v = (v << 6) | d; }
+                null => { return Ok(false); }
+            }
+        }
+        out.push(truncate<u8>(v >> 16))?;
+        if (pad < 2) { out.push(truncate<u8>(v >> 8))?; }
+        if (pad < 1) { out.push(truncate<u8>(v))?; }
+        i += 4;
+    }
+    return Ok(true);
+}
+
+/// A civil date and time in UTC.
+struct Civil {
+    year: i64;
+    month: u32;
+    day: u32;
+    hour: u32;
+    minute: u32;
+    second: u32;
+}
+
+/// The civil date of `seconds` since the Unix epoch (Howard Hinnant's days-from-civil, inverted).
+fn civilOf(seconds: i64) -> Civil {
+    var days = seconds / 86400;
+    var rest = seconds % 86400;
+    if (rest < 0) {
+        rest += 86400;
+        days -= 1;
+    }
+    let z = days + 719468;
+    let era = (if (z >= 0) z else z - 146096) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if (mp < 10) mp + 3 else mp - 9;
+    let y = yoe + era * 400 + (if (m <= 2) 1i64 else 0i64);
+    return Civil {
+        year: y,
+        month: truncate<u32>(m),
+        day: truncate<u32>(d),
+        hour: truncate<u32>(rest / 3600),
+        minute: truncate<u32>(rest % 3600 / 60),
+        second: truncate<u32>(rest % 60),
+    };
+}
+
+/// Seconds since the Unix epoch of a civil time; null if a field is out of range.
+fn secondsOf(c: borrow Civil) -> i64? {
+    if (c.month < 1 || c.month > 12 || c.day < 1 || c.day > 31 || c.hour > 23 || c.minute > 59 || c.second > 60) {
+        return null;
+    }
+    let y = if (c.month <= 2) c.year - 1 else c.year;
+    let era = (if (y >= 0) y else y - 399) / 400;
+    let yoe = y - era * 400;
+    let m = c.month as i64;
+    let mp = if (m > 2) m - 3 else m + 9;
+    let doy = (153 * mp + 2) / 5 + c.day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    return days * 86400 + (c.hour as i64) * 3600 + (c.minute as i64) * 60 + c.second as i64;
+}
+
+/// `YYYYMMDDTHHMMSSZ`, SigV4's x-amz-date.
+fn parseAmzDate(text: Slice<u8>) -> i64? {
+    if (text.length != 16 || text[8] != 'T' || text[15] != 'Z') { return null; }
+    let year = parseDecimal(text[0..4]);
+    let month = parseDecimal(text[4..6]);
+    let day = parseDecimal(text[6..8]);
+    let hour = parseDecimal(text[9..11]);
+    let minute = parseDecimal(text[11..13]);
+    let second = parseDecimal(text[13..15]);
+    if (year.isNull() || month.isNull() || day.isNull() || hour.isNull() || minute.isNull() || second.isNull()) {
+        return null;
+    }
+    let c = Civil {
+        year: truncate<i64>(year ?? 0),
+        month: truncate<u32>(month ?? 0),
+        day: truncate<u32>(day ?? 0),
+        hour: truncate<u32>(hour ?? 0),
+        minute: truncate<u32>(minute ?? 0),
+        second: truncate<u32>(second ?? 0),
+    };
+    return secondsOf(c);
+}
+
+/// `2009-10-12T17:50:30.000Z`, S3's timestamp in XML.
+fn appendIso8601(out: borrow mut Vector<u8>, millis: i64) -> Result<void, AllocError> {
+    let seconds = if (millis >= 0) millis / 1000 else (millis - 999) / 1000;
+    let ms = millis - seconds * 1000;
+    let c = civilOf(seconds);
+    appendPadded(out, truncate<u64>(c.year), 4)?;
+    out.push('-')?;
+    appendPadded(out, c.month as u64, 2)?;
+    out.push('-')?;
+    appendPadded(out, c.day as u64, 2)?;
+    out.push('T')?;
+    appendPadded(out, c.hour as u64, 2)?;
+    out.push(':')?;
+    appendPadded(out, c.minute as u64, 2)?;
+    out.push(':')?;
+    appendPadded(out, c.second as u64, 2)?;
+    out.push('.')?;
+    appendPadded(out, truncate<u64>(ms), 3)?;
+    out.push('Z')?;
+    return Ok();
+}
+
+const MONTHS: StringView = "JanFebMarAprMayJunJulAugSepOctNovDec";
+
+/// The HTTP date (IMF-fixdate) of `seconds`: `Sun, 06 Nov 1994 08:49:37 GMT`.
+fn appendHttpDate(out: borrow mut Vector<u8>, seconds: i64) -> Result<void, AllocError> {
+    var text = [0u8; 29];
+    HttpDate.format(if (seconds > 0) truncate<u64>(seconds) else 0, mut text);
+    out.extend(text[..])?;
+    return Ok();
+}
+
+/// Parses an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`); null for any other form.
+fn parseHttpDate(text: Slice<u8>) -> i64? {
+    if (text.length != 29 || text[3] != ',' || text[4] != ' ' || text[7] != ' ' || text[11] != ' ' ||
+        text[16] != ' ' || text[19] != ':' || text[22] != ':' || text[25] != ' ' || text[26..29] != "GMT".bytes()) {
+        return null;
+    }
+    let names = MONTHS.bytes();
+    var month: u32 = 0;
+    for (m in 0..12) {
+        if (names[m * 3..m * 3 + 3] == text[8..11]) { month = truncate<u32>(m) + 1; }
+    }
+    let day = parseDecimal(text[5..7]);
+    let year = parseDecimal(text[12..16]);
+    let hour = parseDecimal(text[17..19]);
+    let minute = parseDecimal(text[20..22]);
+    let second = parseDecimal(text[23..25]);
+    if (month == 0 || day.isNull() || year.isNull() || hour.isNull() || minute.isNull() || second.isNull()) {
+        return null;
+    }
+    let c = Civil {
+        year: truncate<i64>(year ?? 0),
+        month: month,
+        day: truncate<u32>(day ?? 0),
+        hour: truncate<u32>(hour ?? 0),
+        minute: truncate<u32>(minute ?? 0),
+        second: truncate<u32>(second ?? 0),
+    };
+    return secondsOf(c);
+}
+
+/// ASCII case-insensitive equality.
+fn equalsIgnoreCase(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) { return false; }
+    for (i in 0..a.length) {
+        if (lowerAscii(a[i]) != lowerAscii(b[i])) { return false; }
+    }
+    return true;
+}
+
+fn lowerAscii(c: u8) -> u8 => if (c >= 'A' && c <= 'Z') c + 32 else c;
+
+/// `bytes` without leading and trailing spaces and tabs.
+fn trimSpaces(bytes: Slice<u8>) -> Slice<u8> {
+    var a: usize = 0;
+    var b = bytes.length;
+    while (a < b && (bytes[a] == ' ' || bytes[a] == '\t')) { a += 1; }
+    while (b > a && (bytes[b - 1] == ' ' || bytes[b - 1] == '\t')) { b -= 1; }
+    return bytes[a..b];
+}

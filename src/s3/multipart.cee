@@ -1,0 +1,512 @@
+// Multipart upload over S3 (ADR-0009): Create, UploadPart, Complete, Abort, ListParts and ListMultipartUploads.
+// A part's body takes PutObject's path (`receiveBody`): it streams without the store's lock, and only its commit
+// takes the lock.
+import web_core;
+import web_http;
+import web_server;
+
+/// The largest CompleteMultipartUpload body read: 10,000 parts at about 100 bytes each.
+const MAX_COMPLETE_BODY: usize = 1048576;
+
+/// An upload id as S3 shows it: 32 lowercase hex digits.
+fn appendUploadId(out: borrow mut Vector<u8>, id: borrow [u8; 16]) -> Result<void, AllocError> =>
+    appendHexBytes(out, id[..]);
+
+/// The `uploadId` parameter; an id that cannot be one of ours is NoSuchUpload, as S3 answers.
+fn uploadIdOf(req: borrow S3Request) -> Result<[u8; 16], S3Fail> {
+    let text = paramOf(req, "uploadId") ?? "".bytes();
+    return match (parseUploadId(text)) {
+        Some(id) => Ok(id),
+        null => Err(S3Fail.Code(S3Code.NoSuchUpload)),
+    };
+}
+
+fn parseUploadId(text: Slice<u8>) -> [u8; 16]? {
+    if (text.length != 32) { return null; }
+    var id = [0u8; 16];
+    for (i in 0..16) {
+        let hi = hexValue(text[i * 2]);
+        let lo = hexValue(text[i * 2 + 1]);
+        if (hi.isNull() || lo.isNull()) { return null; }
+        id[i] = ((hi ?? 0) << 4) | (lo ?? 0);
+    }
+    return id;
+}
+
+/// The `partNumber` parameter: 1 to 10,000.
+fn partNumberOf(req: borrow S3Request) -> Result<u32, S3Fail> {
+    match (parseDecimal(paramOf(req, "partNumber") ?? "".bytes())) {
+        Some(n) => {
+            if (n >= 1 && n <= MAX_PART_NUMBER as u64) { return Ok(truncate<u32>(n)); }
+        }
+        null => {}
+    }
+    return Err(S3Fail.Code(S3Code.InvalidArgument));
+}
+
+fn xmlHead(out: borrow mut Vector<u8>, element: StringView) -> Result<void, AllocError> {
+    out.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<".bytes())?;
+    out.extend(element.bytes())?;
+    out.extend(" xmlns=\"".bytes())?;
+    out.extend(S3_XMLNS.bytes())?;
+    out.extend("\">".bytes())?;
+    return Ok();
+}
+
+fn xmlDecimal(out: borrow mut Vector<u8>, name: StringView, v: u64) -> Result<void, AllocError> {
+    var text = Vector<u8>.create();
+    appendDecimal(mut text, v)?;
+    return xmlElement(out, name, text.view(), false);
+}
+
+fn xmlBool(out: borrow mut Vector<u8>, name: StringView, v: bool) -> Result<void, AllocError> =>
+    xmlElement(out, name, if (v) "true".bytes() else "false".bytes(), false);
+
+/// `<ETag>"hex"</ETag>`, escaped.
+fn xmlEtag(out: borrow mut Vector<u8>, md5: borrow [u8; 16], parts: u32) -> Result<void, AllocError> {
+    var etag = Vector<u8>.create();
+    appendEtag(mut etag, md5, parts)?;
+    return xmlElement(out, "ETag", etag.view(), false);
+}
+
+const OWNER_XML: StringView = "<ID>cosmostore</ID><DisplayName>cosmostore</DisplayName>";
+
+// ---- CreateMultipartUpload ----
+
+async fn createMultipartUpload(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    var contentType = String.create();
+    contentTypeOf(req, mut contentType)?;
+    let bucket = req.bucket.view();
+    let key = req.key.view();
+    let ct = contentType.view();
+    let id = await storeCreateUpload(app, bucket, key, ct)?;
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "InitiateMultipartUploadResult")?;
+    xmlElement(mut body, "Bucket", bucket.bytes(), false)?;
+    xmlElement(mut body, "Key", key.bytes(), false)?;
+    var text = Vector<u8>.create();
+    appendUploadId(mut text, borrow id)?;
+    xmlElement(mut body, "UploadId", text.view(), false)?;
+    body.extend("</InitiateMultipartUploadResult>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn storeCreateUpload(
+    app: borrow S3App,
+    bucket: StringView,
+    key: StringView,
+    contentType: StringView,
+) -> Result<[u8; 16], S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => store.createUpload(bucket, key, contentType))) {
+        Ok(id) => Ok(id),
+        Err(e) => Err(storeFail(e, key.length)),
+    };
+}
+
+// ---- UploadPart ----
+
+async fn uploadPart(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let number = partNumberOf(req)?;
+    let id = uploadIdOf(req)?;
+    var spec = bodySpec(req, borrow auth)?;
+    let writer = await startPart(app, req.bucket.view(), req.key.view(), id, number, spec.size)?;
+    let body = await receiveBody(app, auth, mut spec, writer, exchange)?;
+    let md5 = await commitPart(app, req.bucket.view(), req.key.view(), id, number, borrow body.finished)?;
+    return await sendStored(exchange, borrow md5, 0, borrow body);
+}
+
+/// Under the lock: the upload exists, the part's declared size is admitted, and a part writer for it.
+async fn startPart(
+    app: borrow S3App,
+    bucket: StringView,
+    key: StringView,
+    id: [u8; 16],
+    number: u32,
+    size: u64,
+) -> Result<ObjectWriter, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => beginPart(store, bucket, key, id, number, size))) {
+        Ok(w) => Ok(w),
+        Err(e) => Err(storeFail(e, key.length)),
+    };
+}
+
+fn beginPart(
+    store: borrow ObjectStore,
+    bucket: StringView,
+    key: StringView,
+    id: [u8; 16],
+    number: u32,
+    size: u64,
+) -> Result<ObjectWriter, StoreError> {
+    store.checkPart(bucket, key, id, number, size)?;
+    return store.newPartWriter();
+}
+
+async fn commitPart(
+    app: borrow S3App,
+    bucket: StringView,
+    key: StringView,
+    id: [u8; 16],
+    number: u32,
+    finished: borrow FinishedObject,
+) -> Result<[u8; 16], S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => store.putPart(bucket, key, id, number, finished))) {
+        Ok(m) => Ok(m),
+        Err(e) => Err(storeFail(e, key.length)),
+    };
+}
+
+// ---- CompleteMultipartUpload ----
+
+/// Reads a small request body whole, decoding aws-chunked and checking a signed payload's SHA-256.
+async fn readSmallBody(
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+    limit: usize,
+) -> Result<Vector<u8>, S3Fail> {
+    let chunked = match (auth.payload) {
+        PayloadMode.Chunked => true,
+        _ => false,
+    };
+    let expectedSha: [u8; 32]? = match (auth.payload) {
+        PayloadMode.Hashed(h) => Some(h),
+        _ => null,
+    };
+    var decoder = ChunkDecoder.create(auth.signer);
+    var buf = Vector<u8>.create();
+    buf.resize(65536, 0)?;
+    var body = Vector<u8>.create();
+    while (true) {
+        let n = await exchange.read(mut buf.viewMut()[..])?;
+        if (n == 0) { break; }
+        if (chunked) {
+            match (decoder.feed(buf.view()[0..n], mut body)) {
+                Ok() => {}
+                Err(ChunkFault.BadSignature) => { return Err(S3Fail.Code(S3Code.SignatureDoesNotMatch)); }
+                Err(ChunkFault.Malformed) => { return Err(S3Fail.Code(S3Code.IncompleteBody)); }
+                Err(ChunkFault.OutOfMemory(_)) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+            }
+        } else {
+            body.extend(buf.view()[0..n])?;
+        }
+        if (body.length > limit) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    }
+    if (chunked && !decoder.isDone()) { return Err(S3Fail.Code(S3Code.IncompleteBody)); }
+    match (expectedSha) {
+        Some(expected) => {
+            if (Sha256.of(body.view())[..] != expected[..]) {
+                return Err(S3Fail.Code(S3Code.XAmzContentSHA256Mismatch));
+            }
+        }
+        null => {}
+    }
+    return Ok(body);
+}
+
+/// The text of the first `<name>...</name>` in `xml`, trimmed.
+fn elementText<region a>(xml: Slice<a, u8>, name: StringView) -> Slice<a, u8>? {
+    var open = Vector<u8>.create();
+    var close = Vector<u8>.create();
+    open.push('<')!;
+    open.extend(name.bytes())!;
+    open.push('>')!;
+    close.extend("</".bytes())!;
+    close.extend(name.bytes())!;
+    close.push('>')!;
+    let start = match (findBytes(xml, open.view(), 0)) {
+        Some(at) => at + open.length,
+        null => { return null; }
+    };
+    return match (findBytes(xml, close.view(), start)) {
+        Some(end) => Some(trimSpaces(xml[start..end])),
+        null => null,
+    };
+}
+
+/// An ETag as XML carries it: `&quot;` (or `&#34;`) for the quotes.
+fn etagFromXml(text: Slice<u8>) -> Result<ParsedEtag?, AllocError> {
+    var plain = Vector<u8>.create();
+    var at: usize = 0;
+    while (at < text.length) {
+        if (startsWithBytes(text[at..], "&quot;".bytes())) {
+            plain.push('"')?;
+            at += 6;
+        } else if (startsWithBytes(text[at..], "&#34;".bytes())) {
+            plain.push('"')?;
+            at += 5;
+        } else {
+            plain.push(text[at])?;
+            at += 1;
+        }
+    }
+    return Ok(parseEtag(plain.view()));
+}
+
+/// The parts a CompleteMultipartUpload body names, in its order. Only `<Part>`, `<PartNumber>` and `<ETag>` are
+/// read; a part's checksum elements are ignored.
+fn parseCompleteBody(xml: Slice<u8>) -> Result<Vector<PartChoice>, S3Fail> {
+    var parts = Vector<PartChoice>.create();
+    var at: usize = 0;
+    while (true) {
+        let start = match (findBytes(xml, "<Part>".bytes(), at)) {
+            Some(s) => s + 6,
+            null => { break; }
+        };
+        let end = match (findBytes(xml, "</Part>".bytes(), start)) {
+            Some(e) => e,
+            null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        };
+        let inner = xml[start..end];
+        let number = match (parseDecimal(elementText(inner, "PartNumber") ?? "".bytes())) {
+            Some(n) => n,
+            null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        };
+        if (number < 1 || number > MAX_PART_NUMBER as u64) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        let etag = match (etagFromXml(elementText(inner, "ETag") ?? "".bytes())?) {
+            Some(e) => e,
+            null => { return Err(S3Fail.Code(S3Code.InvalidPart)); }
+        };
+        if (etag.parts != 0) { return Err(S3Fail.Code(S3Code.InvalidPart)); }
+        parts.push(PartChoice { number: truncate<u32>(number), md5: etag.md5 })?;
+        at = end + 7;
+    }
+    if (parts.length == 0 || findBytes(xml, "CompleteMultipartUpload".bytes(), 0).isNull()) {
+        return Err(S3Fail.Code(S3Code.MalformedXML));
+    }
+    return Ok(parts);
+}
+
+async fn completeMultipartUpload(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let id = uploadIdOf(req)?;
+    let xml = await readSmallBody(auth, exchange, MAX_COMPLETE_BODY)?;
+    let chosen = parseCompleteBody(xml.view())?;
+    let bucket = req.bucket.view();
+    let key = req.key.view();
+    let outcome = await storeComplete(app, bucket, key, id, chosen.view())?;
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "CompleteMultipartUploadResult")?;
+    var location = Vector<u8>.create();
+    location.push('/')?;
+    appendUriEncoded(mut location, bucket.bytes(), false)?;
+    location.push('/')?;
+    appendUriEncoded(mut location, key.bytes(), true)?;
+    xmlElement(mut body, "Location", location.view(), false)?;
+    xmlElement(mut body, "Bucket", bucket.bytes(), false)?;
+    xmlElement(mut body, "Key", key.bytes(), false)?;
+    xmlEtag(mut body, borrow outcome.md5, outcome.parts)?;
+    body.extend("</CompleteMultipartUploadResult>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn storeComplete(
+    app: borrow S3App,
+    bucket: StringView,
+    key: StringView,
+    id: [u8; 16],
+    parts: Slice<PartChoice>,
+) -> Result<PutOutcome, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => store.completeUpload(bucket, key, id, parts))) {
+        Ok(o) => Ok(o),
+        Err(e) => Err(storeFail(e, key.length)),
+    };
+}
+
+// ---- AbortMultipartUpload ----
+
+async fn abortMultipartUpload(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let id = uploadIdOf(req)?;
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let bucket = req.bucket.view();
+        let key = req.key.view();
+        match (await Async.blocking(() => store.abortUpload(bucket, key, id))) {
+            Ok() => {}
+            Err(e) => { return Err(storeFail(e, key.length)); }
+        }
+    }
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}
+
+// ---- ListParts ----
+
+/// A `max-*` parameter: at most 1000, as S3 caps it.
+fn maxParam(req: borrow S3Request, name: StringView) -> Result<usize, S3Fail> {
+    return match (paramOf(req, name)) {
+        Some(t) => match (parseDecimal(t)) {
+            Some(v) => Ok(if (v < 1000) v as usize else 1000),
+            null => Err(S3Fail.Code(S3Code.InvalidArgument)),
+        },
+        null => Ok(1000),
+    };
+}
+
+async fn listParts(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let id = uploadIdOf(req)?;
+    let maxParts = maxParam(req, "max-parts")?;
+    var after: u32 = 0;
+    match (paramOf(req, "part-number-marker")) {
+        Some(t) => {
+            match (parseDecimal(t)) {
+                Some(v) => { after = truncate<u32>(v.min(MAX_PART_NUMBER as u64)); }
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+        }
+        null => {}
+    }
+    let bucket = req.bucket.view();
+    let key = req.key.view();
+    let listing = await storeListParts(app, bucket, key, id, after, maxParts)?;
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "ListPartsResult")?;
+    xmlElement(mut body, "Bucket", bucket.bytes(), false)?;
+    xmlElement(mut body, "Key", key.bytes(), false)?;
+    var text = Vector<u8>.create();
+    appendUploadId(mut text, borrow id)?;
+    xmlElement(mut body, "UploadId", text.view(), false)?;
+    body.extend("<Initiator>".bytes())?;
+    body.extend(OWNER_XML.bytes())?;
+    body.extend("</Initiator><Owner>".bytes())?;
+    body.extend(OWNER_XML.bytes())?;
+    body.extend("</Owner><StorageClass>STANDARD</StorageClass>".bytes())?;
+    xmlDecimal(mut body, "PartNumberMarker", after as u64)?;
+    let n = listing.parts.length;
+    if (n > 0) { xmlDecimal(mut body, "NextPartNumberMarker", listing.parts[n - 1].number as u64)?; }
+    xmlDecimal(mut body, "MaxParts", maxParts as u64)?;
+    xmlBool(mut body, "IsTruncated", listing.truncated)?;
+    for (i in 0..n) {
+        let p = borrow listing.parts[i];
+        body.extend("<Part>".bytes())?;
+        xmlDecimal(mut body, "PartNumber", p.number as u64)?;
+        body.extend("<LastModified>".bytes())?;
+        appendIso8601(mut body, p.mtimeMillis)?;
+        body.extend("</LastModified>".bytes())?;
+        xmlEtag(mut body, borrow p.md5, 0)?;
+        xmlDecimal(mut body, "Size", p.size)?;
+        body.extend("</Part>".bytes())?;
+    }
+    body.extend("</ListPartsResult>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn storeListParts(
+    app: borrow S3App,
+    bucket: StringView,
+    key: StringView,
+    id: [u8; 16],
+    after: u32,
+    maxParts: usize,
+) -> Result<PartListing, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => store.listParts(bucket, key, id, after, maxParts))) {
+        Ok(l) => Ok(l),
+        Err(e) => Err(storeFail(e, key.length)),
+    };
+}
+
+// ---- ListMultipartUploads ----
+
+async fn listMultipartUploads(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    if (paramOf(req, "delimiter").isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    let urlEncoded = match (paramOf(req, "encoding-type")) {
+        Some(t) => {
+            if (t != "url".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            true
+        }
+        null => false,
+    };
+    let maxUploads = maxParam(req, "max-uploads")?;
+    let prefix = paramOf(req, "prefix") ?? "".bytes();
+    let keyMarker = paramOf(req, "key-marker") ?? "".bytes();
+    var idMarker: [u8; 16]? = null;
+    match (paramOf(req, "upload-id-marker")) {
+        Some(t) => {
+            // S3 ignores the id marker without a key marker.
+            if (keyMarker.length > 0) { idMarker = parseUploadId(t); }
+        }
+        null => {}
+    }
+    let bucket = req.bucket.view();
+    let listing = await storeListUploads(app, bucket, prefix, keyMarker, idMarker, maxUploads)?;
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "ListMultipartUploadsResult")?;
+    xmlElement(mut body, "Bucket", bucket.bytes(), false)?;
+    xmlElement(mut body, "KeyMarker", keyMarker, urlEncoded)?;
+    xmlElement(mut body, "UploadIdMarker", paramOf(req, "upload-id-marker") ?? "".bytes(), false)?;
+    let n = listing.uploads.length;
+    var text = Vector<u8>.create();
+    if (listing.truncated && n > 0) {
+        xmlElement(mut body, "NextKeyMarker", listing.uploads[n - 1].key.view(), urlEncoded)?;
+        appendUploadId(mut text, borrow listing.uploads[n - 1].id)?;
+        xmlElement(mut body, "NextUploadIdMarker", text.view(), false)?;
+    }
+    xmlElement(mut body, "Prefix", prefix, urlEncoded)?;
+    xmlDecimal(mut body, "MaxUploads", maxUploads as u64)?;
+    if (urlEncoded) { body.extend("<EncodingType>url</EncodingType>".bytes())?; }
+    xmlBool(mut body, "IsTruncated", listing.truncated)?;
+    for (i in 0..n) {
+        let u = borrow listing.uploads[i];
+        body.extend("<Upload>".bytes())?;
+        xmlElement(mut body, "Key", u.key.view(), urlEncoded)?;
+        text.clear();
+        appendUploadId(mut text, borrow u.id)?;
+        xmlElement(mut body, "UploadId", text.view(), false)?;
+        body.extend("<Initiator>".bytes())?;
+        body.extend(OWNER_XML.bytes())?;
+        body.extend("</Initiator><Owner>".bytes())?;
+        body.extend(OWNER_XML.bytes())?;
+        body.extend("</Owner><StorageClass>STANDARD</StorageClass><Initiated>".bytes())?;
+        appendIso8601(mut body, u.initiatedMillis)?;
+        body.extend("</Initiated></Upload>".bytes())?;
+    }
+    body.extend("</ListMultipartUploadsResult>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn storeListUploads(
+    app: borrow S3App,
+    bucket: StringView,
+    prefix: Slice<u8>,
+    keyMarker: Slice<u8>,
+    idMarker: [u8; 16]?,
+    maxUploads: usize,
+) -> Result<UploadListing, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => store.listUploads(bucket, prefix, keyMarker, idMarker, maxUploads))) {
+        Ok(l) => Ok(l),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}

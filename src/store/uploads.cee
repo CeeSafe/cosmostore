@@ -1,0 +1,384 @@
+// Multipart uploads (ADR-0009): their state, their records' meta, and how applying a record changes the state.
+// Recovery and live writes both apply them through `applyRecord`, as every other record.
+
+/// Part numbers are 1 to this (S3).
+const MAX_PART_NUMBER: u32 = 10000;
+
+/// An upload id as a map key.
+struct UploadKey {
+    id: [u8; 16];
+}
+
+impl HashKey<UploadKey> for UploadKey {
+    fn hash(borrow this, h: borrow mut Hasher) {
+        h.bytes(this.id[..]);
+    }
+
+    fn sameAs(borrow this, other: borrow UploadKey) -> bool => this.id[..] == other.id[..];
+}
+
+/// One stored part of an upload. Its bytes are always in extents (none for an empty part).
+struct UploadedPart {
+    number: u32;
+    size: u64;
+    md5: [u8; 16];
+    mtimeMillis: i64;
+    extents: Vector<ExtentRef>;
+}
+
+/// An upload in progress.
+struct Upload {
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    contentType: Vector<u8>;
+    initiatedMillis: i64;
+    /// In ascending part number, each number at most once.
+    parts: Vector<UploadedPart>;
+}
+
+/// A part that CompleteMultipartUpload names: its number and the ETag the client has for it.
+struct PartChoice {
+    number: u32;
+    md5: [u8; 16];
+}
+
+/// One upload in a listing.
+struct UploadSummary {
+    key: Vector<u8>;
+    id: [u8; 16];
+    initiatedMillis: i64;
+}
+
+struct UploadListing {
+    uploads: Vector<UploadSummary>;
+    truncated: bool;
+}
+
+/// One part in a listing.
+struct PartSummary {
+    number: u32;
+    size: u64;
+    md5: [u8; 16];
+    mtimeMillis: i64;
+}
+
+struct PartListing {
+    parts: Vector<PartSummary>;
+    truncated: bool;
+}
+
+/// The bytes the files of `extents` occupy, headers included.
+fn extentRefBytes(extents: Slice<ExtentRef>) -> u64 {
+    var total: u64 = 0;
+    for (e in extents) { total += e.length + EXTENT_HEADER_LEN; }
+    return total;
+}
+
+/// The bytes of every part's extent files.
+fn uploadBytes(u: borrow Upload) -> u64 {
+    var total: u64 = 0;
+    for (i in 0..u.parts.length) { total += extentRefBytes(u.parts[i].extents.view()); }
+    return total;
+}
+
+// ---- Record meta ----
+
+/// UploadCreate meta v1: u8 format version, 16 upload id, u16+bytes bucket, u16+bytes key, i64 initiated ms,
+/// u16+bytes content type.
+fn encodeUploadCreateMeta(
+    out: borrow mut Vector<u8>,
+    id: [u8; 16],
+    bucket: Slice<u8>,
+    key: Slice<u8>,
+    initiatedMillis: i64,
+    contentType: Slice<u8>,
+) -> Result<void, AllocError> {
+    out.pushLE(META_FORMAT_VERSION)?;
+    out.extend(id[..])?;
+    pushText16(out, bucket)?;
+    pushText16(out, key)?;
+    out.pushLE(initiatedMillis)?;
+    pushText16(out, contentType)?;
+    return Ok();
+}
+
+struct UploadCreateMeta {
+    id: [u8; 16];
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    initiatedMillis: i64;
+    contentType: Vector<u8>;
+}
+
+fn decodeUploadCreateMeta(bytes: Slice<u8>) -> Result<UploadCreateMeta, MetaFault> {
+    var at: usize = 0;
+    checkVersion(bytes, mut at)?;
+    let id = readId16(bytes, mut at)?;
+    let bucket = readText16(bytes, mut at)?;
+    let key = readText16(bytes, mut at)?;
+    let initiated = readI64(bytes, mut at)?;
+    let contentType = readText16(bytes, mut at)?;
+    return Ok(UploadCreateMeta {
+        id: id,
+        bucket: bucket,
+        key: key,
+        initiatedMillis: initiated,
+        contentType: contentType,
+    });
+}
+
+/// UploadPart meta v1: u8 format version, 16 upload id, u32 part number, u64 size, 16 md5, i64 mtime ms. The
+/// payload is the part's manifest.
+fn encodeUploadPartMeta(
+    out: borrow mut Vector<u8>,
+    id: [u8; 16],
+    number: u32,
+    size: u64,
+    md5: [u8; 16],
+    mtimeMillis: i64,
+) -> Result<void, AllocError> {
+    out.pushLE(META_FORMAT_VERSION)?;
+    out.extend(id[..])?;
+    out.pushLE(number)?;
+    out.pushLE(size)?;
+    out.extend(md5[..])?;
+    out.pushLE(mtimeMillis)?;
+    return Ok();
+}
+
+struct UploadPartMeta {
+    id: [u8; 16];
+    number: u32;
+    size: u64;
+    md5: [u8; 16];
+    mtimeMillis: i64;
+}
+
+fn decodeUploadPartMeta(bytes: Slice<u8>) -> Result<UploadPartMeta, MetaFault> {
+    var at: usize = 0;
+    checkVersion(bytes, mut at)?;
+    let id = readId16(bytes, mut at)?;
+    let number = readU32(bytes, mut at)?;
+    let size = readU64(bytes, mut at)?;
+    let md5 = readId16(bytes, mut at)?;
+    let mtime = readI64(bytes, mut at)?;
+    return Ok(UploadPartMeta { id: id, number: number, size: size, md5: md5, mtimeMillis: mtime });
+}
+
+/// UploadAbort meta v1: u8 format version, 16 upload id, i64 mtime ms.
+fn encodeUploadAbortMeta(out: borrow mut Vector<u8>, id: [u8; 16], mtimeMillis: i64) -> Result<void, AllocError> {
+    out.pushLE(META_FORMAT_VERSION)?;
+    out.extend(id[..])?;
+    out.pushLE(mtimeMillis)?;
+    return Ok();
+}
+
+/// The upload id of UploadAbort meta.
+fn decodeUploadAbortMeta(bytes: Slice<u8>) -> Result<[u8; 16], MetaFault> {
+    var at: usize = 0;
+    checkVersion(bytes, mut at)?;
+    return readId16(bytes, mut at);
+}
+
+/// UploadComplete meta v1: PutExtent's meta (its md5 is the multipart ETag's digest), then 16 upload id and u32
+/// part count. The payload is the object's manifest.
+fn encodeUploadCompleteMeta(
+    out: borrow mut Vector<u8>,
+    bucket: Slice<u8>,
+    key: Slice<u8>,
+    mtimeMillis: i64,
+    size: u64,
+    etagMd5: [u8; 16],
+    contentType: Slice<u8>,
+    id: [u8; 16],
+    parts: u32,
+) -> Result<void, AllocError> {
+    encodePutMeta(out, bucket, key, nullVersionId(), mtimeMillis, size, etagMd5, contentType)?;
+    out.extend(id[..])?;
+    out.pushLE(parts)?;
+    return Ok();
+}
+
+struct UploadCompleteMeta {
+    put: PutMeta;
+    id: [u8; 16];
+    parts: u32;
+}
+
+fn decodeUploadCompleteMeta(bytes: Slice<u8>) -> Result<UploadCompleteMeta, MetaFault> {
+    var at: usize = 0;
+    let put = decodePutMetaAt(bytes, mut at)?;
+    let id = readId16(bytes, mut at)?;
+    let parts = readU32(bytes, mut at)?;
+    return Ok(UploadCompleteMeta { put: put, id: id, parts: parts });
+}
+
+// ---- Applying records ----
+
+fn applyUploadCreate(state: borrow mut StoreState, meta: Slice<u8>) -> Result<void, MetaFault> {
+    let m = decodeUploadCreateMeta(meta)?;
+    let upload = Upload {
+        bucket: m.bucket,
+        key: m.key,
+        contentType: m.contentType,
+        initiatedMillis: m.initiatedMillis,
+        parts: Vector<UploadedPart>.create(),
+    };
+    let _ = state.uploads.put(UploadKey { id: m.id }, upload)?;
+    return Ok();
+}
+
+/// Adds a part, replacing one of the same number. A part of an upload that is gone (completed or aborted between the
+/// part's check and its record, which the store's single writer prevents, or a replay oddity) is garbage at once.
+fn applyUploadPart(
+    state: borrow mut StoreState,
+    meta: Slice<u8>,
+    extents: Vector<ExtentRef>,
+) -> Result<void, MetaFault> {
+    let m = decodeUploadPartMeta(meta)?;
+    let added = extentRefBytes(extents.view());
+    var dead = Vector<ExtentRef>.create();
+    var kept = false;
+    let uk = UploadKey { id: m.id };
+    match (state.uploads.getMut(borrow uk)) {
+        Some(u) => {
+            kept = true;
+            var replaced: usize? = null;
+            for (i in 0..u.parts.length) {
+                if (u.parts[i].number == m.number) { replaced = i; }
+            }
+            match (replaced) {
+                Some(i) => {
+                    let old = u.parts.swapRemove(i);
+                    dead.extend(old.extents.view())?;
+                }
+                null => {}
+            }
+            u.parts.push(UploadedPart {
+                number: m.number,
+                size: m.size,
+                md5: m.md5,
+                mtimeMillis: m.mtimeMillis,
+                extents: extents,
+            })?;
+            u.parts.viewMut().sortBy((a, b) => if (a.number < b.number) -1 else if (a.number > b.number) 1 else 0);
+        }
+        null => { dead.extend(extents.view())?; }
+    }
+    if (kept) { state.extentBytes += added; }
+    state.extentBytes -= extentRefBytes(dead.view()).min(state.extentBytes);
+    for (e in dead.view()) { state.deadExtents.push(e)?; }
+    return Ok();
+}
+
+/// Removes an upload; its parts' extents become dead.
+fn retireUpload(state: borrow mut StoreState, id: [u8; 16]) -> Result<void, AllocError> {
+    let uk = UploadKey { id: id };
+    match (state.uploads.remove(borrow uk)) {
+        Some(u) => {
+            state.extentBytes -= uploadBytes(borrow u).min(state.extentBytes);
+            for (i in 0..u.parts.length) {
+                for (e in u.parts[i].extents.view()) { state.deadExtents.push(e)?; }
+            }
+        }
+        null => {}
+    }
+    return Ok();
+}
+
+fn applyUploadAbort(state: borrow mut StoreState, meta: Slice<u8>) -> Result<void, MetaFault> {
+    let id = decodeUploadAbortMeta(meta)?;
+    retireUpload(state, id)?;
+    return Ok();
+}
+
+/// Drops the uploads of a deleted bucket.
+fn dropBucketUploads(state: borrow mut StoreState, bucket: Slice<u8>) -> Result<void, AllocError> {
+    var ids = Vector<[u8; 16]>.create();
+    for (i in 0..state.uploads.length()) {
+        if (state.uploads.valueAt(i).bucket.view() == bucket) { ids.push(state.uploads.keyAt(i).id)?; }
+    }
+    for (id in ids.view()) { retireUpload(state, id)?; }
+    return Ok();
+}
+
+/// Ends the upload: the extents of the parts the object does not use become dead. Those it uses move from the
+/// upload to the object, so they are counted once in `extentBytes`. Returns whether the upload was there (if not,
+/// the object's extents were not counted yet).
+fn takeCompletedUpload(
+    state: borrow mut StoreState,
+    id: [u8; 16],
+    used: Slice<ExtentRef>,
+) -> Result<bool, AllocError> {
+    let uk = UploadKey { id: id };
+    let u = match (state.uploads.remove(borrow uk)) {
+        Some(u) => u,
+        null => { return Ok(false); }
+    };
+    var keep = HashMap<u64, bool>.create();
+    for (e in used) { let _ = keep.put(e.id, true)?; }
+    for (i in 0..u.parts.length) {
+        for (e in u.parts[i].extents.view()) {
+            if (keep.contains(borrow e.id)) { continue; }
+            let bytes = e.length + EXTENT_HEADER_LEN;
+            state.extentBytes -= bytes.min(state.extentBytes);
+            state.deadExtents.push(e)?;
+        }
+    }
+    return Ok(true);
+}
+
+/// The MD5 of a multipart object's ETag: the MD5 of its parts' binary MD5s, in order.
+fn multipartEtag(md5s: Slice<[u8; 16]>) -> [u8; 16] {
+    var h = Md5.create();
+    for (m in md5s) { h.update(m[..]); }
+    return h.finish();
+}
+
+@test
+fn uploadMetaRoundTrips() -> Result<void, TestFailure> {
+    var id = [0u8; 16];
+    id[0] = 7;
+    id[15] = 9;
+    var out = Vector<u8>.create();
+    encodeUploadCreateMeta(mut out, id, "bkt".bytes(), "a/b".bytes(), 1234, "text/plain".bytes())!;
+    let c = decodeUploadCreateMeta(out.view())!;
+    Check.equalBytes(id[..], c.id[..])?;
+    Check.equalBytes("a/b".bytes(), c.key.view())?;
+    Check.equalBytes("text/plain".bytes(), c.contentType.view())?;
+    for (n in 0..out.length) {
+        Check.isTrue(decodeUploadCreateMeta(out.view()[0..n]).isErr(), "a truncated create meta is refused")?;
+    }
+    out.clear();
+    let md5 = Md5.of("part".bytes());
+    encodeUploadPartMeta(mut out, id, 10000, 5242880, md5, 99)!;
+    let p = decodeUploadPartMeta(out.view())!;
+    Check.equalU64(10000, p.number as u64)?;
+    Check.equalU64(5242880, p.size)?;
+    Check.equalBytes(md5[..], p.md5[..])?;
+    for (n in 0..out.length) {
+        Check.isTrue(decodeUploadPartMeta(out.view()[0..n]).isErr(), "a truncated part meta is refused")?;
+    }
+    out.clear();
+    encodeUploadCompleteMeta(mut out, "bkt".bytes(), "a/b".bytes(), 5, 12, md5, "x/y".bytes(), id, 3)!;
+    let m = decodeUploadCompleteMeta(out.view())!;
+    Check.equalBytes("a/b".bytes(), m.put.key.view())?;
+    Check.equalU64(12, m.put.size)?;
+    Check.equalBytes(id[..], m.id[..])?;
+    Check.equalU64(3, m.parts as u64)?;
+    for (n in 0..out.length) {
+        Check.isTrue(decodeUploadCompleteMeta(out.view()[0..n]).isErr(), "a truncated complete meta is refused")?;
+    }
+    return Ok();
+}
+
+@test
+fn multipartEtagOfKnownParts() -> Result<void, TestFailure> {
+    // Two parts "a" and "b": the ETag digest is MD5(MD5("a") ++ MD5("b")).
+    var both = Vector<u8>.create();
+    both.extend(Md5.of("a".bytes())[..])!;
+    both.extend(Md5.of("b".bytes())[..])!;
+    let md5s = [Md5.of("a".bytes()), Md5.of("b".bytes())];
+    Check.equalBytes(Md5.of(both.view())[..], multipartEtag(md5s[..])[..])?;
+    return Ok();
+}

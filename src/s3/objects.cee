@@ -1,0 +1,705 @@
+// PutObject and GetObject/HeadObject (ADR-0008 §3, §6-10): bodies stream through `Async.blocking` without the store's
+// lock, every check runs before the commit, and a conditional PUT is decided under the lock.
+import web_core;
+import web_http;
+import web_server;
+
+/// A body checksum S3 lets the client name (x-amz-checksum-*).
+enum ChecksumKind {
+    None,
+    Crc32,
+    Crc32c,
+    Crc64Nvme,
+    Sha256,
+}
+
+/// Computes the named checksum over the body as it streams.
+struct BodyChecksum {
+    kind: ChecksumKind;
+    crc32: Crc32;
+    crc32c: Crc32c;
+    crc64: Crc64Nvme;
+    sha: Sha256;
+
+    fn create(kind: ChecksumKind) -> BodyChecksum => BodyChecksum {
+        kind: kind,
+        crc32: Crc32.create(),
+        crc32c: Crc32c.create(),
+        crc64: Crc64Nvme.create(),
+        sha: Sha256.create(),
+    };
+
+    fn update(borrow mut this, data: Slice<u8>) {
+        match (this.kind) {
+            ChecksumKind.None => {}
+            ChecksumKind.Crc32 => { this.crc32.update(data); }
+            ChecksumKind.Crc32c => { this.crc32c.update(data); }
+            ChecksumKind.Crc64Nvme => { this.crc64.update(data); }
+            ChecksumKind.Sha256 => { this.sha.update(data); }
+        }
+    }
+
+    /// The checksum in base64, as S3 writes it.
+    fn encoded(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        match (this.kind) {
+            ChecksumKind.None => {}
+            ChecksumKind.Crc32 => { appendBase64(out, crc32Bytes(this.crc32.finish())[..])?; }
+            ChecksumKind.Crc32c => { appendBase64(out, crc32Bytes(this.crc32c.finish())[..])?; }
+            ChecksumKind.Crc64Nvme => { appendBase64(out, crc64Bytes(this.crc64.finish())[..])?; }
+            ChecksumKind.Sha256 => { appendBase64(out, this.sha.finish()[..])?; }
+        }
+        return Ok();
+    }
+}
+
+/// The checksum named by a field `x-amz-checksum-<name>` (lowercase): its kind, or NotImplemented for SHA-1.
+fn checksumKindOf(field: Slice<u8>) -> Result<ChecksumKind?, S3Code> {
+    if (field == "x-amz-checksum-crc32".bytes()) { return Ok(ChecksumKind.Crc32); }
+    if (field == "x-amz-checksum-crc32c".bytes()) { return Ok(ChecksumKind.Crc32c); }
+    if (field == "x-amz-checksum-crc64nvme".bytes()) { return Ok(ChecksumKind.Crc64Nvme); }
+    if (field == "x-amz-checksum-sha256".bytes()) { return Ok(ChecksumKind.Sha256); }
+    if (field == "x-amz-checksum-sha1".bytes()) { return Err(S3Code.NotImplemented); }
+    return Ok(null);
+}
+
+/// An ETag as a client sends it (`"hex"` or `"hex-N"`, quotes optional): its MD5 and part count (0 for none), or
+/// null.
+fn parseEtag(text: Slice<u8>) -> ParsedEtag? {
+    let t = trimSpaces(text);
+    let inner = if (t.length >= 2 && t[0] == '"' && t[t.length - 1] == '"') t[1..t.length - 1] else t;
+    if (inner.length < 32) { return null; }
+    var parts: u32 = 0;
+    if (inner.length > 32) {
+        if (inner[32] != '-') { return null; }
+        match (parseDecimal(inner[33..])) {
+            Some(n) => {
+                if (n == 0 || n > MAX_PART_NUMBER as u64) { return null; }
+                parts = truncate<u32>(n);
+            }
+            null => { return null; }
+        }
+    }
+    var md5 = [0u8; 16];
+    for (i in 0..16) {
+        let hi = hexValue(inner[i * 2]);
+        let lo = hexValue(inner[i * 2 + 1]);
+        if (hi.isNull() || lo.isNull()) { return null; }
+        md5[i] = ((hi ?? 0) << 4) | (lo ?? 0);
+    }
+    return ParsedEtag { md5: md5, parts: parts };
+}
+
+struct ParsedEtag {
+    md5: [u8; 16];
+    parts: u32;
+}
+
+/// Whether `header` (an If-Match or If-None-Match list) names the ETag of `md5` and `parts`, or is `*`.
+fn etagListMatches(header: Slice<u8>, md5: borrow [u8; 16], parts: u32) -> bool {
+    var at: usize = 0;
+    while (at < header.length) {
+        let end = pieceEnd(header, at, ',');
+        let one = trimSpaces(header[at..end]);
+        at = end + 1;
+        if (one == "*".bytes()) { return true; }
+        match (parseEtag(one)) {
+            Some(e) => {
+                if (e.md5[..] == md5[..] && e.parts == parts) { return true; }
+            }
+            null => {}
+        }
+    }
+    return false;
+}
+
+/// `"hex"`, or `"hex-N"` for a multipart object of N parts.
+fn appendEtag(out: borrow mut Vector<u8>, md5: borrow [u8; 16], parts: u32) -> Result<void, AllocError> {
+    out.push('"')?;
+    appendHexBytes(out, md5[..])?;
+    if (parts > 0) {
+        out.push('-')?;
+        appendDecimal(out, parts as u64)?;
+    }
+    out.push('"')?;
+    return Ok();
+}
+
+/// A PUT's precondition.
+enum PutIf {
+    None,
+    /// If-None-Match: *
+    Absent,
+    /// If-Match: the current version's ETag must be one of these (`*`: any version).
+    Matches,
+}
+
+// ---- PutObject ----
+
+/// What a PUT or UploadPart body must be and match, from the request's fields (ADR-0008 §6-7).
+struct BodySpec {
+    size: u64;
+    chunked: bool;
+    md5Expected: [u8; 16]?;
+    checksumKind: ChecksumKind;
+    checksumExpected: Vector<u8>;
+    checksumInTrailer: bool;
+    trailerName: Vector<u8>;
+}
+
+fn bodySpec(req: borrow S3Request, auth: borrow Authenticated) -> Result<BodySpec, S3Fail> {
+    let chunked = match (auth.payload) {
+        PayloadMode.Chunked => true,
+        _ => false,
+    };
+    let sizeField = if (chunked) headerOf(req, "x-amz-decoded-content-length") else headerOf(req, "content-length");
+    let size = match (sizeField) {
+        Some(t) => {
+            match (parseDecimal(t)) {
+                Some(v) => v,
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+        }
+        null => { return Err(S3Fail.Code(S3Code.MissingContentLength)); }
+    };
+    if (size > MAX_PUT_BYTES) { return Err(S3Fail.Code(S3Code.EntityTooLarge)); }
+    var md5Expected: [u8; 16]? = null;
+    match (headerOf(req, "content-md5")) {
+        Some(t) => {
+            var raw = Vector<u8>.create();
+            if (!decodeBase64(trimSpaces(t), mut raw)? || raw.length != 16) {
+                return Err(S3Fail.Code(S3Code.InvalidDigest));
+            }
+            var d = [0u8; 16];
+            d[..].copyFrom(raw.view());
+            md5Expected = d;
+        }
+        null => {}
+    }
+    var checksumKind = ChecksumKind.None;
+    var checksumExpected = Vector<u8>.create();
+    var checksumInTrailer = false;
+    for (i in 0..req.headers.length) {
+        let name = req.headers[i].name.view();
+        match (checksumKindOf(name)) {
+            Ok(Some(k)) => {
+                checksumKind = k;
+                checksumExpected.clear();
+                checksumExpected.extend(trimSpaces(req.headers[i].value.view()))?;
+            }
+            Ok(null) => {}
+            Err(code) => { return Err(S3Fail.Code(code)); }
+        }
+    }
+    var trailerName = Vector<u8>.create();
+    match (headerOf(req, "x-amz-trailer")) {
+        Some(t) => {
+            if (!chunked) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            for (k in 0..t.length) { trailerName.push(lowerAscii(t[k]))?; }
+            match (checksumKindOf(trimSpaces(trailerName.view()))) {
+                Ok(Some(k)) => {
+                    checksumKind = k;
+                    checksumInTrailer = true;
+                }
+                Ok(null) => { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+                Err(code) => { return Err(S3Fail.Code(code)); }
+            }
+        }
+        null => {}
+    }
+    return Ok(BodySpec {
+        size: size,
+        chunked: chunked,
+        md5Expected: md5Expected,
+        checksumKind: checksumKind,
+        checksumExpected: checksumExpected,
+        checksumInTrailer: checksumInTrailer,
+        trailerName: trailerName,
+    });
+}
+
+/// A body that was received whole and passed every check: its finished bytes, and its checksum as computed.
+struct ReceivedBody {
+    finished: FinishedObject;
+    checksumKind: ChecksumKind;
+    computed: Vector<u8>;
+}
+
+/// Streams the body into `writer` without the store's lock, a step at a time: decoded if aws-chunked, hashed, and
+/// written on a worker thread. Every check runs before the caller commits, and a refused body's extents are removed.
+async fn receiveBody(
+    app: borrow S3App,
+    auth: Authenticated,
+    spec: borrow mut BodySpec,
+    writer: ObjectWriter,
+    exchange: borrow mut Exchange,
+) -> Result<ReceivedBody, S3Fail> {
+    var w = writer;
+    let expectedSha: [u8; 32]? = match (auth.payload) {
+        PayloadMode.Hashed(h) => Some(h),
+        _ => null,
+    };
+    let hashing = expectedSha.isSome();
+    let chunked = spec.chunked;
+    let size = spec.size;
+    var sha = Sha256.create();
+    var checksum = BodyChecksum.create(spec.checksumKind);
+    var decoder = ChunkDecoder.create(auth.signer);
+    var buf = Vector<u8>.create();
+    buf.resize(BODY_STEP, 0)?;
+    var decoded = Vector<u8>.create();
+    var received: u64 = 0;
+    while (true) {
+        let n = await exchange.read(mut buf.viewMut()[..])?;
+        if (n == 0) { break; }
+        if (chunked) {
+            decoded.clear();
+            match (decoder.feed(buf.view()[0..n], mut decoded)) {
+                Ok() => {}
+                Err(ChunkFault.BadSignature) => { return Err(S3Fail.Code(S3Code.SignatureDoesNotMatch)); }
+                Err(ChunkFault.Malformed) => { return Err(S3Fail.Code(S3Code.IncompleteBody)); }
+                Err(ChunkFault.OutOfMemory(_)) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+            }
+        }
+        let data = if (chunked) decoded.view() else buf.view()[0..n];
+        received += data.length as u64;
+        if (received > size) { return Err(S3Fail.Code(S3Code.IncompleteBody)); }
+        if (data.length == 0) { continue; }
+        let wrote = await Async.blocking(() => writeStep(mut w, mut sha, mut checksum, hashing, data));
+        match (wrote) {
+            Ok() => {}
+            Err(f) => { return Err(storeFail(StoreError.Io(f), 0)); }
+        }
+    }
+    if (received != size || (chunked && !decoder.isDone())) { return Err(S3Fail.Code(S3Code.IncompleteBody)); }
+    let finished = match (await Async.blocking(() => w.finish())) {
+        Ok(f) => f,
+        Err(f) => { return Err(storeFail(StoreError.Io(f), 0)); }
+    };
+
+    var refusal: S3Code? = null;
+    match (expectedSha) {
+        Some(expected) => {
+            if (sha.finish()[..] != expected[..]) { refusal = S3Code.XAmzContentSHA256Mismatch; }
+        }
+        null => {}
+    }
+    match (spec.md5Expected) {
+        Some(m) => {
+            if (m[..] != finished.md5[..]) { refusal = S3Code.BadDigest; }
+        }
+        null => {}
+    }
+    if (spec.checksumInTrailer) {
+        spec.checksumExpected.clear();
+        if (!trailerValue(
+            decoder.trailers(),
+            StringView.fromUtf8(trimSpaces(spec.trailerName.view())) ?? "",
+            mut spec.checksumExpected,
+        )?) {
+            refusal = S3Code.IncompleteBody;
+        }
+    }
+    var computed = Vector<u8>.create();
+    checksum.encoded(mut computed)?;
+    match (spec.checksumKind) {
+        ChecksumKind.None => {}
+        _ => {
+            if (refusal.isNull() && computed.view() != spec.checksumExpected.view()) { refusal = S3Code.BadDigest; }
+        }
+    }
+    match (refusal) {
+        Some(code) => {
+            await discardPut(app, borrow finished)?;
+            return Err(S3Fail.Code(code));
+        }
+        null => {}
+    }
+    return Ok(ReceivedBody { finished: finished, checksumKind: spec.checksumKind, computed: computed });
+}
+
+/// A stored body's response: its ETag and the checksum the client named, then 200.
+async fn sendStored(
+    exchange: borrow mut Exchange,
+    md5: borrow [u8; 16],
+    parts: u32,
+    body: borrow ReceivedBody,
+) -> Result<void, S3Fail> {
+    var etag = Vector<u8>.create();
+    appendEtag(mut etag, md5, parts)?;
+    exchange.header("etag", etag.view())?;
+    match (body.checksumKind) {
+        ChecksumKind.None => {}
+        _ => {
+            var name = Vector<u8>.create();
+            appendChecksumName(mut name, body.checksumKind)?;
+            match (StringView.fromUtf8(name.view())) {
+                Some(n) => { exchange.header(n, body.computed.view())?; }
+                null => {}
+            }
+        }
+    }
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn putObject(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    var spec = bodySpec(req, borrow auth)?;
+    var condition = PutIf.None;
+    match (headerOf(req, "if-none-match")) {
+        Some(t) => {
+            if (trimSpaces(t) != "*".bytes()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            condition = PutIf.Absent;
+        }
+        null => {}
+    }
+    var ifMatch = Vector<u8>.create();
+    match (headerOf(req, "if-match")) {
+        Some(t) => {
+            ifMatch.extend(t)?;
+            condition = PutIf.Matches;
+        }
+        null => {}
+    }
+    var contentType = String.create();
+    contentTypeOf(req, mut contentType)?;
+    let writer = await startPut(app, req.bucket.view(), spec.size)?;
+    let body = await receiveBody(app, auth, mut spec, writer, exchange)?;
+    let outcome = await commitPut(
+        app,
+        req.bucket.view(),
+        req.key.view(),
+        contentType.view(),
+        borrow body.finished,
+        condition,
+        ifMatch.view(),
+    )?;
+    return await sendStored(exchange, borrow outcome.md5, 0, borrow body);
+}
+
+/// The request's Content-Type, or S3's default.
+fn contentTypeOf(req: borrow S3Request, out: borrow mut String) -> Result<void, S3Fail> {
+    match (headerOf(req, "content-type")) {
+        Some(t) => { appendUtf8(out, t)?; }
+        null => { out.append("binary/octet-stream")?; }
+    }
+    return Ok();
+}
+
+/// One step of a PUT body, on a worker thread: hashed, checksummed and written.
+fn writeStep(
+    writer: borrow mut ObjectWriter,
+    sha: borrow mut Sha256,
+    checksum: borrow mut BodyChecksum,
+    hashing: bool,
+    data: Slice<u8>,
+) -> Result<void, IoFailure> {
+    if (hashing) { sha.update(data); }
+    checksum.update(data);
+    return writer.write(data);
+}
+
+fn appendChecksumName(out: borrow mut Vector<u8>, kind: ChecksumKind) -> Result<void, AllocError> {
+    out.extend("x-amz-checksum-".bytes())?;
+    out.extend(match (kind) {
+        ChecksumKind.Crc32 => "crc32".bytes(),
+        ChecksumKind.Crc32c => "crc32c".bytes(),
+        ChecksumKind.Crc64Nvme => "crc64nvme".bytes(),
+        ChecksumKind.Sha256 => "sha256".bytes(),
+        ChecksumKind.None => "".bytes(),
+    })?;
+    return Ok();
+}
+
+/// Under the lock: the bucket exists, the declared size is admitted (ADR-0006), and a writer for it.
+async fn startPut(app: borrow S3App, bucket: StringView, size: u64) -> Result<ObjectWriter, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => beginPut(store, bucket, size))) {
+        Ok(w) => Ok(w),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+fn beginPut(store: borrow ObjectStore, bucket: StringView, size: u64) -> Result<ObjectWriter, StoreError> {
+    if (!store.bucketExists(bucket)?) { return Err(StoreError.NoSuchBucket); }
+    store.admit(size)?;
+    return store.newWriter();
+}
+
+async fn discardPut(app: borrow S3App, finished: borrow FinishedObject) -> Result<void, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    await Async.blocking(() => store.discardFinished(finished));
+    return Ok();
+}
+
+/// Under the lock: the precondition, then the commit (ADR-0008 §9).
+async fn commitPut(
+    app: borrow S3App,
+    bucket: StringView,
+    key: StringView,
+    contentType: StringView,
+    finished: borrow FinishedObject,
+    condition: PutIf,
+    ifMatch: Slice<u8>,
+) -> Result<PutOutcome, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(
+        () => commitWith(store, bucket, key, contentType, finished, condition, ifMatch),
+    )) {
+        Ok(o) => Ok(o),
+        Err(e) => Err(storeFail(e, key.length)),
+    };
+}
+
+fn commitWith(
+    store: borrow mut ObjectStore,
+    bucket: StringView,
+    key: StringView,
+    contentType: StringView,
+    finished: borrow FinishedObject,
+    condition: PutIf,
+    ifMatch: Slice<u8>,
+) -> Result<PutOutcome, StoreError> {
+    let cond = match (condition) {
+        PutIf.None => PutCondition.None,
+        PutIf.Absent => PutCondition.IfAbsent,
+        PutIf.Matches => {
+            match (store.headObject(bucket, key)) {
+                Ok(info) => {
+                    if (!etagListMatches(ifMatch, borrow info.md5, info.parts)) {
+                        store.discardFinished(finished);
+                        return Err(StoreError.PreconditionFailed);
+                    }
+                    PutCondition.IfGeneration(info.generation)
+                }
+                Err(StoreError.NoSuchKey) => {
+                    store.discardFinished(finished);
+                    return Err(StoreError.PreconditionFailed);
+                }
+                Err(e) => {
+                    store.discardFinished(finished);
+                    return Err(e);
+                }
+            }
+        }
+    };
+    return store.putFinished(bucket, key, contentType, finished, cond);
+}
+
+// ---- GetObject and HeadObject ----
+
+/// What a GET will send.
+struct GetPlan {
+    info: ObjectInfo;
+    reader: ObjectReader?;
+    start: u64;
+    end: u64;
+    partial: bool;
+}
+
+/// `Range: bytes=a-b | a- | -n` against `size`: the half-open range, null for no (or an unreadable) range, or
+/// InvalidRange when it cannot be satisfied.
+fn parseRange(text: Slice<u8>, size: u64) -> Result<RangeSpan?, S3Code> {
+    let t = trimSpaces(text);
+    let unit = "bytes=".bytes();
+    if (t.length <= unit.length || t[0..unit.length] != unit) { return Ok(null); }
+    let spec = t[unit.length..];
+    if (pieceEnd(spec, 0, ',') != spec.length) { return Ok(null); } // several ranges: the whole object, as S3
+    let dash = pieceEnd(spec, 0, '-');
+    if (dash == spec.length) { return Ok(null); }
+    let first = spec[0..dash];
+    let last = spec[dash + 1..];
+    if (first.length == 0) {
+        let n = match (parseDecimal(last)) {
+            Some(v) => v,
+            null => { return Ok(null); }
+        };
+        if (n == 0 || size == 0) { return Err(S3Code.InvalidRange); }
+        let from = if (n >= size) 0 else size - n;
+        return Ok(RangeSpan { from: from, to: size });
+    }
+    let from = match (parseDecimal(first)) {
+        Some(v) => v,
+        null => { return Ok(null); }
+    };
+    if (from >= size) { return Err(S3Code.InvalidRange); }
+    if (last.length == 0) { return Ok(RangeSpan { from: from, to: size }); }
+    let lastByte = match (parseDecimal(last)) {
+        Some(v) => v,
+        null => { return Ok(null); }
+    };
+    if (lastByte < from) { return Ok(null); }
+    let to = if (lastByte + 1 > size) size else lastByte + 1;
+    return Ok(RangeSpan { from: from, to: to });
+}
+
+struct RangeSpan {
+    from: u64;
+    to: u64;
+}
+
+/// RFC 9110 §13.2.2's order: If-Match, If-Unmodified-Since, If-None-Match, If-Modified-Since.
+fn checkGetConditions(req: borrow S3Request, info: borrow ObjectInfo) -> Result<void, S3Code> {
+    let modified = info.mtimeMillis / 1000;
+    match (headerOf(req, "if-match")) {
+        Some(t) => {
+            if (!etagListMatches(t, borrow info.md5, info.parts)) { return Err(S3Code.PreconditionFailed); }
+        }
+        null => {
+            match (headerOf(req, "if-unmodified-since")) {
+                Some(t) => {
+                    match (parseHttpDate(trimSpaces(t))) {
+                        Some(since) => {
+                            if (modified > since) { return Err(S3Code.PreconditionFailed); }
+                        }
+                        null => {}
+                    }
+                }
+                null => {}
+            }
+        }
+    }
+    match (headerOf(req, "if-none-match")) {
+        Some(t) => {
+            if (etagListMatches(t, borrow info.md5, info.parts)) { return Err(S3Code.NotModified); }
+        }
+        null => {
+            match (headerOf(req, "if-modified-since")) {
+                Some(t) => {
+                    match (parseHttpDate(trimSpaces(t))) {
+                        Some(since) => {
+                            if (modified <= since) { return Err(S3Code.NotModified); }
+                        }
+                        null => {}
+                    }
+                }
+                null => {}
+            }
+        }
+    }
+    return Ok();
+}
+
+/// Under the lock: the object's metadata, its conditions and range, and (for GET) a reader that pins its extents.
+fn planGet(store: borrow mut ObjectStore, req: borrow S3Request, withBody: bool) -> Result<GetPlan, S3Fail> {
+    let bucket = req.bucket.view();
+    let key = req.key.view();
+    let info = match (store.headObject(bucket, key)) {
+        Ok(i) => i,
+        Err(e) => { return Err(storeFail(e, key.length)); }
+    };
+    match (checkGetConditions(req, borrow info)) {
+        Ok() => {}
+        Err(code) => { return Err(S3Fail.Code(code)); }
+    }
+    var start: u64 = 0;
+    var end = info.size;
+    var partial = false;
+    match (headerOf(req, "range")) {
+        Some(t) => {
+            match (parseRange(t, info.size)) {
+                Ok(Some(r)) => {
+                    start = r.from;
+                    end = r.to;
+                    partial = true;
+                }
+                Ok(null) => {}
+                Err(code) => { return Err(S3Fail.Code(code)); }
+            }
+        }
+        null => {}
+    }
+    var reader: ObjectReader? = null;
+    if (withBody && end > start) {
+        reader = match (store.openReader(bucket, key, start, end)) {
+            Ok(r) => r,
+            Err(e) => { return Err(storeFail(e, key.length)); }
+        };
+    }
+    return Ok(GetPlan { info: info, reader: reader, start: start, end: end, partial: partial });
+}
+
+async fn openGet(app: borrow S3App, req: borrow S3Request, withBody: bool) -> Result<GetPlan, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return await Async.blocking(() => planGet(store, req, withBody));
+}
+
+async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let withBody = !isMethod(req.method, Method.Head);
+    var plan = await openGet(app, req, withBody)?;
+    var field = Vector<u8>.create();
+    appendEtag(mut field, borrow plan.info.md5, plan.info.parts)?;
+    exchange.header("etag", field.view())?;
+    field.clear();
+    appendHttpDate(mut field, plan.info.mtimeMillis / 1000)?;
+    exchange.header("last-modified", field.view())?;
+    exchange.header("accept-ranges", "bytes".bytes())?;
+    match (paramOf(req, "response-content-type")) {
+        Some(t) => { exchange.header("content-type", t)?; }
+        null => {
+            if (plan.info.contentType.length > 0) {
+                exchange.header("content-type", plan.info.contentType.view())?;
+            }
+        }
+    }
+    responseOverride(req, exchange, "response-content-language", "content-language")?;
+    responseOverride(req, exchange, "response-expires", "expires")?;
+    responseOverride(req, exchange, "response-cache-control", "cache-control")?;
+    responseOverride(req, exchange, "response-content-disposition", "content-disposition")?;
+    responseOverride(req, exchange, "response-content-encoding", "content-encoding")?;
+    if (plan.partial) {
+        field.clear();
+        field.extend("bytes ".bytes())?;
+        appendDecimal(mut field, plan.start)?;
+        field.push('-')?;
+        appendDecimal(mut field, plan.end - 1)?;
+        field.push('/')?;
+        appendDecimal(mut field, plan.info.size)?;
+        exchange.header("content-range", field.view())?;
+        exchange.setStatus(statusOf(206));
+    } else {
+        exchange.setStatus(Status.ok());
+    }
+    exchange.setContentLength(plan.end - plan.start);
+    match (plan.reader.asBorrowMut()) {
+        Some(reader) => {
+            var buf = Vector<u8>.create();
+            buf.resize(BODY_STEP, 0)?;
+            while (true) {
+                let chunk = buf.viewMut();
+                let got = await Async.blocking(() => reader.read(chunk));
+                let n = match (got) {
+                    Ok(n) => n,
+                    Err(e) => { return Err(storeFail(e, 0)); }
+                };
+                if (n == 0) { break; }
+                await exchange.write(buf.view()[0..n])?;
+            }
+        }
+        null => {}
+    }
+    await exchange.finish()?;
+    return Ok();
+}
+
+/// A `response-*` query parameter sets its response field.
+fn responseOverride(
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+    param: StringView,
+    field: StringView,
+) -> Result<void, S3Fail> {
+    match (paramOf(req, param)) {
+        Some(v) => { exchange.header(field, v)?; }
+        null => {}
+    }
+    return Ok();
+}

@@ -34,6 +34,7 @@ boilerplate; **P2** ergonomics.
 | G23 | P2 | tooling | `ceesafe.toml` cannot require a compiler version, so an older ceesafec gives type errors instead of "needs 0.19.1". **Fixed in CeeSafe 0.20.0** (ADR 0076): CosmoStore's manifest says `ceesafec = ">=0.20.0"` |
 | G24 | P1 | std/files | No free-space query (`statvfs`, `GetDiskFreeSpaceExW`): a store cannot learn how much room its volume has **Fixed in CeeSafe 0.21.0** (ADR 0077: `Directory.space`, `Console.flush`) |
 | G25 | P2 | std/console | No `Console.flush()`: standard output written before a SIGKILL is lost when it is redirected **Fixed in CeeSafe 0.21.0** (ADR 0077) |
+| G26 | P3 | std/checksums | No CRC-32 (IEEE), the AWS CLI's `x-amz-checksum-crc32`: lib/std has CRC-32C and CRC-64/NVME only. CosmoStore computes it in CeeSafe (`src/s3/crc32.cee`) |
 
 ## Status (2026-11-06)
 
@@ -277,6 +278,19 @@ Workaround: the soak writes its lines to standard error (`soakEmit` in `src/soak
 Suggested: `Console.flush()` and `AsyncConsole.flush()`. Line buffering when standard output is not a terminal would
 also do, at a throughput cost.
 
+### G26: no CRC-32 (IEEE) in lib/std (P3)
+
+Found with CeeSafe 0.21.0 on 2026-11-07, while writing the S3 layer (ADR-0008). S3's flexible checksums are CRC-32,
+CRC-32C, CRC-64/NVME, SHA-1 and SHA-256; the AWS CLI and boto3 use CRC-32 when asked for a checksum without an
+algorithm. lib/std has `Crc32c` and `Crc64Nvme` (ADR 0075) but not CRC-32 with the IEEE polynomial (0xEDB88320,
+reflected), nor SHA-1.
+
+Workaround: `src/s3/crc32.cee`, a table-driven CRC-32 in plain CeeSafe, checked against the standard vector
+(`"123456789"` gives `0xCBF43926`). No C, no `unsafe`; it is only slower than a hardware or slicing-by-8 version.
+
+Suggested: `Crc32` beside `Crc32c` in lib/std, with the same `create`/`update`/`finish`/`of`, and `Sha1` for S3's
+`x-amz-checksum-sha1` (refused with `NotImplemented` today).
+
 ## Not gaps (checked)
 
 Things that worked well and are worth keeping:
@@ -294,3 +308,8 @@ Things that worked well and are worth keeping:
 - Passing a named function as a `fn(StringView, borrow mut T)` parameter: this is how the fault sweeps take
   their workload.
 - Moving a field out of a local struct that has no `drop` (`state = loaded.state`).
+- N0295 follows `drop` blocks: an async fn that could drop an `ObjectWriter` (whose drop unlinked files) or a reader
+  pin (whose drop took a `Mutex`) was refused, naming the chain. That found two real event-loop stalls before they
+  ran; both drops now do no I/O and take no lock (ADR-0007 amendment, ADR-0008 §3).
+- `Channel.trySend`/`tryRecv` have no effects, so a `drop` block may queue work for another owner.
+- `Async.blocking` with closures that borrow the store mutably through an `AsyncMutexGuard`.

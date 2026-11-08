@@ -68,4 +68,5 @@
   period, M2). Done: readers pin their extents (ADR-0007).
 - **Multipart upload** will store each part as one or more extents. `CompleteMultipartUpload` then writes a
   single `PutExtent` record with the concatenated manifest, and its ETag is the MD5 of the part MD5s plus
-  `-N`, which the manifest needs an S3 ETag field for.
+  `-N`, which the manifest needs an S3 ETag field for. Done (ADR-0009): the version keeps its part count, and its
+  MD5 field holds the ETag's digest.

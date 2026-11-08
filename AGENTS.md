@@ -81,4 +81,7 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
 - CosmoStore calls no C and has no `unsafe` (since CeeSafe 0.19). A CeeSafe limitation goes in `CEESAFE_GAPS.md`
   (with evidence and a repro) for the CeeSafe repo, not around it with C or `unsafe`.
 - CRC32C and MD5 are lib/std's; `src/storage/checksums/checksums.cee` pins the values the on-disk formats use.
+- The S3 layer (`src/s3/`, ADR-0008) uses CeeSafe.Web by path (`../../CeeSafe.Web/packages`). Async code must not
+  block (N0295): store calls go through `Async.blocking`, and no `drop` may do I/O or take a lock.
+- After changing `src/s3/` or the store's API: `ceesafec build && tools/s3_smoke.sh` (needs the AWS CLI v2).
 - Before finishing: `ceesafec check`, `ceesafec fmt --check`, `ceesafec test` (all pass, no leaks).

@@ -55,9 +55,19 @@ fn encodeManifest(out: borrow mut Vector<u8>, extents: Slice<ExtentRef>) -> Resu
 }
 
 fn decodeManifest(bytes: Slice<u8>) -> Result<Vector<ExtentRef>, MetaFault> {
+    let extents = decodeManifestPrefix(bytes)?;
+    if (bytes.length != manifestLength(extents.length)) { return Err(MetaFault.Short); }
+    return Ok(extents);
+}
+
+/// The bytes of a manifest of `n` extents.
+fn manifestLength(n: usize) -> usize => 4 + n * 20;
+
+/// Decodes the manifest at the start of `bytes`, which may go on after it.
+fn decodeManifestPrefix(bytes: Slice<u8>) -> Result<Vector<ExtentRef>, MetaFault> {
     if (bytes.length < 4) { return Err(MetaFault.Short); }
     let n = bytes.readLE<u32>(0) as usize;
-    if (bytes.length != 4 + n * 20) { return Err(MetaFault.Short); }
+    if (bytes.length < manifestLength(n)) { return Err(MetaFault.Short); }
     var out = Vector<ExtentRef>.create();
     out.reserve(n)?;
     for (i in 0..n) {
@@ -150,8 +160,15 @@ struct ObjectWriter {
     private md5: Md5;
     private size: u64;
     private finished: bool;
+    /// Where an unfinished writer's drop queues its extents for the store to remove (ADR-0008).
+    private abandoned: Channel<u64>;
 
-    fn create(extentDir: StringView, inlineMax: usize, extentMax: u64) -> Result<ObjectWriter, AllocError> {
+    fn create(
+        extentDir: StringView,
+        inlineMax: usize,
+        extentMax: u64,
+        abandoned: Channel<u64>,
+    ) -> Result<ObjectWriter, AllocError> {
         var dir = String.create();
         dir.append(extentDir)?;
         return Ok(ObjectWriter {
@@ -168,6 +185,7 @@ struct ObjectWriter {
             md5: Md5.create(),
             size: 0,
             finished: false,
+            abandoned: abandoned,
         });
     }
 
@@ -254,12 +272,13 @@ struct ObjectWriter {
         return Ok(FinishedObject { body: ObjectBody.Extents(extents), size: this.size, md5: digest });
     }
 
-    /// Safety-free cleanup: an unfinished writer's extents are garbage.
+    /// An unfinished writer's extents are garbage. A drop may run in async code, which must not do I/O, so they are
+    /// queued for the store's next reap; if the queue is full they stay until the orphan sweep at open.
     drop {
         if (this.finished) { return; }
         this.file = null;
-        if (this.currentId != 0) { removeExtent(this.dir.view(), this.currentId); }
-        for (i in 0..this.done.length) { removeExtent(this.dir.view(), this.done[i].id); }
+        if (this.currentId != 0) { let _ = this.abandoned.trySend(this.currentId); }
+        for (i in 0..this.done.length) { let _ = this.abandoned.trySend(this.done[i].id); }
     }
 }
 

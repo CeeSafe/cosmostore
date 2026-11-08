@@ -1,0 +1,503 @@
+// The S3 server (ADR-0008): one handler for every path, which authenticates the request and dispatches it to the
+// bucket and object operations. Store calls run under the store's AsyncMutex, inside `Async.blocking`; bodies move
+// without the lock.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+/// The largest object a single PUT may carry (S3's limit).
+const MAX_PUT_BYTES: u64 = 5368709120;
+/// Body bytes read and written per step.
+const BODY_STEP: usize = 1048576;
+const S3_XMLNS: StringView = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+struct S3App {
+    store: AsyncMutex<ObjectStore>;
+    credentials: Vector<Credential>;
+    requests: AtomicU64;
+}
+
+fn statusOf(code: u16) -> StatusCode => StatusCode.of(code) ?? Status.internalServerError();
+
+/// Takes the store's lock; the guard releases it when dropped.
+async fn lockStore(app: borrow S3App) -> Result<AsyncMutexGuard<ObjectStore>, S3Fail> {
+    match (await app.store.lock()) {
+        Ok(g) => { return Ok(g); }
+        Err(_) => { return Err(S3Fail.Code(S3Code.ServiceUnavailable)); }
+    }
+}
+
+/// The S3 failure of a store error. Server-side failures (5xx) are logged by the handler.
+fn storeFail(e: StoreError, keyLength: usize) -> S3Fail => S3Fail.Code(codeOfStore(e, keyLength));
+
+struct S3Handler {}
+
+impl Handler<S3App> for S3Handler {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<S3App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let app = ctx.state();
+        let id = app.requests.fetchAdd(1) + 1;
+        var requestId = Vector<u8>.create();
+        let idBytes = crc64Bytes(id);
+        match (appendHexBytes(mut requestId, idBytes[..])) {
+            Ok() => {}
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+        exchange.header("x-amz-request-id", requestId.view())?;
+        exchange.header("server", "CosmoStore".bytes())?;
+        match (await serveS3(app, request, exchange)) {
+            Ok() => { return Ok(); }
+            Err(S3Fail.Http(e)) => { return Err(e); }
+            Err(S3Fail.Code(code)) => {
+                if (s3Status(code) >= 500) {
+                    // Standard error is unbuffered, so the line survives a crash (CEESAFE_GAPS G25).
+                    let _ = await AsyncConsole.writeError("cosmostore: ");
+                    let _ = await AsyncConsole.writeError(s3CodeName(code));
+                    let _ = await AsyncConsole.writeError(" on ");
+                    let _ = await AsyncConsole.writeError(request.path());
+                    let _ = await AsyncConsole.writeError("\n");
+                }
+                return await sendError(exchange, code, request.path().bytes(), requestId.view());
+            }
+            Err(S3Fail.OutOfMemory(_)) => {
+                return await sendError(exchange, S3Code.InternalError, request.path().bytes(), requestId.view());
+            }
+        }
+    }
+}
+
+/// S3's XML error response; after the head was sent, the connection is closed instead.
+async fn sendError(
+    exchange: borrow mut Exchange,
+    code: S3Code,
+    resource: Slice<u8>,
+    requestId: Slice<u8>,
+) -> Result<void, HandlerError> {
+    if (exchange.headSent()) {
+        exchange.closeConnection();
+        return Err(HandlerError.Internal);
+    }
+    let status = s3Status(code);
+    if (status == 304) { return await exchange.send(statusOf(304), "".bytes()); }
+    var body = Vector<u8>.create();
+    match (errorXml(mut body, code, resource, requestId)) {
+        Ok() => {}
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
+    exchange.header("content-type", "application/xml".bytes())?;
+    return await exchange.send(statusOf(status), body.view());
+}
+
+fn errorXml(
+    out: borrow mut Vector<u8>,
+    code: S3Code,
+    resource: Slice<u8>,
+    requestId: Slice<u8>,
+) -> Result<void, AllocError> {
+    out.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>".bytes())?;
+    out.extend(s3CodeName(code).bytes())?;
+    out.extend("</Code><Message>".bytes())?;
+    appendXmlEscaped(out, s3Message(code).bytes())?;
+    out.extend("</Message><Resource>".bytes())?;
+    appendXmlEscaped(out, resource)?;
+    out.extend("</Resource><RequestId>".bytes())?;
+    out.extend(requestId)?;
+    out.extend("</RequestId></Error>".bytes())?;
+    return Ok();
+}
+
+async fn sendXml(exchange: borrow mut Exchange, body: borrow Vector<u8>) -> Result<void, S3Fail> {
+    exchange.header("content-type", "application/xml".bytes())?;
+    await exchange.send(Status.ok(), body.view())?;
+    return Ok();
+}
+
+fn isMethod(m: Method, want: Method) -> bool => Methods.same(m, want);
+
+/// Authenticates and dispatches one request.
+async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let req = S3Request.of(request)?;
+    let now = Clock.unixMillis() / 1000;
+    let auth = match (req.authenticate(app.credentials.view(), now)) {
+        Ok(a) => a,
+        Err(code) => { return Err(S3Fail.Code(code)); }
+    };
+    let m = req.method;
+    if (req.bucket.length == 0) {
+        if (isMethod(m, Method.Get) || isMethod(m, Method.Head)) {
+            if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            return await listBuckets(app, exchange);
+        }
+        return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+    }
+    if (req.key.length == 0) {
+        if (isMethod(m, Method.Put)) {
+            if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            return await createBucket(app, borrow req, exchange);
+        }
+        if (isMethod(m, Method.Head)) { return await headBucket(app, borrow req, exchange); }
+        if (isMethod(m, Method.Delete)) {
+            if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            return await deleteBucket(app, borrow req, exchange);
+        }
+        if (isMethod(m, Method.Get)) {
+            if (req.hasParam("location")) {
+                if (!req.onlyParams("location")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+                return await bucketLocation(app, borrow req, exchange);
+            }
+            if (req.hasParam("uploads")) {
+                if (!req.onlyParams("uploads,prefix,delimiter,key-marker,upload-id-marker,max-uploads,encoding-type")) {
+                    return Err(S3Fail.Code(S3Code.NotImplemented));
+                }
+                return await listMultipartUploads(app, borrow req, exchange);
+            }
+            if (!req.onlyParams(
+                "list-type,prefix,delimiter,max-keys,marker,start-after,continuation-token,encoding-type,fetch-owner",
+            )) {
+                return Err(S3Fail.Code(S3Code.NotImplemented));
+            }
+            return await listObjects(app, borrow req, exchange);
+        }
+        if (isMethod(m, Method.Post)) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+    }
+    if (req.key.length > MAX_KEY_BYTES) { return Err(S3Fail.Code(S3Code.KeyTooLongError)); }
+    if (isMethod(m, Method.Put)) {
+        if (headerOf(borrow req, "x-amz-copy-source").isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        if (req.hasParam("uploadId") || req.hasParam("partNumber")) {
+            if (!req.onlyParams("partNumber,uploadId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            return await uploadPart(app, borrow req, auth, exchange);
+        }
+        if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        return await putObject(app, borrow req, auth, exchange);
+    }
+    if (isMethod(m, Method.Get) && req.hasParam("uploadId")) {
+        if (!req.onlyParams("uploadId,max-parts,part-number-marker,encoding-type")) {
+            return Err(S3Fail.Code(S3Code.NotImplemented));
+        }
+        return await listParts(app, borrow req, exchange);
+    }
+    if (isMethod(m, Method.Get) || isMethod(m, Method.Head)) {
+        if (!req.onlyParams(
+            "response-content-type,response-content-language,response-expires,response-cache-control,response-content-disposition,response-content-encoding",
+        )) {
+            return Err(S3Fail.Code(S3Code.NotImplemented));
+        }
+        return await getObject(app, borrow req, exchange);
+    }
+    if (isMethod(m, Method.Delete)) {
+        if (req.hasParam("uploadId")) {
+            if (!req.onlyParams("uploadId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            return await abortMultipartUpload(app, borrow req, exchange);
+        }
+        if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        return await deleteObject(app, borrow req, exchange);
+    }
+    if (isMethod(m, Method.Post)) {
+        if (req.hasParam("uploads") && req.onlyParams("uploads")) {
+            return await createMultipartUpload(app, borrow req, exchange);
+        }
+        if (req.hasParam("uploadId") && req.onlyParams("uploadId")) {
+            return await completeMultipartUpload(app, borrow req, auth, exchange);
+        }
+        return Err(S3Fail.Code(S3Code.NotImplemented));
+    }
+    return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+}
+
+// ---- Service and buckets ----
+
+async fn listBuckets(app: borrow S3App, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let names = await storeBucketNames(app)?;
+    var body = Vector<u8>.create();
+    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"".bytes())?;
+    body.extend(S3_XMLNS.bytes())?;
+    body.extend("\"><Owner><ID>cosmostore</ID><DisplayName>cosmostore</DisplayName></Owner><Buckets>".bytes())?;
+    for (i in 0..names.length) {
+        body.extend("<Bucket><Name>".bytes())?;
+        appendXmlEscaped(mut body, names[i].view())?;
+        // The store does not keep a bucket's creation time yet (ADR-0008, limits).
+        body.extend("</Name><CreationDate>1970-01-01T00:00:00.000Z</CreationDate></Bucket>".bytes())?;
+    }
+    body.extend("</Buckets></ListAllMyBucketsResult>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn storeBucketNames(app: borrow S3App) -> Result<Vector<Vector<u8>>, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => store.listBuckets())) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+async fn createBucket(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let name = req.bucket.view();
+        match (await Async.blocking(() => store.createBucket(name))) {
+            Ok() => {}
+            Err(e) => { return Err(storeFail(e, 0)); }
+        }
+    }
+    var location = Vector<u8>.create();
+    location.push('/')?;
+    location.extend(req.bucket.view().bytes())?;
+    exchange.header("location", location.view())?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn bucketExists(app: borrow S3App, name: StringView) -> Result<bool, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => store.bucketExists(name))) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+async fn headBucket(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    if (!await bucketExists(app, req.bucket.view())?) { return Err(S3Fail.Code(S3Code.NoSuchBucket)); }
+    exchange.header("x-amz-bucket-region", "us-east-1".bytes())?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn bucketLocation(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    if (!await bucketExists(app, req.bucket.view())?) { return Err(S3Fail.Code(S3Code.NoSuchBucket)); }
+    var body = Vector<u8>.create();
+    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint xmlns=\"".bytes())?;
+    body.extend(S3_XMLNS.bytes())?;
+    body.extend("\"></LocationConstraint>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn deleteBucket(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let name = req.bucket.view();
+        match (await Async.blocking(() => store.deleteBucket(name))) {
+            Ok() => {}
+            Err(e) => { return Err(storeFail(e, 0)); }
+        }
+    }
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}
+
+// ---- Listing ----
+
+/// ListObjects v1 and v2 (ADR-0008 §8).
+async fn listObjects(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let v2 = match (paramOf(req, "list-type")) {
+        Some(t) => {
+            if (t != "2".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            true
+        }
+        null => false,
+    };
+    let prefix = utf8Param(req, "prefix")?;
+    let delimiter = utf8Param(req, "delimiter")?;
+    let urlEncoded = match (paramOf(req, "encoding-type")) {
+        Some(t) => {
+            if (t != "url".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            true
+        }
+        null => false,
+    };
+    var maxKeys: usize = 1000;
+    match (paramOf(req, "max-keys")) {
+        Some(t) => {
+            match (parseDecimal(t)) {
+                Some(v) => {
+                    if (v < 1000) { maxKeys = v as usize; }
+                }
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+        }
+        null => {}
+    }
+    // Where the page starts: v2's continuation token (the previous page's last key or prefix, and which it was),
+    // else start-after; v1's marker.
+    var after = Vector<u8>.create();
+    var afterIsPrefix = false;
+    let token = paramOf(req, "continuation-token");
+    if (v2) {
+        match (token) {
+            Some(t) => {
+                var raw = Vector<u8>.create();
+                if (!decodeBase64(t, mut raw)? || raw.length == 0 || raw[0] > 1) {
+                    return Err(S3Fail.Code(S3Code.InvalidArgument));
+                }
+                afterIsPrefix = raw[0] == 1;
+                after.extend(raw.view()[1..])?;
+            }
+            null => {
+                match (paramOf(req, "start-after")) {
+                    Some(s) => { after.extend(s)?; }
+                    null => {}
+                }
+            }
+        }
+    } else {
+        match (paramOf(req, "marker")) {
+            Some(s) => {
+                after.extend(s)?;
+                // A marker that is a common prefix (the previous page's NextMarker) skips everything under it.
+                let d = delimiter.view().bytes();
+                afterIsPrefix = d.length > 0 && s.length >= d.length && s[s.length - d.length..] == d &&
+                    startsWithBytes(s, prefix.view().bytes());
+            }
+            null => {}
+        }
+    }
+    let page = await listPage(
+        app,
+        req.bucket.view(),
+        prefix.view(),
+        delimiter.view(),
+        borrow after,
+        afterIsPrefix,
+        maxKeys,
+    )?;
+
+    var body = Vector<u8>.create();
+    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"".bytes())?;
+    body.extend(S3_XMLNS.bytes())?;
+    body.extend("\"><Name>".bytes())?;
+    appendXmlEscaped(mut body, req.bucket.view().bytes())?;
+    body.extend("</Name>".bytes())?;
+    xmlElement(mut body, "Prefix", prefix.view().bytes(), urlEncoded)?;
+    if (delimiter.length > 0) { xmlElement(mut body, "Delimiter", delimiter.view().bytes(), urlEncoded)?; }
+    body.extend("<MaxKeys>".bytes())?;
+    appendDecimal(mut body, maxKeys as u64)?;
+    body.extend("</MaxKeys>".bytes())?;
+    if (urlEncoded) { body.extend("<EncodingType>url</EncodingType>".bytes())?; }
+    body.extend(
+        if (page.truncated) "<IsTruncated>true</IsTruncated>".bytes() else "<IsTruncated>false</IsTruncated>".bytes(),
+    )?;
+    if (v2) {
+        body.extend("<KeyCount>".bytes())?;
+        appendDecimal(mut body, (page.keys.length + page.commonPrefixes.length) as u64)?;
+        body.extend("</KeyCount>".bytes())?;
+        match (token) {
+            Some(t) => { xmlElement(mut body, "ContinuationToken", t, false)?; }
+            null => {
+                match (paramOf(req, "start-after")) {
+                    Some(s) => { xmlElement(mut body, "StartAfter", s, urlEncoded)?; }
+                    null => {}
+                }
+            }
+        }
+        if (page.truncated) {
+            var next = Vector<u8>.create();
+            next.push(if (page.nextMarkerIsPrefix) 1u8 else 0u8)?;
+            next.extend(page.nextMarker.view())?;
+            var text = Vector<u8>.create();
+            appendBase64(mut text, next.view())?;
+            xmlElement(mut body, "NextContinuationToken", text.view(), false)?;
+        }
+    } else {
+        xmlElement(mut body, "Marker", paramOf(req, "marker") ?? "".bytes(), urlEncoded)?;
+        if (page.truncated) { xmlElement(mut body, "NextMarker", page.nextMarker.view(), urlEncoded)?; }
+    }
+    for (i in 0..page.keys.length) {
+        body.extend("<Contents>".bytes())?;
+        xmlElement(mut body, "Key", page.keys[i].view(), urlEncoded)?;
+        body.extend("<LastModified>".bytes())?;
+        appendIso8601(mut body, page.mtimes[i])?;
+        body.extend("</LastModified><ETag>".bytes())?;
+        var etag = Vector<u8>.create();
+        appendEtag(mut etag, borrow page.md5s[i], page.parts[i])?;
+        appendXmlEscaped(mut body, etag.view())?;
+        body.extend("</ETag><Size>".bytes())?;
+        appendDecimal(mut body, page.sizes[i])?;
+        body.extend("</Size><StorageClass>STANDARD</StorageClass></Contents>".bytes())?;
+    }
+    for (i in 0..page.commonPrefixes.length) {
+        body.extend("<CommonPrefixes>".bytes())?;
+        xmlElement(mut body, "Prefix", page.commonPrefixes[i].view(), urlEncoded)?;
+        body.extend("</CommonPrefixes>".bytes())?;
+    }
+    body.extend("</ListBucketResult>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// A decoded query parameter as text (empty if absent).
+fn utf8Param(req: borrow S3Request, name: StringView) -> Result<String, S3Fail> {
+    var s = String.create();
+    match (paramOf(req, name)) {
+        Some(v) => { appendUtf8(mut s, v)?; }
+        null => {}
+    }
+    return Ok(s);
+}
+
+/// `<name>value</name>`, the value URL-encoded for `encoding-type=url`, else XML-escaped.
+fn xmlElement(
+    out: borrow mut Vector<u8>,
+    name: StringView,
+    value: Slice<u8>,
+    urlEncoded: bool,
+) -> Result<void, AllocError> {
+    out.push('<')?;
+    out.extend(name.bytes())?;
+    out.push('>')?;
+    if (urlEncoded) {
+        appendUriEncoded(out, value, true)?;
+    } else {
+        appendXmlEscaped(out, value)?;
+    }
+    out.extend("</".bytes())?;
+    out.extend(name.bytes())?;
+    out.push('>')?;
+    return Ok();
+}
+
+async fn listPage(
+    app: borrow S3App,
+    bucket: StringView,
+    prefix: StringView,
+    delimiter: StringView,
+    after: borrow Vector<u8>,
+    afterIsPrefix: bool,
+    maxKeys: usize,
+) -> Result<ListPage, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    let start = after.view();
+    return match (await Async.blocking(
+        () => store.listObjects(bucket, prefix, delimiter, start, afterIsPrefix, maxKeys),
+    )) {
+        Ok(p) => Ok(p),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+async fn deleteObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let bucket = req.bucket.view();
+        let key = req.key.view();
+        match (await Async.blocking(() => store.deleteObject(bucket, key))) {
+            Ok() => {}
+            Err(e) => { return Err(storeFail(e, key.length)); }
+        }
+    }
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}

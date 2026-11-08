@@ -64,3 +64,19 @@ remove its segment at any time.
 - One lock and one map update per extent-backed `openReader` and per reader drop. Inline GETs are unchanged.
 - A reader that is never dropped holds its extents' space until the process exits. The S3 layer must drop readers
   when a client disconnects (M3).
+
+## Amendment (7 Nov 2026): pins that never block
+
+The S3 layer (ADR-0008) drops readers in async code, and an async fn must not block (CeeSafe N0295). The compiler
+refused the first design: `ReadPin`'s drop took a `Mutex`, which may sleep.
+
+- **Pins are atomic counts.** There is one `Arc<AtomicU64>` per pinned version, reachable from each of its extent
+  ids in the store's own map, so no lock is needed.
+  - A reader's drop only counts down. Pins are made only by the store, under `borrow mut` (`openReader`), so once the
+    store sees zero no reader can raise it again.
+  - Idle entries are pruned in `maintain`, and when the map passes 4096 entries.
+- **`openReader` takes `borrow mut this`.** fsck and `getObjectRange` read through `openUnpinned`: they finish
+  before they release the store, so no reap can come between.
+- **Abandoned writers work the same way.** An unfinished `ObjectWriter` used to unlink its extents in its drop. It
+  now queues their ids on the store's `Channel<u64>` (`trySend` has no effect), and the next reap or `maintain`
+  removes them. If the queue is full, they stay until the orphan sweep at open.

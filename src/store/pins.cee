@@ -1,84 +1,81 @@
-// Extent pins (ADR-0007): readers count up the extents they may still open, and the store
-// does not unlink a retired extent while its count is above zero.
+// Extent pins (ADR-0007): readers count up the version whose extents they may still open, and the store does not
+// unlink a retired extent while its version's count is above zero.
+//
+// A reader may be dropped anywhere, including in async code, which must not block (type-system.md §40.1). So a pin
+// is an atomic count shared through an `Arc`, and its drop only counts down: no lock, no I/O. Pins are only made
+// by the store (in `openReader`), so once the store sees a count of zero no reader can raise it again.
 
-/// Open readers per extent id. An id with no reader is not in the map.
-struct PinTable {
-    counts: HashMap<u64, u32>;
-}
-
-/// The store's side: makes pins and asks whether an extent has one.
+/// The store's side: one count per pinned version, reachable from each of its extent ids.
 struct ExtentPins {
-    private table: Arc<Mutex<PinTable>>;
+    private counts: HashMap<u64, Arc<AtomicU64>>;
 
-    fn create() -> Result<ExtentPins, AllocError> {
-        let table = Mutex<PinTable>.create(PinTable { counts: HashMap<u64, u32>.create() })?;
-        return Ok(ExtentPins { table: Arc<Mutex<PinTable>>.create(table)? });
-    }
+    fn create() -> ExtentPins => ExtentPins { counts: HashMap<u64, Arc<AtomicU64>>.create() };
 
-    /// Pins every extent in `extents` for one reader.
-    fn pin(borrow this, extents: Slice<ExtentRef>) -> Result<ReadPin, AllocError> {
-        // `pin` is declared before `guard`, so on an early return the guard unlocks before the pin's drop locks.
-        var pin = ReadPin { table: this.table.clone(), ids: Vector<u64>.create() };
-        var guard = this.table.get().lock();
-        let t = guard.data();
-        for (i in 0..extents.length) {
-            let id = extents[i].id;
-            // The pin lists only what it counted, so a failure part way releases exactly that.
-            pin.ids.push(id)?;
-            var counted = false;
-            match (t.counts.getMut(borrow id)) {
-                Some(c) => {
-                    * c += 1;
-                    counted = true;
-                }
-                null => {}
+    /// Pins the version made of `extents` (not empty) for one reader.
+    fn pin(borrow mut this, extents: Slice<ExtentRef>) -> Result<ReadPin, AllocError> {
+        if (this.counts.length() > PIN_PRUNE_ABOVE) { this.prune(); }
+        match (this.counts.get(borrow extents[0].id)) {
+            Some(c) => {
+                c.get().fetchAdd(1);
+                return Ok(ReadPin { count: c.clone() });
             }
-            if (!counted) {
-                match (t.counts.put(id, 1)) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let _ = pin.ids.pop();
-                        return Err(e);
-                    }
+            null => {}
+        }
+        let count = Arc<AtomicU64>.create(AtomicU64.create(0))?;
+        for (i in 0..extents.length) {
+            match (this.counts.put(extents[i].id, count.clone())) {
+                Ok(_) => {}
+                Err(e) => {
+                    // Not every extent is reachable: take none, so no reap can see a partial pin.
+                    for (k in 0..i) { let _ = this.counts.remove(borrow extents[k].id); }
+                    return Err(e);
                 }
             }
         }
-        return Ok(pin);
+        count.get().fetchAdd(1);
+        return Ok(ReadPin { count: count });
     }
 
     /// Whether a reader may still open extent `id`.
-    fn isPinned(borrow this, id: u64) -> bool {
-        var guard = this.table.get().lock();
-        return guard.data().counts.contains(borrow id);
+    fn isPinned(borrow this, id: u64) -> bool => match (this.counts.get(borrow id)) {
+        Some(c) => c.get().load() > 0,
+        null => false,
+    };
+
+    /// Forgets the versions no reader holds.
+    fn prune(borrow mut this) {
+        var idle = Vector<u64>.create();
+        for (i in 0..this.counts.length()) {
+            if (this.counts.valueAt(i).get().load() == 0) {
+                match (idle.push(this.counts.keyAt(i))) {
+                    Ok() => {}
+                    Err(_) => { break; }
+                }
+            }
+        }
+        for (id in idle.view()) { let _ = this.counts.remove(borrow id); }
     }
 
-    /// The number of pinned extents.
+    /// The number of extents that open readers pin.
     fn pinnedCount(borrow this) -> usize {
-        var guard = this.table.get().lock();
-        return guard.data().counts.length();
+        var n: usize = 0;
+        for (i in 0..this.counts.length()) {
+            if (this.counts.valueAt(i).get().load() > 0) { n += 1; }
+        }
+        return n;
     }
 }
 
-/// One reader's pins; dropping it releases them. It does no I/O: the store unlinks what is left.
+/// Above this many entries, `pin` first forgets the idle ones.
+const PIN_PRUNE_ABOVE: usize = 4096;
+
+/// One reader's pin; dropping it counts down. No lock and no I/O: the store unlinks what is left.
 @noncopy
 struct ReadPin {
-    private table: Arc<Mutex<PinTable>>;
-    private ids: Vector<u64>;
+    private count: Arc<AtomicU64>;
 
     drop {
-        var guard = this.table.get().lock();
-        let t = guard.data();
-        for (id in this.ids.view()) {
-            var zero = false;
-            match (t.counts.getMut(borrow id)) {
-                Some(c) => {
-                    * c -= 1;
-                    zero = * c == 0;
-                }
-                null => {}
-            }
-            if (zero) { let _ = t.counts.remove(borrow id); }
-        }
+        this.count.get().fetchSub(1);
     }
 }
 

@@ -1,0 +1,312 @@
+// Multipart upload tests (ADR-0009): completing, the checks, recovery and checkpoints, aborts, bucket deletes, and
+// listings.
+
+fn uploadConfig() -> StoreConfig {
+    var config = storeConfig();
+    config.minPartBytes = 50000;
+    return config;
+}
+
+/// Writes one part through a part writer and commits it.
+fn sendPart(
+    s: borrow mut ObjectStore,
+    bucket: StringView,
+    key: StringView,
+    id: [u8; 16],
+    number: u32,
+    data: Slice<u8>,
+) -> Result<[u8; 16], StoreError> {
+    var w = s.newPartWriter()?;
+    sio(w.write(data))?;
+    let obj = sio(w.finish())?;
+    return s.putPart(bucket, key, id, number, borrow obj);
+}
+
+fn choice(number: u32, md5: [u8; 16]) -> PartChoice => PartChoice { number: number, md5: md5 };
+
+@test
+fn uploadCompleteServesTheNamedParts() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("upload-complete");
+    let whole = patterned(100000, 41);
+    let first = whole.view()[0..70000];
+    let second = whole.view()[70000..];
+    var etag = [0u8; 16];
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        s.createBucket("bkt")!;
+        putText(mut s, "bkt", "big", "the previous version");
+        let id = s.createUpload("bkt", "big", "video/mp4")!;
+        let m1 = sendPart(mut s, "bkt", "big", id, 1, first)!;
+        // Part 2 twice: the second replaces the first, whose extent goes at once.
+        let _ = sendPart(mut s, "bkt", "big", id, 2, patterned(30000, 7).view())!;
+        let m2 = sendPart(mut s, "bkt", "big", id, 2, second)!;
+        let _ = sendPart(mut s, "bkt", "big", id, 3, patterned(10000, 8).view())!; // never named
+        Check.equalU64(4, extentFiles(dir.view()))?;                               // 70000 is two 64 KiB extents, then one each
+        let parts = s.listParts("bkt", "big", id, 0, 1000)!;
+        Check.equalU64(3, parts.parts.length as u64)?;
+        Check.equalU64(30000, parts.parts[1].size)?;
+        let chosen = [choice(1, m1), choice(2, m2)];
+        let outcome = s.completeUpload("bkt", "big", id, chosen[..])!;
+        let md5s = [m1, m2];
+        etag = multipartEtag(md5s[..]);
+        Check.equalBytes(etag[..], outcome.md5[..])?;
+        Check.equalU64(2, outcome.parts as u64)?;
+        Check.equalBytes(whole.view(), s.getObject("bkt", "big")!.view())?;
+        Check.equalBytes(whole.view()[65000..75000], s.getObjectRange("bkt", "big", 65000, 75000)!.view())?;
+        let info = s.headObject("bkt", "big")!;
+        Check.equalU64(100000, info.size)?;
+        Check.equalU64(2, info.parts as u64)?;
+        Check.equalText("video/mp4", StringView.fromUtf8(info.contentType.view())!)?;
+        // Part 3 is gone, and so is the upload.
+        Check.equalU64(3, extentFiles(dir.view()))?;
+        Check.equalU64(0, s.uploadCount() as u64)?;
+        match (s.listParts("bkt", "big", id, 0, 1000)) {
+            Err(StoreError.NoSuchUpload) => {}
+            _ => { return Check.fail("a completed upload is gone"); }
+        }
+        let report = s.verify()!;
+        Check.equalU64(0, report.problems.length as u64)?;
+        Check.equalU64(0, report.orphanExtents as u64)?;
+        let page = s.listObjects("bkt", "", "", "".bytes(), false, 10)!;
+        Check.equalU64(2, page.parts[0] as u64)?;
+    }
+    // The journal, then a checkpoint, give the same object.
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        Check.equalBytes(whole.view(), s.getObject("bkt", "big")!.view())?;
+        let info = s.headObject("bkt", "big")!;
+        Check.equalBytes(etag[..], info.md5[..])?;
+        Check.equalU64(2, info.parts as u64)?;
+        Check.equalU64(3, extentFiles(dir.view()))?;
+        if (round == 0) { let _ = s.checkpoint()!; }
+    }
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        s.deleteObject("bkt", "big")!;
+        Check.equalU64(0, extentFiles(dir.view()))?;
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn uploadRefusals() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("upload-refusals");
+    var s = ObjectStore.open(dir.view(), uploadConfig())!;
+    s.createBucket("bkt")!;
+    match (s.createUpload("none", "k", "")) {
+        Err(StoreError.NoSuchBucket) => {}
+        _ => { return Check.fail("an upload needs its bucket"); }
+    }
+    let id = s.createUpload("bkt", "k", "")!;
+    let m1 = sendPart(mut s, "bkt", "k", id, 1, patterned(60000, 1).view())!;
+    let m2 = sendPart(mut s, "bkt", "k", id, 2, patterned(20000, 2).view())!;
+    let m3 = sendPart(mut s, "bkt", "k", id, 3, patterned(60000, 3).view())!;
+    let files = extentFiles(dir.view());
+    // Parts for no upload, another key, or a bad number are refused, and their extents removed.
+    var other = id;
+    other[0] ^= 0xFF;
+    match (sendPart(mut s, "bkt", "k", other, 1, patterned(70000, 4).view())) {
+        Err(StoreError.NoSuchUpload) => {}
+        _ => { return Check.fail("a part of an unknown upload"); }
+    }
+    match (sendPart(mut s, "bkt", "other-key", id, 1, patterned(70000, 4).view())) {
+        Err(StoreError.NoSuchUpload) => {}
+        _ => { return Check.fail("a part for another key"); }
+    }
+    match (sendPart(mut s, "bkt", "k", id, 0, patterned(70000, 4).view())) {
+        Err(StoreError.InvalidPartNumber) => {}
+        _ => { return Check.fail("part number 0"); }
+    }
+    match (sendPart(mut s, "bkt", "k", id, 10001, patterned(70000, 4).view())) {
+        Err(StoreError.InvalidPartNumber) => {}
+        _ => { return Check.fail("part number 10001"); }
+    }
+    Check.equalU64(files, extentFiles(dir.view()))?;
+    // Completion checks; none of them changes anything.
+    let none: Slice<PartChoice> = [];
+    match (s.completeUpload("bkt", "k", id, none)) {
+        Err(StoreError.InvalidPart) => {}
+        _ => { return Check.fail("no parts"); }
+    }
+    let backwards = [choice(2, m2), choice(1, m1)];
+    match (s.completeUpload("bkt", "k", id, backwards[..])) {
+        Err(StoreError.InvalidPartOrder) => {}
+        _ => { return Check.fail("parts out of order"); }
+    }
+    let twice = [choice(1, m1), choice(1, m1)];
+    match (s.completeUpload("bkt", "k", id, twice[..])) {
+        Err(StoreError.InvalidPartOrder) => {}
+        _ => { return Check.fail("a part twice"); }
+    }
+    let wrongEtag = [choice(1, m2)];
+    match (s.completeUpload("bkt", "k", id, wrongEtag[..])) {
+        Err(StoreError.InvalidPart) => {}
+        _ => { return Check.fail("a part with another ETag"); }
+    }
+    let missing = [choice(1, m1), choice(4, m3)];
+    match (s.completeUpload("bkt", "k", id, missing[..])) {
+        Err(StoreError.InvalidPart) => {}
+        _ => { return Check.fail("a part never uploaded"); }
+    }
+    let small = [choice(1, m1), choice(2, m2), choice(3, m3)];
+    match (s.completeUpload("bkt", "k", id, small[..])) {
+        Err(StoreError.EntityTooSmall) => {}
+        _ => { return Check.fail("a small part that is not the last"); }
+    }
+    match (s.completeUpload("bkt", "other-key", id, small[..])) {
+        Err(StoreError.NoSuchUpload) => {}
+        _ => { return Check.fail("completing for another key"); }
+    }
+    Check.equalU64(1, s.uploadCount() as u64)?;
+    Check.equalU64(files, extentFiles(dir.view()))?;
+    // A small last part is fine; so is leaving a part out.
+    let skip = [choice(1, m1), choice(3, m3)];
+    let _ = s.completeUpload("bkt", "k", id, skip[..])!;
+    var expected = patterned(60000, 1);
+    expected.extend(patterned(60000, 3).view())!;
+    Check.equalBytes(expected.view(), s.getObject("bkt", "k")!.view())?;
+    match (s.completeUpload("bkt", "k", id, skip[..])) {
+        Err(StoreError.NoSuchUpload) => {}
+        _ => { return Check.fail("completing twice"); }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn uploadAbortAndBucketDelete() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("upload-abort");
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        s.createBucket("bkt")!;
+        s.createBucket("tmp")!;
+        let id = s.createUpload("bkt", "k", "")!;
+        let _ = sendPart(mut s, "bkt", "k", id, 1, patterned(70000, 1).view())!;
+        let _ = sendPart(mut s, "bkt", "k", id, 2, patterned(1000, 2).view())!;
+        Check.isTrue(extentFiles(dir.view()) > 0, "parts are extents")?;
+        s.abortUpload("bkt", "k", id)!;
+        Check.equalU64(0, extentFiles(dir.view()))?;
+        match (s.abortUpload("bkt", "k", id)) {
+            Err(StoreError.NoSuchUpload) => {}
+            _ => { return Check.fail("aborting twice"); }
+        }
+        match (sendPart(mut s, "bkt", "k", id, 3, patterned(1000, 3).view())) {
+            Err(StoreError.NoSuchUpload) => {}
+            _ => { return Check.fail("a part after the abort"); }
+        }
+        Check.equalU64(0, extentFiles(dir.view()))?;
+        // An upload does not keep its bucket: deleting the bucket drops it.
+        let gone = s.createUpload("tmp", "k", "")!;
+        let _ = sendPart(mut s, "tmp", "k", gone, 1, patterned(5000, 4).view())!;
+        s.deleteBucket("tmp")!;
+        Check.equalU64(0, s.uploadCount() as u64)?;
+        Check.equalU64(0, extentFiles(dir.view()))?;
+        s.createBucket("tmp")!;
+        match (s.listParts("tmp", "k", gone, 0, 10)) {
+            Err(StoreError.NoSuchUpload) => {}
+            _ => { return Check.fail("a recreated bucket does not inherit uploads"); }
+        }
+    }
+    let s = ObjectStore.open(dir.view(), uploadConfig())!;
+    Check.equalU64(0, s.uploadCount() as u64)?;
+    Check.equalU64(0, extentFiles(dir.view()))?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn uploadSurvivesRestartAndCheckpoint() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("upload-restart");
+    var id = [0u8; 16];
+    var m1 = [0u8; 16];
+    var m2 = [0u8; 16];
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        s.createBucket("bkt")!;
+        id = s.createUpload("bkt", "k", "text/plain")!;
+        m1 = sendPart(mut s, "bkt", "k", id, 1, patterned(70000, 1).view())!;
+    }
+    {
+        // From the journal.
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        Check.equalU64(1, s.listParts("bkt", "k", id, 0, 10)!.parts.length as u64)?;
+        Check.equalU64(2, extentFiles(dir.view()))?; // the orphan sweep kept the part's extents
+        let _ = s.checkpoint()!;
+        m2 = sendPart(mut s, "bkt", "k", id, 2, patterned(3000, 2).view())!;
+    }
+    {
+        // From the checkpoint, then the journal after it.
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        let parts = s.listParts("bkt", "k", id, 0, 10)!;
+        Check.equalU64(2, parts.parts.length as u64)?;
+        Check.equalBytes(m2[..], parts.parts[1].md5[..])?;
+        Check.equalU64(3, extentFiles(dir.view()))?;
+        let _ = s.checkpoint()!; // both parts in a checkpoint
+        let report = s.verify()!;
+        Check.equalU64(0, report.orphanExtents as u64)?;
+    }
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        Check.equalU64(3, extentFiles(dir.view()))?;
+        let chosen = [choice(1, m1), choice(2, m2)];
+        let _ = s.completeUpload("bkt", "k", id, chosen[..])!;
+    }
+    let s = ObjectStore.open(dir.view(), uploadConfig())!;
+    var expected = patterned(70000, 1);
+    expected.extend(patterned(3000, 2).view())!;
+    Check.equalBytes(expected.view(), s.getObject("bkt", "k")!.view())?;
+    Check.equalU64(0, s.uploadCount() as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn uploadListings() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("upload-list");
+    var s = ObjectStore.open(dir.view(), uploadConfig())!;
+    s.createBucket("bkt")!;
+    s.createBucket("other")!;
+    let b1 = s.createUpload("bkt", "b", "")!;
+    let a1 = s.createUpload("bkt", "a", "")!;
+    let b2 = s.createUpload("bkt", "b", "")!;
+    let _ = s.createUpload("bkt", "x/c", "")!;
+    let _ = s.createUpload("other", "a", "")!;
+    let all = s.listUploads("bkt", "".bytes(), "".bytes(), null, 1000)!;
+    Check.equalU64(4, all.uploads.length as u64)?;
+    Check.equalBytes(a1[..], all.uploads[0].id[..])?;
+    Check.equalBytes("b".bytes(), all.uploads[1].key.view())?;
+    Check.equalBytes("x/c".bytes(), all.uploads[3].key.view())?;
+    Check.isTrue(!all.truncated, "not truncated")?;
+    // Pages: two, then from the second's key and id.
+    let first = s.listUploads("bkt", "".bytes(), "".bytes(), null, 2)!;
+    Check.isTrue(first.truncated, "a page of two is truncated")?;
+    let last = borrow first.uploads[1];
+    let rest = s.listUploads("bkt", "".bytes(), last.key.view(), last.id, 1000)!;
+    Check.equalU64(2, rest.uploads.length as u64)?;
+    Check.equalBytes(all.uploads[2].id[..], rest.uploads[0].id[..])?;
+    // A key marker alone skips that key's uploads; a prefix narrows.
+    let afterB = s.listUploads("bkt", "".bytes(), "b".bytes(), null, 1000)!;
+    Check.equalU64(1, afterB.uploads.length as u64)?;
+    let prefixed = s.listUploads("bkt", "x/".bytes(), "".bytes(), null, 1000)!;
+    Check.equalU64(1, prefixed.uploads.length as u64)?;
+    // Both of key b's uploads are listed whichever was made first.
+    Check.isTrue(
+        (all.uploads[1].id[..] == b1[..] && all.uploads[2].id[..] == b2[..]) ||
+            (all.uploads[1].id[..] == b2[..] && all.uploads[2].id[..] == b1[..]),
+        "key b's two uploads",
+    )?;
+    // Part listings page by part number.
+    let _ = sendPart(mut s, "bkt", "a", a1, 3, patterned(10, 1).view())!;
+    let _ = sendPart(mut s, "bkt", "a", a1, 1, patterned(10, 2).view())!;
+    let _ = sendPart(mut s, "bkt", "a", a1, 2, patterned(10, 3).view())!;
+    let p = s.listParts("bkt", "a", a1, 0, 2)!;
+    Check.isTrue(p.truncated, "two of three parts")?;
+    Check.equalU64(1, p.parts[0].number as u64)?;
+    Check.equalU64(2, p.parts[1].number as u64)?;
+    let q = s.listParts("bkt", "a", a1, 2, 2)!;
+    Check.isTrue(!q.truncated, "the last part")?;
+    Check.equalU64(3, q.parts[0].number as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}

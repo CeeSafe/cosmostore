@@ -219,15 +219,15 @@ deadlocks. **Passed** (7 Nov 2026: 186 SIGKILLs, used/live at most 119%, recover
 
 ### M3: S3 core compatibility, the first alpha (8–10 wk)
 
-- HTTP on CeeSafe.Web with path-style and virtual-host addressing.
+- HTTP on CeeSafe.Web with path-style and virtual-host addressing. Path-style **done** (slice 1, ADR-0008).
 - SigV4 header/query auth, presigned URLs, **aws-chunked and trailing checksums** (#4),
-  and POST policy.
-- Bucket CRUD, ListBuckets, GetBucketLocation.
+  and POST policy. Header auth, aws-chunked and trailing checksums **done** (slice 1).
+- Bucket CRUD, ListBuckets, GetBucketLocation. **Done** (slice 1).
 - PUT/GET/HEAD/DELETE, DeleteObjects, CopyObject, Range, conditional GET/PUT via CAS.
-- ListObjects v1/v2 with delimiter, continuation-token, start-after and encoding-type.
+- ListObjects v1/v2 with delimiter, continuation-token, start-after and encoding-type. **Done** (slice 1).
 - ETag semantics, checksum headers, exact XML errors.
 - Multipart: create, upload, upload-copy, list, complete, abort, sharing the extent
-  machinery.
+  machinery. **Done** except upload-copy (slice 2, ADR-0009).
 - Static credentials file and a minimal bucket policy (owner-only), with private buckets
   by default.
 - CI matrix: AWS CLI v2, boto3, Go/Java/.NET SDKs, rclone, plus the relevant subset of
@@ -530,3 +530,73 @@ Next: the rest of M2 (space reserve, fsck), or the CeeSafe.Web spike → S3 HTTP
   - With the pin check removed, all three tests fail.
 - **Tests:** 60 pass.
 - **M2 is complete.** Next: M3, the S3 HTTP layer. It must drop a reader when its client disconnects.
+
+### 7 Nov 2026: M3 slice 1, the S3 HTTP layer (ADR-0008)
+
+`cosmostore serve <dir> <port> <credentials-file>` serves the store over S3 on CeeSafe.Web (`web_server` 0.3.1,
+HTTP/1.1, path-style addressing). Stock AWS CLI v2 works against it.
+- **Concurrency:** one `AsyncMutex<ObjectStore>`, with every store call inside `Async.blocking`. Bodies stream on
+  worker threads without the lock, and only the commit takes it.
+- **Authentication:**
+  - SigV4 header auth against a static credentials file;
+  - `x-amz-content-sha256` as a hex digest, `UNSIGNED-PAYLOAD`, signed aws-chunked (each chunk's signature checked)
+    and unsigned aws-chunked with a trailer;
+  - `Content-MD5` and `x-amz-checksum-{crc32,crc32c,crc64nvme,sha256}` are all checked before the commit.
+- **Operations:**
+  - buckets: ListBuckets, CreateBucket, HeadBucket, DeleteBucket, GetBucketLocation;
+  - objects: PutObject (`If-None-Match: *`, `If-Match` as a CAS), GetObject and HeadObject (Range, the four
+    conditionals, `response-*`), DeleteObject;
+  - listing: ListObjects v1 and v2 (delimiter, pagination, `encoding-type=url`);
+  - errors: S3's XML.
+- **Store changes:**
+  - reader pins are atomic counts, and an abandoned writer queues its extents for the store. Neither drop blocks,
+    which the compiler (N0295) enforced (ADR-0007 amendment);
+  - `ListPage` carries ETags and modification times.
+- **Tests:**
+  - 7 unit tests, including AWS's published SigV4 and chunked-upload signatures;
+  - `tools/s3_smoke.sh`, 42 checks with the AWS CLI and `tools/s3_raw.py`, ending in a clean fsck;
+  - `ceesafec test`: 67 pass.
+- **Gap:** CEESAFE_GAPS G26, no CRC-32 (IEEE) in lib/std, so it is plain CeeSafe in `src/s3/crc32.cee`.
+- **M3 left:**
+  - multipart (`aws s3 cp` over 8 MB needs it), CopyObject, DeleteObjects;
+  - presigned URLs, POST policy, virtual-host addressing;
+  - user metadata, bucket creation dates, response checksums;
+  - binding beyond loopback, and TLS;
+  - the SDK matrix (boto3, Go, Java, .NET, rclone) and the s3-tests subset.
+
+### 8 Nov 2026: M3 slice 2, multipart upload (ADR-0009)
+
+Create, UploadPart, Complete, Abort, ListParts and ListMultipartUploads, in the store and over S3. `aws s3 cp` of
+files over 8 MB now works.
+- **Store:**
+  - four journal records (codes 9 to 12): upload create, part, abort, and complete;
+  - `StoreState.uploads`, rebuilt by `applyRecord` like everything else (`src/store/uploads.cee`);
+  - parts are always extents, durable before their record. Complete writes one self-contained record with the
+    named parts' manifest, so the parts' extents become the object's without a copy;
+  - parts that are replaced, left out of the completion, aborted, or in a deleted bucket are reaped once the record
+    that drops them is durable. Part extents are live for the orphan sweep and fsck, and count in `usedBytes`.
+- **Checkpoint format 2:** an upload count in the header, a part count on each object, and upload entries. Format 1
+  still loads, checked with a store written by the previous build.
+- **ETags:** a multipart object's ETag is `"<md5 of the part md5s>-N"`, in PUT, GET/HEAD, listings and `If-Match`.
+  fsck checks a multipart object's size and extent CRCs, since its stored MD5 is the ETag's.
+- **S3:** UploadPart shares PutObject's body path (aws-chunked, `Content-MD5`, `x-amz-checksum-*`), and Complete's
+  body is checked against `x-amz-content-sha256`. New errors: `NoSuchUpload`, `InvalidPart`, `InvalidPartOrder`,
+  `EntityTooSmall` and `MalformedXML`.
+- **Tests:**
+  - 5 store tests (`upload_tests.cee`): completion, refusals, abort and bucket delete, restart and checkpoints, and
+    listings;
+  - fault sweeps of a multipart workload: once, sticky, torn, crash, and crash during open. The sweeps now also
+    check that the extent directory holds exactly the versions' and the uploads' extents. With upload parts left out
+    of the orphan sweep's live set, six tests fail;
+  - 2 S3 unit tests: the Complete body parser, and multipart ETags and upload ids;
+  - `tools/s3_smoke.sh`: 62 checks, up from 42. They include `aws s3 cp` of 20 MB both ways with the exact `-3`
+    ETag, a range across parts, and every multipart call and refusal by hand;
+  - `ceesafec test`: 81 pass.
+- **Measured** (macOS laptop, loopback): `aws s3 cp` of 256 MiB (32 parts) takes 1.6 s up and 0.75 s down.
+- **M3 left:**
+  - CopyObject and UploadPartCopy, DeleteObjects;
+  - presigned URLs, POST policy, virtual-host addressing;
+  - user metadata, bucket creation dates, response checksums;
+  - expiring abandoned uploads;
+  - binding beyond loopback, and TLS;
+  - the SDK matrix (boto3, Go, Java, .NET, rclone) and the s3-tests subset.

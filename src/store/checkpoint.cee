@@ -9,28 +9,31 @@
 // than fall back, because segments it covered may already be gone. Little-endian:
 //
 // Header (64 bytes):
-//   0 u64 magic "CSCKPT01"   8 u16 format (1)   10 u16 header length (64)   12 u32 flags (0)
+//   0 u64 magic "CSCKPT01"   8 u16 format (2; 1 still loads)   10 u16 header length (64)   12 u32 flags (0)
 //  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count   48 i64 created ms
-//  56 u32 reserved   60 u32 crc32c of bytes 0..60
-// Entries, buckets first: u8 kind (1 bucket, 2 object), u32 body length, body.
+//  56 u32 upload count (format 2; reserved, 0, in format 1)   60 u32 crc32c of bytes 0..60
+// Entries, buckets, then objects, then uploads: u8 kind (1 bucket, 2 object, 3 upload), u32 body length, body.
 //   bucket: u16+bytes name, i64 created ms
 //   object: u16+bytes bucket, u16+bytes key, 16 version id, u64 lsn, u64 size, i64 mtime ms,
 //           16 md5, u16+bytes content type, u64 payload segment, u64 payload offset,
 //           u32 payload length, u64 record segment, u32 record length, manifest (u32 count,
-//           then u64 id, u64 length, u32 crc32c per extent)
+//           then u64 id, u64 length, u32 crc32c per extent), and in format 2 a u32 part count (ADR-0009)
+//   upload (format 2): 16 upload id, u16+bytes bucket, u16+bytes key, i64 initiated ms, u16+bytes content type,
+//           u32 part count, then per part u32 number, u64 size, 16 md5, i64 mtime ms, manifest
 // Trailer (16 bytes): u32 "CKND", u32 crc32c of every entry byte, u64 entry count.
 
 const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 1;
+const CHECKPOINT_FORMAT: u16 = 2;
 const CHECKPOINT_BUCKET: u8 = 1;
 const CHECKPOINT_OBJECT: u8 = 2;
+const CHECKPOINT_UPLOAD: u8 = 3;
 const CHECKPOINT_IO_CHUNK: usize = 1048576;
-/// No single entry is larger: a key and content type of at most 1 KiB each, and a manifest
-/// of at most 5 GiB / 64 KiB extents.
-const CHECKPOINT_MAX_ENTRY: usize = 2097152;
+/// No single entry is larger: an upload of 10,000 parts of 5 GiB each, every part in 64 MiB extents, needs about
+/// 16 MiB.
+const CHECKPOINT_MAX_ENTRY: usize = 33554432;
 
 /// `<dir>/ckpt-<lsn>.ck`, or `.tmp` while it is being written.
 fn checkpointPath(dir: StringView, lsn: u64, temporary: bool) -> Result<String, AllocError> {
@@ -113,7 +116,7 @@ struct CheckpointWriter {
     }
 }
 
-fn encodeCheckpointHeader(lsn: u64, segment: u64, buckets: u64, objects: u64) -> [u8; 64] {
+fn encodeCheckpointHeader(lsn: u64, segment: u64, buckets: u64, objects: u64, uploads: u32) -> [u8; 64] {
     var h = [0u8; 64];
     h.writeLE(0, CHECKPOINT_MAGIC);
     h.writeLE(8, CHECKPOINT_FORMAT);
@@ -124,6 +127,7 @@ fn encodeCheckpointHeader(lsn: u64, segment: u64, buckets: u64, objects: u64) ->
     h.writeLE(32, buckets);
     h.writeLE(40, objects);
     h.writeLE(48, Clock.unixMillis());
+    h.writeLE(56, uploads);
     let crc = Crc32c.of(h[0..60]);
     h.writeLE(60, crc);
     return h;
@@ -149,6 +153,26 @@ fn encodeObjectEntry(
     out.pushLE(v.recordSegment)?;
     out.pushLE(v.recordLength)?;
     encodeManifest(out, v.extents.view())?;
+    out.pushLE(v.parts)?;
+    return Ok();
+}
+
+fn encodeUploadEntry(out: borrow mut Vector<u8>, id: [u8; 16], u: borrow Upload) -> Result<void, AllocError> {
+    out.clear();
+    out.extend(id[..])?;
+    pushText16(out, u.bucket.view())?;
+    pushText16(out, u.key.view())?;
+    out.pushLE(u.initiatedMillis)?;
+    pushText16(out, u.contentType.view())?;
+    out.pushLE(truncate<u32>(u.parts.length))?;
+    for (i in 0..u.parts.length) {
+        let p = borrow u.parts[i];
+        out.pushLE(p.number)?;
+        out.pushLE(p.size)?;
+        out.extend(p.md5[..])?;
+        out.pushLE(p.mtimeMillis)?;
+        encodeManifest(out, p.extents.view())?;
+    }
     return Ok();
 }
 
@@ -181,7 +205,13 @@ fn writeCheckpoint(dir: StringView, lsn: u64, segment: u64, state: borrow StoreS
 
 fn writeCheckpointFile(path: StringView, lsn: u64, segment: u64, state: borrow StoreState) -> Result<u64, StoreError> {
     let file = sio(DurableFile.createNew(path))?;
-    let header = encodeCheckpointHeader(lsn, segment, state.buckets.length() as u64, state.index.length() as u64);
+    let header = encodeCheckpointHeader(
+        lsn,
+        segment,
+        state.buckets.length() as u64,
+        state.index.length() as u64,
+        truncate<u32>(state.uploads.length()),
+    );
     sio(file.writeAt(header[..], 0))?;
     var w = CheckpointWriter {
         file: file,
@@ -204,6 +234,10 @@ fn writeCheckpointFile(path: StringView, lsn: u64, segment: u64, state: borrow S
         let v = state.index.valueAt(i);
         encodeObjectEntry(mut body, k, v)?;
         w.add(CHECKPOINT_OBJECT, body.view())?;
+    }
+    for (i in 0..state.uploads.length()) {
+        encodeUploadEntry(mut body, state.uploads.keyAt(i).id, state.uploads.valueAt(i))?;
+        w.add(CHECKPOINT_UPLOAD, body.view())?;
     }
     w.buffer.pushLE(CHECKPOINT_TRAILER_MAGIC)?;
     w.buffer.pushLE(w.crc.finish())?;
@@ -264,7 +298,7 @@ fn corrupt<T>(r: Result<T, MetaFault>) -> Result<T, StoreError> => match (r) {
     Err(_) => Err(StoreError.CheckpointCorrupt),
 };
 
-fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState) -> Result<void, StoreError> {
+fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16) -> Result<void, StoreError> {
     var at: usize = 0;
     let bucket = corrupt(readText16(bytes, mut at))?;
     let key = corrupt(readText16(bytes, mut at))?;
@@ -281,7 +315,11 @@ fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState) -> Result<v
     let recordSegment = bytes.readLE<u64>(at + 20);
     let recordLength = bytes.readLE<u32>(at + 28);
     at += 32;
-    let extents = corrupt(decodeManifest(bytes[at..]))?;
+    let extents = corrupt(decodeManifestPrefix(bytes[at..]))?;
+    at += manifestLength(extents.length);
+    var parts: u32 = 0;
+    if (format >= 2) { parts = corrupt(readU32(bytes, mut at))?; }
+    if (at != bytes.length) { return Err(StoreError.CheckpointCorrupt); }
     if (!state.hasBucket(bucket.view())?) { return Err(StoreError.CheckpointCorrupt); }
     state.bumpObjects(bucket.view(), true)?;
     let version = ObjectVersion {
@@ -296,10 +334,48 @@ fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState) -> Result<v
         recordSegment: recordSegment,
         recordLength: recordLength,
         extents: extents,
+        parts: parts,
     };
     state.extentBytes += extentFileBytes(borrow version);
     match (state.index.put(IndexKey { bucket: bucket, key: key }, version)?) {
         Some(_) => { return Err(StoreError.CheckpointCorrupt); } // a key twice
+        null => {}
+    }
+    return Ok();
+}
+
+fn decodeUploadEntry(bytes: Slice<u8>, state: borrow mut StoreState) -> Result<void, StoreError> {
+    var at: usize = 0;
+    let id = corrupt(readId16(bytes, mut at))?;
+    let bucket = corrupt(readText16(bytes, mut at))?;
+    let key = corrupt(readText16(bytes, mut at))?;
+    let initiated = corrupt(readI64(bytes, mut at))?;
+    let contentType = corrupt(readText16(bytes, mut at))?;
+    let count = corrupt(readU32(bytes, mut at))?;
+    if (!state.hasBucket(bucket.view())?) { return Err(StoreError.CheckpointCorrupt); }
+    var parts = Vector<UploadedPart>.create();
+    for (i in 0..count) {
+        let number = corrupt(readU32(bytes, mut at))?;
+        let size = corrupt(readU64(bytes, mut at))?;
+        let md5 = corrupt(readId16(bytes, mut at))?;
+        let mtime = corrupt(readI64(bytes, mut at))?;
+        let extents = corrupt(decodeManifestPrefix(bytes[at..]))?;
+        at += manifestLength(extents.length);
+        let n = parts.length;
+        if (n > 0 && parts[n - 1].number >= number) { return Err(StoreError.CheckpointCorrupt); }
+        state.extentBytes += extentRefBytes(extents.view());
+        parts.push(UploadedPart { number: number, size: size, md5: md5, mtimeMillis: mtime, extents: extents })?;
+    }
+    if (at != bytes.length) { return Err(StoreError.CheckpointCorrupt); }
+    let upload = Upload {
+        bucket: bucket,
+        key: key,
+        contentType: contentType,
+        initiatedMillis: initiated,
+        parts: parts,
+    };
+    match (state.uploads.put(UploadKey { id: id }, upload)?) {
+        Some(_) => { return Err(StoreError.CheckpointCorrupt); } // an upload twice
         null => {}
     }
     return Ok();
@@ -314,24 +390,27 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
     r.ensure(CHECKPOINT_HEADER_LEN)?;
     let h = r.take(CHECKPOINT_HEADER_LEN);
     if (h.readLE<u32>(60) != Crc32c.of(h[0..60])) { return Err(StoreError.CheckpointCorrupt); }
-    if (h.readLE<u64>(0) != CHECKPOINT_MAGIC || h.readLE<u16>(8) != CHECKPOINT_FORMAT) {
+    let format = h.readLE<u16>(8);
+    if (h.readLE<u64>(0) != CHECKPOINT_MAGIC || format < 1 || format > CHECKPOINT_FORMAT) {
         return Err(StoreError.CheckpointCorrupt);
     }
     if (h.readLE<u64>(16) != lsn) { return Err(StoreError.CheckpointCorrupt); }
     let segment = h.readLE<u64>(24);
     let buckets = h.readLE<u64>(32);
     let objects = h.readLE<u64>(40);
+    let uploads = if (format >= 2) h.readLE<u32>(56) as u64 else 0;
     var state = StoreState.create();
     var crc = Crc32c.create();
     var entries: u64 = 0;
-    while (entries < buckets + objects) {
+    while (entries < buckets + objects + uploads) {
         r.ensure(5)?;
         let prefix = r.take(5);
         let kind = prefix[0];
         let length = prefix.readLE<u32>(1) as usize;
         crc.update(prefix);
         if (length > CHECKPOINT_MAX_ENTRY) { return Err(StoreError.CheckpointCorrupt); }
-        let expected = if (entries < buckets) CHECKPOINT_BUCKET else CHECKPOINT_OBJECT;
+        let expected = if (entries < buckets) CHECKPOINT_BUCKET else if (entries <
+            buckets + objects) CHECKPOINT_OBJECT else CHECKPOINT_UPLOAD;
         if (kind != expected) { return Err(StoreError.CheckpointCorrupt); }
         r.ensure(length)?;
         let body = r.take(length);
@@ -345,8 +424,10 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
                 Some(_) => { return Err(StoreError.CheckpointCorrupt); }
                 null => {}
             }
+        } else if (kind == CHECKPOINT_OBJECT) {
+            decodeObjectEntry(body, mut state, format)?;
         } else {
-            decodeObjectEntry(body, mut state)?;
+            decodeUploadEntry(body, mut state)?;
         }
         entries += 1;
     }

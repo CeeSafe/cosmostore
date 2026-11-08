@@ -1,0 +1,360 @@
+// The S3 layer's pure parts (ADR-0008 Tests): SigV4 against AWS's published examples, the aws-chunked decoder split
+// at every byte, encodings and CRC-32.
+
+const EXAMPLE_SECRET: StringView = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+
+fn pair(name: StringView, value: StringView) -> HeaderPair {
+    var p = HeaderPair { name: Vector<u8>.create(), value: Vector<u8>.create() };
+    p.name.extend(name.bytes())!;
+    p.value.extend(value.bytes())!;
+    return p;
+}
+
+fn utf8(v: borrow Vector<u8>) -> StringView => StringView.fromUtf8(v.view()) ?? "<not utf-8>";
+
+/// The "GET Object" example of AWS's SigV4 header-auth documentation.
+@test
+fn sigv4GetObjectExample() -> Result<void, TestFailure> {
+    var headers = Vector<HeaderPair>.create();
+    headers.push(pair("host", "examplebucket.s3.amazonaws.com"))!;
+    headers.push(pair("range", "bytes=0-9"))!;
+    headers.push(pair("x-amz-content-sha256", EMPTY_SHA256))!;
+    headers.push(pair("x-amz-date", "20130524T000000Z"))!;
+    var canonical = Vector<u8>.create();
+    let ok = canonicalRequest(
+        "GET".bytes(),
+        "/test.txt".bytes(),
+        "".bytes(),
+        headers.view(),
+        "host;range;x-amz-content-sha256;x-amz-date".bytes(),
+        EMPTY_SHA256.bytes(),
+        mut canonical,
+    )!;
+    Check.isTrue(ok, "every signed header is present")?;
+    let key = signingKey(EXAMPLE_SECRET.bytes(), "20130524".bytes(), "us-east-1".bytes(), "s3".bytes())!;
+    var sig = Vector<u8>.create();
+    seedSignature(
+        borrow key,
+        "20130524T000000Z".bytes(),
+        "20130524/us-east-1/s3/aws4_request".bytes(),
+        canonical.view(),
+        mut sig,
+    )!;
+    Check.equalText("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41", utf8(borrow sig))?;
+    return Ok();
+}
+
+/// The parts of an Authorization value.
+@test
+fn sigv4ParsesAuthorization() -> Result<void, TestFailure> {
+    let value =
+        "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41";
+    let auth = match (parseAuthorization(value.bytes())) {
+        Ok(a) => a,
+        Err(_) => { return Check.fail("a valid Authorization value"); }
+    };
+    Check.equalText("AKIAIOSFODNN7EXAMPLE", utf8(borrow auth.accessKey))?;
+    Check.equalText("20130524/us-east-1/s3/aws4_request", utf8(borrow auth.scope))?;
+    Check.equalText("us-east-1", utf8(borrow auth.region))?;
+    Check.equalText("s3", utf8(borrow auth.service))?;
+    Check.equalText("host;range;x-amz-content-sha256;x-amz-date", utf8(borrow auth.signedHeaders))?;
+    match (parseAuthorization("AWS4-HMAC-SHA256 Credential=x".bytes())) {
+        Err(AuthFault.Malformed) => {}
+        _ => { return Check.fail("a truncated value is malformed"); }
+    }
+    return Ok();
+}
+
+/// The query is decoded, encoded again and sorted.
+@test
+fn sigv4CanonicalQuery() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    canonicalQuery("prefix=a%2Fb&list-type=2&delimiter=/&max-keys=10&acl".bytes(), mut out)!;
+    Check.equalText("acl=&delimiter=%2F&list-type=2&max-keys=10&prefix=a%2Fb", utf8(borrow out))?;
+    return Ok();
+}
+
+/// AWS's chunked-upload example (PUT /examplebucket/chunkObject.txt, 65536 + 1024 bytes of 'a').
+@test
+fn sigv4ChunkedUploadExample() -> Result<void, TestFailure> {
+    var headers = Vector<HeaderPair>.create();
+    headers.push(pair("host", "s3.amazonaws.com"))!;
+    headers.push(pair("x-amz-date", "20130524T000000Z"))!;
+    headers.push(pair("x-amz-storage-class", "REDUCED_REDUNDANCY"))!;
+    headers.push(pair("content-encoding", "aws-chunked"))!;
+    headers.push(pair("x-amz-decoded-content-length", "66560"))!;
+    headers.push(pair("content-length", "66824"))!;
+    headers.push(pair("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"))!;
+    var canonical = Vector<u8>.create();
+    let ok = canonicalRequest(
+        "PUT".bytes(),
+        "/examplebucket/chunkObject.txt".bytes(),
+        "".bytes(),
+        headers.view(),
+        "content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-storage-class".bytes(),
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".bytes(),
+        mut canonical,
+    )!;
+    Check.isTrue(ok, "every signed header is present")?;
+    let key = signingKey(EXAMPLE_SECRET.bytes(), "20130524".bytes(), "us-east-1".bytes(), "s3".bytes())!;
+    let scope = "20130524/us-east-1/s3/aws4_request";
+    var seed = Vector<u8>.create();
+    seedSignature(borrow key, "20130524T000000Z".bytes(), scope.bytes(), canonical.view(), mut seed)!;
+    Check.equalText("4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9", utf8(borrow seed))?;
+
+    var signer = exampleSigner(borrow key, borrow seed);
+    var sig = Vector<u8>.create();
+    var data = Vector<u8>.create();
+    for (i in 0..65536) { data.push('a')!; }
+    signer.next(Sha256.of(data.view()), mut sig)!;
+    Check.equalText("ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648", utf8(borrow sig))?;
+    signer.next(Sha256.of(data.view()[0..1024]), mut sig)!;
+    Check.equalText("0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497", utf8(borrow sig))?;
+    signer.next(Sha256.of("".bytes()), mut sig)!;
+    Check.equalText("b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9", utf8(borrow sig))?;
+    return Ok();
+}
+
+fn exampleSigner(key: borrow [u8; 32], seed: borrow Vector<u8>) -> ChunkSigner {
+    var s = ChunkSigner {
+        key: * key,
+        amzDate: Vector<u8>.create(),
+        scope: Vector<u8>.create(),
+        previous: Vector<u8>.create(),
+    };
+    s.amzDate.extend("20130524T000000Z".bytes())!;
+    s.scope.extend("20130524/us-east-1/s3/aws4_request".bytes())!;
+    s.previous.extend(seed.view())!;
+    return s;
+}
+
+/// A signed aws-chunked body of `data` in chunks of `chunk` bytes, with a signed CRC-32 trailer if `trailer`.
+fn signedBody(data: Slice<u8>, chunk: usize, signer: borrow mut ChunkSigner, trailer: bool) -> Vector<u8> {
+    var body = Vector<u8>.create();
+    var sig = Vector<u8>.create();
+    var at: usize = 0;
+    while (true) {
+        let n = if (data.length - at < chunk) data.length - at else chunk;
+        let piece = data[at..at + n];
+        signer.next(Sha256.of(piece), mut sig)!;
+        appendHexNumber(mut body, n as u64);
+        body.extend(";chunk-signature=".bytes())!;
+        body.extend(sig.view())!;
+        body.extend("\r\n".bytes())!;
+        if (n == 0) { break; }
+        body.extend(piece)!;
+        body.extend("\r\n".bytes())!;
+        at += n;
+    }
+    if (trailer) {
+        var crc = Crc32.create();
+        crc.update(data);
+        var line = Vector<u8>.create();
+        line.extend("x-amz-checksum-crc32:".bytes())!;
+        appendBase64(mut line, crc32Bytes(crc.finish())[..])!;
+        line.push('\n')!;
+        signer.trailer(line.view(), mut sig)!;
+        body.extend(line.view()[0..line.length - 1])!;
+        body.extend("\r\nx-amz-trailer-signature:".bytes())!;
+        body.extend(sig.view())!;
+        body.extend("\r\n".bytes())!;
+    }
+    body.extend("\r\n".bytes())!;
+    return body;
+}
+
+fn appendHexNumber(out: borrow mut Vector<u8>, v: u64) {
+    let digits = "0123456789abcdef".bytes();
+    var tmp = [0u8; 16];
+    var i: usize = 16;
+    var n = v;
+    while (true) {
+        i -= 1;
+        tmp[i] = digits[(n & 15) as usize];
+        n = n >> 4;
+        if (n == 0) { break; }
+    }
+    out.extend(tmp[i..16])!;
+}
+
+/// Decodes `body` fed in two pieces split at `split`, or one byte at a time when `split` is null.
+fn decodeSplit(
+    body: Slice<u8>,
+    split: usize?,
+    signer: ChunkSigner?,
+    out: borrow mut Vector<u8>,
+) -> Result<ChunkDecoder, ChunkFault> {
+    var d = ChunkDecoder.create(signer);
+    match (split) {
+        Some(at) => {
+            d.feed(body[0..at], out)?;
+            d.feed(body[at..], out)?;
+        }
+        null => {
+            for (i in 0..body.length) { d.feed(body[i..i + 1], out)?; }
+        }
+    }
+    return Ok(d);
+}
+
+@test
+fn chunkedSignedBodySplitAnywhere() -> Result<void, TestFailure> {
+    let key = signingKey(EXAMPLE_SECRET.bytes(), "20130524".bytes(), "us-east-1".bytes(), "s3".bytes())!;
+    var seed = Vector<u8>.create();
+    seed.extend("4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9".bytes())!;
+    var data = Vector<u8>.create();
+    for (i in 0..300) { data.push(truncate<u8>(i * 7))!; }
+    for (withTrailer in [false, true]) {
+        var maker = exampleSigner(borrow key, borrow seed);
+        let body = signedBody(data.view(), 128, mut maker, withTrailer);
+        for (split in 0..body.length + 1) {
+            var out = Vector<u8>.create();
+            let d = match (decodeSplit(body.view(), split, exampleSigner(borrow key, borrow seed), mut out)) {
+                Ok(d) => d,
+                Err(_) => { return Check.fail("a valid signed body is refused"); }
+            };
+            Check.isTrue(d.isDone(), "the decoder reaches the end")?;
+            Check.equalBytes(data.view(), out.view())?;
+        }
+        var out = Vector<u8>.create();
+        let d = decodeSplit(body.view(), null, exampleSigner(borrow key, borrow seed), mut out);
+        Check.isTrue(d.isOk(), "byte at a time")?;
+        Check.equalBytes(data.view(), out.view())?;
+        // Any flipped data byte breaks a chunk signature.
+        var bad = Vector<u8>.create();
+        bad.extend(body.view())!;
+        let mid = bad.length / 2;
+        bad[mid] = bad[mid] ^ 1;
+        var out2 = Vector<u8>.create();
+        match (decodeSplit(bad.view(), 7, exampleSigner(borrow key, borrow seed), mut out2)) {
+            Ok(_) => { return Check.fail("a changed body passes"); }
+            Err(_) => {}
+        }
+    }
+    return Ok();
+}
+
+@test
+fn chunkedUnsignedTrailer() -> Result<void, TestFailure> {
+    let body = "5\r\nhello\r\n6\r\n world\r\n0\r\nx-amz-checksum-crc32:DUoRhQ==\r\n\r\n";
+    for (split in 0..body.length + 1) {
+        var out = Vector<u8>.create();
+        let d = match (decodeSplit(body.bytes(), split, null, mut out)) {
+            Ok(d) => d,
+            Err(_) => { return Check.fail("a valid unsigned body is refused"); }
+        };
+        Check.isTrue(d.isDone(), "done")?;
+        Check.equalBytes("hello world".bytes(), out.view())?;
+        var v = Vector<u8>.create();
+        Check.isTrue(trailerValue(d.trailers(), "x-amz-checksum-crc32", mut v)!, "the trailer is kept")?;
+        Check.equalText("DUoRhQ==", utf8(borrow v))?;
+    }
+    // CRC-32 of "hello world" is 0x0D4A1185.
+    var crc = Crc32.create();
+    crc.update("hello world".bytes());
+    Check.equalU64(0x0D4A1185, crc.finish() as u64)?;
+    var out = Vector<u8>.create();
+    match (decodeSplit("5\r\nhelloXX".bytes(), 3, null, mut out)) {
+        Err(ChunkFault.Malformed) => {}
+        _ => { return Check.fail("data not followed by CRLF"); }
+    }
+    return Ok();
+}
+
+@test
+fn encodingsAndCrc32() -> Result<void, TestFailure> {
+    var crc = Crc32.create();
+    crc.update("123456789".bytes());
+    Check.equalU64(0xCBF43926, crc.finish() as u64)?;
+    var b = Vector<u8>.create();
+    appendBase64(mut b, "any carnal pleas".bytes())!;
+    Check.equalText("YW55IGNhcm5hbCBwbGVhcw==", utf8(borrow b))?;
+    var back = Vector<u8>.create();
+    Check.isTrue(decodeBase64(b.view(), mut back)!, "decodes")?;
+    Check.equalBytes("any carnal pleas".bytes(), back.view())?;
+    back.clear();
+    Check.isTrue(!decodeBase64("abc".bytes(), mut back)!, "unpadded is refused")?;
+    var u = Vector<u8>.create();
+    appendUriEncoded(mut u, "a b/c+d~é".bytes(), true)!;
+    Check.equalText("a%20b/c%2Bd~%C3%A9", utf8(borrow u))?;
+    var x = Vector<u8>.create();
+    appendXmlEscaped(mut x, "<a&'\">".bytes())!;
+    Check.equalText("&lt;a&amp;&apos;&quot;&gt;", utf8(borrow x))?;
+    Check.equalI64(1369353600, parseAmzDate("20130524T000000Z".bytes()) ?? 0)?;
+    Check.equalI64(784111777, parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT".bytes()) ?? 0)?;
+    var iso = Vector<u8>.create();
+    appendIso8601(mut iso, 1369353600123)!;
+    Check.equalText("2013-05-24T00:00:00.123Z", utf8(borrow iso))?;
+    var hd = Vector<u8>.create();
+    appendHttpDate(mut hd, 784111777)!;
+    Check.equalText("Sun, 06 Nov 1994 08:49:37 GMT", utf8(borrow hd))?;
+    return Ok();
+}
+
+@test
+fn completeBodyParses() -> Result<void, TestFailure> {
+    // As the AWS CLI sends it: a namespace, quoted ETags (raw or escaped), and checksum elements to ignore.
+    let xml = """
+        <CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Part><ETag>"0123456789abcdef0123456789abcdef"</ETag><ChecksumCRC32>AAAAAA==</ChecksumCRC32><PartNumber>1</PartNumber></Part>
+          <Part>
+            <PartNumber> 2 </PartNumber>
+            <ETag>&quot;FEDCBA9876543210fedcba9876543210&quot;</ETag>
+          </Part>
+        </CompleteMultipartUpload>
+        """;
+    let parts = match (parseCompleteBody(xml.bytes())) {
+        Ok(p) => p,
+        Err(_) => { return Check.fail("the body parses"); }
+    };
+    Check.equalU64(2, parts.length as u64)?;
+    Check.equalU64(1, parts[0].number as u64)?;
+    Check.equalU64(0x01, parts[0].md5[0] as u64)?;
+    Check.equalU64(2, parts[1].number as u64)?;
+    Check.equalU64(0xFE, parts[1].md5[0] as u64)?;
+    Check.equalU64(0x10, parts[1].md5[15] as u64)?;
+    let bad = [
+        "<CompleteMultipartUpload></CompleteMultipartUpload>",
+        "<CompleteMultipartUpload><Part><PartNumber>x</PartNumber><ETag>\"0123456789abcdef0123456789abcdef\"</ETag></Part></CompleteMultipartUpload>",
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>",
+        "<Other><Part><PartNumber>1</PartNumber><ETag>\"0123456789abcdef0123456789abcdef\"</ETag></Part></Other>",
+    ];
+    for (b in bad) {
+        match (parseCompleteBody(b.bytes())) {
+            Err(S3Fail.Code(S3Code.MalformedXML)) => {}
+            _ => { return Check.fail("a malformed body is MalformedXML"); }
+        }
+    }
+    match (parseCompleteBody(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>nope</ETag></Part></CompleteMultipartUpload>".bytes(),
+    )) {
+        Err(S3Fail.Code(S3Code.InvalidPart)) => {}
+        _ => { return Check.fail("an unreadable ETag is InvalidPart"); }
+    }
+    return Ok();
+}
+
+@test
+fn multipartEtagsAndUploadIds() -> Result<void, TestFailure> {
+    var md5 = [0u8; 16];
+    md5[0] = 0xAB;
+    var text = Vector<u8>.create();
+    appendEtag(mut text, borrow md5, 3)!;
+    Check.equalBytes("\"ab000000000000000000000000000000-3\"".bytes(), text.view())?;
+    let parsed = parseEtag(text.view())!;
+    Check.equalU64(3, parsed.parts as u64)?;
+    Check.isTrue(etagListMatches(text.view(), borrow md5, 3), "the multipart ETag matches")?;
+    Check.isTrue(!etagListMatches(text.view(), borrow md5, 0), "not as a single-part ETag")?;
+    Check.isTrue(!etagListMatches("\"ab000000000000000000000000000000\"".bytes(), borrow md5, 3), "nor the reverse")?;
+    Check.isTrue(parseEtag("\"ab000000000000000000000000000000-0\"".bytes()).isNull(), "0 parts")?;
+    Check.isTrue(parseEtag("\"ab000000000000000000000000000000-\"".bytes()).isNull(), "no count")?;
+    Check.isTrue(parseEtag("\"ab000000000000000000000000000000x3\"".bytes()).isNull(), "no dash")?;
+    var id = [0u8; 16];
+    id[1] = 0x5C;
+    text.clear();
+    appendUploadId(mut text, borrow id)!;
+    Check.equalU64(32, text.length as u64)?;
+    Check.equalBytes(id[..], parseUploadId(text.view())![..])?;
+    Check.isTrue(parseUploadId("abc".bytes()).isNull(), "a short id")?;
+    return Ok();
+}
