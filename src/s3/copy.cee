@@ -81,6 +81,15 @@ struct CopyPlan {
     reader: ObjectReader?;
     writer: ObjectWriter;
     size: u64;
+    /// The checksum the copy gets (ADR-0015).
+    algorithm: ChecksumAlgorithm;
+}
+
+/// A finished copy and its checksum, raw.
+struct CopyResult {
+    finished: FinishedObject;
+    algorithm: ChecksumAlgorithm;
+    checksum: Vector<u8>;
 }
 
 /// Under the lock: the source exists and meets its conditions, the range is in it, the size is admitted at the
@@ -138,7 +147,36 @@ fn planCopy(
             Err(e) => { return Err(storeFail(e, src.key.length)); }
         };
     }
-    return Ok(CopyPlan { source: info, reader: reader, writer: writer, size: size });
+    // A part takes its upload's algorithm. An object takes the one the request names, else the source's (if it is one
+    // part), else CRC64NVME, as S3 does.
+    var algorithm = ChecksumAlgorithm.Crc64Nvme;
+    match (target) {
+        CopyTarget.Part(_) => { algorithm = store.uploadAlgorithm(uploadId); }
+        CopyTarget.Object => {
+            match (headerOf(req, "x-amz-checksum-algorithm")) {
+                Some(t) => {
+                    algorithm = match (checksumFromName(t)) {
+                        Ok(a) => a,
+                        Err(code) => { return Err(S3Fail.Code(code)); }
+                    };
+                }
+                null => {
+                    match (decodeExtras(info.extras.view())) {
+                        Ok(e) => {
+                            match (e.algorithm) {
+                                ChecksumAlgorithm.None => {}
+                                _ => {
+                                    if (e.partSizes.length == 0) { algorithm = e.algorithm; }
+                                }
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    return Ok(CopyPlan { source: info, reader: reader, writer: writer, size: size, algorithm: algorithm });
 }
 
 async fn openCopy(
@@ -157,17 +195,22 @@ async fn openCopy(
 fn copyStep(
     reader: borrow mut ObjectReader,
     writer: borrow mut ObjectWriter,
+    sum: borrow mut RunningChecksum,
     buf: SliceMut<u8>,
 ) -> Result<usize, StoreError> {
     let n = reader.read(buf)?;
-    if (n > 0) { sio(writer.write(buf[0..n]))?; }
+    if (n > 0) {
+        sum.update(buf[0..n]);
+        sio(writer.write(buf[0..n]))?;
+    }
     return Ok(n);
 }
 
 /// Streams the planned bytes into the writer and finishes it. The reader (and its pins) goes when this returns.
-async fn runCopy(plan: CopyPlan) -> Result<FinishedObject, S3Fail> {
+async fn runCopy(plan: CopyPlan) -> Result<CopyResult, S3Fail> {
     var p = plan;
     var writer = p.writer;
+    var sum = RunningChecksum.create(p.algorithm);
     match (p.reader.asBorrowMut()) {
         Some(reader) => {
             var buf = Vector<u8>.create();
@@ -175,7 +218,7 @@ async fn runCopy(plan: CopyPlan) -> Result<FinishedObject, S3Fail> {
             var copied: u64 = 0;
             while (true) {
                 let chunk = buf.viewMut();
-                let step = await Async.blocking(() => copyStep(reader, mut writer, chunk));
+                let step = await Async.blocking(() => copyStep(reader, mut writer, mut sum, chunk));
                 let n = match (step) {
                     Ok(n) => n,
                     Err(e) => { return Err(storeFail(e, 0)); }
@@ -187,10 +230,13 @@ async fn runCopy(plan: CopyPlan) -> Result<FinishedObject, S3Fail> {
         }
         null => {}
     }
-    return match (await Async.blocking(() => writer.finish())) {
-        Ok(f) => Ok(f),
-        Err(f) => Err(storeFail(StoreError.Io(f), 0)),
+    let finished = match (await Async.blocking(() => writer.finish())) {
+        Ok(f) => f,
+        Err(f) => { return Err(storeFail(StoreError.Io(f), 0)); }
     };
+    var checksum = Vector<u8>.create();
+    sum.finishInto(mut checksum)?;
+    return Ok(CopyResult { finished: finished, algorithm: p.algorithm, checksum: checksum });
 }
 
 /// `<CopyObjectResult>` or `<CopyPartResult>`: the new ETag and modification time.
@@ -198,6 +244,7 @@ async fn sendCopyResult(
     exchange: borrow mut Exchange,
     element: StringView,
     md5: borrow [u8; 16],
+    extras: Slice<u8>,
 ) -> Result<void, S3Fail> {
     var body = Vector<u8>.create();
     xmlHead(mut body, element)?;
@@ -205,6 +252,7 @@ async fn sendCopyResult(
     appendIso8601(mut body, Clock.unixMillis())?;
     body.extend("</LastModified>".bytes())?;
     xmlEtag(mut body, md5, 0)?;
+    xmlChecksum(mut body, extras)?;
     body.extend("</".bytes())?;
     body.extend(element.bytes())?;
     body.extend(">".bytes())?;
@@ -242,18 +290,21 @@ async fn copyObject(app: borrow S3App, req: borrow S3Request, exchange: borrow m
         appendUtf8(mut contentType, plan.source.contentType.view())?;
         metadata.extend(plan.source.metadata.view())?;
     }
-    let finished = await runCopy(plan)?;
+    let copied = await runCopy(plan)?;
+    var extras = Vector<u8>.create();
+    singlePartExtras(copied.algorithm, copied.checksum.view(), mut extras)?;
     let outcome = await commitPut(
         app,
         req.bucket.view(),
         req.key.view(),
         contentType.view(),
         metadata.view(),
-        borrow finished,
+        extras.view(),
+        borrow copied.finished,
         PutIf.None,
         "".bytes(),
     )?;
-    return await sendCopyResult(exchange, "CopyObjectResult", borrow outcome.md5);
+    return await sendCopyResult(exchange, "CopyObjectResult", borrow outcome.md5, outcome.extras.view());
 }
 
 async fn uploadPartCopy(
@@ -265,7 +316,18 @@ async fn uploadPartCopy(
     let id = uploadIdOf(req)?;
     let src = copySourceOf(req)?;
     let plan = await openCopy(app, req, borrow src, CopyTarget.Part(number), id)?;
-    let finished = await runCopy(plan)?;
-    let md5 = await commitPart(app, req.bucket.view(), req.key.view(), id, number, borrow finished)?;
-    return await sendCopyResult(exchange, "CopyPartResult", borrow md5);
+    let copied = await runCopy(plan)?;
+    let md5 = await commitPart(
+        app,
+        req.bucket.view(),
+        req.key.view(),
+        id,
+        number,
+        copied.checksum.view(),
+        borrow copied.finished,
+    )?;
+    // A part's checksum, alone: COMPOSITE parts have no type of their own to show.
+    var extras = Vector<u8>.create();
+    singlePartExtras(copied.algorithm, copied.checksum.view(), mut extras)?;
+    return await sendCopyResult(exchange, "CopyPartResult", borrow md5, extras.view());
 }

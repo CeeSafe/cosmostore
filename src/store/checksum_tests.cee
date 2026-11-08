@@ -1,0 +1,127 @@
+// Stored checksums and part layouts (ADR-0015), through PUT, multipart completion, the journal and checkpoints.
+
+fn sendCheckedPart(
+    s: borrow mut ObjectStore,
+    id: [u8; 16],
+    number: u32,
+    algorithm: ChecksumAlgorithm,
+    data: Slice<u8>,
+) -> Result<[u8; 16], StoreError> {
+    var w = s.newPartWriter()?;
+    sio(w.write(data))?;
+    let obj = sio(w.finish())?;
+    let sum = checksumOf(algorithm, data)?;
+    return s.putPartWith("bkt", "k", id, number, sum.view(), borrow obj);
+}
+
+fn named(number: u32, md5: [u8; 16], checksum: Slice<u8>) -> PartChoice {
+    var c = PartChoice { number: number, md5: md5, checksum: [0u8; 32], checksumLength: truncate<u8>(checksum.length) };
+    c.checksum[0..checksum.length].copyFrom(checksum);
+    return c;
+}
+
+@test
+fn checksumsAndLayoutsSurvive() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("checksums");
+    let a = patterned(70000, 1);
+    let b = patterned(30000, 2);
+    var whole = Vector<u8>.create();
+    whole.extend(a.view())!;
+    whole.extend(b.view())!;
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        s.createBucket("bkt")!;
+        // One PUT with its checksum.
+        var single = Vector<u8>.create();
+        var e = ObjectExtras.none();
+        e.algorithm = ChecksumAlgorithm.Crc32c;
+        e.value = checksumOf(ChecksumAlgorithm.Crc32c, a.view())!;
+        e.encode(mut single)!;
+        var w = s.newWriter()!;
+        w.write(a.view())!;
+        let obj = w.finish()!;
+        let _ = s.putFinishedWith("bkt", "one", "", "".bytes(), single.view(), borrow obj, PutCondition.None)!;
+        // A FULL_OBJECT CRC64NVME upload: the object's CRC is the CRC of all its bytes.
+        let id = s.createUploadWith("bkt", "k", "", "".bytes(), ChecksumAlgorithm.Crc64Nvme, ChecksumType.FullObject)!;
+        let m1 = sendCheckedPart(mut s, id, 1, ChecksumAlgorithm.Crc64Nvme, a.view())!;
+        let m2 = sendCheckedPart(mut s, id, 2, ChecksumAlgorithm.Crc64Nvme, b.view())!;
+        let c1 = checksumOf(ChecksumAlgorithm.Crc64Nvme, a.view())!;
+        let c2 = checksumOf(ChecksumAlgorithm.Crc64Nvme, b.view())!;
+        let full = checksumOf(ChecksumAlgorithm.Crc64Nvme, whole.view())!;
+        let chosen = [named(1, m1, c1.view()), named(2, m2, c2.view())];
+        // A wrong expected checksum, and a part named with another checksum, are refused, and nothing is written.
+        match (s.completeUploadIf("bkt", "k", id, chosen[..], PutCondition.None, c1.view())) {
+            Err(StoreError.BadDigest) => {}
+            _ => { return Check.fail("a wrong object checksum"); }
+        }
+        let wrongPart = [named(1, m1, c2.view()), named(2, m2, c2.view())];
+        match (s.completeUploadIf("bkt", "k", id, wrongPart[..], PutCondition.None, "".bytes())) {
+            Err(StoreError.InvalidPart) => {}
+            _ => { return Check.fail("a part named with another checksum"); }
+        }
+        let done = s.completeUploadIf("bkt", "k", id, chosen[..], PutCondition.None, full.view())!;
+        let got = decodeExtras(done.extras.view())!;
+        Check.equalBytes(full.view(), got.value.view())?;
+        // A COMPOSITE SHA-256 upload: the checksum of the parts' checksums.
+        let cid = s.createUploadWith("bkt", "k", "", "".bytes(), ChecksumAlgorithm.Sha256, ChecksumType.Composite)!;
+        let n1 = sendCheckedPart(mut s, cid, 1, ChecksumAlgorithm.Sha256, a.view())!;
+        let n2 = sendCheckedPart(mut s, cid, 2, ChecksumAlgorithm.Sha256, b.view())!;
+        var both = checksumOf(ChecksumAlgorithm.Sha256, a.view())!;
+        both.extend(checksumOf(ChecksumAlgorithm.Sha256, b.view())!.view())!;
+        let none: Slice<u8> = [];
+        let plain = [named(1, n1, none), named(2, n2, none)];
+        let ok = s.completeUploadIf("bkt", "k", cid, plain[..], PutCondition.None, "".bytes())!;
+        let composite = decodeExtras(ok.extras.view())!;
+        Check.equalBytes(checksumOf(ChecksumAlgorithm.Sha256, both.view())!.view(), composite.value.view())?;
+        var shown = Vector<u8>.create();
+        composite.display(mut shown)!;
+        Check.isTrue(shown.view()[shown.length - 2..] == "-2".bytes(), "a composite checksum shows its part count")?;
+        // Parts without checksums give the layout alone.
+        let lid = s.createUpload("bkt", "plain", "")!;
+        let p1 = sendPart(mut s, "bkt", "plain", lid, 1, a.view())!;
+        let p2 = sendPart(mut s, "bkt", "plain", lid, 2, b.view())!;
+        let pc = [choice(1, p1), choice(2, p2)];
+        let layout = decodeExtras(s.completeUpload("bkt", "plain", lid, pc[..])!.extras.view())!;
+        Check.isTrue(sameAlgorithm(ChecksumAlgorithm.None, layout.algorithm), "no checksum")?;
+        Check.equalU64(2, layout.partSizes.length as u64)?;
+        Check.equalU64(30000, layout.partSizes[1])?;
+    }
+    // The journal, then a checkpoint, keep every version's extras.
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        let one = decodeExtras(s.headObject("bkt", "one")!.extras.view())!;
+        Check.equalBytes(checksumOf(ChecksumAlgorithm.Crc32c, a.view())!.view(), one.value.view())?;
+        let k = decodeExtras(s.headObject("bkt", "k")!.extras.view())!;
+        Check.isTrue(sameAlgorithm(ChecksumAlgorithm.Sha256, k.algorithm), "the composite upload is current")?;
+        Check.equalU64(2, k.partSizes.length as u64)?;
+        Check.equalU64(64, k.partChecksums.length as u64)?;
+        Check.equalBytes(whole.view(), s.getObject("bkt", "k")!.view())?;
+        if (round == 0) { let _ = s.checkpoint()!; }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn uploadChecksumsSurviveACheckpoint() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("upload-checksums");
+    var id = [0u8; 16];
+    let a = patterned(70000, 3);
+    var m1 = [0u8; 16];
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        s.createBucket("bkt")!;
+        id = s.createUploadWith("bkt", "k", "", "".bytes(), ChecksumAlgorithm.Crc32, ChecksumType.FullObject)!;
+        m1 = sendCheckedPart(mut s, id, 1, ChecksumAlgorithm.Crc32, a.view())!;
+        let _ = s.checkpoint()!;
+    }
+    var s = ObjectStore.open(dir.view(), uploadConfig())!;
+    let parts = s.listParts("bkt", "k", id, 0, 10)!;
+    Check.isTrue(sameAlgorithm(ChecksumAlgorithm.Crc32, parts.algorithm), "the upload's algorithm")?;
+    Check.equalBytes(checksumOf(ChecksumAlgorithm.Crc32, a.view())!.view(), parts.parts[0].checksum.view())?;
+    let chosen = [choice(1, m1)];
+    let done = decodeExtras(s.completeUpload("bkt", "k", id, chosen[..])!.extras.view())!;
+    Check.equalBytes(checksumOf(ChecksumAlgorithm.Crc32, a.view())!.view(), done.value.view())?;
+    removeTree(dir.view());
+    return Ok();
+}

@@ -76,6 +76,8 @@ enum StoreError {
     InvalidPartNumber,
     /// The stored fields are larger than MAX_METADATA_BYTES (ADR-0012).
     MetadataTooLarge,
+    /// A completed object's checksum is not the one the client named (ADR-0015).
+    BadDigest,
 }
 
 fn sio<T>(r: Result<T, IoFailure>) -> Result<T, StoreError> => match (r) {
@@ -149,12 +151,16 @@ struct ObjectInfo {
     parts: u32;
     /// User metadata and stored headers (ADR-0012), as a blob (`metadataPairs` reads it).
     metadata: Vector<u8>;
+    /// The checksum and part layout (ADR-0015), as a blob (`decodeExtras` reads it).
+    extras: Vector<u8>;
 }
 
 struct PutOutcome {
     md5: [u8; 16];
     generation: u64;
     parts: u32;
+    /// The version's checksum and part layout (ADR-0015).
+    extras: Vector<u8>;
 }
 
 /// One page of a listing: keys and rolled-up common prefixes, both in byte order.
@@ -440,6 +446,7 @@ fn applyPut(
         extents: extents,
         parts: parts,
         metadata: m.metadata,
+        extras: m.extras,
     };
     let key = IndexKey { bucket: m.bucket, key: m.key };
     match (state.index.put(key, version)?) {
@@ -944,15 +951,17 @@ struct ObjectStore {
         obj: borrow FinishedObject,
         condition: PutCondition,
     ) -> Result<PutOutcome, StoreError> =>
-        this.putFinishedWith(bucket, key, contentType, "".bytes(), obj, condition);
+        this.putFinishedWith(bucket, key, contentType, "".bytes(), "".bytes(), obj, condition);
 
-    /// `putFinished` with stored fields: a blob from `metadataAdd` (ADR-0012).
+    /// `putFinished` with stored fields, a blob from `metadataAdd` (ADR-0012), and its checksum, a blob from
+    /// `ObjectExtras.encode` (ADR-0015).
     fn putFinishedWith(
         borrow mut this,
         bucket: StringView,
         key: StringView,
         contentType: StringView,
         metadata: Slice<u8>,
+        extras: Slice<u8>,
         obj: borrow FinishedObject,
         condition: PutCondition,
     ) -> Result<PutOutcome, StoreError> {
@@ -972,9 +981,9 @@ struct ObjectStore {
                 return Err(e);
             }
         }
-        let lsn = this.stageFinished(bucket, key, contentType, metadata, obj)?;
+        let lsn = this.stageFinished(bucket, key, contentType, metadata, extras, obj)?;
         this.commitStaged()?;
-        return Ok(PutOutcome { md5: obj.md5, generation: lsn, parts: 0 });
+        return Ok(PutOutcome { md5: obj.md5, generation: lsn, parts: 0, extras: copyBytes(extras)? });
     }
 
     fn checkPut(
@@ -1034,7 +1043,7 @@ struct ObjectStore {
                 return Err(e);
             }
         }
-        return this.stageFinished(bucket, key, contentType, "".bytes(), obj);
+        return this.stageFinished(bucket, key, contentType, "".bytes(), "".bytes(), obj);
     }
 
     /// Stages the record that publishes a finished object; returns its LSN (its generation).
@@ -1045,6 +1054,7 @@ struct ObjectStore {
         key: StringView,
         contentType: StringView,
         metadata: Slice<u8>,
+        extras: Slice<u8>,
         obj: borrow FinishedObject,
     ) -> Result<u64, StoreError> {
         var meta = Vector<u8>.create();
@@ -1060,6 +1070,7 @@ struct ObjectStore {
             contentType.bytes(),
             metadata,
         )?;
+        appendExtrasSection(mut meta, extras)?;
         var manifest = Vector<u8>.create();
         let kind = match (borrow obj.body) {
             ObjectBody.Inline(_) => RecordType.PutInline,
@@ -1137,6 +1148,7 @@ struct ObjectStore {
                     contentType: copyBytes(v.contentType.view())?,
                     parts: v.parts,
                     metadata: copyBytes(v.metadata.view())?,
+                    extras: copyBytes(v.extras.view())?,
                 });
             }
             null => { return Err(StoreError.NoSuchKey); }
@@ -1291,15 +1303,19 @@ struct ObjectStore {
         bucket: StringView,
         key: StringView,
         contentType: StringView,
-    ) -> Result<[u8; 16], StoreError> => this.createUploadWith(bucket, key, contentType, "".bytes());
+    ) -> Result<[u8; 16], StoreError> =>
+        this.createUploadWith(bucket, key, contentType, "".bytes(), ChecksumAlgorithm.None, ChecksumType.FullObject);
 
-    /// `createUpload` with the stored fields the completed object will have (ADR-0012).
+    /// `createUpload` with the stored fields the completed object will have (ADR-0012), and the checksum its parts
+    /// carry and how the object's comes from them (ADR-0015). A FULL_OBJECT checksum must be a CRC.
     fn createUploadWith(
         borrow mut this,
         bucket: StringView,
         key: StringView,
         contentType: StringView,
         metadata: Slice<u8>,
+        algorithm: ChecksumAlgorithm,
+        kind: ChecksumType,
     ) -> Result<[u8; 16], StoreError> {
         this.commitStaged()?;
         if (metadata.length > MAX_METADATA_BYTES) { return Err(StoreError.MetadataTooLarge); }
@@ -1323,6 +1339,8 @@ struct ObjectStore {
             Clock.unixMillis(),
             contentType.bytes(),
             metadata,
+            algorithm,
+            kind,
         )?;
         let empty = [0u8; 1];
         this.commitOne(RecordType.UploadCreate, empty[0..0])?;
@@ -1374,8 +1392,23 @@ struct ObjectStore {
         id: [u8; 16],
         number: u32,
         obj: borrow FinishedObject,
+    ) -> Result<[u8; 16], StoreError> => this.putPartWith(bucket, key, id, number, "".bytes(), obj);
+
+    /// `putPart` with the part's checksum in the upload's algorithm (ADR-0015; empty for none).
+    fn putPartWith(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16],
+        number: u32,
+        checksum: Slice<u8>,
+        obj: borrow FinishedObject,
     ) -> Result<[u8; 16], StoreError> {
         this.commitStaged()?;
+        if (checksum.length > 0 && checksum.length != checksumLength(this.uploadAlgorithm(id))) {
+            this.discardFinished(obj);
+            return Err(StoreError.InvalidPart);
+        }
         var manifest = Vector<u8>.create();
         let checked = match (borrow obj.body) {
             ObjectBody.Extents(extents) => {
@@ -1396,7 +1429,7 @@ struct ObjectStore {
             }
         }
         this.scratch.clear();
-        encodeUploadPartMeta(mut this.scratch, id, number, obj.size, obj.md5, Clock.unixMillis())?;
+        encodeUploadPartMeta(mut this.scratch, id, number, obj.size, obj.md5, Clock.unixMillis(), checksum)?;
         this.commitOne(RecordType.UploadPart, manifest.view())?;
         return Ok(obj.md5);
     }
@@ -1421,7 +1454,8 @@ struct ObjectStore {
         key: StringView,
         id: [u8; 16],
         chosen: Slice<PartChoice>,
-    ) -> Result<PutOutcome, StoreError> => this.completeUploadIf(bucket, key, id, chosen, PutCondition.None);
+    ) -> Result<PutOutcome, StoreError> =>
+        this.completeUploadIf(bucket, key, id, chosen, PutCondition.None, "".bytes());
 
     /// `completeUpload` if `condition` holds for the key's current version, checked with the commit (ADR-0014). A
     /// retry of a completion whose object is still current gets the first answer, whatever its parts and condition.
@@ -1432,11 +1466,13 @@ struct ObjectStore {
         id: [u8; 16],
         chosen: Slice<PartChoice>,
         condition: PutCondition,
+        expected: Slice<u8>,
     ) -> Result<PutOutcome, StoreError> {
         this.commitStaged()?;
         this.checkWritable()?;
         var manifest = Vector<u8>.create();
         var meta = Vector<u8>.create();
+        var extrasBlob = Vector<u8>.create();
         {
             match (this.findUpload(bucket, key, id)) {
                 Ok() => {}
@@ -1466,6 +1502,10 @@ struct ObjectStore {
             if (chosen.length == 0) { return Err(StoreError.InvalidPart); }
             var extents = Vector<ExtentRef>.create();
             var md5s = Vector<[u8; 16]>.create();
+            // The parts' sizes and checksums, for the object's checksum and its part layout (ADR-0015).
+            var extras = ObjectExtras.none();
+            let checksumBytes = checksumLength(u.checksumAlgorithm);
+            var allChecksummed = checksumBytes > 0;
             var size: u64 = 0;
             var next: usize = 0;
             for (c in 1..chosen.length) {
@@ -1480,6 +1520,16 @@ struct ObjectStore {
                 }
                 let part = borrow u.parts[next];
                 if (part.md5[..] != want.md5[..]) { return Err(StoreError.InvalidPart); }
+                let named = want.checksumLength as usize;
+                if (named > 0 && (part.checksum.length != named || part.checksum.view() != want.checksum[0..named])) {
+                    return Err(StoreError.InvalidPart);
+                }
+                extras.partSizes.push(part.size)?;
+                if (part.checksum.length == checksumBytes && checksumBytes > 0) {
+                    extras.partChecksums.extend(part.checksum.view())?;
+                } else {
+                    allChecksummed = false;
+                }
                 if (c + 1 < chosen.length && part.size < this.config.minPartBytes) {
                     return Err(StoreError.EntityTooSmall);
                 }
@@ -1488,6 +1538,20 @@ struct ObjectStore {
                 md5s.push(part.md5)?;
             }
             if (size > this.config.maxUploadBytes) { return Err(StoreError.EntityTooLarge); }
+            if (allChecksummed) {
+                extras.algorithm = u.checksumAlgorithm;
+                extras.kind = u.checksumType;
+                extras.value = multipartChecksum(
+                    u.checksumAlgorithm,
+                    u.checksumType,
+                    extras.partChecksums.view(),
+                    extras.partSizes.view(),
+                )?;
+            } else {
+                extras.partChecksums.clear(); // the layout alone
+            }
+            if (expected.length > 0 && expected != extras.value.view()) { return Err(StoreError.BadDigest); }
+            extras.encode(mut extrasBlob)?;
             encodeManifest(mut manifest, extents.view())?;
             encodeUploadCompleteMeta(
                 mut meta,
@@ -1500,6 +1564,7 @@ struct ObjectStore {
                 u.metadata.view(),
                 id,
                 truncate<u32>(chosen.length),
+                extrasBlob.view(),
             )?;
         }
         this.scratch.clear();
@@ -1510,7 +1575,7 @@ struct ObjectStore {
             Some(v) => v.md5,
             null => [0u8; 16],
         };
-        return Ok(PutOutcome { md5: md5, generation: lsn, parts: truncate<u32>(chosen.length) });
+        return Ok(PutOutcome { md5: md5, generation: lsn, parts: truncate<u32>(chosen.length), extras: extrasBlob });
     }
 
     /// The first answer to the completion of `id`, if its object is still the key's current version.
@@ -1526,7 +1591,12 @@ struct ObjectStore {
             match (this.state.index.get(borrow k)) {
                 Some(v) => {
                     if (v.lsn == c.generation) {
-                        return Ok(PutOutcome { md5: v.md5, generation: v.lsn, parts: v.parts });
+                        return Ok(PutOutcome {
+                            md5: v.md5,
+                            generation: v.lsn,
+                            parts: v.parts,
+                            extras: copyBytes(v.extras.view())?,
+                        });
                     }
                 }
                 null => {}
@@ -1624,7 +1694,12 @@ struct ObjectStore {
             Some(u) => u,
             null => { return Err(StoreError.NoSuchUpload); }
         };
-        var listing = PartListing { parts: Vector<PartSummary>.create(), truncated: false };
+        var listing = PartListing {
+            parts: Vector<PartSummary>.create(),
+            truncated: false,
+            algorithm: u.checksumAlgorithm,
+            kind: u.checksumType,
+        };
         for (i in 0..u.parts.length) {
             let p = borrow u.parts[i];
             if (p.number <= after) { continue; }
@@ -1632,12 +1707,35 @@ struct ObjectStore {
                 listing.truncated = true;
                 break;
             }
-            listing.parts.push(PartSummary { number: p.number, size: p.size, md5: p.md5, mtimeMillis: p.mtimeMillis })?;
+            listing.parts.push(PartSummary {
+                number: p.number,
+                size: p.size,
+                md5: p.md5,
+                mtimeMillis: p.mtimeMillis,
+                checksum: copyBytes(p.checksum.view())?,
+            })?;
         }
         return Ok(listing);
     }
 
     fn uploadCount(borrow this) -> usize => this.state.uploads.length();
+
+    /// The checksum algorithm and type an upload's parts carry (ADR-0015); None for an unknown upload.
+    fn uploadAlgorithm(borrow this, id: [u8; 16]) -> ChecksumAlgorithm {
+        let uk = UploadKey { id: id };
+        return match (this.state.uploads.get(borrow uk)) {
+            Some(u) => u.checksumAlgorithm,
+            null => ChecksumAlgorithm.None,
+        };
+    }
+
+    fn uploadChecksumType(borrow this, id: [u8; 16]) -> ChecksumType {
+        let uk = UploadKey { id: id };
+        return match (this.state.uploads.get(borrow uk)) {
+            Some(u) => u.checksumType,
+            null => ChecksumType.FullObject,
+        };
+    }
 
     /// The extent files the uploads' parts hold.
     fn uploadExtentCount(borrow this) -> u64 {

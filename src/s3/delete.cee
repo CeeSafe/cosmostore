@@ -8,9 +8,10 @@ const MAX_DELETE_KEYS: usize = 1000;
 /// 1,000 keys of up to 1 KiB each, escaped, and their elements.
 const MAX_DELETE_BODY: usize = 8388608;
 
-/// Checks a small body read whole against its `Content-MD5` and an `x-amz-checksum-*` field, if the request has
-/// them. A checksum in a trailer is covered by the chunk signatures, when there are any.
-fn verifySmallBody(req: borrow S3Request, body: Slice<u8>) -> Result<void, S3Fail> {
+/// Checks a small body read whole against its `Content-MD5` and, with `checksums`, an `x-amz-checksum-*` field, if
+/// the request has them. (On CompleteMultipartUpload that field is the object's checksum, not the body's.) A checksum
+/// in a trailer is covered by the chunk signatures, when there are any.
+fn verifySmallBody(req: borrow S3Request, body: Slice<u8>, checksums: bool) -> Result<void, S3Fail> {
     match (headerOf(req, "content-md5")) {
         Some(t) => {
             var raw = Vector<u8>.create();
@@ -22,12 +23,13 @@ fn verifySmallBody(req: borrow S3Request, body: Slice<u8>) -> Result<void, S3Fai
         null => {}
     }
     for (i in 0..req.headers.length) {
+        if (!checksums) { break; }
         match (checksumKindOf(req.headers[i].name.view())) {
             Ok(Some(kind)) => {
-                var sum = BodyChecksum.create(kind);
+                var sum = RunningChecksum.create(kind);
                 sum.update(body);
                 var computed = Vector<u8>.create();
-                sum.encoded(mut computed)?;
+                encodedChecksum(borrow sum, mut computed)?;
                 if (computed.view() != trimSpaces(req.headers[i].value.view())) {
                     return Err(S3Fail.Code(S3Code.BadDigest));
                 }
@@ -144,7 +146,7 @@ async fn deleteObjects(
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
     let xml = await readSmallBody(auth, exchange, MAX_DELETE_BODY)?;
-    verifySmallBody(req, xml.view())?;
+    verifySmallBody(req, xml.view(), true)?;
     let request = parseDeleteBody(xml.view())?;
     let valid = await storeDeleteMany(app, req.bucket.view(), request.keys.view())?;
     var body = Vector<u8>.create();

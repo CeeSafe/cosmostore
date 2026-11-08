@@ -1,0 +1,349 @@
+// Object checksums (ADR-0015): the algorithms S3's flexible checksums offer (but SHA-1), a version's checksum and part
+// layout as one blob (`extras`), and how a multipart object's checksum comes from its parts: COMPOSITE (the checksum
+// of the parts' checksums) or FULL_OBJECT (a CRC of every byte, combined from the parts' CRCs without reading them).
+
+enum ChecksumAlgorithm {
+    None,
+    Crc32,
+    Crc32c,
+    Crc64Nvme,
+    Sha256,
+}
+
+enum ChecksumType {
+    FullObject,
+    Composite,
+}
+
+fn checksumCode(a: ChecksumAlgorithm) -> u8 => match (a) {
+    ChecksumAlgorithm.None => 0,
+    ChecksumAlgorithm.Crc32 => 1,
+    ChecksumAlgorithm.Crc32c => 2,
+    ChecksumAlgorithm.Crc64Nvme => 3,
+    ChecksumAlgorithm.Sha256 => 4,
+};
+
+fn checksumFromCode(code: u8) -> ChecksumAlgorithm? => match (code) {
+    0 => ChecksumAlgorithm.None,
+    1 => ChecksumAlgorithm.Crc32,
+    2 => ChecksumAlgorithm.Crc32c,
+    3 => ChecksumAlgorithm.Crc64Nvme,
+    4 => ChecksumAlgorithm.Sha256,
+    _ => null,
+};
+
+/// The bytes of a checksum of `a`.
+fn checksumLength(a: ChecksumAlgorithm) -> usize => match (a) {
+    ChecksumAlgorithm.None => 0,
+    ChecksumAlgorithm.Crc32 => 4,
+    ChecksumAlgorithm.Crc32c => 4,
+    ChecksumAlgorithm.Crc64Nvme => 8,
+    ChecksumAlgorithm.Sha256 => 32,
+};
+
+fn isCrc(a: ChecksumAlgorithm) -> bool => match (a) {
+    ChecksumAlgorithm.Crc32 => true,
+    ChecksumAlgorithm.Crc32c => true,
+    ChecksumAlgorithm.Crc64Nvme => true,
+    _ => false,
+};
+
+fn sameAlgorithm(a: ChecksumAlgorithm, b: ChecksumAlgorithm) -> bool => checksumCode(a) == checksumCode(b);
+
+/// A checksum of any algorithm, computed as bytes stream past.
+struct RunningChecksum {
+    algorithm: ChecksumAlgorithm;
+    crc32: Crc32;
+    crc32c: Crc32c;
+    crc64: Crc64Nvme;
+    sha: Sha256;
+
+    fn create(algorithm: ChecksumAlgorithm) -> RunningChecksum => RunningChecksum {
+        algorithm: algorithm,
+        crc32: Crc32.create(),
+        crc32c: Crc32c.create(),
+        crc64: Crc64Nvme.create(),
+        sha: Sha256.create(),
+    };
+
+    fn update(borrow mut this, data: Slice<u8>) {
+        match (this.algorithm) {
+            ChecksumAlgorithm.None => {}
+            ChecksumAlgorithm.Crc32 => { this.crc32.update(data); }
+            ChecksumAlgorithm.Crc32c => { this.crc32c.update(data); }
+            ChecksumAlgorithm.Crc64Nvme => { this.crc64.update(data); }
+            ChecksumAlgorithm.Sha256 => { this.sha.update(data); }
+        }
+    }
+
+    /// The checksum's bytes, big-endian for a CRC, as S3 base64-encodes them.
+    fn finishInto(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        out.clear();
+        match (this.algorithm) {
+            ChecksumAlgorithm.None => {}
+            ChecksumAlgorithm.Crc32 => { out.extend(crc32Bytes(this.crc32.finish())[..])?; }
+            ChecksumAlgorithm.Crc32c => { out.extend(crc32Bytes(this.crc32c.finish())[..])?; }
+            ChecksumAlgorithm.Crc64Nvme => { out.extend(crc64Bytes(this.crc64.finish())[..])?; }
+            ChecksumAlgorithm.Sha256 => { out.extend(this.sha.finish()[..])?; }
+        }
+        return Ok();
+    }
+}
+
+fn checksumOf(algorithm: ChecksumAlgorithm, data: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var c = RunningChecksum.create(algorithm);
+    c.update(data);
+    var out = Vector<u8>.create();
+    c.finishInto(mut out)?;
+    return Ok(out);
+}
+
+// ---- Combining CRCs (zlib's crc32_combine, for any reflected CRC up to 64 bits whose init and xorout are all ones) ----
+
+fn gf2Times(mat: Slice<u64>, vec: u64) -> u64 {
+    var sum: u64 = 0;
+    var v = vec;
+    var i: usize = 0;
+    while (v != 0) {
+        if ((v & 1) != 0) { sum ^= mat[i]; }
+        v >>= 1;
+        i += 1;
+    }
+    return sum;
+}
+
+fn gf2Square(square: SliceMut<u64>, mat: Slice<u64>, width: usize) {
+    for (n in 0..width) { square[n] = gf2Times(mat, mat[n]); }
+}
+
+/// The CRC of A followed by B, from CRC(A), CRC(B) and B's length, for a reflected polynomial of `width` bits.
+fn crcCombine(crc1: u64, crc2: u64, len2: u64, poly: u64, width: usize) -> u64 {
+    if (len2 == 0) { return crc1; }
+    var even = [0u64; 64];
+    var odd = [0u64; 64];
+    // The operator for one zero bit.
+    odd[0] = poly;
+    var row: u64 = 1;
+    for (n in 1..width) {
+        odd[n] = row;
+        row <<= 1;
+    }
+    gf2Square(mut even[..], odd[..], width); // two zero bits
+    gf2Square(mut odd[..], even[..], width); // four
+    var crc = crc1;
+    var len = len2;
+    while (true) {
+        gf2Square(mut even[..], odd[..], width); // the first pass makes one zero byte
+        if ((len & 1) != 0) { crc = gf2Times(even[..], crc); }
+        len >>= 1;
+        if (len == 0) { break; }
+        gf2Square(mut odd[..], even[..], width);
+        if ((len & 1) != 0) { crc = gf2Times(odd[..], crc); }
+        len >>= 1;
+        if (len == 0) { break; }
+    }
+    return crc ^ crc2;
+}
+
+fn crcPolynomial(a: ChecksumAlgorithm) -> u64 => match (a) {
+    ChecksumAlgorithm.Crc32 => 0xEDB88320,
+    ChecksumAlgorithm.Crc32c => 0x82F63B78,
+    ChecksumAlgorithm.Crc64Nvme => 0x9A6C9329AC4BC9B5,
+    _ => 0,
+};
+
+fn readBigEndian(bytes: Slice<u8>) -> u64 {
+    var v: u64 = 0;
+    for (b in bytes) { v = (v << 8) | b as u64; }
+    return v;
+}
+
+fn appendBigEndian(out: borrow mut Vector<u8>, v: u64, length: usize) -> Result<void, AllocError> {
+    for (i in 0..length) { out.push(truncate<u8>(v >> (8 * (length - 1 - i) as u64)))?; }
+    return Ok();
+}
+
+/// A multipart object's checksum from its parts' (`values`, each `checksumLength` bytes, in order) and their sizes.
+fn multipartChecksum(
+    algorithm: ChecksumAlgorithm,
+    kind: ChecksumType,
+    values: Slice<u8>,
+    sizes: Slice<u64>,
+) -> Result<Vector<u8>, AllocError> {
+    match (kind) {
+        ChecksumType.Composite => { return checksumOf(algorithm, values); }
+        ChecksumType.FullObject => {}
+    }
+    let n = checksumLength(algorithm);
+    var out = Vector<u8>.create();
+    if (n == 0 || sizes.length == 0) { return Ok(out); }
+    let width = n * 8;
+    var crc = readBigEndian(values[0..n]);
+    for (i in 1..sizes.length) {
+        crc = crcCombine(crc, readBigEndian(values[i * n..(i + 1) * n]), sizes[i], crcPolynomial(algorithm), width);
+    }
+    appendBigEndian(mut out, crc, n)?;
+    return Ok(out);
+}
+
+// ---- A version's extras ----
+
+/// A version's checksum and, for a multipart object, its parts' sizes and checksums. Encoded (v1): u8 format (1),
+/// u8 algorithm, u8 type (0 FULL_OBJECT, 1 COMPOSITE), u8 checksum length, the checksum, u32 part count, then per part
+/// u64 size and its checksum (the algorithm's length). An empty blob: no checksum, and one part (a version written
+/// before ADR-0015).
+struct ObjectExtras {
+    algorithm: ChecksumAlgorithm;
+    kind: ChecksumType;
+    value: Vector<u8>;
+    partSizes: Vector<u64>;
+    /// Each part's checksum, `checksumLength(algorithm)` bytes each, in part order.
+    partChecksums: Vector<u8>;
+
+    fn none() -> ObjectExtras => ObjectExtras {
+        algorithm: ChecksumAlgorithm.None,
+        kind: ChecksumType.FullObject,
+        value: Vector<u8>.create(),
+        partSizes: Vector<u64>.create(),
+        partChecksums: Vector<u8>.create(),
+    };
+
+    fn encode(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        out.clear();
+        out.pushLE(1u8)?;
+        out.pushLE(checksumCode(this.algorithm))?;
+        out.pushLE(match (this.kind) {
+            ChecksumType.FullObject => 0u8,
+            ChecksumType.Composite => 1u8,
+        })?;
+        out.pushLE(truncate<u8>(this.value.length))?;
+        out.extend(this.value.view())?;
+        out.pushLE(truncate<u32>(this.partSizes.length))?;
+        let n = checksumLength(this.algorithm);
+        for (i in 0..this.partSizes.length) {
+            out.pushLE(this.partSizes[i])?;
+            out.extend(this.partChecksums.view()[i * n..(i + 1) * n])?;
+        }
+        return Ok();
+    }
+
+    /// The checksum as S3 shows it: base64, then `-N` for a COMPOSITE one of N parts.
+    fn display(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        out.clear();
+        appendBase64(out, this.value.view())?;
+        match (this.kind) {
+            ChecksumType.Composite => {
+                if (this.partSizes.length > 0) {
+                    out.push('-')?;
+                    appendDecimal(out, this.partSizes.length as u64)?;
+                }
+            }
+            ChecksumType.FullObject => {}
+        }
+        return Ok();
+    }
+}
+
+fn decodeExtras(blob: Slice<u8>) -> Result<ObjectExtras, MetaFault> {
+    var e = ObjectExtras.none();
+    if (blob.length == 0) { return Ok(e); }
+    var at: usize = 0;
+    need(blob, at, 4)?;
+    if (blob[0] != 1) { return Err(MetaFault.BadVersion); }
+    e.algorithm = match (checksumFromCode(blob[1])) {
+        Some(a) => a,
+        null => { return Err(MetaFault.BadVersion); }
+    };
+    e.kind = if (blob[2] == 1) ChecksumType.Composite else ChecksumType.FullObject;
+    let vlen = blob[3] as usize;
+    at = 4;
+    need(blob, at, vlen)?;
+    e.value.extend(blob[at..at + vlen])?;
+    at += vlen;
+    let parts = readU32(blob, mut at)?;
+    let n = checksumLength(e.algorithm);
+    for (i in 0..parts) {
+        e.partSizes.push(readU64(blob, mut at)?)?;
+        need(blob, at, n)?;
+        e.partChecksums.extend(blob[at..at + n])?;
+        at += n;
+    }
+    if (at != blob.length) { return Err(MetaFault.TooLong); }
+    return Ok(e);
+}
+
+/// An extras section in a record or checkpoint: u32 length, then the blob.
+fn appendExtrasSection(out: borrow mut Vector<u8>, extras: Slice<u8>) -> Result<void, AllocError> {
+    out.pushLE(truncate<u32>(extras.length))?;
+    out.extend(extras)?;
+    return Ok();
+}
+
+fn readExtrasSection(bytes: Slice<u8>, at: borrow mut usize) -> Result<Vector<u8>, MetaFault> {
+    let n = readU32(bytes, at)? as usize;
+    need(bytes, at, n)?;
+    let blob = copyBytes(bytes[at..at + n])?;
+    at += n;
+    let _ = decodeExtras(blob.view())?; // checked now, so reads never fail on it
+    return Ok(blob);
+}
+
+@test
+fn crcCombineMatchesWholeCrcs() -> Result<void, TestFailure> {
+    let data = patterned(100003, 7);
+    let cuts = [0usize, 1, 4096, 50000, 100002, 100003];
+    for (cut in cuts) {
+        let a = data.view()[0..cut];
+        let b = data.view()[cut..];
+        Check.equalU64(
+            readBigEndian(checksumOf(ChecksumAlgorithm.Crc32, data.view())!.view()),
+            crcCombine(
+                readBigEndian(checksumOf(ChecksumAlgorithm.Crc32, a)!.view()),
+                readBigEndian(checksumOf(ChecksumAlgorithm.Crc32, b)!.view()),
+                b.length as u64,
+                0xEDB88320,
+                32,
+            ),
+        )?;
+        Check.equalU64(
+            Crc32c.of(data.view()) as u64,
+            crcCombine(Crc32c.of(a) as u64, Crc32c.of(b) as u64, b.length as u64, 0x82F63B78, 32),
+        )?;
+        Check.equalU64(
+            Crc64Nvme.of(data.view()),
+            crcCombine(Crc64Nvme.of(a), Crc64Nvme.of(b), b.length as u64, 0x9A6C9329AC4BC9B5, 64),
+        )?;
+    }
+    return Ok();
+}
+
+/// The multipart checksum of three 5 MiB parts of 'A', 'B' and 'C', in base64.
+fn threePartChecksum(algorithm: ChecksumAlgorithm, kind: ChecksumType) -> Vector<u8> {
+    var values = Vector<u8>.create();
+    var sizes = Vector<u64>.create();
+    let letters = ['A', 'B', 'C'];
+    for (c in letters) {
+        var part = Vector<u8>.create();
+        part.resize(5242880, truncate<u8>(c))!;
+        values.extend(checksumOf(algorithm, part.view())!.view())!;
+        sizes.push(5242880)!;
+    }
+    var out = Vector<u8>.create();
+    appendBase64(mut out, multipartChecksum(algorithm, kind, values.view(), sizes.view())!.view())!;
+    return out;
+}
+
+/// s3-tests' values (test_multipart_use_cksum_helper_*).
+@test
+fn multipartChecksumsMatchS3Tests() -> Result<void, TestFailure> {
+    Check.equalBytes("WgDhBQ==".bytes(), threePartChecksum(ChecksumAlgorithm.Crc32, ChecksumType.FullObject).view())?;
+    Check.equalBytes(
+        "i+6LR0y3eFo=".bytes(),
+        threePartChecksum(ChecksumAlgorithm.Crc64Nvme, ChecksumType.FullObject).view(),
+    )?;
+    Check.equalBytes(
+        "uWBwpe1dxI4Vw8Gf0X9ynOdw/SS6VBzfWm9giiv1sf4=".bytes(),
+        threePartChecksum(ChecksumAlgorithm.Sha256, ChecksumType.Composite).view(),
+    )?;
+    return Ok();
+}

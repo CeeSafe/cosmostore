@@ -81,10 +81,15 @@ async fn createMultipartUpload(
     var contentType = String.create();
     contentTypeOf(req, mut contentType)?;
     let metadata = metadataOf(req)?;
+    let checksum = uploadChecksumOf(req)?;
     let bucket = req.bucket.view();
     let key = req.key.view();
     let ct = contentType.view();
-    let id = await storeCreateUpload(app, bucket, key, ct, metadata.view())?;
+    let id = await storeCreateUpload(app, bucket, key, ct, metadata.view(), checksum.algorithm, checksum.kind)?;
+    if (checksum.declared) {
+        exchange.header("x-amz-checksum-algorithm", checksumNameUpper(checksum.algorithm).bytes())?;
+        exchange.header("x-amz-checksum-type", checksumTypeName(checksum.kind).bytes())?;
+    }
     var body = Vector<u8>.create();
     xmlHead(mut body, "InitiateMultipartUploadResult")?;
     xmlElement(mut body, "Bucket", bucket.bytes(), false)?;
@@ -102,13 +107,69 @@ async fn storeCreateUpload(
     key: StringView,
     contentType: StringView,
     metadata: Slice<u8>,
+    algorithm: ChecksumAlgorithm,
+    kind: ChecksumType,
 ) -> Result<[u8; 16], S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return match (await Async.blocking(() => store.createUploadWith(bucket, key, contentType, metadata))) {
+    return match (await Async.blocking(
+        () => store.createUploadWith(bucket, key, contentType, metadata, algorithm, kind),
+    )) {
         Ok(id) => Ok(id),
         Err(e) => Err(storeFail(e, key.length)),
     };
+}
+
+/// An upload's checksum (ADR-0015): `x-amz-checksum-algorithm` and `x-amz-checksum-type`, with S3's defaults
+/// (COMPOSITE for CRC32, CRC32C and SHA256; FULL_OBJECT for CRC64NVME). Without an algorithm the parts carry
+/// CRC64NVME and the object a FULL_OBJECT CRC64NVME, as S3 does, but the client is not told so at create.
+struct UploadChecksum {
+    algorithm: ChecksumAlgorithm;
+    kind: ChecksumType;
+    declared: bool;
+}
+
+fn uploadChecksumOf(req: borrow S3Request) -> Result<UploadChecksum, S3Fail> {
+    var kind: ChecksumType? = null;
+    match (headerOf(req, "x-amz-checksum-type")) {
+        Some(t) => {
+            let v = trimSpaces(t);
+            if (equalsIgnoreCase(v, "FULL_OBJECT".bytes())) {
+                kind = ChecksumType.FullObject;
+            } else if (equalsIgnoreCase(v, "COMPOSITE".bytes())) {
+                kind = ChecksumType.Composite;
+            } else {
+                return Err(S3Fail.Code(S3Code.InvalidRequest));
+            }
+        }
+        null => {}
+    }
+    let algorithm = match (headerOf(req, "x-amz-checksum-algorithm")) {
+        Some(t) => match (checksumFromName(t)) {
+            Ok(a) => a,
+            Err(code) => { return Err(S3Fail.Code(code)); }
+        },
+        null => {
+            if (kind.isSome()) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            return Ok(UploadChecksum {
+                algorithm: ChecksumAlgorithm.Crc64Nvme,
+                kind: ChecksumType.FullObject,
+                declared: false,
+            });
+        }
+    };
+    let crc64 = sameAlgorithm(algorithm, ChecksumAlgorithm.Crc64Nvme);
+    let chosen = kind ?? (if (crc64) ChecksumType.FullObject else ChecksumType.Composite);
+    // FULL_OBJECT needs a CRC (its parts combine); CRC64NVME is FULL_OBJECT only.
+    match (chosen) {
+        ChecksumType.FullObject => {
+            if (!isCrc(algorithm)) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        }
+        ChecksumType.Composite => {
+            if (crc64) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        }
+    }
+    return Ok(UploadChecksum { algorithm: algorithm, kind: chosen, declared: true });
 }
 
 // ---- UploadPart ----
@@ -122,10 +183,36 @@ async fn uploadPart(
     let number = partNumberOf(req)?;
     let id = uploadIdOf(req)?;
     var spec = bodySpec(req, borrow auth)?;
-    let writer = await startPart(app, req.bucket.view(), req.key.view(), id, number, spec.size)?;
-    let body = await receiveBody(app, auth, mut spec, writer, exchange)?;
-    let md5 = await commitPart(app, req.bucket.view(), req.key.view(), id, number, borrow body.finished)?;
+    let start = await startPart(app, req.bucket.view(), req.key.view(), id, number, spec.size)?;
+    // A part's checksum is in its upload's algorithm. A client may name another only for an upload that took the
+    // default (CRC64NVME); the part then gets both, the client's checked and the upload's stored.
+    let named = spec.checksumKind;
+    match (named) {
+        ChecksumAlgorithm.None => {}
+        _ => {
+            let upload = start.algorithm;
+            let fine = sameAlgorithm(named, upload) || sameAlgorithm(upload, ChecksumAlgorithm.Crc64Nvme) ||
+                sameAlgorithm(upload, ChecksumAlgorithm.None);
+            if (!fine) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        }
+    }
+    let body = await receiveBody(app, auth, mut spec, start.writer, exchange, start.algorithm)?;
+    let md5 = await commitPart(
+        app,
+        req.bucket.view(),
+        req.key.view(),
+        id,
+        number,
+        body.stored.view(),
+        borrow body.finished,
+    )?;
     return await sendStored(exchange, borrow md5, 0, borrow body);
+}
+
+/// A part writer, and the checksum algorithm its upload's parts carry.
+struct PartStart {
+    writer: ObjectWriter;
+    algorithm: ChecksumAlgorithm;
 }
 
 /// Under the lock: the upload exists, the part's declared size is admitted, and a part writer for it.
@@ -136,11 +223,11 @@ async fn startPart(
     id: [u8; 16],
     number: u32,
     size: u64,
-) -> Result<ObjectWriter, S3Fail> {
+) -> Result<PartStart, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
     return match (await Async.blocking(() => beginPart(store, bucket, key, id, number, size))) {
-        Ok(w) => Ok(w),
+        Ok(w) => Ok(PartStart { writer: w, algorithm: store.uploadAlgorithm(id) }),
         Err(e) => Err(storeFail(e, key.length)),
     };
 }
@@ -163,11 +250,12 @@ async fn commitPart(
     key: StringView,
     id: [u8; 16],
     number: u32,
+    checksum: Slice<u8>,
     finished: borrow FinishedObject,
 ) -> Result<[u8; 16], S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return match (await Async.blocking(() => store.putPart(bucket, key, id, number, finished))) {
+    return match (await Async.blocking(() => store.putPartWith(bucket, key, id, number, checksum, finished))) {
         Ok(m) => Ok(m),
         Err(e) => Err(storeFail(e, key.length)),
     };
@@ -259,8 +347,8 @@ fn etagFromXml(text: Slice<u8>) -> Result<ParsedEtag?, AllocError> {
     return Ok(parseEtag(plain.view()));
 }
 
-/// The parts a CompleteMultipartUpload body names, in its order. Only `<Part>`, `<PartNumber>` and `<ETag>` are
-/// read; a part's checksum elements are ignored.
+/// The parts a CompleteMultipartUpload body names, in its order: `<Part>`, `<PartNumber>`, `<ETag>`, and a part's
+/// `<ChecksumCRC32>` (and the like), which must be its stored checksum (ADR-0015).
 fn parseCompleteBody(xml: Slice<u8>) -> Result<Vector<PartChoice>, S3Fail> {
     var parts = Vector<PartChoice>.create();
     var at: usize = 0;
@@ -284,7 +372,27 @@ fn parseCompleteBody(xml: Slice<u8>) -> Result<Vector<PartChoice>, S3Fail> {
             null => { return Err(S3Fail.Code(S3Code.InvalidPart)); }
         };
         if (etag.parts != 0) { return Err(S3Fail.Code(S3Code.InvalidPart)); }
-        parts.push(PartChoice { number: truncate<u32>(number), md5: etag.md5 })?;
+        var choice = PartChoice {
+            number: truncate<u32>(number),
+            md5: etag.md5,
+            checksum: [0u8; 32],
+            checksumLength: 0,
+        };
+        let names = ["ChecksumCRC32", "ChecksumCRC32C", "ChecksumCRC64NVME", "ChecksumSHA256"];
+        for (name in names) {
+            match (elementText(inner, name)) {
+                Some(text) => {
+                    var raw = Vector<u8>.create();
+                    if (!decodeBase64(text, mut raw)? || raw.length > 32) {
+                        return Err(S3Fail.Code(S3Code.InvalidPart));
+                    }
+                    choice.checksum[0..raw.length].copyFrom(raw.view());
+                    choice.checksumLength = truncate<u8>(raw.length);
+                }
+                null => {}
+            }
+        }
+        parts.push(choice)?;
         at = end + 7;
     }
     if (parts.length == 0 || findBytes(xml, "CompleteMultipartUpload".bytes(), 0).isNull()) {
@@ -303,11 +411,12 @@ async fn completeMultipartUpload(
     var etags = Vector<u8>.create();
     let condition = putConditionOf(req, mut etags)?;
     let xml = await readSmallBody(auth, exchange, MAX_COMPLETE_BODY)?;
-    verifySmallBody(req, xml.view())?;
+    verifySmallBody(req, xml.view(), false)?;
     let chosen = parseCompleteBody(xml.view())?;
+    let expected = expectedObjectChecksum(req)?;
     let bucket = req.bucket.view();
     let key = req.key.view();
-    let outcome = await storeComplete(app, bucket, key, id, chosen.view(), condition, etags.view())?;
+    let outcome = await storeComplete(app, bucket, key, id, chosen.view(), condition, etags.view(), expected.view())?;
     var body = Vector<u8>.create();
     xmlHead(mut body, "CompleteMultipartUploadResult")?;
     var location = Vector<u8>.create();
@@ -319,8 +428,62 @@ async fn completeMultipartUpload(
     xmlElement(mut body, "Bucket", bucket.bytes(), false)?;
     xmlElement(mut body, "Key", key.bytes(), false)?;
     xmlEtag(mut body, borrow outcome.md5, outcome.parts)?;
+    xmlChecksum(mut body, outcome.extras.view())?;
     body.extend("</CompleteMultipartUploadResult>".bytes())?;
     return await sendXml(exchange, borrow body);
+}
+
+/// The object checksum a CompleteMultipartUpload names in `x-amz-checksum-<name>` (`-N` and all), raw; empty for none.
+fn expectedObjectChecksum(req: borrow S3Request) -> Result<Vector<u8>, S3Fail> {
+    var raw = Vector<u8>.create();
+    for (i in 0..req.headers.length) {
+        match (checksumKindOf(req.headers[i].name.view())) {
+            Ok(Some(_)) => {
+                let v = trimSpaces(req.headers[i].value.view());
+                let text = v[0..pieceEnd(v, 0, '-')];
+                // A value that is not even base64 cannot be the object's checksum: BadDigest, as S3 answers.
+                if (!decodeBase64(text, mut raw)?) { return Err(S3Fail.Code(S3Code.BadDigest)); }
+            }
+            Ok(null) => {}
+            Err(code) => { return Err(S3Fail.Code(code)); }
+        }
+    }
+    return Ok(raw);
+}
+
+/// A part's `<ChecksumCRC32>…</ChecksumCRC32>` (or the like), if it has one.
+fn xmlPartChecksum(
+    out: borrow mut Vector<u8>,
+    algorithm: ChecksumAlgorithm,
+    raw: Slice<u8>,
+) -> Result<void, AllocError> {
+    if (raw.length == 0) { return Ok(); }
+    var name = Vector<u8>.create();
+    name.extend("Checksum".bytes())?;
+    name.extend(checksumNameUpper(algorithm).bytes())?;
+    var value = Vector<u8>.create();
+    appendBase64(mut value, raw)?;
+    return xmlElement(out, StringView.fromUtf8(name.view()) ?? "Checksum", value.view(), false);
+}
+
+/// `<ChecksumCRC32>…</ChecksumCRC32><ChecksumType>…</ChecksumType>` of a version's extras, if it has a checksum.
+fn xmlChecksum(out: borrow mut Vector<u8>, extras: Slice<u8>) -> Result<void, S3Fail> {
+    let e = match (decodeExtras(extras)) {
+        Ok(e) => e,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    match (e.algorithm) {
+        ChecksumAlgorithm.None => { return Ok(); }
+        _ => {}
+    }
+    var name = Vector<u8>.create();
+    name.extend("Checksum".bytes())?;
+    name.extend(checksumNameUpper(e.algorithm).bytes())?;
+    var value = Vector<u8>.create();
+    e.display(mut value)?;
+    xmlElement(out, StringView.fromUtf8(name.view()) ?? "Checksum", value.view(), false)?;
+    xmlElement(out, "ChecksumType", checksumTypeName(e.kind).bytes(), false)?;
+    return Ok();
 }
 
 async fn storeComplete(
@@ -331,10 +494,13 @@ async fn storeComplete(
     parts: Slice<PartChoice>,
     condition: PutIf,
     etags: Slice<u8>,
+    expected: Slice<u8>,
 ) -> Result<PutOutcome, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return match (await Async.blocking(() => completeWith(store, bucket, key, id, parts, condition, etags))) {
+    return match (await Async.blocking(
+        () => completeWith(store, bucket, key, id, parts, condition, etags, expected),
+    )) {
         Ok(o) => Ok(o),
         Err(e) => Err(storeFail(e, key.length)),
     };
@@ -349,9 +515,10 @@ fn completeWith(
     parts: Slice<PartChoice>,
     condition: PutIf,
     etags: Slice<u8>,
+    expected: Slice<u8>,
 ) -> Result<PutOutcome, StoreError> {
     let cond = resolveCondition(store, bucket, key, condition, etags)?;
-    return store.completeUploadIf(bucket, key, id, parts, cond);
+    return store.completeUploadIf(bucket, key, id, parts, cond, expected);
 }
 
 // ---- AbortMultipartUpload ----
@@ -417,6 +584,13 @@ async fn listParts(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
     body.extend("</Initiator><Owner>".bytes())?;
     body.extend(OWNER_XML.bytes())?;
     body.extend("</Owner><StorageClass>STANDARD</StorageClass>".bytes())?;
+    match (listing.algorithm) {
+        ChecksumAlgorithm.None => {}
+        _ => {
+            xmlElement(mut body, "ChecksumAlgorithm", checksumNameUpper(listing.algorithm).bytes(), false)?;
+            xmlElement(mut body, "ChecksumType", checksumTypeName(listing.kind).bytes(), false)?;
+        }
+    }
     xmlDecimal(mut body, "PartNumberMarker", after as u64)?;
     let n = listing.parts.length;
     if (n > 0) { xmlDecimal(mut body, "NextPartNumberMarker", listing.parts[n - 1].number as u64)?; }
@@ -431,6 +605,7 @@ async fn listParts(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
         body.extend("</LastModified>".bytes())?;
         xmlEtag(mut body, borrow p.md5, 0)?;
         xmlDecimal(mut body, "Size", p.size)?;
+        xmlPartChecksum(mut body, listing.algorithm, p.checksum.view())?;
         body.extend("</Part>".bytes())?;
     }
     body.extend("</ListPartsResult>".bytes())?;

@@ -1,5 +1,5 @@
 #!/bin/sh
-# The M3 end-to-end test (ADR-0008 to ADR-0012): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
+# The M3 end-to-end test (ADR-0008 to ADR-0015): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
 # against `cosmostore serve` on a fresh store. Prints one line per check; exit status 1 if any fails.
 #
 # usage: tools/s3_smoke.sh [COSMOSTORE] [PORT]     (defaults: out/cosmostore, 9311)
@@ -106,6 +106,24 @@ aws s3api get-object --bucket smoke --key m/huge.bin --range bytes=8388000-83890
 dd if=huge.bin of=r.want bs=1 skip=8388000 count=1001 2> /dev/null
 cmp -s r.bin r.want && pass "range across parts" || fail "range across parts"
 check "GET If-Match multipart ETag" "$(aws s3api get-object --bucket smoke --key m/huge.bin --if-match "$huge_etag" --range bytes=0-0 x --query ETag --output text)" "$huge_etag"
+# Stored checksums and part layouts (ADR-0015).
+check "checksum only when asked" "$(aws s3api head-object --bucket smoke --key a/big.bin --query 'ChecksumType' --output text)" None
+check "checksum with checksum-mode" "$(aws s3api head-object --bucket smoke --key a/big.bin --checksum-mode ENABLED --query 'ChecksumType' --output text)" FULL_OBJECT
+check "default CRC64NVME" "$(AWS_REQUEST_CHECKSUM_CALCULATION=when_required aws s3api put-object --bucket smoke --key a/nosum.bin --body small.txt > /dev/null 2>&1; aws s3api head-object --bucket smoke --key a/nosum.bin --checksum-mode ENABLED --query 'ChecksumCRC64NVME' --output text)" "$(python3 -I -c '
+import base64, sys
+data = open(sys.argv[1], "rb").read()
+crc = 0xFFFFFFFFFFFFFFFF
+for b in data:
+    crc ^= b
+    for _ in range(8):
+        crc = (crc >> 1) ^ (0x9A6C9329AC4BC9B5 if crc & 1 else 0)
+print(base64.b64encode((crc ^ 0xFFFFFFFFFFFFFFFF).to_bytes(8, "big")).decode())' small.txt)"
+aws s3api get-object --bucket smoke --key m/huge.bin --part-number 2 part2.bin > part.json 2>&1
+dd if=huge.bin of=part2.want bs=8388608 skip=1 count=1 2> /dev/null
+cmp -s part2.bin part2.want && pass "get-object --part-number" || fail "get-object --part-number"
+check "parts count" "$(sed -n 's/.*"PartsCount": \([0-9]*\).*/\1/p' part.json)" 3
+check "get-object-attributes" "$(aws s3api get-object-attributes --bucket smoke --key m/huge.bin --object-attributes ObjectParts ObjectSize --query '[ObjectSize,ObjectParts.TotalPartsCount]' --output text)" "20000000	3"
+check "part number past the last" "$(code s3api get-object --bucket smoke --key m/huge.bin --part-number 4 x)" InvalidPart
 
 head -c 5242880 /dev/urandom > p1.bin
 id=$(aws s3api create-multipart-upload --bucket smoke --key m/manual --content-type text/x-test --query UploadId --output text)

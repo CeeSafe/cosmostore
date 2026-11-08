@@ -4,60 +4,64 @@ import web_core;
 import web_http;
 import web_server;
 
-/// A body checksum S3 lets the client name (x-amz-checksum-*).
-enum ChecksumKind {
-    None,
-    Crc32,
-    Crc32c,
-    Crc64Nvme,
-    Sha256,
+/// A checksum in base64, as S3 writes it.
+fn encodedChecksum(sum: borrow RunningChecksum, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var raw = Vector<u8>.create();
+    sum.finishInto(mut raw)?;
+    out.clear();
+    appendBase64(out, raw.view())?;
+    return Ok();
 }
 
-/// Computes the named checksum over the body as it streams.
-struct BodyChecksum {
-    kind: ChecksumKind;
-    crc32: Crc32;
-    crc32c: Crc32c;
-    crc64: Crc64Nvme;
-    sha: Sha256;
+/// The algorithm's name in S3's fields and elements: `CRC32`, `CRC32C`, `CRC64NVME`, `SHA256`.
+fn checksumNameUpper(a: ChecksumAlgorithm) -> StringView => match (a) {
+    ChecksumAlgorithm.Crc32 => "CRC32",
+    ChecksumAlgorithm.Crc32c => "CRC32C",
+    ChecksumAlgorithm.Crc64Nvme => "CRC64NVME",
+    ChecksumAlgorithm.Sha256 => "SHA256",
+    ChecksumAlgorithm.None => "",
+};
 
-    fn create(kind: ChecksumKind) -> BodyChecksum => BodyChecksum {
-        kind: kind,
-        crc32: Crc32.create(),
-        crc32c: Crc32c.create(),
-        crc64: Crc64Nvme.create(),
-        sha: Sha256.create(),
-    };
+fn checksumTypeName(t: ChecksumType) -> StringView => match (t) {
+    ChecksumType.FullObject => "FULL_OBJECT",
+    ChecksumType.Composite => "COMPOSITE",
+};
 
-    fn update(borrow mut this, data: Slice<u8>) {
-        match (this.kind) {
-            ChecksumKind.None => {}
-            ChecksumKind.Crc32 => { this.crc32.update(data); }
-            ChecksumKind.Crc32c => { this.crc32c.update(data); }
-            ChecksumKind.Crc64Nvme => { this.crc64.update(data); }
-            ChecksumKind.Sha256 => { this.sha.update(data); }
-        }
+/// `x-amz-checksum-algorithm`'s value; SHA-1 is NotImplemented (CEESAFE_GAPS G26), anything else InvalidRequest.
+fn checksumFromName(text: Slice<u8>) -> Result<ChecksumAlgorithm, S3Code> {
+    let t = trimSpaces(text);
+    if (equalsIgnoreCase(t, "CRC32".bytes())) { return Ok(ChecksumAlgorithm.Crc32); }
+    if (equalsIgnoreCase(t, "CRC32C".bytes())) { return Ok(ChecksumAlgorithm.Crc32c); }
+    if (equalsIgnoreCase(t, "CRC64NVME".bytes())) { return Ok(ChecksumAlgorithm.Crc64Nvme); }
+    if (equalsIgnoreCase(t, "SHA256".bytes())) { return Ok(ChecksumAlgorithm.Sha256); }
+    if (equalsIgnoreCase(t, "SHA1".bytes())) { return Err(S3Code.NotImplemented); }
+    return Err(S3Code.InvalidRequest);
+}
+
+/// `x-amz-checksum-<name>: <value>` and `x-amz-checksum-type` for a stored checksum, if there is one.
+fn sendChecksumHeaders(exchange: borrow mut Exchange, e: borrow ObjectExtras) -> Result<void, S3Fail> {
+    match (e.algorithm) {
+        ChecksumAlgorithm.None => { return Ok(); }
+        _ => {}
     }
-
-    /// The checksum in base64, as S3 writes it.
-    fn encoded(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
-        match (this.kind) {
-            ChecksumKind.None => {}
-            ChecksumKind.Crc32 => { appendBase64(out, crc32Bytes(this.crc32.finish())[..])?; }
-            ChecksumKind.Crc32c => { appendBase64(out, crc32Bytes(this.crc32c.finish())[..])?; }
-            ChecksumKind.Crc64Nvme => { appendBase64(out, crc64Bytes(this.crc64.finish())[..])?; }
-            ChecksumKind.Sha256 => { appendBase64(out, this.sha.finish()[..])?; }
-        }
-        return Ok();
+    var name = Vector<u8>.create();
+    appendChecksumName(mut name, e.algorithm)?;
+    var value = Vector<u8>.create();
+    e.display(mut value)?;
+    match (StringView.fromUtf8(name.view())) {
+        Some(n) => { exchange.header(n, value.view())?; }
+        null => {}
     }
+    exchange.header("x-amz-checksum-type", checksumTypeName(e.kind).bytes())?;
+    return Ok();
 }
 
 /// The checksum named by a field `x-amz-checksum-<name>` (lowercase): its kind, or NotImplemented for SHA-1.
-fn checksumKindOf(field: Slice<u8>) -> Result<ChecksumKind?, S3Code> {
-    if (field == "x-amz-checksum-crc32".bytes()) { return Ok(ChecksumKind.Crc32); }
-    if (field == "x-amz-checksum-crc32c".bytes()) { return Ok(ChecksumKind.Crc32c); }
-    if (field == "x-amz-checksum-crc64nvme".bytes()) { return Ok(ChecksumKind.Crc64Nvme); }
-    if (field == "x-amz-checksum-sha256".bytes()) { return Ok(ChecksumKind.Sha256); }
+fn checksumKindOf(field: Slice<u8>) -> Result<ChecksumAlgorithm?, S3Code> {
+    if (field == "x-amz-checksum-crc32".bytes()) { return Ok(ChecksumAlgorithm.Crc32); }
+    if (field == "x-amz-checksum-crc32c".bytes()) { return Ok(ChecksumAlgorithm.Crc32c); }
+    if (field == "x-amz-checksum-crc64nvme".bytes()) { return Ok(ChecksumAlgorithm.Crc64Nvme); }
+    if (field == "x-amz-checksum-sha256".bytes()) { return Ok(ChecksumAlgorithm.Sha256); }
     if (field == "x-amz-checksum-sha1".bytes()) { return Err(S3Code.NotImplemented); }
     return Ok(null);
 }
@@ -208,7 +212,7 @@ struct BodySpec {
     size: u64;
     chunked: bool;
     md5Expected: [u8; 16]?;
-    checksumKind: ChecksumKind;
+    checksumKind: ChecksumAlgorithm;
     checksumExpected: Vector<u8>;
     checksumInTrailer: bool;
     trailerName: Vector<u8>;
@@ -243,7 +247,7 @@ fn bodySpec(req: borrow S3Request, auth: borrow Authenticated) -> Result<BodySpe
         }
         null => {}
     }
-    var checksumKind = ChecksumKind.None;
+    var checksumKind = ChecksumAlgorithm.None;
     var checksumExpected = Vector<u8>.create();
     var checksumInTrailer = false;
     for (i in 0..req.headers.length) {
@@ -288,8 +292,12 @@ fn bodySpec(req: borrow S3Request, auth: borrow Authenticated) -> Result<BodySpe
 /// A body that was received whole and passed every check: its finished bytes, and its checksum as computed.
 struct ReceivedBody {
     finished: FinishedObject;
-    checksumKind: ChecksumKind;
+    /// The checksum the client named, and its value in base64.
+    checksumKind: ChecksumAlgorithm;
     computed: Vector<u8>;
+    /// The checksum to store (ADR-0015), raw: the client's algorithm, else the one the caller asked for.
+    storedAlgorithm: ChecksumAlgorithm;
+    stored: Vector<u8>;
 }
 
 /// Streams the body into `writer` without the store's lock, a step at a time: decoded if aws-chunked, hashed, and
@@ -300,8 +308,12 @@ async fn receiveBody(
     spec: borrow mut BodySpec,
     writer: ObjectWriter,
     exchange: borrow mut Exchange,
+    storedAlgorithm: ChecksumAlgorithm,
 ) -> Result<ReceivedBody, S3Fail> {
     var w = writer;
+    // A second checksum only when the one to store is not the client's.
+    let separate = !sameAlgorithm(storedAlgorithm, spec.checksumKind);
+    var storedSum = RunningChecksum.create(if (separate) storedAlgorithm else ChecksumAlgorithm.None);
     let expectedSha: [u8; 32]? = match (auth.payload) {
         PayloadMode.Hashed(h) => Some(h),
         _ => null,
@@ -310,7 +322,7 @@ async fn receiveBody(
     let chunked = spec.chunked;
     let size = spec.size;
     var sha = Sha256.create();
-    var checksum = BodyChecksum.create(spec.checksumKind);
+    var checksum = RunningChecksum.create(spec.checksumKind);
     var decoder = ChunkDecoder.create(auth.signer);
     var buf = Vector<u8>.create();
     buf.resize(BODY_STEP, 0)?;
@@ -332,7 +344,7 @@ async fn receiveBody(
         received += data.length as u64;
         if (received > size) { return Err(S3Fail.Code(S3Code.IncompleteBody)); }
         if (data.length == 0) { continue; }
-        let wrote = await Async.blocking(() => writeStep(mut w, mut sha, mut checksum, hashing, data));
+        let wrote = await Async.blocking(() => writeStep(mut w, mut sha, mut checksum, mut storedSum, hashing, data));
         match (wrote) {
             Ok() => {}
             Err(f) => { return Err(storeFail(StoreError.Io(f), 0)); }
@@ -368,9 +380,11 @@ async fn receiveBody(
         }
     }
     var computed = Vector<u8>.create();
-    checksum.encoded(mut computed)?;
+    encodedChecksum(borrow checksum, mut computed)?;
+    var stored = Vector<u8>.create();
+    if (separate) { storedSum.finishInto(mut stored)?; } else { checksum.finishInto(mut stored)?; }
     match (spec.checksumKind) {
-        ChecksumKind.None => {}
+        ChecksumAlgorithm.None => {}
         _ => {
             if (refusal.isNull() && computed.view() != spec.checksumExpected.view()) { refusal = S3Code.BadDigest; }
         }
@@ -382,7 +396,13 @@ async fn receiveBody(
         }
         null => {}
     }
-    return Ok(ReceivedBody { finished: finished, checksumKind: spec.checksumKind, computed: computed });
+    return Ok(ReceivedBody {
+        finished: finished,
+        checksumKind: spec.checksumKind,
+        computed: computed,
+        storedAlgorithm: if (separate) storedAlgorithm else spec.checksumKind,
+        stored: stored,
+    });
 }
 
 /// A stored body's response: its ETag and the checksum the client named, then 200.
@@ -395,8 +415,15 @@ async fn sendStored(
     var etag = Vector<u8>.create();
     appendEtag(mut etag, md5, parts)?;
     exchange.header("etag", etag.view())?;
+    // The stored checksum too, when it is not the client's (S3's default CRC64NVME).
+    if (!sameAlgorithm(body.storedAlgorithm, body.checksumKind)) {
+        var e = ObjectExtras.none();
+        e.algorithm = body.storedAlgorithm;
+        e.value.extend(body.stored.view())?;
+        sendChecksumHeaders(exchange, borrow e)?;
+    }
     match (body.checksumKind) {
-        ChecksumKind.None => {}
+        ChecksumAlgorithm.None => {}
         _ => {
             var name = Vector<u8>.create();
             appendChecksumName(mut name, body.checksumKind)?;
@@ -423,13 +450,21 @@ async fn putObject(
     contentTypeOf(req, mut contentType)?;
     let metadata = metadataOf(req)?; // refused before the body is read
     let writer = await startPut(app, req.bucket.view(), spec.size)?;
-    let body = await receiveBody(app, auth, mut spec, writer, exchange)?;
+    // Every object gets a checksum: the client's, else CRC64NVME, as S3 does (ADR-0015).
+    let storeAs = match (spec.checksumKind) {
+        ChecksumAlgorithm.None => ChecksumAlgorithm.Crc64Nvme,
+        _ => spec.checksumKind,
+    };
+    let body = await receiveBody(app, auth, mut spec, writer, exchange, storeAs)?;
+    var extras = Vector<u8>.create();
+    singlePartExtras(body.storedAlgorithm, body.stored.view(), mut extras)?;
     let outcome = await commitPut(
         app,
         req.bucket.view(),
         req.key.view(),
         contentType.view(),
         metadata.view(),
+        extras.view(),
         borrow body.finished,
         condition,
         ifMatch.view(),
@@ -497,27 +532,41 @@ fn contentTypeOf(req: borrow S3Request, out: borrow mut String) -> Result<void, 
     return Ok();
 }
 
+/// A single PUT's extras: its checksum, FULL_OBJECT, and no parts.
+fn singlePartExtras(
+    algorithm: ChecksumAlgorithm,
+    value: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    var e = ObjectExtras.none();
+    e.algorithm = algorithm;
+    e.value.extend(value)?;
+    return e.encode(out);
+}
+
 /// One step of a PUT body, on a worker thread: hashed, checksummed and written.
 fn writeStep(
     writer: borrow mut ObjectWriter,
     sha: borrow mut Sha256,
-    checksum: borrow mut BodyChecksum,
+    checksum: borrow mut RunningChecksum,
+    stored: borrow mut RunningChecksum,
     hashing: bool,
     data: Slice<u8>,
 ) -> Result<void, IoFailure> {
     if (hashing) { sha.update(data); }
     checksum.update(data);
+    stored.update(data);
     return writer.write(data);
 }
 
-fn appendChecksumName(out: borrow mut Vector<u8>, kind: ChecksumKind) -> Result<void, AllocError> {
+fn appendChecksumName(out: borrow mut Vector<u8>, kind: ChecksumAlgorithm) -> Result<void, AllocError> {
     out.extend("x-amz-checksum-".bytes())?;
     out.extend(match (kind) {
-        ChecksumKind.Crc32 => "crc32".bytes(),
-        ChecksumKind.Crc32c => "crc32c".bytes(),
-        ChecksumKind.Crc64Nvme => "crc64nvme".bytes(),
-        ChecksumKind.Sha256 => "sha256".bytes(),
-        ChecksumKind.None => "".bytes(),
+        ChecksumAlgorithm.Crc32 => "crc32".bytes(),
+        ChecksumAlgorithm.Crc32c => "crc32c".bytes(),
+        ChecksumAlgorithm.Crc64Nvme => "crc64nvme".bytes(),
+        ChecksumAlgorithm.Sha256 => "sha256".bytes(),
+        ChecksumAlgorithm.None => "".bytes(),
     })?;
     return Ok();
 }
@@ -552,6 +601,7 @@ async fn commitPut(
     key: StringView,
     contentType: StringView,
     metadata: Slice<u8>,
+    extras: Slice<u8>,
     finished: borrow FinishedObject,
     condition: PutIf,
     ifMatch: Slice<u8>,
@@ -559,7 +609,7 @@ async fn commitPut(
     var guard = await lockStore(app)?;
     let store = guard.data();
     return match (await Async.blocking(
-        () => commitWith(store, bucket, key, contentType, metadata, finished, condition, ifMatch),
+        () => commitWith(store, bucket, key, contentType, metadata, extras, finished, condition, ifMatch),
     )) {
         Ok(o) => Ok(o),
         Err(e) => Err(storeFail(e, key.length)),
@@ -572,6 +622,7 @@ fn commitWith(
     key: StringView,
     contentType: StringView,
     metadata: Slice<u8>,
+    extras: Slice<u8>,
     finished: borrow FinishedObject,
     condition: PutIf,
     ifMatch: Slice<u8>,
@@ -583,7 +634,7 @@ fn commitWith(
             return Err(e);
         }
     };
-    return store.putFinishedWith(bucket, key, contentType, metadata, finished, cond);
+    return store.putFinishedWith(bucket, key, contentType, metadata, extras, finished, cond);
 }
 
 // ---- GetObject and HeadObject ----
@@ -597,6 +648,9 @@ struct GetPlan {
     partial: bool;
     /// If-None-Match or If-Modified-Since held: a 304, which still carries the ETag and Last-Modified.
     notModified: bool;
+    /// `?partNumber=N` of a multipart object: N (0 otherwise), for x-amz-mp-parts-count and the part's checksum.
+    partNumber: u32;
+    extras: ObjectExtras;
 }
 
 /// `Range: bytes=a-b | a- | -n` against `size`: the half-open range, null for no (or an unreadable) range, or
@@ -705,7 +759,16 @@ fn planGet(store: borrow mut ObjectStore, req: borrow S3Request, withBody: bool)
     match (checkGetConditions(req, borrow info)) {
         Ok() => {}
         Err(S3Code.NotModified) => {
-            return Ok(GetPlan { info: info, reader: null, start: 0, end: 0, partial: false, notModified: true });
+            return Ok(GetPlan {
+                info: info,
+                reader: null,
+                start: 0,
+                end: 0,
+                partial: false,
+                notModified: true,
+                partNumber: 0,
+                extras: ObjectExtras.none(),
+            });
         }
         Err(code) => { return Err(S3Fail.Code(code)); }
     }
@@ -726,6 +789,34 @@ fn planGet(store: borrow mut ObjectStore, req: borrow S3Request, withBody: bool)
         }
         null => {}
     }
+    let extras = match (decodeExtras(info.extras.view())) {
+        Ok(e) => e,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    // `?partNumber=N`: that part of a multipart object, or, for one PUT, the whole object as part 1 (ADR-0015).
+    var partNumber: u32 = 0;
+    match (paramOf(req, "partNumber")) {
+        Some(t) => {
+            if (partial) { return Err(S3Fail.Code(S3Code.InvalidRequest)); } // not with Range
+            let n = match (parseDecimal(t)) {
+                Some(v) => v,
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            };
+            if (n < 1 || n > MAX_PART_NUMBER as u64) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            if (info.parts == 0) {
+                if (n != 1) { return Err(S3Fail.Code(S3Code.InvalidPart)); }
+            } else {
+                // A multipart version written before ADR-0015 kept no part layout.
+                if (extras.partSizes.length == 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+                if (n > extras.partSizes.length as u64) { return Err(S3Fail.Code(S3Code.InvalidPart)); }
+                for (i in 0..truncate<usize>(n - 1)) { start += extras.partSizes[i]; }
+                end = start + extras.partSizes[truncate<usize>(n - 1)];
+                partial = true;
+                partNumber = truncate<u32>(n);
+            }
+        }
+        null => {}
+    }
     var reader: ObjectReader? = null;
     if (withBody && end > start) {
         reader = match (store.openReader(bucket, key, start, end)) {
@@ -733,7 +824,16 @@ fn planGet(store: borrow mut ObjectStore, req: borrow S3Request, withBody: bool)
             Err(e) => { return Err(storeFail(e, key.length)); }
         };
     }
-    return Ok(GetPlan { info: info, reader: reader, start: start, end: end, partial: partial, notModified: false });
+    return Ok(GetPlan {
+        info: info,
+        reader: reader,
+        start: start,
+        end: end,
+        partial: partial,
+        notModified: false,
+        partNumber: partNumber,
+        extras: extras,
+    });
 }
 
 async fn openGet(app: borrow S3App, req: borrow S3Request, withBody: bool) -> Result<GetPlan, S3Fail> {
@@ -756,6 +856,28 @@ async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
         return Ok();
     }
     exchange.header("accept-ranges", "bytes".bytes())?;
+    if (plan.partNumber > 0) {
+        field.clear();
+        appendDecimal(mut field, plan.info.parts as u64)?;
+        exchange.header("x-amz-mp-parts-count", field.view())?;
+    }
+    // Checksums only when asked for, and only for what they cover: the whole object, or a part's own (ADR-0015).
+    let checksums = equalsIgnoreCase(trimSpaces(headerOf(req, "x-amz-checksum-mode") ?? "".bytes()), "ENABLED".bytes());
+    if (checksums) {
+        if (plan.partNumber > 0) {
+            let n = checksumLength(plan.extras.algorithm);
+            let i = (plan.partNumber - 1) as usize;
+            if (n > 0 && plan.extras.partChecksums.length >= (i + 1) * n) {
+                var part = ObjectExtras.none();
+                part.algorithm = plan.extras.algorithm;
+                part.kind = plan.extras.kind;
+                part.value.extend(plan.extras.partChecksums.view()[i * n..(i + 1) * n])?;
+                sendChecksumHeaders(exchange, borrow part)?;
+            }
+        } else if (!plan.partial) {
+            sendChecksumHeaders(exchange, borrow plan.extras)?;
+        }
+    }
     match (paramOf(req, "response-content-type")) {
         Some(t) => { exchange.header("content-type", t)?; }
         null => {
@@ -838,4 +960,110 @@ fn responseOverride(
         null => {}
     }
     return Ok();
+}
+
+// ---- GetObjectAttributes (ADR-0015) ----
+
+/// GetObjectAttributes: `x-amz-object-attributes` names any of ETag, Checksum, ObjectParts, StorageClass and
+/// ObjectSize. ObjectParts (a multipart object's) pages with `x-amz-max-parts` and `x-amz-part-number-marker`.
+async fn getObjectAttributes(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let wanted = match (headerOf(req, "x-amz-object-attributes")) {
+        Some(t) => t,
+        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    };
+    var maxParts: u64 = 1000;
+    match (headerOf(req, "x-amz-max-parts")) {
+        Some(t) => {
+            match (parseDecimal(trimSpaces(t))) {
+                Some(v) => { maxParts = v.min(1000); }
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+        }
+        null => {}
+    }
+    var marker: u64 = 0;
+    match (headerOf(req, "x-amz-part-number-marker")) {
+        Some(t) => {
+            match (parseDecimal(trimSpaces(t))) {
+                Some(v) => { marker = v; }
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+        }
+        null => {}
+    }
+    let info = await objectInfo(app, req.bucket.view(), req.key.view())?;
+    let extras = match (decodeExtras(info.extras.view())) {
+        Ok(e) => e,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    var field = Vector<u8>.create();
+    appendHttpDate(mut field, info.mtimeMillis / 1000)?;
+    exchange.header("last-modified", field.view())?;
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "GetObjectAttributesResponse")?;
+    let names = StringView.fromUtf8(wanted) ?? "";
+    if (listedTrimmed(names, "ETag")) {
+        var etag = Vector<u8>.create();
+        appendEtag(mut etag, borrow info.md5, info.parts)?;
+        xmlElement(mut body, "ETag", etag.view()[1..etag.length - 1], false)?; // without its quotes, as S3 sends it
+    }
+    if (listedTrimmed(names, "Checksum")) {
+        match (extras.algorithm) {
+            ChecksumAlgorithm.None => {}
+            _ => {
+                body.extend("<Checksum>".bytes())?;
+                xmlChecksum(mut body, info.extras.view())?;
+                body.extend("</Checksum>".bytes())?;
+            }
+        }
+    }
+    if (listedTrimmed(names, "ObjectParts") && info.parts > 0 && extras.partSizes.length > 0) {
+        let count = extras.partSizes.length as u64;
+        let n = checksumLength(extras.algorithm);
+        body.extend("<ObjectParts>".bytes())?;
+        xmlDecimal(mut body, "PartsCount", count)?;
+        xmlDecimal(mut body, "PartNumberMarker", marker)?;
+        var last: u64 = marker;
+        var shown: u64 = 0;
+        var parts = Vector<u8>.create();
+        var number = marker + 1;
+        while (number <= count && shown < maxParts) {
+            let i = truncate<usize>(number - 1);
+            parts.extend("<Part>".bytes())?;
+            xmlDecimal(mut parts, "PartNumber", number)?;
+            xmlDecimal(mut parts, "Size", extras.partSizes[i])?;
+            if (n > 0 && extras.partChecksums.length >= (i + 1) * n) {
+                xmlPartChecksum(mut parts, extras.algorithm, extras.partChecksums.view()[i * n..(i + 1) * n])?;
+            }
+            parts.extend("</Part>".bytes())?;
+            last = number;
+            shown += 1;
+            number += 1;
+        }
+        if (shown > 0) { xmlDecimal(mut body, "NextPartNumberMarker", last)?; }
+        xmlDecimal(mut body, "MaxParts", maxParts)?;
+        xmlBool(mut body, "IsTruncated", last < count)?;
+        body.extend(parts.view())?;
+        body.extend("</ObjectParts>".bytes())?;
+    }
+    if (listedTrimmed(names, "StorageClass")) { body.extend("<StorageClass>STANDARD</StorageClass>".bytes())?; }
+    if (listedTrimmed(names, "ObjectSize")) { xmlDecimal(mut body, "ObjectSize", info.size)?; }
+    body.extend("</GetObjectAttributesResponse>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// Whether a comma-separated list names `name`, ignoring spaces around the items.
+fn listedTrimmed(list: StringView, name: StringView) -> bool {
+    let l = list.bytes();
+    var at: usize = 0;
+    while (at < l.length) {
+        let end = pieceEnd(l, at, ',');
+        if (trimSpaces(l[at..end]) == name.bytes()) { return true; }
+        at = end + 1;
+    }
+    return false;
 }

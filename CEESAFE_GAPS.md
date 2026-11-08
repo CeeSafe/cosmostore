@@ -34,7 +34,8 @@ boilerplate; **P2** ergonomics.
 | G23 | P2 | tooling | `ceesafe.toml` cannot require a compiler version, so an older ceesafec gives type errors instead of "needs 0.19.1". **Fixed in CeeSafe 0.20.0** (ADR 0076): CosmoStore's manifest says `ceesafec = ">=0.20.0"` |
 | G24 | P1 | std/files | No free-space query (`statvfs`, `GetDiskFreeSpaceExW`): a store cannot learn how much room its volume has **Fixed in CeeSafe 0.21.0** (ADR 0077: `Directory.space`, `Console.flush`) |
 | G25 | P2 | std/console | No `Console.flush()`: standard output written before a SIGKILL is lost when it is redirected **Fixed in CeeSafe 0.21.0** (ADR 0077) |
-| G26 | P3 | std/checksums | No CRC-32 (IEEE), the AWS CLI's `x-amz-checksum-crc32`: lib/std has CRC-32C and CRC-64/NVME only. CosmoStore computes it in CeeSafe (`src/s3/crc32.cee`) |
+| G26 | P3 | std/checksums | No CRC-32 (IEEE), the AWS CLI's `x-amz-checksum-crc32`: lib/std has CRC-32C and CRC-64/NVME only. CosmoStore computes it in CeeSafe (`src/storage/checksums/crc32.cee`) |
+| G27 | P2 | std/async-console | `AsyncConsole.writeError` fails when standard error is `/dev/null` (macOS), so a server that checks it exits under `2>/dev/null` |
 
 ## Status (2026-11-06)
 
@@ -285,11 +286,40 @@ CRC-32C, CRC-64/NVME, SHA-1 and SHA-256; the AWS CLI and boto3 use CRC-32 when a
 algorithm. lib/std has `Crc32c` and `Crc64Nvme` (ADR 0075) but not CRC-32 with the IEEE polynomial (0xEDB88320,
 reflected), nor SHA-1.
 
-Workaround: `src/s3/crc32.cee`, a table-driven CRC-32 in plain CeeSafe, checked against the standard vector
+Workaround: `src/storage/checksums/crc32.cee` (moved from `src/s3/` with ADR-0015), a table-driven CRC-32 in plain CeeSafe, checked against the standard vector
 (`"123456789"` gives `0xCBF43926`). No C, no `unsafe`; it is only slower than a hardware or slicing-by-8 version.
 
 Suggested: `Crc32` beside `Crc32c` in lib/std, with the same `create`/`update`/`finish`/`of`, and `Sha1` for S3's
 `x-amz-checksum-sha1` (refused with `NotImplemented` today).
+
+### G27: `AsyncConsole.writeError` fails on `/dev/null` (P2)
+
+Found with CeeSafe 0.23.0 on macOS on 2026-11-08. `cosmostore serve … 2>/dev/null` exited at once with status 1:
+`serveOn` returned the error of its startup notice. With standard error a file or a pipe, the same binary served.
+
+Repro (`ceesafec build main.cee -o g27`):
+
+```
+async fn note() -> i32 {
+    match (await AsyncConsole.writeError("hello\n")) {
+        Ok() => { return 0; }
+        Err(_) => { return 1; }
+    }
+}
+
+fn main() {
+    Process.exit(Async.run(note()));
+}
+```
+
+`./g27 2>/dev/null` exits 1, and `./g27 2>err.txt` exits 0 and writes `hello`. The likely cause is that the async
+console registers the descriptor with kqueue, which refuses character devices such as `/dev/null`.
+
+Workaround: CosmoStore ignores the result of its startup notice (`src/s3/serve.cee`), as it already did for its
+error log lines.
+
+Suggested: when a descriptor cannot be polled, AsyncConsole should fall back to a blocking write on the blocking
+pool. Writing to `/dev/null` never blocks.
 
 ## Not gaps (checked)
 

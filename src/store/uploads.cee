@@ -24,6 +24,8 @@ struct UploadedPart {
     md5: [u8; 16];
     mtimeMillis: i64;
     extents: Vector<ExtentRef>;
+    /// The part's checksum in the upload's algorithm (ADR-0015); empty if it has none.
+    checksum: Vector<u8>;
 }
 
 /// An upload in progress.
@@ -33,6 +35,9 @@ struct Upload {
     contentType: Vector<u8>;
     /// The completed object's stored fields (ADR-0012).
     metadata: Vector<u8>;
+    /// The checksum the parts carry and how the object's comes from them (ADR-0015); None for an upload made before.
+    checksumAlgorithm: ChecksumAlgorithm;
+    checksumType: ChecksumType;
     initiatedMillis: i64;
     /// In ascending part number, each number at most once.
     parts: Vector<UploadedPart>;
@@ -42,6 +47,10 @@ struct Upload {
 struct PartChoice {
     number: u32;
     md5: [u8; 16];
+    /// The part's checksum the client names, raw, in its first `checksumLength` bytes (0: none named). It must be the
+    /// stored one (ADR-0015). Fixed-size, so a choice stays Copy.
+    checksum: [u8; 32];
+    checksumLength: u8;
 }
 
 /// One upload in a listing.
@@ -62,11 +71,14 @@ struct PartSummary {
     size: u64;
     md5: [u8; 16];
     mtimeMillis: i64;
+    checksum: Vector<u8>;
 }
 
 struct PartListing {
     parts: Vector<PartSummary>;
     truncated: bool;
+    algorithm: ChecksumAlgorithm;
+    kind: ChecksumType;
 }
 
 /// The bytes the files of `extents` occupy, headers included.
@@ -86,7 +98,8 @@ fn uploadBytes(u: borrow Upload) -> u64 {
 // ---- Record meta ----
 
 /// UploadCreate meta v1: u8 format version, 16 upload id, u16+bytes bucket, u16+bytes key, i64 initiated ms,
-/// u16+bytes content type, then the metadata section (ADR-0012; absent in records written before it, meaning none).
+/// u16+bytes content type, then the metadata section (ADR-0012), then u8 checksum algorithm and u8 checksum type
+/// (ADR-0015). Records written before those end earlier, meaning none.
 fn encodeUploadCreateMeta(
     out: borrow mut Vector<u8>,
     id: [u8; 16],
@@ -95,6 +108,8 @@ fn encodeUploadCreateMeta(
     initiatedMillis: i64,
     contentType: Slice<u8>,
     metadata: Slice<u8>,
+    algorithm: ChecksumAlgorithm,
+    kind: ChecksumType,
 ) -> Result<void, AllocError> {
     out.pushLE(META_FORMAT_VERSION)?;
     out.extend(id[..])?;
@@ -103,8 +118,17 @@ fn encodeUploadCreateMeta(
     out.pushLE(initiatedMillis)?;
     pushText16(out, contentType)?;
     appendMetadataSection(out, metadata)?;
+    out.pushLE(checksumCode(algorithm))?;
+    out.pushLE(checksumTypeCode(kind))?;
     return Ok();
 }
+
+fn checksumTypeCode(kind: ChecksumType) -> u8 => match (kind) {
+    ChecksumType.FullObject => 0,
+    ChecksumType.Composite => 1,
+};
+
+fn checksumTypeFromCode(code: u8) -> ChecksumType => if (code == 1) ChecksumType.Composite else ChecksumType.FullObject;
 
 struct UploadCreateMeta {
     id: [u8; 16];
@@ -113,6 +137,8 @@ struct UploadCreateMeta {
     initiatedMillis: i64;
     contentType: Vector<u8>;
     metadata: Vector<u8>;
+    algorithm: ChecksumAlgorithm;
+    kind: ChecksumType;
 }
 
 fn decodeUploadCreateMeta(bytes: Slice<u8>) -> Result<UploadCreateMeta, MetaFault> {
@@ -125,6 +151,17 @@ fn decodeUploadCreateMeta(bytes: Slice<u8>) -> Result<UploadCreateMeta, MetaFaul
     let contentType = readText16(bytes, mut at)?;
     var metadata = Vector<u8>.create();
     if (at < bytes.length) { metadata = readMetadataSection(bytes, mut at)?; }
+    var algorithm = ChecksumAlgorithm.None;
+    var kind = ChecksumType.FullObject;
+    if (at < bytes.length) {
+        need(bytes, at, 2)?;
+        algorithm = match (checksumFromCode(bytes[at])) {
+            Some(a) => a,
+            null => { return Err(MetaFault.BadVersion); }
+        };
+        kind = checksumTypeFromCode(bytes[at + 1]);
+        at += 2;
+    }
     if (at != bytes.length) { return Err(MetaFault.TooLong); }
     return Ok(UploadCreateMeta {
         id: id,
@@ -133,11 +170,14 @@ fn decodeUploadCreateMeta(bytes: Slice<u8>) -> Result<UploadCreateMeta, MetaFaul
         initiatedMillis: initiated,
         contentType: contentType,
         metadata: metadata,
+        algorithm: algorithm,
+        kind: kind,
     });
 }
 
-/// UploadPart meta v1: u8 format version, 16 upload id, u32 part number, u64 size, 16 md5, i64 mtime ms. The
-/// payload is the part's manifest.
+/// UploadPart meta v1: u8 format version, 16 upload id, u32 part number, u64 size, 16 md5, i64 mtime ms, then u8
+/// length and the part's checksum (ADR-0015; absent in records written before it). The payload is the part's
+/// manifest.
 fn encodeUploadPartMeta(
     out: borrow mut Vector<u8>,
     id: [u8; 16],
@@ -145,6 +185,7 @@ fn encodeUploadPartMeta(
     size: u64,
     md5: [u8; 16],
     mtimeMillis: i64,
+    checksum: Slice<u8>,
 ) -> Result<void, AllocError> {
     out.pushLE(META_FORMAT_VERSION)?;
     out.extend(id[..])?;
@@ -152,6 +193,8 @@ fn encodeUploadPartMeta(
     out.pushLE(size)?;
     out.extend(md5[..])?;
     out.pushLE(mtimeMillis)?;
+    out.pushLE(truncate<u8>(checksum.length))?;
+    out.extend(checksum)?;
     return Ok();
 }
 
@@ -161,6 +204,7 @@ struct UploadPartMeta {
     size: u64;
     md5: [u8; 16];
     mtimeMillis: i64;
+    checksum: Vector<u8>;
 }
 
 fn decodeUploadPartMeta(bytes: Slice<u8>) -> Result<UploadPartMeta, MetaFault> {
@@ -171,7 +215,16 @@ fn decodeUploadPartMeta(bytes: Slice<u8>) -> Result<UploadPartMeta, MetaFault> {
     let size = readU64(bytes, mut at)?;
     let md5 = readId16(bytes, mut at)?;
     let mtime = readI64(bytes, mut at)?;
-    return Ok(UploadPartMeta { id: id, number: number, size: size, md5: md5, mtimeMillis: mtime });
+    var checksum = Vector<u8>.create();
+    if (at < bytes.length) {
+        let n = bytes[at] as usize;
+        at += 1;
+        need(bytes, at, n)?;
+        checksum.extend(bytes[at..at + n])?;
+        at += n;
+    }
+    if (at != bytes.length) { return Err(MetaFault.TooLong); }
+    return Ok(UploadPartMeta { id: id, number: number, size: size, md5: md5, mtimeMillis: mtime, checksum: checksum });
 }
 
 /// UploadAbort meta v1: u8 format version, 16 upload id, i64 mtime ms.
@@ -189,8 +242,9 @@ fn decodeUploadAbortMeta(bytes: Slice<u8>) -> Result<[u8; 16], MetaFault> {
     return readId16(bytes, mut at);
 }
 
-/// UploadComplete meta v1: PutExtent's meta (its md5 is the multipart ETag's digest), then 16 upload id and u32
-/// part count. The payload is the object's manifest.
+/// UploadComplete meta v1: PutExtent's meta (its md5 is the multipart ETag's digest), then 16 upload id, u32 part
+/// count, and the extras section (ADR-0015; absent in records written before it). The payload is the object's
+/// manifest.
 fn encodeUploadCompleteMeta(
     out: borrow mut Vector<u8>,
     bucket: Slice<u8>,
@@ -202,10 +256,12 @@ fn encodeUploadCompleteMeta(
     metadata: Slice<u8>,
     id: [u8; 16],
     parts: u32,
+    extras: Slice<u8>,
 ) -> Result<void, AllocError> {
     encodePutMeta(out, bucket, key, nullVersionId(), mtimeMillis, size, etagMd5, contentType, metadata)?;
     out.extend(id[..])?;
     out.pushLE(parts)?;
+    appendExtrasSection(out, extras)?;
     return Ok();
 }
 
@@ -220,7 +276,10 @@ fn decodeUploadCompleteMeta(bytes: Slice<u8>) -> Result<UploadCompleteMeta, Meta
     let put = decodePutMetaAt(bytes, mut at)?;
     let id = readId16(bytes, mut at)?;
     let parts = readU32(bytes, mut at)?;
-    return Ok(UploadCompleteMeta { put: put, id: id, parts: parts });
+    var m = UploadCompleteMeta { put: put, id: id, parts: parts };
+    if (at < bytes.length) { m.put.extras = readExtrasSection(bytes, mut at)?; }
+    if (at != bytes.length) { return Err(MetaFault.TooLong); }
+    return Ok(m);
 }
 
 // ---- Applying records ----
@@ -232,6 +291,8 @@ fn applyUploadCreate(state: borrow mut StoreState, meta: Slice<u8>) -> Result<vo
         key: m.key,
         contentType: m.contentType,
         metadata: m.metadata,
+        checksumAlgorithm: m.algorithm,
+        checksumType: m.kind,
         initiatedMillis: m.initiatedMillis,
         parts: Vector<UploadedPart>.create(),
     };
@@ -271,6 +332,7 @@ fn applyUploadPart(
                 md5: m.md5,
                 mtimeMillis: m.mtimeMillis,
                 extents: extents,
+                checksum: m.checksum,
             })?;
             u.parts.viewMut().sortBy((a, b) => if (a.number < b.number) -1 else if (a.number > b.number) 1 else 0);
         }
@@ -380,37 +442,81 @@ fn uploadMetaRoundTrips() -> Result<void, TestFailure> {
     var out = Vector<u8>.create();
     var meta = Vector<u8>.create();
     metadataAdd(mut meta, "x-amz-meta-a".bytes(), "1".bytes())!;
-    encodeUploadCreateMeta(mut out, id, "bkt".bytes(), "a/b".bytes(), 1234, "text/plain".bytes(), meta.view())!;
+    encodeUploadCreateMeta(
+        mut out,
+        id,
+        "bkt".bytes(),
+        "a/b".bytes(),
+        1234,
+        "text/plain".bytes(),
+        meta.view(),
+        ChecksumAlgorithm.Sha256,
+        ChecksumType.Composite,
+    )!;
     let c = decodeUploadCreateMeta(out.view())!;
     Check.equalBytes(id[..], c.id[..])?;
     Check.equalBytes("a/b".bytes(), c.key.view())?;
     Check.equalBytes("text/plain".bytes(), c.contentType.view())?;
     Check.equalBytes(meta.view(), c.metadata.view())?;
-    // A record from before ADR-0012 ends at the content type: no metadata. Any other truncation is refused.
-    let oldLength = out.length - meta.length;
-    Check.equalU64(0, decodeUploadCreateMeta(out.view()[0..oldLength])!.metadata.length as u64)?;
+    Check.isTrue(sameAlgorithm(ChecksumAlgorithm.Sha256, c.algorithm), "the checksum algorithm")?;
+    // Records from before ADR-0012 end at the content type, and from before ADR-0015 at the metadata: they decode as
+    // having none. Any other truncation is refused.
+    let beforeChecksum = out.length - 2;
+    let beforeMetadata = beforeChecksum - meta.length;
+    Check.equalU64(0, decodeUploadCreateMeta(out.view()[0..beforeMetadata])!.metadata.length as u64)?;
+    Check.isTrue(
+        sameAlgorithm(ChecksumAlgorithm.None, decodeUploadCreateMeta(out.view()[0..beforeChecksum])!.algorithm),
+        "no checksum in an older record",
+    )?;
     for (n in 0..out.length) {
-        if (n == oldLength) { continue; }
+        if (n == beforeMetadata || n == beforeChecksum) { continue; }
         Check.isTrue(decodeUploadCreateMeta(out.view()[0..n]).isErr(), "a truncated create meta is refused")?;
     }
     out.clear();
     let md5 = Md5.of("part".bytes());
-    encodeUploadPartMeta(mut out, id, 10000, 5242880, md5, 99)!;
+    encodeUploadPartMeta(mut out, id, 10000, 5242880, md5, 99, md5[..])!;
     let p = decodeUploadPartMeta(out.view())!;
     Check.equalU64(10000, p.number as u64)?;
     Check.equalU64(5242880, p.size)?;
     Check.equalBytes(md5[..], p.md5[..])?;
+    Check.equalBytes(md5[..], p.checksum.view())?;
+    let partBefore = out.length - 17; // an older record ends at the mtime
+    Check.equalU64(0, decodeUploadPartMeta(out.view()[0..partBefore])!.checksum.length as u64)?;
     for (n in 0..out.length) {
+        if (n == partBefore) { continue; }
         Check.isTrue(decodeUploadPartMeta(out.view()[0..n]).isErr(), "a truncated part meta is refused")?;
     }
     out.clear();
-    encodeUploadCompleteMeta(mut out, "bkt".bytes(), "a/b".bytes(), 5, 12, md5, "x/y".bytes(), meta.view(), id, 3)!;
+    var extras = Vector<u8>.create();
+    var e = ObjectExtras.none();
+    e.algorithm = ChecksumAlgorithm.Crc32;
+    e.value.extend("abcd".bytes())!;
+    e.partSizes.push(12)!;
+    e.partChecksums.extend("wxyz".bytes())!;
+    e.encode(mut extras)!;
+    encodeUploadCompleteMeta(
+        mut out,
+        "bkt".bytes(),
+        "a/b".bytes(),
+        5,
+        12,
+        md5,
+        "x/y".bytes(),
+        meta.view(),
+        id,
+        3,
+        extras.view(),
+    )!;
     let m = decodeUploadCompleteMeta(out.view())!;
     Check.equalBytes("a/b".bytes(), m.put.key.view())?;
     Check.equalU64(12, m.put.size)?;
     Check.equalBytes(id[..], m.id[..])?;
     Check.equalU64(3, m.parts as u64)?;
+    Check.equalBytes(extras.view(), m.put.extras.view())?;
+    let completeBefore = out.length - 4 - extras.length; // an older record ends at the part count
+    Check.equalU64(0, decodeUploadCompleteMeta(out.view()[0..completeBefore])!.put.extras.length as u64)?;
     for (n in 0..out.length) {
+        if (n == completeBefore) { continue; }
         Check.isTrue(decodeUploadCompleteMeta(out.view()[0..n]).isErr(), "a truncated complete meta is refused")?;
     }
     return Ok();

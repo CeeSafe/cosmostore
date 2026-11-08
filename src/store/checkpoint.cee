@@ -9,7 +9,7 @@
 // than fall back, because segments it covered may already be gone. Little-endian:
 //
 // Header (64 bytes):
-//   0 u64 magic "CSCKPT01"   8 u16 format (3; 1 and 2 still load)   10 u16 header length (64)   12 u32 flags (0)
+//   0 u64 magic "CSCKPT01"   8 u16 format (4; 1 to 3 still load)   10 u16 header length (64)   12 u32 flags (0)
 //  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count   48 i64 created ms
 //  56 u32 upload count (format 2; reserved, 0, in format 1)   60 u32 crc32c of bytes 0..60
 // Entries, buckets, then objects, then uploads: u8 kind (1 bucket, 2 object, 3 upload), u32 body length, body.
@@ -18,17 +18,19 @@
 //           16 md5, u16+bytes content type, u64 payload segment, u64 payload offset,
 //           u32 payload length, u64 record segment, u32 record length, manifest (u32 count,
 //           then u64 id, u64 length, u32 crc32c per extent), in format 2 a u32 part count (ADR-0009), and in
-//           format 3 the metadata section (u16 pairs, each u16+bytes name, u16+bytes value; ADR-0012)
+//           format 3 the metadata section (u16 pairs, each u16+bytes name, u16+bytes value; ADR-0012), and in
+//           format 4 the extras section (u32 length + the blob of ADR-0015)
 //   upload (format 2): 16 upload id, u16+bytes bucket, u16+bytes key, i64 initiated ms, u16+bytes content type,
 //           u32 part count, then per part u32 number, u64 size, 16 md5, i64 mtime ms, manifest; in format 3 the
-//           metadata section
+//           metadata section; in format 4 u8 checksum algorithm, u8 checksum type, then per part u8 length and its
+//           checksum (ADR-0015)
 // Trailer (16 bytes): u32 "CKND", u32 crc32c of every entry byte, u64 entry count.
 
 const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 3;
+const CHECKPOINT_FORMAT: u16 = 4;
 const CHECKPOINT_BUCKET: u8 = 1;
 const CHECKPOINT_OBJECT: u8 = 2;
 const CHECKPOINT_UPLOAD: u8 = 3;
@@ -157,6 +159,7 @@ fn encodeObjectEntry(
     encodeManifest(out, v.extents.view())?;
     out.pushLE(v.parts)?;
     appendMetadataSection(out, v.metadata.view())?;
+    appendExtrasSection(out, v.extras.view())?;
     return Ok();
 }
 
@@ -177,6 +180,12 @@ fn encodeUploadEntry(out: borrow mut Vector<u8>, id: [u8; 16], u: borrow Upload)
         encodeManifest(out, p.extents.view())?;
     }
     appendMetadataSection(out, u.metadata.view())?;
+    out.pushLE(checksumCode(u.checksumAlgorithm))?;
+    out.pushLE(checksumTypeCode(u.checksumType))?;
+    for (i in 0..u.parts.length) {
+        out.pushLE(truncate<u8>(u.parts[i].checksum.length))?;
+        out.extend(u.parts[i].checksum.view())?;
+    }
     return Ok();
 }
 
@@ -325,6 +334,8 @@ fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16
     if (format >= 2) { parts = corrupt(readU32(bytes, mut at))?; }
     var metadata = Vector<u8>.create();
     if (format >= 3) { metadata = corrupt(readMetadataSection(bytes, mut at))?; }
+    var extras = Vector<u8>.create();
+    if (format >= 4) { extras = corrupt(readExtrasSection(bytes, mut at))?; }
     if (at != bytes.length) { return Err(StoreError.CheckpointCorrupt); }
     if (!state.hasBucket(bucket.view())?) { return Err(StoreError.CheckpointCorrupt); }
     state.bumpObjects(bucket.view(), true)?;
@@ -342,6 +353,7 @@ fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16
         extents: extents,
         parts: parts,
         metadata: metadata,
+        extras: extras,
     };
     state.extentBytes += extentFileBytes(borrow version);
     match (state.index.put(IndexKey { bucket: bucket, key: key }, version)?) {
@@ -371,16 +383,45 @@ fn decodeUploadEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16
         let n = parts.length;
         if (n > 0 && parts[n - 1].number >= number) { return Err(StoreError.CheckpointCorrupt); }
         state.extentBytes += extentRefBytes(extents.view());
-        parts.push(UploadedPart { number: number, size: size, md5: md5, mtimeMillis: mtime, extents: extents })?;
+        parts.push(UploadedPart {
+            number: number,
+            size: size,
+            md5: md5,
+            mtimeMillis: mtime,
+            extents: extents,
+            checksum: Vector<u8>.create(),
+        })?;
     }
     var metadata = Vector<u8>.create();
     if (format >= 3) { metadata = corrupt(readMetadataSection(bytes, mut at))?; }
+    var algorithm = ChecksumAlgorithm.None;
+    var kind = ChecksumType.FullObject;
+    if (format >= 4) {
+        corrupt(need(bytes, at, 2))?;
+        algorithm = match (checksumFromCode(bytes[at])) {
+            Some(a) => a,
+            null => { return Err(StoreError.CheckpointCorrupt); }
+        };
+        kind = checksumTypeFromCode(bytes[at + 1]);
+        at += 2;
+        for (i in 0..parts.length) {
+            corrupt(need(bytes, at, 1))?;
+            let n = bytes[at] as usize;
+            at += 1;
+            corrupt(need(bytes, at, n))?;
+            let part = borrow mut parts[i];
+            part.checksum.extend(bytes[at..at + n])?;
+            at += n;
+        }
+    }
     if (at != bytes.length) { return Err(StoreError.CheckpointCorrupt); }
     let upload = Upload {
         bucket: bucket,
         key: key,
         contentType: contentType,
         metadata: metadata,
+        checksumAlgorithm: algorithm,
+        checksumType: kind,
         initiatedMillis: initiated,
         parts: parts,
     };

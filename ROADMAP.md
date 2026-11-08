@@ -227,7 +227,7 @@ deadlocks. **Passed** (7 Nov 2026: 186 SIGKILLs, used/live at most 119%, recover
 - Bucket CRUD, ListBuckets, GetBucketLocation. **Done** (slice 1).
 - PUT/GET/HEAD/DELETE, DeleteObjects, CopyObject, Range, conditional GET/PUT via CAS. **Done** (slices 1 and 3).
 - ListObjects v1/v2 with delimiter, continuation-token, start-after and encoding-type. **Done** (slice 1).
-- ETag semantics, checksum headers, exact XML errors.
+- ETag semantics, checksum headers, exact XML errors. Checksums stored and returned **done** (slice 8, ADR-0015).
 - Multipart: create, upload, upload-copy, list, complete, abort, sharing the extent
   machinery. **Done** (slice 2, ADR-0009; upload-copy in slice 3, ADR-0010).
 - Static credentials file and a minimal bucket policy (owner-only), with private buckets
@@ -739,6 +739,48 @@ All 218 pass.
   build.
 - **M3 left:**
   - response checksums (with GetObjectAttributes), and GET `?partNumber`;
+  - POST policy;
+  - tags;
+  - CopyObject destination conditions;
+  - expiring abandoned uploads;
+  - binding beyond loopback, and TLS;
+  - the Java and .NET SDKs.
+
+### 8 Nov 2026: M3 slice 8, stored checksums and part layouts (ADR-0015)
+
+Every version keeps its checksum and, if it is multipart, its part layout: an extras blob beside its metadata.
+- **Formats:**
+  - put, complete, upload-create and part records each gain an optional trailing section, so older records decode
+    as having none;
+  - checkpoint format 4 (1 to 3 still load).
+- **Which checksum:**
+  - a PUT or copy stores the client's checksum, else a CRC64NVME computed as the body streams, as S3 does;
+  - uploads take `x-amz-checksum-algorithm` and `x-amz-checksum-type` with S3's defaults, and defaulted uploads
+    are CRC64NVME FULL_OBJECT;
+  - a multipart checksum is COMPOSITE (the checksum of the part checksums, `-N`) or FULL_OBJECT. A FULL_OBJECT CRC
+    combines the parts' CRCs with zlib's GF(2) method, generalised to 64 bits, so no byte is read again;
+  - SHA-1 stays NotImplemented (G26).
+- **Served:**
+  - `x-amz-checksum-mode: ENABLED` on GET and HEAD;
+  - GET/HEAD `?partNumber` (206 and `x-amz-mp-parts-count`);
+  - GetObjectAttributes (ETag, Checksum, ObjectParts paged, StorageClass, ObjectSize);
+  - checksums in Create, UploadPart, ListParts, Complete and the copy results.
+- **Checked:** at Complete, a named object checksum must match (BadDigest), and so must each part's named
+  checksum (InvalidPart).
+- **Tests:**
+  - the combine equals the whole CRC at every cut, for all three CRCs;
+  - s3-tests' three-part reference values;
+  - store tests through the journal and checkpoints;
+  - `ceesafec test`: 92;
+  - smoke 103, including CRC64NVME recomputed bit by bit in Python;
+  - s3-tests subset 235, up from 218, with nothing dropped;
+  - rclone, boto3, Go and JS pass.
+- **Throughput:** the stored checksum costs nothing measurable. A 256 MiB `aws s3 cp` up takes 1.7 to 1.9 s on
+  this build and on the one before it, in alternating runs.
+- **Found while measuring:** `cosmostore serve … 2>/dev/null` exited at once. Its startup notice to the async
+  console failed, and that failure was fatal. The notice is now best effort, and CEESAFE_GAPS G27 has the repro
+  (`AsyncConsole.writeError` fails on `/dev/null` on macOS).
+- **M3 left:**
   - POST policy;
   - tags;
   - CopyObject destination conditions;
