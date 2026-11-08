@@ -44,12 +44,13 @@ check "key of another certificate" "$(cat out.txt)" "the TLS certificate and key
 check "missing certificate" "$(sed 's/ (.*//' out.txt)" "cannot read the TLS certificate: cannot open it"
 [ -e store ] && fail "a refused setup opened the store" || pass "a refused setup opens no store"
 
-"$bin" serve store "0.0.0.0:$port" credentials --tls-cert server.pem --tls-key server.key 2> server.log &
+"$bin" serve store "0.0.0.0:$port" credentials --tls-cert server.pem --tls-key server.key --maintain-seconds 1 \
+    2> server.log &
 server=$!
 until curl -s -o /dev/null --cacert ca.pem "https://localhost:$port/"; do
     kill -0 "$server" 2> /dev/null || { fail "server exited"; cat server.log; exit 1; }
 done
-check "notice" "$(cat server.log)" "cosmostore: serving S3 over TLS on 0.0.0.0:$port"
+check "notice" "$(head -1 server.log)" "cosmostore: serving S3 over TLS on 0.0.0.0:$port"
 
 # Clients that verify the certificate.
 export AWS_CA_BUNDLE="$work/ca.pem"
@@ -68,6 +69,31 @@ if command -v rclone > /dev/null; then
         rclone --config /dev/null --ca-cert ca.pem lsf t:tls-smoke > rc.txt 2>&1
     check "rclone over TLS" "$(cat rc.txt)" "big.bin"
 fi
+
+# Reload (ADR-0019): a new certificate and key in place of the old ones are served within a few upkeep rounds, and a
+# broken key keeps the certificate that works.
+served() {
+    "$openssl" s_client -connect "127.0.0.1:$port" -servername localhost < /dev/null 2> /dev/null \
+        | "$openssl" x509 -noout -fingerprint -sha256 2> /dev/null
+}
+first=$(served)
+"$openssl" req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=localhost" \
+    -keyout new.key -out new.csr 2> /dev/null
+"$openssl" x509 -req -in new.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile san.ext \
+    -out new.pem 2> /dev/null
+cp new.key server.key
+cp new.pem server.pem
+wanted=$("$openssl" x509 -in new.pem -noout -fingerprint -sha256)
+for i in 1 2 3 4 5 6 7 8 9 10; do [ "$(served)" = "$wanted" ] && break; sleep 1; done
+[ -n "$first" ] && [ "$first" != "$wanted" ] && [ "$(served)" = "$wanted" ] && pass "certificate reloaded" \
+    || fail "certificate reloaded"
+check "reload logged" "$(grep -c 'TLS certificate reloaded' server.log)" 1
+printf 'not a key\n' > server.key
+for i in 1 2 3 4 5 6 7 8 9 10; do grep -q "TLS reload failed" server.log && break; sleep 1; done
+# Logged each round until the files are fixed, so only its presence is checked.
+grep -q "TLS reload failed, keeping the old certificate" server.log && pass "broken key logged" || fail "broken key logged"
+check "still the working certificate" "$(served)" "$wanted"
+aws s3 ls s3://tls-smoke > /dev/null 2>&1 && pass "clients still served" || fail "clients still served"
 
 # Refusals.
 check "plain HTTP to the TLS port" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/")" 000

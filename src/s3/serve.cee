@@ -105,41 +105,6 @@ fn listenAddress(text: StringView) -> SocketAddress? {
     return SocketAddresses.parse(text);
 }
 
-/// How often the server runs the store's upkeep (ADR-0017).
-const MAINTAIN_EVERY_MS: u64 = 10000;
-
-/// The store's upkeep, forever, every MAINTAIN_EVERY_MS: checkpoints when due, compaction, reaping, and expiring old
-/// uploads (`ObjectStore.maintain`). It holds the store's lock while it runs, so requests wait for it. A failure is
-/// logged and tried again next time; the loop ends only when it is cancelled.
-async fn maintainForever(store: borrow Arc<AsyncMutex<ObjectStore>>) -> Result<ServerReport, NetError> {
-    while (true) {
-        match (await Timer.sleep(MAINTAIN_EVERY_MS)) {
-            Ok() => {}
-            Err(e) => { return Err(NetErrors.fromAsync(e)); }
-        }
-        let outcome = await maintainOnce(store);
-        match (outcome) {
-            Ok() => {}
-            Err(e) => {
-                let _ = await AsyncConsole.writeError("cosmostore: maintenance failed: ");
-                let _ = await AsyncConsole.writeError(describe(e));
-                let _ = await AsyncConsole.writeError("\n");
-            }
-        }
-    }
-    return Err(NetError.Closed);
-}
-
-async fn maintainOnce(store: borrow Arc<AsyncMutex<ObjectStore>>) -> Result<void, StoreError> {
-    var guard = match (await store.get().lock()) {
-        Ok(g) => g,
-        Err(_) => { return Ok(); } // cancelled: the server is stopping
-    };
-    let s = guard.data();
-    let _ = await Async.blocking(() => s.maintain())?;
-    return Ok();
-}
-
 fn textOf(s: StringView) -> String {
     var t = String.create();
     let _ = t.append(s);
@@ -163,31 +128,186 @@ fn tlsConfig(certPath: StringView, keyPath: StringView) -> Result<TlsConfig, Str
     return Ok(config);
 }
 
-async fn serveOn(
-    server: Server<S3App>,
-    address: SocketAddress,
-    acceptor: borrow dyn Acceptor,
-    tls: bool,
-    store: borrow Arc<AsyncMutex<ObjectStore>>,
-) -> Result<ServerReport, NetError> {
+/// How often the server runs the store's upkeep, unless `--maintain-seconds` says otherwise (ADR-0017, ADR-0019).
+const MAINTAIN_EVERY_MS: u64 = 10000;
+
+fn listenOn(address: SocketAddress) -> Result<Listener, NetError> {
     let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
-    let listener = Listener.bindWith(address, options)?;
-    let drain = Drain.create()?;
+    return Listener.bindWith(address, options);
+}
+
+async fn notice(address: SocketAddress, tls: bool) {
     // A notice, not a condition of serving: standard error may be something the async console cannot write to, such
     // as /dev/null on macOS (CEESAFE_GAPS G27), and the server must run all the same.
-    let notice = match (servingNotice(address, tls)) {
+    let text = match (servingNotice(address, tls)) {
         Ok(n) => n,
         Err(_) => Vector<u8>.create(),
     };
-    let _ = await AsyncConsole.writeError(StringView.fromUtf8(notice.view()) ?? "");
-    // The server, and beside it the store's upkeep; if the server stops, the upkeep is cancelled.
+    let _ = await AsyncConsole.writeError(StringView.fromUtf8(text.view()) ?? "");
+}
+
+/// Plain HTTP: the server, and beside it the store's upkeep; if the server stops, the upkeep is cancelled.
+async fn servePlain(
+    server: Server<S3App>,
+    address: SocketAddress,
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    everyMs: u64,
+) -> Result<ServerReport, NetError> {
+    let listener = listenOn(address)?;
+    let drain = Drain.create()?;
+    let plain = PlainAcceptor {};
+    await notice(address, false);
     let raced = await Async.race(
-        async move () => await server.run(listener, acceptor, ConnectionLimits.defaults(), drain),
-        async () => await maintainForever(store),
+        async move () => await server.run(listener, borrow plain, ConnectionLimits.defaults(), drain),
+        async () => await maintainForever(store, everyMs),
     );
     return Ok(raced?.value);
 }
 
+/// TLS: as plain, and the upkeep also reloads the certificate when its files change (ADR-0019).
+async fn serveTls(
+    server: Server<S3App>,
+    address: SocketAddress,
+    acceptor: borrow TlsAcceptor,
+    watch: borrow mut CertWatch,
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    everyMs: u64,
+) -> Result<ServerReport, NetError> {
+    let listener = listenOn(address)?;
+    let drain = Drain.create()?;
+    await notice(address, true);
+    let config = acceptor.configuration();
+    let raced = await Async.race(
+        async move () => await server.run(listener, acceptor, ConnectionLimits.defaults(), drain),
+        async () => await maintainAndReload(store, everyMs, config, watch),
+    );
+    return Ok(raced?.value);
+}
+
+/// The certificate and key files of a TLS server, and when each was last seen modified.
+struct CertWatch {
+    certPath: String;
+    keyPath: String;
+    certMillis: i64;
+    keyMillis: i64;
+}
+
+fn certWatch(certPath: StringView, keyPath: StringView) -> CertWatch => CertWatch {
+    certPath: textOf(certPath),
+    keyPath: textOf(keyPath),
+    certMillis: match (Fs.modifiedMillis(certPath)) {
+        Ok(m) => m,
+        Err(_) => 0,
+    },
+    keyMillis: match (Fs.modifiedMillis(keyPath)) {
+        Ok(m) => m,
+        Err(_) => 0,
+    },
+};
+
+/// The store's upkeep, forever, every `everyMs`: checkpoints when due, compaction, reaping, and expiring old uploads
+/// (`ObjectStore.maintain`). It holds the store's lock while it runs, so requests wait for it. A failure is logged and
+/// tried again next time; the loop ends only when it is cancelled.
+async fn maintainForever(store: borrow Arc<AsyncMutex<ObjectStore>>, everyMs: u64) -> Result<ServerReport, NetError> {
+    while (true) {
+        match (await Timer.sleep(everyMs)) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+        await upkeep(store);
+    }
+    return Err(NetError.Closed);
+}
+
+/// The upkeep, and a certificate reload whenever the certificate's or the key's file changed.
+async fn maintainAndReload(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    everyMs: u64,
+    config: borrow TlsConfig,
+    watch: borrow mut CertWatch,
+) -> Result<ServerReport, NetError> {
+    while (true) {
+        match (await Timer.sleep(everyMs)) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+        await upkeep(store);
+        await reloadIfChanged(config, watch);
+    }
+    return Err(NetError.Closed);
+}
+
+async fn upkeep(store: borrow Arc<AsyncMutex<ObjectStore>>) {
+    match (await maintainOnce(store)) {
+        Ok() => {}
+        Err(e) => {
+            let _ = await AsyncConsole.writeError("cosmostore: maintenance failed: ");
+            let _ = await AsyncConsole.writeError(describe(e));
+            let _ = await AsyncConsole.writeError("\n");
+        }
+    }
+}
+
+async fn maintainOnce(store: borrow Arc<AsyncMutex<ObjectStore>>) -> Result<void, StoreError> {
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Ok(); } // cancelled: the server is stopping
+    };
+    let s = guard.data();
+    let _ = await Async.blocking(() => s.maintain())?;
+    return Ok();
+}
+
+/// Reloads the certificate if its file or its key's changed since the last good load, on a worker thread (the stat and
+/// the reads block). New connections get the new certificate; open connections keep theirs. A failed reload (a
+/// certificate written before its key, say) keeps the old certificate, is logged, and is tried again next time.
+async fn reloadIfChanged(config: borrow TlsConfig, watch: borrow mut CertWatch) {
+    let outcome = await Async.blocking(() => checkAndReload(config, watch));
+    match (outcome) {
+        ReloadOutcome.Unchanged => {}
+        ReloadOutcome.Reloaded => { let _ = await AsyncConsole.writeError("cosmostore: TLS certificate reloaded\n"); }
+        ReloadOutcome.Failed(message) => {
+            let _ = await AsyncConsole.writeError("cosmostore: TLS reload failed, keeping the old certificate: ");
+            let _ = await AsyncConsole.writeError(message.view());
+            let _ = await AsyncConsole.writeError("\n");
+        }
+    }
+}
+
+enum ReloadOutcome {
+    Unchanged,
+    Reloaded,
+    Failed(String),
+}
+
+fn checkAndReload(config: borrow TlsConfig, watch: borrow mut CertWatch) -> ReloadOutcome {
+    let certMillis = match (Fs.modifiedMillis(watch.certPath.view())) {
+        Ok(m) => m,
+        Err(_) => watch.certMillis,
+    };
+    let keyMillis = match (Fs.modifiedMillis(watch.keyPath.view())) {
+        Ok(m) => m,
+        Err(_) => watch.keyMillis,
+    };
+    if (certMillis == watch.certMillis && keyMillis == watch.keyMillis) { return ReloadOutcome.Unchanged; }
+    match (reloadCertificate(config, watch.certPath.view(), watch.keyPath.view())) {
+        Ok() => {
+            watch.certMillis = certMillis;
+            watch.keyMillis = keyMillis;
+            return ReloadOutcome.Reloaded;
+        }
+        Err(message) => { return ReloadOutcome.Failed(message); }
+    }
+}
+
+fn reloadCertificate(config: borrow TlsConfig, certPath: StringView, keyPath: StringView) -> Result<void, String> {
+    let chain = readSmallFile(certPath, "TLS certificate")?;
+    let key = readSmallFile(keyPath, "TLS key")?;
+    return match (config.reload(chain.view(), key.view())) {
+        Ok() => Ok(),
+        Err(_) => Err(textOf("the TLS certificate and key could not be used together")),
+    };
+}
 /// `cosmostore: serving S3 on <address>:<port>`, a line.
 fn servingNotice(address: SocketAddress, tls: bool) -> Result<Vector<u8>, AllocError> {
     var notice = Vector<u8>.create();
@@ -221,6 +341,8 @@ fn serve() -> i32 {
     // The argument positions of the certificate and the key (0: not given).
     var certAt: usize = 0;
     var keyAt: usize = 0;
+    var everyMs = MAINTAIN_EVERY_MS;
+    var storeConfig = StoreConfig.defaults();
     var at: usize = 5;
     match (Process.argument(5)) {
         Some(d) => {
@@ -245,6 +367,19 @@ fn serve() -> i32 {
             certAt = at + 1;
         } else if (option == "--tls-key") {
             keyAt = at + 1;
+        } else if (option == "--maintain-seconds") {
+            match (value.parseInt<u64>()) {
+                Some(n) => {
+                    if (n < 1 || n > 86400) { die("--maintain-seconds is 1 to 86400"); }
+                    everyMs = n * 1000;
+                }
+                null => { usage(); }
+            }
+        } else if (option == "--upload-expiry-hours") {
+            match (value.parseInt<u64>()) {
+                Some(n) => { storeConfig.uploadExpiryMillis = n * 3600000; } // 0: never
+                null => { usage(); }
+            }
         } else {
             usage();
         }
@@ -267,7 +402,7 @@ fn serve() -> i32 {
             Err(message) => { die(message.view()); }
         };
     }
-    let store = match (ObjectStore.open(dir, StoreConfig.defaults())) {
+    let store = match (ObjectStore.open(dir, storeConfig)) {
         Ok(s) => s,
         Err(e) => { die(describe(e)); }
     };
@@ -291,12 +426,10 @@ fn serve() -> i32 {
                 Ok(a) => a,
                 Err(_) => { die("TLS: the acceptor could not be made"); }
             };
-            Async.run(serveOn(server, address, borrow acceptor, true, borrow maintenance))
+            var watch = certWatch(Process.argument(certAt) ?? "", Process.argument(keyAt) ?? "");
+            Async.run(serveTls(server, address, borrow acceptor, mut watch, borrow maintenance, everyMs))
         }
-        null => {
-            let plain = PlainAcceptor {};
-            Async.run(serveOn(server, address, borrow plain, false, borrow maintenance))
-        }
+        null => { Async.run(servePlain(server, address, borrow maintenance, everyMs)) }
     };
     match (result) {
         Ok(_) => { return 0; }

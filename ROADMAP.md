@@ -869,3 +869,23 @@ Browser form uploads with a SigV4 POST policy.
   - certificate reload, and configuring the upkeep from the command line;
   - bucket tags and lifecycle rules (beyond upload expiry);
   - the Java and .NET SDKs.
+
+### 9 Nov 2026: M3 slice 12, certificate reload and upkeep options (ADR-0019)
+
+- **Certificate reload:** the TLS server's upkeep watches the certificate's and the key's modified times. On a change
+  it reloads both (`TlsConfig.reload`), for new connections. A failed reload keeps the old certificate, is logged,
+  and is retried next round. There are no signals in lib/std, and watching the files also suits ACME clients that
+  only replace them.
+- **N0295 refused** the first version, which stat'ed and read the files in async code. They now run on a worker
+  thread.
+- **`serve` options:** `--maintain-seconds <n>` (1 to 86,400; default 10) and `--upload-expiry-hours <n>` (default
+  168; 0 for never).
+- **Tests:**
+  - `tools/tls_smoke.sh`, 23 checks: a new certificate is served (by fingerprint), and a broken key keeps the
+    working one;
+  - the option refusals, by hand;
+  - `ceesafec test`: 97;
+  - smoke 115; the SDK matrix; the s3-tests subset of 238.
+- **M3 left:**
+  - bucket tags and lifecycle rules (beyond upload expiry);
+  - the Java and .NET SDKs (no Maven, Gradle or .NET SDK on this machine).
