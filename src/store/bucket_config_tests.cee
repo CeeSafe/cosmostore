@@ -1,0 +1,117 @@
+// Bucket tags and lifecycle rules in the store (ADR-0020).
+
+fn rule(id: StringView, prefix: StringView, days: u32) -> LifecycleRule => LifecycleRule {
+    id: copyBytes(id.bytes())!,
+    enabled: true,
+    prefix: copyBytes(prefix.bytes())!,
+    tags: Vector<Vector<u8>>.create(),
+    hasSizeAbove: false,
+    sizeAbove: 0,
+    hasSizeBelow: false,
+    sizeBelow: 0,
+    expirationDays: days,
+    expirationDate: 0,
+    abortDays: 0,
+    legacyPrefix: false,
+    expiredDeleteMarker: false,
+};
+
+@test
+fn bucketConfigSurvivesAndGoesWithTheBucket() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("bucket-config");
+    var rules = Vector<LifecycleRule>.create();
+    rules.push(rule("all", "", 1))!;
+    var blob = Vector<u8>.create();
+    encodeLifecycle(rules.view(), mut blob)!;
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        s.setBucketConfig("bkt", BUCKET_CONFIG_TAGS, "env=prod".bytes())!;
+        s.setBucketConfig("bkt", BUCKET_CONFIG_LIFECYCLE, blob.view())!;
+        Check.equalBytes("env=prod".bytes(), s.bucketConfig("bkt", BUCKET_CONFIG_TAGS)!.view())?;
+        match (s.setBucketConfig("none", BUCKET_CONFIG_TAGS, "a=b".bytes())) {
+            Err(StoreError.NoSuchBucket) => {}
+            _ => { return Check.fail("config on a missing bucket"); }
+        }
+    }
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.equalBytes("env=prod".bytes(), s.bucketConfig("bkt", BUCKET_CONFIG_TAGS)!.view())?;
+        Check.equalBytes(blob.view(), s.bucketConfig("bkt", BUCKET_CONFIG_LIFECYCLE)!.view())?;
+        if (round == 0) { let _ = s.checkpoint()!; }
+        if (round == 1) {
+            s.setBucketConfig("bkt", BUCKET_CONFIG_TAGS, "".bytes())!; // cleared
+            s.deleteBucket("bkt")!;
+            s.createBucket("bkt")!;
+        }
+    }
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(0, s.bucketConfig("bkt", BUCKET_CONFIG_TAGS)!.length as u64)?;
+    Check.equalU64(0, s.bucketConfig("bkt", BUCKET_CONFIG_LIFECYCLE)!.length as u64)?; // a new bucket starts bare
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn lifecycleExpiresAndAborts() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("lifecycle");
+    var s = ObjectStore.open(dir.view(), uploadConfig())!;
+    s.createBucket("bkt")!;
+    putText(mut s, "bkt", "logs/a", "a");
+    putText(mut s, "bkt", "logs/b", "b");
+    putText(mut s, "bkt", "keep/c", "c");
+    let _ = s.putObject("bkt", "logs/big", "", patterned(100000, 1).view(), PutCondition.None)!;
+    // Tagged: only `tmp=yes` objects under tmp/ expire.
+    var meta = Vector<u8>.create();
+    metadataAdd(mut meta, TAGS_FIELD.bytes(), "tmp=yes".bytes())!;
+    var w = s.newWriter()!;
+    w.write("t".bytes())!;
+    let obj = w.finish()!;
+    let _ = s.putFinishedWith("bkt", "tmp/tagged", "", meta.view(), "".bytes(), borrow obj, PutCondition.None)!;
+    putText(mut s, "bkt", "tmp/untagged", "u");
+    let upload = s.createUpload("bkt", "logs/upload", "")!;
+    let _ = sendPart(mut s, "bkt", "logs/upload", upload, 1, patterned(70000, 2).view())!;
+    var rules = Vector<LifecycleRule>.create();
+    var logs = rule("logs", "logs/", 30);
+    logs.hasSizeBelow = true;
+    logs.sizeBelow = 1000; // the 100 kB object stays
+    logs.abortDays = 2;
+    rules.push(logs)!;
+    var tmp = rule("tmp", "tmp/", 1);
+    tmp.tags.push(copyBytes("tmp=yes".bytes())!)!;
+    rules.push(tmp)!;
+    var off = rule("off", "keep/", 1);
+    off.enabled = false;
+    rules.push(off)!;
+    var blob = Vector<u8>.create();
+    encodeLifecycle(rules.view(), mut blob)!;
+    s.setBucketConfig("bkt", BUCKET_CONFIG_LIFECYCLE, blob.view())!;
+    let now = Clock.unixMillis();
+    // Today nothing has expired.
+    let today = s.applyLifecycle(now)!;
+    Check.equalU64(0, today.objectsExpired + today.uploadsAborted)?;
+    // In three days: the tagged tmp object and the old upload, not the 30-day logs.
+    let later = s.applyLifecycle(now + 3 * DAY_MILLIS)!;
+    Check.equalU64(1, later.objectsExpired)?;
+    Check.equalU64(1, later.uploadsAborted)?;
+    Check.isTrue(s.headObject("bkt", "tmp/tagged").isErr(), "the tagged object expired")?;
+    Check.isTrue(s.headObject("bkt", "tmp/untagged").isOk(), "the untagged one stays")?;
+    Check.equalU64(0, s.uploadCount() as u64)?;
+    // In 32 days: the small logs; the big one, and the disabled rule's object, stay.
+    let month = s.applyLifecycle(now + 32 * DAY_MILLIS)!;
+    Check.equalU64(2, month.objectsExpired)?;
+    Check.isTrue(s.headObject("bkt", "logs/big").isOk(), "above the size ceiling")?;
+    Check.isTrue(s.headObject("bkt", "keep/c").isOk(), "a disabled rule")?;
+    Check.equalU64(3, s.objectCount() as u64)?;
+    // A date rule expires from its date on.
+    var dated = rule("dated", "keep/", 0);
+    dated.expirationDate = now + 5 * DAY_MILLIS;
+    var one = Vector<LifecycleRule>.create();
+    one.push(dated)!;
+    encodeLifecycle(one.view(), mut blob)!;
+    s.setBucketConfig("bkt", BUCKET_CONFIG_LIFECYCLE, blob.view())!;
+    Check.equalU64(0, s.applyLifecycle(now + 4 * DAY_MILLIS)!.objectsExpired)?;
+    Check.equalU64(1, s.applyLifecycle(now + 5 * DAY_MILLIS)!.objectsExpired)?;
+    removeTree(dir.view());
+    return Ok();
+}

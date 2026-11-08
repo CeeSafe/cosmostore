@@ -9,11 +9,11 @@
 // than fall back, because segments it covered may already be gone. Little-endian:
 //
 // Header (64 bytes):
-//   0 u64 magic "CSCKPT01"   8 u16 format (4; 1 to 3 still load)   10 u16 header length (64)   12 u32 flags (0)
+//   0 u64 magic "CSCKPT01"   8 u16 format (5; 1 to 4 still load)   10 u16 header length (64)   12 u32 flags (0)
 //  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count   48 i64 created ms
 //  56 u32 upload count (format 2; reserved, 0, in format 1)   60 u32 crc32c of bytes 0..60
 // Entries, buckets, then objects, then uploads: u8 kind (1 bucket, 2 object, 3 upload), u32 body length, body.
-//   bucket: u16+bytes name, i64 created ms
+//   bucket: u16+bytes name, i64 created ms, and in format 5 u32+bytes tags and u32+bytes lifecycle rules (ADR-0020)
 //   object: u16+bytes bucket, u16+bytes key, 16 version id, u64 lsn, u64 size, i64 mtime ms,
 //           16 md5, u16+bytes content type, u64 payload segment, u64 payload offset,
 //           u32 payload length, u64 record segment, u32 record length, manifest (u32 count,
@@ -30,7 +30,7 @@ const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 4;
+const CHECKPOINT_FORMAT: u16 = 5;
 const CHECKPOINT_BUCKET: u8 = 1;
 const CHECKPOINT_OBJECT: u8 = 2;
 const CHECKPOINT_UPLOAD: u8 = 3;
@@ -240,6 +240,10 @@ fn writeCheckpointFile(path: StringView, lsn: u64, segment: u64, state: borrow S
         body.clear();
         pushText16(mut body, k.name.view())?;
         body.pushLE(b.createdMillis)?;
+        body.pushLE(truncate<u32>(b.tags.length))?;
+        body.extend(b.tags.view())?;
+        body.pushLE(truncate<u32>(b.lifecycle.length))?;
+        body.extend(b.lifecycle.view())?;
         w.add(CHECKPOINT_BUCKET, body.view())?;
     }
     for (i in 0..state.index.length()) {
@@ -432,6 +436,14 @@ fn decodeUploadEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16
     return Ok();
 }
 
+fn readBlob32(bytes: Slice<u8>, at: borrow mut usize) -> Result<Vector<u8>, MetaFault> {
+    let n = readU32(bytes, at)? as usize;
+    need(bytes, at, n)?;
+    let v = copyBytes(bytes[at..at + n])?;
+    at += n;
+    return Ok(v);
+}
+
 /// Loads and verifies the checkpoint of `lsn`.
 fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreError> {
     let path = checkpointPath(dir, lsn, false)?;
@@ -470,7 +482,17 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
             var at: usize = 0;
             let name = corrupt(readText16(body, mut at))?;
             let created = corrupt(readI64(body, mut at))?;
-            let info = BucketInfo { createdMillis: created, objects: 0 };
+            var info = BucketInfo {
+                createdMillis: created,
+                objects: 0,
+                tags: Vector<u8>.create(),
+                lifecycle: Vector<u8>.create(),
+            };
+            if (format >= 5) {
+                info.tags = corrupt(readBlob32(body, mut at))?;
+                info.lifecycle = corrupt(readBlob32(body, mut at))?;
+            }
+            if (at != body.length) { return Err(StoreError.CheckpointCorrupt); }
             match (state.buckets.put(BucketKey { name: name }, info)?) {
                 Some(_) => { return Err(StoreError.CheckpointCorrupt); }
                 null => {}

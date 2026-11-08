@@ -679,3 +679,50 @@ fn postPolicyOf(json: StringView) -> Result<Policy, TestFailure> {
         }
     }
 }
+
+@test
+fn lifecycleXmlParsesAndWritesBack() -> Result<void, TestFailure> {
+    let xml = """
+        <LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Rule><ID>logs</ID><Filter><And><Prefix>logs/</Prefix><Tag><Key>t</Key><Value>a b</Value></Tag>
+            <ObjectSizeGreaterThan>10</ObjectSizeGreaterThan></And></Filter><Status>Enabled</Status>
+            <Expiration><Days>30</Days></Expiration></Rule>
+          <Rule><Filter><Prefix>up/</Prefix></Filter><Status>Disabled</Status>
+            <AbortIncompleteMultipartUpload><DaysAfterInitiation>3</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>
+          <Rule><ID>dated</ID><Prefix>old/</Prefix><Status>Enabled</Status>
+            <Expiration><Date>2030-01-01T00:00:00.000Z</Date></Expiration></Rule>
+        </LifecycleConfiguration>
+        """;
+    let rules = match (parseLifecycle(xml.bytes())) {
+        Ok(r) => r,
+        Err(_) => { return Check.fail("the configuration parses"); }
+    };
+    Check.equalU64(3, rules.length as u64)?;
+    Check.equalBytes("logs/".bytes(), rules[0].prefix.view())?;
+    Check.equalBytes("t=a%20b".bytes(), rules[0].tags[0].view())?;
+    Check.isTrue(rules[0].hasSizeAbove && rules[0].sizeAbove == 10, "a size floor")?;
+    Check.isTrue(!rules[1].enabled && rules[1].abortDays == 3, "a disabled abort rule")?;
+    Check.isTrue(rules[1].id.length > 0, "an ID is made for a rule without one")?;
+    Check.isTrue(rules[2].expirationDate == 1893456000000, "a date rule, with the legacy Prefix")?;
+    var out = Vector<u8>.create();
+    match (writeFilter(mut out, borrow rules[0])) {
+        Ok() => {}
+        Err(_) => { return Check.fail("the filter writes"); }
+    }
+    Check.equalBytes(
+        "<Filter><And><Prefix>logs/</Prefix><Tag><Key>t</Key><Value>a b</Value></Tag><ObjectSizeGreaterThan>10</ObjectSizeGreaterThan></And></Filter>".bytes(),
+        out.view(),
+    )?;
+    let refused = [
+        "<LifecycleConfiguration></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><Status>Enabled</Status></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><Status>On</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Days>0</Days></Expiration></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Date>2030-01-01T12:00:00Z</Date></Expiration></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><ID>a</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule><Rule><ID>a</ID><Status>Enabled</Status><Expiration><Days>2</Days></Expiration></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><Days>1</Days><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><Filter><Tag><Key>k</Key><Value>v</Value></Tag></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+    ];
+    for (r in refused) { Check.isTrue(parseLifecycle(r.bytes()).isErr(), "a configuration S3 refuses")?; }
+    return Ok();
+}

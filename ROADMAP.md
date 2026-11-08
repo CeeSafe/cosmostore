@@ -889,3 +889,28 @@ Browser form uploads with a SigV4 POST policy.
 - **M3 left:**
   - bucket tags and lifecycle rules (beyond upload expiry);
   - the Java and .NET SDKs (no Maven, Gradle or .NET SDK on this machine).
+
+### 9 Nov 2026: M3 slice 13, bucket tags and lifecycle rules (ADR-0020)
+
+- **Store:**
+  - buckets keep their tags and lifecycle rules; one new record, `BucketConfig` (code 14), sets or clears them;
+  - checkpoint format 5 (1 to 4 still load); deleting a bucket drops both, and a recreated bucket starts bare;
+  - `applyLifecycle` (from `maintain`, at most hourly) expires objects by days, rounded up to midnight UTC as S3 does,
+    or by date. Rules filter by prefix, tags and size. Deletes are batched per bucket, up to 1,000 a run, and old
+    uploads are aborted.
+- **S3:**
+  - Get, Put and DeleteBucketTagging (50 tags);
+  - Get, Put and DeleteBucketLifecycleConfiguration, with S3's checks;
+  - rules come back in the form given (a legacy Prefix stays one);
+  - ExpiredObjectDeleteMarker is accepted as the no-op it is without versioning;
+  - transitions and noncurrent-version rules are NotImplemented.
+- **Tests:**
+  - unit tests for rule blobs, matching, rounding and the XML;
+  - store tests through the journal and checkpoints, and expiry at now plus 0, 3, 5 and 32 days;
+  - the multipart fault sweeps set bucket tags;
+  - smoke 122, up from 115;
+  - the s3-tests subset of 252, up from 238, with the `lifecycle` marker in: 13 lifecycle configuration tests and
+    bucket tagging pass, and nothing was lost;
+  - `ceesafec test`: 101; the SDK matrix and TLS smoke pass.
+- **M3 left:**
+  - the Java and .NET SDKs (no Maven, Gradle or .NET SDK on this machine). Everything else on M3's list is done.

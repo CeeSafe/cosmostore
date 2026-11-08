@@ -33,6 +33,8 @@ struct StoreConfig {
     /// `maintain` aborts uploads started longer ago than this (0: never), so an abandoned upload does not keep its
     /// parts forever (ADR-0017).
     uploadExpiryMillis: u64;
+    /// How often `maintain` applies buckets' lifecycle rules (0: never); S3 runs them about daily (ADR-0020).
+    lifecycleEveryMillis: u64;
 
     fn defaults() -> StoreConfig => StoreConfig {
         journal: JournalConfig.defaults(),
@@ -47,6 +49,7 @@ struct StoreConfig {
         minPartBytes: 5242880,
         maxUploadBytes: 5497558138880,
         uploadExpiryMillis: 604800000, // 7 days
+        lifecycleEveryMillis: 3600000, // an hour
     };
 }
 
@@ -107,6 +110,10 @@ struct BucketEntry {
 struct BucketInfo {
     createdMillis: i64;
     objects: u64;
+    /// The bucket's tags (canonical, as object tags are) and lifecycle rules (`encodeLifecycle`); empty for none
+    /// (ADR-0020).
+    tags: Vector<u8>;
+    lifecycle: Vector<u8>;
 }
 
 /// Space use of one segment, for compaction (ADR-0005). `liveBytes` counts the records that
@@ -132,6 +139,14 @@ struct MaintenanceReport {
     compaction: CompactStats;
     /// Uploads aborted for their age.
     uploadsExpired: u64;
+    /// What lifecycle rules did this time (zeros when they did not run).
+    lifecycle: LifecycleReport;
+}
+
+/// What one application of the lifecycle rules did.
+struct LifecycleReport {
+    objectsExpired: u64;
+    uploadsAborted: u64;
 }
 
 /// A live inline version that compaction copies.
@@ -388,8 +403,29 @@ fn applyRecord(
                 Ok(t) => t,
                 Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
             };
-            let info = BucketInfo { createdMillis: created, objects: 0 };
+            let info = BucketInfo {
+                createdMillis: created,
+                objects: 0,
+                tags: Vector<u8>.create(),
+                lifecycle: Vector<u8>.create(),
+            };
             let _ = state.buckets.put(BucketKey { name: name }, info)?;
+        }
+        RecordType.BucketConfig => {
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
+            let m = match (decodeBucketConfigMeta(meta)) {
+                Ok(m) => m,
+                Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+            };
+            let configKind = m.kind;
+            let value = m.value;
+            let k = BucketKey { name: m.bucket };
+            match (state.buckets.getMut(borrow k)) {
+                Some(b) => {
+                    if (configKind == BUCKET_CONFIG_TAGS) { b.tags = value; } else { b.lifecycle = value; }
+                }
+                null => {}
+            }
         }
         RecordType.Relocate => {
             let m = match (decodeRelocateMeta(meta)) {
@@ -537,6 +573,9 @@ fn verifyFault(e: StoreError) -> VerifyFault => match (e) {
 /// What admission adds for a write's journal record and the extent headers of a small object (ADR-0006).
 const ADMIT_RECORD_BYTES: u64 = 4096;
 
+/// The most objects one bucket's lifecycle rules delete in one run (ADR-0020).
+const LIFECYCLE_BATCH: usize = 1000;
+
 /// Abandoned extents queued between reaps; more are left to the orphan sweep at open.
 const ABANDONED_CAPACITY: usize = 4096;
 
@@ -561,6 +600,8 @@ struct ObjectStore {
     /// Extents of writers dropped unfinished, for the store to remove: a drop may run in async code, which must not
     /// do I/O, so it only queues them here.
     private abandoned: Channel<u64>;
+    /// When `maintain` last applied lifecycle rules (Unix milliseconds).
+    private lifecycleRan: i64;
 
     /// Opens the store in `dir`: loads the newest checkpoint, if any, then replays the journal
     /// records after it.
@@ -652,6 +693,7 @@ struct ObjectStore {
             abandoned: Channel<u64>.create(ABANDONED_CAPACITY)?,
             deferred: Vector<DeferredExtent>.create(),
             deferredBytes: 0,
+            lifecycleRan: 0,
         };
         // Every extent not referenced by a live version is garbage: superseded or deleted
         // versions, and uploads that never committed (ADR-0003).
@@ -2036,7 +2078,122 @@ struct ObjectStore {
         let every = this.config.checkpointEveryBytes;
         if (every > 0 && this.sinceCheckpoint >= every) { checkpointed = this.checkpoint()?; }
         let compaction = this.compact(this.config.compactMaxCopyBytes)?;
-        return Ok(MaintenanceReport { checkpointed: checkpointed, compaction: compaction, uploadsExpired: expired });
+        var lifecycle = LifecycleReport { objectsExpired: 0, uploadsAborted: 0 };
+        let lifecycleEvery = this.config.lifecycleEveryMillis;
+        if (lifecycleEvery > 0 && now - this.lifecycleRan >= truncate<i64>(lifecycleEvery)) {
+            lifecycle = this.applyLifecycle(now)?;
+            this.lifecycleRan = now;
+        }
+        return Ok(MaintenanceReport {
+            checkpointed: checkpointed,
+            compaction: compaction,
+            uploadsExpired: expired,
+            lifecycle: lifecycle,
+        });
+    }
+
+    // ---- Bucket configuration (ADR-0020) ----
+
+    /// Sets a bucket's tags (kind BUCKET_CONFIG_TAGS) or lifecycle rules (BUCKET_CONFIG_LIFECYCLE); an empty value
+    /// clears it. One BucketConfig record, durable before this returns.
+    fn setBucketConfig(borrow mut this, bucket: StringView, kind: u8, value: Slice<u8>) -> Result<void, StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        if (value.length > 1048576) { return Err(StoreError.MetadataTooLarge); }
+        this.scratch.clear();
+        encodeBucketConfigMeta(mut this.scratch, bucket.bytes(), kind, value)?;
+        let empty = [0u8; 1];
+        this.commitOne(RecordType.BucketConfig, empty[0..0])?;
+        return Ok();
+    }
+
+    /// A bucket's tags or lifecycle rules, as stored; empty for none.
+    fn bucketConfig(borrow this, bucket: StringView, kind: u8) -> Result<Vector<u8>, StoreError> {
+        let k = BucketKey { name: copyBytes(bucket.bytes())? };
+        return match (this.state.buckets.get(borrow k)) {
+            Some(b) => Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?),
+            null => Err(StoreError.NoSuchBucket),
+        };
+    }
+
+    /// Applies every bucket's lifecycle rules as of `nowMillis`: deletes the objects a rule has expired (one batch per
+    /// bucket, as DeleteObjects does) and aborts the uploads a rule's AbortIncompleteMultipartUpload has. At most
+    /// LIFECYCLE_BATCH objects per bucket and run, so the store's lock is never held long; the rest wait for the next.
+    fn applyLifecycle(borrow mut this, nowMillis: i64) -> Result<LifecycleReport, StoreError> {
+        var report = LifecycleReport { objectsExpired: 0, uploadsAborted: 0 };
+        var names = Vector<Vector<u8>>.create();
+        for (i in 0..this.state.buckets.length()) {
+            if (this.state.buckets.valueAt(i).lifecycle.length > 0) {
+                names.push(copyBytes(this.state.buckets.keyAt(i).name.view())?)?;
+            }
+        }
+        for (n in 0..names.length) {
+            let bucketName = names[n].view();
+            let k = BucketKey { name: copyBytes(bucketName)? };
+            let blob = match (this.state.buckets.get(borrow k)) {
+                Some(b) => copyBytes(b.lifecycle.view())?,
+                null => { continue; }
+            };
+            let rules = match (decodeLifecycle(blob.view())) {
+                Ok(r) => r,
+                Err(_) => { return Err(StoreError.DataCorrupt); }
+            };
+            // Objects that some rule has expired.
+            var expired = Vector<Vector<u8>>.create();
+            for (i in 0..this.state.index.length()) {
+                if (expired.length == LIFECYCLE_BATCH) { break; }
+                let key = this.state.index.keyAt(i);
+                if (key.bucket.view() != bucketName) { continue; }
+                let v = this.state.index.valueAt(i);
+                let tags = match (metadataValue(v.metadata.view(), TAGS_FIELD.bytes())) {
+                    Ok(t) => t,
+                    Err(_) => Vector<u8>.create(),
+                };
+                for (r in 0..rules.length) {
+                    if (!ruleMatches(borrow rules[r], key.key.view(), v.size, tags.view())) { continue; }
+                    match (expiresAt(borrow rules[r], v.mtimeMillis)) {
+                        Some(at) => {
+                            if (nowMillis >= at) {
+                                expired.push(copyBytes(key.key.view())?)?;
+                                break;
+                            }
+                        }
+                        null => {}
+                    }
+                }
+            }
+            if (expired.length > 0) {
+                let bucketText = StringView.fromUtf8(bucketName) ?? "";
+                let _ = this.deleteObjects(bucketText, expired.view())?;
+                report.objectsExpired += expired.length as u64;
+            }
+            // Uploads that some rule aborts.
+            var old = Vector<[u8; 16]>.create();
+            for (i in 0..this.state.uploads.length()) {
+                let u = this.state.uploads.valueAt(i);
+                if (u.bucket.view() != bucketName) { continue; }
+                for (r in 0..rules.length) {
+                    let rule = borrow rules[r];
+                    if (!rule.enabled || rule.abortDays == 0 || !startsWithBytes(u.key.view(), rule.prefix.view())) {
+                        continue;
+                    }
+                    if (nowMillis >= u.initiatedMillis + (rule.abortDays as i64) * DAY_MILLIS) {
+                        old.push(this.state.uploads.keyAt(i).id)?;
+                        break;
+                    }
+                }
+            }
+            for (id in old.view()) {
+                this.checkWritable()?;
+                this.scratch.clear();
+                encodeUploadAbortMeta(mut this.scratch, id, nowMillis)?;
+                let empty = [0u8; 1];
+                this.commitOne(RecordType.UploadAbort, empty[0..0])?;
+                report.uploadsAborted += 1;
+            }
+        }
+        return Ok(report);
     }
 
     /// Aborts every upload initiated before `cutoffMillis` (Unix milliseconds), each with its own UploadAbort record,

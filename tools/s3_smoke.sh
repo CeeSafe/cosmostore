@@ -1,5 +1,5 @@
 #!/bin/sh
-# The M3 end-to-end test (ADR-0008 to ADR-0017): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
+# The M3 end-to-end test (ADR-0008 to ADR-0020): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
 # against `cosmostore serve` on a fresh store. Prints one line per check; exit status 1 if any fails.
 #
 # usage: tools/s3_smoke.sh [COSMOSTORE] [PORT]     (defaults: out/cosmostore, 9311)
@@ -262,6 +262,21 @@ check "delete-object-tagging" "$(aws s3api get-object-tagging --bucket smoke --k
 check "eleven tags" "$(code s3api put-object-tagging --bucket smoke --key t/one --tagging 'TagSet=[{Key=a,Value=1},{Key=b,Value=1},{Key=c,Value=1},{Key=d,Value=1},{Key=e,Value=1},{Key=f,Value=1},{Key=g,Value=1},{Key=h,Value=1},{Key=i,Value=1},{Key=j,Value=1},{Key=k,Value=1}]')" InvalidTag
 check "tags on a missing key" "$(code s3api put-object-tagging --bucket smoke --key t/none --tagging 'TagSet=[{Key=a,Value=1}]')" NoSuchKey
 aws s3 rm --recursive s3://smoke/t/ > /dev/null 2>&1
+
+# Bucket tags and lifecycle rules (ADR-0020).
+check "no bucket tags" "$(code s3api get-bucket-tagging --bucket smoke)" NoSuchTagSet
+aws s3api put-bucket-tagging --bucket smoke --tagging 'TagSet=[{Key=env,Value=test},{Key=owner,Value=smoke}]' > /dev/null 2>&1
+check "bucket tags" "$(aws s3api get-bucket-tagging --bucket smoke --query 'TagSet[].Key' --output text)" "env	owner"
+aws s3api delete-bucket-tagging --bucket smoke > /dev/null 2>&1
+check "bucket tags deleted" "$(code s3api get-bucket-tagging --bucket smoke)" NoSuchTagSet
+check "no lifecycle" "$(code s3api get-bucket-lifecycle-configuration --bucket smoke)" NoSuchLifecycleConfiguration
+aws s3api put-bucket-lifecycle-configuration --bucket smoke --lifecycle-configuration '{"Rules":[
+  {"ID":"logs","Filter":{"Prefix":"logs/"},"Status":"Enabled","Expiration":{"Days":30}},
+  {"ID":"uploads","Filter":{"Prefix":""},"Status":"Enabled","AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}' > /dev/null 2>&1
+check "lifecycle rules" "$(aws s3api get-bucket-lifecycle-configuration --bucket smoke --query 'Rules[].[ID,Expiration.Days,AbortIncompleteMultipartUpload.DaysAfterInitiation]' --output text | tr '\t\n' ' ;')" "logs 30 None;uploads None 7;"
+check "transitions not implemented" "$(code s3api put-bucket-lifecycle-configuration --bucket smoke --lifecycle-configuration '{"Rules":[{"ID":"t","Filter":{"Prefix":""},"Status":"Enabled","Transitions":[{"Days":1,"StorageClass":"GLACIER"}]}]}')" NotImplemented
+aws s3api delete-bucket-lifecycle --bucket smoke > /dev/null 2>&1
+check "lifecycle deleted" "$(code s3api get-bucket-lifecycle-configuration --bucket smoke)" NoSuchLifecycleConfiguration
 
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1

@@ -1,0 +1,218 @@
+// Bucket configuration (ADR-0020): a bucket's tags and its lifecycle rules, kept with the bucket and set or cleared by
+// BucketConfig records. Lifecycle rules expire objects (by days or date, filtered by prefix, tags and size) and abort
+// old multipart uploads; `ObjectStore.applyLifecycle` enforces them.
+
+const BUCKET_CONFIG_TAGS: u8 = 1;
+const BUCKET_CONFIG_LIFECYCLE: u8 = 2;
+const DAY_MILLIS: i64 = 86400000;
+
+/// BucketConfig meta v1: u8 format version, u16+bytes bucket, u8 kind (1 tags, 2 lifecycle), u32+bytes the value
+/// (empty: cleared).
+fn encodeBucketConfigMeta(
+    out: borrow mut Vector<u8>,
+    bucket: Slice<u8>,
+    kind: u8,
+    value: Slice<u8>,
+) -> Result<void, AllocError> {
+    out.pushLE(META_FORMAT_VERSION)?;
+    pushText16(out, bucket)?;
+    out.pushLE(kind)?;
+    out.pushLE(truncate<u32>(value.length))?;
+    out.extend(value)?;
+    return Ok();
+}
+
+struct BucketConfigMeta {
+    bucket: Vector<u8>;
+    kind: u8;
+    value: Vector<u8>;
+}
+
+fn decodeBucketConfigMeta(bytes: Slice<u8>) -> Result<BucketConfigMeta, MetaFault> {
+    var at: usize = 0;
+    checkVersion(bytes, mut at)?;
+    let bucket = readText16(bytes, mut at)?;
+    need(bytes, at, 1)?;
+    let kind = bytes[at];
+    at += 1;
+    let n = readU32(bytes, mut at)? as usize;
+    need(bytes, at, n)?;
+    let value = copyBytes(bytes[at..at + n])?;
+    at += n;
+    if (at != bytes.length || (kind != BUCKET_CONFIG_TAGS && kind != BUCKET_CONFIG_LIFECYCLE)) {
+        return Err(MetaFault.TooLong);
+    }
+    return Ok(BucketConfigMeta { bucket: bucket, kind: kind, value: value });
+}
+
+// ---- Lifecycle rules ----
+
+/// One rule. Its filter: a key prefix, tags (each a canonical `k=v` piece, as tags are stored, ADR-0017), and object
+/// sizes; every part must hold. Its actions: expire objects (after `expirationDays`, or from `expirationDate`), and
+/// abort uploads `abortDays` after they began. 0 means no such action.
+struct LifecycleRule {
+    id: Vector<u8>;
+    enabled: bool;
+    prefix: Vector<u8>;
+    tags: Vector<Vector<u8>>;
+    hasSizeAbove: bool;
+    sizeAbove: u64;
+    hasSizeBelow: bool;
+    sizeBelow: u64;
+    expirationDays: u32;
+    /// Unix milliseconds, midnight UTC.
+    expirationDate: i64;
+    abortDays: u32;
+    /// Given as the legacy top-level `<Prefix>`, so written back that way, as S3 does.
+    legacyPrefix: bool;
+    /// `ExpiredObjectDeleteMarker`: kept and returned, and a no-op, since an unversioned bucket has no delete markers.
+    expiredDeleteMarker: bool;
+}
+
+/// Rules blob v1: u8 version (1), u16 rule count, then per rule: u16+bytes id, u8 flags (1 enabled, 2 a size floor,
+/// 4 a size ceiling, 8 a legacy prefix, 16 ExpiredObjectDeleteMarker), u16+bytes prefix, u8 tag count and each u16+bytes, u64 size floor, u64 size ceiling,
+/// u32 expiration days, i64 expiration date, u32 abort days.
+fn encodeLifecycle(rules: Slice<LifecycleRule>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.clear();
+    out.pushLE(1u8)?;
+    out.pushLE(truncate<u16>(rules.length))?;
+    for (r in rules) {
+        pushText16(out, r.id.view())?;
+        var flags: u8 = 0;
+        if (r.enabled) { flags |= 1; }
+        if (r.hasSizeAbove) { flags |= 2; }
+        if (r.hasSizeBelow) { flags |= 4; }
+        if (r.legacyPrefix) { flags |= 8; }
+        if (r.expiredDeleteMarker) { flags |= 16; }
+        out.pushLE(flags)?;
+        pushText16(out, r.prefix.view())?;
+        out.pushLE(truncate<u8>(r.tags.length))?;
+        for (t in r.tags.view()) { pushText16(out, t.view())?; }
+        out.pushLE(r.sizeAbove)?;
+        out.pushLE(r.sizeBelow)?;
+        out.pushLE(r.expirationDays)?;
+        out.pushLE(r.expirationDate)?;
+        out.pushLE(r.abortDays)?;
+    }
+    return Ok();
+}
+
+fn decodeLifecycle(blob: Slice<u8>) -> Result<Vector<LifecycleRule>, MetaFault> {
+    var rules = Vector<LifecycleRule>.create();
+    if (blob.length == 0) { return Ok(rules); }
+    var at: usize = 0;
+    need(blob, at, 3)?;
+    if (blob[0] != 1) { return Err(MetaFault.BadVersion); }
+    let count = blob.readLE<u16>(1);
+    at = 3;
+    for (i in 0..count) {
+        let id = readText16(blob, mut at)?;
+        need(blob, at, 1)?;
+        let flags = blob[at];
+        at += 1;
+        let prefix = readText16(blob, mut at)?;
+        need(blob, at, 1)?;
+        let tagCount = blob[at];
+        at += 1;
+        var tags = Vector<Vector<u8>>.create();
+        for (t in 0..tagCount) { tags.push(readText16(blob, mut at)?)?; }
+        let above = readU64(blob, mut at)?;
+        let below = readU64(blob, mut at)?;
+        let days = readU32(blob, mut at)?;
+        let date = readI64(blob, mut at)?;
+        let abort = readU32(blob, mut at)?;
+        rules.push(LifecycleRule {
+            id: id,
+            enabled: (flags & 1) != 0,
+            prefix: prefix,
+            tags: tags,
+            hasSizeAbove: (flags & 2) != 0,
+            sizeAbove: above,
+            hasSizeBelow: (flags & 4) != 0,
+            sizeBelow: below,
+            expirationDays: days,
+            expirationDate: date,
+            abortDays: abort,
+            legacyPrefix: (flags & 8) != 0,
+            expiredDeleteMarker: (flags & 16) != 0,
+        })?;
+    }
+    if (at != blob.length) { return Err(MetaFault.TooLong); }
+    return Ok(rules);
+}
+
+/// Whether every tag of `wanted` (canonical `k=v` pieces) is one of `canonical`'s `&`-separated pieces.
+fn tagsInclude(canonical: Slice<u8>, wanted: Slice<Vector<u8>>) -> bool {
+    for (w in wanted) {
+        var found = false;
+        var at: usize = 0;
+        while (at <= canonical.length && canonical.length > 0) {
+            let end = pieceEnd(canonical, at, '&');
+            if (canonical[at..end] == w.view()) { found = true; }
+            at = end + 1;
+        }
+        if (!found) { return false; }
+    }
+    return true;
+}
+
+/// Whether an enabled rule's filter takes this object.
+fn ruleMatches(r: borrow LifecycleRule, key: Slice<u8>, size: u64, tags: Slice<u8>) -> bool {
+    if (!r.enabled || !startsWithBytes(key, r.prefix.view())) { return false; }
+    if (r.hasSizeAbove && !(size > r.sizeAbove)) { return false; }
+    if (r.hasSizeBelow && !(size < r.sizeBelow)) { return false; }
+    return tagsInclude(tags, r.tags.view());
+}
+
+/// When a rule expires an object made at `mtimeMillis`: S3 adds the days and rounds up to the next midnight UTC; a
+/// date is its own time. null: the rule does not expire objects.
+fn expiresAt(r: borrow LifecycleRule, mtimeMillis: i64) -> i64? {
+    if (r.expirationDays > 0) {
+        let t = mtimeMillis + (r.expirationDays as i64) * DAY_MILLIS;
+        return ((t + DAY_MILLIS - 1) / DAY_MILLIS) * DAY_MILLIS;
+    }
+    if (r.expirationDate > 0) { return r.expirationDate; }
+    return null;
+}
+
+@test
+fn lifecycleRulesRoundTripAndMatch() -> Result<void, TestFailure> {
+    var tags = Vector<Vector<u8>>.create();
+    tags.push(copyBytes("team=blue".bytes())!)!;
+    let rule = LifecycleRule {
+        id: copyBytes("logs".bytes())!,
+        enabled: true,
+        prefix: copyBytes("logs/".bytes())!,
+        tags: tags,
+        hasSizeAbove: true,
+        sizeAbove: 10,
+        hasSizeBelow: false,
+        sizeBelow: 0,
+        expirationDays: 30,
+        expirationDate: 0,
+        abortDays: 7,
+        legacyPrefix: false,
+        expiredDeleteMarker: false,
+    };
+    var rules = Vector<LifecycleRule>.create();
+    rules.push(rule)!;
+    var blob = Vector<u8>.create();
+    encodeLifecycle(rules.view(), mut blob)!;
+    let back = decodeLifecycle(blob.view())!;
+    Check.equalU64(1, back.length as u64)?;
+    let r = borrow back[0];
+    Check.equalBytes("logs/".bytes(), r.prefix.view())?;
+    Check.equalU64(7, r.abortDays as u64)?;
+    for (n in 0..blob.length) {
+        Check.isTrue(decodeLifecycle(blob.view()[0..n]).isErr() || n == 0, "a truncated blob")?;
+    }
+    Check.isTrue(ruleMatches(r, "logs/a".bytes(), 11, "a=1&team=blue".bytes()), "prefix, size and tag")?;
+    Check.isTrue(!ruleMatches(r, "data/a".bytes(), 11, "team=blue".bytes()), "another prefix")?;
+    Check.isTrue(!ruleMatches(r, "logs/a".bytes(), 10, "team=blue".bytes()), "not above the floor")?;
+    Check.isTrue(!ruleMatches(r, "logs/a".bytes(), 11, "team=bluegreen".bytes()), "a tag must match whole")?;
+    Check.isTrue(!ruleMatches(r, "logs/a".bytes(), 11, "".bytes()), "no tags")?;
+    // 2026-11-09T15:00Z plus 30 days is 2026-12-09T15:00Z: expired from midnight on 2026-12-10.
+    let made: i64 = 1794236400000;
+    Check.isTrue(expiresAt(r, made)! == 1796860800000, "the next midnight UTC after 30 days")?;
+    return Ok();
+}

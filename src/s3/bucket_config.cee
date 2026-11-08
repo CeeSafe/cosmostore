@@ -1,0 +1,389 @@
+// Bucket tagging and lifecycle configuration over S3 (ADR-0020): Get/Put/DeleteBucketTagging and
+// Get/Put/DeleteBucketLifecycleConfiguration. The store keeps tags in their canonical form and rules in a compact blob;
+// GET writes the XML from them.
+import web_core;
+import web_http;
+import web_server;
+
+/// A bucket may have 50 tags (S3).
+const MAX_BUCKET_TAGS: usize = 50;
+const MAX_LIFECYCLE_RULES: usize = 1000;
+
+async fn storeBucketConfig(app: borrow S3App, bucket: StringView, kind: u8) -> Result<Vector<u8>, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => store.bucketConfig(bucket, kind))) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+async fn storeSetBucketConfig(
+    app: borrow S3App,
+    bucket: StringView,
+    kind: u8,
+    value: Slice<u8>,
+) -> Result<void, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => store.setBucketConfig(bucket, kind, value))) {
+        Ok() => Ok(),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+// ---- Bucket tagging ----
+
+async fn getBucketTagging(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let stored = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_TAGS)?;
+    if (stored.length == 0) { return Err(S3Fail.Code(S3Code.NoSuchTagSet)); }
+    let tags = tagsOfQuery(stored.view())?;
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "Tagging")?;
+    body.extend("<TagSet>".bytes())?;
+    for (i in 0..tags.length) {
+        body.extend("<Tag>".bytes())?;
+        xmlElement(mut body, "Key", tags[i].key.view(), false)?;
+        xmlElement(mut body, "Value", tags[i].value.view(), false)?;
+        body.extend("</Tag>".bytes())?;
+    }
+    body.extend("</TagSet></Tagging>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn putBucketTagging(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    verifySmallBody(req, xml.view(), true)?;
+    let tags = tagsOfXmlUpTo(xml.view(), MAX_BUCKET_TAGS)?;
+    var canonical = Vector<u8>.create();
+    canonicalTagsUpTo(borrow tags, mut canonical, MAX_BUCKET_TAGS)?;
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_TAGS, canonical.view())?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}
+
+async fn deleteBucketTagging(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_TAGS, "".bytes())?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}
+
+// ---- Lifecycle ----
+
+/// The first `<name>…</name>` block of `xml`, its inside; null if there is none.
+fn blockOf<region a>(xml: Slice<a, u8>, name: StringView, from: usize) -> Slice<a, u8>? {
+    var open = Vector<u8>.create();
+    var close = Vector<u8>.create();
+    if (open.push('<').isErr() || open.extend(name.bytes()).isErr() || open.push('>').isErr()) { return null; }
+    if (close.extend("</".bytes()).isErr() || close.extend(name.bytes()).isErr() || close.push('>').isErr()) {
+        return null;
+    }
+    let start = match (findBytes(xml, open.view(), from)) {
+        Some(s) => s + open.length,
+        null => { return null; }
+    };
+    return match (findBytes(xml, close.view(), start)) {
+        Some(end) => Some(xml[start..end]),
+        null => null,
+    };
+}
+
+fn positiveDecimal(text: Slice<u8>) -> Result<u64, S3Fail> {
+    return match (parseDecimal(trimSpaces(text))) {
+        Some(v) => if (v > 0) Ok(v) else Err(S3Fail.Code(S3Code.InvalidArgument)),
+        null => Err(S3Fail.Code(S3Code.InvalidArgument)),
+    };
+}
+
+/// A rule's filter (a `<Filter>`'s inside, or an `<And>`'s): Prefix, Tags, ObjectSizeGreaterThan/LessThan.
+fn filterInto(xml: Slice<u8>, rule: borrow mut LifecycleRule) -> Result<void, S3Fail> {
+    match (blockOf(xml, "And", 0)) {
+        Some(and) => { return filterInto(and, rule); }
+        null => {}
+    }
+    var prefix = Vector<u8>.create();
+    if (rawElement(xml, "Prefix", mut prefix)?) { rule.prefix = prefix; }
+    match (elementText(xml, "ObjectSizeGreaterThan")) {
+        Some(t) => {
+            rule.hasSizeAbove = true;
+            rule.sizeAbove = match (parseDecimal(t)) {
+                Some(v) => v,
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            };
+        }
+        null => {}
+    }
+    match (elementText(xml, "ObjectSizeLessThan")) {
+        Some(t) => {
+            rule.hasSizeBelow = true;
+            rule.sizeBelow = positiveDecimal(t)?;
+        }
+        null => {}
+    }
+    // Tags, each canonical as object tags are stored, so the store compares them whole.
+    var tags = Vector<Tag>.create();
+    var at: usize = 0;
+    while (true) {
+        let start = match (findBytes(xml, "<Tag>".bytes(), at)) {
+            Some(s) => s + 5,
+            null => { break; }
+        };
+        let end = match (findBytes(xml, "</Tag>".bytes(), start)) {
+            Some(e) => e,
+            null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        };
+        var tag = Tag { key: Vector<u8>.create(), value: Vector<u8>.create() };
+        if (!rawElement(xml[start..end], "Key", mut tag.key)?) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        let _ = rawElement(xml[start..end], "Value", mut tag.value)?;
+        tags.push(tag)?;
+        at = end + 6;
+    }
+    for (i in 0..tags.length) {
+        var one = Vector<Tag>.create();
+        one.push(Tag { key: copyBytes(tags[i].key.view())?, value: copyBytes(tags[i].value.view())? })?;
+        var canonical = Vector<u8>.create();
+        canonicalTags(borrow one, mut canonical)?;
+        rule.tags.push(canonical)?;
+    }
+    if (rule.hasSizeAbove && rule.hasSizeBelow && rule.sizeAbove >= rule.sizeBelow) {
+        return Err(S3Fail.Code(S3Code.InvalidArgument));
+    }
+    return Ok();
+}
+
+/// A LifecycleConfiguration document's rules, checked as S3 checks them.
+fn parseLifecycle(xml: Slice<u8>) -> Result<Vector<LifecycleRule>, S3Fail> {
+    if (findBytes(xml, "<LifecycleConfiguration".bytes(), 0).isNull()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    var rules = Vector<LifecycleRule>.create();
+    var at: usize = 0;
+    while (true) {
+        let start = match (findBytes(xml, "<Rule>".bytes(), at)) {
+            Some(s) => s + 6,
+            null => { break; }
+        };
+        let end = match (findBytes(xml, "</Rule>".bytes(), start)) {
+            Some(e) => e,
+            null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        };
+        let inner = xml[start..end];
+        at = end + 7;
+        // Actions CosmoStore does not have: storage classes and versions.
+        let unsupported = [
+            "<Transition>",
+            "<NoncurrentVersionExpiration>",
+            "<NoncurrentVersionTransition>",
+        ];
+        for (u in unsupported) {
+            if (findBytes(inner, u.bytes(), 0).isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        }
+        var rule = LifecycleRule {
+            id: Vector<u8>.create(),
+            enabled: false,
+            prefix: Vector<u8>.create(),
+            tags: Vector<Vector<u8>>.create(),
+            hasSizeAbove: false,
+            sizeAbove: 0,
+            hasSizeBelow: false,
+            sizeBelow: 0,
+            expirationDays: 0,
+            expirationDate: 0,
+            abortDays: 0,
+            legacyPrefix: false,
+            expiredDeleteMarker: false,
+        };
+        let _ = rawElement(inner, "ID", mut rule.id)?;
+        if (rule.id.length > 255) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        let status = elementText(inner, "Status") ?? "".bytes();
+        if (status == "Enabled".bytes()) {
+            rule.enabled = true;
+        } else if (status != "Disabled".bytes()) {
+            return Err(S3Fail.Code(S3Code.MalformedXML));
+        }
+        match (blockOf(inner, "Filter", 0)) {
+            Some(filter) => { filterInto(filter, mut rule)?; }
+            null => {
+                // The legacy form: a Prefix directly in the rule.
+                var prefix = Vector<u8>.create();
+                if (rawElement(inner, "Prefix", mut prefix)?) {
+                    rule.prefix = prefix;
+                    rule.legacyPrefix = true;
+                }
+            }
+        }
+        match (blockOf(inner, "Expiration", 0)) {
+            Some(e) => {
+                let days = elementText(e, "Days");
+                let date = elementText(e, "Date");
+                // ExpiredObjectDeleteMarker stands alone (S3); here it is kept and does nothing, as no bucket is
+                // versioned.
+                match (elementText(e, "ExpiredObjectDeleteMarker")) {
+                    Some(t) => {
+                        if (days.isSome() || date.isSome()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+                        if (t == "true".bytes()) {
+                            rule.expiredDeleteMarker = true;
+                        } else if (t != "false".bytes()) {
+                            return Err(S3Fail.Code(S3Code.MalformedXML));
+                        }
+                    }
+                    null => {
+                        if (days.isSome() == date.isSome()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+                    }
+                }
+                match (days) {
+                    Some(d) => { rule.expirationDays = truncate<u32>(positiveDecimal(d)?.min(0xFFFFFFFF)); }
+                    null => {}
+                }
+                match (date) {
+                    Some(d) => {
+                        let seconds = match (parseIsoTime(d)) {
+                            Some(t) => t,
+                            null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                        };
+                        if (seconds % 86400 != 0) { return Err(S3Fail.Code(S3Code.InvalidArgument)); } // midnight UTC
+                        rule.expirationDate = seconds * 1000;
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        match (blockOf(inner, "AbortIncompleteMultipartUpload", 0)) {
+            Some(a) => {
+                rule.abortDays = truncate<u32>(
+                    positiveDecimal(elementText(a, "DaysAfterInitiation") ?? "".bytes())?.min(
+                        0xFFFFFFFF,
+                    ),
+                );
+                // S3: an upload has no tags to filter by.
+                if (rule.tags.length > 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            }
+            null => {}
+        }
+        if (rule.expirationDays == 0 && rule.expirationDate == 0 && rule.abortDays == 0 && !rule.expiredDeleteMarker) {
+            return Err(S3Fail.Code(S3Code.MalformedXML)); // a rule needs an action
+        }
+        rules.push(rule)?;
+        if (rules.length > MAX_LIFECYCLE_RULES) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    }
+    if (rules.length == 0) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    // IDs: unique, and S3 makes one for a rule without.
+    for (i in 0..rules.length) {
+        if (rules[i].id.length == 0) {
+            var random = [0u8; 12];
+            Random.fill(mut random[..])!;
+            var id = Vector<u8>.create();
+            appendBase64(mut id, random[..])?;
+            rules[i].id = id;
+        }
+        for (j in 0..i) {
+            if (rules[j].id.view() == rules[i].id.view()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        }
+    }
+    return Ok(rules);
+}
+
+/// A rule's `<Filter>` as S3 writes it back: one part alone, several in an `<And>`.
+fn writeFilter(out: borrow mut Vector<u8>, r: borrow LifecycleRule) -> Result<void, S3Fail> {
+    if (r.legacyPrefix) { return Ok(xmlElement(out, "Prefix", r.prefix.view(), false)?); } // as it was given
+    var parts: usize = r.tags.length;
+    if (r.prefix.length > 0) { parts += 1; }
+    if (r.hasSizeAbove) { parts += 1; }
+    if (r.hasSizeBelow) { parts += 1; }
+    out.extend("<Filter>".bytes())?;
+    if (parts > 1) { out.extend("<And>".bytes())?; }
+    if (r.prefix.length > 0 || parts == 0) { xmlElement(out, "Prefix", r.prefix.view(), false)?; }
+    for (t in r.tags.view()) {
+        let decoded = tagsOfQuery(t.view())?;
+        out.extend("<Tag>".bytes())?;
+        xmlElement(out, "Key", decoded[0].key.view(), false)?;
+        xmlElement(out, "Value", decoded[0].value.view(), false)?;
+        out.extend("</Tag>".bytes())?;
+    }
+    if (r.hasSizeAbove) { xmlDecimal(out, "ObjectSizeGreaterThan", r.sizeAbove)?; }
+    if (r.hasSizeBelow) { xmlDecimal(out, "ObjectSizeLessThan", r.sizeBelow)?; }
+    if (parts > 1) { out.extend("</And>".bytes())?; }
+    out.extend("</Filter>".bytes())?;
+    return Ok();
+}
+
+async fn getBucketLifecycle(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let stored = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_LIFECYCLE)?;
+    if (stored.length == 0) { return Err(S3Fail.Code(S3Code.NoSuchLifecycleConfiguration)); }
+    let rules = match (decodeLifecycle(stored.view())) {
+        Ok(r) => r,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "LifecycleConfiguration")?;
+    for (i in 0..rules.length) {
+        let r = borrow rules[i];
+        body.extend("<Rule>".bytes())?;
+        xmlElement(mut body, "ID", r.id.view(), false)?;
+        writeFilter(mut body, r)?;
+        xmlElement(mut body, "Status", if (r.enabled) "Enabled".bytes() else "Disabled".bytes(), false)?;
+        if (r.expirationDays > 0) {
+            body.extend("<Expiration>".bytes())?;
+            xmlDecimal(mut body, "Days", r.expirationDays as u64)?;
+            body.extend("</Expiration>".bytes())?;
+        } else if (r.expirationDate > 0) {
+            body.extend("<Expiration><Date>".bytes())?;
+            appendIso8601(mut body, r.expirationDate)?;
+            body.extend("</Date></Expiration>".bytes())?;
+        } else if (r.expiredDeleteMarker) {
+            body.extend(
+                "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>".bytes(),
+            )?;
+        }
+        if (r.abortDays > 0) {
+            body.extend("<AbortIncompleteMultipartUpload>".bytes())?;
+            xmlDecimal(mut body, "DaysAfterInitiation", r.abortDays as u64)?;
+            body.extend("</AbortIncompleteMultipartUpload>".bytes())?;
+        }
+        body.extend("</Rule>".bytes())?;
+    }
+    body.extend("</LifecycleConfiguration>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn putBucketLifecycle(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 1048576)?;
+    verifySmallBody(req, xml.view(), true)?;
+    let rules = parseLifecycle(xml.view())?;
+    var blob = Vector<u8>.create();
+    encodeLifecycle(rules.view(), mut blob)?;
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_LIFECYCLE, blob.view())?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn deleteBucketLifecycle(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_LIFECYCLE, "".bytes())?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}
