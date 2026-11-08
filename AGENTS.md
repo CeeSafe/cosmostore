@@ -79,9 +79,12 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
 - **Toolchain: ceesafec 0.20.0 or later**, which `ceesafe.toml` requires (`ceesafec = ">=0.20.0"`, CeeSafe ADR 0076):
   an older compiler stops at that line. 0.19.1 is the first that accepts `durable.cee`.
 - CosmoStore calls no C and has no `unsafe` (since CeeSafe 0.19). A CeeSafe limitation goes in `CEESAFE_GAPS.md`
-  (with evidence and a repro) for the CeeSafe repo, not around it with C or `unsafe`.
+  (with evidence and a repro) for the CeeSafe repo, not around it with C or `unsafe`. The one C below it is
+  CeeSafe.Web's `web_tls` (OpenSSL 3 through its shim) for TLS, a dependency chosen in ADR-0016; building needs
+  OpenSSL 3 (Homebrew `openssl@3` on macOS).
 - CRC32C and MD5 are lib/std's; `src/storage/checksums/checksums.cee` pins the values the on-disk formats use.
 - The S3 layer (`src/s3/`, ADR-0008) uses CeeSafe.Web by path (`../../CeeSafe.Web/packages`). Async code must not
   block (N0295): store calls go through `Async.blocking`, and no `drop` may do I/O or take a lock.
-- After changing `src/s3/` or the store's API: `ceesafec build && tools/s3_smoke.sh` (needs the AWS CLI v2).
+- After changing `src/s3/` or the store's API: `ceesafec build && tools/s3_smoke.sh` (needs the AWS CLI v2), and
+  `tools/tls_smoke.sh` after changing how `serve` listens.
 - Before finishing: `ceesafec check`, `ceesafec fmt --check`, `ceesafec test` (all pass, no leaks).

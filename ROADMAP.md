@@ -787,3 +787,27 @@ Every version keeps its checksum and, if it is multipart, its part layout: an ex
   - expiring abandoned uploads;
   - binding beyond loopback, and TLS;
   - the Java and .NET SDKs.
+
+### 8 Nov 2026: M3 slice 9, listen address and TLS (ADR-0016)
+
+- **The listen address:** `serve <dir> <[address:]port> …`. A bare port is still 127.0.0.1; `0.0.0.0:9000`,
+  `[::]:9000` (dual-stack) or a single interface's address work too.
+- **Native TLS:**
+  - `--tls-cert <pem> --tls-key <pem>` uses CeeSafe.Web's `web_tls`, OpenSSL 3 through its C shim, as chosen over a
+    reverse proxy;
+  - CosmoStore's own code still has no C and no `unsafe`, and AGENTS.md records the dependency;
+  - a bad certificate, a mismatched key or a missing file stops the server before the store opens.
+- **Tests:** `tools/tls_smoke.sh`, 18 checks:
+  - a throwaway CA and certificate;
+  - the AWS CLI (multipart both ways), curl (presigned GET, handshake checks) and rclone over verified TLS;
+  - refusals: plain HTTP to the TLS port, and clients without the CA;
+  - the refused setups;
+  - fsck.
+- **Measured:** 256 MiB over TLS takes the same time as over plain HTTP, in alternating runs.
+- **M3 left:**
+  - POST policy;
+  - tags;
+  - CopyObject destination conditions;
+  - expiring abandoned uploads;
+  - certificate reload;
+  - the Java and .NET SDKs.

@@ -1,35 +1,74 @@
-// `cosmostore serve <dir> <port> <credentials-file> [domain]` (ADR-0008 §1, ADR-0011): the store behind S3 on
-// 127.0.0.1:<port>; with a domain, `<bucket>.<domain>` hosts address buckets too.
+// `cosmostore serve <dir> <[address:]port> <credentials-file> [domain]` (ADR-0008 §1, ADR-0011, ADR-0016): the
+// store behind S3, on 127.0.0.1 unless an address is given; with a domain, `<bucket>.<domain>` hosts address buckets
+// too.
 import web_core;
 import web_transport;
 import web_http;
 import web_server;
+import web_tls;
 
-/// Reads the credentials file through `Fs` (all file I/O goes through it).
-fn readCredentials(path: StringView) -> Result<Vector<Credential>, StringView> {
+/// Reads a small file (at most 1 MiB) whole, through `DurableFile` (all file I/O goes through it); `what` names it
+/// in the error.
+fn readSmallFile(path: StringView, what: StringView) -> Result<Vector<u8>, String> {
+    var text = Vector<u8>.create();
+    let failure = match (readSmallFileInto(path, mut text)) {
+        Ok() => { return Ok(text); }
+        Err(reason) => match (reason) {
+            ReadFault.Open => "cannot open it",
+            ReadFault.Size => "cannot read its size",
+            ReadFault.TooLarge => "it is larger than 1 MiB",
+            ReadFault.Memory => "out of memory",
+            ReadFault.Read => "a read failed",
+        },
+    };
+    var message = String.create();
+    let _ = message.append("cannot read the ");
+    let _ = message.append(what);
+    let _ = message.append(": ");
+    let _ = message.append(failure);
+    let _ = message.append(" (");
+    let _ = message.append(path);
+    let _ = message.append(")");
+    return Err(message);
+}
+
+enum ReadFault {
+    Open,
+    Size,
+    TooLarge,
+    Memory,
+    Read,
+}
+
+fn readSmallFileInto(path: StringView, out: borrow mut Vector<u8>) -> Result<void, ReadFault> {
     let file = match (DurableFile.openRead(path)) {
         Ok(f) => f,
-        Err(_) => { return Err("cannot open the credentials file"); }
+        Err(_) => { return Err(ReadFault.Open); }
     };
     let size = match (file.size()) {
         Ok(n) => n,
-        Err(_) => { return Err("cannot read the credentials file"); }
+        Err(_) => { return Err(ReadFault.Size); }
     };
-    if (size > 1048576) { return Err("the credentials file is larger than 1 MiB"); }
-    var text = Vector<u8>.create();
-    match (text.resize(size as usize, 0)) {
+    if (size > 1048576) { return Err(ReadFault.TooLarge); }
+    match (out.resize(size as usize, 0)) {
         Ok() => {}
-        Err(_) => { return Err("out of memory"); }
+        Err(_) => { return Err(ReadFault.Memory); }
     }
-    match (file.readExactAt(text.viewMut(), 0)) {
+    match (file.readExactAt(out.viewMut(), 0)) {
         Ok() => {}
-        Err(_) => { return Err("cannot read the credentials file"); }
+        Err(_) => { return Err(ReadFault.Read); }
     }
+    return Ok();
+}
+
+/// Reads the credentials file.
+fn readCredentials(path: StringView) -> Result<Vector<Credential>, String> {
+    let text = readSmallFile(path, "credentials file")?;
     let creds = match (parseCredentials(text.view())) {
         Ok(c) => c,
-        Err(_) => { return Err("out of memory"); }
+        Err(_) => { return Err(textOf("out of memory")); }
     };
-    if (creds.length == 0) { return Err("the credentials file has no `access-key secret-key` line"); }
+    if (creds.length == 0) { return Err(textOf("the credentials file has no `access-key secret-key` line")); }
     return Ok(creds);
 }
 
@@ -56,35 +95,137 @@ fn s3Server(app: S3App) -> Result<Server<S3App>, RouteError> {
     return Ok(server);
 }
 
-async fn serveOn(server: Server<S3App>, port: u16) -> Result<ServerReport, NetError> {
+/// Where to listen (ADR-0016): a bare port is 127.0.0.1's; otherwise `a.b.c.d:port` or `[v6]:port`. `[::]` takes
+/// IPv4 too (not v6-only).
+fn listenAddress(text: StringView) -> SocketAddress? {
+    match (text.parseInt<u16>()) {
+        Some(port) => { return SocketAddresses.v4Loopback(port); }
+        null => {}
+    }
+    return SocketAddresses.parse(text);
+}
+
+fn textOf(s: StringView) -> String {
+    var t = String.create();
+    let _ = t.append(s);
+    return t;
+}
+
+/// The TLS configuration from a PEM certificate chain (leaf first) and its key (ADR-0016). HTTP/1.1 only, as the S3
+/// layer serves.
+fn tlsConfig(certPath: StringView, keyPath: StringView) -> Result<TlsConfig, String> {
+    let chain = readSmallFile(certPath, "TLS certificate")?;
+    let key = readSmallFile(keyPath, "TLS key")?;
+    var config = match (TlsConfig.server(chain.view(), key.view())) {
+        Ok(c) => c,
+        Err(_) => { return Err(textOf("the TLS certificate and key could not be used together")); }
+    };
+    let protocols = [Alpn.Http11];
+    match (config.setAlpn(protocols[..])) {
+        Ok() => {}
+        Err(_) => { return Err(textOf("TLS: ALPN could not be set")); }
+    }
+    return Ok(config);
+}
+
+async fn serveOn(
+    server: Server<S3App>,
+    address: SocketAddress,
+    acceptor: borrow dyn Acceptor,
+    tls: bool,
+) -> Result<ServerReport, NetError> {
     let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
-    let listener = Listener.bindWith(SocketAddresses.v4Loopback(port), options)?;
+    let listener = Listener.bindWith(address, options)?;
     let drain = Drain.create()?;
     // A notice, not a condition of serving: standard error may be something the async console cannot write to, such
     // as /dev/null on macOS (CEESAFE_GAPS G27), and the server must run all the same.
-    let _ = await AsyncConsole.writeError("cosmostore: serving S3 on 127.0.0.1\n");
-    return await server.run(listener, PlainAcceptor {}, ConnectionLimits.defaults(), drain);
+    let notice = match (servingNotice(address, tls)) {
+        Ok(n) => n,
+        Err(_) => Vector<u8>.create(),
+    };
+    let _ = await AsyncConsole.writeError(StringView.fromUtf8(notice.view()) ?? "");
+    return await server.run(listener, acceptor, ConnectionLimits.defaults(), drain);
 }
+
+/// `cosmostore: serving S3 on <address>:<port>`, a line.
+fn servingNotice(address: SocketAddress, tls: bool) -> Result<Vector<u8>, AllocError> {
+    var notice = Vector<u8>.create();
+    notice.extend(if (tls) "cosmostore: serving S3 over TLS on ".bytes() else "cosmostore: serving S3 on ".bytes())?;
+    let v6 = match (address) {
+        SocketAddress.V6(_, _, _) => true,
+        _ => false,
+    };
+    if (v6) { notice.push('[')?; }
+    ipText(address, mut notice)?;
+    if (v6) { notice.push(']')?; }
+    notice.push(':')?;
+    appendDecimal(mut notice, addressPort(address) as u64)?;
+    notice.push('\n')?;
+    return Ok(notice);
+}
+
+fn addressPort(a: SocketAddress) -> u16 => match (a) {
+    SocketAddress.V4(_, port) => port,
+    SocketAddress.V6(_, port, _) => port,
+};
 
 /// `cosmostore serve`: returns the exit status.
 fn serve() -> i32 {
     let dir = Process.argument(2) ?? "";
     let portText = Process.argument(3) ?? "";
     let credentialsPath = Process.argument(4) ?? "";
-    var domain = Vector<u8>.create();
-    match (domain.extend((Process.argument(5) ?? "").bytes())) {
-        Ok() => {}
-        Err(_) => { die("out of memory"); }
-    }
     if (dir.length == 0 || credentialsPath.length == 0) { usage(); }
-    let port = match (portText.parseInt<u16>()) {
-        Some(p) => p,
+    // Then the domain, if the next argument is not an option, and `--tls-cert <file> --tls-key <file>`.
+    var domain = Vector<u8>.create();
+    // The argument positions of the certificate and the key (0: not given).
+    var certAt: usize = 0;
+    var keyAt: usize = 0;
+    var at: usize = 5;
+    match (Process.argument(5)) {
+        Some(d) => {
+            if (!d.startsWith("--")) {
+                match (domain.extend(d.bytes())) {
+                    Ok() => {}
+                    Err(_) => { die("out of memory"); }
+                }
+                at = 6;
+            }
+        }
+        null => {}
+    }
+    while (true) {
+        let option = match (Process.argument(at)) {
+            Some(o) => o,
+            null => { break; }
+        };
+        let value = Process.argument(at + 1) ?? "";
+        if (value.length == 0) { usage(); }
+        if (option == "--tls-cert") {
+            certAt = at + 1;
+        } else if (option == "--tls-key") {
+            keyAt = at + 1;
+        } else {
+            usage();
+        }
+        at += 2;
+    }
+    if ((certAt == 0) != (keyAt == 0)) { die("--tls-cert and --tls-key go together"); }
+    let address = match (listenAddress(portText)) {
+        Some(a) => a,
         null => { usage(); }
     };
     let credentials = match (readCredentials(credentialsPath)) {
         Ok(c) => c,
-        Err(message) => { die(message); }
+        Err(message) => { die(message.view()); }
     };
+    // TLS before the store opens, so a bad certificate costs no recovery.
+    var tls: TlsConfig? = null;
+    if (certAt > 0) {
+        tls = match (tlsConfig(Process.argument(certAt) ?? "", Process.argument(keyAt) ?? "")) {
+            Ok(c) => c,
+            Err(message) => { die(message.view()); }
+        };
+    }
     let store = match (ObjectStore.open(dir, StoreConfig.defaults())) {
         Ok(s) => s,
         Err(e) => { die(describe(e)); }
@@ -98,7 +239,20 @@ fn serve() -> i32 {
         Ok(s) => s,
         Err(_) => { die("cannot build the routes"); }
     };
-    match (Async.run(serveOn(server, port))) {
+    let result = match (tls) {
+        Some(config) => {
+            let acceptor = match (TlsAcceptor.create(config)) {
+                Ok(a) => a,
+                Err(_) => { die("TLS: the acceptor could not be made"); }
+            };
+            Async.run(serveOn(server, address, borrow acceptor, true))
+        }
+        null => {
+            let plain = PlainAcceptor {};
+            Async.run(serveOn(server, address, borrow plain, false))
+        }
+    };
+    match (result) {
         Ok(_) => { return 0; }
         Err(e) => {
             Console.writeErrorLine(NetErrors.describe(e));

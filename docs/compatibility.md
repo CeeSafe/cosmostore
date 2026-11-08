@@ -25,6 +25,10 @@ on a fresh store and ends with fsck. Updated 8 Nov 2026.
   `requestChecksumCalculation: "WHEN_REQUIRED"`. S3 then refuses the upload with BadDigest, and so does CosmoStore.
 - **Virtual-host addressing** needs `cosmostore serve … <domain>`, so that buckets are `<bucket>.<domain>`.
   Path-style always works.
+- **TLS:** `cosmostore serve <dir> 0.0.0.0:9000 <credentials> --tls-cert chain.pem --tls-key key.pem`. Clients
+  verify the certificate as usual, for example with `AWS_CA_BUNDLE`, rclone's `--ca-cert` or curl's `--cacert` for
+  a private CA. Without TLS, requests are still authenticated (SigV4), but their bytes are readable on the
+  network.
 
 ### s3-tests
 
@@ -46,6 +50,6 @@ the checksum tests, only SHA-1 still fails, along with those that need ACLs, ver
 | Multipart | Create, UploadPart, UploadPartCopy (ranges), Complete (a retry gets its first answer), Abort, ListParts, ListMultipartUploads | `delimiter` in ListMultipartUploads; expiring abandoned uploads |
 | Copy and delete | CopyObject (COPY/REPLACE, `x-amz-copy-source-if-*`), DeleteObjects (one sync per batch) | destination conditions on CopyObject |
 | Addressing | path-style; virtual-host under a configured domain | |
-| Network | HTTP/1.1 on 127.0.0.1 | other addresses, TLS |
+| Network | HTTP/1.1 on any address (`[address:]port`, 127.0.0.1 by default); TLS 1.2/1.3 with `--tls-cert`/`--tls-key` | certificate reload without restart, SNI, HTTP/2 |
 
-Anything else gets S3's `NotImplemented` (501) XML error. Design notes: ADR-0008 to ADR-0015 in `docs/adr/`.
+Anything else gets S3's `NotImplemented` (501) XML error. Design notes: ADR-0008 to ADR-0016 in `docs/adr/`.
