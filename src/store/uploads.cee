@@ -31,6 +31,8 @@ struct Upload {
     bucket: Vector<u8>;
     key: Vector<u8>;
     contentType: Vector<u8>;
+    /// The completed object's stored fields (ADR-0012).
+    metadata: Vector<u8>;
     initiatedMillis: i64;
     /// In ascending part number, each number at most once.
     parts: Vector<UploadedPart>;
@@ -84,7 +86,7 @@ fn uploadBytes(u: borrow Upload) -> u64 {
 // ---- Record meta ----
 
 /// UploadCreate meta v1: u8 format version, 16 upload id, u16+bytes bucket, u16+bytes key, i64 initiated ms,
-/// u16+bytes content type.
+/// u16+bytes content type, then the metadata section (ADR-0012; absent in records written before it, meaning none).
 fn encodeUploadCreateMeta(
     out: borrow mut Vector<u8>,
     id: [u8; 16],
@@ -92,6 +94,7 @@ fn encodeUploadCreateMeta(
     key: Slice<u8>,
     initiatedMillis: i64,
     contentType: Slice<u8>,
+    metadata: Slice<u8>,
 ) -> Result<void, AllocError> {
     out.pushLE(META_FORMAT_VERSION)?;
     out.extend(id[..])?;
@@ -99,6 +102,7 @@ fn encodeUploadCreateMeta(
     pushText16(out, key)?;
     out.pushLE(initiatedMillis)?;
     pushText16(out, contentType)?;
+    appendMetadataSection(out, metadata)?;
     return Ok();
 }
 
@@ -108,6 +112,7 @@ struct UploadCreateMeta {
     key: Vector<u8>;
     initiatedMillis: i64;
     contentType: Vector<u8>;
+    metadata: Vector<u8>;
 }
 
 fn decodeUploadCreateMeta(bytes: Slice<u8>) -> Result<UploadCreateMeta, MetaFault> {
@@ -118,12 +123,16 @@ fn decodeUploadCreateMeta(bytes: Slice<u8>) -> Result<UploadCreateMeta, MetaFaul
     let key = readText16(bytes, mut at)?;
     let initiated = readI64(bytes, mut at)?;
     let contentType = readText16(bytes, mut at)?;
+    var metadata = Vector<u8>.create();
+    if (at < bytes.length) { metadata = readMetadataSection(bytes, mut at)?; }
+    if (at != bytes.length) { return Err(MetaFault.TooLong); }
     return Ok(UploadCreateMeta {
         id: id,
         bucket: bucket,
         key: key,
         initiatedMillis: initiated,
         contentType: contentType,
+        metadata: metadata,
     });
 }
 
@@ -190,10 +199,11 @@ fn encodeUploadCompleteMeta(
     size: u64,
     etagMd5: [u8; 16],
     contentType: Slice<u8>,
+    metadata: Slice<u8>,
     id: [u8; 16],
     parts: u32,
 ) -> Result<void, AllocError> {
-    encodePutMeta(out, bucket, key, nullVersionId(), mtimeMillis, size, etagMd5, contentType)?;
+    encodePutMeta(out, bucket, key, nullVersionId(), mtimeMillis, size, etagMd5, contentType, metadata)?;
     out.extend(id[..])?;
     out.pushLE(parts)?;
     return Ok();
@@ -221,6 +231,7 @@ fn applyUploadCreate(state: borrow mut StoreState, meta: Slice<u8>) -> Result<vo
         bucket: m.bucket,
         key: m.key,
         contentType: m.contentType,
+        metadata: m.metadata,
         initiatedMillis: m.initiatedMillis,
         parts: Vector<UploadedPart>.create(),
     };
@@ -341,12 +352,19 @@ fn uploadMetaRoundTrips() -> Result<void, TestFailure> {
     id[0] = 7;
     id[15] = 9;
     var out = Vector<u8>.create();
-    encodeUploadCreateMeta(mut out, id, "bkt".bytes(), "a/b".bytes(), 1234, "text/plain".bytes())!;
+    var meta = Vector<u8>.create();
+    metadataAdd(mut meta, "x-amz-meta-a".bytes(), "1".bytes())!;
+    encodeUploadCreateMeta(mut out, id, "bkt".bytes(), "a/b".bytes(), 1234, "text/plain".bytes(), meta.view())!;
     let c = decodeUploadCreateMeta(out.view())!;
     Check.equalBytes(id[..], c.id[..])?;
     Check.equalBytes("a/b".bytes(), c.key.view())?;
     Check.equalBytes("text/plain".bytes(), c.contentType.view())?;
+    Check.equalBytes(meta.view(), c.metadata.view())?;
+    // A record from before ADR-0012 ends at the content type: no metadata. Any other truncation is refused.
+    let oldLength = out.length - meta.length;
+    Check.equalU64(0, decodeUploadCreateMeta(out.view()[0..oldLength])!.metadata.length as u64)?;
     for (n in 0..out.length) {
+        if (n == oldLength) { continue; }
         Check.isTrue(decodeUploadCreateMeta(out.view()[0..n]).isErr(), "a truncated create meta is refused")?;
     }
     out.clear();
@@ -360,7 +378,7 @@ fn uploadMetaRoundTrips() -> Result<void, TestFailure> {
         Check.isTrue(decodeUploadPartMeta(out.view()[0..n]).isErr(), "a truncated part meta is refused")?;
     }
     out.clear();
-    encodeUploadCompleteMeta(mut out, "bkt".bytes(), "a/b".bytes(), 5, 12, md5, "x/y".bytes(), id, 3)!;
+    encodeUploadCompleteMeta(mut out, "bkt".bytes(), "a/b".bytes(), 5, 12, md5, "x/y".bytes(), meta.view(), id, 3)!;
     let m = decodeUploadCompleteMeta(out.view())!;
     Check.equalBytes("a/b".bytes(), m.put.key.view())?;
     Check.equalU64(12, m.put.size)?;

@@ -654,3 +654,30 @@ CopyObject, UploadPartCopy and DeleteObjects. With them, `aws s3 cp` between S3 
   - expiring abandoned uploads;
   - binding beyond loopback, and TLS;
   - the SDK matrix (boto3, Go, Java, .NET, rclone) and the s3-tests subset.
+
+### 8 Nov 2026: M3 slice 5, object metadata (ADR-0012)
+
+`x-amz-meta-*` user metadata, and the headers S3 keeps (Content-Encoding, Content-Disposition, Cache-Control,
+Content-Language, Expires), are stored with each version and returned on GET and HEAD. rclone's modification times
+need this.
+- **No journal format change:** put meta v1 always had a section for these pairs, and it was empty until now.
+  UploadCreate meta gains the section at its end, and older records decode as having none.
+- **Checkpoint format 3** ends each object and upload entry with the section. Format 2 still loads, checked with a
+  store written by the previous build.
+- **Semantics:**
+  - PUT, multipart create and REPLACE copies take the request's fields, and COPY keeps the source's;
+  - `aws-chunked` is not stored as a Content-Encoding;
+  - user metadata over 2 KiB is `MetadataTooLarge`, refused before the body is read;
+  - a `response-*` override replaces the stored header.
+- **Tests:**
+  - a store test through the journal, checkpoints and multipart;
+  - meta round-trip tests, including UploadCreate records from before the section existed;
+  - `tools/s3_smoke.sh`: 96 checks, up from 88;
+  - `ceesafec test`: 87 pass.
+- **M3 left:**
+  - POST policy;
+  - tags, response checksums;
+  - CopyObject destination conditions;
+  - expiring abandoned uploads;
+  - binding beyond loopback, and TLS;
+  - the SDK matrix (boto3, Go, Java, .NET, rclone) and the s3-tests subset.

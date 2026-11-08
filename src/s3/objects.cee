@@ -367,6 +367,7 @@ async fn putObject(
     }
     var contentType = String.create();
     contentTypeOf(req, mut contentType)?;
+    let metadata = metadataOf(req)?; // refused before the body is read
     let writer = await startPut(app, req.bucket.view(), spec.size)?;
     let body = await receiveBody(app, auth, mut spec, writer, exchange)?;
     let outcome = await commitPut(
@@ -374,11 +375,63 @@ async fn putObject(
         req.bucket.view(),
         req.key.view(),
         contentType.view(),
+        metadata.view(),
         borrow body.finished,
         condition,
         ifMatch.view(),
     )?;
     return await sendStored(exchange, borrow outcome.md5, 0, borrow body);
+}
+
+/// The headers S3 stores with an object and returns on GET and HEAD, besides Content-Type (ADR-0012).
+const STORED_HEADERS: StringView = "content-encoding,content-disposition,cache-control,content-language,expires";
+
+/// Whether `name` is in a comma-separated `list`.
+fn listed(list: StringView, name: Slice<u8>) -> bool {
+    let l = list.bytes();
+    var at: usize = 0;
+    while (at < l.length) {
+        let end = pieceEnd(l, at, ',');
+        if (l[at..end] == name) { return true; }
+        at = end + 1;
+    }
+    return false;
+}
+
+/// The request's stored fields as a metadata blob: every `x-amz-meta-*` field and the STORED_HEADERS. The
+/// `aws-chunked` coding is the transfer's, not the object's, so it is dropped from Content-Encoding, as S3 does.
+/// User metadata over 2 KiB is MetadataTooLarge.
+fn metadataOf(req: borrow S3Request) -> Result<Vector<u8>, S3Fail> {
+    var blob = Vector<u8>.create();
+    var userBytes: usize = 0;
+    let prefix = "x-amz-meta-".bytes();
+    for (i in 0..req.headers.length) {
+        let name = req.headers[i].name.view();
+        let value = trimSpaces(req.headers[i].value.view());
+        if (startsWithBytes(name, prefix)) {
+            if (name.length == prefix.length) { continue; }
+            userBytes += name.length - prefix.length + value.length;
+            metadataAdd(mut blob, name, value)?;
+        } else if (name == "content-encoding".bytes()) {
+            var kept = Vector<u8>.create();
+            var at: usize = 0;
+            while (at < value.length) {
+                let end = pieceEnd(value, at, ',');
+                let coding = trimSpaces(value[at..end]);
+                at = end + 1;
+                if (coding.length == 0 || equalsIgnoreCase(coding, "aws-chunked".bytes())) { continue; }
+                if (kept.length > 0) { kept.extend(",".bytes())?; }
+                kept.extend(coding)?;
+            }
+            if (kept.length > 0) { metadataAdd(mut blob, name, kept.view())?; }
+        } else if (listed(STORED_HEADERS, name)) {
+            metadataAdd(mut blob, name, value)?;
+        }
+    }
+    if (userBytes > MAX_USER_METADATA || blob.length > MAX_METADATA_BYTES) {
+        return Err(S3Fail.Code(S3Code.MetadataTooLarge));
+    }
+    return Ok(blob);
 }
 
 /// The request's Content-Type, or S3's default.
@@ -444,6 +497,7 @@ async fn commitPut(
     bucket: StringView,
     key: StringView,
     contentType: StringView,
+    metadata: Slice<u8>,
     finished: borrow FinishedObject,
     condition: PutIf,
     ifMatch: Slice<u8>,
@@ -451,7 +505,7 @@ async fn commitPut(
     var guard = await lockStore(app)?;
     let store = guard.data();
     return match (await Async.blocking(
-        () => commitWith(store, bucket, key, contentType, finished, condition, ifMatch),
+        () => commitWith(store, bucket, key, contentType, metadata, finished, condition, ifMatch),
     )) {
         Ok(o) => Ok(o),
         Err(e) => Err(storeFail(e, key.length)),
@@ -463,6 +517,7 @@ fn commitWith(
     bucket: StringView,
     key: StringView,
     contentType: StringView,
+    metadata: Slice<u8>,
     finished: borrow FinishedObject,
     condition: PutIf,
     ifMatch: Slice<u8>,
@@ -490,7 +545,7 @@ fn commitWith(
             }
         }
     };
-    return store.putFinished(bucket, key, contentType, finished, cond);
+    return store.putFinishedWith(bucket, key, contentType, metadata, finished, cond);
 }
 
 // ---- GetObject and HeadObject ----
@@ -661,6 +716,28 @@ async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
                 exchange.header("content-type", plan.info.contentType.view())?;
             }
         }
+    }
+    // Stored fields, except those a `response-*` parameter overrides.
+    match (metadataPairs(plan.info.metadata.view())) {
+        Ok(pairs) => {
+            var param = Vector<u8>.create();
+            for (i in 0..pairs.length) {
+                let name = pairs[i].name.view();
+                param.clear();
+                param.extend("response-".bytes())?;
+                param.extend(name)?;
+                let overridden = match (StringView.fromUtf8(param.view())) {
+                    Some(p) => listed(STORED_HEADERS, name) && paramOf(req, p).isSome(),
+                    null => false,
+                };
+                if (overridden) { continue; }
+                match (StringView.fromUtf8(name)) {
+                    Some(n) => { exchange.header(n, pairs[i].value.view())?; }
+                    null => {}
+                }
+            }
+        }
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
     }
     responseOverride(req, exchange, "response-content-language", "content-language")?;
     responseOverride(req, exchange, "response-expires", "expires")?;

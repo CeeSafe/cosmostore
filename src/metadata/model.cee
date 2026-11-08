@@ -6,6 +6,9 @@ const META_FORMAT_VERSION: u8 = 1;
 const MAX_BUCKET_NAME: usize = 63;
 const MAX_KEY_BYTES: usize = 1024;
 const MAX_CONTENT_TYPE: usize = 1024;
+/// The most bytes of user metadata (`x-amz-meta-*` names and values, S3's 2 KiB) and of every stored field together.
+const MAX_USER_METADATA: usize = 2048;
+const MAX_METADATA_BYTES: usize = 8192;
 
 /// The null version id, used by unversioned buckets.
 fn nullVersionId() -> [u8; 16] => [0u8; 16];
@@ -96,6 +99,8 @@ struct ObjectVersion {
     recordLength: u32;
     /// The object's extents, in order; empty for an inline object (its bytes are at `payload`).
     extents: Vector<ExtentRef>;
+    /// User metadata and stored headers (ADR-0012), as put meta carries them; empty for none.
+    metadata: Vector<u8>;
     /// A multipart object's part count, 0 for a single PUT. A multipart object's `md5` is its ETag's digest, the MD5
     /// of its parts' MD5s, not the MD5 of its bytes (ADR-0009).
     parts: u32;
@@ -110,6 +115,8 @@ struct PutMeta {
     size: u64;
     md5: [u8; 16];
     contentType: Vector<u8>;
+    /// The metadata section (`metadataAdd`'s format), empty when it has no pairs.
+    metadata: Vector<u8>;
 }
 
 /// Decoded meta of a Relocate record: which version the copied payload belongs to.
@@ -144,7 +151,8 @@ fn pushText16(out: borrow mut Vector<u8>, s: Slice<u8>) -> Result<void, AllocErr
 
 /// PutInline / PutExtent meta v1:
 ///   u8 format version, u16+bytes bucket, u16+bytes key, 16 version id, i64 mtime ms,
-///   u64 size, 16 md5, u16+bytes content type, u16 user metadata pairs (each u16+bytes, u16+bytes).
+///   u64 size, 16 md5, u16+bytes content type, u16 user metadata pairs (each u16+bytes, u16+bytes). `metadata` is
+///   that last section, from `metadataAdd` (empty: no pairs).
 fn encodePutMeta(
     out: borrow mut Vector<u8>,
     bucket: Slice<u8>,
@@ -154,6 +162,7 @@ fn encodePutMeta(
     size: u64,
     md5: [u8; 16],
     contentType: Slice<u8>,
+    metadata: Slice<u8>,
 ) -> Result<void, AllocError> {
     out.pushLE(META_FORMAT_VERSION)?;
     pushText16(out, bucket)?;
@@ -163,8 +172,64 @@ fn encodePutMeta(
     out.pushLE(size)?;
     out.extend(md5[..])?;
     pushText16(out, contentType)?;
-    out.pushLE(0u16)?; // user metadata: none yet
+    appendMetadataSection(out, metadata)?;
     return Ok();
+}
+
+// ---- Metadata (ADR-0012) ----
+
+/// One stored field: a lowercase name (`x-amz-meta-*`, or a header S3 keeps such as `content-encoding`) and its value.
+struct MetaPair {
+    name: Vector<u8>;
+    value: Vector<u8>;
+}
+
+/// Adds a pair to a metadata blob: u16 pair count, then per pair u16+bytes name and u16+bytes value.
+fn metadataAdd(blob: borrow mut Vector<u8>, name: Slice<u8>, value: Slice<u8>) -> Result<void, AllocError> {
+    if (blob.length == 0) { blob.pushLE(0u16)?; }
+    let count = blob.view().readLE<u16>(0);
+    blob.viewMut().writeLE(0, count + 1);
+    pushText16(blob, name)?;
+    pushText16(blob, value)?;
+    return Ok();
+}
+
+/// A blob's section in a record or checkpoint: the blob, or a zero count for none.
+fn appendMetadataSection(out: borrow mut Vector<u8>, metadata: Slice<u8>) -> Result<void, AllocError> {
+    if (metadata.length == 0) {
+        out.pushLE(0u16)?;
+    } else {
+        out.extend(metadata)?;
+    }
+    return Ok();
+}
+
+/// Reads a metadata section at `at`, checking every pair, and returns it as a blob (empty for none).
+fn readMetadataSection(bytes: Slice<u8>, at: borrow mut usize) -> Result<Vector<u8>, MetaFault> {
+    let start: usize = at;
+    need(bytes, at, 2)?;
+    let pairs = bytes.readLE<u16>(at);
+    at += 2;
+    for (i in 0..pairs) {
+        let _ = readText16(bytes, at)?;
+        let _ = readText16(bytes, at)?;
+    }
+    if (pairs == 0) { return Ok(Vector<u8>.create()); }
+    return Ok(copyBytes(bytes[start..at])?);
+}
+
+/// The pairs of a metadata blob.
+fn metadataPairs(blob: Slice<u8>) -> Result<Vector<MetaPair>, MetaFault> {
+    var pairs = Vector<MetaPair>.create();
+    if (blob.length == 0) { return Ok(pairs); }
+    var at: usize = 2;
+    let n = blob.readLE<u16>(0);
+    for (i in 0..n) {
+        let name = readText16(blob, mut at)?;
+        let value = readText16(blob, mut at)?;
+        pairs.push(MetaPair { name: name, value: value })?;
+    }
+    return Ok(pairs);
 }
 
 /// DeleteVersion / DeleteMarker meta v1: u8 format version, u16+bytes bucket, u16+bytes key,
@@ -275,13 +340,7 @@ fn decodePutMetaAt(bytes: Slice<u8>, at: borrow mut usize) -> Result<PutMeta, Me
     let size = readU64(bytes, at)?;
     let md5 = readId16(bytes, at)?;
     let contentType = readText16(bytes, at)?;
-    need(bytes, at, 2)?;
-    let pairs = bytes.readLE<u16>(at);
-    at += 2;
-    for (i in 0..pairs) {
-        let _ = readText16(bytes, at)?;
-        let _ = readText16(bytes, at)?;
-    }
+    let metadata = readMetadataSection(bytes, at)?;
     return Ok(PutMeta {
         bucket: bucket,
         key: key,
@@ -290,6 +349,7 @@ fn decodePutMetaAt(bytes: Slice<u8>, at: borrow mut usize) -> Result<PutMeta, Me
         size: size,
         md5: md5,
         contentType: contentType,
+        metadata: metadata,
     });
 }
 
@@ -358,7 +418,10 @@ fn putMetaRoundTrip() -> Result<void, TestFailure> {
     var vid = nullVersionId();
     vid[3] = 9;
     let md5 = Md5.of(key.bytes());
-    encodePutMeta(mut out, bucket.bytes(), key.bytes(), vid, 1700000000000, 12345, md5, ctype.bytes())!;
+    var meta = Vector<u8>.create();
+    metadataAdd(mut meta, "x-amz-meta-mtime".bytes(), "1700000000".bytes())!;
+    metadataAdd(mut meta, "content-encoding".bytes(), "gzip".bytes())!;
+    encodePutMeta(mut out, bucket.bytes(), key.bytes(), vid, 1700000000000, 12345, md5, ctype.bytes(), meta.view())!;
     let m = match (decodePutMeta(out.view())) {
         Ok(m) => m,
         Err(_) => { return Check.fail("decodes"); }
@@ -369,8 +432,13 @@ fn putMetaRoundTrip() -> Result<void, TestFailure> {
     Check.equalU64(12345, m.size)?;
     Check.equalBytes(md5[..], m.md5[..])?;
     Check.equalBytes(ctype.bytes(), m.contentType.view())?;
+    Check.equalBytes(meta.view(), m.metadata.view())?;
+    let pairs = metadataPairs(m.metadata.view())!;
+    Check.equalU64(2, pairs.length as u64)?;
+    Check.equalBytes("content-encoding".bytes(), pairs[1].name.view())?;
+    Check.equalBytes("gzip".bytes(), pairs[1].value.view())?;
     // Every truncation is rejected, never misread.
-    for (n in 0..out.length - 2) {
+    for (n in 0..out.length) {
         match (decodePutMeta(out.view()[0..n])) {
             Ok(_) => { return Check.fail("a truncated meta must not decode"); }
             Err(_) => {}

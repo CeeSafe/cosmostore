@@ -9,7 +9,7 @@
 // than fall back, because segments it covered may already be gone. Little-endian:
 //
 // Header (64 bytes):
-//   0 u64 magic "CSCKPT01"   8 u16 format (2; 1 still loads)   10 u16 header length (64)   12 u32 flags (0)
+//   0 u64 magic "CSCKPT01"   8 u16 format (3; 1 and 2 still load)   10 u16 header length (64)   12 u32 flags (0)
 //  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count   48 i64 created ms
 //  56 u32 upload count (format 2; reserved, 0, in format 1)   60 u32 crc32c of bytes 0..60
 // Entries, buckets, then objects, then uploads: u8 kind (1 bucket, 2 object, 3 upload), u32 body length, body.
@@ -17,16 +17,18 @@
 //   object: u16+bytes bucket, u16+bytes key, 16 version id, u64 lsn, u64 size, i64 mtime ms,
 //           16 md5, u16+bytes content type, u64 payload segment, u64 payload offset,
 //           u32 payload length, u64 record segment, u32 record length, manifest (u32 count,
-//           then u64 id, u64 length, u32 crc32c per extent), and in format 2 a u32 part count (ADR-0009)
+//           then u64 id, u64 length, u32 crc32c per extent), in format 2 a u32 part count (ADR-0009), and in
+//           format 3 the metadata section (u16 pairs, each u16+bytes name, u16+bytes value; ADR-0012)
 //   upload (format 2): 16 upload id, u16+bytes bucket, u16+bytes key, i64 initiated ms, u16+bytes content type,
-//           u32 part count, then per part u32 number, u64 size, 16 md5, i64 mtime ms, manifest
+//           u32 part count, then per part u32 number, u64 size, 16 md5, i64 mtime ms, manifest; in format 3 the
+//           metadata section
 // Trailer (16 bytes): u32 "CKND", u32 crc32c of every entry byte, u64 entry count.
 
 const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 2;
+const CHECKPOINT_FORMAT: u16 = 3;
 const CHECKPOINT_BUCKET: u8 = 1;
 const CHECKPOINT_OBJECT: u8 = 2;
 const CHECKPOINT_UPLOAD: u8 = 3;
@@ -154,6 +156,7 @@ fn encodeObjectEntry(
     out.pushLE(v.recordLength)?;
     encodeManifest(out, v.extents.view())?;
     out.pushLE(v.parts)?;
+    appendMetadataSection(out, v.metadata.view())?;
     return Ok();
 }
 
@@ -173,6 +176,7 @@ fn encodeUploadEntry(out: borrow mut Vector<u8>, id: [u8; 16], u: borrow Upload)
         out.pushLE(p.mtimeMillis)?;
         encodeManifest(out, p.extents.view())?;
     }
+    appendMetadataSection(out, u.metadata.view())?;
     return Ok();
 }
 
@@ -319,6 +323,8 @@ fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16
     at += manifestLength(extents.length);
     var parts: u32 = 0;
     if (format >= 2) { parts = corrupt(readU32(bytes, mut at))?; }
+    var metadata = Vector<u8>.create();
+    if (format >= 3) { metadata = corrupt(readMetadataSection(bytes, mut at))?; }
     if (at != bytes.length) { return Err(StoreError.CheckpointCorrupt); }
     if (!state.hasBucket(bucket.view())?) { return Err(StoreError.CheckpointCorrupt); }
     state.bumpObjects(bucket.view(), true)?;
@@ -335,6 +341,7 @@ fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16
         recordLength: recordLength,
         extents: extents,
         parts: parts,
+        metadata: metadata,
     };
     state.extentBytes += extentFileBytes(borrow version);
     match (state.index.put(IndexKey { bucket: bucket, key: key }, version)?) {
@@ -344,7 +351,7 @@ fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16
     return Ok();
 }
 
-fn decodeUploadEntry(bytes: Slice<u8>, state: borrow mut StoreState) -> Result<void, StoreError> {
+fn decodeUploadEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16) -> Result<void, StoreError> {
     var at: usize = 0;
     let id = corrupt(readId16(bytes, mut at))?;
     let bucket = corrupt(readText16(bytes, mut at))?;
@@ -366,11 +373,14 @@ fn decodeUploadEntry(bytes: Slice<u8>, state: borrow mut StoreState) -> Result<v
         state.extentBytes += extentRefBytes(extents.view());
         parts.push(UploadedPart { number: number, size: size, md5: md5, mtimeMillis: mtime, extents: extents })?;
     }
+    var metadata = Vector<u8>.create();
+    if (format >= 3) { metadata = corrupt(readMetadataSection(bytes, mut at))?; }
     if (at != bytes.length) { return Err(StoreError.CheckpointCorrupt); }
     let upload = Upload {
         bucket: bucket,
         key: key,
         contentType: contentType,
+        metadata: metadata,
         initiatedMillis: initiated,
         parts: parts,
     };
@@ -427,7 +437,7 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
         } else if (kind == CHECKPOINT_OBJECT) {
             decodeObjectEntry(body, mut state, format)?;
         } else {
-            decodeUploadEntry(body, mut state)?;
+            decodeUploadEntry(body, mut state, format)?;
         }
         entries += 1;
     }

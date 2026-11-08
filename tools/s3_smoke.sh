@@ -1,5 +1,5 @@
 #!/bin/sh
-# The M3 end-to-end test (ADR-0008 to ADR-0011): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
+# The M3 end-to-end test (ADR-0008 to ADR-0012): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
 # against `cosmostore serve` on a fresh store. Prints one line per check; exit status 1 if any fails.
 #
 # usage: tools/s3_smoke.sh [COSMOSTORE] [PORT]     (defaults: out/cosmostore, 9311)
@@ -168,6 +168,23 @@ cmp -s got.bin want2.bin && pass "upload-part-copy ranges" || fail "upload-part-
 check "delete-objects" "$(aws s3api delete-objects --bucket smoke --delete '{"Objects":[{"Key":"c/copy1"},{"Key":"c/none"},{"Key":"c/enc.txt"}]}' --query 'length(Deleted)')" 3
 check "deleted by the batch" "$(code s3api head-object --bucket smoke --key c/copy1)" 404
 check "delete-objects quiet" "$(aws s3api delete-objects --bucket smoke --delete '{"Objects":[{"Key":"c/ranged"}],"Quiet":true}' --query 'length(Deleted || `[]`)')" 0
+
+# Stored fields (ADR-0012): user metadata and the headers S3 keeps, through PUT, multipart and copies.
+aws s3api put-object --bucket smoke --key meta/one --body small.txt --metadata mtime=1731000000,Color=Blue \
+    --content-encoding gzip --cache-control max-age=60 --content-disposition 'attachment; filename="x.txt"' > /dev/null 2>&1
+check "user metadata" "$(aws s3api head-object --bucket smoke --key meta/one --query 'Metadata' --output json | tr -d ' \n')" '{"mtime":"1731000000","color":"Blue"}'
+check "stored headers" "$(aws s3api head-object --bucket smoke --key meta/one --query '[ContentEncoding,CacheControl,ContentDisposition]' --output text)" 'gzip	max-age=60	attachment; filename="x.txt"'
+check "aws-chunked is not stored" "$(aws s3api head-object --bucket smoke --key a/small.txt --query 'ContentEncoding' --output text)" None
+signed() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" "$@"; }
+check "response-* overrides a stored header" "$(signed -D - -o /dev/null "$AWS_ENDPOINT_URL/smoke/meta/one?response-cache-control=no-store" | tr -d '\r' | grep -i '^cache-control:')" "cache-control: no-store"
+aws s3 cp huge.bin s3://smoke/meta/huge --metadata origin=smoke > /dev/null 2>&1
+check "multipart metadata" "$(aws s3api head-object --bucket smoke --key meta/huge --query 'Metadata.origin' --output text)" smoke
+aws s3api copy-object --bucket smoke --key meta/copy --copy-source smoke/meta/one > /dev/null 2>&1
+check "copy keeps metadata" "$(aws s3api head-object --bucket smoke --key meta/copy --query 'Metadata.color' --output text)" Blue
+aws s3api copy-object --bucket smoke --key meta/copy --copy-source smoke/meta/one --metadata-directive REPLACE --metadata new=1 > /dev/null 2>&1
+check "copy REPLACE replaces metadata" "$(aws s3api head-object --bucket smoke --key meta/copy --query 'Metadata' --output json | tr -d ' \n')" '{"new":"1"}'
+check "metadata too large" "$(code s3api put-object --bucket smoke --key meta/big --body small.txt --metadata "big=$(head -c 2100 /dev/zero | tr '\0' a)")" MetadataTooLarge
+aws s3 rm --recursive s3://smoke/meta/ > /dev/null 2>&1
 
 # Presigned URLs (ADR-0011): the CLI's GET, a PUT through curl, a changed URL, and an expired one.
 url=$(aws s3 presign s3://smoke/a/small.txt --expires-in 60)

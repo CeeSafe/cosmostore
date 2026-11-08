@@ -1,0 +1,71 @@
+// Stored fields (ADR-0012): user metadata and headers kept with a version, through PUT, multipart, the journal and
+// checkpoints.
+
+fn sampleMetadata() -> Vector<u8> {
+    var m = Vector<u8>.create();
+    metadataAdd(mut m, "x-amz-meta-mtime".bytes(), "1731000000.5".bytes())!;
+    metadataAdd(mut m, "content-encoding".bytes(), "gzip".bytes())!;
+    return m;
+}
+
+fn checkSample(blob: Slice<u8>) -> Result<void, TestFailure> {
+    let pairs = metadataPairs(blob)!;
+    Check.equalU64(2, pairs.length as u64)?;
+    Check.equalBytes("x-amz-meta-mtime".bytes(), pairs[0].name.view())?;
+    Check.equalBytes("1731000000.5".bytes(), pairs[0].value.view())?;
+    Check.equalBytes("gzip".bytes(), pairs[1].value.view())?;
+    return Ok();
+}
+
+@test
+fn metadataSurvivesReplayAndCheckpoints() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("metadata");
+    let meta = sampleMetadata();
+    var upload = [0u8; 16];
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        s.createBucket("bkt")!;
+        for (k in ["small", "large"]) {
+            var w = s.newWriter()!;
+            w.write(patterned(if (k == "small") 100 else 100000, 3).view())!;
+            let obj = w.finish()!;
+            let _ = s.putFinishedWith("bkt", k, "text/plain", meta.view(), borrow obj, PutCondition.None)!;
+        }
+        checkSample(s.headObject("bkt", "small")!.metadata.view())?;
+        putText(mut s, "bkt", "plain", "no metadata");
+        Check.equalU64(0, s.headObject("bkt", "plain")!.metadata.length as u64)?;
+        upload = s.createUploadWith("bkt", "multi", "a/b", meta.view())!;
+        // Too much is refused, and its extents removed.
+        var huge = Vector<u8>.create();
+        for (i in 0..9) { metadataAdd(mut huge, "x-amz-meta-big".bytes(), patterned(1000, 1).view())!; }
+        var w = s.newWriter()!;
+        w.write(patterned(100000, 4).view())!;
+        let obj = w.finish()!;
+        let files = extentFiles(dir.view());
+        match (s.putFinishedWith("bkt", "huge", "", huge.view(), borrow obj, PutCondition.None)) {
+            Err(StoreError.MetadataTooLarge) => {}
+            _ => { return Check.fail("metadata over the limit"); }
+        }
+        Check.equalU64(files - 2, extentFiles(dir.view()))?;
+    }
+    for (round in 0..3) {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        checkSample(s.headObject("bkt", "small")!.metadata.view())?;
+        checkSample(s.headObject("bkt", "large")!.metadata.view())?;
+        Check.equalU64(0, s.headObject("bkt", "plain")!.metadata.length as u64)?;
+        if (round == 0) { let _ = s.checkpoint()!; } // the upload, with its metadata, in a checkpoint
+        if (round == 1) {
+            let m1 = sendPart(mut s, "bkt", "multi", upload, 1, patterned(10, 5).view())!;
+            let chosen = [choice(1, m1)];
+            let _ = s.completeUpload("bkt", "multi", upload, chosen[..])!;
+            let _ = s.checkpoint()!;
+        }
+        if (round == 2) {
+            let info = s.headObject("bkt", "multi")!;
+            checkSample(info.metadata.view())?;
+            Check.equalText("a/b", StringView.fromUtf8(info.contentType.view())!)?;
+        }
+    }
+    removeTree(dir.view());
+    return Ok();
+}

@@ -74,6 +74,8 @@ enum StoreError {
     InvalidPartOrder,
     EntityTooSmall,
     InvalidPartNumber,
+    /// The stored fields are larger than MAX_METADATA_BYTES (ADR-0012).
+    MetadataTooLarge,
 }
 
 fn sio<T>(r: Result<T, IoFailure>) -> Result<T, StoreError> => match (r) {
@@ -145,6 +147,8 @@ struct ObjectInfo {
     contentType: Vector<u8>;
     /// A multipart object's part count (its ETag is `md5-parts`), else 0.
     parts: u32;
+    /// User metadata and stored headers (ADR-0012), as a blob (`metadataPairs` reads it).
+    metadata: Vector<u8>;
 }
 
 struct PutOutcome {
@@ -430,6 +434,7 @@ fn applyPut(
         recordLength: totalLen,
         extents: extents,
         parts: parts,
+        metadata: m.metadata,
     };
     let key = IndexKey { bucket: m.bucket, key: m.key };
     match (state.index.put(key, version)?) {
@@ -933,11 +938,27 @@ struct ObjectStore {
         contentType: StringView,
         obj: borrow FinishedObject,
         condition: PutCondition,
+    ) -> Result<PutOutcome, StoreError> =>
+        this.putFinishedWith(bucket, key, contentType, "".bytes(), obj, condition);
+
+    /// `putFinished` with stored fields: a blob from `metadataAdd` (ADR-0012).
+    fn putFinishedWith(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        contentType: StringView,
+        metadata: Slice<u8>,
+        obj: borrow FinishedObject,
+        condition: PutCondition,
     ) -> Result<PutOutcome, StoreError> {
         // Staged writes must be visible to the precondition check.
         match (this.commitStaged()) {
             Ok(_) => {}
             Err(e) => { return Err(e); }
+        }
+        if (metadata.length > MAX_METADATA_BYTES) {
+            this.discardFinished(obj);
+            return Err(StoreError.MetadataTooLarge);
         }
         match (this.checkPut(bucket, key, contentType, obj, condition)) {
             Ok() => {}
@@ -946,7 +967,7 @@ struct ObjectStore {
                 return Err(e);
             }
         }
-        let lsn = this.stageFinished(bucket, key, contentType, obj)?;
+        let lsn = this.stageFinished(bucket, key, contentType, metadata, obj)?;
         this.commitStaged()?;
         return Ok(PutOutcome { md5: obj.md5, generation: lsn, parts: 0 });
     }
@@ -1008,7 +1029,7 @@ struct ObjectStore {
                 return Err(e);
             }
         }
-        return this.stageFinished(bucket, key, contentType, obj);
+        return this.stageFinished(bucket, key, contentType, "".bytes(), obj);
     }
 
     /// Stages the record that publishes a finished object; returns its LSN (its generation).
@@ -1018,6 +1039,7 @@ struct ObjectStore {
         bucket: StringView,
         key: StringView,
         contentType: StringView,
+        metadata: Slice<u8>,
         obj: borrow FinishedObject,
     ) -> Result<u64, StoreError> {
         var meta = Vector<u8>.create();
@@ -1031,6 +1053,7 @@ struct ObjectStore {
             obj.size,
             obj.md5,
             contentType.bytes(),
+            metadata,
         )?;
         var manifest = Vector<u8>.create();
         let kind = match (borrow obj.body) {
@@ -1108,6 +1131,7 @@ struct ObjectStore {
                     generation: v.lsn,
                     contentType: copyBytes(v.contentType.view())?,
                     parts: v.parts,
+                    metadata: copyBytes(v.metadata.view())?,
                 });
             }
             null => { return Err(StoreError.NoSuchKey); }
@@ -1262,8 +1286,18 @@ struct ObjectStore {
         bucket: StringView,
         key: StringView,
         contentType: StringView,
+    ) -> Result<[u8; 16], StoreError> => this.createUploadWith(bucket, key, contentType, "".bytes());
+
+    /// `createUpload` with the stored fields the completed object will have (ADR-0012).
+    fn createUploadWith(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        contentType: StringView,
+        metadata: Slice<u8>,
     ) -> Result<[u8; 16], StoreError> {
         this.commitStaged()?;
+        if (metadata.length > MAX_METADATA_BYTES) { return Err(StoreError.MetadataTooLarge); }
         this.checkWritable()?;
         ObjectStore.checkKey(key)?;
         if (contentType.length > MAX_CONTENT_TYPE) { return Err(StoreError.InvalidKey); }
@@ -1283,6 +1317,7 @@ struct ObjectStore {
             key.bytes(),
             Clock.unixMillis(),
             contentType.bytes(),
+            metadata,
         )?;
         let empty = [0u8; 1];
         this.commitOne(RecordType.UploadCreate, empty[0..0])?;
@@ -1427,6 +1462,7 @@ struct ObjectStore {
                 size,
                 multipartEtag(md5s.view()),
                 u.contentType.view(),
+                u.metadata.view(),
                 id,
                 truncate<u32>(chosen.length),
             )?;
