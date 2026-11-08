@@ -1,0 +1,42 @@
+// DeleteObjects in the store (ADR-0010): one sync for the batch, per-key validity, and recovery.
+
+fn keyList(names: Slice<StringView>) -> Vector<Vector<u8>> {
+    var keys = Vector<Vector<u8>>.create();
+    for (n in names) { keys.push(copyBytes(n.bytes())!)!; }
+    return keys;
+}
+
+@test
+fn deleteObjectsCommitsOnce() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("batch-delete");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        putText(mut s, "bkt", "a", "1");
+        putText(mut s, "bkt", "b", "2");
+        putText(mut s, "bkt", "c", "3");
+        let _ = s.putObject("bkt", "big", "", patterned(200000, 5).view(), PutCondition.None)!;
+        let syncs = s.journalSyncs();
+        let names = ["a", "big", "missing", "", "c", "a"];
+        let valid = s.deleteObjects("bkt", keyList(names[..]).view())!;
+        Check.equalU64(syncs + 1, s.journalSyncs())?; // the whole batch in one sync
+        Check.equalU64(6, valid.length as u64)?;
+        Check.isTrue(valid[0] && valid[1] && valid[2] && !valid[3] && valid[4] && valid[5], "validity per key")?;
+        Check.equalU64(1, s.objectCount() as u64)?;
+        checkText("2", s.getObject("bkt", "b")!)?;
+        Check.equalU64(0, extentFiles(dir.view()))?; // the big object's extents are reaped
+        match (s.deleteObjects("none", keyList(names[0..1]).view())) {
+            Err(StoreError.NoSuchBucket) => {}
+            _ => { return Check.fail("a missing bucket"); }
+        }
+        // Nothing to delete: no record and no sync.
+        let before = s.journalSyncs();
+        let _ = s.deleteObjects("bkt", keyList(names[2..3]).view())!;
+        Check.equalU64(before, s.journalSyncs())?;
+    }
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(1, s.objectCount() as u64)?;
+    checkText("2", s.getObject("bkt", "b")!)?;
+    removeTree(dir.view());
+    return Ok();
+}

@@ -1,0 +1,266 @@
+// CopyObject and UploadPartCopy (ADR-0010). The source is read through a pinned reader and written to a new writer,
+// a step at a time on worker threads without the store's lock, so a copy is a GET and a PUT that never leave the
+// server. Only the plan (source, conditions, admission) and the commit take the lock.
+import web_core;
+import web_http;
+import web_server;
+
+/// `x-amz-copy-source`: `bucket/key` or `/bucket/key`, URL-encoded, with an optional `?versionId=null`.
+struct CopySource {
+    bucket: String;
+    key: String;
+}
+
+fn copySourceOf(req: borrow S3Request) -> Result<CopySource, S3Fail> {
+    let raw = headerOf(req, "x-amz-copy-source") ?? "".bytes();
+    var end = raw.length;
+    match (findBytes(raw, "?".bytes(), 0)) {
+        Some(q) => {
+            end = q;
+            // Only the null version exists in an unversioned bucket.
+            if (raw[q..] != "?versionId=null".bytes()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        }
+        null => {}
+    }
+    var decoded = Vector<u8>.create();
+    if (!percentDecodeInto(mut decoded, raw[0..end], false)?) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    let path = if (decoded.length > 0 && decoded[0] == '/') decoded.view()[1..] else decoded.view();
+    let slash = pieceEnd(path, 0, '/');
+    if (slash == 0 || slash + 1 >= path.length) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    var bucket = String.create();
+    var key = String.create();
+    appendUtf8(mut bucket, path[0..slash])?;
+    appendUtf8(mut key, path[slash + 1..])?;
+    if (key.length > MAX_KEY_BYTES) { return Err(S3Fail.Code(S3Code.KeyTooLongError)); }
+    return Ok(CopySource { bucket: bucket, key: key });
+}
+
+/// The `x-amz-copy-source-if-*` conditions. Every failure is PreconditionFailed, as S3 answers for a copy.
+fn checkCopyConditions(req: borrow S3Request, info: borrow ObjectInfo) -> Result<void, S3Code> {
+    return match (checkConditions(
+        req,
+        info,
+        "x-amz-copy-source-if-match",
+        "x-amz-copy-source-if-unmodified-since",
+        "x-amz-copy-source-if-none-match",
+        "x-amz-copy-source-if-modified-since",
+    )) {
+        Ok() => Ok(),
+        Err(_) => Err(S3Code.PreconditionFailed),
+    };
+}
+
+/// `x-amz-copy-source-range: bytes=first-last`, both given and within a source of `size` bytes; null otherwise, which
+/// S3 answers with InvalidArgument.
+fn parseCopyRange(text: Slice<u8>, size: u64) -> RangeSpan? {
+    let t = trimSpaces(text);
+    let unit = "bytes=".bytes();
+    if (t.length <= unit.length || t[0..unit.length] != unit) { return null; }
+    let spec = t[unit.length..];
+    let dash = pieceEnd(spec, 0, '-');
+    if (dash == 0 || dash + 1 >= spec.length) { return null; }
+    let first = parseDecimal(spec[0..dash]);
+    let last = parseDecimal(spec[dash + 1..]);
+    if (first.isNull() || last.isNull()) { return null; }
+    let a = first ?? 0;
+    let b = last ?? 0;
+    if (a > b || b >= size) { return null; }
+    return RangeSpan { from: a, to: b + 1 };
+}
+
+/// Where a copy goes: a new version of a key, or a part of an upload.
+enum CopyTarget {
+    Object,
+    Part(u32),
+}
+
+/// What a copy will do, decided under the lock.
+struct CopyPlan {
+    source: ObjectInfo;
+    reader: ObjectReader?;
+    writer: ObjectWriter;
+    size: u64;
+}
+
+/// Under the lock: the source exists and meets its conditions, the range is in it, the size is admitted at the
+/// destination (whose bucket, or upload, exists), and a reader that pins the source's extents.
+fn planCopy(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    src: borrow CopySource,
+    target: CopyTarget,
+    uploadId: [u8; 16],
+) -> Result<CopyPlan, S3Fail> {
+    let info = match (store.headObject(src.bucket.view(), src.key.view())) {
+        Ok(i) => i,
+        Err(e) => { return Err(storeFail(e, src.key.length)); }
+    };
+    match (checkCopyConditions(req, borrow info)) {
+        Ok() => {}
+        Err(code) => { return Err(S3Fail.Code(code)); }
+    }
+    var start: u64 = 0;
+    var end = info.size;
+    match (target) {
+        CopyTarget.Part(_) => {
+            match (headerOf(req, "x-amz-copy-source-range")) {
+                Some(t) => {
+                    match (parseCopyRange(t, info.size)) {
+                        Some(r) => {
+                            start = r.from;
+                            end = r.to;
+                        }
+                        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                    }
+                }
+                null => {}
+            }
+        }
+        CopyTarget.Object => {}
+    }
+    let size = end - start;
+    if (size > MAX_PUT_BYTES) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    let bucket = req.bucket.view();
+    let key = req.key.view();
+    let made = match (target) {
+        CopyTarget.Object => beginPut(store, bucket, size),
+        CopyTarget.Part(number) => beginPart(store, bucket, key, uploadId, number, size),
+    };
+    let writer = match (made) {
+        Ok(w) => w,
+        Err(e) => { return Err(storeFail(e, key.length)); }
+    };
+    var reader: ObjectReader? = null;
+    if (size > 0) {
+        reader = match (store.openReader(src.bucket.view(), src.key.view(), start, end)) {
+            Ok(r) => r,
+            Err(e) => { return Err(storeFail(e, src.key.length)); }
+        };
+    }
+    return Ok(CopyPlan { source: info, reader: reader, writer: writer, size: size });
+}
+
+async fn openCopy(
+    app: borrow S3App,
+    req: borrow S3Request,
+    src: borrow CopySource,
+    target: CopyTarget,
+    uploadId: [u8; 16],
+) -> Result<CopyPlan, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return await Async.blocking(() => planCopy(store, req, src, target, uploadId));
+}
+
+/// One step of a copy, on a worker thread: read from the source, write to the destination; 0 at the end.
+fn copyStep(
+    reader: borrow mut ObjectReader,
+    writer: borrow mut ObjectWriter,
+    buf: SliceMut<u8>,
+) -> Result<usize, StoreError> {
+    let n = reader.read(buf)?;
+    if (n > 0) { sio(writer.write(buf[0..n]))?; }
+    return Ok(n);
+}
+
+/// Streams the planned bytes into the writer and finishes it. The reader (and its pins) goes when this returns.
+async fn runCopy(plan: CopyPlan) -> Result<FinishedObject, S3Fail> {
+    var p = plan;
+    var writer = p.writer;
+    match (p.reader.asBorrowMut()) {
+        Some(reader) => {
+            var buf = Vector<u8>.create();
+            buf.resize(BODY_STEP, 0)?;
+            var copied: u64 = 0;
+            while (true) {
+                let chunk = buf.viewMut();
+                let step = await Async.blocking(() => copyStep(reader, mut writer, chunk));
+                let n = match (step) {
+                    Ok(n) => n,
+                    Err(e) => { return Err(storeFail(e, 0)); }
+                };
+                if (n == 0) { break; }
+                copied += n as u64;
+            }
+            if (copied != p.size) { return Err(S3Fail.Code(S3Code.InternalError)); }
+        }
+        null => {}
+    }
+    return match (await Async.blocking(() => writer.finish())) {
+        Ok(f) => Ok(f),
+        Err(f) => Err(storeFail(StoreError.Io(f), 0)),
+    };
+}
+
+/// `<CopyObjectResult>` or `<CopyPartResult>`: the new ETag and modification time.
+async fn sendCopyResult(
+    exchange: borrow mut Exchange,
+    element: StringView,
+    md5: borrow [u8; 16],
+) -> Result<void, S3Fail> {
+    var body = Vector<u8>.create();
+    xmlHead(mut body, element)?;
+    body.extend("<LastModified>".bytes())?;
+    appendIso8601(mut body, Clock.unixMillis())?;
+    body.extend("</LastModified>".bytes())?;
+    xmlEtag(mut body, md5, 0)?;
+    body.extend("</".bytes())?;
+    body.extend(element.bytes())?;
+    body.extend(">".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn copyObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    // Conditions on the destination, and stored metadata other than the content type, are not built yet.
+    if (headerOf(req, "if-match").isSome() || headerOf(req, "if-none-match").isSome()) {
+        return Err(S3Fail.Code(S3Code.NotImplemented));
+    }
+    let src = copySourceOf(req)?;
+    let replace = match (headerOf(req, "x-amz-metadata-directive")) {
+        Some(t) => {
+            if (t == "REPLACE".bytes()) {
+                true
+            } else if (t == "COPY".bytes()) {
+                false
+            } else {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
+        }
+        null => false,
+    };
+    if (!replace && src.bucket.view() == req.bucket.view() && src.key.view() == req.key.view()) {
+        return Err(S3Fail.Code(S3Code.InvalidRequest)); // a copy onto itself must change something
+    }
+    let plan = await openCopy(app, req, borrow src, CopyTarget.Object, [0u8; 16])?;
+    var contentType = String.create();
+    if (replace) {
+        contentTypeOf(req, mut contentType)?;
+    } else {
+        appendUtf8(mut contentType, plan.source.contentType.view())?;
+    }
+    let finished = await runCopy(plan)?;
+    let outcome = await commitPut(
+        app,
+        req.bucket.view(),
+        req.key.view(),
+        contentType.view(),
+        borrow finished,
+        PutIf.None,
+        "".bytes(),
+    )?;
+    return await sendCopyResult(exchange, "CopyObjectResult", borrow outcome.md5);
+}
+
+async fn uploadPartCopy(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let number = partNumberOf(req)?;
+    let id = uploadIdOf(req)?;
+    let src = copySourceOf(req)?;
+    let plan = await openCopy(app, req, borrow src, CopyTarget.Part(number), id)?;
+    let finished = await runCopy(plan)?;
+    let md5 = await commitPart(app, req.bucket.view(), req.key.view(), id, number, borrow finished)?;
+    return await sendCopyResult(exchange, "CopyPartResult", borrow md5);
+}

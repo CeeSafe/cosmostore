@@ -163,18 +163,29 @@ async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mu
             }
             return await listObjects(app, borrow req, exchange);
         }
-        if (isMethod(m, Method.Post)) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        if (isMethod(m, Method.Post)) {
+            if (req.hasParam("delete") && req.onlyParams("delete")) {
+                return await deleteObjects(app, borrow req, auth, exchange);
+            }
+            return Err(S3Fail.Code(S3Code.NotImplemented));
+        }
         return Err(S3Fail.Code(S3Code.MethodNotAllowed));
     }
     if (req.key.length > MAX_KEY_BYTES) { return Err(S3Fail.Code(S3Code.KeyTooLongError)); }
     if (isMethod(m, Method.Put)) {
-        if (headerOf(borrow req, "x-amz-copy-source").isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        let copying = headerOf(borrow req, "x-amz-copy-source").isSome();
         if (req.hasParam("uploadId") || req.hasParam("partNumber")) {
             if (!req.onlyParams("partNumber,uploadId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            if (copying) { return await uploadPartCopy(app, borrow req, exchange); }
             return await uploadPart(app, borrow req, auth, exchange);
         }
         if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        if (copying) { return await copyObject(app, borrow req, exchange); }
         return await putObject(app, borrow req, auth, exchange);
+    }
+    if (isMethod(m, Method.Get) && req.hasParam("tagging")) {
+        if (!req.onlyParams("tagging")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        return await getObjectTagging(app, borrow req, exchange);
     }
     if (isMethod(m, Method.Get) && req.hasParam("uploadId")) {
         if (!req.onlyParams("uploadId,max-parts,part-number-marker,encoding-type")) {
@@ -500,4 +511,28 @@ async fn deleteObject(app: borrow S3App, req: borrow S3Request, exchange: borrow
     }
     await exchange.send(Status.noContent(), "".bytes())?;
     return Ok();
+}
+
+/// GetObjectTagging: tags cannot be set yet (PutObjectTagging is NotImplemented), so every object's set is empty. The
+/// AWS CLI reads it before a multipart copy.
+async fn getObjectTagging(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let _ = await objectInfo(app, req.bucket.view(), req.key.view())?;
+    var body = Vector<u8>.create();
+    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging xmlns=\"".bytes())?;
+    body.extend(S3_XMLNS.bytes())?;
+    body.extend("\"><TagSet></TagSet></Tagging>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn objectInfo(app: borrow S3App, bucket: StringView, key: StringView) -> Result<ObjectInfo, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => store.headObject(bucket, key))) {
+        Ok(i) => Ok(i),
+        Err(e) => Err(storeFail(e, key.length)),
+    };
 }

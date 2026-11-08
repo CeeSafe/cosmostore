@@ -1,5 +1,5 @@
 #!/bin/sh
-# The M3 end-to-end test (ADR-0008, ADR-0009): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
+# The M3 end-to-end test (ADR-0008 to ADR-0010): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
 # against `cosmostore serve` on a fresh store. Prints one line per check; exit status 1 if any fails.
 #
 # usage: tools/s3_smoke.sh [COSMOSTORE] [PORT]     (defaults: out/cosmostore, 9311)
@@ -135,6 +135,39 @@ check "aborted upload gone" "$(code s3api upload-part --bucket smoke --key m/abo
 check "no uploads left" "$(aws s3api list-multipart-uploads --bucket smoke --query 'length(Uploads || `[]`)')" 0
 check "unknown upload id" "$(code s3api abort-multipart-upload --bucket smoke --key m/x --upload-id nope)" NoSuchUpload
 
+# Copies (ADR-0010): whole objects, the CLI's multipart copy (UploadPartCopy above 8 MB), and part ranges by hand.
+aws s3api copy-object --bucket smoke --key c/copy1 --copy-source smoke/m/manual > /dev/null 2>&1
+aws s3api get-object --bucket smoke --key c/copy1 got.bin > /dev/null 2>&1
+cmp -s got.bin want.bin && pass "copy-object" || fail "copy-object"
+check "copy keeps the content type" "$(aws s3api head-object --bucket smoke --key c/copy1 --query ContentType --output text)" text/x-test
+check "copy of a multipart object is one part" "$(aws s3api head-object --bucket smoke --key c/copy1 --query ETag --output text)" "\"$(md5 -q want.bin)\""
+aws s3api copy-object --bucket smoke --key c/copy1 --copy-source smoke/c/copy1 --metadata-directive REPLACE --content-type x/y > /dev/null 2>&1
+check "copy onto itself, REPLACE" "$(aws s3api head-object --bucket smoke --key c/copy1 --query ContentType --output text)" x/y
+check "copy onto itself, COPY" "$(code s3api copy-object --bucket smoke --key c/copy1 --copy-source smoke/c/copy1)" InvalidRequest
+check "copy of a missing key" "$(code s3api copy-object --bucket smoke --key c/x --copy-source smoke/nope)" NoSuchKey
+check "copy-source-if-match wrong" "$(code s3api copy-object --bucket smoke --key c/x --copy-source smoke/c/copy1 --copy-source-if-match '"00000000000000000000000000000000"')" PreconditionFailed
+aws s3api put-object --bucket smoke --key "c/sp ace+ü.txt" --body small.txt > /dev/null 2>&1
+aws s3 cp "s3://smoke/c/sp ace+ü.txt" s3://smoke/c/enc.txt > /dev/null 2>&1
+aws s3api get-object --bucket smoke --key c/enc.txt o.txt > /dev/null 2>&1
+cmp -s o.txt small.txt && pass "copy of an encoded key" || fail "copy of an encoded key"
+rm -f huge.got; aws s3 cp s3://smoke/m/huge.bin s3://smoke/c/huge.bin > /dev/null 2>&1 && aws s3 cp s3://smoke/c/huge.bin huge.got > /dev/null 2>&1
+cmp -s huge.got huge.bin && pass "s3 cp S3 to S3 (UploadPartCopy)" || fail "s3 cp S3 to S3 (UploadPartCopy)"
+check "UploadPartCopy ETag" "$(aws s3api head-object --bucket smoke --key c/huge.bin --query ETag --output text)" "$huge_etag"
+id=$(aws s3api create-multipart-upload --bucket smoke --key c/ranged --query UploadId --output text)
+r1=$(aws s3api upload-part-copy --bucket smoke --key c/ranged --upload-id "$id" --part-number 1 --copy-source smoke/m/huge.bin --copy-source-range bytes=1000-5243879 --query CopyPartResult.ETag --output text | tr -d '"')
+r2=$(aws s3api upload-part-copy --bucket smoke --key c/ranged --upload-id "$id" --part-number 2 --copy-source smoke/a/small.txt --query CopyPartResult.ETag --output text | tr -d '"')
+check "part copy range past the end" "$(code s3api upload-part-copy --bucket smoke --key c/ranged --upload-id "$id" --part-number 3 --copy-source smoke/a/small.txt --copy-source-range bytes=0-17)" InvalidArgument
+aws s3api complete-multipart-upload --bucket smoke --key c/ranged --upload-id "$id" \
+    --multipart-upload "{\"Parts\":[{\"ETag\":\"$r1\",\"PartNumber\":1},{\"ETag\":\"$r2\",\"PartNumber\":2}]}" > /dev/null 2>&1
+aws s3api get-object --bucket smoke --key c/ranged got.bin > /dev/null 2>&1
+{ dd if=huge.bin bs=1000 skip=1 count=5242 2> /dev/null; dd if=huge.bin bs=1 skip=5243000 count=880 2> /dev/null; cat small.txt; } > want2.bin
+cmp -s got.bin want2.bin && pass "upload-part-copy ranges" || fail "upload-part-copy ranges"
+
+# DeleteObjects (ADR-0010): one commit for the batch; missing keys count as deleted.
+check "delete-objects" "$(aws s3api delete-objects --bucket smoke --delete '{"Objects":[{"Key":"c/copy1"},{"Key":"c/none"},{"Key":"c/enc.txt"}]}' --query 'length(Deleted)')" 3
+check "deleted by the batch" "$(code s3api head-object --bucket smoke --key c/copy1)" 404
+check "delete-objects quiet" "$(aws s3api delete-objects --bucket smoke --delete '{"Objects":[{"Key":"c/ranged"}],"Quiet":true}' --query 'length(Deleted || `[]`)')" 0
+
 # A GET dropped half way releases its pins: the overwritten extents go on the next commits.
 for i in 1 2 3; do python3 -I "$here/s3_raw.py" abort-get "$AWS_ENDPOINT_URL" smoke a/big.bin 100000 > /dev/null; done
 aws s3api put-object --bucket smoke --key a/big.bin --body small.txt > /dev/null 2>&1
@@ -147,7 +180,8 @@ check "bucket not empty" "$(code s3api delete-bucket --bucket smoke)" BucketNotE
 check "wrong secret" "$(AWS_SECRET_ACCESS_KEY=wrong code s3api list-buckets)" SignatureDoesNotMatch
 check "unknown key id" "$(AWS_ACCESS_KEY_ID=AKIAUNKNOWN code s3api list-buckets)" InvalidAccessKeyId
 check "anonymous" "$(code s3api list-buckets --no-sign-request)" AccessDenied
-check "not implemented (copy)" "$(code s3api copy-object --bucket smoke --key copy --copy-source smoke/a/small.txt)" NotImplemented
+check "no tags" "$(aws s3api get-object-tagging --bucket smoke --key a/small.txt --query 'length(TagSet)')" 0
+check "not implemented (put tags)" "$(code s3api put-object-tagging --bucket smoke --key a/small.txt --tagging 'TagSet=[{Key=a,Value=b}]')" NotImplemented
 
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1

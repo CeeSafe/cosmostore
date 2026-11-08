@@ -1183,6 +1183,58 @@ struct ObjectStore {
         return Ok();
     }
 
+    /// Deletes many keys of `bucket` with one commit: one journal write and one sync for the batch (ADR-0010). The
+    /// result says, per key, whether it was valid; a missing key is deleted, as in S3. Nothing is acknowledged
+    /// before the batch is durable: on an error none of it is.
+    fn deleteObjects(borrow mut this, bucket: StringView, keys: Slice<Vector<u8>>) -> Result<Vector<bool>, StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        var valid = Vector<bool>.create();
+        let now = Clock.unixMillis();
+        for (i in 0..keys.length) {
+            let key = keys[i].view();
+            if (key.length == 0 || key.length > MAX_KEY_BYTES) {
+                valid.push(false)?;
+                continue;
+            }
+            valid.push(true)?;
+            let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key)? };
+            if (!this.state.index.contains(borrow k)) { continue; }
+            match (this.stageDelete(bucket.bytes(), key, now)) {
+                Ok() => {}
+                Err(e) => {
+                    this.journal.discardPending();
+                    this.pendingApplies.clear();
+                    return Err(e);
+                }
+            }
+        }
+        this.commitStaged()?;
+        return Ok(valid);
+    }
+
+    /// Stages the DeleteVersion record of `key`; a full batch is committed first.
+    fn stageDelete(borrow mut this, bucket: Slice<u8>, key: Slice<u8>, now: i64) -> Result<void, StoreError> {
+        var meta = Vector<u8>.create();
+        encodeDeleteMeta(mut meta, bucket, key, nullVersionId(), now)?;
+        let empty = [0u8; 1];
+        if (this.journal.wouldOverflow(meta.length, 0)) { this.commitStaged()?; }
+        this.pendingApplies.reserve(1)?;
+        let pos = this.journal.stage(RecordType.DeleteVersion, meta.view(), empty[0..0])?;
+        this.pendingApplies.push(PendingApply {
+            kind: RecordType.DeleteVersion,
+            lsn: pos.lsn,
+            segment: pos.segmentId,
+            offset: pos.offset,
+            total: truncate<u32>(recordLength(meta.length, 0)),
+            meta: meta,
+            payloadLen: 0,
+            manifest: Vector<u8>.create(),
+        })?;
+        return Ok();
+    }
+
     // ---- Multipart uploads (ADR-0009) ----
 
     /// Begins a multipart upload of `key`; returns its id.

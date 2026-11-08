@@ -223,11 +223,11 @@ deadlocks. **Passed** (7 Nov 2026: 186 SIGKILLs, used/live at most 119%, recover
 - SigV4 header/query auth, presigned URLs, **aws-chunked and trailing checksums** (#4),
   and POST policy. Header auth, aws-chunked and trailing checksums **done** (slice 1).
 - Bucket CRUD, ListBuckets, GetBucketLocation. **Done** (slice 1).
-- PUT/GET/HEAD/DELETE, DeleteObjects, CopyObject, Range, conditional GET/PUT via CAS.
+- PUT/GET/HEAD/DELETE, DeleteObjects, CopyObject, Range, conditional GET/PUT via CAS. **Done** (slices 1 and 3).
 - ListObjects v1/v2 with delimiter, continuation-token, start-after and encoding-type. **Done** (slice 1).
 - ETag semantics, checksum headers, exact XML errors.
 - Multipart: create, upload, upload-copy, list, complete, abort, sharing the extent
-  machinery. **Done** except upload-copy (slice 2, ADR-0009).
+  machinery. **Done** (slice 2, ADR-0009; upload-copy in slice 3, ADR-0010).
 - Static credentials file and a minimal bucket policy (owner-only), with private buckets
   by default.
 - CI matrix: AWS CLI v2, boto3, Go/Java/.NET SDKs, rclone, plus the relevant subset of
@@ -597,6 +597,34 @@ files over 8 MB now works.
   - CopyObject and UploadPartCopy, DeleteObjects;
   - presigned URLs, POST policy, virtual-host addressing;
   - user metadata, bucket creation dates, response checksums;
+  - expiring abandoned uploads;
+  - binding beyond loopback, and TLS;
+  - the SDK matrix (boto3, Go, Java, .NET, rclone) and the s3-tests subset.
+
+### 8 Nov 2026: M3 slice 3, copies and batch deletes (ADR-0010)
+
+CopyObject, UploadPartCopy and DeleteObjects. With them, `aws s3 cp` between S3 paths works at any size, and
+`aws s3 rm --recursive` deletes up to 1,000 keys per sync.
+- **Copies** read the source through a pinned reader and write new extents, a step at a time on worker threads
+  without the lock, then commit as a PUT or a part. No format changes: an extent still has one owner. Shared extents
+  for zero-copy copies wait for evidence that they matter.
+  - `x-amz-copy-source-if-*` conditions, COPY and REPLACE metadata directives, and `x-amz-copy-source-range` are
+    handled.
+  - GetObjectTagging returns an empty set, which is true, since tags cannot be set yet. The CLI reads it before
+    every multipart copy, and the smoke test found that.
+- **DeleteObjects** stages one DeleteVersion per existing key and commits once: one journal write and one sync.
+  - Its body is checked against `Content-MD5` and `x-amz-checksum-*`, and so is the multipart Complete body now.
+  - Keys keep their spaces, and XML entities are decoded.
+- **Tests:**
+  - a store test of the one-sync batch and its recovery;
+  - the multipart fault sweeps now end with a batch delete;
+  - 2 unit tests (the delete body parser, copy ranges);
+  - `tools/s3_smoke.sh`: 78 checks, up from 62, with a 20 MB S3-to-S3 copy through UploadPartCopy;
+  - `ceesafec test`: 84 pass.
+- **M3 left:**
+  - presigned URLs, POST policy, virtual-host addressing;
+  - user metadata, tags, bucket creation dates, response checksums;
+  - CopyObject destination conditions;
   - expiring abandoned uploads;
   - binding beyond loopback, and TLS;
   - the SDK matrix (boto3, Go, Java, .NET, rclone) and the s3-tests subset.

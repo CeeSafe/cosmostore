@@ -358,3 +358,50 @@ fn multipartEtagsAndUploadIds() -> Result<void, TestFailure> {
     Check.isTrue(parseUploadId("abc".bytes()).isNull(), "a short id")?;
     return Ok();
 }
+
+@test
+fn deleteBodyParses() -> Result<void, TestFailure> {
+    let xml = """
+        <Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Quiet>true</Quiet>
+          <Object><Key>a/one.txt</Key></Object>
+          <Object><Key> sp &amp; &lt;x&gt; &#39;q&#x27; </Key><VersionId>null</VersionId></Object>
+        </Delete>
+        """;
+    let d = match (parseDeleteBody(xml.bytes())) {
+        Ok(d) => d,
+        Err(_) => { return Check.fail("the body parses"); }
+    };
+    Check.isTrue(d.quiet, "quiet")?;
+    Check.equalU64(2, d.keys.length as u64)?;
+    Check.equalBytes("a/one.txt".bytes(), d.keys[0].view())?;
+    Check.equalBytes(" sp & <x> 'q' ".bytes(), d.keys[1].view())?; // spaces kept, entities decoded
+    match (parseDeleteBody("<Delete><Object><Key>k</Key><VersionId>abc</VersionId></Object></Delete>".bytes())) {
+        Err(S3Fail.Code(S3Code.NotImplemented)) => {}
+        _ => { return Check.fail("a real version id is not implemented"); }
+    }
+    let bad = [
+        "<Delete></Delete>",
+        "<Delete><Object><Key>k</Object></Delete>",
+        "<Delete><Object><Key>a&bogus;b</Key></Object></Delete>",
+        "<Other><Object><Key>k</Key></Object></Other>",
+    ];
+    for (b in bad) {
+        match (parseDeleteBody(b.bytes())) {
+            Err(S3Fail.Code(S3Code.MalformedXML)) => {}
+            _ => { return Check.fail("a malformed delete body"); }
+        }
+    }
+    return Ok();
+}
+
+@test
+fn copyRanges() -> Result<void, TestFailure> {
+    let r = parseCopyRange("bytes=0-9".bytes(), 10)!;
+    Check.equalU64(0, r.from)?;
+    Check.equalU64(10, r.to)?;
+    let s = parseCopyRange(" bytes=5-5 ".bytes(), 10)!;
+    Check.equalU64(1, s.to - s.from)?;
+    let bad = ["bytes=0-10", "bytes=5-4", "bytes=-5", "bytes=5-", "bytes=a-b", "items=0-1", "bytes=0-1,2-3"];
+    for (b in bad) { Check.isTrue(parseCopyRange(b.bytes(), 10).isNull(), "an invalid copy range")?; }
+    return Ok();
+}

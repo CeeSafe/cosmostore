@@ -99,7 +99,7 @@ syncs (ADR-0001).
 
 ## Not yet
 
-- `UploadPartCopy` (it comes with CopyObject), and `GET ?partNumber`.
+- `UploadPartCopy` (it comes with CopyObject; done in ADR-0010), and `GET ?partNumber`.
 - Expiring abandoned uploads (S3's lifecycle rule `AbortIncompleteMultipartUpload`). Until then an abandoned upload
   keeps its parts until it is aborted.
 - `delimiter` in ListMultipartUploads.
