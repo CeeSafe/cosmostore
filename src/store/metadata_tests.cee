@@ -44,7 +44,7 @@ fn metadataSurvivesReplayAndCheckpoints() -> Result<void, TestFailure> {
         )!;
         // Too much is refused, and its extents removed.
         var huge = Vector<u8>.create();
-        for (i in 0..9) { metadataAdd(mut huge, "x-amz-meta-big".bytes(), patterned(1000, 1).view())!; }
+        for (i in 0..17) { metadataAdd(mut huge, "x-amz-meta-big".bytes(), patterned(1000, 1).view())!; }
         var w = s.newWriter()!;
         w.write(patterned(100000, 4).view())!;
         let obj = w.finish()!;
@@ -72,6 +72,63 @@ fn metadataSurvivesReplayAndCheckpoints() -> Result<void, TestFailure> {
             checkSample(info.metadata.view())?;
             Check.equalText("a/b", StringView.fromUtf8(info.contentType.view())!)?;
         }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+fn tagsOf(s: borrow ObjectStore, key: StringView) -> Vector<u8> =>
+    metadataValue(s.headObject("bkt", key)!.metadata.view(), TAGS_FIELD.bytes())!;
+
+@test
+fn tagsChangeInPlace() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("tags");
+    var generation: u64 = 0;
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        var meta = Vector<u8>.create();
+        metadataAdd(mut meta, "x-amz-meta-a".bytes(), "1".bytes())!;
+        metadataAdd(mut meta, TAGS_FIELD.bytes(), "team=blue".bytes())!;
+        var w = s.newWriter()!;
+        w.write("tagged".bytes())!;
+        let obj = w.finish()!;
+        generation = s.putFinishedWith(
+            "bkt",
+            "k",
+            "",
+            meta.view(),
+            "".bytes(),
+            borrow obj,
+            PutCondition.None,
+        )!.generation;
+        Check.equalBytes("team=blue".bytes(), tagsOf(borrow s, "k").view())?;
+        // New tags keep the version: its generation, ETag and other fields.
+        s.setTags("bkt", "k", "team=red&tier=gold".bytes())!;
+        let info = s.headObject("bkt", "k")!;
+        Check.equalU64(generation, info.generation)?;
+        Check.equalBytes("1".bytes(), metadataValue(info.metadata.view(), "x-amz-meta-a".bytes())!.view())?;
+        Check.equalBytes("team=red&tier=gold".bytes(), tagsOf(borrow s, "k").view())?;
+        match (s.setTags("bkt", "missing", "a=b".bytes())) {
+            Err(StoreError.NoSuchKey) => {}
+            _ => { return Check.fail("tags on a missing key"); }
+        }
+        putText(mut s, "bkt", "plain", "x");
+        s.setTags("bkt", "plain", "x=y".bytes())!;
+        s.setTags("bkt", "plain", "".bytes())!; // DeleteObjectTagging
+        Check.equalU64(0, tagsOf(borrow s, "plain").length as u64)?;
+    }
+    // From the journal; then a checkpoint; then an overwrite, which brings its own (no) tags.
+    for (round in 0..3) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        if (round < 2) {
+            Check.equalBytes("team=red&tier=gold".bytes(), tagsOf(borrow s, "k").view())?;
+            Check.equalU64(0, tagsOf(borrow s, "plain").length as u64)?;
+        } else {
+            Check.equalU64(0, tagsOf(borrow s, "k").length as u64)?;
+        }
+        if (round == 0) { let _ = s.checkpoint()!; }
+        if (round == 1) { putText(mut s, "bkt", "k", "overwritten"); }
     }
     removeTree(dir.view());
     return Ok();

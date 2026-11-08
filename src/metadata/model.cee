@@ -8,7 +8,10 @@ const MAX_KEY_BYTES: usize = 1024;
 const MAX_CONTENT_TYPE: usize = 1024;
 /// The most bytes of user metadata (`x-amz-meta-*` names and values, S3's 2 KiB) and of every stored field together.
 const MAX_USER_METADATA: usize = 2048;
-const MAX_METADATA_BYTES: usize = 8192;
+/// Every stored field together, tags included (ADR-0017: ten tags of 128 and 256 characters, URL-encoded).
+const MAX_METADATA_BYTES: usize = 16384;
+/// The stored field that holds a version's tags: their URL-encoded `k=v&k2=v2` form, as `x-amz-tagging` sends them.
+const TAGS_FIELD: StringView = "x-amz-tagging";
 
 /// The null version id, used by unversioned buckets.
 fn nullVersionId() -> [u8; 16] => [0u8; 16];
@@ -220,6 +223,65 @@ fn readMetadataSection(bytes: Slice<u8>, at: borrow mut usize) -> Result<Vector<
     }
     if (pairs == 0) { return Ok(Vector<u8>.create()); }
     return Ok(copyBytes(bytes[start..at])?);
+}
+
+/// `blob` with the pair `name` set to `value`, or removed for an empty `value`; the other pairs keep their order.
+fn metadataReplace(blob: Slice<u8>, name: Slice<u8>, value: Slice<u8>) -> Result<Vector<u8>, MetaFault> {
+    var out = Vector<u8>.create();
+    let pairs = metadataPairs(blob)?;
+    for (i in 0..pairs.length) {
+        if (pairs[i].name.view() != name) { metadataAdd(mut out, pairs[i].name.view(), pairs[i].value.view())?; }
+    }
+    if (value.length > 0) { metadataAdd(mut out, name, value)?; }
+    return Ok(out);
+}
+
+/// The value of the pair `name`, empty if there is none.
+fn metadataValue(blob: Slice<u8>, name: Slice<u8>) -> Result<Vector<u8>, MetaFault> {
+    let pairs = metadataPairs(blob)?;
+    for (i in 0..pairs.length) {
+        if (pairs[i].name.view() == name) { return Ok(copyBytes(pairs[i].value.view())?); }
+    }
+    return Ok(Vector<u8>.create());
+}
+
+/// SetTags meta v1: u8 format version, u16+bytes bucket, u16+bytes key, 16 version id, u64 generation (the version's
+/// LSN), u16+bytes tags (URL-encoded; empty: no tags). ADR-0017.
+fn encodeSetTagsMeta(
+    out: borrow mut Vector<u8>,
+    bucket: Slice<u8>,
+    key: Slice<u8>,
+    versionId: [u8; 16],
+    generation: u64,
+    tags: Slice<u8>,
+) -> Result<void, AllocError> {
+    out.pushLE(META_FORMAT_VERSION)?;
+    pushText16(out, bucket)?;
+    pushText16(out, key)?;
+    out.extend(versionId[..])?;
+    out.pushLE(generation)?;
+    pushText16(out, tags)?;
+    return Ok();
+}
+
+struct SetTagsMeta {
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    versionId: [u8; 16];
+    generation: u64;
+    tags: Vector<u8>;
+}
+
+fn decodeSetTagsMeta(bytes: Slice<u8>) -> Result<SetTagsMeta, MetaFault> {
+    var at: usize = 0;
+    checkVersion(bytes, mut at)?;
+    let bucket = readText16(bytes, mut at)?;
+    let key = readText16(bytes, mut at)?;
+    let versionId = readId16(bytes, mut at)?;
+    let generation = readU64(bytes, mut at)?;
+    let tags = readText16(bytes, mut at)?;
+    if (at != bytes.length) { return Err(MetaFault.TooLong); }
+    return Ok(SetTagsMeta { bucket: bucket, key: key, versionId: versionId, generation: generation, tags: tags });
 }
 
 /// The pairs of a metadata blob.

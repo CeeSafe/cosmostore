@@ -17,7 +17,7 @@ features, which makes a subset possible.
    - IAM, STS and tenants;
    - lifecycle and object lock;
    - versioning and delete markers;
-   - tagging, websites, Select, SNS and storage classes;
+   - tagging (until ADR-0017 built it), websites, Select, SNS and storage classes;
    - `fails_on_aws`, which is RGW-only behaviour.
 2. **The subset is what passes,** pinned by name in `tools/s3tests/subset.txt`: 218 tests at s3-tests commit
    `5b39871`. `tools/s3tests/run.sh` runs it against a fresh server and fails if any of them fails, the server logs

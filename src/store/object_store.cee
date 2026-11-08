@@ -30,6 +30,9 @@ struct StoreConfig {
     /// may complete (S3: 5 TiB). ADR-0009.
     minPartBytes: u64;
     maxUploadBytes: u64;
+    /// `maintain` aborts uploads started longer ago than this (0: never), so an abandoned upload does not keep its
+    /// parts forever (ADR-0017).
+    uploadExpiryMillis: u64;
 
     fn defaults() -> StoreConfig => StoreConfig {
         journal: JournalConfig.defaults(),
@@ -43,6 +46,7 @@ struct StoreConfig {
         reserveBytes: 268435456,
         minPartBytes: 5242880,
         maxUploadBytes: 5497558138880,
+        uploadExpiryMillis: 604800000, // 7 days
     };
 }
 
@@ -126,6 +130,8 @@ struct CompactStats {
 struct MaintenanceReport {
     checkpointed: bool;
     compaction: CompactStats;
+    /// Uploads aborted for their age.
+    uploadsExpired: u64;
 }
 
 /// A live inline version that compaction copies.
@@ -314,6 +320,30 @@ fn applyRecord(
             }
             rememberCompletion(state, borrow c, lsn)?;
             return applyPut(state, c.put, extents, c.parts, lsn, segment, offset, totalLen, meta.length, payloadLen);
+        }
+        RecordType.SetTags => {
+            // Like Relocate: it changes the version only if that is still the key's current one. Its record is never
+            // live: the index and every later checkpoint hold the tags.
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
+            let m = match (decodeSetTagsMeta(meta)) {
+                Ok(m) => m,
+                Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+            };
+            let tags = m.tags;
+            let generation = m.generation;
+            let versionId = m.versionId;
+            let key = IndexKey { bucket: m.bucket, key: m.key };
+            match (state.index.getMut(borrow key)) {
+                Some(v) => {
+                    if (v.lsn == generation && v.versionId[..] == versionId[..]) {
+                        v.metadata = match (metadataReplace(v.metadata.view(), TAGS_FIELD.bytes(), tags.view())) {
+                            Ok(b) => b,
+                            Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+                        };
+                    }
+                }
+                null => {}
+            }
         }
         RecordType.UploadCreate => {
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
@@ -878,6 +908,34 @@ struct ObjectStore {
     }
 
     fn bucketExists(borrow this, name: StringView) -> Result<bool, StoreError> => this.state.hasBucket(name.bytes());
+
+    /// Sets the current version's tags (URL-encoded; empty removes them), without a new version: its ETag, generation
+    /// and modification time stay (ADR-0017). One SetTags record, durable before this returns.
+    fn setTags(borrow mut this, bucket: StringView, key: StringView, tags: Slice<u8>) -> Result<void, StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+        var generation: u64 = 0;
+        var versionId = [0u8; 16];
+        match (this.state.index.get(borrow k)) {
+            Some(v) => {
+                generation = v.lsn;
+                versionId = v.versionId;
+                let next = match (metadataReplace(v.metadata.view(), TAGS_FIELD.bytes(), tags)) {
+                    Ok(b) => b,
+                    Err(_) => { return Err(StoreError.DataCorrupt); }
+                };
+                if (next.length > MAX_METADATA_BYTES) { return Err(StoreError.MetadataTooLarge); }
+            }
+            null => { return Err(StoreError.NoSuchKey); }
+        }
+        this.scratch.clear();
+        encodeSetTagsMeta(mut this.scratch, bucket.bytes(), key.bytes(), versionId, generation, tags)?;
+        let empty = [0u8; 1];
+        this.commitOne(RecordType.SetTags, empty[0..0])?;
+        return Ok();
+    }
 
     /// The bucket names, in byte order.
     fn listBuckets(borrow this) -> Result<Vector<Vector<u8>>, StoreError> {
@@ -1970,11 +2028,34 @@ struct ObjectStore {
         this.reapDeferred();
         this.reapAbandoned();
         this.pins.prune();
+        var expired: u64 = 0;
+        let expiry = this.config.uploadExpiryMillis;
+        let now = Clock.unixMillis();
+        if (expiry > 0 && now > truncate<i64>(expiry)) { expired = this.expireUploads(now - truncate<i64>(expiry))?; }
         var checkpointed = false;
         let every = this.config.checkpointEveryBytes;
         if (every > 0 && this.sinceCheckpoint >= every) { checkpointed = this.checkpoint()?; }
         let compaction = this.compact(this.config.compactMaxCopyBytes)?;
-        return Ok(MaintenanceReport { checkpointed: checkpointed, compaction: compaction });
+        return Ok(MaintenanceReport { checkpointed: checkpointed, compaction: compaction, uploadsExpired: expired });
+    }
+
+    /// Aborts every upload initiated before `cutoffMillis` (Unix milliseconds), each with its own UploadAbort record,
+    /// as AbortMultipartUpload would; returns how many.
+    fn expireUploads(borrow mut this, cutoffMillis: i64) -> Result<u64, StoreError> {
+        var old = Vector<[u8; 16]>.create();
+        for (i in 0..this.state.uploads.length()) {
+            if (this.state.uploads.valueAt(i).initiatedMillis < cutoffMillis) {
+                old.push(this.state.uploads.keyAt(i).id)?;
+            }
+        }
+        for (id in old.view()) {
+            this.checkWritable()?;
+            this.scratch.clear();
+            encodeUploadAbortMeta(mut this.scratch, id, Clock.unixMillis())?;
+            let empty = [0u8; 1];
+            this.commitOne(RecordType.UploadAbort, empty[0..0])?;
+        }
+        return Ok(old.length as u64);
     }
 
     // Statistics.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# The M3 end-to-end test (ADR-0008 to ADR-0015): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
+# The M3 end-to-end test (ADR-0008 to ADR-0017): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
 # against `cosmostore serve` on a fresh store. Prints one line per check; exit status 1 if any fails.
 #
 # usage: tools/s3_smoke.sh [COSMOSTORE] [PORT]     (defaults: out/cosmostore, 9311)
@@ -165,6 +165,10 @@ check "copy onto itself, REPLACE" "$(aws s3api head-object --bucket smoke --key 
 check "copy onto itself, COPY" "$(code s3api copy-object --bucket smoke --key c/copy1 --copy-source smoke/c/copy1)" InvalidRequest
 check "copy of a missing key" "$(code s3api copy-object --bucket smoke --key c/x --copy-source smoke/nope)" NoSuchKey
 check "copy-source-if-match wrong" "$(code s3api copy-object --bucket smoke --key c/x --copy-source smoke/c/copy1 --copy-source-if-match '"00000000000000000000000000000000"')" PreconditionFailed
+check "copy If-None-Match * onto an object" "$(code s3api copy-object --bucket smoke --key c/copy1 --copy-source smoke/a/small.txt --if-none-match '*')" PreconditionFailed
+check "copy If-Match wrong" "$(code s3api copy-object --bucket smoke --key c/copy1 --copy-source smoke/a/small.txt --if-match '"00000000000000000000000000000000"')" PreconditionFailed
+check "copy If-Match missing key" "$(code s3api copy-object --bucket smoke --key c/none --copy-source smoke/a/small.txt --if-match "$small_etag")" NoSuchKey
+check "copy If-None-Match * onto nothing" "$(aws s3api copy-object --bucket smoke --key c/fresh --copy-source smoke/a/small.txt --if-none-match '*' --query CopyObjectResult.ETag --output text)" "$small_etag"
 aws s3api put-object --bucket smoke --key "c/sp ace+ü.txt" --body small.txt > /dev/null 2>&1
 aws s3 cp "s3://smoke/c/sp ace+ü.txt" s3://smoke/c/enc.txt > /dev/null 2>&1
 aws s3api get-object --bucket smoke --key c/enc.txt o.txt > /dev/null 2>&1
@@ -240,8 +244,24 @@ check "bucket not empty" "$(code s3api delete-bucket --bucket smoke)" BucketNotE
 check "wrong secret" "$(AWS_SECRET_ACCESS_KEY=wrong code s3api list-buckets)" SignatureDoesNotMatch
 check "unknown key id" "$(AWS_ACCESS_KEY_ID=AKIAUNKNOWN code s3api list-buckets)" InvalidAccessKeyId
 check "anonymous" "$(code s3api list-buckets --no-sign-request)" AccessDenied
+# Tags (ADR-0017).
 check "no tags" "$(aws s3api get-object-tagging --bucket smoke --key a/small.txt --query 'length(TagSet)')" 0
-check "not implemented (put tags)" "$(code s3api put-object-tagging --bucket smoke --key a/small.txt --tagging 'TagSet=[{Key=a,Value=b}]')" NotImplemented
+aws s3api put-object --bucket smoke --key t/one --body small.txt --tagging 'team=blue&tier=gold%20plus' > /dev/null 2>&1
+check "tags at put" "$(aws s3api get-object-tagging --bucket smoke --key t/one --query 'TagSet[].[Key,Value]' --output text | tr '\t\n' '=;')" "team=blue;tier=gold plus;"
+check "tag count on HEAD" "$(aws s3api head-object --bucket smoke --key t/one --query TagCount)" 2
+etag_before=$(aws s3api head-object --bucket smoke --key t/one --query ETag --output text)
+aws s3api put-object-tagging --bucket smoke --key t/one --tagging 'TagSet=[{Key=state,Value=done}]' > /dev/null 2>&1
+check "put-object-tagging" "$(aws s3api get-object-tagging --bucket smoke --key t/one --query 'TagSet[0].Value' --output text)" done
+check "tags keep the version" "$(aws s3api head-object --bucket smoke --key t/one --query ETag --output text)" "$etag_before"
+aws s3api copy-object --bucket smoke --key t/copy --copy-source smoke/t/one > /dev/null 2>&1
+check "copy keeps tags" "$(aws s3api get-object-tagging --bucket smoke --key t/copy --query 'TagSet[0].Key' --output text)" state
+aws s3api copy-object --bucket smoke --key t/copy --copy-source smoke/t/one --tagging-directive REPLACE --tagging 'new=1' > /dev/null 2>&1
+check "copy REPLACE tags" "$(aws s3api get-object-tagging --bucket smoke --key t/copy --query 'TagSet[0].Key' --output text)" new
+aws s3api delete-object-tagging --bucket smoke --key t/one > /dev/null 2>&1
+check "delete-object-tagging" "$(aws s3api get-object-tagging --bucket smoke --key t/one --query 'length(TagSet)')" 0
+check "eleven tags" "$(code s3api put-object-tagging --bucket smoke --key t/one --tagging 'TagSet=[{Key=a,Value=1},{Key=b,Value=1},{Key=c,Value=1},{Key=d,Value=1},{Key=e,Value=1},{Key=f,Value=1},{Key=g,Value=1},{Key=h,Value=1},{Key=i,Value=1},{Key=j,Value=1},{Key=k,Value=1}]')" InvalidTag
+check "tags on a missing key" "$(code s3api put-object-tagging --bucket smoke --key t/none --tagging 'TagSet=[{Key=a,Value=1}]')" NoSuchKey
+aws s3 rm --recursive s3://smoke/t/ > /dev/null 2>&1
 
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1

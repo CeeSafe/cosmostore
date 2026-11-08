@@ -811,3 +811,34 @@ Every version keeps its checksum and, if it is multipart, its part layout: an ex
   - expiring abandoned uploads;
   - certificate reload;
   - the Java and .NET SDKs.
+
+### 8 Nov 2026: M3 slice 10, upkeep, upload expiry, tags, copy conditions (ADR-0017)
+
+- **The server never ran its upkeep.** `cosmostore serve` did not call `maintain`, so a long-running server never
+  checkpointed or compacted: its journal and its recovery time grew without bound.
+  - It now runs `maintain` every 10 s, raced beside the HTTP server. The store's mutex is shared through an `Arc`.
+  - By hand: after 72 MB of small objects, the server checkpointed on its own within 7 s, and fsck was clean after
+    a SIGKILL.
+- **Upload expiry:** `maintain` aborts uploads older than `uploadExpiryMillis` (7 days), with ordinary UploadAbort
+  records.
+- **Object tags:**
+  - they live in the version's metadata as the canonical, key-sorted `x-amz-tagging` field, so there is no
+    checkpoint change;
+  - one new record, `SetTags` (code 13), changes them in place, if the version is still current, keeping the ETag
+    and generation;
+  - S3's limits are enforced; GetObjectTagging, PutObjectTagging and DeleteObjectTagging work, and so do
+    `x-amz-tagging-directive` and `x-amz-tagging-count`;
+  - the multipart fault sweeps set tags.
+- **CopyObject destination conditions:** If-Match and If-None-Match, through PUT's resolver.
+- **Tests:**
+  - `ceesafec test`: 95;
+  - smoke 115, up from 103;
+  - TLS smoke;
+  - rclone, boto3, Go and JS;
+  - the s3-tests subset of 246, up from 235, now with the tagging marker included. 11 tagging tests pass, and none
+    was lost.
+- **M3 left:**
+  - POST policy;
+  - certificate reload, and configuring the upkeep from the command line;
+  - bucket tags and lifecycle rules (beyond upload expiry);
+  - the Java and .NET SDKs.

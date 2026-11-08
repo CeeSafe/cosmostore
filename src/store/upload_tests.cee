@@ -376,3 +376,32 @@ fn completeRetryAndConditions() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+@test
+fn oldUploadsExpire() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("upload-expiry");
+    var config = uploadConfig();
+    config.uploadExpiryMillis = StoreConfig.defaults().uploadExpiryMillis;
+    {
+        var s = ObjectStore.open(dir.view(), config)!;
+        s.createBucket("bkt")!;
+        let id = s.createUpload("bkt", "k", "")!;
+        let _ = sendPart(mut s, "bkt", "k", id, 1, patterned(70000, 1).view())!;
+        Check.isTrue(extentFiles(dir.view()) > 0, "the part's extents")?;
+        // A cutoff before the upload began expires nothing; one after it expires the upload and frees its parts.
+        Check.equalU64(0, s.expireUploads(Clock.unixMillis() - 3600000)!)?;
+        Check.equalU64(1, s.uploadCount() as u64)?;
+        Check.equalU64(1, s.expireUploads(Clock.unixMillis() + 1)!)?;
+        Check.equalU64(0, s.uploadCount() as u64)?;
+        Check.equalU64(0, extentFiles(dir.view()))?;
+        // maintain uses the configured age, 7 days by default, so a fresh upload stays.
+        let fresh = s.createUpload("bkt", "k2", "")!;
+        let _ = fresh;
+        Check.equalU64(0, s.maintain()!.uploadsExpired)?;
+    }
+    // The expiry is an abort record like any other: it survives a restart.
+    let s = ObjectStore.open(dir.view(), uploadConfig())!;
+    Check.equalU64(1, s.uploadCount() as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}

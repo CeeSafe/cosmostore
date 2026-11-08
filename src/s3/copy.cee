@@ -260,10 +260,9 @@ async fn sendCopyResult(
 }
 
 async fn copyObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
-    // Conditions on the destination are not built yet.
-    if (headerOf(req, "if-match").isSome() || headerOf(req, "if-none-match").isSome()) {
-        return Err(S3Fail.Code(S3Code.NotImplemented));
-    }
+    // If-Match / If-None-Match on the destination, checked with the commit as for PUT (ADR-0017).
+    var etags = Vector<u8>.create();
+    let condition = putConditionOf(req, mut etags)?;
     let src = copySourceOf(req)?;
     let replace = match (headerOf(req, "x-amz-metadata-directive")) {
         Some(t) => {
@@ -290,6 +289,31 @@ async fn copyObject(app: borrow S3App, req: borrow S3Request, exchange: borrow m
         appendUtf8(mut contentType, plan.source.contentType.view())?;
         metadata.extend(plan.source.metadata.view())?;
     }
+    // Tags follow `x-amz-tagging-directive`, apart from the metadata directive: COPY (the default) keeps the source's,
+    // REPLACE takes `x-amz-tagging` (ADR-0017).
+    let tagsReplaced = match (headerOf(req, "x-amz-tagging-directive")) {
+        Some(t) => {
+            if (t == "REPLACE".bytes()) {
+                true
+            } else if (t == "COPY".bytes()) {
+                false
+            } else {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
+        }
+        null => false,
+    };
+    let tags = if (tagsReplaced) requestTags(req)? else match (metadataValue(
+        plan.source.metadata.view(),
+        TAGS_FIELD.bytes(),
+    )) {
+        Ok(t) => t,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    metadata = match (metadataReplace(metadata.view(), TAGS_FIELD.bytes(), tags.view())) {
+        Ok(b) => b,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
     let copied = await runCopy(plan)?;
     var extras = Vector<u8>.create();
     singlePartExtras(copied.algorithm, copied.checksum.view(), mut extras)?;
@@ -301,8 +325,8 @@ async fn copyObject(app: borrow S3App, req: borrow S3Request, exchange: borrow m
         metadata.view(),
         extras.view(),
         borrow copied.finished,
-        PutIf.None,
-        "".bytes(),
+        condition,
+        etags.view(),
     )?;
     return await sendCopyResult(exchange, "CopyObjectResult", borrow outcome.md5, outcome.extras.view());
 }

@@ -474,3 +474,51 @@ fn virtualHostBuckets() -> Result<void, TestFailure> {
     Check.equalU64(0, out.length as u64)?; // no domain: path-style only
     return Ok();
 }
+
+fn tagRequest(text: StringView) -> Result<Vector<u8>, S3Fail> {
+    let tags = tagsOfQuery(text.bytes())?;
+    var out = Vector<u8>.create();
+    canonicalTags(borrow tags, mut out)?;
+    return Ok(out);
+}
+
+@test
+fn tagsParseAndCanonicalise() -> Result<void, TestFailure> {
+    // A header's form, with `+` and escapes, comes out canonical: escaped alike, and sorted by key, as S3 returns tags.
+    let c = tagRequest("team=blue+green&k%2Fv=a%26b&empty=")!;
+    Check.equalBytes("empty=&k%2Fv=a%26b&team=blue%20green".bytes(), c.view())?;
+    Check.equalU64(3, tagCount(c.view()))?;
+    let again = tagsOfQuery(c.view())!;
+    Check.equalBytes("a&b".bytes(), again[1].value.view())?;
+    Check.equalU64(0, tagCount("".bytes()))?;
+    // S3's limits.
+    var eleven = Vector<u8>.create();
+    for (i in 0..11) {
+        if (i > 0) { eleven.push('&')!; }
+        eleven.push('a' + truncate<u8>(i))!;
+        eleven.extend("=1".bytes())!;
+    }
+    let refused = [StringView.fromUtf8(eleven.view())!, "a=1&a=2", "=nokey"];
+    for (r in refused) {
+        match (tagRequest(r)) {
+            Err(S3Fail.Code(S3Code.InvalidTag)) => {}
+            _ => { return Check.fail("a tag set S3 refuses"); }
+        }
+    }
+    var longKey = Vector<u8>.create();
+    longKey.resize(129, 'k')!;
+    longKey.extend("=v".bytes())!;
+    match (tagRequest(StringView.fromUtf8(longKey.view())!)) {
+        Err(S3Fail.Code(S3Code.InvalidTag)) => {}
+        _ => { return Check.fail("a 129-character key"); }
+    }
+    // The XML of PutObjectTagging keeps spaces and decodes entities.
+    let xml =
+        "<Tagging><TagSet><Tag><Key> a b </Key><Value>x &amp; y</Value></Tag><Tag><Key>n</Key><Value></Value></Tag></TagSet></Tagging>";
+    let fromXml = tagsOfXml(xml.bytes())!;
+    Check.equalU64(2, fromXml.length as u64)?;
+    Check.equalBytes(" a b ".bytes(), fromXml[0].key.view())?;
+    Check.equalBytes("x & y".bytes(), fromXml[0].value.view())?;
+    Check.equalU64(0, fromXml[1].value.length as u64)?;
+    return Ok();
+}

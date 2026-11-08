@@ -105,6 +105,41 @@ fn listenAddress(text: StringView) -> SocketAddress? {
     return SocketAddresses.parse(text);
 }
 
+/// How often the server runs the store's upkeep (ADR-0017).
+const MAINTAIN_EVERY_MS: u64 = 10000;
+
+/// The store's upkeep, forever, every MAINTAIN_EVERY_MS: checkpoints when due, compaction, reaping, and expiring old
+/// uploads (`ObjectStore.maintain`). It holds the store's lock while it runs, so requests wait for it. A failure is
+/// logged and tried again next time; the loop ends only when it is cancelled.
+async fn maintainForever(store: borrow Arc<AsyncMutex<ObjectStore>>) -> Result<ServerReport, NetError> {
+    while (true) {
+        match (await Timer.sleep(MAINTAIN_EVERY_MS)) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+        let outcome = await maintainOnce(store);
+        match (outcome) {
+            Ok() => {}
+            Err(e) => {
+                let _ = await AsyncConsole.writeError("cosmostore: maintenance failed: ");
+                let _ = await AsyncConsole.writeError(describe(e));
+                let _ = await AsyncConsole.writeError("\n");
+            }
+        }
+    }
+    return Err(NetError.Closed);
+}
+
+async fn maintainOnce(store: borrow Arc<AsyncMutex<ObjectStore>>) -> Result<void, StoreError> {
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Ok(); } // cancelled: the server is stopping
+    };
+    let s = guard.data();
+    let _ = await Async.blocking(() => s.maintain())?;
+    return Ok();
+}
+
 fn textOf(s: StringView) -> String {
     var t = String.create();
     let _ = t.append(s);
@@ -133,6 +168,7 @@ async fn serveOn(
     address: SocketAddress,
     acceptor: borrow dyn Acceptor,
     tls: bool,
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
 ) -> Result<ServerReport, NetError> {
     let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
     let listener = Listener.bindWith(address, options)?;
@@ -144,7 +180,12 @@ async fn serveOn(
         Err(_) => Vector<u8>.create(),
     };
     let _ = await AsyncConsole.writeError(StringView.fromUtf8(notice.view()) ?? "");
-    return await server.run(listener, acceptor, ConnectionLimits.defaults(), drain);
+    // The server, and beside it the store's upkeep; if the server stops, the upkeep is cancelled.
+    let raced = await Async.race(
+        async move () => await server.run(listener, acceptor, ConnectionLimits.defaults(), drain),
+        async () => await maintainForever(store),
+    );
+    return Ok(raced?.value);
 }
 
 /// `cosmostore: serving S3 on <address>:<port>`, a line.
@@ -234,7 +275,12 @@ fn serve() -> i32 {
         Ok(m) => m,
         Err(_) => { die("out of memory"); }
     };
-    let app = S3App { store: locked, credentials: credentials, requests: AtomicU64.create(0), domain: domain };
+    let shared = match (Arc<AsyncMutex<ObjectStore>>.create(locked)) {
+        Ok(a) => a,
+        Err(_) => { die("out of memory"); }
+    };
+    let maintenance = shared.clone();
+    let app = S3App { store: shared, credentials: credentials, requests: AtomicU64.create(0), domain: domain };
     let server = match (s3Server(app)) {
         Ok(s) => s,
         Err(_) => { die("cannot build the routes"); }
@@ -245,11 +291,11 @@ fn serve() -> i32 {
                 Ok(a) => a,
                 Err(_) => { die("TLS: the acceptor could not be made"); }
             };
-            Async.run(serveOn(server, address, borrow acceptor, true))
+            Async.run(serveOn(server, address, borrow acceptor, true, borrow maintenance))
         }
         null => {
             let plain = PlainAcceptor {};
-            Async.run(serveOn(server, address, borrow plain, false))
+            Async.run(serveOn(server, address, borrow plain, false, borrow maintenance))
         }
     };
     match (result) {

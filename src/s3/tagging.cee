@@ -1,0 +1,216 @@
+// Object tags (ADR-0017): kept in the version's metadata as the `x-amz-tagging` field, in one canonical URL-encoded
+// form, `k1=v1&k2=v2`. Set at PUT, CreateMultipartUpload and CopyObject (`x-amz-tagging`, `x-amz-tagging-directive`),
+// and in place by PutObjectTagging and DeleteObjectTagging; read by GetObjectTagging and counted on GET and HEAD.
+import web_core;
+import web_http;
+import web_server;
+
+const MAX_TAGS: usize = 10;
+const MAX_TAG_KEY_CHARS: usize = 128;
+const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// One tag, decoded.
+struct Tag {
+    key: Vector<u8>;
+    value: Vector<u8>;
+}
+
+/// The characters of UTF-8 text (bytes that do not continue one).
+fn utf8Chars(bytes: Slice<u8>) -> usize {
+    var n: usize = 0;
+    for (b in bytes) {
+        if ((b & 0xC0) != 0x80) { n += 1; }
+    }
+    return n;
+}
+
+/// The canonical form of a tag set, after S3's checks: at most 10 tags, keys unique, 1 to 128 characters, values at
+/// most 256, all UTF-8 (InvalidTag otherwise). Sorted by key, as S3 returns a tag set.
+fn canonicalTags(given: borrow Vector<Tag>, out: borrow mut Vector<u8>) -> Result<void, S3Fail> {
+    if (given.length > MAX_TAGS) { return Err(S3Fail.Code(S3Code.InvalidTag)); }
+    var tags = Vector<Tag>.create();
+    for (i in 0..given.length) {
+        tags.push(Tag { key: copyBytes(given[i].key.view())?, value: copyBytes(given[i].value.view())? })?;
+    }
+    tags.viewMut().sortBy((a, b) => compareBytes(a.key.view(), b.key.view()));
+    for (i in 0..tags.length) {
+        let k = tags[i].key.view();
+        let v = tags[i].value.view();
+        if (StringView.fromUtf8(k).isNull() || StringView.fromUtf8(v).isNull()) {
+            return Err(S3Fail.Code(S3Code.InvalidTag));
+        }
+        if (k.length == 0 || utf8Chars(k) > MAX_TAG_KEY_CHARS || utf8Chars(v) > MAX_TAG_VALUE_CHARS) {
+            return Err(S3Fail.Code(S3Code.InvalidTag));
+        }
+        for (j in 0..i) {
+            if (tags[j].key.view() == k) { return Err(S3Fail.Code(S3Code.InvalidTag)); }
+        }
+        if (i > 0) { out.push('&')?; }
+        appendUriEncoded(out, k, false)?;
+        out.push('=')?;
+        appendUriEncoded(out, v, false)?;
+    }
+    return Ok();
+}
+
+/// The tags of a URL-encoded `k1=v1&k2=v2` text (an `x-amz-tagging` field, or a stored one).
+fn tagsOfQuery(text: Slice<u8>) -> Result<Vector<Tag>, S3Fail> {
+    var tags = Vector<Tag>.create();
+    var at: usize = 0;
+    while (at < text.length) {
+        let end = pieceEnd(text, at, '&');
+        let piece = text[at..end];
+        at = end + 1;
+        if (piece.length == 0) { continue; }
+        let eq = pieceEnd(piece, 0, '=');
+        var tag = Tag { key: Vector<u8>.create(), value: Vector<u8>.create() };
+        if (!percentDecodeInto(mut tag.key, piece[0..eq], true)?) { return Err(S3Fail.Code(S3Code.InvalidTag)); }
+        if (eq < piece.length && !percentDecodeInto(mut tag.value, piece[eq + 1..], true)?) {
+            return Err(S3Fail.Code(S3Code.InvalidTag));
+        }
+        tags.push(tag)?;
+    }
+    return Ok(tags);
+}
+
+/// The canonical tags of the request's `x-amz-tagging`, empty without one.
+fn requestTags(req: borrow S3Request) -> Result<Vector<u8>, S3Fail> {
+    var out = Vector<u8>.create();
+    match (headerOf(req, "x-amz-tagging")) {
+        Some(t) => {
+            let tags = tagsOfQuery(trimSpaces(t))?;
+            canonicalTags(borrow tags, mut out)?;
+        }
+        null => {}
+    }
+    return Ok(out);
+}
+
+/// `metadata` with the request's tags in it (PUT, CreateMultipartUpload).
+fn withRequestTags(req: borrow S3Request, metadata: Vector<u8>) -> Result<Vector<u8>, S3Fail> {
+    let tags = requestTags(req)?;
+    if (tags.length == 0) { return Ok(metadata); }
+    return match (metadataReplace(metadata.view(), TAGS_FIELD.bytes(), tags.view())) {
+        Ok(b) => Ok(b),
+        Err(_) => Err(S3Fail.Code(S3Code.InternalError)),
+    };
+}
+
+/// How many tags a canonical tag text holds.
+fn tagCount(canonical: Slice<u8>) -> u64 {
+    if (canonical.length == 0) { return 0; }
+    var n: u64 = 1;
+    for (b in canonical) {
+        if (b == '&') { n += 1; }
+    }
+    return n;
+}
+
+/// The tags of a Tagging XML body: `<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag>…</TagSet></Tagging>`.
+fn tagsOfXml(xml: Slice<u8>) -> Result<Vector<Tag>, S3Fail> {
+    if (findBytes(xml, "<Tagging".bytes(), 0).isNull() || findBytes(xml, "<TagSet".bytes(), 0).isNull()) {
+        return Err(S3Fail.Code(S3Code.MalformedXML));
+    }
+    var tags = Vector<Tag>.create();
+    var at: usize = 0;
+    while (true) {
+        let start = match (findBytes(xml, "<Tag>".bytes(), at)) {
+            Some(s) => s + 5,
+            null => { break; }
+        };
+        let end = match (findBytes(xml, "</Tag>".bytes(), start)) {
+            Some(e) => e,
+            null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        };
+        let inner = xml[start..end];
+        var tag = Tag { key: Vector<u8>.create(), value: Vector<u8>.create() };
+        // Keys and values keep their spaces, so they are found by hand rather than with elementText.
+        if (!rawElement(inner, "Key", mut tag.key)?) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        let _ = rawElement(inner, "Value", mut tag.value)?;
+        tags.push(tag)?;
+        at = end + 6;
+        if (tags.length > MAX_TAGS) { return Err(S3Fail.Code(S3Code.InvalidTag)); }
+    }
+    return Ok(tags);
+}
+
+/// The XML-unescaped text of the first `<name>…</name>` in `xml`, untrimmed; false if there is none.
+fn rawElement(xml: Slice<u8>, name: StringView, out: borrow mut Vector<u8>) -> Result<bool, S3Fail> {
+    var open = Vector<u8>.create();
+    open.push('<')?;
+    open.extend(name.bytes())?;
+    open.push('>')?;
+    var close = Vector<u8>.create();
+    close.extend("</".bytes())?;
+    close.extend(name.bytes())?;
+    close.push('>')?;
+    let start = match (findBytes(xml, open.view(), 0)) {
+        Some(s) => s + open.length,
+        null => { return Ok(false); }
+    };
+    let end = match (findBytes(xml, close.view(), start)) {
+        Some(e) => e,
+        null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    };
+    if (!xmlUnescape(xml[start..end], out)?) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    return Ok(true);
+}
+
+async fn getObjectTagging(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let info = await objectInfo(app, req.bucket.view(), req.key.view())?;
+    let stored = match (metadataValue(info.metadata.view(), TAGS_FIELD.bytes())) {
+        Ok(t) => t,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    let tags = tagsOfQuery(stored.view())?;
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "Tagging")?;
+    body.extend("<TagSet>".bytes())?;
+    for (i in 0..tags.length) {
+        body.extend("<Tag>".bytes())?;
+        xmlElement(mut body, "Key", tags[i].key.view(), false)?;
+        xmlElement(mut body, "Value", tags[i].value.view(), false)?;
+        body.extend("</Tag>".bytes())?;
+    }
+    body.extend("</TagSet></Tagging>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn putObjectTagging(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    verifySmallBody(req, xml.view(), true)?;
+    let tags = tagsOfXml(xml.view())?;
+    var canonical = Vector<u8>.create();
+    canonicalTags(borrow tags, mut canonical)?;
+    await storeSetTags(app, req.bucket.view(), req.key.view(), canonical.view())?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn deleteObjectTagging(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    await storeSetTags(app, req.bucket.view(), req.key.view(), "".bytes())?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}
+
+async fn storeSetTags(app: borrow S3App, bucket: StringView, key: StringView, tags: Slice<u8>) -> Result<void, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => store.setTags(bucket, key, tags))) {
+        Ok() => Ok(),
+        Err(e) => Err(storeFail(e, key.length)),
+    };
+}

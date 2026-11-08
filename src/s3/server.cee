@@ -13,7 +13,8 @@ const BODY_STEP: usize = 1048576;
 const S3_XMLNS: StringView = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 struct S3App {
-    store: AsyncMutex<ObjectStore>;
+    /// Shared with the maintenance task (ADR-0017).
+    store: Arc<AsyncMutex<ObjectStore>>;
     credentials: Vector<Credential>;
     requests: AtomicU64;
     /// With virtual-host addressing, the domain under which `<bucket>.<domain>` names a bucket (empty: path-style
@@ -25,7 +26,7 @@ fn statusOf(code: u16) -> StatusCode => StatusCode.of(code) ?? Status.internalSe
 
 /// Takes the store's lock; the guard releases it when dropped.
 async fn lockStore(app: borrow S3App) -> Result<AsyncMutexGuard<ObjectStore>, S3Fail> {
-    match (await app.store.lock()) {
+    match (await app.store.get().lock()) {
         Ok(g) => { return Ok(g); }
         Err(_) => { return Err(S3Fail.Code(S3Code.ServiceUnavailable)); }
     }
@@ -187,6 +188,13 @@ async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mu
         return Err(S3Fail.Code(S3Code.MethodNotAllowed));
     }
     if (req.key.length > MAX_KEY_BYTES) { return Err(S3Fail.Code(S3Code.KeyTooLongError)); }
+    if (req.hasParam("tagging")) {
+        if (!req.onlyParams("tagging,versionId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        if (isMethod(m, Method.Get)) { return await getObjectTagging(app, borrow req, exchange); }
+        if (isMethod(m, Method.Put)) { return await putObjectTagging(app, borrow req, auth, exchange); }
+        if (isMethod(m, Method.Delete)) { return await deleteObjectTagging(app, borrow req, exchange); }
+        return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+    }
     if (isMethod(m, Method.Put)) {
         let copying = headerOf(borrow req, "x-amz-copy-source").isSome();
         if (req.hasParam("uploadId") || req.hasParam("partNumber")) {
@@ -208,10 +216,6 @@ async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mu
     if (isMethod(m, Method.Get) && req.hasParam("attributes")) {
         if (!req.onlyParams("attributes,versionId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
         return await getObjectAttributes(app, borrow req, exchange);
-    }
-    if (isMethod(m, Method.Get) && req.hasParam("tagging")) {
-        if (!req.onlyParams("tagging,versionId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-        return await getObjectTagging(app, borrow req, exchange);
     }
     if (isMethod(m, Method.Get) && req.hasParam("uploadId")) {
         if (!req.onlyParams("uploadId,max-parts,part-number-marker,encoding-type")) {
@@ -593,21 +597,6 @@ async fn deleteObject(app: borrow S3App, req: borrow S3Request, exchange: borrow
     }
     await exchange.send(Status.noContent(), "".bytes())?;
     return Ok();
-}
-
-/// GetObjectTagging: tags cannot be set yet (PutObjectTagging is NotImplemented), so every object's set is empty. The
-/// AWS CLI reads it before a multipart copy.
-async fn getObjectTagging(
-    app: borrow S3App,
-    req: borrow S3Request,
-    exchange: borrow mut Exchange,
-) -> Result<void, S3Fail> {
-    let _ = await objectInfo(app, req.bucket.view(), req.key.view())?;
-    var body = Vector<u8>.create();
-    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging xmlns=\"".bytes())?;
-    body.extend(S3_XMLNS.bytes())?;
-    body.extend("\"><TagSet></TagSet></Tagging>".bytes())?;
-    return await sendXml(exchange, borrow body);
 }
 
 async fn objectInfo(app: borrow S3App, bucket: StringView, key: StringView) -> Result<ObjectInfo, S3Fail> {
