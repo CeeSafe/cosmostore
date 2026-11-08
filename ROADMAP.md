@@ -914,3 +914,21 @@ Browser form uploads with a SigV4 POST policy.
   - `ceesafec test`: 101; the SDK matrix and TLS smoke pass.
 - **M3 left:**
   - the Java and .NET SDKs (no Maven, Gradle or .NET SDK on this machine). Everything else on M3's list is done.
+
+### 9 Nov 2026: M3 slice 14, the Java SDK in the matrix
+
+- **`tools/sdk/java.sh`:** the AWS SDK for Java v2 (2.57.11, with aws-crt), 25 checks, all passing. They cover:
+  - every checksum algorithm, and the checksum returned on GET;
+  - typed errors and paginators;
+  - the async multipart client (upload, download and copy of 13 MiB);
+  - the presigner, through the JDK's HTTP client;
+  - virtual hosts, tags and batch delete.
+- **Maven** ran from the scratchpad (3.9.11, its SHA-512 checked against Apache's), with its repository there too.
+  No system install was needed.
+- **What the Java SDK showed:**
+  - it sends a CRC32 with each PUT by default;
+  - it names HEAD errors (NoSuchKey, NoSuchBucket) itself, from the status;
+  - like boto3, it needs the CRT for CRC64NVME.
+  - The server needed no change.
+- **M3 left:** the .NET SDK. Downloading its tarball into the scratchpad was refused by this session's permission
+  check, so it waits for the user.

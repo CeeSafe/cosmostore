@@ -61,7 +61,9 @@ All pass, each followed by a clean fsck, as does `tools/s3_smoke.sh` (96 checks)
 
 ## Not yet
 
-- **The Java SDK v2:** this machine has no Maven or Gradle to resolve it.
+- **The Java SDK v2:** run since slice 14, `tools/sdk/java.sh` (25 checks). Maven ran from the scratchpad, and its
+  tarball was checked against Apache's SHA-512. The checks cover checksums, typed errors, paginators, the async
+  multipart client (upload, download and copy), the presigner, virtual hosts, tags and batch delete.
 - **The .NET SDK:** no .NET SDK is installed.
 - **The Ceph s3-tests subset.**
 - **Response checksums:** the Go SDK notes "Response has no supported checksum", and every client accepts that.
