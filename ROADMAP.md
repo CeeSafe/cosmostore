@@ -223,7 +223,7 @@ deadlocks. **Passed** (7 Nov 2026: 186 SIGKILLs, used/live at most 119%, recover
   slice 4, ADR-0011).
 - SigV4 header/query auth, presigned URLs, **aws-chunked and trailing checksums** (#4),
   and POST policy. Header auth, aws-chunked and trailing checksums **done** (slice 1); query auth and presigned
-  URLs **done** (slice 4, ADR-0011). POST policy left.
+  URLs **done** (slice 4, ADR-0011); POST policy **done** (slice 11, ADR-0018).
 - Bucket CRUD, ListBuckets, GetBucketLocation. **Done** (slice 1).
 - PUT/GET/HEAD/DELETE, DeleteObjects, CopyObject, Range, conditional GET/PUT via CAS. **Done** (slices 1 and 3).
 - ListObjects v1/v2 with delimiter, continuation-token, start-after and encoding-type. **Done** (slice 1).
@@ -839,6 +839,33 @@ Every version keeps its checksum and, if it is multipart, its part layout: an ex
     was lost.
 - **M3 left:**
   - POST policy;
+  - certificate reload, and configuring the upkeep from the command line;
+  - bucket tags and lifecycle rules (beyond upload expiry);
+  - the Java and .NET SDKs.
+
+### 9 Nov 2026: M3 slice 11, POST object (ADR-0018)
+
+Browser form uploads with a SigV4 POST policy.
+- **Streaming:** a POST to a bucket whose body is `multipart/form-data` is read by a streaming form reader. Fields
+  arrive whole, and the file streams into a writer as a PUT body does. A 100 MB POST took 0.85 s, and server memory
+  stayed at 6 to 8 MB.
+- **Checks:**
+  - the policy (base64 JSON) is signed with the credential's signing key;
+  - expiration, `eq`, `starts-with` and `content-length-range` are enforced;
+  - every field must be covered; `${filename}` is replaced in the key;
+  - `success_action_status` and `success_action_redirect` are honoured;
+  - metadata and tagging fields are stored.
+- **SigV2 forms** get the SigV2 refusal. Every s3-tests POST test signs with SigV2, so they pass or fail on that
+  refusal, not on POST object. The subset leaves them all out: 238, down from 246, the 8 removed having passed only
+  because form POSTs used to fail header auth. Nothing else was lost.
+- **Tests:**
+  - the form reader split at every byte;
+  - policy parsing and checks;
+  - boto3 `generate_presigned_post` (9 checks: 204, 201, redirect, and five refusals);
+  - JS `createPresignedPost` (3 checks);
+  - `ceesafec test`: 97;
+  - smoke 115, TLS smoke, the SDK matrix, and the s3-tests subset of 238 all pass.
+- **M3 left:**
   - certificate reload, and configuring the upkeep from the command line;
   - bucket tags and lifecycle rules (beyond upload expiry);
   - the Java and .NET SDKs.

@@ -1,5 +1,6 @@
 // The AWS SDK for JavaScript v3 against `cosmostore serve` (M3 SDK matrix). Run by tools/sdk/js.sh, which starts
-// the server, sets AWS_ENDPOINT_URL and the credentials, and points NODE_PATH at the installed SDK.
+// the server and sets AWS_ENDPOINT_URL and the credentials; the SDK (client-s3, lib-storage, s3-request-presigner,
+// s3-presigned-post) is installed in JS_SDK_DIR.
 import { createHash, randomBytes } from "node:crypto";
 import {
   S3Client, CreateBucketCommand, PutObjectCommand, GetObjectCommand, HeadObjectCommand, CopyObjectCommand,
@@ -7,6 +8,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
 
 const endpoint = process.env.AWS_ENDPOINT_URL;
 let failed = false;
@@ -65,6 +67,22 @@ const plain = new S3Client({ endpoint, forcePathStyle: true, region: "us-east-1"
 const putUrl = await getSignedUrl(plain, new PutObjectCommand({ Bucket, Key: "p/put" }), { expiresIn: 60 });
 check("presigned PUT", (await fetch(putUrl, { method: "PUT", body: "presigned" })).status, 200);
 check("presigned PUT stored", (await bytes((await s3.send(new GetObjectCommand({ Bucket, Key: "p/put" }))).Body)).toString(), "presigned");
+
+// POST object with a SigV4 policy (ADR-0018), as a browser form sends it.
+const post = await createPresignedPost(s3, {
+  Bucket, Key: "post/${filename}", Expires: 60,
+  Conditions: [["starts-with", "$key", "post/"], ["content-length-range", 1, 1024]],
+  Fields: { "Content-Type": "text/plain" },
+});
+const form = new FormData();
+for (const [k, val] of Object.entries(post.fields)) form.append(k, val);
+form.append("file", new Blob(["from a form"], { type: "text/plain" }), "form.txt");
+check("presigned POST", (await fetch(post.url, { method: "POST", body: form })).status, 204);
+check("presigned POST stored", (await bytes((await s3.send(new GetObjectCommand({ Bucket, Key: "post/form.txt" }))).Body)).toString(), "from a form");
+const tooBig = new FormData();
+for (const [k, val] of Object.entries(post.fields)) tooBig.append(k, val);
+tooBig.append("file", new Blob(["x".repeat(2000)]), "big.txt");
+check("presigned POST too large", (await fetch(post.url, { method: "POST", body: tooBig })).status, 400);
 
 const v = client(false);
 await v.send(new PutObjectCommand({ Bucket, Key: "v/hosted", Body: "virtual" }));

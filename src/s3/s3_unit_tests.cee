@@ -522,3 +522,160 @@ fn tagsParseAndCanonicalise() -> Result<void, TestFailure> {
     Check.equalU64(0, fromXml[1].value.length as u64)?;
     return Ok();
 }
+
+/// A form with two fields, a file whose bytes include CRLFs and a near-boundary, and a field after the file.
+fn sampleForm(file: Slice<u8>) -> Vector<u8> {
+    var f = Vector<u8>.create();
+    f.extend(
+        "preamble\r\n--XyZ\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nuploads/${filename}\r\n".bytes(),
+    )!;
+    f.extend("--XyZ\r\nContent-Disposition: form-data; name=\"Content-Type\"\r\n\r\ntext/plain\r\n".bytes())!;
+    f.extend("--XyZ\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a \\\"b\\\".txt\"\r\n".bytes())!;
+    f.extend("Content-Type: text/plain\r\n\r\n".bytes())!;
+    f.extend(file)!;
+    f.extend("\r\n--XyZ\r\nContent-Disposition: form-data; name=\"after\"\r\n\r\nignored\r\n--XyZ--\r\n".bytes())!;
+    return f;
+}
+
+@test
+fn formReaderSplitAtEveryByte() -> Result<void, TestFailure> {
+    var file = Vector<u8>.create();
+    // Near-misses only: a sender picks a boundary that its content never has after a CRLF.
+    file.extend("line one --XyZ inline\r\n--XyQ\r\n--Xy".bytes())!;
+    for (i in 0..300) { file.push(truncate<u8>(i))!; }
+    let form = sampleForm(file.view());
+    for (cut in 0..form.length + 1) {
+        var r = FormReader.create("XyZ".bytes())!;
+        var out = Vector<u8>.create();
+        var got = Vector<u8>.create();
+        var fields: u32 = 0;
+        var key = Vector<u8>.create();
+        var fileName = Vector<u8>.create();
+        var fed: usize = 0;
+        var done = false;
+        while (!done) {
+            match (r.step(mut out)!) {
+                FormEvent.More => {
+                    // First the bytes up to the cut, then the rest at once.
+                    let next = if (fed < cut) cut else form.length;
+                    if (fed == form.length) { return Check.fail("the form ended early"); }
+                    r.feed(form.view()[fed..next])!;
+                    fed = next;
+                }
+                FormEvent.Field => {
+                    fields += 1;
+                    if (r.name.view() == "key".bytes()) { key.extend(r.value.view())!; }
+                }
+                FormEvent.FileStart => { fileName.extend(r.fileName.view())!; }
+                FormEvent.FileData => { got.extend(out.view())!; }
+                FormEvent.FileEnd => {}
+                FormEvent.End => { done = true; }
+                FormEvent.Malformed => { return Check.fail("a well-formed form"); }
+            }
+        }
+        Check.equalU64(3, fields as u64)?;
+        Check.equalBytes("uploads/${filename}".bytes(), key.view())?;
+        Check.equalBytes("a \"b\".txt".bytes(), fileName.view())?;
+        Check.equalBytes(file.view(), got.view())?;
+    }
+    var boundary = Vector<u8>.create();
+    Check.isTrue(formBoundary("multipart/form-data; boundary=\"ab;c\"".bytes(), mut boundary)!, "a quoted boundary")?;
+    Check.equalBytes("ab;c".bytes(), boundary.view())?;
+    boundary.clear();
+    Check.isTrue(!formBoundary("text/plain; boundary=x".bytes(), mut boundary)!, "not a form")?;
+    return Ok();
+}
+
+fn field(name: StringView, value: StringView) -> FormField =>
+    FormField { name: copyBytes(name.bytes())!, value: copyBytes(value.bytes())! };
+
+@test
+fn postPolicyRules() -> Result<void, TestFailure> {
+    let json = """
+        {"expiration": "2030-01-01T00:00:00.000Z",
+         "conditions": [
+           {"bucket": "bkt"},
+           ["starts-with", "$key", "uploads/"],
+           ["eq", "$Content-Type", "text/plain"],
+           ["content-length-range", 1, 1024],
+           {"x-amz-credential": "AK/20261108/us-east-1/s3/aws4_request"},
+           ["starts-with", "$x-amz-meta-note", ""],
+           {"x-amz-algorithm": "AWS4-HMAC-SHA256"}, {"x-amz-date": "20261108T000000Z"},
+           {"note": "aé\"\n"}
+         ]}
+        """;
+    let p = postPolicyOf(json)!;
+    Check.equalU64(9, p.conditions.length as u64)?;
+    Check.equalBytes("aé\"\n".bytes(), p.conditions[8].value.view())?;
+    var min: u64 = 0;
+    var max: u64 = 0;
+    Check.isTrue(lengthRange(borrow p, mut min, mut max), "a length range")?;
+    Check.equalU64(1024, max)?;
+    var fields = Vector<FormField>.create();
+    let names = [
+        "key",
+        "content-type",
+        "x-amz-credential",
+        "x-amz-algorithm",
+        "x-amz-date",
+        "x-amz-meta-note",
+        "policy",
+        "x-amz-signature",
+        "x-ignore-me",
+        "note",
+    ];
+    let values = [
+        "uploads/a.txt",
+        "text/plain",
+        "AK/20261108/us-east-1/s3/aws4_request",
+        "AWS4-HMAC-SHA256",
+        "20261108T000000Z",
+        "anything",
+        "p",
+        "s",
+        "z",
+        "aé\"\n",
+    ];
+    for (i in 0..names.length) { fields.push(field(names[i], values[i]))!; }
+    let now: i64 = 1794000000; // 2026-11
+    Check.isTrue(checkPolicy(borrow p, borrow fields, "bkt".bytes(), now).isOk(), "a form the policy allows")?;
+    Check.isTrue(checkPolicy(borrow p, borrow fields, "other".bytes(), now).isErr(), "another bucket")?;
+    Check.isTrue(checkPolicy(borrow p, borrow fields, "bkt".bytes(), 1900000000).isErr(), "an expired policy")?;
+    fields[0].value.clear();
+    fields[0].value.extend("elsewhere/a.txt".bytes())!;
+    Check.isTrue(checkPolicy(borrow p, borrow fields, "bkt".bytes(), now).isErr(), "a key outside the prefix")?;
+    fields[0].value.clear();
+    fields[0].value.extend("uploads/a.txt".bytes())!;
+    fields.push(field("acl", "private"))!;
+    Check.isTrue(checkPolicy(borrow p, borrow fields, "bkt".bytes(), now).isErr(), "a field no condition covers")?;
+    let missing = postPolicyOf("{\"expiration\":\"2030-01-01T00:00:00Z\",\"conditions\":[[\"eq\",\"$gone\",\"x\"]]}")!;
+    Check.isTrue(
+        checkPolicy(borrow missing, borrow fields, "bkt".bytes(), now).isErr(),
+        "a condition on a missing field",
+    )?;
+    let bad = [
+        "{\"conditions\":[]}",
+        "{\"expiration\":\"2030-01-01T00:00:00Z\"}",
+        "{\"expiration\":\"soon\",\"conditions\":[]}",
+        "{\"expiration\":\"2030-01-01T00:00:00Z\",\"conditions\":[[\"EQ\",\"$key\",\"x\"]]}",
+        "{\"expiration\":\"2030-01-01T00:00:00Z\",\"conditions\":[[\"eq\",\"key\",\"x\"]]}",
+        "{\"expiration\":\"2030-01-01T00:00:00Z\",\"conditions\":[]} trailing",
+    ];
+    for (b in bad) {
+        match (parsePolicy(b.bytes())) {
+            Err(S3Fail.Code(S3Code.InvalidPolicyDocument)) => {}
+            _ => { return Check.fail("an invalid policy document"); }
+        }
+    }
+    return Ok();
+}
+
+fn postPolicyOf(json: StringView) -> Result<Policy, TestFailure> {
+    match (parsePolicy(json.bytes())) {
+        Ok(p) => { return Ok(p); }
+        Err(_) => {
+            Check.fail("the policy parses")?;
+            return Err(TestFailure.create("the policy parses"));
+        }
+    }
+}

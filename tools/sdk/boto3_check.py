@@ -132,6 +132,63 @@ except urllib.error.HTTPError as e:
     text = e.read().decode()
     check("SigV2 refused", (e.code, "<Code>InvalidRequest</Code>" in text, "AWS4-HMAC-SHA256" in text), (400, True, True))
 
+# POST object with a SigV4 policy (ADR-0018), posted as a browser would: multipart/form-data.
+def post_form(url, fields, filename, data, content_type="text/plain"):
+    boundary = "----cosmostore" + os.urandom(8).hex()
+    body = b""
+    for k, v in fields.items():
+        body += b"--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" % (
+            boundary.encode(), k.encode(), v.encode())
+    body += b"--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n" % (
+        boundary.encode(), filename.encode(), content_type.encode())
+    body += data + b"\r\n--%s--\r\n" % boundary.encode()
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+    try:
+        r = urllib.request.urlopen(req)
+        return r.status, r.read().decode(errors="replace"), {k.lower(): v for k, v in r.headers.items()}
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace"), {k.lower(): v for k, v in e.headers.items()}
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+urllib.request.install_opener(urllib.request.build_opener(NoRedirect))
+
+conditions = [["starts-with", "$key", "post/"], ["starts-with", "$Content-Type", "text/"],
+              ["content-length-range", 1, 1048576], ["starts-with", "$x-amz-meta-note", ""]]
+post = s3.generate_presigned_post(B, "post/${filename}", Fields={"Content-Type": "text/plain", "x-amz-meta-note": "hi"},
+                                  Conditions=conditions, ExpiresIn=60)
+status, text, _ = post_form(post["url"], post["fields"], "hello.txt", b"posted bytes")
+check("POST object", status, 204)
+got = s3.get_object(Bucket=B, Key="post/hello.txt")
+check("POST object stored", (got["Body"].read(), got["ContentType"], got["Metadata"]), (b"posted bytes", "text/plain", {"note": "hi"}))
+created = s3.generate_presigned_post(B, "post/created", Fields={"success_action_status": "201"},
+                                     Conditions=[{"success_action_status": "201"}], ExpiresIn=60)
+status, text, _ = post_form(created["url"], created["fields"], "x", b"x")
+check("POST 201", (status, "<Key>post/created</Key>" in text), (201, True))
+redirect = s3.generate_presigned_post(B, "post/r", Fields={"success_action_redirect": "http://example.invalid/done"},
+                                      Conditions=[{"success_action_redirect": "http://example.invalid/done"}], ExpiresIn=60)
+status, _, headers = post_form(redirect["url"], redirect["fields"], "x", b"x")
+check("POST redirect", (status, headers.get("location", "").startswith("http://example.invalid/done?bucket=")), (303, True))
+status, text, _ = post_form(post["url"], post["fields"], "big.txt", b"x" * 1048577)
+check("POST too large", (status, "EntityTooLarge" in text), (400, True))
+extra = dict(post["fields"]); extra["x-amz-meta-other"] = "no"
+status, text, _ = post_form(post["url"], extra, "e.txt", b"x")
+check("POST field outside the policy", status, 403)
+bad = dict(post["fields"]); bad["policy"] = bad["policy"][:-4] + "AAA="
+status, text, _ = post_form(post["url"], bad, "b.txt", b"x")
+check("POST with a changed policy", status in (400, 403), True)
+short = s3.generate_presigned_post(B, "post/${filename}", Fields={"Content-Type": "text/plain", "x-amz-meta-note": "hi"},
+                                   Conditions=conditions, ExpiresIn=1)
+import time
+time.sleep(2)
+status, text, _ = post_form(short["url"], short["fields"], "late.txt", b"x")
+check("POST with an expired policy", status, 403)
+wrong_key = dict(post["fields"]); wrong_key["key"] = "elsewhere/${filename}"
+status, _, _ = post_form(post["url"], wrong_key, "w.txt", b"x")
+check("POST key outside the policy", status, 403)
+
 # Batch delete, then everything.
 r = s3.delete_objects(Bucket=B, Delete={"Objects": [{"Key": "l/%02d" % i} for i in range(25)] + [{"Key": "missing"}]})
 check("delete_objects", len(r["Deleted"]), 26)

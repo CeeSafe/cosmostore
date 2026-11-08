@@ -1,0 +1,670 @@
+// POST object (ADR-0018): browser form uploads signed with a SigV4 POST policy. The form's fields come first; the
+// policy (base64 JSON: an expiration and conditions on the fields) is signed with the credential's signing key, and
+// every field must be one the policy allows. The file streams into a writer as PUT's body does, and is committed
+// only if its size is within the policy's content-length-range.
+import web_core;
+import web_http;
+import web_server;
+
+/// The most bytes of fields before the file (S3: 20 KiB; a little more for multipart framing).
+const POST_FIELDS_LIMIT: usize = 65536;
+
+/// One form field: its name lowercased (field names are case-insensitive) and its value.
+struct FormField {
+    name: Vector<u8>;
+    value: Vector<u8>;
+}
+
+fn fieldOf<region a>(fields: borrow(a) Vector<FormField>, name: StringView) -> Slice<a, u8>? {
+    for (i in 0..fields.length) {
+        if (fields[i].name.view() == name.bytes()) { return Some(fields[i].value.view()); }
+    }
+    return null;
+}
+
+// ---- The policy ----
+
+enum ConditionKind {
+    Equals,
+    StartsWith,
+    LengthRange,
+}
+
+/// A policy condition: `{"field": "value"}` or `["eq", "$field", "value"]`, `["starts-with", "$field", "prefix"]`,
+/// or `["content-length-range", min, max]`. Field names are lowercased, without `$`.
+struct PolicyCondition {
+    kind: ConditionKind;
+    field: Vector<u8>;
+    value: Vector<u8>;
+    min: u64;
+    max: u64;
+}
+
+struct Policy {
+    /// Unix seconds.
+    expiration: i64;
+    conditions: Vector<PolicyCondition>;
+}
+
+/// A JSON reader for the policy's shape: objects, arrays, strings and non-negative integers.
+struct JsonReader<region a> {
+    text: Slice<a, u8>;
+    at: usize;
+
+    fn skipSpace(borrow mut this) {
+        while (this.at < this.text.length) {
+            let c = this.text[this.at];
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n') { return; }
+            this.at += 1;
+        }
+    }
+
+    /// Consumes `c` after any space, if it is next.
+    fn take(borrow mut this, c: u8) -> bool {
+        this.skipSpace();
+        if (this.at < this.text.length && this.text[this.at] == c) {
+            this.at += 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn peek(borrow mut this) -> u8 {
+        this.skipSpace();
+        return if (this.at < this.text.length) this.text[this.at] else 0;
+    }
+
+    /// A string, its escapes decoded (`\uXXXX` to UTF-8, surrogate pairs joined).
+    fn string(borrow mut this, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+        out.clear();
+        if (!this.take('"')) { return Ok(false); }
+        while (this.at < this.text.length) {
+            let c = this.text[this.at];
+            this.at += 1;
+            if (c == '"') { return Ok(true); }
+            if (c != '\\') {
+                out.push(c)?;
+                continue;
+            }
+            if (this.at >= this.text.length) { return Ok(false); }
+            let e = this.text[this.at];
+            this.at += 1;
+            if (e == 'n') {
+                out.push('\n')?;
+            } else if (e == 't') {
+                out.push('\t')?;
+            } else if (e == 'r') {
+                out.push('\r')?;
+            } else if (e == 'b') {
+                out.push(8)?;
+            } else if (e == 'f') {
+                out.push(12)?;
+            } else if (e == 'u') {
+                var cp = match (this.hex4()) {
+                    Some(v) => v,
+                    null => { return Ok(false); }
+                };
+                if (cp >= 0xD800 && cp < 0xDC00) {
+                    if (this.at + 1 >= this.text.length || this.text[this.at] != '\\' ||
+                        this.text[this.at + 1] != 'u') {
+                        return Ok(false);
+                    }
+                    this.at += 2;
+                    let low = match (this.hex4()) {
+                        Some(v) => v,
+                        null => { return Ok(false); }
+                    };
+                    if (low < 0xDC00 || low >= 0xE000) { return Ok(false); }
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                }
+                appendUtf8CodePoint(out, cp)?;
+            } else {
+                out.push(e)?; // `\"`, `\\`, `\/`
+            }
+        }
+        return Ok(false);
+    }
+
+    fn hex4(borrow mut this) -> u32? {
+        if (this.at + 4 > this.text.length) { return null; }
+        var v: u32 = 0;
+        for (i in 0..4) {
+            let d = match (hexValue(this.text[this.at + i])) {
+                Some(x) => x,
+                null => { return null; }
+            };
+            v = (v << 4) | d as u32;
+        }
+        this.at += 4;
+        return v;
+    }
+
+    fn integer(borrow mut this) -> u64? {
+        this.skipSpace();
+        let start = this.at;
+        while (this.at < this.text.length && this.text[this.at] >= '0' && this.text[this.at] <= '9') { this.at += 1; }
+        if (this.at == start || this.at - start > 19) { return null; }
+        return parseDecimal(this.text[start..this.at]);
+    }
+}
+
+fn appendUtf8CodePoint(out: borrow mut Vector<u8>, cp: u32) -> Result<void, AllocError> {
+    if (cp < 0x80) {
+        out.push(truncate<u8>(cp))?;
+    } else if (cp < 0x800) {
+        out.push(truncate<u8>(0xC0 | (cp >> 6)))?;
+        out.push(truncate<u8>(0x80 | (cp & 0x3F)))?;
+    } else if (cp < 0x10000) {
+        out.push(truncate<u8>(0xE0 | (cp >> 12)))?;
+        out.push(truncate<u8>(0x80 | ((cp >> 6) & 0x3F)))?;
+        out.push(truncate<u8>(0x80 | (cp & 0x3F)))?;
+    } else {
+        out.push(truncate<u8>(0xF0 | (cp >> 18)))?;
+        out.push(truncate<u8>(0x80 | ((cp >> 12) & 0x3F)))?;
+        out.push(truncate<u8>(0x80 | ((cp >> 6) & 0x3F)))?;
+        out.push(truncate<u8>(0x80 | (cp & 0x3F)))?;
+    }
+    return Ok();
+}
+
+/// `2026-11-08T12:00:00Z` or `2026-11-08T12:00:00.000Z`, the policy's expiration, in Unix seconds.
+fn parseIsoTime(text: Slice<u8>) -> i64? {
+    if (text.length < 20 || text[4] != '-' || text[7] != '-' || text[10] != 'T' || text[13] != ':' || text[16] != ':') {
+        return null;
+    }
+    if (text[text.length - 1] != 'Z') { return null; }
+    if (text.length != 20 && (text[19] != '.' || text.length > 27)) { return null; }
+    var compact = Vector<u8>.create();
+    let pieces = [
+        text[0..4],
+        text[5..7],
+        text[8..10],
+        "T".bytes(),
+        text[11..13],
+        text[14..16],
+        text[17..19],
+        "Z".bytes(),
+    ];
+    for (p in pieces) {
+        match (compact.extend(p)) {
+            Ok() => {}
+            Err(_) => { return null; }
+        }
+    }
+    return parseAmzDate(compact.view());
+}
+
+/// The policy document, or InvalidPolicyDocument.
+fn parsePolicy(json: Slice<u8>) -> Result<Policy, S3Fail> {
+    let bad = S3Fail.Code(S3Code.InvalidPolicyDocument);
+    var r = JsonReader { text: json, at: 0 };
+    var policy = Policy { expiration: 0, conditions: Vector<PolicyCondition>.create() };
+    var expiration = false;
+    var conditions = false;
+    var name = Vector<u8>.create();
+    var text = Vector<u8>.create();
+    if (!r.take('{')) { return Err(bad); }
+    if (!r.take('}')) {
+        while (true) {
+            if (!r.string(mut name)?) { return Err(bad); }
+            if (!r.take(':')) { return Err(bad); }
+            if (name.view() == "expiration".bytes()) {
+                if (!r.string(mut text)?) { return Err(bad); }
+                policy.expiration = match (parseIsoTime(text.view())) {
+                    Some(v) => v,
+                    null => { return Err(bad); }
+                };
+                expiration = true;
+            } else if (name.view() == "conditions".bytes()) {
+                parseConditions(mut r, mut policy.conditions)?;
+                conditions = true;
+            } else {
+                return Err(bad);
+            }
+            if (r.take(',')) { continue; }
+            if (r.take('}')) { break; }
+            return Err(bad);
+        }
+    }
+    r.skipSpace();
+    if (r.at != json.length || !expiration || !conditions) { return Err(bad); }
+    return Ok(policy);
+}
+
+fn parseConditions<region a>(
+    r: borrow mut JsonReader<a>,
+    out: borrow mut Vector<PolicyCondition>,
+) -> Result<void, S3Fail> {
+    let bad = S3Fail.Code(S3Code.InvalidPolicyDocument);
+    if (!r.take('[')) { return Err(bad); }
+    if (r.take(']')) { return Ok(); }
+    var a = Vector<u8>.create();
+    var b = Vector<u8>.create();
+    while (true) {
+        var c = PolicyCondition {
+            kind: ConditionKind.Equals,
+            field: Vector<u8>.create(),
+            value: Vector<u8>.create(),
+            min: 0,
+            max: 0,
+        };
+        if (r.peek() == '{') {
+            // {"field": "value"}: exactly one member.
+            r.take('{');
+            if (!r.string(mut a)?) { return Err(bad); }
+            if (!r.take(':') || !r.string(mut b)?) { return Err(bad); }
+            if (!r.take('}')) { return Err(bad); }
+            lowerInto(a.view(), mut c.field)?;
+            c.value.extend(b.view())?;
+        } else if (r.take('[')) {
+            if (!r.string(mut a)?) { return Err(bad); }
+            if (!r.take(',')) { return Err(bad); }
+            if (equalsIgnoreCase(a.view(), "content-length-range".bytes())) {
+                c.kind = ConditionKind.LengthRange;
+                c.min = match (r.integer()) {
+                    Some(v) => v,
+                    null => { return Err(bad); }
+                };
+                if (!r.take(',')) { return Err(bad); }
+                c.max = match (r.integer()) {
+                    Some(v) => v,
+                    null => { return Err(bad); }
+                };
+            } else {
+                // The operator is case-sensitive in S3: `eq` and `starts-with` only.
+                if (a.view() == "eq".bytes()) {
+                    c.kind = ConditionKind.Equals;
+                } else if (a.view() == "starts-with".bytes()) {
+                    c.kind = ConditionKind.StartsWith;
+                } else {
+                    return Err(bad);
+                }
+                if (!r.string(mut b)?) { return Err(bad); }
+                if (b.length < 2 || b[0] != '$') { return Err(bad); }
+                lowerInto(b.view()[1..], mut c.field)?;
+                if (!r.take(',') || !r.string(mut b)?) { return Err(bad); }
+                c.value.extend(b.view())?;
+            }
+            if (!r.take(']')) { return Err(bad); }
+        } else {
+            return Err(bad);
+        }
+        out.push(c)?;
+        if (r.take(',')) { continue; }
+        if (r.take(']')) { return Ok(); }
+        return Err(bad);
+    }
+    return Ok();
+}
+
+fn lowerInto(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    for (c in text) { out.push(lowerAscii(c))?; }
+    return Ok();
+}
+
+/// The fields that need no condition (S3): the signature and policy themselves, the file, and `x-ignore-*`.
+fn exemptField(name: Slice<u8>) -> bool =>
+    name == "policy".bytes() || name == "x-amz-signature".bytes() || name == "file".bytes() ||
+        startsWithBytes(name, "x-ignore-".bytes());
+
+/// Checks every condition against the fields (the bucket being `bucket`), and that every field has a condition.
+/// AccessDenied (S3's "Invalid according to Policy") otherwise. The size is checked once the file is in.
+fn checkPolicy(
+    policy: borrow Policy,
+    fields: borrow Vector<FormField>,
+    bucket: Slice<u8>,
+    now: i64,
+) -> Result<void, S3Fail> {
+    let denied = S3Fail.Code(S3Code.AccessDenied);
+    if (now >= policy.expiration) { return Err(denied); }
+    for (i in 0..policy.conditions.length) {
+        let c = borrow policy.conditions[i];
+        match (c.kind) {
+            ConditionKind.LengthRange => { continue; }
+            _ => {}
+        }
+        let actual = if (c.field.view() == "bucket".bytes()) Some(bucket) else fieldOf(
+            fields,
+            StringView.fromUtf8(c.field.view()) ?? "",
+        );
+        let value = match (actual) {
+            Some(v) => v,
+            null => { return Err(denied); }
+        };
+        let holds = match (c.kind) {
+            ConditionKind.Equals => value == c.value.view(),
+            ConditionKind.StartsWith => startsWithBytes(value, c.value.view()),
+            ConditionKind.LengthRange => true,
+        };
+        if (!holds) { return Err(denied); }
+    }
+    for (i in 0..fields.length) {
+        let name = fields[i].name.view();
+        if (exemptField(name)) { continue; }
+        var covered = false;
+        for (j in 0..policy.conditions.length) {
+            if (policy.conditions[j].field.view() == name) { covered = true; }
+        }
+        if (!covered) { return Err(denied); } // "Extra input fields"
+    }
+    return Ok();
+}
+
+/// The policy's content-length-range, if it has one: (min, max) as two optionals.
+fn lengthRange(policy: borrow Policy, min: borrow mut u64, max: borrow mut u64) -> bool {
+    for (i in 0..policy.conditions.length) {
+        match (policy.conditions[i].kind) {
+            ConditionKind.LengthRange => {
+                min = policy.conditions[i].min;
+                max = policy.conditions[i].max;
+                return true;
+            }
+            _ => {}
+        }
+    }
+    return false;
+}
+
+/// The SigV4 POST signature (ADR-0018): `x-amz-algorithm` AWS4-HMAC-SHA256, `x-amz-credential`, `x-amz-date`, and
+/// `x-amz-signature`, the hex HMAC of the policy (base64, as sent) with the credential's signing key. SigV2 forms
+/// (`AWSAccessKeyId`, `signature`) are refused as SigV2 is.
+fn checkPostSignature(fields: borrow Vector<FormField>, credentials: Slice<Credential>) -> Result<void, S3Fail> {
+    if (fieldOf(fields, "awsaccesskeyid").isSome()) { return Err(S3Fail.Code(S3Code.AuthorizationMechanism)); }
+    let policy = match (fieldOf(fields, "policy")) {
+        Some(v) => v,
+        null => { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    };
+    let algorithm = match (fieldOf(fields, "x-amz-algorithm")) {
+        Some(v) => v,
+        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    };
+    if (algorithm != "AWS4-HMAC-SHA256".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    let credential = match (fieldOf(fields, "x-amz-credential")) {
+        Some(v) => v,
+        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    };
+    let amzDate = match (fieldOf(fields, "x-amz-date")) {
+        Some(v) => v,
+        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    };
+    let signature = match (fieldOf(fields, "x-amz-signature")) {
+        Some(v) => v,
+        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    };
+    // The same fields as an Authorization header, so one parser checks them (as query auth does).
+    var header = Vector<u8>.create();
+    header.extend("AWS4-HMAC-SHA256 Credential=".bytes())?;
+    header.extend(credential)?;
+    header.extend(", SignedHeaders=host, Signature=".bytes())?;
+    header.extend(signature)?;
+    let auth = match (parseAuthorization(header.view())) {
+        Ok(a) => a,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    };
+    if (auth.service.view() != "s3".bytes() || amzDate.length < 8 || amzDate[0..8] != auth.date.view()) {
+        return Err(S3Fail.Code(S3Code.InvalidArgument));
+    }
+    var secret: Slice<u8>? = null;
+    for (i in 0..credentials.length) {
+        if (sameSignature(credentials[i].accessKey.view(), auth.accessKey.view())) {
+            secret = Some(credentials[i].secret.view());
+        }
+    }
+    let key = match (secret) {
+        Some(v) => v,
+        null => { return Err(S3Fail.Code(S3Code.InvalidAccessKeyId)); }
+    };
+    let signing = signingKey(key, auth.date.view(), auth.region.view(), auth.service.view())?;
+    let mac = HmacSha256.of(signing[..], policy);
+    var hex = Vector<u8>.create();
+    appendHexBytes(mut hex, mac[..])?;
+    if (!sameSignature(hex.view(), auth.signature.view())) { return Err(S3Fail.Code(S3Code.SignatureDoesNotMatch)); }
+    return Ok();
+}
+
+// ---- The request ----
+
+/// Whether a request is a POST object: a POST to a bucket, with no query, whose body is multipart/form-data. It is
+/// authenticated by its form, not its headers.
+fn isPostObject(req: borrow S3Request) -> bool {
+    if (!isMethod(req.method, Method.Post) || req.bucket.length == 0 || req.key.length > 0 || req.query.length > 0) {
+        return false;
+    }
+    let ct = headerOf(req, "content-type") ?? "".bytes();
+    let semi = pieceEnd(ct, 0, ';');
+    return equalsIgnoreCase(trimSpaces(ct[0..semi]), "multipart/form-data".bytes());
+}
+
+/// One step of a POST file, on a worker thread: written, and checksummed for its stored CRC64NVME.
+fn postStep(
+    writer: borrow mut ObjectWriter,
+    sum: borrow mut RunningChecksum,
+    data: Slice<u8>,
+) -> Result<void, IoFailure> {
+    sum.update(data);
+    return writer.write(data);
+}
+
+async fn postObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    var boundary = Vector<u8>.create();
+    if (!formBoundary(headerOf(req, "content-type") ?? "".bytes(), mut boundary)?) {
+        return Err(S3Fail.Code(S3Code.MalformedPOSTRequest));
+    }
+    var form = FormReader.create(boundary.view())?;
+    var fields = Vector<FormField>.create();
+    var buf = Vector<u8>.create();
+    buf.resize(BODY_STEP, 0)?;
+    var data = Vector<u8>.create();
+    var fieldBytes: usize = 0;
+    // The fields, up to the file.
+    var started = false;
+    while (!started) {
+        let event = form.step(mut data)?;
+        match (event) {
+            FormEvent.More => {
+                let n = await exchange.read(mut buf.viewMut()[..])?;
+                if (n == 0) { return Err(S3Fail.Code(S3Code.MalformedPOSTRequest)); }
+                fieldBytes += n;
+                if (fieldBytes > POST_FIELDS_LIMIT + BODY_STEP) {
+                    return Err(S3Fail.Code(S3Code.MalformedPOSTRequest));
+                }
+                form.feed(buf.view()[0..n])?;
+            }
+            FormEvent.Field => {
+                var f = FormField { name: Vector<u8>.create(), value: Vector<u8>.create() };
+                lowerInto(form.name.view(), mut f.name)?;
+                f.value.extend(form.value.view())?;
+                fields.push(f)?;
+                if (fields.length > 100) { return Err(S3Fail.Code(S3Code.MalformedPOSTRequest)); }
+            }
+            FormEvent.FileStart => { started = true; }
+            _ => { return Err(S3Fail.Code(S3Code.MalformedPOSTRequest)); } // the end, or no file before it
+        }
+    }
+    // The key, with `${filename}` replaced by the file's name.
+    let keyField = match (fieldOf(borrow fields, "key")) {
+        Some(v) => v,
+        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    };
+    var key = Vector<u8>.create();
+    var at: usize = 0;
+    let marker = "${filename}".bytes();
+    while (at < keyField.length) {
+        if (startsWithBytes(keyField[at..], marker)) {
+            key.extend(form.fileName.view())?;
+            at += marker.length;
+        } else {
+            key.push(keyField[at])?;
+            at += 1;
+        }
+    }
+    if (key.length == 0) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    if (key.length > MAX_KEY_BYTES) { return Err(S3Fail.Code(S3Code.KeyTooLongError)); }
+    for (i in 0..fields.length) {
+        if (fields[i].name.view() == "key".bytes()) {
+            fields[i].value.clear();
+            fields[i].value.extend(key.view())?;
+        }
+    }
+    // Who, and what the policy allows.
+    checkPostSignature(borrow fields, app.credentials.view())?;
+    let policyText = fieldOf(borrow fields, "policy") ?? "".bytes();
+    var json = Vector<u8>.create();
+    if (!decodeBase64(policyText, mut json)?) { return Err(S3Fail.Code(S3Code.InvalidPolicyDocument)); }
+    let policy = parsePolicy(json.view())?;
+    checkPolicy(borrow policy, borrow fields, req.bucket.view().bytes(), Clock.unixMillis() / 1000)?;
+    var minSize: u64 = 0;
+    var maxSize: u64 = MAX_PUT_BYTES;
+    let ranged = lengthRange(borrow policy, mut minSize, mut maxSize);
+    // What the object gets: its type, stored fields and tags.
+    var contentType = String.create();
+    appendUtf8(mut contentType, fieldOf(borrow fields, "content-type") ?? "binary/octet-stream".bytes())?;
+    var metadata = Vector<u8>.create();
+    for (i in 0..fields.length) {
+        let name = fields[i].name.view();
+        if (startsWithBytes(name, "x-amz-meta-".bytes()) || listed(STORED_HEADERS, name)) {
+            metadataAdd(mut metadata, name, fields[i].value.view())?;
+        }
+    }
+    match (fieldOf(borrow fields, "tagging")) {
+        Some(xml) => {
+            let tags = tagsOfXml(xml)?;
+            var canonical = Vector<u8>.create();
+            canonicalTags(borrow tags, mut canonical)?;
+            metadata = match (metadataReplace(metadata.view(), TAGS_FIELD.bytes(), canonical.view())) {
+                Ok(b) => b,
+                Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+            };
+        }
+        null => {}
+    }
+    if (metadata.length > MAX_METADATA_BYTES) { return Err(S3Fail.Code(S3Code.MetadataTooLarge)); }
+    let bucket = req.bucket.view();
+    let keyText = match (StringView.fromUtf8(key.view())) {
+        Some(v) => v,
+        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    };
+    // The file, streamed into a writer; the size is checked as it grows, and against the minimum at the end.
+    var writer = await startPut(app, bucket, 0)?;
+    var sum = RunningChecksum.create(ChecksumAlgorithm.Crc64Nvme);
+    var size: u64 = 0;
+    var ended = false;
+    while (!ended) {
+        let event = form.step(mut data)?;
+        match (event) {
+            FormEvent.More => {
+                let n = await exchange.read(mut buf.viewMut()[..])?;
+                if (n == 0) { return Err(S3Fail.Code(S3Code.IncompleteBody)); }
+                form.feed(buf.view()[0..n])?;
+            }
+            FormEvent.FileData => {
+                size += data.length as u64;
+                if (size > maxSize) {
+                    return Err(S3Fail.Code(if (ranged) S3Code.EntityTooLarge else S3Code.EntityTooLarge));
+                }
+                let chunk = data.view();
+                let wrote = await Async.blocking(() => postStep(mut writer, mut sum, chunk));
+                match (wrote) {
+                    Ok() => {}
+                    Err(f) => { return Err(storeFail(StoreError.Io(f), 0)); }
+                }
+            }
+            FormEvent.FileEnd => { ended = true; }
+            _ => { return Err(S3Fail.Code(S3Code.MalformedPOSTRequest)); }
+        }
+    }
+    // Fields after the file are ignored, as S3 does; the rest of the body is read so the connection can be reused.
+    while (!form.isDone()) {
+        let event = form.step(mut data)?;
+        match (event) {
+            FormEvent.More => {
+                let n = await exchange.read(mut buf.viewMut()[..])?;
+                if (n == 0) { break; }
+                form.feed(buf.view()[0..n])?;
+            }
+            FormEvent.Malformed => { break; }
+            _ => {}
+        }
+    }
+    let finished = match (await Async.blocking(() => writer.finish())) {
+        Ok(f) => f,
+        Err(f) => { return Err(storeFail(StoreError.Io(f), 0)); }
+    };
+    if (size < minSize) {
+        await discardPut(app, borrow finished)?;
+        return Err(S3Fail.Code(S3Code.EntityTooSmall));
+    }
+    var checksum = Vector<u8>.create();
+    sum.finishInto(mut checksum)?;
+    var extras = Vector<u8>.create();
+    singlePartExtras(ChecksumAlgorithm.Crc64Nvme, checksum.view(), mut extras)?;
+    let outcome = await commitPut(
+        app,
+        bucket,
+        keyText,
+        contentType.view(),
+        metadata.view(),
+        extras.view(),
+        borrow finished,
+        PutIf.None,
+        "".bytes(),
+    )?;
+    return await sendPostResult(exchange, borrow fields, bucket, keyText, borrow outcome);
+}
+
+/// S3's answers to a POST object: a 303 to `success_action_redirect` (with bucket, key and etag), else
+/// `success_action_status` 200, 201 (with a PostResponse) or 204, the default.
+async fn sendPostResult(
+    exchange: borrow mut Exchange,
+    fields: borrow Vector<FormField>,
+    bucket: StringView,
+    key: StringView,
+    outcome: borrow PutOutcome,
+) -> Result<void, S3Fail> {
+    var etag = Vector<u8>.create();
+    appendEtag(mut etag, borrow outcome.md5, 0)?;
+    exchange.header("etag", etag.view())?;
+    var location = Vector<u8>.create();
+    location.push('/')?;
+    appendUriEncoded(mut location, bucket.bytes(), false)?;
+    location.push('/')?;
+    appendUriEncoded(mut location, key.bytes(), true)?;
+    match (fieldOf(fields, "success_action_redirect")) {
+        Some(url) => {
+            if (url.length > 0) {
+                var target = Vector<u8>.create();
+                target.extend(url)?;
+                target.push(if (findBytes(url, "?".bytes(), 0).isSome()) '&' else '?')?;
+                target.extend("bucket=".bytes())?;
+                appendUriEncoded(mut target, bucket.bytes(), false)?;
+                target.extend("&key=".bytes())?;
+                appendUriEncoded(mut target, key.bytes(), false)?;
+                target.extend("&etag=".bytes())?;
+                appendUriEncoded(mut target, etag.view(), false)?;
+                exchange.header("location", target.view())?;
+                await exchange.send(statusOf(303), "".bytes())?;
+                return Ok();
+            }
+        }
+        null => {}
+    }
+    let status = match (fieldOf(fields, "success_action_status")) {
+        Some(t) => if (t == "200".bytes()) 200u16 else if (t == "201".bytes()) 201u16 else 204u16,
+        null => 204u16,
+    };
+    exchange.header("location", location.view())?;
+    if (status == 201) {
+        var body = Vector<u8>.create();
+        body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PostResponse>".bytes())?;
+        xmlElement(mut body, "Location", location.view(), false)?;
+        xmlElement(mut body, "Bucket", bucket.bytes(), false)?;
+        xmlElement(mut body, "Key", key.bytes(), false)?;
+        xmlElement(mut body, "ETag", etag.view(), false)?;
+        body.extend("</PostResponse>".bytes())?;
+        exchange.header("content-type", "application/xml".bytes())?;
+        await exchange.send(statusOf(201), body.view())?;
+        return Ok();
+    }
+    await exchange.send(statusOf(status), "".bytes())?;
+    return Ok();
+}

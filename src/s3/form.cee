@@ -1,0 +1,232 @@
+// A streaming multipart/form-data reader (RFC 7578) for POST object uploads (ADR-0018). Fields arrive whole; the
+// `file` part's bytes stream out as they come, so an upload of any size takes a bounded buffer. Bytes are fed as
+// read, and `step` says what is next.
+
+/// The most bytes a part's headers, or a field's value, may take.
+const FORM_PART_LIMIT: usize = 65536;
+
+enum FormEvent {
+    /// Feed more bytes.
+    More,
+    /// A field ended: its name and value are `name` and `value`.
+    Field,
+    /// The file part began: its field name, file name and content type are `name`, `fileName` and `fileType`.
+    FileStart,
+    /// File bytes are in the step's `out`.
+    FileData,
+    /// The file part ended.
+    FileEnd,
+    /// The closing boundary.
+    End,
+    Malformed,
+}
+
+struct FormReader {
+    /// `--<boundary>` and `\r\n--<boundary>`.
+    private opening: Vector<u8>;
+    private delimiter: Vector<u8>;
+    private buf: Vector<u8>;
+    private pos: usize;
+    /// 0: before the first boundary; 1: a part's headers; 2: a field's value; 3: the file's bytes; 4: after a
+    /// delimiter (a part or the end follows); 5: done.
+    private state: u8;
+    private fileEnded: bool;
+    name: Vector<u8>;
+    value: Vector<u8>;
+    fileName: Vector<u8>;
+    fileType: Vector<u8>;
+
+    fn create(boundary: Slice<u8>) -> Result<FormReader, AllocError> {
+        var opening = Vector<u8>.create();
+        opening.extend("--".bytes())?;
+        opening.extend(boundary)?;
+        var delimiter = Vector<u8>.create();
+        delimiter.extend("\r\n--".bytes())?;
+        delimiter.extend(boundary)?;
+        return Ok(FormReader {
+            opening: opening,
+            delimiter: delimiter,
+            buf: Vector<u8>.create(),
+            pos: 0,
+            state: 0,
+            fileEnded: false,
+            name: Vector<u8>.create(),
+            value: Vector<u8>.create(),
+            fileName: Vector<u8>.create(),
+            fileType: Vector<u8>.create(),
+        });
+    }
+
+    fn feed(borrow mut this, data: Slice<u8>) -> Result<void, AllocError> {
+        if (this.pos > 0 && this.pos * 2 >= this.buf.length) {
+            var kept = Vector<u8>.create();
+            kept.extend(this.buf.view()[this.pos..])?;
+            this.buf = kept;
+            this.pos = 0;
+        }
+        this.buf.extend(data)?;
+        return Ok();
+    }
+
+    fn isDone(borrow this) -> bool => this.state == 5;
+
+    /// What comes next; file bytes go into `out` (cleared first).
+    fn step(borrow mut this, out: borrow mut Vector<u8>) -> Result<FormEvent, AllocError> {
+        out.clear();
+        let rest = this.buf.view()[this.pos..];
+        if (this.state == 0) {
+            // The first boundary, perhaps after a preamble.
+            match (findBytes(rest, this.opening.view(), 0)) {
+                Some(at) => {
+                    this.pos += at + this.opening.length;
+                    this.state = 4;
+                    return this.step(out);
+                }
+                null => { return Ok(if (rest.length > FORM_PART_LIMIT) FormEvent.Malformed else FormEvent.More); }
+            }
+        }
+        if (this.state == 4) {
+            // After a delimiter: `--` ends the form, CRLF starts a part.
+            if (rest.length < 2) { return Ok(FormEvent.More); }
+            if (rest[0] == '-' && rest[1] == '-') {
+                this.state = 5;
+                return Ok(FormEvent.End);
+            }
+            if (rest[0] != '\r' || rest[1] != '\n') { return Ok(FormEvent.Malformed); }
+            this.pos += 2;
+            this.state = 1;
+            return this.step(out);
+        }
+        if (this.state == 1) {
+            let end = match (findBytes(rest, "\r\n\r\n".bytes(), 0)) {
+                Some(e) => e,
+                null => { return Ok(if (rest.length > FORM_PART_LIMIT) FormEvent.Malformed else FormEvent.More); }
+            };
+            let headers = copyBytes(rest[0..end])?; // a copy: the part's fields are set from it
+            if (!this.partHeaders(headers.view())?) { return Ok(FormEvent.Malformed); }
+            this.pos += end + 4;
+            if (equalsIgnoreCase(this.name.view(), "file".bytes())) {
+                this.state = 3;
+                this.fileEnded = false;
+                return Ok(FormEvent.FileStart);
+            }
+            this.state = 2;
+            return this.step(out);
+        }
+        if (this.state == 2) {
+            match (findBytes(rest, this.delimiter.view(), 0)) {
+                Some(at) => {
+                    this.value.clear();
+                    this.value.extend(rest[0..at])?;
+                    this.pos += at + this.delimiter.length;
+                    this.state = 4;
+                    return Ok(FormEvent.Field);
+                }
+                null => { return Ok(if (rest.length > FORM_PART_LIMIT) FormEvent.Malformed else FormEvent.More); }
+            }
+        }
+        if (this.state == 3) {
+            if (this.fileEnded) {
+                this.state = 4;
+                return Ok(FormEvent.FileEnd);
+            }
+            match (findBytes(rest, this.delimiter.view(), 0)) {
+                Some(at) => {
+                    out.extend(rest[0..at])?;
+                    this.pos += at + this.delimiter.length;
+                    this.fileEnded = true;
+                    return Ok(FormEvent.FileData);
+                }
+                null => {
+                    // All but what could still begin a delimiter.
+                    let keep = this.delimiter.length - 1;
+                    if (rest.length <= keep) { return Ok(FormEvent.More); }
+                    let n = rest.length - keep;
+                    out.extend(rest[0..n])?;
+                    this.pos += n;
+                    return Ok(FormEvent.FileData);
+                }
+            }
+        }
+        return Ok(FormEvent.End);
+    }
+
+    /// A part's `Content-Disposition: form-data; name="…"; filename="…"` and `Content-Type`.
+    fn partHeaders(borrow mut this, headers: Slice<u8>) -> Result<bool, AllocError> {
+        this.name.clear();
+        this.fileName.clear();
+        this.fileType.clear();
+        var named = false;
+        var at: usize = 0;
+        while (at < headers.length) {
+            let end = match (findBytes(headers, "\r\n".bytes(), at)) {
+                Some(e) => e,
+                null => headers.length,
+            };
+            let line = headers[at..end];
+            at = end + 2;
+            let colon = pieceEnd(line, 0, ':');
+            if (colon == line.length) { continue; }
+            let field = trimSpaces(line[0..colon]);
+            let value = trimSpaces(line[colon + 1..]);
+            if (equalsIgnoreCase(field, "Content-Type".bytes())) {
+                this.fileType.extend(value)?;
+            } else if (equalsIgnoreCase(field, "Content-Disposition".bytes())) {
+                named = dispositionParam(value, "name", mut this.name)?;
+                let _ = dispositionParam(value, "filename", mut this.fileName)?;
+            }
+        }
+        return Ok(named);
+    }
+}
+
+/// A parameter of a Content-Disposition value (`name="x"` or `name=x`), with `\"` and `\\` unescaped.
+fn dispositionParam(value: Slice<u8>, param: StringView, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    var at = pieceEnd(value, 0, ';');
+    while (at < value.length) {
+        at += 1;
+        let end = parameterEnd(value, at);
+        let piece = trimSpaces(value[at..end]);
+        at = end;
+        let eq = pieceEnd(piece, 0, '=');
+        if (eq == piece.length || !equalsIgnoreCase(trimSpaces(piece[0..eq]), param.bytes())) { continue; }
+        let v = trimSpaces(piece[eq + 1..]);
+        if (v.length >= 2 && v[0] == '"' && v[v.length - 1] == '"') {
+            var i: usize = 1;
+            while (i < v.length - 1) {
+                if (v[i] == '\\' && i + 1 < v.length - 1) { i += 1; }
+                out.push(v[i])?;
+                i += 1;
+            }
+        } else {
+            out.extend(v)?;
+        }
+        return Ok(true);
+    }
+    return Ok(false);
+}
+
+/// The end of a `;`-separated parameter that starts at `at`, skipping `;` inside quotes.
+fn parameterEnd(value: Slice<u8>, at: usize) -> usize {
+    var quoted = false;
+    var i = at;
+    while (i < value.length) {
+        let c = value[i];
+        if (quoted && c == '\\') {
+            i += 2;
+            continue;
+        }
+        if (c == '"') { quoted = !quoted; }
+        if (c == ';' && !quoted) { return i; }
+        i += 1;
+    }
+    return value.length;
+}
+
+/// A `multipart/form-data; boundary=…` Content-Type's boundary (quotes removed), into `out`; false if it has none.
+fn formBoundary(contentType: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    let semi = pieceEnd(contentType, 0, ';');
+    if (!equalsIgnoreCase(trimSpaces(contentType[0..semi]), "multipart/form-data".bytes())) { return Ok(false); }
+    if (!dispositionParam(contentType, "boundary", out)?) { return Ok(false); }
+    return Ok(out.length > 0 && out.length <= 70);
+}

@@ -20,7 +20,7 @@ features, which makes a subset possible.
    - tagging (until ADR-0017 built it), websites, Select, SNS and storage classes;
    - `fails_on_aws`, which is RGW-only behaviour.
 2. **The subset is what passes,** pinned by name in `tools/s3tests/subset.txt`: 218 tests at s3-tests commit
-   `5b39871`. `tools/s3tests/run.sh` runs it against a fresh server and fails if any of them fails, the server logs
+   `5b39871`; 238 since ADR-0018 left out the POST tests, which all sign with SigV2. `tools/s3tests/run.sh` runs it against a fresh server and fails if any of them fails, the server logs
    an internal error, or fsck finds a problem afterwards. `run.sh all` reruns the whole in-scope set, to review the
    subset.
    - s3-tests is not vendored. The runner takes a checkout (`S3TESTS_DIR`) and a Python with its requirements
