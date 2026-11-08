@@ -5,6 +5,7 @@ usage:
   s3_raw.py chunked-put  ENDPOINT BUCKET KEY FILE [CHUNK]   signed aws-chunked PUT (STREAMING-AWS4-HMAC-SHA256-PAYLOAD)
   s3_raw.py bad-chunk    ENDPOINT BUCKET KEY FILE           the same with one data byte changed: expects 403
   s3_raw.py abort-get    ENDPOINT BUCKET KEY BYTES          reads BYTES of a GET, then drops the connection
+  s3_raw.py presign      ENDPOINT METHOD BUCKET KEY SECONDS prints a presigned URL (query auth, ADR-0011)
 
 Credentials come from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY; the region is us-east-1.
 """
@@ -131,6 +132,28 @@ def abort_get(endpoint, bucket, key, nbytes):
     return got[:12]
 
 
+def presign(endpoint, method, bucket, key, seconds):
+    access = os.environ["AWS_ACCESS_KEY_ID"]
+    secret = os.environ["AWS_SECRET_ACCESS_KEY"]
+    host = urllib.parse.urlsplit(endpoint).netloc
+    amz_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date = amz_date[:8]
+    scope = f"{date}/{REGION}/s3/aws4_request"
+    path = "/" + bucket + "/" + urllib.parse.quote(key, safe="/~")
+    params = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{access}/{scope}",
+        "X-Amz-Date": amz_date,
+        "X-Amz-Expires": str(seconds),
+        "X-Amz-SignedHeaders": "host",
+    }
+    query = "&".join(f"{urllib.parse.quote(k, safe='~')}={urllib.parse.quote(v, safe='~')}" for k, v in sorted(params.items()))
+    canonical = "\n".join([method, path, query, f"host:{host}\n", "host", "UNSIGNED-PAYLOAD"])
+    sts = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    signature = hmac.new(signing_key(secret, date), sts.encode(), hashlib.sha256).hexdigest()
+    return f"{endpoint}{path}?{query}&X-Amz-Signature={signature}"
+
+
 def main():
     cmd = sys.argv[1]
     if cmd in ("chunked-put", "bad-chunk"):
@@ -139,6 +162,8 @@ def main():
         print(status, etag)
         if status >= 300:
             print(rest.decode(errors="replace"))
+    elif cmd == "presign":
+        print(presign(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], int(sys.argv[6])))
     elif cmd == "abort-get":
         print(abort_get(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])))
     else:

@@ -56,8 +56,9 @@ struct S3Request {
     key: String;
     query: Vector<QueryParam>;
 
-    /// The request's parts, or InvalidArgument for a path or query that does not decode to UTF-8.
-    fn of(request: borrow Request) -> Result<S3Request, S3Fail> {
+    /// The request's parts, or InvalidArgument for a path or query that does not decode to UTF-8. With a `domain`,
+    /// a Host of `<bucket>.<domain>` names the bucket (virtual-host addressing), and the whole path is the key.
+    fn of(request: borrow Request, domain: Slice<u8>) -> Result<S3Request, S3Fail> {
         var r = S3Request {
             method: request.method(),
             methodText: Vector<u8>.create(),
@@ -83,10 +84,22 @@ struct S3Request {
             Some(q) => { r.rawQuery.extend(q.bytes())?; }
             null => {}
         }
-        // /bucket/key: the key is everything after the bucket's slash, slashes included.
         let start: usize = if (path.length > 0 && path[0] == '/') 1 else 0;
-        let slash = pieceEnd(path, start, '/');
         var decoded = Vector<u8>.create();
+        var hostBucket = Vector<u8>.create();
+        virtualBucket(headerOf(borrow r, "host") ?? "".bytes(), domain, mut hostBucket)?;
+        if (hostBucket.length > 0) {
+            // /key, under <bucket>.<domain>.
+            appendUtf8(mut r.bucket, hostBucket.view())?;
+            if (!percentDecodeInto(mut decoded, path[start..], false)?) {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
+            appendUtf8(mut r.key, decoded.view())?;
+            r.parseQuery()?;
+            return Ok(r);
+        }
+        // /bucket/key: the key is everything after the bucket's slash, slashes included.
+        let slash = pieceEnd(path, start, '/');
         if (!percentDecodeInto(mut decoded, path[start..slash], false)?) {
             return Err(S3Fail.Code(S3Code.InvalidArgument));
         }
@@ -98,7 +111,12 @@ struct S3Request {
             }
             appendUtf8(mut r.key, decoded.view())?;
         }
-        let raw = r.rawQuery.view();
+        r.parseQuery()?;
+        return Ok(r);
+    }
+
+    fn parseQuery(borrow mut this) -> Result<void, S3Fail> {
+        let raw = this.rawQuery.view();
         var at: usize = 0;
         while (at < raw.length) {
             let end = pieceEnd(raw, at, '&');
@@ -111,9 +129,9 @@ struct S3Request {
             if (eq < part.length && !percentDecodeInto(mut p.value, part[eq + 1..], true)?) {
                 return Err(S3Fail.Code(S3Code.InvalidArgument));
             }
-            r.query.push(p)?;
+            this.query.push(p)?;
         }
-        return Ok(r);
+        return Ok();
     }
 
     fn hasParam(borrow this, name: StringView) -> bool {
@@ -123,11 +141,12 @@ struct S3Request {
         return false;
     }
 
-    /// Whether every query parameter is among `allowed` (comma-separated) or one S3 ignores (`x-id`).
+    /// Whether every query parameter is among `allowed` (comma-separated), one S3 ignores (`x-id`), or a presigned
+    /// URL's `X-Amz-*`.
     fn onlyParams(borrow this, allowed: StringView) -> bool {
         for (i in 0..this.query.length) {
             let name = this.query[i].name.view();
-            if (name == "x-id".bytes()) { continue; }
+            if (name == "x-id".bytes() || startsWithBytes(name, "X-Amz-".bytes())) { continue; }
             var found = false;
             let list = allowed.bytes();
             var at: usize = 0;
@@ -141,16 +160,96 @@ struct S3Request {
         return true;
     }
 
-    /// The SigV4 check (ADR-0008 §5).
+    /// The SigV4 check: the Authorization header (ADR-0008 §5), or a presigned URL's query (ADR-0011).
     fn authenticate(borrow this, credentials: Slice<Credential>, now: i64) -> Result<Authenticated, S3Code> {
-        let value = match (headerOf(this, "authorization")) {
+        match (headerOf(this, "authorization")) {
+            Some(value) => {
+                let auth = match (parseAuthorization(value)) {
+                    Ok(a) => a,
+                    Err(_) => { return Err(S3Code.AuthorizationHeaderMalformed); }
+                };
+                let amzDate = match (headerOf(this, "x-amz-date")) {
+                    Some(v) => v,
+                    null => { return Err(S3Code.AccessDenied); }
+                };
+                let when = match (parseAmzDate(amzDate)) {
+                    Some(v) => v,
+                    null => { return Err(S3Code.AccessDenied); }
+                };
+                let skew = if (when > now) when - now else now - when;
+                if (skew > 900) { return Err(S3Code.RequestTimeTooSkewed); }
+                let payloadHash = match (headerOf(this, "x-amz-content-sha256")) {
+                    Some(v) => v,
+                    null => { return Err(S3Code.InvalidRequest); }
+                };
+                return this.verify(credentials, borrow auth, amzDate, payloadHash, this.rawQuery.view());
+            }
+            null => {}
+        }
+        if (paramOf(this, "X-Amz-Algorithm").isSome()) { return this.authenticateQuery(credentials, now); }
+        return Err(S3Code.AccessDenied);
+    }
+
+    /// A presigned URL: X-Amz-Algorithm, -Credential, -Date, -Expires, -SignedHeaders and -Signature in the query,
+    /// which is signed without its signature. The payload is UNSIGNED-PAYLOAD unless a header says otherwise.
+    fn authenticateQuery(borrow this, credentials: Slice<Credential>, now: i64) -> Result<Authenticated, S3Code> {
+        let malformed = S3Code.AuthorizationQueryParametersError;
+        if ((paramOf(this, "X-Amz-Algorithm") ?? "".bytes()) != "AWS4-HMAC-SHA256".bytes()) { return Err(malformed); }
+        if (paramOf(this, "X-Amz-Security-Token").isSome()) { return Err(S3Code.InvalidToken); }
+        let credential = match (paramOf(this, "X-Amz-Credential")) {
             Some(v) => v,
-            null => { return Err(S3Code.AccessDenied); }
+            null => { return Err(malformed); }
         };
-        let auth = match (parseAuthorization(value)) {
+        let signedHeaders = match (paramOf(this, "X-Amz-SignedHeaders")) {
+            Some(v) => v,
+            null => { return Err(malformed); }
+        };
+        let signature = match (paramOf(this, "X-Amz-Signature")) {
+            Some(v) => v,
+            null => { return Err(malformed); }
+        };
+        let amzDate = match (paramOf(this, "X-Amz-Date")) {
+            Some(v) => v,
+            null => { return Err(malformed); }
+        };
+        let expires = match (parseDecimal(paramOf(this, "X-Amz-Expires") ?? "".bytes())) {
+            Some(v) => v,
+            null => { return Err(malformed); }
+        };
+        if (expires < 1 || expires > 604800) { return Err(malformed); }
+        // The same fields as an Authorization header, so one parser checks them.
+        var header = Vector<u8>.create();
+        mapOom(header.extend("AWS4-HMAC-SHA256 Credential=".bytes()))?;
+        mapOom(header.extend(credential))?;
+        mapOom(header.extend(", SignedHeaders=".bytes()))?;
+        mapOom(header.extend(signedHeaders))?;
+        mapOom(header.extend(", Signature=".bytes()))?;
+        mapOom(header.extend(signature))?;
+        let auth = match (parseAuthorization(header.view())) {
             Ok(a) => a,
-            Err(_) => { return Err(S3Code.AuthorizationHeaderMalformed); }
+            Err(_) => { return Err(malformed); }
         };
+        let when = match (parseAmzDate(amzDate)) {
+            Some(v) => v,
+            null => { return Err(malformed); }
+        };
+        if (when > now + 900) { return Err(S3Code.AccessDenied); }                    // not valid yet
+        if (now > when + truncate<i64>(expires)) { return Err(S3Code.AccessDenied); } // expired
+        var query = Vector<u8>.create();
+        mapOom(queryWithout(this.rawQuery.view(), "X-Amz-Signature".bytes(), mut query))?;
+        let payloadHash = headerOf(this, "x-amz-content-sha256") ?? "UNSIGNED-PAYLOAD".bytes();
+        return this.verify(credentials, borrow auth, amzDate, payloadHash, query.view());
+    }
+
+    /// Checks a signature over the canonical request with `query`, then says how the payload is covered.
+    fn verify(
+        borrow this,
+        credentials: Slice<Credential>,
+        auth: borrow AuthHeader,
+        amzDate: Slice<u8>,
+        payloadHash: Slice<u8>,
+        query: Slice<u8>,
+    ) -> Result<Authenticated, S3Code> {
         if (auth.service.view() != "s3".bytes()) { return Err(S3Code.AuthorizationHeaderMalformed); }
         var secret: Slice<u8>? = null;
         for (i in 0..credentials.length) {
@@ -162,26 +261,12 @@ struct S3Request {
             Some(s) => s,
             null => { return Err(S3Code.InvalidAccessKeyId); }
         };
-        let amzDate = match (headerOf(this, "x-amz-date")) {
-            Some(d) => d,
-            null => { return Err(S3Code.AccessDenied); }
-        };
-        let when = match (parseAmzDate(amzDate)) {
-            Some(t) => t,
-            null => { return Err(S3Code.AccessDenied); }
-        };
-        let skew = if (when > now) when - now else now - when;
-        if (skew > 900) { return Err(S3Code.RequestTimeTooSkewed); }
-        if (amzDate[0..8] != auth.date.view()) { return Err(S3Code.SignatureDoesNotMatch); }
-        let payloadHash = match (headerOf(this, "x-amz-content-sha256")) {
-            Some(h) => h,
-            null => { return Err(S3Code.InvalidRequest); }
-        };
+        if (amzDate.length < 8 || amzDate[0..8] != auth.date.view()) { return Err(S3Code.SignatureDoesNotMatch); }
         var canonical = Vector<u8>.create();
         let complete = mapOom(canonicalRequest(
             this.methodText.view(),
             this.rawPath.view(),
-            this.rawQuery.view(),
+            query,
             this.headers.view(),
             auth.signedHeaders.view(),
             payloadHash,
@@ -224,6 +309,32 @@ struct S3Request {
         }
         return Err(S3Code.InvalidArgument);
     }
+}
+
+/// The raw query without the parameter `name` (as sent, not decoded).
+fn queryWithout(raw: Slice<u8>, name: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var at: usize = 0;
+    while (at < raw.length) {
+        let end = pieceEnd(raw, at, '&');
+        let part = raw[at..end];
+        at = end + 1;
+        let eq = pieceEnd(part, 0, '=');
+        if (part.length == 0 || part[0..eq] == name) { continue; }
+        if (out.length > 0) { out.push('&')?; }
+        out.extend(part)?;
+    }
+    return Ok();
+}
+
+/// The bucket a Host of `<bucket>.<domain>` (any port) names, into `out`; nothing for any other Host or no domain.
+fn virtualBucket(host: Slice<u8>, domain: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (domain.length == 0) { return Ok(); }
+    let name = host[0..pieceEnd(host, 0, ':')];
+    if (name.length <= domain.length + 1) { return Ok(); }
+    let dot = name.length - domain.length - 1;
+    if (name[dot] != '.' || !equalsIgnoreCase(name[dot + 1..], domain)) { return Ok(); }
+    out.extend(name[0..dot])?;
+    return Ok();
 }
 
 /// The field `name` (lowercase) of `r`, its first value.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# The M3 end-to-end test (ADR-0008 to ADR-0010): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
+# The M3 end-to-end test (ADR-0008 to ADR-0011): the AWS CLI v2, and tools/s3_raw.py for what the CLI does not send,
 # against `cosmostore serve` on a fresh store. Prints one line per check; exit status 1 if any fails.
 #
 # usage: tools/s3_smoke.sh [COSMOSTORE] [PORT]     (defaults: out/cosmostore, 9311)
@@ -17,7 +17,7 @@ export AWS_EC2_METADATA_DISABLED=true
 export AWS_ENDPOINT_URL="http://127.0.0.1:$port"
 echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > "$work/credentials"
 
-"$bin" serve "$work/store" "$port" "$work/credentials" 2> "$work/server.log" &
+"$bin" serve "$work/store" "$port" "$work/credentials" localhost 2> "$work/server.log" &
 server=$!
 sleep 1
 
@@ -37,6 +37,7 @@ aws s3api create-bucket --bucket smoke > /dev/null 2>&1 || fail "create-bucket"
 check "create-bucket twice" "$(code s3api create-bucket --bucket smoke)" BucketAlreadyOwnedByYou
 check "invalid bucket name" "$(code s3api create-bucket --bucket NO_)" InvalidBucketName
 check "list-buckets" "$(aws s3api list-buckets --query 'Buckets[].Name' --output text)" smoke
+check "bucket creation date" "$(aws s3api list-buckets --query 'Buckets[0].CreationDate' --output text | cut -c1-10)" "$(date -u +%Y-%m-%d)"
 aws s3api head-bucket --bucket smoke > /dev/null 2>&1 && pass "head-bucket" || fail "head-bucket"
 check "head-bucket missing" "$(code s3api head-bucket --bucket missing)" 404
 
@@ -167,6 +168,30 @@ cmp -s got.bin want2.bin && pass "upload-part-copy ranges" || fail "upload-part-
 check "delete-objects" "$(aws s3api delete-objects --bucket smoke --delete '{"Objects":[{"Key":"c/copy1"},{"Key":"c/none"},{"Key":"c/enc.txt"}]}' --query 'length(Deleted)')" 3
 check "deleted by the batch" "$(code s3api head-object --bucket smoke --key c/copy1)" 404
 check "delete-objects quiet" "$(aws s3api delete-objects --bucket smoke --delete '{"Objects":[{"Key":"c/ranged"}],"Quiet":true}' --query 'length(Deleted || `[]`)')" 0
+
+# Presigned URLs (ADR-0011): the CLI's GET, a PUT through curl, a changed URL, and an expired one.
+url=$(aws s3 presign s3://smoke/a/small.txt --expires-in 60)
+check "presigned GET" "$(curl -s "$url")" "hello cosmostore"
+check "presigned GET, changed key" "$(curl -s -o /dev/null -w '%{http_code}' "$(echo "$url" | sed 's|a/small.txt|a/big.bin|')")" 403
+url=$(python3 -I "$here/s3_raw.py" presign "$AWS_ENDPOINT_URL" PUT smoke p/presigned.txt 60)
+check "presigned PUT" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @small.txt "$url")" 200
+aws s3api get-object --bucket smoke --key p/presigned.txt o.txt > /dev/null 2>&1
+cmp -s o.txt small.txt && pass "presigned PUT stored" || fail "presigned PUT stored"
+url=$(python3 -I "$here/s3_raw.py" presign "$AWS_ENDPOINT_URL" GET smoke a/small.txt 1)
+sleep 2
+check "presigned URL expired" "$(curl -s "$url" | sed -n 's/.*<Code>\(.*\)<\/Code>.*/\1/p')" AccessDenied
+check "presigned without a signature" "$(curl -s "$(echo "$url" | sed 's/&X-Amz-Signature=.*//')" | sed -n 's/.*<Code>\(.*\)<\/Code>.*/\1/p')" AuthorizationQueryParametersError
+
+# Virtual-host addressing (ADR-0011): `smoke.localhost` names the bucket.
+printf '[default]\ns3 =\n  addressing_style = virtual\n' > virtual.cfg
+vhost() { AWS_CONFIG_FILE="$work/virtual.cfg" AWS_ENDPOINT_URL="http://localhost:$port" aws "$@"; }
+vhost s3api put-object --bucket smoke --key v/hosted.txt --body small.txt > /dev/null 2>&1
+check "virtual-host GET" "$(curl -s "$(vhost s3 presign s3://smoke/v/hosted.txt)")" "hello cosmostore"
+vhost s3 cp big.bin s3://smoke/v/big.bin > /dev/null 2>&1 && vhost s3 cp s3://smoke/v/big.bin vg.bin > /dev/null 2>&1
+cmp -s vg.bin big.bin && pass "virtual-host cp both ways" || fail "virtual-host cp both ways"
+check "virtual-host list" "$(vhost s3api list-objects-v2 --bucket smoke --prefix v/ --query 'Contents[].Key' --output text)" "v/big.bin	v/hosted.txt"
+aws s3 rm --recursive s3://smoke/v/ > /dev/null 2>&1
+aws s3 rm --recursive s3://smoke/p/ > /dev/null 2>&1
 
 # A GET dropped half way releases its pins: the overwritten extents go on the next commits.
 for i in 1 2 3; do python3 -I "$here/s3_raw.py" abort-get "$AWS_ENDPOINT_URL" smoke a/big.bin 100000 > /dev/null; done

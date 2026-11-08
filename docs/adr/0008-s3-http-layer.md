@@ -137,10 +137,11 @@ path dependency (`../../CeeSafe.Web/packages`, `web_server` 0.3.1).
 
 - **No multipart:** `aws s3 cp` of a file over 8 MB (the CLI's multipart threshold) fails with `NotImplemented`.
   Done in slice 2 (ADR-0009).
-- **Not yet built:** CopyObject, DeleteObjects, presigned URLs, POST policy, and virtual-host addressing.
+- **Not yet built:** CopyObject, DeleteObjects, presigned URLs, POST policy, and virtual-host addressing. All but
+  POST policy are done (ADR-0010, ADR-0011).
 - **Not stored:**
   - `x-amz-meta-*` user metadata;
   - the response checksum;
-  - a bucket's creation date (ListBuckets says 1970).
+  - a bucket's creation date (ListBuckets says 1970). Done in slice 4 (ADR-0011).
 - **One address:** only 127.0.0.1 is served, without TLS.
 - **No shared group commit:** PUTs are serialized on the store's lock, each with its own commit.

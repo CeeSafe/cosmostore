@@ -219,9 +219,11 @@ deadlocks. **Passed** (7 Nov 2026: 186 SIGKILLs, used/live at most 119%, recover
 
 ### M3: S3 core compatibility, the first alpha (8–10 wk)
 
-- HTTP on CeeSafe.Web with path-style and virtual-host addressing. Path-style **done** (slice 1, ADR-0008).
+- HTTP on CeeSafe.Web with path-style and virtual-host addressing. **Done** (slice 1, ADR-0008; virtual-host in
+  slice 4, ADR-0011).
 - SigV4 header/query auth, presigned URLs, **aws-chunked and trailing checksums** (#4),
-  and POST policy. Header auth, aws-chunked and trailing checksums **done** (slice 1).
+  and POST policy. Header auth, aws-chunked and trailing checksums **done** (slice 1); query auth and presigned
+  URLs **done** (slice 4, ADR-0011). POST policy left.
 - Bucket CRUD, ListBuckets, GetBucketLocation. **Done** (slice 1).
 - PUT/GET/HEAD/DELETE, DeleteObjects, CopyObject, Range, conditional GET/PUT via CAS. **Done** (slices 1 and 3).
 - ListObjects v1/v2 with delimiter, continuation-token, start-after and encoding-type. **Done** (slice 1).
@@ -624,6 +626,30 @@ CopyObject, UploadPartCopy and DeleteObjects. With them, `aws s3 cp` between S3 
 - **M3 left:**
   - presigned URLs, POST policy, virtual-host addressing;
   - user metadata, tags, bucket creation dates, response checksums;
+  - CopyObject destination conditions;
+  - expiring abandoned uploads;
+  - binding beyond loopback, and TLS;
+  - the SDK matrix (boto3, Go, Java, .NET, rclone) and the s3-tests subset.
+
+### 8 Nov 2026: M3 slice 4, presigned URLs and virtual hosts (ADR-0011)
+
+- **Presigned URLs:** SigV4 in the query (`X-Amz-Algorithm`, `-Credential`, `-Date`, `-Expires`, `-SignedHeaders`,
+  `-Signature`).
+  - Header and query auth now share one verification.
+  - Expiry and future dates are checked, and session tokens are refused (`InvalidToken`).
+  - AWS's published presigned example gives its documented signature exactly.
+- **Virtual-host addressing:** `cosmostore serve … [domain]`. A Host of `<bucket>.<domain>` names the bucket, and
+  path-style still works.
+- **ListBuckets** reports real creation dates. The store always had them, in `BucketCreate` and checkpoints.
+- **Tests:**
+  - 2 unit tests (the presigned example, virtual-host parsing);
+  - `tools/s3_smoke.sh`: 88 checks, up from 78. They cover `aws s3 presign` with curl, a presigned PUT from
+    `tools/s3_raw.py presign`, changed, expired and unsigned URLs, and the CLI in `addressing_style = virtual`
+    against `smoke.localhost`;
+  - `ceesafec test`: 86 pass.
+- **M3 left:**
+  - POST policy;
+  - user metadata, tags, response checksums;
   - CopyObject destination conditions;
   - expiring abandoned uploads;
   - binding beyond loopback, and TLS;

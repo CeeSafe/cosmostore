@@ -16,6 +16,9 @@ struct S3App {
     store: AsyncMutex<ObjectStore>;
     credentials: Vector<Credential>;
     requests: AtomicU64;
+    /// With virtual-host addressing, the domain under which `<bucket>.<domain>` names a bucket (empty: path-style
+    /// only). ADR-0011.
+    domain: Vector<u8>;
 }
 
 fn statusOf(code: u16) -> StatusCode => StatusCode.of(code) ?? Status.internalServerError();
@@ -121,7 +124,7 @@ fn isMethod(m: Method, want: Method) -> bool => Methods.same(m, want);
 
 /// Authenticates and dispatches one request.
 async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
-    let req = S3Request.of(request)?;
+    let req = S3Request.of(request, app.domain.view())?;
     let now = Clock.unixMillis() / 1000;
     let auth = match (req.authenticate(app.credentials.view(), now)) {
         Ok(a) => a,
@@ -224,25 +227,26 @@ async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mu
 // ---- Service and buckets ----
 
 async fn listBuckets(app: borrow S3App, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
-    let names = await storeBucketNames(app)?;
+    let buckets = await storeBucketList(app)?;
     var body = Vector<u8>.create();
     body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"".bytes())?;
     body.extend(S3_XMLNS.bytes())?;
     body.extend("\"><Owner><ID>cosmostore</ID><DisplayName>cosmostore</DisplayName></Owner><Buckets>".bytes())?;
-    for (i in 0..names.length) {
+    for (i in 0..buckets.length) {
         body.extend("<Bucket><Name>".bytes())?;
-        appendXmlEscaped(mut body, names[i].view())?;
-        // The store does not keep a bucket's creation time yet (ADR-0008, limits).
-        body.extend("</Name><CreationDate>1970-01-01T00:00:00.000Z</CreationDate></Bucket>".bytes())?;
+        appendXmlEscaped(mut body, buckets[i].name.view())?;
+        body.extend("</Name><CreationDate>".bytes())?;
+        appendIso8601(mut body, buckets[i].createdMillis)?;
+        body.extend("</CreationDate></Bucket>".bytes())?;
     }
     body.extend("</Buckets></ListAllMyBucketsResult>".bytes())?;
     return await sendXml(exchange, borrow body);
 }
 
-async fn storeBucketNames(app: borrow S3App) -> Result<Vector<Vector<u8>>, S3Fail> {
+async fn storeBucketList(app: borrow S3App) -> Result<Vector<BucketEntry>, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return match (await Async.blocking(() => store.listBuckets())) {
+    return match (await Async.blocking(() => store.listBucketInfo())) {
         Ok(v) => Ok(v),
         Err(e) => Err(storeFail(e, 0)),
     };
