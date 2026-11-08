@@ -234,10 +234,11 @@ deadlocks. **Passed** (7 Nov 2026: 186 SIGKILLs, used/live at most 119%, recover
   by default.
 - CI matrix: AWS CLI v2, boto3, Go/Java/.NET SDKs, rclone, plus the relevant subset of
   Ceph s3-tests. CLI, rclone, boto3, Go and JavaScript **pass** (slice 6, ADR-0013, `docs/compatibility.md`), and
-  so does the s3-tests subset of 218 (slice 7, ADR-0014). Java and .NET left.
+  so does the s3-tests subset (slice 7, ADR-0014); Java (slice 14) and .NET (slice 15) pass too.
 
 **Exit:** the Tier A subset in the matrix passes the s3-tests subset and the SDK matrix.
-The compatibility matrix is published.
+The compatibility matrix is published. **Passed** (9 Nov 2026): the AWS CLI, rclone, boto3, Go,
+JavaScript, Java and .NET SDK checks and the s3-tests subset of 252 all pass; the matrix is `docs/compatibility.md`.
 
 ### M4: Small-object performance hardening (4–6 wk)
 
@@ -932,3 +933,23 @@ Browser form uploads with a SigV4 POST policy.
   - The server needed no change.
 - **M3 left:** the .NET SDK. Downloading its tarball into the scratchpad was refused by this session's permission
   check, so it waits for the user.
+
+### 9 Nov 2026: M3 slice 15, the .NET SDK; M3 complete
+
+- **`tools/sdk/dotnet.sh`:** the AWS SDK for .NET (AWSSDK.S3 4.0.104.11 with CrtIntegration), 22 checks, all
+  passing. They cover every checksum algorithm, typed errors, paginators, TransferUtility multipart, copy,
+  presigned GET and PUT through HttpClient, virtual hosts, tags and batch delete.
+- **Setup:** the .NET 10 SDK was already installed (`/usr/local/share/dotnet`); my earlier check had run
+  `dotnet version`, which is not a command. The NuGet cache is kept in the scratchpad.
+- **What .NET showed:** it needs the CRT integration for CRC32C and CRC64NVME, as boto3 and Java do. It reports a
+  HEAD's 404 as `NotFound` (Java names it NoSuchBucket). The server needed no change.
+- **M3 exit: passed.** Every client in the matrix passes, and so does the s3-tests subset:
+  - the AWS CLI (122 checks), rclone (20), boto3 (52), Go (22), JavaScript (28), Java (25) and .NET (22);
+  - TLS (23);
+  - s3-tests (252);
+  - the matrix is published in `docs/compatibility.md`.
+- **Next: M4, small-object performance hardening.** Its list: journal shards, read caches, allocation profiling,
+  latency dashboards, the comparison run. M3 also left some work to it:
+  - checkpointing without the store's lock;
+  - group commit across concurrent PUTs (ADR-0008 §4);
+  - an ordered index for listing and lifecycle.

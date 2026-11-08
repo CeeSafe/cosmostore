@@ -1,6 +1,7 @@
 # S3 compatibility
 
-What `cosmostore serve` supports, and which clients are tested against it (ROADMAP M3). Every client run starts
+What `cosmostore serve` supports, and which clients are tested against it (ROADMAP M3, whose exit this matrix
+passed on 9 Nov 2026). Every client run starts
 on a fresh store and ends with fsck. Updated 8 Nov 2026.
 
 ## Clients
@@ -13,15 +14,15 @@ on a fresh store and ends with fsck. Updated 8 Nov 2026.
 | AWS SDK for Go v2 | service/s3 1.114.9 | `tools/sdk/go.sh` | 22 | pass |
 | AWS SDK for JavaScript v3 | client-s3 3.1164.0 | `tools/sdk/js.sh` | 28 | pass |
 | AWS SDK for Java v2 (with aws-crt) | 2.57.11 | `tools/sdk/java.sh` | 25 | pass |
-| AWS SDK for .NET | — | — | — | not run yet |
+| AWS SDK for .NET (with CrtIntegration) | AWSSDK.S3 4.0.104.11 | `tools/sdk/dotnet.sh` | 22 | pass |
 | Ceph s3-tests (subset) | commit 5b39871 | `tools/s3tests/run.sh` | 252 | pass |
 
 ### Client settings to know
 
 - **boto3** presigns with SigV2 for a custom endpoint unless it is told otherwise:
   `Config(signature_version="s3v4")`. CosmoStore accepts SigV4 only, and refuses SigV2 with S3's `InvalidRequest`.
-  boto3's CRC32C and CRC64NVME checksums need `pip install "boto3[crt]"`, and the Java SDK's need the
-  `software.amazon.awssdk.crt:aws-crt` dependency.
+  boto3's CRC32C and CRC64NVME checksums need `pip install "boto3[crt]"`, the Java SDK's need the
+  `software.amazon.awssdk.crt:aws-crt` dependency, and the .NET SDK's need `AWSSDK.Extensions.CrtIntegration`.
 - **The JavaScript SDK's presigned PUT** signs a CRC32 of an empty body unless the client sets
   `requestChecksumCalculation: "WHEN_REQUIRED"`. S3 then refuses the upload with BadDigest, and so does CosmoStore.
 - **Virtual-host addressing** needs `cosmostore serve … <domain>`, so that buckets are `<bucket>.<domain>`.

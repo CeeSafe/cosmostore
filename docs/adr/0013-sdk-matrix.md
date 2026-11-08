@@ -64,6 +64,7 @@ All pass, each followed by a clean fsck, as does `tools/s3_smoke.sh` (96 checks)
 - **The Java SDK v2:** run since slice 14, `tools/sdk/java.sh` (25 checks). Maven ran from the scratchpad, and its
   tarball was checked against Apache's SHA-512. The checks cover checksums, typed errors, paginators, the async
   multipart client (upload, download and copy), the presigner, virtual hosts, tags and batch delete.
-- **The .NET SDK:** no .NET SDK is installed.
+- **The .NET SDK:** run since slice 15, `tools/sdk/dotnet.sh` (22 checks, AWSSDK.S3 4.0.104.11 with CrtIntegration).
+  The .NET 10 SDK was found installed in `/usr/local/share/dotnet`; an earlier check had misread `dotnet version`.
 - **The Ceph s3-tests subset.**
 - **Response checksums:** the Go SDK notes "Response has no supported checksum", and every client accepts that.
