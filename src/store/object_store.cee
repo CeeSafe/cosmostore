@@ -186,6 +186,9 @@ struct StoreState {
     extentBytes: u64;
     /// Multipart uploads in progress (ADR-0009).
     uploads: HashMap<UploadKey, Upload>;
+    /// The latest completions, oldest first, so a retried Complete gets its first answer (ADR-0014). Rebuilt from
+    /// the journal after the newest checkpoint, and never written to one.
+    completions: Vector<Completion>;
 
     fn create() -> StoreState => StoreState {
         index: HashMap<IndexKey, ObjectVersion>.create(),
@@ -195,6 +198,7 @@ struct StoreState {
         deadExtents: Vector<ExtentRef>.create(),
         extentBytes: 0,
         uploads: HashMap<UploadKey, Upload>.create(),
+        completions: Vector<Completion>.create(),
     };
 
     /// Releases a superseded or deleted version: its record bytes and its extents.
@@ -302,6 +306,7 @@ fn applyRecord(
             if (!takeCompletedUpload(state, c.id, extents.view())?) {
                 state.extentBytes += extentRefBytes(extents.view());
             }
+            rememberCompletion(state, borrow c, lsn)?;
             return applyPut(state, c.put, extents, c.parts, lsn, segment, offset, totalLen, meta.length, payloadLen);
         }
         RecordType.UploadCreate => {
@@ -1416,13 +1421,43 @@ struct ObjectStore {
         key: StringView,
         id: [u8; 16],
         chosen: Slice<PartChoice>,
+    ) -> Result<PutOutcome, StoreError> => this.completeUploadIf(bucket, key, id, chosen, PutCondition.None);
+
+    /// `completeUpload` if `condition` holds for the key's current version, checked with the commit (ADR-0014). A
+    /// retry of a completion whose object is still current gets the first answer, whatever its parts and condition.
+    fn completeUploadIf(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16],
+        chosen: Slice<PartChoice>,
+        condition: PutCondition,
     ) -> Result<PutOutcome, StoreError> {
         this.commitStaged()?;
         this.checkWritable()?;
         var manifest = Vector<u8>.create();
         var meta = Vector<u8>.create();
         {
-            this.findUpload(bucket, key, id)?;
+            match (this.findUpload(bucket, key, id)) {
+                Ok() => {}
+                Err(StoreError.NoSuchUpload) => {
+                    match (this.repeatedCompletion(bucket, key, id)?) {
+                        Some(outcome) => { return Ok(outcome); }
+                        null => { return Err(StoreError.NoSuchUpload); }
+                    }
+                }
+                Err(e) => { return Err(e); }
+            }
+            let current = this.currentGeneration(bucket, key)?;
+            match (condition) {
+                PutCondition.None => {}
+                PutCondition.IfAbsent => {
+                    if (current.isSome()) { return Err(StoreError.PreconditionFailed); }
+                }
+                PutCondition.IfGeneration(g) => {
+                    if ((current ?? 0) != g) { return Err(StoreError.PreconditionFailed); }
+                }
+            }
             let uk = UploadKey { id: id };
             let u = match (this.state.uploads.get(borrow uk)) {
                 Some(u) => u,
@@ -1476,6 +1511,29 @@ struct ObjectStore {
             null => [0u8; 16],
         };
         return Ok(PutOutcome { md5: md5, generation: lsn, parts: truncate<u32>(chosen.length) });
+    }
+
+    /// The first answer to the completion of `id`, if its object is still the key's current version.
+    fn repeatedCompletion(
+        borrow this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16],
+    ) -> Result<PutOutcome?, StoreError> {
+        for (c in this.state.completions.view()) {
+            if (c.id[..] != id[..] || c.bucket.view() != bucket.bytes() || c.key.view() != key.bytes()) { continue; }
+            let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+            match (this.state.index.get(borrow k)) {
+                Some(v) => {
+                    if (v.lsn == c.generation) {
+                        return Ok(PutOutcome { md5: v.md5, generation: v.lsn, parts: v.parts });
+                    }
+                }
+                null => {}
+            }
+            return Ok(null);
+        }
+        return Ok(null);
     }
 
     /// The uploads of `bucket` whose keys start with `prefix`, in key order, then by initiation. The listing starts

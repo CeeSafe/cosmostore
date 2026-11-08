@@ -14,7 +14,7 @@ on a fresh store and ends with fsck. Updated 8 Nov 2026.
 | AWS SDK for JavaScript v3 | client-s3 3.1164.0 | `tools/sdk/js.sh` | 25 | pass |
 | AWS SDK for Java v2 | — | — | — | not run yet |
 | AWS SDK for .NET | — | — | — | not run yet |
-| Ceph s3-tests (subset) | — | — | — | not run yet |
+| Ceph s3-tests (subset) | commit 5b39871 | `tools/s3tests/run.sh` | 218 | pass |
 
 ### Client settings to know
 
@@ -26,19 +26,26 @@ on a fresh store and ends with fsck. Updated 8 Nov 2026.
 - **Virtual-host addressing** needs `cosmostore serve … <domain>`, so that buckets are `<bucket>.<domain>`.
   Path-style always works.
 
+### s3-tests
+
+The subset is every in-scope test that passes (`tools/s3tests/subset.txt`). At this commit, 440 tests are left once
+the out-of-scope markers are excluded. 218 pass, and ADR-0014 accounts for the other 222: most test ACLs, object
+lock, versioning, POST object, CORS or policies. Of the rest, 15 need response checksums and 3 need GET
+`?partNumber`.
+
 ## Operations
 
 | Area | Supported | Not yet |
 |---|---|---|
 | Auth | SigV4 headers; presigned URLs, with hoisted `x-amz-*` query headers; aws-chunked, signed and unsigned, with trailers | SigV2, POST policy, session tokens |
-| Buckets | Create, Head, Delete, List (with creation dates), GetBucketLocation, GetBucketVersioning (always unversioned) | versioning, policies, ACLs, CORS, lifecycle |
-| Objects | Put, Get, Head, Delete; Range; If-Match / If-None-Match / If-(Un)Modified-Since; conditional PUT (`If-None-Match: *`, `If-Match`); `response-*` | GET `?partNumber`, object lock |
+| Buckets | Create, Head, Delete, List (with creation dates and pagination), GetBucketLocation, GetBucketVersioning (always unversioned), ListObjectVersions (one `null` version per object) | versioning, policies, ACLs, CORS, lifecycle |
+| Objects | Put, Get, Head, Delete; Range; If-Match / If-None-Match / If-(Un)Modified-Since; conditional PUT and Complete (`If-None-Match`, `If-Match`); `response-*`; `versionId=null` | GET `?partNumber`, object lock |
 | Integrity | Content-MD5; `x-amz-checksum-{crc32,crc32c,crc64nvme,sha256}` on the request | SHA-1 checksums; checksums in responses |
 | Metadata | `x-amz-meta-*` (2 KiB), Content-Encoding/-Disposition/-Language, Cache-Control, Expires | tagging (GetObjectTagging returns an empty set) |
 | Listing | ListObjects v1 and v2: prefix, delimiter, pagination, `encoding-type=url` | |
-| Multipart | Create, UploadPart, UploadPartCopy (ranges), Complete, Abort, ListParts, ListMultipartUploads | `delimiter` in ListMultipartUploads; expiring abandoned uploads |
+| Multipart | Create, UploadPart, UploadPartCopy (ranges), Complete (a retry gets its first answer), Abort, ListParts, ListMultipartUploads | `delimiter` in ListMultipartUploads; expiring abandoned uploads |
 | Copy and delete | CopyObject (COPY/REPLACE, `x-amz-copy-source-if-*`), DeleteObjects (one sync per batch) | destination conditions on CopyObject |
 | Addressing | path-style; virtual-host under a configured domain | |
 | Network | HTTP/1.1 on 127.0.0.1 | other addresses, TLS |
 
-Anything else gets S3's `NotImplemented` (501) XML error. Design notes: ADR-0008 to ADR-0013 in `docs/adr/`.
+Anything else gets S3's `NotImplemented` (501) XML error. Design notes: ADR-0008 to ADR-0014 in `docs/adr/`.

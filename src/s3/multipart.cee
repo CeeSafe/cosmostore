@@ -300,12 +300,14 @@ async fn completeMultipartUpload(
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
     let id = uploadIdOf(req)?;
+    var etags = Vector<u8>.create();
+    let condition = putConditionOf(req, mut etags)?;
     let xml = await readSmallBody(auth, exchange, MAX_COMPLETE_BODY)?;
     verifySmallBody(req, xml.view())?;
     let chosen = parseCompleteBody(xml.view())?;
     let bucket = req.bucket.view();
     let key = req.key.view();
-    let outcome = await storeComplete(app, bucket, key, id, chosen.view())?;
+    let outcome = await storeComplete(app, bucket, key, id, chosen.view(), condition, etags.view())?;
     var body = Vector<u8>.create();
     xmlHead(mut body, "CompleteMultipartUploadResult")?;
     var location = Vector<u8>.create();
@@ -327,13 +329,29 @@ async fn storeComplete(
     key: StringView,
     id: [u8; 16],
     parts: Slice<PartChoice>,
+    condition: PutIf,
+    etags: Slice<u8>,
 ) -> Result<PutOutcome, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return match (await Async.blocking(() => store.completeUpload(bucket, key, id, parts))) {
+    return match (await Async.blocking(() => completeWith(store, bucket, key, id, parts, condition, etags))) {
         Ok(o) => Ok(o),
         Err(e) => Err(storeFail(e, key.length)),
     };
+}
+
+/// Under the lock: the condition (from the key's current version), then the completion.
+fn completeWith(
+    store: borrow mut ObjectStore,
+    bucket: StringView,
+    key: StringView,
+    id: [u8; 16],
+    parts: Slice<PartChoice>,
+    condition: PutIf,
+    etags: Slice<u8>,
+) -> Result<PutOutcome, StoreError> {
+    let cond = resolveCondition(store, bucket, key, condition, etags)?;
+    return store.completeUploadIf(bucket, key, id, parts, cond);
 }
 
 // ---- AbortMultipartUpload ----

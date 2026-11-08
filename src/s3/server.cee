@@ -133,8 +133,10 @@ async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mu
     let m = req.method;
     if (req.bucket.length == 0) {
         if (isMethod(m, Method.Get) || isMethod(m, Method.Head)) {
-            if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-            return await listBuckets(app, exchange);
+            if (!req.onlyParams("max-buckets,continuation-token,prefix")) {
+                return Err(S3Fail.Code(S3Code.NotImplemented));
+            }
+            return await listBuckets(app, borrow req, exchange);
         }
         return Err(S3Fail.Code(S3Code.MethodNotAllowed));
     }
@@ -152,6 +154,12 @@ async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mu
             if (req.hasParam("location")) {
                 if (!req.onlyParams("location")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
                 return await bucketLocation(app, borrow req, exchange);
+            }
+            if (req.hasParam("versions")) {
+                if (!req.onlyParams("versions,prefix,delimiter,key-marker,version-id-marker,max-keys,encoding-type")) {
+                    return Err(S3Fail.Code(S3Code.NotImplemented));
+                }
+                return await listObjectVersions(app, borrow req, exchange);
             }
             if (req.hasParam("versioning")) {
                 if (!req.onlyParams("versioning")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
@@ -190,8 +198,15 @@ async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mu
         if (copying) { return await copyObject(app, borrow req, exchange); }
         return await putObject(app, borrow req, auth, exchange);
     }
+    // An unversioned bucket's one version is `null` (ADR-0014): naming it is the same as naming none.
+    match (paramOf(borrow req, "versionId")) {
+        Some(v) => {
+            if (v != "null".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        }
+        null => {}
+    }
     if (isMethod(m, Method.Get) && req.hasParam("tagging")) {
-        if (!req.onlyParams("tagging")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        if (!req.onlyParams("tagging,versionId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
         return await getObjectTagging(app, borrow req, exchange);
     }
     if (isMethod(m, Method.Get) && req.hasParam("uploadId")) {
@@ -202,7 +217,7 @@ async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mu
     }
     if (isMethod(m, Method.Get) || isMethod(m, Method.Head)) {
         if (!req.onlyParams(
-            "response-content-type,response-content-language,response-expires,response-cache-control,response-content-disposition,response-content-encoding",
+            "versionId,response-content-type,response-content-language,response-expires,response-cache-control,response-content-disposition,response-content-encoding",
         )) {
             return Err(S3Fail.Code(S3Code.NotImplemented));
         }
@@ -213,7 +228,7 @@ async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mu
             if (!req.onlyParams("uploadId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
             return await abortMultipartUpload(app, borrow req, exchange);
         }
-        if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        if (!req.onlyParams("versionId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
         return await deleteObject(app, borrow req, exchange);
     }
     if (isMethod(m, Method.Post)) {
@@ -230,8 +245,43 @@ async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mu
 
 // ---- Service and buckets ----
 
-async fn listBuckets(app: borrow S3App, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
-    let buckets = await storeBucketList(app)?;
+/// ListBuckets, with S3's pagination: `max-buckets` (1 to 10,000), `continuation-token` (the previous page's last
+/// name, base64), and `prefix`.
+async fn listBuckets(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let all = await storeBucketList(app)?;
+    let prefix = paramOf(req, "prefix") ?? "".bytes();
+    var limit: usize = 10000;
+    match (paramOf(req, "max-buckets")) {
+        Some(t) => {
+            match (parseDecimal(t)) {
+                Some(v) => {
+                    if (v < 1 || v > 10000) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                    limit = v as usize;
+                }
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+        }
+        null => {}
+    }
+    var after = Vector<u8>.create();
+    match (paramOf(req, "continuation-token")) {
+        Some(t) => {
+            if (!decodeBase64(t, mut after)?) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        }
+        null => {}
+    }
+    var buckets = Vector<BucketEntry>.create();
+    var more = false;
+    for (i in 0..all.length) {
+        let name = all[i].name.view();
+        if (!startsWithBytes(name, prefix)) { continue; }
+        if (after.length > 0 && compareBytes(name, after.view()) <= 0) { continue; }
+        if (buckets.length == limit) {
+            more = true;
+            break;
+        }
+        buckets.push(BucketEntry { name: copyBytes(name)?, createdMillis: all[i].createdMillis })?;
+    }
     var body = Vector<u8>.create();
     body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"".bytes())?;
     body.extend(S3_XMLNS.bytes())?;
@@ -243,7 +293,14 @@ async fn listBuckets(app: borrow S3App, exchange: borrow mut Exchange) -> Result
         appendIso8601(mut body, buckets[i].createdMillis)?;
         body.extend("</CreationDate></Bucket>".bytes())?;
     }
-    body.extend("</Buckets></ListAllMyBucketsResult>".bytes())?;
+    body.extend("</Buckets>".bytes())?;
+    if (more) {
+        var token = Vector<u8>.create();
+        appendBase64(mut token, buckets[buckets.length - 1].name.view())?;
+        xmlElement(mut body, "ContinuationToken", token.view(), false)?;
+    }
+    if (prefix.length > 0) { xmlElement(mut body, "Prefix", prefix, false)?; }
+    body.extend("</ListAllMyBucketsResult>".bytes())?;
     return await sendXml(exchange, borrow body);
 }
 
@@ -353,9 +410,14 @@ async fn listObjects(app: borrow S3App, req: borrow S3Request, exchange: borrow 
     // else start-after; v1's marker.
     var after = Vector<u8>.create();
     var afterIsPrefix = false;
+    // An empty token is no token, though it is echoed back, as S3 does.
     let token = paramOf(req, "continuation-token");
+    let tokenGiven = match (token) {
+        Some(t) => t.length > 0,
+        null => false,
+    };
     if (v2) {
-        match (token) {
+        match (if (tokenGiven) token else null) {
             Some(t) => {
                 var raw = Vector<u8>.create();
                 if (!decodeBase64(t, mut raw)? || raw.length == 0 || raw[0] > 1) {
@@ -392,6 +454,10 @@ async fn listObjects(app: borrow S3App, req: borrow S3Request, exchange: borrow 
         afterIsPrefix,
         maxKeys,
     )?;
+    // max-keys=0 lists nothing and, as S3 answers, is not truncated.
+    let truncated = page.truncated && maxKeys > 0;
+    // fetch-owner in v2; v1 always has owners.
+    let withOwner = !v2 || (paramOf(req, "fetch-owner") ?? "".bytes()) == "true".bytes();
 
     var body = Vector<u8>.create();
     body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"".bytes())?;
@@ -399,14 +465,15 @@ async fn listObjects(app: borrow S3App, req: borrow S3Request, exchange: borrow 
     body.extend("\"><Name>".bytes())?;
     appendXmlEscaped(mut body, req.bucket.view().bytes())?;
     body.extend("</Name>".bytes())?;
-    xmlElement(mut body, "Prefix", prefix.view().bytes(), urlEncoded)?;
+    // v1 does not encode its own Prefix element (botocore decodes it only in v2).
+    xmlElement(mut body, "Prefix", prefix.view().bytes(), urlEncoded && v2)?;
     if (delimiter.length > 0) { xmlElement(mut body, "Delimiter", delimiter.view().bytes(), urlEncoded)?; }
     body.extend("<MaxKeys>".bytes())?;
     appendDecimal(mut body, maxKeys as u64)?;
     body.extend("</MaxKeys>".bytes())?;
     if (urlEncoded) { body.extend("<EncodingType>url</EncodingType>".bytes())?; }
     body.extend(
-        if (page.truncated) "<IsTruncated>true</IsTruncated>".bytes() else "<IsTruncated>false</IsTruncated>".bytes(),
+        if (truncated) "<IsTruncated>true</IsTruncated>".bytes() else "<IsTruncated>false</IsTruncated>".bytes(),
     )?;
     if (v2) {
         body.extend("<KeyCount>".bytes())?;
@@ -414,14 +481,13 @@ async fn listObjects(app: borrow S3App, req: borrow S3Request, exchange: borrow 
         body.extend("</KeyCount>".bytes())?;
         match (token) {
             Some(t) => { xmlElement(mut body, "ContinuationToken", t, false)?; }
-            null => {
-                match (paramOf(req, "start-after")) {
-                    Some(s) => { xmlElement(mut body, "StartAfter", s, urlEncoded)?; }
-                    null => {}
-                }
-            }
+            null => {}
         }
-        if (page.truncated) {
+        match (paramOf(req, "start-after")) {
+            Some(s) => { xmlElement(mut body, "StartAfter", s, urlEncoded)?; }
+            null => {}
+        }
+        if (truncated) {
             var next = Vector<u8>.create();
             next.push(if (page.nextMarkerIsPrefix) 1u8 else 0u8)?;
             next.extend(page.nextMarker.view())?;
@@ -431,7 +497,7 @@ async fn listObjects(app: borrow S3App, req: borrow S3Request, exchange: borrow 
         }
     } else {
         xmlElement(mut body, "Marker", paramOf(req, "marker") ?? "".bytes(), urlEncoded)?;
-        if (page.truncated) { xmlElement(mut body, "NextMarker", page.nextMarker.view(), urlEncoded)?; }
+        if (truncated) { xmlElement(mut body, "NextMarker", page.nextMarker.view(), urlEncoded)?; }
     }
     for (i in 0..page.keys.length) {
         body.extend("<Contents>".bytes())?;
@@ -444,7 +510,11 @@ async fn listObjects(app: borrow S3App, req: borrow S3Request, exchange: borrow 
         appendXmlEscaped(mut body, etag.view())?;
         body.extend("</ETag><Size>".bytes())?;
         appendDecimal(mut body, page.sizes[i])?;
-        body.extend("</Size><StorageClass>STANDARD</StorageClass></Contents>".bytes())?;
+        body.extend("</Size><StorageClass>STANDARD</StorageClass>".bytes())?;
+        if (withOwner) {
+            body.extend("<Owner><ID>cosmostore</ID><DisplayName>cosmostore</DisplayName></Owner>".bytes())?;
+        }
+        body.extend("</Contents>".bytes())?;
     }
     for (i in 0..page.commonPrefixes.length) {
         body.extend("<CommonPrefixes>".bytes())?;
@@ -557,5 +627,99 @@ async fn bucketVersioning(
     body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"".bytes())?;
     body.extend(S3_XMLNS.bytes())?;
     body.extend("\"></VersioningConfiguration>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// ListObjectVersions in an unversioned bucket (ADR-0014): every object is its one version, `null`, and the latest.
+/// The key marker works as ListObjects v1's marker; a version-id marker can only name `null`, which is that key's
+/// one version, so it changes nothing.
+async fn listObjectVersions(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let prefix = utf8Param(req, "prefix")?;
+    let delimiter = utf8Param(req, "delimiter")?;
+    let urlEncoded = match (paramOf(req, "encoding-type")) {
+        Some(t) => {
+            if (t != "url".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            true
+        }
+        null => false,
+    };
+    var maxKeys: usize = 1000;
+    match (paramOf(req, "max-keys")) {
+        Some(t) => {
+            match (parseDecimal(t)) {
+                Some(v) => {
+                    if (v < 1000) { maxKeys = v as usize; }
+                }
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+        }
+        null => {}
+    }
+    var after = Vector<u8>.create();
+    var afterIsPrefix = false;
+    match (paramOf(req, "key-marker")) {
+        Some(m) => {
+            after.extend(m)?;
+            let d = delimiter.view().bytes();
+            afterIsPrefix = d.length > 0 && m.length >= d.length && m[m.length - d.length..] == d &&
+                startsWithBytes(m, prefix.view().bytes());
+        }
+        null => {}
+    }
+    let page = await listPage(
+        app,
+        req.bucket.view(),
+        prefix.view(),
+        delimiter.view(),
+        borrow after,
+        afterIsPrefix,
+        maxKeys,
+    )?;
+    let truncated = page.truncated && maxKeys > 0;
+    var body = Vector<u8>.create();
+    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"".bytes())?;
+    body.extend(S3_XMLNS.bytes())?;
+    body.extend("\"><Name>".bytes())?;
+    appendXmlEscaped(mut body, req.bucket.view().bytes())?;
+    body.extend("</Name>".bytes())?;
+    xmlElement(mut body, "Prefix", prefix.view().bytes(), urlEncoded)?;
+    xmlElement(mut body, "KeyMarker", paramOf(req, "key-marker") ?? "".bytes(), urlEncoded)?;
+    xmlElement(mut body, "VersionIdMarker", paramOf(req, "version-id-marker") ?? "".bytes(), false)?;
+    if (truncated) {
+        xmlElement(mut body, "NextKeyMarker", page.nextMarker.view(), urlEncoded)?;
+        if (!page.nextMarkerIsPrefix) { body.extend("<NextVersionIdMarker>null</NextVersionIdMarker>".bytes())?; }
+    }
+    if (delimiter.length > 0) { xmlElement(mut body, "Delimiter", delimiter.view().bytes(), urlEncoded)?; }
+    body.extend("<MaxKeys>".bytes())?;
+    appendDecimal(mut body, maxKeys as u64)?;
+    body.extend("</MaxKeys>".bytes())?;
+    if (urlEncoded) { body.extend("<EncodingType>url</EncodingType>".bytes())?; }
+    body.extend(
+        if (truncated) "<IsTruncated>true</IsTruncated>".bytes() else "<IsTruncated>false</IsTruncated>".bytes(),
+    )?;
+    for (i in 0..page.keys.length) {
+        body.extend("<Version>".bytes())?;
+        xmlElement(mut body, "Key", page.keys[i].view(), urlEncoded)?;
+        body.extend("<VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>".bytes())?;
+        appendIso8601(mut body, page.mtimes[i])?;
+        body.extend("</LastModified><ETag>".bytes())?;
+        var etag = Vector<u8>.create();
+        appendEtag(mut etag, borrow page.md5s[i], page.parts[i])?;
+        appendXmlEscaped(mut body, etag.view())?;
+        body.extend("</ETag><Size>".bytes())?;
+        appendDecimal(mut body, page.sizes[i])?;
+        body.extend("</Size><StorageClass>STANDARD</StorageClass>".bytes())?;
+        body.extend("<Owner><ID>cosmostore</ID><DisplayName>cosmostore</DisplayName></Owner></Version>".bytes())?;
+    }
+    for (i in 0..page.commonPrefixes.length) {
+        body.extend("<CommonPrefixes>".bytes())?;
+        xmlElement(mut body, "Prefix", page.commonPrefixes[i].view(), urlEncoded)?;
+        body.extend("</CommonPrefixes>".bytes())?;
+    }
+    body.extend("</ListVersionsResult>".bytes())?;
     return await sendXml(exchange, borrow body);
 }

@@ -157,7 +157,7 @@ check "UploadPartCopy ETag" "$(aws s3api head-object --bucket smoke --key c/huge
 id=$(aws s3api create-multipart-upload --bucket smoke --key c/ranged --query UploadId --output text)
 r1=$(aws s3api upload-part-copy --bucket smoke --key c/ranged --upload-id "$id" --part-number 1 --copy-source smoke/m/huge.bin --copy-source-range bytes=1000-5243879 --query CopyPartResult.ETag --output text | tr -d '"')
 r2=$(aws s3api upload-part-copy --bucket smoke --key c/ranged --upload-id "$id" --part-number 2 --copy-source smoke/a/small.txt --query CopyPartResult.ETag --output text | tr -d '"')
-check "part copy range past the end" "$(code s3api upload-part-copy --bucket smoke --key c/ranged --upload-id "$id" --part-number 3 --copy-source smoke/a/small.txt --copy-source-range bytes=0-17)" InvalidArgument
+check "part copy range past the end" "$(code s3api upload-part-copy --bucket smoke --key c/ranged --upload-id "$id" --part-number 3 --copy-source smoke/a/small.txt --copy-source-range bytes=0-17)" InvalidRange
 aws s3api complete-multipart-upload --bucket smoke --key c/ranged --upload-id "$id" \
     --multipart-upload "{\"Parts\":[{\"ETag\":\"$r1\",\"PartNumber\":1},{\"ETag\":\"$r2\",\"PartNumber\":2}]}" > /dev/null 2>&1
 aws s3api get-object --bucket smoke --key c/ranged got.bin > /dev/null 2>&1

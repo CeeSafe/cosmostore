@@ -131,6 +131,74 @@ enum PutIf {
     Absent,
     /// If-Match: the current version's ETag must be one of these (`*`: any version).
     Matches,
+    /// If-None-Match with ETags: the key may be absent, or its current ETag must be none of these (ADR-0014).
+    NoneMatch,
+}
+
+/// A write's If-Match / If-None-Match, and the ETag list it names, from the request.
+fn putConditionOf(req: borrow S3Request, etags: borrow mut Vector<u8>) -> Result<PutIf, S3Fail> {
+    var condition = PutIf.None;
+    match (headerOf(req, "if-none-match")) {
+        Some(t) => {
+            if (trimSpaces(t) == "*".bytes()) {
+                condition = PutIf.Absent;
+            } else {
+                etags.extend(t)?;
+                condition = PutIf.NoneMatch;
+            }
+        }
+        null => {}
+    }
+    match (headerOf(req, "if-match")) {
+        Some(t) => {
+            match (condition) {
+                PutIf.None => {}
+                _ => { return Err(S3Fail.Code(S3Code.NotImplemented)); } // both at once
+            }
+            etags.extend(t)?;
+            condition = PutIf.Matches;
+        }
+        null => {}
+    }
+    return Ok(condition);
+}
+
+/// Under the lock: the store's condition for a write, read from the key's current version so that nothing can come
+/// between the check and the commit (ADR-0008 §9).
+fn resolveCondition(
+    store: borrow ObjectStore,
+    bucket: StringView,
+    key: StringView,
+    condition: PutIf,
+    etags: Slice<u8>,
+) -> Result<PutCondition, StoreError> {
+    return match (condition) {
+        PutIf.None => Ok(PutCondition.None),
+        PutIf.Absent => Ok(PutCondition.IfAbsent),
+        PutIf.Matches => match (store.headObject(bucket, key)) {
+            Ok(info) => {
+                if (!etagListMatches(etags, borrow info.md5, info.parts)) {
+                    Err(StoreError.PreconditionFailed)
+                } else {
+                    Ok(PutCondition.IfGeneration(info.generation))
+                }
+            }
+            // If-Match on a key with no object is 404 NoSuchKey, as AWS documents for conditional writes.
+            Err(StoreError.NoSuchKey) => Err(StoreError.NoSuchKey),
+            Err(e) => Err(e),
+        },
+        PutIf.NoneMatch => match (store.headObject(bucket, key)) {
+            Ok(info) => {
+                if (etagListMatches(etags, borrow info.md5, info.parts)) {
+                    Err(StoreError.PreconditionFailed)
+                } else {
+                    Ok(PutCondition.IfGeneration(info.generation))
+                }
+            }
+            Err(StoreError.NoSuchKey) => Ok(PutCondition.IfAbsent),
+            Err(e) => Err(e),
+        },
+    };
 }
 
 // ---- PutObject ----
@@ -349,22 +417,8 @@ async fn putObject(
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
     var spec = bodySpec(req, borrow auth)?;
-    var condition = PutIf.None;
-    match (headerOf(req, "if-none-match")) {
-        Some(t) => {
-            if (trimSpaces(t) != "*".bytes()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-            condition = PutIf.Absent;
-        }
-        null => {}
-    }
     var ifMatch = Vector<u8>.create();
-    match (headerOf(req, "if-match")) {
-        Some(t) => {
-            ifMatch.extend(t)?;
-            condition = PutIf.Matches;
-        }
-        null => {}
-    }
+    let condition = putConditionOf(req, mut ifMatch)?;
     var contentType = String.create();
     contentTypeOf(req, mut contentType)?;
     let metadata = metadataOf(req)?; // refused before the body is read
@@ -420,7 +474,7 @@ fn metadataOf(req: borrow S3Request) -> Result<Vector<u8>, S3Fail> {
                 let coding = trimSpaces(value[at..end]);
                 at = end + 1;
                 if (coding.length == 0 || equalsIgnoreCase(coding, "aws-chunked".bytes())) { continue; }
-                if (kept.length > 0) { kept.extend(",".bytes())?; }
+                if (kept.length > 0) { kept.extend(", ".bytes())?; }
                 kept.extend(coding)?;
             }
             if (kept.length > 0) { metadataAdd(mut blob, name, kept.view())?; }
@@ -522,27 +576,11 @@ fn commitWith(
     condition: PutIf,
     ifMatch: Slice<u8>,
 ) -> Result<PutOutcome, StoreError> {
-    let cond = match (condition) {
-        PutIf.None => PutCondition.None,
-        PutIf.Absent => PutCondition.IfAbsent,
-        PutIf.Matches => {
-            match (store.headObject(bucket, key)) {
-                Ok(info) => {
-                    if (!etagListMatches(ifMatch, borrow info.md5, info.parts)) {
-                        store.discardFinished(finished);
-                        return Err(StoreError.PreconditionFailed);
-                    }
-                    PutCondition.IfGeneration(info.generation)
-                }
-                Err(StoreError.NoSuchKey) => {
-                    store.discardFinished(finished);
-                    return Err(StoreError.PreconditionFailed);
-                }
-                Err(e) => {
-                    store.discardFinished(finished);
-                    return Err(e);
-                }
-            }
+    let cond = match (resolveCondition(store, bucket, key, condition, ifMatch)) {
+        Ok(c) => c,
+        Err(e) => {
+            store.discardFinished(finished);
+            return Err(e);
         }
     };
     return store.putFinishedWith(bucket, key, contentType, metadata, finished, cond);
@@ -557,6 +595,8 @@ struct GetPlan {
     start: u64;
     end: u64;
     partial: bool;
+    /// If-None-Match or If-Modified-Since held: a 304, which still carries the ETag and Last-Modified.
+    notModified: bool;
 }
 
 /// `Range: bytes=a-b | a- | -n` against `size`: the half-open range, null for no (or an unreadable) range, or
@@ -664,6 +704,9 @@ fn planGet(store: borrow mut ObjectStore, req: borrow S3Request, withBody: bool)
     };
     match (checkGetConditions(req, borrow info)) {
         Ok() => {}
+        Err(S3Code.NotModified) => {
+            return Ok(GetPlan { info: info, reader: null, start: 0, end: 0, partial: false, notModified: true });
+        }
         Err(code) => { return Err(S3Fail.Code(code)); }
     }
     var start: u64 = 0;
@@ -690,7 +733,7 @@ fn planGet(store: borrow mut ObjectStore, req: borrow S3Request, withBody: bool)
             Err(e) => { return Err(storeFail(e, key.length)); }
         };
     }
-    return Ok(GetPlan { info: info, reader: reader, start: start, end: end, partial: partial });
+    return Ok(GetPlan { info: info, reader: reader, start: start, end: end, partial: partial, notModified: false });
 }
 
 async fn openGet(app: borrow S3App, req: borrow S3Request, withBody: bool) -> Result<GetPlan, S3Fail> {
@@ -708,6 +751,10 @@ async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
     field.clear();
     appendHttpDate(mut field, plan.info.mtimeMillis / 1000)?;
     exchange.header("last-modified", field.view())?;
+    if (plan.notModified) {
+        await exchange.send(statusOf(304), "".bytes())?;
+        return Ok();
+    }
     exchange.header("accept-ranges", "bytes".bytes())?;
     match (paramOf(req, "response-content-type")) {
         Some(t) => { exchange.header("content-type", t)?; }

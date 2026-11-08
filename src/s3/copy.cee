@@ -50,22 +50,23 @@ fn checkCopyConditions(req: borrow S3Request, info: borrow ObjectInfo) -> Result
     };
 }
 
-/// `x-amz-copy-source-range: bytes=first-last`, both given and within a source of `size` bytes; null otherwise, which
-/// S3 answers with InvalidArgument.
-fn parseCopyRange(text: Slice<u8>, size: u64) -> RangeSpan? {
+/// `x-amz-copy-source-range: bytes=first-last`, both given: InvalidArgument if it does not read so, InvalidRange if
+/// it is not within a source of `size` bytes, as S3 answers.
+fn parseCopyRange(text: Slice<u8>, size: u64) -> Result<RangeSpan, S3Code> {
     let t = trimSpaces(text);
     let unit = "bytes=".bytes();
-    if (t.length <= unit.length || t[0..unit.length] != unit) { return null; }
+    if (t.length <= unit.length || t[0..unit.length] != unit) { return Err(S3Code.InvalidArgument); }
     let spec = t[unit.length..];
     let dash = pieceEnd(spec, 0, '-');
-    if (dash == 0 || dash + 1 >= spec.length) { return null; }
+    if (dash == 0 || dash + 1 >= spec.length) { return Err(S3Code.InvalidArgument); }
     let first = parseDecimal(spec[0..dash]);
     let last = parseDecimal(spec[dash + 1..]);
-    if (first.isNull() || last.isNull()) { return null; }
+    if (first.isNull() || last.isNull()) { return Err(S3Code.InvalidArgument); }
     let a = first ?? 0;
     let b = last ?? 0;
-    if (a > b || b >= size) { return null; }
-    return RangeSpan { from: a, to: b + 1 };
+    if (a > b) { return Err(S3Code.InvalidArgument); }
+    if (b >= size) { return Err(S3Code.InvalidRange); }
+    return Ok(RangeSpan { from: a, to: b + 1 });
 }
 
 /// Where a copy goes: a new version of a key, or a part of an upload.
@@ -106,11 +107,11 @@ fn planCopy(
             match (headerOf(req, "x-amz-copy-source-range")) {
                 Some(t) => {
                     match (parseCopyRange(t, info.size)) {
-                        Some(r) => {
+                        Ok(r) => {
                             start = r.from;
                             end = r.to;
                         }
-                        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                        Err(code) => { return Err(S3Fail.Code(code)); }
                     }
                 }
                 null => {}
