@@ -131,6 +131,37 @@ struct S3Request {
             }
             this.query.push(p)?;
         }
+        this.hoistQueryHeaders()?;
+        return Ok();
+    }
+
+    /// A presigned URL carries some `x-amz-*` headers in its query (presigners hoist them), and the signature covers
+    /// them there. Each one stands for the header it names, unless the request also sends that header (ADR-0013).
+    /// Only presigned requests do this: for header auth the query's `x-amz-*` would be unsigned headers.
+    fn hoistQueryHeaders(borrow mut this) -> Result<void, AllocError> {
+        if (!this.hasParam("X-Amz-Algorithm")) { return Ok(); }
+        var hoisted = Vector<HeaderPair>.create();
+        for (i in 0..this.query.length) {
+            let name = this.query[i].name.view();
+            if (name.length <= 6 || !equalsIgnoreCase(name[0..6], "x-amz-".bytes()) || isQueryAuthParam(name)) {
+                continue;
+            }
+            var lower = Vector<u8>.create();
+            for (c in name) { lower.push(lowerAscii(c))?; }
+            var present = false;
+            for (h in 0..this.headers.length) {
+                if (this.headers[h].name.view() == lower.view()) { present = true; }
+            }
+            if (present) { continue; }
+            var value = Vector<u8>.create();
+            value.extend(this.query[i].value.view())?;
+            hoisted.push(HeaderPair { name: lower, value: value })?;
+        }
+        for (h in 0..hoisted.length) {
+            this.headers.push(
+                replace(mut hoisted[h], HeaderPair { name: Vector<u8>.create(), value: Vector<u8>.create() }),
+            )?;
+        }
         return Ok();
     }
 
@@ -146,7 +177,9 @@ struct S3Request {
     fn onlyParams(borrow this, allowed: StringView) -> bool {
         for (i in 0..this.query.length) {
             let name = this.query[i].name.view();
-            if (name == "x-id".bytes() || startsWithBytes(name, "X-Amz-".bytes())) { continue; }
+            if (name == "x-id".bytes() || (name.length > 6 && equalsIgnoreCase(name[0..6], "x-amz-".bytes()))) {
+                continue;
+            }
             var found = false;
             let list = allowed.bytes();
             var at: usize = 0;
@@ -164,6 +197,7 @@ struct S3Request {
     fn authenticate(borrow this, credentials: Slice<Credential>, now: i64) -> Result<Authenticated, S3Code> {
         match (headerOf(this, "authorization")) {
             Some(value) => {
+                if (startsWithBytes(value, "AWS ".bytes())) { return Err(S3Code.AuthorizationMechanism); } // SigV2
                 let auth = match (parseAuthorization(value)) {
                     Ok(a) => a,
                     Err(_) => { return Err(S3Code.AuthorizationHeaderMalformed); }
@@ -187,6 +221,7 @@ struct S3Request {
             null => {}
         }
         if (paramOf(this, "X-Amz-Algorithm").isSome()) { return this.authenticateQuery(credentials, now); }
+        if (paramOf(this, "AWSAccessKeyId").isSome()) { return Err(S3Code.AuthorizationMechanism); } // SigV2
         return Err(S3Code.AccessDenied);
     }
 
@@ -237,7 +272,8 @@ struct S3Request {
         if (now > when + truncate<i64>(expires)) { return Err(S3Code.AccessDenied); } // expired
         var query = Vector<u8>.create();
         mapOom(queryWithout(this.rawQuery.view(), "X-Amz-Signature".bytes(), mut query))?;
-        let payloadHash = headerOf(this, "x-amz-content-sha256") ?? "UNSIGNED-PAYLOAD".bytes();
+        let payloadHash = headerOf(this, "x-amz-content-sha256") ?? paramOf(this, "X-Amz-Content-Sha256") ??
+            "UNSIGNED-PAYLOAD".bytes();
         return this.verify(credentials, borrow auth, amzDate, payloadHash, query.view());
     }
 
@@ -309,6 +345,18 @@ struct S3Request {
         }
         return Err(S3Code.InvalidArgument);
     }
+}
+
+/// Whether `name` is one of query auth's own parameters, which are not hoisted headers.
+fn isQueryAuthParam(name: Slice<u8>) -> bool {
+    let names = [
+        "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires", "X-Amz-SignedHeaders",
+        "X-Amz-Signature", "X-Amz-Security-Token", "X-Amz-Content-Sha256",
+    ];
+    for (n in names) {
+        if (equalsIgnoreCase(name, n.bytes())) { return true; }
+    }
+    return false;
 }
 
 /// The raw query without the parameter `name` (as sent, not decoded).

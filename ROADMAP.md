@@ -233,7 +233,8 @@ deadlocks. **Passed** (7 Nov 2026: 186 SIGKILLs, used/live at most 119%, recover
 - Static credentials file and a minimal bucket policy (owner-only), with private buckets
   by default.
 - CI matrix: AWS CLI v2, boto3, Go/Java/.NET SDKs, rclone, plus the relevant subset of
-  Ceph s3-tests.
+  Ceph s3-tests. CLI, rclone, boto3, Go and JavaScript **pass** (slice 6, ADR-0013, `docs/compatibility.md`);
+  Java, .NET and s3-tests left.
 
 **Exit:** the Tier A subset in the matrix passes the s3-tests subset and the SDK matrix.
 The compatibility matrix is published.
@@ -681,3 +682,30 @@ need this.
   - expiring abandoned uploads;
   - binding beyond loopback, and TLS;
   - the SDK matrix (boto3, Go, Java, .NET, rclone) and the s3-tests subset.
+
+### 8 Nov 2026: M3 slice 6, the SDK matrix (ADR-0013)
+
+`tools/sdk/`: one script per client, each against a fresh server and ending in fsck. All pass:
+- rclone 1.73.2: 20 checks;
+- boto3 1.42.97: 43 checks;
+- the Go SDK v2: 22 checks;
+- the JavaScript SDK v3: 25 checks.
+
+The matrix is published in `docs/compatibility.md`. What the clients found:
+- **Hoisted headers in presigned URLs.** The JS presigner puts `x-amz-checksum-*`, `x-amz-checksum-mode` and
+  `x-amz-sdk-checksum-algorithm` in the signed query. For presigned requests these are now read as headers. So a
+  hoisted checksum is checked, as S3 checks it, and the JS SDK's empty-body CRC32 gets BadDigest on S3 and here
+  alike.
+- **SigV2.** boto3 presigns with it for custom endpoints. It is refused with S3's own "Please use
+  AWS4-HMAC-SHA256" `InvalidRequest`, not a bare AccessDenied. It is not built: it is deprecated, and lib/std has no
+  SHA-1 (G26).
+- **GetBucketVersioning** is now answered (never enabled), because rclone's purge reads it.
+- Every other operation the four clients used already worked.
+
+M3 left:
+- the Java and .NET SDKs (no Maven, Gradle or .NET here), and the Ceph s3-tests subset;
+- POST policy;
+- tags, response checksums;
+- CopyObject destination conditions;
+- expiring abandoned uploads;
+- binding beyond loopback, and TLS.
