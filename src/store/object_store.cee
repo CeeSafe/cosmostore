@@ -640,6 +640,8 @@ struct ObjectStore {
     private sinceCheckpoint: u64;
     /// Extents that open readers may still read (ADR-0007), and the retired ones that wait for them.
     private pins: ExtentPins;
+    /// Segments whose records readers are reading without the store (ADR-0024): compaction leaves them on disk.
+    private segmentPins: ExtentPins;
     private deferred: Vector<DeferredExtent>;
     private deferredBytes: u64;
     /// Extents of writers dropped unfinished, for the store to remove: a drop may run in async code, which must not
@@ -739,6 +741,7 @@ struct ObjectStore {
             checkpointSegment: start.segment,
             sinceCheckpoint: 0,
             pins: ExtentPins.create(),
+            segmentPins: ExtentPins.create(),
             abandoned: Channel<u64>.create(ABANDONED_CAPACITY)?,
             deferred: Vector<DeferredExtent>.create(),
             deferredBytes: 0,
@@ -1395,15 +1398,53 @@ struct ObjectStore {
         from: u64,
         to: u64,
     ) -> Result<ObjectReader, StoreError> {
-        var reader = this.openUnpinned(bucket, key, from, to)?;
-        if (reader.extents.isSome()) {
-            let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
-            match (this.state.index.get(borrow k)) {
-                Some(v) => { reader.pin = this.pins.pin(v.extents.view())?; }
-                null => {}
-            }
+        var prepared = this.prepareReader(bucket, key, from, to)?;
+        return prepared.open();
+    }
+
+    /// The first half of `openReader`, with no I/O (ADR-0024): the version's lookup and its pins. `open` then reads
+    /// without the store, so it may run without the store's lock: the pins keep the version's extents, or the
+    /// segment holding its inline record, on disk until the reader is dropped.
+    fn prepareReader(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        from: u64,
+        to: u64,
+    ) -> Result<PreparedReader, StoreError> {
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+        let v = match (this.state.index.get(borrow k)) {
+            Some(v) => v,
+            null => { return Err(StoreError.NoSuchKey); }
+        };
+        let end = if (to > v.size) v.size else to;
+        let start = if (from > end) end else from;
+        if (v.extents.length != 0) {
+            var refs = Vector<ExtentRef>.create();
+            refs.extend(v.extents.view())?;
+            let extents = ExtentReader.create(this.extentDir.view(), refs, start, end)?;
+            let pin = this.pins.pin(v.extents.view())?;
+            return Ok(PreparedReader {
+                reader: ObjectReader { inline: Vector<u8>.create(), inlinePosition: 0, extents: extents, pin: pin },
+                record: null,
+            });
         }
-        return Ok(reader);
+        let payloadStart = v.recordLength as usize - RECORD_TRAILER_LEN - v.payload.length as usize;
+        let path = match (this.journal.segmentFile(v.recordSegment)) {
+            Ok(p) => p,
+            Err(e) => { return Err(StoreError.Journal(e)); }
+        };
+        let record = InlineRecord {
+            path: path,
+            segment: v.recordSegment,
+            offset: v.payload.offset + v.payload.length as u64 + RECORD_TRAILER_LEN as u64 - v.recordLength as u64,
+            length: v.recordLength,
+            from: payloadStart + start as usize,
+            to: payloadStart + end as usize,
+            pin: this.segmentPins.pinOne(v.recordSegment)?,
+        };
+        return Ok(PreparedReader { reader: null, record: record });
     }
 
     /// A reader that does not pin its extents: only for reads that end before the store is released (fsck,
@@ -2159,6 +2200,8 @@ struct ObjectStore {
             let id: u64 = chosen.keyAt(i);
             let usage = this.segmentUsage(id);
             if (usage.liveBytes != 0) { continue; }
+            // A reader still reads a record of it (ADR-0024): a later pass removes it, as after a crash here.
+            if (this.segmentPins.isPinned(id)) { continue; }
             this.journal.removeSegment(id)?;
             let _ = this.state.segments.remove(borrow id);
             stats.segmentsRemoved += 1;
@@ -2211,6 +2254,7 @@ struct ObjectStore {
         this.reapDeferred();
         this.reapAbandoned();
         this.pins.prune();
+        this.segmentPins.prune();
         var expired: u64 = 0;
         let expiry = this.config.uploadExpiryMillis;
         let now = Clock.unixMillis();
@@ -2408,6 +2452,47 @@ struct ObjectStore {
 }
 
 /// Streams an object's bytes, from the journal (inline) or its extents.
+/// An inline version's record, to be read without the store (ADR-0024).
+struct InlineRecord {
+    path: String;
+    segment: u64;
+    offset: u64;
+    length: u32;
+    /// The range to keep, as offsets in the record.
+    from: usize;
+    to: usize;
+    /// Keeps the segment on disk until the record is read.
+    pin: ReadPin;
+}
+
+/// A reader made by `ObjectStore.prepareReader`, opened by `open`: either the reader itself (extents, which open
+/// lazily) or the inline record still to read.
+struct PreparedReader {
+    private reader: ObjectReader?;
+    private record: InlineRecord?;
+
+    /// Reads and verifies an inline record from its segment's own file (I/O, without the store); an extent reader
+    /// is returned as it is.
+    fn open(borrow mut this) -> Result<ObjectReader, StoreError> {
+        match (replace(mut this.reader, null)) {
+            Some(r) => { return Ok(r); }
+            null => {}
+        }
+        let rec = match (replace(mut this.record, null)) {
+            Some(r) => r,
+            null => { return Err(StoreError.NoSuchKey); } // opened twice
+        };
+        let bytes = match (readRecordFile(rec.path.view(), rec.segment, rec.offset, rec.length)) {
+            Ok(b) => b,
+            Err(JournalError.Corrupt(_, _)) => { return Err(StoreError.DataCorrupt); }
+            Err(e) => { return Err(StoreError.Journal(e)); }
+        };
+        var inline = Vector<u8>.create();
+        inline.extend(bytes.view()[rec.from..rec.to])?;
+        return Ok(ObjectReader { inline: inline, inlinePosition: 0, extents: null, pin: null });
+    }
+}
+
 struct ObjectReader {
     private inline: Vector<u8>;
     private inlinePosition: usize;

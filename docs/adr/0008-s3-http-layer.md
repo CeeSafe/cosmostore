@@ -32,6 +32,8 @@ shape this ADR:
      validation is discarded (`discardFinished`) and never committed.
    - **GET:** `openReader` runs under the lock, and its extents are pinned (ADR-0007). The bytes are then streamed
      on worker threads without the lock. A client that disconnects drops the reader, which releases the pins.
+   - **Amended by ADR-0024 (M4 slice 4):** only `prepareReader` (index work and pins) runs under the lock. An inline
+     record is read and verified on a worker thread after the lock is released, with its segment pinned.
 4. **Commits are serialized.** Each PUT is one journal commit with its own sync, so concurrent PUTs do not share a
    group commit yet. Batching them across requests is M4 work (perf hardening). It needs the store to commit from
    one place, for example a commit task.

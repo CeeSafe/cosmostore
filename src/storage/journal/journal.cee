@@ -459,14 +459,12 @@ struct Journal {
         var out = Vector<u8>.create();
         out.resize(totalLen as usize, 0)?;
         this.readAt(segmentId, offset, mut out.viewMut())?;
-        match (decodeRecord(out.view())) {
-            Ok(h) => {
-                if (h.totalLen != totalLen) { return Err(JournalError.Corrupt(segmentId, offset)); }
-            }
-            Err(_) => { return Err(JournalError.Corrupt(segmentId, offset)); }
-        }
+        checkRecord(out.view(), segmentId, offset, totalLen)?;
         return Ok(out);
     }
+
+    /// The path of segment `id`'s file, for a reader that opens it without the journal (`readRecordFile`).
+    fn segmentFile(borrow this, id: u64) -> Result<String, JournalError> => segmentPath(this.dir.view(), id);
 
     /// Reads a payload into a new vector and checks nothing more: the record was verified when
     /// it was written or recovered. (Scrub re-verifies whole records.)
@@ -476,6 +474,29 @@ struct Journal {
         this.readAt(at.segmentId, at.offset, mut out.viewMut())?;
         return Ok(out);
     }
+}
+
+/// Whether `bytes` is one whole, valid record of `totalLen` bytes.
+fn checkRecord(bytes: Slice<u8>, segmentId: u64, offset: u64, totalLen: u32) -> Result<void, JournalError> {
+    match (decodeRecord(bytes)) {
+        Ok(h) => {
+            if (h.totalLen != totalLen) { return Err(JournalError.Corrupt(segmentId, offset)); }
+        }
+        Err(_) => { return Err(JournalError.Corrupt(segmentId, offset)); }
+    }
+    return Ok();
+}
+
+/// Reads and verifies a published record from its segment's file, as `Journal.readRecord` does, but without the
+/// journal: through a handle of its own, so it can run without the store's lock (ADR-0024). The caller keeps the
+/// segment from being removed meanwhile (a segment pin).
+fn readRecordFile(path: StringView, segmentId: u64, offset: u64, totalLen: u32) -> Result<Vector<u8>, JournalError> {
+    var out = Vector<u8>.create();
+    out.resize(totalLen as usize, 0)?;
+    let file = DurableFile.openRead(path)?;
+    file.readExactAt(mut out.viewMut(), offset)?;
+    checkRecord(out.view(), segmentId, offset, totalLen)?;
+    return Ok(out);
 }
 
 /// `<dir>/seg-<id as 16 hex digits>.cj`

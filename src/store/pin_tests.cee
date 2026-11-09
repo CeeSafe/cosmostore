@@ -128,3 +128,103 @@ fn pinDeferredExtentsAreSweptAtOpen() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// Writes "keep" once, then enough overwrites of other keys that keep's segment is mostly garbage, and checkpoints.
+fn agedStore(dir: StringView) -> Result<ObjectStore, TestFailure> {
+    let ctype = "application/octet-stream";
+    var s = ObjectStore.open(dir, faultStoreConfig())!;
+    s.createBucket("bkt")!;
+    s.putObject("bkt", "keep", ctype, patterned(300, 1).view(), PutCondition.None)!;
+    for (r in 0u64..40) {
+        for (k in 0u64..10) {
+            var name = String.create();
+            name.append("hot-")!;
+            name.appendNumber(k)!;
+            s.putObject("bkt", name.view(), ctype, patterned(900, r * 100 + k).view(), PutCondition.None)!;
+        }
+    }
+    Check.isTrue(s.checkpoint()!, "checkpoint")?;
+    return Ok(s);
+}
+
+/// An inline reader prepared under the store and opened after compaction (ADR-0024): its segment stays until the
+/// reader is done, and the next pass removes it.
+@test
+fn pinInlineReaderOutlivesCompaction() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("pin-inline");
+    var s = agedStore(dir.view())?;
+    var prepared = s.prepareReader("bkt", "keep", 0, 0xFFFFFFFFFFFFFFFF)!;
+    let stats = s.compact(1073741824)!;
+    Check.isTrue(stats.relocated > 0, "keep's payload is copied")?;
+    // keep's old segment holds nothing live, but its reader has not read it yet.
+    Check.equalU64(s.segmentCount() as u64, countFiles(dir.view(), "seg-", ".cj"))?;
+    Check.isTrue(s.segmentUsage(s.segmentIds()[0]).liveBytes == 0, "the pinned segment is garbage")?;
+    var reader = prepared.open()!;
+    var out = Vector<u8>.create();
+    drain(mut reader, mut out)!;
+    Check.equalBytes(patterned(300, 1).view(), out.view())?;
+    close(reader); // the segment's pin went when the record was read
+    Check.equalU64(1, s.compact(1073741824)!.segmentsRemoved)?;
+    Check.equalU64(s.segmentCount() as u64, countFiles(dir.view(), "seg-", ".cj"))?;
+    Check.equalBytes(patterned(300, 1).view(), s.getObject("bkt", "keep")!.view())?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// A segment left on disk for a reader when the process stops (as after a crash between the relocation commit and
+/// the unlink) is removed by a later pass after reopening, and nothing is counted twice.
+@test
+fn pinnedSegmentLeftAtStopIsCompactedAfterOpen() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("pin-inline-reopen");
+    {
+        var s = agedStore(dir.view())?;
+        let prepared = s.prepareReader("bkt", "keep", 0, 0xFFFFFFFFFFFFFFFF)!;
+        let _ = s.compact(1073741824)!;
+        Check.equalU64(s.segmentCount() as u64, countFiles(dir.view(), "seg-", ".cj"))?;
+        let _ = prepared; // never opened: dropped with the store
+    }
+    var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+    // Recovery knows the segment, with nothing live in it.
+    let dead = s.segmentIds()[0];
+    Check.equalU64(0, s.segmentUsage(dead).liveBytes)?;
+    Check.equalBytes(patterned(300, 1).view(), s.getObject("bkt", "keep")!.view())?;
+    let _ = s.checkpoint()!;
+    let files = countFiles(dir.view(), "seg-", ".cj");
+    Check.equalU64(1, s.compact(1073741824)!.segmentsRemoved)?;
+    Check.equalU64(files - 1, countFiles(dir.view(), "seg-", ".cj"))?;
+    Check.isTrue(s.segmentIds()[0] != dead, "the left segment is gone")?;
+    Check.equalU64(0, s.compact(1073741824)!.segmentsRemoved)?;
+    Check.equalBytes(patterned(300, 1).view(), s.getObject("bkt", "keep")!.view())?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// Every I/O step of a reader opened without the store, failed in turn (ADR-0024): the read fails, never serves
+/// other bytes, releases its segment, and leaves the store serving.
+@test
+fn preparedInlineReadFaults() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("pin-inline-faults");
+    var s = agedStore(dir.view())?;
+    var counted = s.prepareReader("bkt", "keep", 0, 0xFFFFFFFFFFFFFFFF)!;
+    Faults.countOperations();
+    let _ = counted.open()!;
+    let steps = Faults.seen();
+    Faults.disarm();
+    Check.isTrue(steps >= 2, "an open and a read")?;
+    for (n in 1..steps + 1) {
+        var prepared = s.prepareReader("bkt", "keep", 0, 0xFFFFFFFFFFFFFFFF)!;
+        Faults.failAt(n, false, false);
+        let opened = prepared.open();
+        Faults.disarm();
+        match (opened) {
+            Ok(_) => { return Check.fail("an injected failure fails the read"); }
+            Err(_) => {}
+        }
+    }
+    let stats = s.compact(1073741824)!;
+    Check.isTrue(stats.segmentsRemoved > 0, "no failed read keeps its segment pinned")?;
+    Check.equalU64(s.segmentCount() as u64, countFiles(dir.view(), "seg-", ".cj"))?;
+    Check.equalBytes(patterned(300, 1).view(), s.getObject("bkt", "keep")!.view())?;
+    removeTree(dir.view());
+    return Ok();
+}

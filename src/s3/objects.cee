@@ -846,20 +846,34 @@ fn planGet(store: borrow ObjectStore, req: borrow S3Request) -> Result<GetPlan, 
 }
 
 async fn openGet(app: borrow S3App, req: borrow S3Request, withBody: bool) -> Result<GetPlan, S3Fail> {
-    var guard = await lockStore(app)?;
-    let store = guard.data();
-    // The plan is an index lookup, on the event loop. Only a body's reader may do I/O (an inline record's read, or
-    // an extent reader's open), so only a GET with bytes to send takes a worker thread (ADR-0023).
-    var plan = planGet(store, req)?;
-    if (withBody && !plan.notModified && plan.end > plan.start) {
-        let bucket = req.bucket.view();
-        let key = req.key.view();
-        let start = plan.start;
-        let end = plan.end;
-        plan.reader = match (await Async.blocking(() => store.openReader(bucket, key, start, end))) {
-            Ok(r) => r,
-            Err(e) => { return Err(storeFail(e, key.length)); }
-        };
+    // The plan and the reader's pins are index work, on the event loop under the lock (ADR-0023). Only an inline
+    // record's read does I/O: on a worker thread, after the lock is released, while its segment is pinned (ADR-0024).
+    var prepared: PreparedReader? = null;
+    var planned: GetPlan? = null;
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let p = planGet(store, req)?;
+        if (withBody && !p.notModified && p.end > p.start) {
+            prepared = match (store.prepareReader(req.bucket.view(), req.key.view(), p.start, p.end)) {
+                Ok(r) => r,
+                Err(e) => { return Err(storeFail(e, req.key.length)); }
+            };
+        }
+        planned = p;
+    }
+    var plan = match (planned) {
+        Some(p) => p,
+        null => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    match (prepared.asBorrowMut()) {
+        Some(r) => {
+            plan.reader = match (await Async.blocking(() => r.open())) {
+                Ok(reader) => reader,
+                Err(e) => { return Err(storeFail(e, req.key.length)); }
+            };
+        }
+        null => {}
     }
     return Ok(plan);
 }

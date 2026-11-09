@@ -1024,3 +1024,20 @@ Browser form uploads with a SigV4 POST policy.
   - inline reads without the store's lock (segment pins);
   - deletes through group commit;
   - T2.
+
+### 9 Nov 2026: M4 slice 4, inline reads without the store's lock (ADR-0024)
+
+- **A GET holds the lock only for index work.** `prepareReader` (no I/O, on the event loop) looks the version up and
+  pins its extents or its record's segment. `PreparedReader.open` reads and verifies the record on a worker thread
+  after the lock is released.
+- **Compaction skips a pinned segment,** and a later pass removes it. That is the state a crash between the
+  relocation commit and the unlink already leaves, so recovery has nothing new to handle.
+- **Results** (`docs/benchmarks/2026-11-09-unlocked-reads.md`):
+  - 128 B to 4 KiB GET at 22,900 to 25,200/s at concurrency 32 (from 15,500 to 16,200), p99 2.2 to 2.6 ms;
+  - 22,500 to 26,200/s at 128 (from about 9,000);
+  - T5 met with margin. Large objects unchanged (checked back to back against slice 3).
+- **Tests:** a reader across compaction, a segment left at stop and reopened, every I/O step of the read failed in
+  turn, and rot detected on the new path. 112 tests, s3-tests subset 252, the SDK checks, both smokes.
+- **Next:**
+  - deletes through group commit;
+  - T2.
