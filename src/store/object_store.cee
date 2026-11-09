@@ -217,6 +217,9 @@ struct ListPage {
     nextMarkerIsPrefix: bool;
 }
 
+/// Index entries a checkpoint step encodes under the store (ADR-0028): about 0.7 MB and a millisecond or two.
+const CHECKPOINT_STEP_ENTRIES: usize = 4096;
+
 /// The bucket number of a lookup key whose bucket is not there (ADR-0027): never given to a bucket.
 const NO_BUCKET: u32 = 0xFFFFFFFF;
 
@@ -2270,22 +2273,88 @@ struct ObjectStore {
     /// Writes a checkpoint of the current state, so recovery replays only what follows it,
     /// and removes the previous checkpoint. Seals the active journal segment first, so the
     /// checkpoint covers whole segments (ADR-0005). Returns whether one was written (false when
-    /// nothing was committed since the last one).
+    /// nothing was committed since the last one). The steps of ADR-0028 in a row, holding the store throughout; the
+    /// server runs them with the lock released between steps (`serve.cee`).
     fn checkpoint(borrow mut this) -> Result<bool, StoreError> {
+        var job = match (this.beginCheckpoint()?) {
+            Some(j) => j,
+            null => { return Ok(false); }
+        };
+        loop {
+            let finished = match (this.checkpointStep(mut job, CHECKPOINT_STEP_ENTRIES)) {
+                Ok(f) => f,
+                Err(e) => {
+                    job.abandon();
+                    return Err(e);
+                }
+            };
+            match (job.flush()) {
+                Ok() => {}
+                Err(e) => {
+                    this.checkpointAbandoned(mut job);
+                    return Err(e);
+                }
+            }
+            if (finished) { break; }
+        }
+        match (job.publish()) {
+            Ok(size) => { this.checkpointPublished(borrow job, size); }
+            Err(e) => {
+                this.checkpointAbandoned(mut job);
+                return Err(e);
+            }
+        }
+        return Ok(true);
+    }
+
+    /// Whether `maintain` would write a checkpoint now: `checkpointEveryBytes` committed since the last one.
+    fn checkpointDue(borrow this) -> bool {
+        let every = this.config.checkpointEveryBytes;
+        return every > 0 && this.sinceCheckpoint >= every;
+    }
+
+    /// Starts a checkpoint (ADR-0028): commits what is staged, seals the active segment, and begins the job, with a
+    /// snapshot of the index as of the last LSN. Null when nothing was committed since the last checkpoint. A job
+    /// that was given up without a word (its task cancelled) is dropped first.
+    fn beginCheckpoint(borrow mut this) -> Result<CheckpointJob?, StoreError> {
+        if (this.state.index.snapshotActive()) { this.state.index.endSnapshot(); }
         this.commitStaged()?;
         this.checkWritable()?;
         let segment = this.journal.sealActive()?;
         let lsn = this.journal.upcomingLsn() - 1;
-        if (lsn == this.checkpointLsn) { return Ok(false); }
-        let written = writeCheckpoint(this.dir.view(), lsn, segment, borrow this.state)?;
-        this.counts.checkpointBytesWritten += written;
+        if (lsn == this.checkpointLsn) { return Ok(null); }
+        return Ok(beginCheckpointJob(this.dir.view(), lsn, segment, this.sinceCheckpoint, mut this.state)?);
+    }
+
+    /// Encodes the job's next `max` index entries (memory only). Returns whether it has all of them. On an error the
+    /// snapshot ends; the caller abandons the job.
+    fn checkpointStep(borrow mut this, job: borrow mut CheckpointJob, max: usize) -> Result<bool, StoreError> {
+        return match (checkpointStepOf(job, mut this.state, max)) {
+            Ok(f) => Ok(f),
+            Err(e) => {
+                this.state.index.endSnapshot();
+                Err(e)
+            }
+        };
+    }
+
+    /// The job's file is published: segments before its segment may be compacted from now, and older checkpoints go.
+    fn checkpointPublished(borrow mut this, job: borrow CheckpointJob, size: u64) {
+        this.state.index.endSnapshot();
+        this.counts.checkpointBytesWritten += size;
         this.counts.checkpoints += 1;
-        // Durable now: segments before `segment` may be compacted, and older checkpoints go.
-        this.checkpointLsn = lsn;
-        this.checkpointSegment = segment;
-        this.sinceCheckpoint = 0;
-        removeCheckpoints(this.dir.view(), lsn, false);
-        return Ok(true);
+        this.checkpointLsn = job.lsn;
+        this.checkpointSegment = job.segment;
+        // What was committed during the job is not in the checkpoint.
+        this.sinceCheckpoint =
+            if (this.sinceCheckpoint > job.sinceBefore) this.sinceCheckpoint - job.sinceBefore else 0;
+        removeCheckpoints(this.dir.view(), job.lsn, false);
+    }
+
+    /// Gives the job up: the snapshot ends, and the temporary file goes.
+    fn checkpointAbandoned(borrow mut this, job: borrow mut CheckpointJob) {
+        this.state.index.endSnapshot();
+        job.abandon();
     }
 
     /// Reclaims sealed segments that the checkpoint covers and that are mostly garbage. Their
@@ -2409,7 +2478,10 @@ struct ObjectStore {
     }
 
     /// Background upkeep: a checkpoint when one is due, then compaction.
-    fn maintain(borrow mut this) -> Result<MaintenanceReport, StoreError> {
+    fn maintain(borrow mut this) -> Result<MaintenanceReport, StoreError> => this.upkeep(true);
+
+    /// `maintain`, with or without its checkpoint: the server writes checkpoints in steps of its own (ADR-0028).
+    fn upkeep(borrow mut this, withCheckpoint: bool) -> Result<MaintenanceReport, StoreError> {
         this.reapDeferred();
         this.reapAbandoned();
         this.pins.prune();
@@ -2419,8 +2491,7 @@ struct ObjectStore {
         let now = Clock.unixMillis();
         if (expiry > 0 && now > truncate<i64>(expiry)) { expired = this.expireUploads(now - truncate<i64>(expiry))?; }
         var checkpointed = false;
-        let every = this.config.checkpointEveryBytes;
-        if (every > 0 && this.sinceCheckpoint >= every) { checkpointed = this.checkpoint()?; }
+        if (withCheckpoint && this.checkpointDue()) { checkpointed = this.checkpoint()?; }
         let compaction = this.compact(this.config.compactMaxCopyBytes)?;
         var lifecycle = LifecycleReport { objectsExpired: 0, uploadsAborted: 0 };
         let lifecycleEvery = this.config.lifecycleEveryMillis;

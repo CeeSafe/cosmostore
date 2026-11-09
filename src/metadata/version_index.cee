@@ -12,11 +12,25 @@ struct VersionIndex {
     private versions: Vector<ObjectVersion>;
     /// Slots of removed versions, for the next put.
     private free: Vector<u32>;
+    /// A snapshot in progress (ADR-0028): the index as it was when `beginSnapshot` was called, read in key order a
+    /// few entries at a time while the index keeps changing.
+    private snapshot: bool;
+    /// The last key the snapshot has given (null: none yet). Changes to it or to earlier keys need nothing kept.
+    private snapshotDone: IndexKey?;
+    /// Keys after `snapshotDone` that changed since the snapshot began, with their version then (null: the key was
+    /// not there).
+    private before: OrderedMap<IndexKey, ObjectVersion?>;
+    /// A version could not be kept (out of memory): the snapshot is not whole, and its reader must give it up.
+    private broken: bool;
 
     fn create() -> VersionIndex => VersionIndex {
         order: OrderedMap<IndexKey, u32>.create(),
         versions: Vector<ObjectVersion>.create(),
         free: Vector<u32>.create(),
+        snapshot: false,
+        snapshotDone: null,
+        before: OrderedMap<IndexKey, ObjectVersion?>.create(),
+        broken: false,
     };
 
     fn length(borrow this) -> usize => this.order.length();
@@ -29,6 +43,7 @@ struct VersionIndex {
     }
 
     fn getMut(borrow mut this, key: borrow IndexKey) -> borrow mut(this) ObjectVersion? {
+        this.keep(key);
         let slot = match (this.order.get(key)) {
             Some(s) => s as usize,
             null => { return null; }
@@ -39,6 +54,7 @@ struct VersionIndex {
     /// Puts `version` at `key`: the old version if the key was there, else null. A failure leaves the index as it
     /// was.
     fn put(borrow mut this, key: IndexKey, version: ObjectVersion) -> Result<ObjectVersion?, AllocError> {
+        this.keep(borrow key);
         match (this.order.get(borrow key)) {
             Some(s) => { return Ok(replace(mut this.versions[s as usize], version)); }
             null => {}
@@ -72,11 +88,129 @@ struct VersionIndex {
 
     /// Removes `key`; its version, if it was there.
     fn remove(borrow mut this, key: borrow IndexKey) -> ObjectVersion? {
+        this.keep(key);
         let slot = this.order.remove(key)?;
         let old = replace(mut this.versions[slot as usize], vacantVersion());
         // Without room to remember it, the slot stays unused: a few bytes, never a wrong answer.
         let _ = this.free.push(slot);
         return old;
+    }
+
+    // ---- Snapshots (ADR-0028) ----
+
+    /// Starts a snapshot of the index as it is now, dropping one that was in progress.
+    fn beginSnapshot(borrow mut this) {
+        this.snapshot = true;
+        this.snapshotDone = null;
+        this.before.clear();
+        this.broken = false;
+    }
+
+    /// Ends the snapshot and frees the versions it kept.
+    fn endSnapshot(borrow mut this) {
+        this.snapshot = false;
+        this.snapshotDone = null;
+        this.before.clear();
+        this.broken = false;
+    }
+
+    fn snapshotActive(borrow this) -> bool => this.snapshot;
+
+    /// Whether a version could not be kept: the snapshot must be given up.
+    fn snapshotBroken(borrow this) -> bool => this.broken;
+
+    /// The versions kept for the snapshot, for tests and the stats.
+    fn snapshotKept(borrow this) -> usize => this.before.length();
+
+    /// Before `key` changes: if the snapshot has not given it yet, keeps its version as the snapshot saw it, once.
+    fn keep(borrow mut this, key: borrow IndexKey) {
+        if (!this.snapshot || this.broken) { return; }
+        let passed = match (this.snapshotDone.asBorrow()) {
+            Some(d) => key.compareKey(d) <= 0,
+            null => false,
+        };
+        if (passed || this.before.contains(key)) { return; }
+        let old: ObjectVersion? = match (this.order.get(key)) {
+            Some(s) => {
+                match (copyVersion(borrow this.versions[s as usize])) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        this.broken = true;
+                        return;
+                    }
+                }
+            }
+            null => null,
+        };
+        let copy = match (copyIndexKey(key)) {
+            Ok(k) => k,
+            Err(_) => {
+                this.broken = true;
+                return;
+            }
+        };
+        match (this.before.put(copy, old)) {
+            Ok(_) => {}
+            Err(_) => { this.broken = true; }
+        }
+    }
+
+    /// The snapshot's next entry: the next key after the last one given, in the index or among the kept versions,
+    /// whichever comes first. A kept version wins over the index's for the same key. Null at the end.
+    fn snapshotPeek(borrow this) -> SnapshotAt? {
+        let inOrder = match (this.snapshotDone.asBorrow()) {
+            Some(d) => this.order.seekAfter(d),
+            null => this.order.first(),
+        };
+        let inBefore = match (this.snapshotDone.asBorrow()) {
+            Some(d) => this.before.seekAfter(d),
+            null => this.before.first(),
+        };
+        let b = match (inBefore) {
+            Some(c) => c,
+            null => {
+                return match (inOrder) {
+                    Some(c) => SnapshotAt { cursor: c, kept: false },
+                    null => null,
+                };
+            }
+        };
+        return match (inOrder) {
+            Some(o) => {
+                if (this.order.keyAt(o).compareKey(this.before.keyAt(b)) < 0) {
+                    SnapshotAt { cursor: o, kept: false }
+                } else {
+                    SnapshotAt { cursor: b, kept: true }
+                }
+            }
+            null => SnapshotAt { cursor: b, kept: true },
+        };
+    }
+
+    fn snapshotKey(borrow this, at: SnapshotAt) -> borrow(this) IndexKey =>
+        if (at.kept) this.before.keyAt(at.cursor) else this.order.keyAt(at.cursor);
+
+    /// Whether the entry is a key that was not there when the snapshot began: it is skipped.
+    fn snapshotSkips(borrow this, at: SnapshotAt) -> bool => at.kept && this.before.valueAt(at.cursor).isNull();
+
+    /// The entry's version as the snapshot saw it. Not for an entry the snapshot skips.
+    fn snapshotVersion(borrow this, at: SnapshotAt) -> borrow(this) ObjectVersion {
+        if (!at.kept) {
+            let slot = this.order.valueAt(at.cursor);
+            return borrow this.versions[slot as usize];
+        }
+        return match (this.before.valueAt(at.cursor)) {
+            Some(v) => v,
+            null => { panic("snapshotVersion of a skipped entry"); }
+        };
+    }
+
+    /// Moves the snapshot past the entry, and frees its kept version if it had one.
+    fn snapshotAdvance(borrow mut this, at: SnapshotAt) -> Result<void, AllocError> {
+        let done = copyIndexKey(this.snapshotKey(at))?;
+        if (at.kept) { let _ = this.before.remove(borrow done); }
+        this.snapshotDone = done;
+        return Ok();
     }
 
     fn first(borrow this) -> OrderedCursor? => this.order.first();
@@ -95,6 +229,46 @@ struct VersionIndex {
         let slot = this.order.valueAt(at);
         return borrow this.versions[slot as usize];
     }
+}
+
+/// A snapshot's position (`VersionIndex.snapshotPeek`): a key in the index, or among the versions the snapshot kept.
+struct SnapshotAt {
+    cursor: OrderedCursor;
+    kept: bool;
+}
+
+fn copyIndexKey(k: borrow IndexKey) -> Result<IndexKey, AllocError> {
+    var key = Vector<u8>.create();
+    key.extend(k.key.view())?;
+    return Ok(IndexKey { bucket: k.bucket, key: key });
+}
+
+/// A version's deep copy.
+fn copyVersion(v: borrow ObjectVersion) -> Result<ObjectVersion, AllocError> {
+    var contentType = Vector<u8>.create();
+    contentType.extend(v.contentType.view())?;
+    var extents = Vector<ExtentRef>.create();
+    extents.extend(v.extents.view())?;
+    var metadata = Vector<u8>.create();
+    metadata.extend(v.metadata.view())?;
+    var extras = Vector<u8>.create();
+    extras.extend(v.extras.view())?;
+    return Ok(ObjectVersion {
+        versionId: v.versionId,
+        lsn: v.lsn,
+        kind: v.kind,
+        size: v.size,
+        mtimeMillis: v.mtimeMillis,
+        md5: v.md5,
+        contentType: contentType,
+        payload: PayloadLocator { segmentId: v.payload.segmentId, offset: v.payload.offset, length: v.payload.length },
+        recordSegment: v.recordSegment,
+        recordLength: v.recordLength,
+        extents: extents,
+        metadata: metadata,
+        extras: extras,
+        parts: v.parts,
+    });
 }
 
 /// An empty slot's placeholder: no heap memory.

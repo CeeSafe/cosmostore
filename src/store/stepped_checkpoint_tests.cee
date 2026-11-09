@@ -1,0 +1,252 @@
+// Checkpoints written in steps while the store changes (ADR-0028): the file holds the state at its LSN, whatever
+// happened between the steps. Then the fault sweeps.
+
+/// Every object of the store as "bucket/key@generation" lines, sorted: buckets from the store's own list.
+fn liveState(s: borrow ObjectStore) -> Vector<u8> {
+    var lines = Vector<Vector<u8>>.create();
+    let buckets = s.listBucketInfo()!;
+    for (b in 0..buckets.length) {
+        let name = StringView.fromUtf8(buckets[b].name.view()) ?? "";
+        let page = s.listObjects(name, "", "", "".bytes(), false, 100000)!;
+        for (i in 0..page.keys.length) {
+            let key = StringView.fromUtf8(page.keys[i].view()) ?? "";
+            var line = Vector<u8>.create();
+            line.extend(name.bytes())!;
+            line.push('/')!;
+            line.extend(page.keys[i].view())!;
+            line.push('@')!;
+            appendDecimal(mut line, s.headObject(name, key)!.generation)!;
+            lines.push(line)!;
+        }
+    }
+    return joinSorted(mut lines);
+}
+
+/// The objects a checkpoint file holds, in the same form.
+fn checkpointState(dir: StringView, lsn: u64) -> Vector<u8> {
+    let loaded = readCheckpoint(dir, lsn)!;
+    var lines = Vector<Vector<u8>>.create();
+    var cursor = loaded.state.index.first();
+    while (true) {
+        let i = match (cursor) {
+            Some(c) => c,
+            null => { break; }
+        };
+        cursor = loaded.state.index.next(i);
+        let k = loaded.state.index.keyAt(i);
+        var line = Vector<u8>.create();
+        line.extend(loaded.state.bucketName(k.bucket))!;
+        line.push('/')!;
+        line.extend(k.key.view())!;
+        line.push('@')!;
+        appendDecimal(mut line, loaded.state.index.valueAt(i).lsn)!;
+        lines.push(line)!;
+    }
+    return joinSorted(mut lines);
+}
+
+fn joinSorted(lines: borrow mut Vector<Vector<u8>>) -> Vector<u8> {
+    lines.viewMut().sortBy((a, b) => compareBytes(a.view(), b.view()));
+    var out = Vector<u8>.create();
+    for (i in 0..lines.length) {
+        out.extend(lines[i].view())!;
+        out.push('\n')!;
+    }
+    return out;
+}
+
+fn twoDigit(prefix: StringView, i: u64) -> String {
+    var s = String.create();
+    s.append(prefix)!;
+    if (i < 10) { s.append("0")!; }
+    s.appendNumber(i)!;
+    return s;
+}
+
+/// One step of `job`; whether the snapshot is done.
+fn step(s: borrow mut ObjectStore, job: borrow mut CheckpointJob) -> bool {
+    let done = s.checkpointStep(job, 3)!;
+    job.flush()!;
+    return done;
+}
+
+@test
+fn steppedCheckpointHoldsTheStateAtItsLsn() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("ckpt-stepped");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    s.createBucket("gone")!;
+    s.createBucket("aux")!;
+    for (i in 0u64..30) { putText(mut s, "bkt", twoDigit("k", i).view(), "v0"); }
+    for (i in 0u64..5) { putText(mut s, "aux", twoDigit("a", i).view(), "v0"); }
+    // An extent-backed object, so a kept version carries extents.
+    let big = patterned(150000, 5);
+    s.putObject("bkt", "k10", "application/octet-stream", big.view(), PutCondition.None)!;
+    let atLsn = liveState(borrow s);
+    var job = match (s.beginCheckpoint()!) {
+        Some(j) => j,
+        null => { return Check.fail("a checkpoint is due"); }
+    };
+    // k00, k01, k02 are written; then changes behind the walk and ahead of it.
+    Check.isTrue(!step(mut s, mut job), "more to come")?;
+    putText(mut s, "bkt", "k01", "behind");
+    s.deleteObject("bkt", "k02")!;
+    putText(mut s, "bkt", "k00x", "new, behind");
+    putText(mut s, "bkt", "k20", "ahead");
+    s.deleteObject("bkt", "k21")!;
+    putText(mut s, "bkt", "k03x", "new, ahead");
+    s.deleteObject("bkt", "k22")!;
+    putText(mut s, "bkt", "k22", "deleted, then back");
+    putText(mut s, "bkt", "k25x", "new, then deleted");
+    s.deleteObject("bkt", "k25x")!;
+    s.putObject("bkt", "k10", "application/octet-stream", "small now".bytes(), PutCondition.None)!;
+    s.deleteBucket("gone")!;
+    s.createBucket("fresh")!;
+    putText(mut s, "fresh", "f0", "in a bucket made after the LSN");
+    putText(mut s, "aux", "a03", "ahead, in another bucket");
+    // A few steps, and more changes in the middle.
+    Check.isTrue(!step(mut s, mut job), "more to come")?;
+    Check.isTrue(!step(mut s, mut job), "more to come")?;
+    putText(mut s, "bkt", "k29", "once");
+    putText(mut s, "bkt", "k29", "twice");
+    s.deleteObject("aux", "a04")!;
+    putText(mut s, "bkt", "k05", "just behind or ahead");
+    var steps: u64 = 3;
+    while (!step(mut s, mut job)) { steps += 1; }
+    Check.equalU64(12, steps + 1)?; // 35 entries at the LSN, 3 a step: the walk did not see the changes
+    let size = job.publish()!;
+    s.checkpointPublished(borrow job, size);
+    Check.equalU64(job.lsn, s.lastCheckpoint())?;
+    // The file holds the state at its LSN, not the state now.
+    let inFile = checkpointState(dir.view(), job.lsn);
+    if (inFile.view() != atLsn.view()) {
+        Console.writeLine(StringView.fromUtf8(atLsn.view()) ?? "");
+        Console.writeLine(StringView.fromUtf8(inFile.view()) ?? "");
+        return Check.fail("the checkpoint holds the state at its LSN");
+    }
+    let now = liveState(borrow s);
+    Check.isTrue(now.view() != atLsn.view(), "the store changed meanwhile")?;
+    // Recovery from it, with the journal after it, gives the state now.
+    {
+        let r = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.isTrue(liveState(borrow r).view() == now.view(), "recovery from the stepped checkpoint")?;
+        checkText("small now", r.getObject("bkt", "k10")!)?;
+        Check.equalU64(0, r.verify()!.problems.length as u64)?;
+    }
+    // A checkpoint begun and given up leaves the store as it was, and the next one is whole.
+    var dropped = match (s.beginCheckpoint()!) {
+        Some(j) => j,
+        null => { return Check.fail("a checkpoint is due"); }
+    };
+    Check.isTrue(!step(mut s, mut dropped), "more to come")?;
+    putText(mut s, "bkt", "k28", "during a job that is given up");
+    s.checkpointAbandoned(mut dropped);
+    Check.equalU64(0, countFiles(dir.view(), "ckpt-", ".tmp"))?;
+    Check.isTrue(s.checkpoint()!, "the next checkpoint")?;
+    Check.isTrue(checkpointState(dir.view(), s.lastCheckpoint()).view() == liveState(borrow s).view(), "whole")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+// ---- Fault sweeps (ADR-0004) ----
+
+/// What `steppedWorkload` leaves each key holding when nothing fails.
+const STEPPED_WORKLOAD_RESULT: [u64; 5] = [5u64, 0, 6, 4, 7];
+
+/// A checkpoint written in steps of one entry, with writes and a delete between the steps, ahead of the walk and
+/// behind it; then a compaction, and writes after it. The checkpoint's outcome does not change what a key holds.
+fn steppedWorkload(dir: StringView, m: borrow mut FaultModel) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    match (s.createBucket("bkt")) {
+        Ok() => {
+            m.bucket = true;
+            m.bucketAlt = true;
+        }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.bucketAlt = true; }
+        }
+    }
+    let keys = [0usize, 1, 2, 3, 4];
+    let seeds = [1u64, 2, 3, 4, 5];
+    for (i in 0..5) { putStep(mut s, m, keys[i], seeds[i]); }
+    match (s.beginCheckpoint()) {
+        Ok(Some(job)) => {
+            var j = job;
+            var failed = false;
+            // Key 0 is written first; then a write behind the walk, one ahead, and a delete ahead.
+            match (s.checkpointStep(mut j, 1)) {
+                Ok(_) => {}
+                Err(_) => { failed = true; }
+            }
+            if (!failed && j.flush().isErr()) { failed = true; }
+            putStep(mut s, m, 0, 5);
+            putStep(mut s, m, 2, 6);
+            match (s.deleteObject("bkt", keyName(1))) {
+                Ok() => { m.succeeded(1, 0); }
+                Err(e) => { m.failed(1, 0, borrow e); }
+            }
+            while (!failed) {
+                match (s.checkpointStep(mut j, 1)) {
+                    Ok(done) => {
+                        if (j.flush().isErr()) {
+                            failed = true;
+                        } else if (done) {
+                            break;
+                        }
+                    }
+                    Err(_) => { failed = true; }
+                }
+            }
+            if (failed) {
+                s.checkpointAbandoned(mut j);
+            } else {
+                match (j.publish()) {
+                    Ok(size) => { s.checkpointPublished(borrow j, size); }
+                    Err(_) => { s.checkpointAbandoned(mut j); }
+                }
+            }
+        }
+        _ => {}
+    }
+    putStep(mut s, m, 4, 7);
+    let _ = s.compact(1073741824);
+    putStep(mut s, m, 3, 4);
+}
+
+@test
+fn steppedWorkloadCheckpoints() -> Result<void, TestFailure> {
+    // The sweeps below are only meaningful if the workload's checkpoint is published.
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory("ckpt-stepped-workload");
+    var m = FaultModel.create();
+    steppedWorkload(dir.view(), mut m);
+    for (k in 0..FKEYS) { Check.equalU64(STEPPED_WORKLOAD_RESULT[k], m.cur[k])?; }
+    let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+    Check.isTrue(s.lastCheckpoint() > 0, "checkpointed")?;
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn steppedFaultsOnce() -> Result<void, TestFailure> =>
+    sweepStore("sfault-once", SweepMode.Once, steppedWorkload, STEPPED_WORKLOAD_RESULT);
+
+@test
+fn steppedFaultsSticky() -> Result<void, TestFailure> =>
+    sweepStore("sfault-sticky", SweepMode.Sticky, steppedWorkload, STEPPED_WORKLOAD_RESULT);
+
+@test
+fn steppedFaultsTorn() -> Result<void, TestFailure> =>
+    sweepStore("sfault-torn", SweepMode.StickyTorn, steppedWorkload, STEPPED_WORKLOAD_RESULT);
+
+@test
+fn steppedFaultsCrash() -> Result<void, TestFailure> =>
+    sweepStore("sfault-crash", SweepMode.Crash, steppedWorkload, STEPPED_WORKLOAD_RESULT);
+
+@test
+fn steppedFaultsCrashDuringOpen() -> Result<void, TestFailure> =>
+    sweepStoreOpen("sfault-open", SweepMode.Crash, steppedWorkload);

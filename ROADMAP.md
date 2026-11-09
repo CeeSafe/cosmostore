@@ -1109,3 +1109,23 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - T7: checkpoints without the store's lock;
   - T9's margin: the version's rarely used fields out of line.
+
+### 9 Nov 2026: M4 slice 9, checkpoints in steps (ADR-0028)
+
+- **A checkpoint is a job of steps:**
+  - it begins under the store's lock (header, buckets, uploads, a snapshot of the index);
+  - it encodes 4,096 index entries a step under the lock;
+  - it writes, syncs and publishes without the lock.
+- **The index keeps what the snapshot still needs.** A key changed before the walk reaches it keeps its version at
+  the checkpoint's LSN. So the file is exactly the state at that LSN, and recovery is unchanged. A file is published
+  only if it holds the entries its header counts.
+- **Results** (`docs/benchmarks/2026-11-09-stepped-checkpoints.md`):
+  - the 1M fill's slowest PUT went from 446 to 662 ms down to 72 ms, and p99 from about 60 to 36 ms;
+  - T7 at concurrency 8: 28 of 30 phases within 50 ms; 128 B overwrite at 55 ms, and one 109 ms spike in 16 KiB
+    delete. Not met yet.
+- **Tests:** the checkpoint written in steps of three, with changes ahead of and behind the walk, decoded and
+  compared with the state at its LSN. Fault sweeps (once, sticky, torn, crash, crash while opening) of a stepped
+  workload. A no-keep mutant fails them. 123 tests, s3-tests subset 252, the SDK checks, both smokes.
+- **Next:**
+  - T7: time the upkeep's parts, then compaction's plan out from under the lock;
+  - a quiet run.

@@ -108,8 +108,7 @@ struct CheckpointWriter {
         this.buffer.extend(body)?;
         this.crc.update(this.buffer.view()[start..]);
         this.entries += 1;
-        if (this.buffer.length >= CHECKPOINT_IO_CHUNK) { this.flush()?; }
-        return Ok();
+        return Ok(); // the caller flushes, without the store's lock (ADR-0028)
     }
 
     fn flush(borrow mut this) -> Result<void, StoreError> {
@@ -190,43 +189,82 @@ fn encodeUploadEntry(out: borrow mut Vector<u8>, id: [u8; 16], u: borrow Upload)
     return Ok();
 }
 
-/// Writes a checkpoint of `state` as of `lsn`, whose replay starts at `segment`, durably.
-/// Returns the file's size.
-fn writeCheckpoint(dir: StringView, lsn: u64, segment: u64, state: borrow StoreState) -> Result<u64, StoreError> {
+/// A checkpoint written in steps (ADR-0028): the state as of `lsn`, while the store keeps changing. It begins under the
+/// store (`beginCheckpointJob`: the header, the buckets and uploads, and a snapshot of the index), encodes the index a
+/// step at a time under the store (`checkpointStepOf`, memory only), and does its I/O without it (`flush`,
+/// `publish`).
+struct CheckpointJob {
+    lsn: u64;
+    /// The first segment the checkpoint does not cover: replay starts there.
+    segment: u64;
+    /// The journal bytes committed between the previous checkpoint and `lsn`.
+    sinceBefore: u64;
+    private dir: String;
+    private tmp: String;
+    private done: String;
+    private writer: CheckpointWriter;
+    /// The entries the header promises: buckets, objects and uploads at `lsn`.
+    private expected: u64;
+    /// The bucket names by number at `lsn`, for object entries: a bucket may go before its keys are written.
+    private names: HashMap<u32, Vector<u8>>;
+    /// The upload entries at `lsn`, encoded; they follow the objects.
+    private uploads: Vector<Vector<u8>>;
+    private body: Vector<u8>;
+
+    /// Writes what the steps have encoded so far (I/O, without the store).
+    fn flush(borrow mut this) -> Result<void, StoreError> => this.writer.flush();
+
+    /// Writes the uploads and the trailer and syncs the file. Then checks that it holds the entries its header
+    /// promises, and publishes it: rename, then directory sync (I/O, without the store). Returns the file's size.
+    /// Until the directory sync returns, a crash may lose the new name: recovery then uses the previous checkpoint,
+    /// whose segments are all still there.
+    fn publish(borrow mut this) -> Result<u64, StoreError> {
+        for (i in 0..this.uploads.length) { this.writer.add(CHECKPOINT_UPLOAD, this.uploads[i].view())?; }
+        // A snapshot that gave each key at `lsn` exactly once fills the header's count; anything else is a bug, and
+        // such a file must never be published.
+        if (this.writer.entries != this.expected) { return Err(StoreError.CheckpointCorrupt); }
+        this.writer.buffer.pushLE(CHECKPOINT_TRAILER_MAGIC)?;
+        this.writer.buffer.pushLE(this.writer.crc.finish())?;
+        this.writer.buffer.pushLE(this.writer.entries)?;
+        this.writer.flush()?;
+        sio(this.writer.file.syncData())?;
+        sio(Fs.rename(this.tmp.view(), this.done.view()))?;
+        sio(Fs.syncDirectory(this.dir.view()))?;
+        return Ok(this.writer.offset);
+    }
+
+    /// Removes the temporary file of a checkpoint given up.
+    fn abandon(borrow mut this) { let _ = Fs.unlink(this.tmp.view()); }
+}
+
+/// Starts a checkpoint of `state` as of `lsn`, whose replay starts at `segment`. Creates its temporary file with the
+/// header, encodes the buckets and uploads, and begins a snapshot of the index.
+fn beginCheckpointJob(
+    dir: StringView,
+    lsn: u64,
+    segment: u64,
+    sinceBefore: u64,
+    state: borrow mut StoreState,
+) -> Result<CheckpointJob, StoreError> {
     let tmp = checkpointPath(dir, lsn, true)?;
     let done = checkpointPath(dir, lsn, false)?;
     let _ = Fs.unlink(tmp.view()); // a leftover of an interrupted attempt
-    match (writeCheckpointFile(tmp.view(), lsn, segment, state)) {
-        Ok(size) => {
-            match (Fs.rename(tmp.view(), done.view())) {
-                Ok() => {}
-                Err(e) => {
-                    let _ = Fs.unlink(tmp.view());
-                    return Err(StoreError.Io(e));
-                }
-            }
-            // Until this sync returns, a crash may lose the new name: recovery then uses the
-            // previous checkpoint, whose segments are all still there.
-            sio(Fs.syncDirectory(dir))?;
-            return Ok(size);
-        }
-        Err(e) => {
-            let _ = Fs.unlink(tmp.view());
-            return Err(e);
-        }
-    }
-}
-
-fn writeCheckpointFile(path: StringView, lsn: u64, segment: u64, state: borrow StoreState) -> Result<u64, StoreError> {
-    let file = sio(DurableFile.createNew(path))?;
+    let file = sio(DurableFile.createNew(tmp.view()))?;
+    let objects = state.index.length() as u64;
     let header = encodeCheckpointHeader(
         lsn,
         segment,
         state.buckets.length() as u64,
-        state.index.length() as u64,
+        objects,
         truncate<u32>(state.uploads.length()),
     );
-    sio(file.writeAt(header[..], 0))?;
+    match (file.writeAt(header[..], 0)) {
+        Ok() => {}
+        Err(e) => {
+            let _ = Fs.unlink(tmp.view());
+            return Err(StoreError.Io(e));
+        }
+    }
     var w = CheckpointWriter {
         file: file,
         offset: CHECKPOINT_HEADER_LEN as u64,
@@ -247,28 +285,61 @@ fn writeCheckpointFile(path: StringView, lsn: u64, segment: u64, state: borrow S
         body.extend(b.lifecycle.view())?;
         w.add(CHECKPOINT_BUCKET, body.view())?;
     }
-    var cursor = state.index.first();
-    while (true) {
-        let i = match (cursor) {
-            Some(c) => c,
-            null => { break; }
-        };
-        cursor = state.index.next(i);
-        let k = state.index.keyAt(i);
-        let v = state.index.valueAt(i);
-        encodeObjectEntry(mut body, state.bucketName(k.bucket), k, v)?;
-        w.add(CHECKPOINT_OBJECT, body.view())?;
-    }
+    var uploads = Vector<Vector<u8>>.create();
     for (i in 0..state.uploads.length()) {
         encodeUploadEntry(mut body, state.uploads.keyAt(i).id, state.uploads.valueAt(i))?;
-        w.add(CHECKPOINT_UPLOAD, body.view())?;
+        uploads.push(copyBytes(body.view())?)?;
     }
-    w.buffer.pushLE(CHECKPOINT_TRAILER_MAGIC)?;
-    w.buffer.pushLE(w.crc.finish())?;
-    w.buffer.pushLE(w.entries)?;
-    w.flush()?;
-    sio(w.file.syncData())?;
-    return Ok(w.offset);
+    var names = HashMap<u32, Vector<u8>>.create();
+    for (i in 0..state.bucketNames.length()) {
+        let _ = names.put(state.bucketNames.keyAt(i), copyBytes(state.bucketNames.valueAt(i).view())?)?;
+    }
+    state.index.beginSnapshot();
+    var dirCopy = String.create();
+    dirCopy.append(dir)?;
+    return Ok(CheckpointJob {
+        lsn: lsn,
+        segment: segment,
+        sinceBefore: sinceBefore,
+        dir: dirCopy,
+        tmp: tmp,
+        done: done,
+        writer: w,
+        expected: state.buckets.length() as u64 + objects + state.uploads.length() as u64,
+        names: names,
+        uploads: uploads,
+        body: body,
+    });
+}
+
+/// Encodes up to `max` object entries of the index's snapshot into the job (memory only: under the store). Returns
+/// whether the snapshot is done.
+fn checkpointStepOf(
+    job: borrow mut CheckpointJob,
+    state: borrow mut StoreState,
+    max: usize,
+) -> Result<bool, StoreError> {
+    // A version the snapshot could not keep (out of memory): this checkpoint cannot be whole.
+    if (state.index.snapshotBroken()) { return Err(StoreError.OutOfMemory(AllocError.OutOfMemory)); }
+    var n: usize = 0;
+    while (n < max) {
+        let at = match (state.index.snapshotPeek()) {
+            Some(a) => a,
+            null => { return Ok(true); }
+        };
+        if (!state.index.snapshotSkips(at)) {
+            let k = state.index.snapshotKey(at);
+            let name = match (job.names.get(borrow k.bucket)) {
+                Some(b) => b.view(),
+                null => { return Err(StoreError.CheckpointCorrupt); } // a key of no bucket at `lsn`: a bug
+            };
+            encodeObjectEntry(mut job.body, name, k, state.index.snapshotVersion(at))?;
+            job.writer.add(CHECKPOINT_OBJECT, job.body.view())?;
+            n += 1;
+        }
+        state.index.snapshotAdvance(at)?;
+    }
+    return Ok(false);
 }
 
 /// A loaded checkpoint: where replay starts, and the state to replay onto.

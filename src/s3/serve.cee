@@ -249,13 +249,104 @@ async fn upkeep(store: borrow Arc<AsyncMutex<ObjectStore>>) {
 }
 
 async fn maintainOnce(store: borrow Arc<AsyncMutex<ObjectStore>>) -> Result<void, StoreError> {
+    await checkpointInSteps(store)?;
     var guard = match (await store.get().lock()) {
         Ok(g) => g,
         Err(_) => { return Ok(); } // cancelled: the server is stopping
     };
     let s = guard.data();
-    let _ = await Async.blocking(() => s.maintain())?;
+    let _ = await Async.blocking(() => s.upkeep(false))?;
     return Ok();
+}
+
+/// A due checkpoint, written in steps (ADR-0028). The store's lock is held to begin it, for each step's encoding (a
+/// few thousand entries, memory only), and to record or abandon it. The writes, the sync and the rename go without
+/// the lock while requests go on; the index keeps the versions they change until the checkpoint has them. If the
+/// server stops part way, the next begin drops the snapshot, and the next open the temporary file.
+async fn checkpointInSteps(store: borrow Arc<AsyncMutex<ObjectStore>>) -> Result<void, StoreError> {
+    var job = match (await beginJob(store)?) {
+        Some(j) => j,
+        null => { return Ok(); }
+    };
+    var failure: StoreError? = null;
+    loop {
+        let finished = match (await stepJob(store, mut job)) {
+            Ok(Some(f)) => f,
+            Ok(null) => { return Ok(); } // cancelled
+            Err(e) => {
+                failure = e;
+                break;
+            }
+        };
+        let j = borrow mut job;
+        match (await Async.blocking(() => j.flush())) {
+            Ok() => {}
+            Err(e) => {
+                failure = e;
+                break;
+            }
+        }
+        if (finished) { break; }
+    }
+    if (failure.isNull()) {
+        let j = borrow mut job;
+        match (await Async.blocking(() => j.publish())) {
+            Ok(size) => { return await recordJob(store, borrow job, size); }
+            Err(e) => { failure = e; }
+        }
+    }
+    await abandonJob(store, mut job);
+    return match (failure) {
+        Some(e) => Err(e),
+        null => Ok(),
+    };
+}
+
+/// Begins a checkpoint if one is due: null if not, or if the server is stopping.
+async fn beginJob(store: borrow Arc<AsyncMutex<ObjectStore>>) -> Result<CheckpointJob?, StoreError> {
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Ok(null); }
+    };
+    let s = guard.data();
+    if (!s.checkpointDue()) { return Ok(null); }
+    return await Async.blocking(() => s.beginCheckpoint());
+}
+
+/// One step under the lock: whether the snapshot is done; null if the server is stopping.
+async fn stepJob(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    job: borrow mut CheckpointJob,
+) -> Result<bool?, StoreError> {
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Ok(null); }
+    };
+    let s = guard.data();
+    return Ok(await Async.blocking(() => s.checkpointStep(job, CHECKPOINT_STEP_ENTRIES))?);
+}
+
+async fn recordJob(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    job: borrow CheckpointJob,
+    size: u64,
+) -> Result<void, StoreError> {
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Ok(); } // published, but not recorded: the next open uses it all the same
+    };
+    let s = guard.data();
+    await Async.blocking(() => s.checkpointPublished(job, size));
+    return Ok();
+}
+
+async fn abandonJob(store: borrow Arc<AsyncMutex<ObjectStore>>, job: borrow mut CheckpointJob) {
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return; }
+    };
+    let s = guard.data();
+    await Async.blocking(() => s.checkpointAbandoned(job));
 }
 
 /// Reloads the certificate if its file or its key's changed since the last good load, on a worker thread (the stat and

@@ -29,6 +29,8 @@ Recovery time and disk use therefore grew with everything ever written, not with
    because segments the bad one covered may already be gone.
 5. `maintain()` checkpoints once `checkpointEveryBytes` of journal (64 MiB by default) has been committed since
    the last checkpoint.
+   - **Amended by ADR-0028 (M4 slice 9):** a checkpoint is written in steps from a snapshot of the index, and the
+     server releases the store's lock between steps. The file, its publication and recovery are unchanged.
 
 ### Compaction
 
