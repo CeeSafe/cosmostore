@@ -1150,3 +1150,23 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - a quiet reference run of the whole matrix;
   - T2.
+
+### 9 Nov 2026: M4 reference run
+
+- **The whole matrix and the 1M scale run at `7e99bb0`, on a quiet machine** (load average 1.8 to 4.4), against every
+  target (`docs/benchmarks/2026-11-09-m4-reference.md`). This is the reference for M4's p99 regression gates.
+- **T2 restated** with the user: ≤ 70 syncs per 1,000 tiny PUTs at concurrency 32, about 2 per client for closed-loop
+  clients (`docs/targets.md`). It is met at 64.
+- **Met:** T2 to T6 and T8 to T12.
+- **Short:**
+  - T1 at 4 KiB: 2,908/s against 3,000. 0 B to 1 KiB ran at 3,161 to 3,267, and 4 KiB ran at 3,300 in earlier runs.
+  - T7 in one phase of 30: 4 KiB PUT at 53.1 ms p99.9, with no upkeep hold during it.
+- **From the baseline,** at concurrency 32:
+  - tiny PUT went from about 200 to 3,000/s, with p99 from up to 550 ms down to 16 ms;
+  - small GET went from up to 2,300 to 21,000 to 27,000/s;
+  - HEAD went from up to 14,600 to 34,000 to 42,000/s;
+  - DELETE went from about 200 to 3,000/s.
+- **Not done from M4's plan:**
+  - journal shards and per-core appenders;
+  - the comparison against SeaweedFS, Garage and RustFS;
+  - p99 regression gates in CI.
