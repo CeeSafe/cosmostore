@@ -1075,3 +1075,22 @@ Browser form uploads with a SigV4 POST policy.
   - an ordered index for listing (T10, and listing's memory);
   - checkpoints that do not hold the lock (T7);
   - quiet runs.
+
+### 9 Nov 2026: M4 slice 7, the ordered index (ADR-0026)
+
+- **The index is ordered:** `VersionIndex` keeps (bucket, key) in lib/std's `OrderedMap` with a slot number, and the
+  versions in one dense vector.
+- **A listing seeks to its first key** and reads only its page; a common prefix skips the keys under it with one
+  seek. Listing now runs on the event loop.
+- **Results at 1M objects** (`docs/benchmarks/2026-11-09-ordered-index.md`):
+  - T10 met: about 1 ms a page at any position, from 164 ms;
+  - listing leaves no memory behind;
+  - T11 still met: 1.54 s, from 0.87 s;
+  - T9 not met: 423 bytes per object, from 362. Keys inserted in order leave the B-tree's nodes half full
+    (CEESAFE_GAPS G29). A first version with the versions in the nodes took 598.
+- **Tests:** `listingMatchesTheReference`, 3,168 listings against the old scan as a reference, plus paging one entry
+  at a time. It caught a bug in the first version. Also `versionIndexOrdersAndReusesSlots`. 115 tests, s3-tests
+  subset 252, the SDK checks, both smokes.
+- **Next:**
+  - T9: a bucket number in index keys, and smaller versions;
+  - T7: checkpoints without the lock.

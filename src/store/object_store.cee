@@ -217,7 +217,8 @@ struct ListPage {
 
 /// Everything recovery rebuilds from the journal.
 struct StoreState {
-    index: HashMap<IndexKey, ObjectVersion>;
+    /// In (bucket, key) order, so a listing seeks to its first key and reads only its page (ADR-0026).
+    index: VersionIndex;
     buckets: HashMap<BucketKey, BucketInfo>;
     segments: HashMap<u64, SegmentUsage>;
     records: u64;
@@ -233,7 +234,7 @@ struct StoreState {
     completions: Vector<Completion>;
 
     fn create() -> StoreState => StoreState {
-        index: HashMap<IndexKey, ObjectVersion>.create(),
+        index: VersionIndex.create(),
         buckets: HashMap<BucketKey, BucketInfo>.create(),
         segments: HashMap<u64, SegmentUsage>.create(),
         records: 0,
@@ -620,6 +621,46 @@ fn applyBatch(
     return Ok();
 }
 
+/// The later of two positions in the index; null is the end, after everything.
+fn laterOf(
+    index: borrow VersionIndex,
+    a: OrderedCursor?,
+    b: OrderedCursor?,
+) -> OrderedCursor? {
+    let x = match (a) {
+        Some(c) => c,
+        null => { return null; }
+    };
+    let y = match (b) {
+        Some(c) => c,
+        null => { return null; }
+    };
+    return if (index.keyAt(x).compareKey(index.keyAt(y)) >= 0) x else y;
+}
+
+/// The first index entry after `marker` in `bucket`; with `wholePrefix`, after every key that starts with `marker`
+/// (the first key at or after the prefix's end: the marker without its trailing 0xFF bytes, its last byte
+/// incremented). Null when nothing in the bucket follows.
+fn seekPast(
+    index: borrow VersionIndex,
+    bucket: Slice<u8>,
+    marker: Slice<u8>,
+    wholePrefix: bool,
+) -> Result<OrderedCursor?, AllocError> {
+    if (!wholePrefix) {
+        let after = IndexKey { bucket: copyBytes(bucket)?, key: copyBytes(marker)? };
+        return Ok(index.seekAfter(borrow after));
+    }
+    var end = copyBytes(marker)?;
+    while (end.length > 0 && end[end.length - 1] == 0xFF) { let _ = end.pop(); }
+    // Every key after an all-0xFF marker starts with it: nothing in the bucket follows.
+    if (end.length == 0) { return Ok(null); }
+    let last = end.length - 1;
+    end[last] = end[last] + 1;
+    let from = IndexKey { bucket: copyBytes(bucket)?, key: end };
+    return Ok(index.seek(borrow from));
+}
+
 struct ObjectStore {
     private journal: Journal;
     private state: StoreState;
@@ -665,7 +706,13 @@ struct ObjectStore {
             state = loaded.state;
             // The checkpointed versions' inline records are live in the segments they cover.
             var live = Vector<SegmentFile>.create();
-            for (i in 0..state.index.length()) {
+            var cursor = state.index.first();
+            while (true) {
+                let i = match (cursor) {
+                    Some(c) => c,
+                    null => { break; }
+                };
+                cursor = state.index.next(i);
                 let v = state.index.valueAt(i);
                 if (v.extents.length == 0) {
                     live.push(SegmentFile { id: v.recordSegment, size: v.recordLength as u64 })?;
@@ -776,7 +823,13 @@ struct ObjectStore {
     /// The extent files that no live version references.
     fn orphanExtents(borrow this) -> Result<Vector<u64>, StoreError> {
         var live = HashMap<u64, bool>.create();
-        for (i in 0..this.state.index.length()) {
+        var cursor = this.state.index.first();
+        while (true) {
+            let i = match (cursor) {
+                Some(c) => c,
+                null => { break; }
+            };
+            cursor = this.state.index.next(i);
             let v = this.state.index.valueAt(i);
             for (k in 0..v.extents.length) {
                 let _ = live.put(v.extents[k].id, true)?;
@@ -824,7 +877,13 @@ struct ObjectStore {
         };
         var chunk = Vector<u8>.create();
         chunk.resize(65536, 0)?;
-        for (i in 0..this.state.index.length()) {
+        var cursor = this.state.index.first();
+        while (true) {
+            let i = match (cursor) {
+                Some(c) => c,
+                null => { break; }
+            };
+            cursor = this.state.index.next(i);
             let k = this.state.index.keyAt(i);
             let v = this.state.index.valueAt(i);
             report.objects += 1;
@@ -2042,7 +2101,8 @@ struct ObjectStore {
 
     /// Lists keys of `bucket` that start with `prefix` and sort after `startAfter`, rolling up
     /// keys that contain `delimiter` after the prefix into common prefixes (S3 ListObjectsV2).
-    /// v0: scans the whole index (O(objects)); the ordered index replaces this (ROADMAP M4).
+    /// The index is ordered (ADR-0026): the page seeks to its first key and reads on from there, and a common prefix
+    /// skips the keys under it with one more seek, so a page costs its own keys, not the bucket's.
     fn listObjects(
         borrow this,
         bucket: StringView,
@@ -2053,25 +2113,7 @@ struct ObjectStore {
         maxKeys: usize,
     ) -> Result<ListPage, StoreError> {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        // Collect the matching keys (indexes into the map), then sort them.
-        var matches = Vector<usize>.create();
-        for (i in 0..this.state.index.length()) {
-            let k = this.state.index.keyAt(i);
-            if (k.bucket.view() != bucket.bytes()) { continue; }
-            let key = k.key.view();
-            if (!startsWithBytes(key, prefix.bytes())) { continue; }
-            if (startAfter.length > 0) {
-                if (compareBytes(key, startAfter) <= 0) { continue; }
-                if (startAfterIsPrefix && startsWithBytes(key, startAfter)) { continue; }
-            }
-            matches.push(i)?;
-        }
         let index = borrow this.state.index;
-        matches.viewMut().sortBy((a, b) => {
-            let ka = index.keyAt(a);
-            let kb = index.keyAt(b);
-            return compareBytes(ka.key.view(), kb.key.view());
-        });
         var page = ListPage {
             keys: Vector<Vector<u8>>.create(),
             sizes: Vector<u64>.create(),
@@ -2083,38 +2125,48 @@ struct ObjectStore {
             nextMarker: Vector<u8>.create(),
             nextMarkerIsPrefix: false,
         };
+        // The first candidate: the first key at or after the prefix, or past the marker if that comes later. A
+        // marker that is a common prefix skips every key under it, even one that sorts before the prefix ("a" with
+        // prefix "a/" skips everything).
+        let first = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(prefix.bytes())? };
+        var cursor = index.seek(borrow first);
+        if (startAfter.length > 0) {
+            cursor = laterOf(index, cursor, seekPast(index, bucket.bytes(), startAfter, startAfterIsPrefix)?);
+        }
         var returned: usize = 0;
-        for (m in 0..matches.length) {
-            let entry = index.keyAt(matches[m]);
+        while (true) {
+            let at = match (cursor) {
+                Some(c) => c,
+                null => { break; }
+            };
+            let entry = index.keyAt(at);
+            // Keys are in (bucket, key) order: the first one outside the bucket or the prefix ends the listing.
+            if (entry.bucket.view() != bucket.bytes() || !startsWithBytes(entry.key.view(), prefix.bytes())) { break; }
             let key = entry.key.view();
             var rolled: usize? = null;
             if (delimiter.length > 0) {
                 match (findBytes(key, delimiter.bytes(), prefix.length)) {
-                    Some(at) => { rolled = at + delimiter.length; }
+                    Some(d) => { rolled = d + delimiter.length; }
                     null => {}
                 }
+            }
+            if (returned == maxKeys) {
+                page.truncated = true;
+                break;
             }
             match (rolled) {
                 Some(end) => {
                     let cp = key[0..end];
-                    let n = page.commonPrefixes.length;
-                    if (n > 0 && page.commonPrefixes[n - 1].view() == cp) { continue; }
-                    if (returned == maxKeys) {
-                        page.truncated = true;
-                        break;
-                    }
                     page.commonPrefixes.push(copyBytes(cp)?)?;
                     page.nextMarker.clear();
                     page.nextMarker.extend(cp)?;
                     page.nextMarkerIsPrefix = true;
+                    // The other keys under this common prefix are rolled up into it: seek past them.
+                    cursor = seekPast(index, bucket.bytes(), cp, true)?;
                 }
                 null => {
-                    if (returned == maxKeys) {
-                        page.truncated = true;
-                        break;
-                    }
                     page.keys.push(copyBytes(key)?)?;
-                    let v = index.valueAt(matches[m]);
+                    let v = index.valueAt(at);
                     page.sizes.push(v.size)?;
                     page.md5s.push(v.md5)?;
                     page.mtimes.push(v.mtimeMillis)?;
@@ -2122,6 +2174,7 @@ struct ObjectStore {
                     page.nextMarker.clear();
                     page.nextMarker.extend(key)?;
                     page.nextMarkerIsPrefix = false;
+                    cursor = index.next(at);
                 }
             }
             returned += 1;
@@ -2180,7 +2233,13 @@ struct ObjectStore {
         }
         // The live inline versions in the chosen segments.
         var plan = Vector<Relocation>.create();
-        for (i in 0..this.state.index.length()) {
+        var cursor = this.state.index.first();
+        while (true) {
+            let i = match (cursor) {
+                Some(c) => c,
+                null => { break; }
+            };
+            cursor = this.state.index.next(i);
             let k = this.state.index.keyAt(i);
             let v = this.state.index.valueAt(i);
             if (v.extents.length != 0 || !chosen.contains(borrow v.recordSegment)) { continue; }
@@ -2341,7 +2400,13 @@ struct ObjectStore {
             };
             // Objects that some rule has expired.
             var expired = Vector<Vector<u8>>.create();
-            for (i in 0..this.state.index.length()) {
+            var cursor = this.state.index.first();
+            while (true) {
+                let i = match (cursor) {
+                    Some(c) => c,
+                    null => { break; }
+                };
+                cursor = this.state.index.next(i);
                 if (expired.length == LIFECYCLE_BATCH) { break; }
                 let key = this.state.index.keyAt(i);
                 if (key.bucket.view() != bucketName) { continue; }

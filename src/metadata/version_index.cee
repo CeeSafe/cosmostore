@@ -1,0 +1,192 @@
+// The index (ADR-0026): keys in (bucket, key) order in a B-tree, and the versions they map to in one dense vector.
+//
+// lib/std's OrderedMap keeps its entries inline in nodes that are allocated with room for 32, and keys inserted in
+// order (a fill, or recovery from a checkpoint) leave them about half full. With an ObjectVersion of about 200 bytes
+// in every slot, that came to 600 to 700 bytes per object. So the B-tree holds only the key and a slot number, and
+// the versions sit in `versions`, where a removed one's slot is reused.
+
+/// Versions by key, in key order. A cursor is a position in that order (`first`, `seek`, `seekAfter`, `next`), read
+/// with `keyAt` and `valueAt`. Any change to the index invalidates it.
+struct VersionIndex {
+    private order: OrderedMap<IndexKey, u32>;
+    private versions: Vector<ObjectVersion>;
+    /// Slots of removed versions, for the next put.
+    private free: Vector<u32>;
+
+    fn create() -> VersionIndex => VersionIndex {
+        order: OrderedMap<IndexKey, u32>.create(),
+        versions: Vector<ObjectVersion>.create(),
+        free: Vector<u32>.create(),
+    };
+
+    fn length(borrow this) -> usize => this.order.length();
+
+    fn contains(borrow this, key: borrow IndexKey) -> bool => this.order.contains(key);
+
+    fn get(borrow this, key: borrow IndexKey) -> borrow(this) ObjectVersion? {
+        let slot = this.order.get(key)?;
+        return borrow this.versions[slot as usize];
+    }
+
+    fn getMut(borrow mut this, key: borrow IndexKey) -> borrow mut(this) ObjectVersion? {
+        let slot = match (this.order.get(key)) {
+            Some(s) => s as usize,
+            null => { return null; }
+        };
+        return borrow mut this.versions[slot];
+    }
+
+    /// Puts `version` at `key`: the old version if the key was there, else null. A failure leaves the index as it
+    /// was.
+    fn put(borrow mut this, key: IndexKey, version: ObjectVersion) -> Result<ObjectVersion?, AllocError> {
+        match (this.order.get(borrow key)) {
+            Some(s) => { return Ok(replace(mut this.versions[s as usize], version)); }
+            null => {}
+        }
+        // A slot first, so the B-tree's put is the last step that can fail.
+        var reused = false;
+        let slot = match (this.free.pop()) {
+            Some(s) => {
+                reused = true;
+                s
+            }
+            null => {
+                this.versions.push(vacantVersion())?;
+                truncate<u32>(this.versions.length - 1)
+            }
+        };
+        match (this.order.put(key, slot)) {
+            Ok(_) => {}
+            Err(e) => {
+                if (reused) {
+                    let _ = this.free.push(slot); // popped just now: its room is there
+                } else {
+                    let _ = this.versions.pop();
+                }
+                return Err(e);
+            }
+        }
+        this.versions[slot as usize] = version;
+        return Ok(null);
+    }
+
+    /// Removes `key`; its version, if it was there.
+    fn remove(borrow mut this, key: borrow IndexKey) -> ObjectVersion? {
+        let slot = this.order.remove(key)?;
+        let old = replace(mut this.versions[slot as usize], vacantVersion());
+        // Without room to remember it, the slot stays unused: a few bytes, never a wrong answer.
+        let _ = this.free.push(slot);
+        return old;
+    }
+
+    fn first(borrow this) -> OrderedCursor? => this.order.first();
+
+    fn next(borrow this, at: OrderedCursor) -> OrderedCursor? => this.order.next(at);
+
+    /// The first key at or after `key`.
+    fn seek(borrow this, key: borrow IndexKey) -> OrderedCursor? => this.order.seek(key);
+
+    /// The first key after `key`.
+    fn seekAfter(borrow this, key: borrow IndexKey) -> OrderedCursor? => this.order.seekAfter(key);
+
+    fn keyAt(borrow this, at: OrderedCursor) -> borrow(this) IndexKey => this.order.keyAt(at);
+
+    fn valueAt(borrow this, at: OrderedCursor) -> borrow(this) ObjectVersion {
+        let slot = this.order.valueAt(at);
+        return borrow this.versions[slot as usize];
+    }
+}
+
+/// An empty slot's placeholder: no heap memory.
+fn vacantVersion() -> ObjectVersion => ObjectVersion {
+    versionId: [0u8; 16],
+    lsn: 0,
+    kind: VersionKind.Object,
+    size: 0,
+    mtimeMillis: 0,
+    md5: [0u8; 16],
+    contentType: Vector<u8>.create(),
+    payload: PayloadLocator { segmentId: 0, offset: 0, length: 0 },
+    recordSegment: 0,
+    recordLength: 0,
+    extents: Vector<ExtentRef>.create(),
+    metadata: Vector<u8>.create(),
+    extras: Vector<u8>.create(),
+    parts: 0,
+};
+
+fn indexKey(bucket: StringView, key: StringView) -> IndexKey {
+    var b = Vector<u8>.create();
+    b.extend(bucket.bytes())!;
+    var k = Vector<u8>.create();
+    k.extend(key.bytes())!;
+    return IndexKey { bucket: b, key: k };
+}
+
+fn sized(n: u64) -> ObjectVersion {
+    var v = vacantVersion();
+    v.size = n;
+    return v;
+}
+
+/// The size of the version at bucket/key (sizes in these tests are not 0); 0 if there is none.
+fn sizeAt(index: borrow VersionIndex, bucket: StringView, key: StringView) -> u64 {
+    let k = indexKey(bucket, key);
+    return match (index.get(borrow k)) {
+        Some(v) => v.size,
+        null => 0,
+    };
+}
+
+/// Removes bucket/key: the removed version's size, 0 if there was none.
+fn removeAt(index: borrow mut VersionIndex, bucket: StringView, key: StringView) -> u64 {
+    let k = indexKey(bucket, key);
+    return match (index.remove(borrow k)) {
+        Some(v) => v.size,
+        null => 0,
+    };
+}
+
+@test
+fn versionIndexOrdersAndReusesSlots() -> Result<void, TestFailure> {
+    var index = VersionIndex.create();
+    Check.isTrue(index.put(indexKey("b", "y"), sized(1))!.isNull(), "a new key")?;
+    Check.isTrue(index.put(indexKey("a", "z"), sized(2))!.isNull(), "a new key")?;
+    Check.isTrue(index.put(indexKey("b", "x"), sized(3))!.isNull(), "a new key")?;
+    // Replacing a key's version returns the old one, and keeps the count.
+    Check.equalU64(1, (index.put(indexKey("b", "y"), sized(4))! ?? sized(0)).size)?;
+    Check.equalU64(3, index.length() as u64)?;
+    // (bucket, key) order: a/z, b/x, b/y.
+    var sizes = Vector<u64>.create();
+    var at = index.first();
+    while (true) {
+        let c = match (at) {
+            Some(c) => c,
+            null => { break; }
+        };
+        at = index.next(c);
+        sizes.push(index.valueAt(c).size)!;
+    }
+    Check.equalU64(3, sizes.length as u64)?;
+    Check.isTrue(sizes[0] == 2 && sizes[1] == 3 && sizes[2] == 4, "keys in order, each with its version")?;
+    // A removed key's slot is reused, and the others keep their versions.
+    Check.equalU64(3, removeAt(mut index, "b", "x"))?;
+    Check.equalU64(0, removeAt(mut index, "b", "x"))?;
+    Check.isTrue(index.put(indexKey("c", "w"), sized(5))!.isNull(), "a new key")?;
+    Check.equalU64(3, index.versions.length as u64)?;
+    Check.equalU64(5, sizeAt(borrow index, "c", "w"))?;
+    Check.equalU64(2, sizeAt(borrow index, "a", "z"))?;
+    Check.equalU64(4, sizeAt(borrow index, "b", "y"))?;
+    Check.equalU64(0, sizeAt(borrow index, "b", "x"))?;
+    // seek and seekAfter.
+    let from = indexKey("b", "y");
+    match (index.seekAfter(borrow from)) {
+        Some(c) => { Check.equalU64(5, index.valueAt(c).size)?; }
+        null => { return Check.fail("c/w follows b/y"); }
+    }
+    match (index.seek(borrow from)) {
+        Some(c) => { Check.equalU64(4, index.valueAt(c).size)?; }
+        null => { return Check.fail("b/y is there"); }
+    }
+    return Ok();
+}

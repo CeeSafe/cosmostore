@@ -1,0 +1,185 @@
+// Listing over the ordered index (ADR-0026), checked against a reference: every key of the bucket sorted, filtered
+// by prefix and marker, and rolled up by the delimiter, as the scan before it did.
+
+const LIST_KEYS: [StringView; 24] = [
+    "a", "a/", "a/1", "a/2", "a/b/1", "a/b/2", "a/b/c/1", "a/c", "a0", "ab", "b/", "b/1", "b/c/1", "b/c/2", "b/d",
+    "c", "c/x/y/z", "d/", "d//e", "zz", "z/1", "z/2", "\u{e9}t\u{e9}/1", "\u{e9}t\u{e9}/2",
+];
+
+/// What a listing returns, flattened: keys and common prefixes in order, each marked, then the end marker.
+struct Listed {
+    items: Vector<Vector<u8>>;
+    truncated: bool;
+    next: Vector<u8>;
+    nextIsPrefix: bool;
+}
+
+fn flatten(page: borrow ListPage) -> Result<Listed, AllocError> {
+    // The store returns keys and prefixes in two lists; merged by byte order they are the listing's order.
+    var items = Vector<Vector<u8>>.create();
+    var k: usize = 0;
+    var p: usize = 0;
+    while (k < page.keys.length || p < page.commonPrefixes.length) {
+        let takeKey = p >= page.commonPrefixes.length ||
+            (k < page.keys.length && compareBytes(page.keys[k].view(), page.commonPrefixes[p].view()) < 0);
+        var item = Vector<u8>.create();
+        if (takeKey) {
+            item.push('k')?;
+            item.extend(page.keys[k].view())?;
+            k += 1;
+        } else {
+            item.push('p')?;
+            item.extend(page.commonPrefixes[p].view())?;
+            p += 1;
+        }
+        items.push(item)?;
+    }
+    return Ok(Listed {
+        items: items,
+        truncated: page.truncated,
+        next: copyBytes(page.nextMarker.view())?,
+        nextIsPrefix: page.nextMarkerIsPrefix,
+    });
+}
+
+/// The reference listing of `keys` (all of the bucket's, any order).
+fn referenceList(
+    keys: Slice<StringView>,
+    prefix: Slice<u8>,
+    delimiter: Slice<u8>,
+    after: Slice<u8>,
+    afterIsPrefix: bool,
+    maxKeys: usize,
+) -> Result<Listed, AllocError> {
+    var sorted = Vector<Vector<u8>>.create();
+    for (k in keys) { sorted.push(copyBytes(k.bytes())?)?; }
+    sorted.viewMut().sortBy((a, b) => compareBytes(a.view(), b.view()));
+    var out = Listed {
+        items: Vector<Vector<u8>>.create(),
+        truncated: false,
+        next: Vector<u8>.create(),
+        nextIsPrefix: false,
+    };
+    var last = Vector<u8>.create();
+    for (i in 0..sorted.length) {
+        let key = sorted[i].view();
+        if (!startsWithBytes(key, prefix)) { continue; }
+        if (after.length > 0) {
+            if (compareBytes(key, after) <= 0) { continue; }
+            if (afterIsPrefix && startsWithBytes(key, after)) { continue; }
+        }
+        var rolled: usize? = null;
+        if (delimiter.length > 0) {
+            match (findBytes(key, delimiter, prefix.length)) {
+                Some(d) => { rolled = d + delimiter.length; }
+                null => {}
+            }
+        }
+        var item = Vector<u8>.create();
+        match (rolled) {
+            Some(end) => {
+                if (last.length > 0 && last.view()[0] == 'p' && last.view()[1..] == key[0..end]) { continue; }
+                item.push('p')?;
+                item.extend(key[0..end])?;
+            }
+            null => {
+                item.push('k')?;
+                item.extend(key)?;
+            }
+        }
+        if (out.items.length == maxKeys) {
+            out.truncated = true;
+            break;
+        }
+        out.next.clear();
+        out.next.extend(item.view()[1..])?;
+        out.nextIsPrefix = item.view()[0] == 'p';
+        last = copyBytes(item.view())?;
+        out.items.push(item)?;
+    }
+    return Ok(out);
+}
+
+fn sameListing(want: borrow Listed, got: borrow Listed) -> bool {
+    if (want.items.length != got.items.length || want.truncated != got.truncated) { return false; }
+    for (i in 0..want.items.length) {
+        if (want.items[i].view() != got.items[i].view()) { return false; }
+    }
+    if (got.items.length == 0) { return true; }
+    return want.next.view() == got.next.view() && want.nextIsPrefix == got.nextIsPrefix;
+}
+
+@test
+fn listingMatchesTheReference() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("list-reference");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    // Neighbouring buckets, so a listing that runs past its bucket would show.
+    s.createBucket("bks")!;
+    s.createBucket("bkt")!;
+    s.createBucket("bkt0")!;
+    for (k in LIST_KEYS) { putText(mut s, "bkt", k, "v"); }
+    putText(mut s, "bks", "t", "v");
+    putText(mut s, "bks", "a/1", "v");
+    putText(mut s, "bkt0", "a", "v");
+    putText(mut s, "bkt0", "a/1", "v");
+    let prefixes = ["", "a", "a/", "a/b", "b/", "d/", "z", "\u{e9}", "zzz"];
+    let delimiters = ["", "/", "b", "//"];
+    let markers = ["", "a", "a/", "a/b/", "a0", "b/c", "b/c/", "c", "d/", "zz", "zzzz"];
+    let sizes = [1usize, 2, 3, 1000];
+    var cases: u64 = 0;
+    for (prefix in prefixes) {
+        for (delimiter in delimiters) {
+            for (marker in markers) {
+                for (isPrefix in [false, true]) {
+                    for (max in sizes) {
+                        let page = s.listObjects("bkt", prefix, delimiter, marker.bytes(), isPrefix, max)!;
+                        let got = flatten(borrow page)!;
+                        let want = referenceList(
+                            LIST_KEYS[..],
+                            prefix.bytes(),
+                            delimiter.bytes(),
+                            marker.bytes(),
+                            isPrefix,
+                            max,
+                        )!;
+                        if (!sameListing(borrow want, borrow got)) {
+                            Console.writeLine(prefix);
+                            Console.writeLine(delimiter);
+                            Console.writeLine(marker);
+                            Console.writeLine(max as u64);
+                            return Check.fail("a listing differs from the reference");
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        // Paging by each page's marker, one entry a page, visits the whole listing once, in order.
+        for (delimiter in delimiters) {
+            let whole = referenceList(LIST_KEYS[..], prefix.bytes(), delimiter.bytes(), "".bytes(), false, 1000)!;
+            var marker = Vector<u8>.create();
+            var markerIsPrefix = false;
+            var seen: usize = 0;
+            while (true) {
+                let page = s.listObjects("bkt", prefix, delimiter, marker.view(), markerIsPrefix, 1)!;
+                let got = flatten(borrow page)!;
+                for (i in 0..got.items.length) {
+                    if (seen >= whole.items.length || whole.items[seen].view() != got.items[i].view()) {
+                        return Check.fail("paging visits the listing in order, once");
+                    }
+                    seen += 1;
+                }
+                if (!page.truncated) { break; }
+                marker = copyBytes(page.nextMarker.view())!;
+                markerIsPrefix = page.nextMarkerIsPrefix;
+            }
+            Check.equalU64(whole.items.length as u64, seen as u64)?;
+        }
+    }
+    Check.equalU64(9 * 4 * 11 * 2 * 4, cases)?;
+    // The neighbouring buckets list only their own keys.
+    Check.equalU64(2, s.listObjects("bks", "", "", "".bytes(), false, 1000)!.keys.length as u64)?;
+    Check.equalU64(2, s.listObjects("bkt0", "", "", "".bytes(), false, 1000)!.keys.length as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}

@@ -30,6 +30,8 @@
    reader opened, so streaming them through worker threads only copied memory.
 4. **Listing stays on a worker thread.** It does no I/O, but it scans the index (T10), which could hold the event loop
    for milliseconds at a large key count.
+   - **Amended by ADR-0026 (M4 slice 7):** listing reads only its page of the ordered index now, so it runs on the
+     event loop too.
 
 ## Rejected
 

@@ -37,6 +37,7 @@ boilerplate; **P2** ergonomics.
 | G26 | P3 | std/checksums | No CRC-32 (IEEE), the AWS CLI's `x-amz-checksum-crc32`: lib/std has CRC-32C and CRC-64/NVME only. CosmoStore computes it in CeeSafe (`src/storage/checksums/crc32.cee`) |
 | G27 | P2 | std/async-console | `AsyncConsole.writeError` fails when standard error is `/dev/null` (macOS), so a server that checks it exits under `2>/dev/null` |
 | G28 | P2 | runtime/async | `Async.blocking` starts and joins a new OS thread for every call: no pool, so each blocking step costs a `pthread_create` and a join |
+| G29 | P2 | lib/std | `OrderedMap` leaves nodes about half full when keys arrive in order, and reserves a full node's room for whole values: 2.6 times the entries' bytes for in-order inserts |
 
 ## Status (2026-11-06)
 
@@ -338,6 +339,25 @@ requires it), so a small request makes four or five of them. Thread creation the
 **Suggested.** A small pool of reusable workers, growing up to a bound and parking idle threads, as Tokio's
 `spawn_blocking` and libuv's thread pool do. The semantics need not change: each call still runs on some thread
 other than the event loop's.
+
+### G29: `OrderedMap` is half empty after in-order inserts (P2)
+
+**Evidence.** `lib/std/ordered_map.cee`: a full node (31 entries) splits at its middle, and every node's
+`keys` and `values` vectors are allocated with room for 32. Inserting keys in order fills only the rightmost node,
+so every node it leaves behind stays at half. Measured with `ceesafec build` and `/usr/bin/time -l`: 1,000,000
+entries of `OrderedMap<u64, [u8; 64]>` (72 bytes each) peak at 184 MB inserted in order, and 128 MB in a scrambled
+order. CosmoStore's index (ADR-0026) took 575 MiB at 1M objects with versions stored in the nodes, against 350 MiB
+as a `HashMap`. Its fill writes keys in order, and recovery inserts a checkpoint's entries in key order.
+
+**Why it matters.** Loading a map from sorted data (a checkpoint, a snapshot, a bulk import) is the common way to
+build a large one, and it gives the worst fill.
+
+**Repro.** Put 1,000,000 `u64` keys from 0 upward into an `OrderedMap<u64, [u8; 64]>`, then the same keys scrambled
+(`i * 2654435761 % 4294967311`), and compare peak footprints.
+
+**Suggested.** Split unevenly when the insert is at the right edge of the tree, keeping the left node full, as
+many B-tree implementations do for appends. Alternatively, offer a bulk load from sorted input that packs nodes.
+Allocating a node's vectors for its current count, not for 32, would also bound the waste for large values.
 
 ## Not gaps (checked)
 

@@ -129,6 +129,14 @@ fn pinDeferredExtentsAreSweptAtOpen() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// A segment with nothing live, if the store lists one (the segment table has no order).
+fn deadSegment(s: borrow ObjectStore) -> u64? {
+    for (id in s.segmentIds().view()) {
+        if (s.segmentUsage(id).liveBytes == 0) { return id; }
+    }
+    return null;
+}
+
 /// Writes "keep" once, then enough overwrites of other keys that keep's segment is mostly garbage, and checkpoints.
 fn agedStore(dir: StringView) -> Result<ObjectStore, TestFailure> {
     let ctype = "application/octet-stream";
@@ -158,7 +166,7 @@ fn pinInlineReaderOutlivesCompaction() -> Result<void, TestFailure> {
     Check.isTrue(stats.relocated > 0, "keep's payload is copied")?;
     // keep's old segment holds nothing live, but its reader has not read it yet.
     Check.equalU64(s.segmentCount() as u64, countFiles(dir.view(), "seg-", ".cj"))?;
-    Check.isTrue(s.segmentUsage(s.segmentIds()[0]).liveBytes == 0, "the pinned segment is garbage")?;
+    Check.isTrue(deadSegment(borrow s).isSome(), "the pinned segment is kept, with nothing live")?;
     var reader = prepared.open()!;
     var out = Vector<u8>.create();
     drain(mut reader, mut out)!;
@@ -185,14 +193,17 @@ fn pinnedSegmentLeftAtStopIsCompactedAfterOpen() -> Result<void, TestFailure> {
     }
     var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
     // Recovery knows the segment, with nothing live in it.
-    let dead = s.segmentIds()[0];
-    Check.equalU64(0, s.segmentUsage(dead).liveBytes)?;
+    let dead = match (deadSegment(borrow s)) {
+        Some(id) => id,
+        null => { return Check.fail("recovery lists the kept segment, with nothing live"); }
+    };
     Check.equalBytes(patterned(300, 1).view(), s.getObject("bkt", "keep")!.view())?;
     let _ = s.checkpoint()!;
     let files = countFiles(dir.view(), "seg-", ".cj");
     Check.equalU64(1, s.compact(1073741824)!.segmentsRemoved)?;
     Check.equalU64(files - 1, countFiles(dir.view(), "seg-", ".cj"))?;
-    Check.isTrue(s.segmentIds()[0] != dead, "the left segment is gone")?;
+    Check.isTrue(deadSegment(borrow s).isNull(), "the left segment is gone")?;
+    for (id in s.segmentIds().view()) { Check.isTrue(id != dead, "the left segment is gone")?; }
     Check.equalU64(0, s.compact(1073741824)!.segmentsRemoved)?;
     Check.equalBytes(patterned(300, 1).view(), s.getObject("bkt", "keep")!.view())?;
     removeTree(dir.view());
