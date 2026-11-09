@@ -133,6 +133,21 @@ struct CompactStats {
     bytesCopied: u64;
 }
 
+/// The store's work since it opened, for the stats endpoint and benchmarks (ADR-0021): from these, syncs per 1,000
+/// writes and write amplification (bytes written per payload byte accepted).
+struct StoreCounters {
+    /// Object and part bytes accepted for commit.
+    payloadBytes: u64;
+    /// Bytes written: journal records (inline payloads included), extent files (headers included), checkpoints.
+    journalBytesWritten: u64;
+    extentBytesWritten: u64;
+    checkpointBytesWritten: u64;
+    /// Live inline payload bytes compaction copied (they are in journalBytesWritten too).
+    compactionBytesCopied: u64;
+    segmentsCompacted: u64;
+    checkpoints: u64;
+}
+
 /// What `maintain` did.
 struct MaintenanceReport {
     checkpointed: bool;
@@ -602,6 +617,7 @@ struct ObjectStore {
     private abandoned: Channel<u64>;
     /// When `maintain` last applied lifecycle rules (Unix milliseconds).
     private lifecycleRan: i64;
+    private counts: StoreCounters;
 
     /// Opens the store in `dir`: loads the newest checkpoint, if any, then replays the journal
     /// records after it.
@@ -694,6 +710,15 @@ struct ObjectStore {
             deferred: Vector<DeferredExtent>.create(),
             deferredBytes: 0,
             lifecycleRan: 0,
+            counts: StoreCounters {
+                payloadBytes: 0,
+                journalBytesWritten: 0,
+                extentBytesWritten: 0,
+                checkpointBytesWritten: 0,
+                compactionBytesCopied: 0,
+                segmentsCompacted: 0,
+                checkpoints: 0,
+            },
         };
         // Every extent not referenced by a live version is garbage: superseded or deleted
         // versions, and uploads that never committed (ADR-0003).
@@ -885,6 +910,7 @@ struct ObjectStore {
         this.journal.commit()?;
         let total = truncate<u32>(recordLength(this.scratch.length, payload.length));
         this.sinceCheckpoint += total as u64;
+        this.counts.journalBytesWritten += total as u64;
         applyRecord(
             mut this.state,
             kind,
@@ -1176,9 +1202,11 @@ struct ObjectStore {
             ObjectBody.Inline(_) => RecordType.PutInline,
             ObjectBody.Extents(extents) => {
                 encodeManifest(mut manifest, extents.view())?;
+                this.counts.extentBytesWritten += extentRefBytes(extents.view());
                 RecordType.PutExtent
             }
         };
+        this.counts.payloadBytes += obj.size;
         let payload = match (borrow obj.body) {
             ObjectBody.Inline(data) => data.view(),
             ObjectBody.Extents(_) => manifest.view(),
@@ -1218,6 +1246,7 @@ struct ObjectStore {
         for (i in 0..n) {
             let p = borrow this.pendingApplies[i];
             this.sinceCheckpoint += p.total as u64;
+            this.counts.journalBytesWritten += p.total as u64;
             applyRecord(
                 mut this.state,
                 p.kind,
@@ -1530,6 +1559,11 @@ struct ObjectStore {
         }
         this.scratch.clear();
         encodeUploadPartMeta(mut this.scratch, id, number, obj.size, obj.md5, Clock.unixMillis(), checksum)?;
+        this.counts.payloadBytes += obj.size;
+        match (borrow obj.body) {
+            ObjectBody.Extents(extents) => { this.counts.extentBytesWritten += extentRefBytes(extents.view()); }
+            ObjectBody.Inline(_) => {}
+        }
         this.commitOne(RecordType.UploadPart, manifest.view())?;
         return Ok(obj.md5);
     }
@@ -1946,7 +1980,9 @@ struct ObjectStore {
         let segment = this.journal.sealActive()?;
         let lsn = this.journal.upcomingLsn() - 1;
         if (lsn == this.checkpointLsn) { return Ok(false); }
-        writeCheckpoint(this.dir.view(), lsn, segment, borrow this.state)?;
+        let written = writeCheckpoint(this.dir.view(), lsn, segment, borrow this.state)?;
+        this.counts.checkpointBytesWritten += written;
+        this.counts.checkpoints += 1;
         // Durable now: segments before `segment` may be compacted, and older checkpoints go.
         this.checkpointLsn = lsn;
         this.checkpointSegment = segment;
@@ -2012,6 +2048,7 @@ struct ObjectStore {
             }
             stats.relocated += 1;
             stats.bytesCopied += plan[i].payloadLength as u64;
+            this.counts.compactionBytesCopied += plan[i].payloadLength as u64;
         }
         this.commitStaged()?;
         // Every copy is durable and applied: the chosen segments hold nothing live.
@@ -2022,6 +2059,7 @@ struct ObjectStore {
             this.journal.removeSegment(id)?;
             let _ = this.state.segments.remove(borrow id);
             stats.segmentsRemoved += 1;
+            this.counts.segmentsCompacted += 1;
             stats.bytesFreed += usage.totalBytes;
         }
         if (stats.segmentsRemoved > 0) { this.journal.syncDirectory()?; }
@@ -2247,6 +2285,17 @@ struct ObjectStore {
     fn recordsApplied(borrow this) -> u64 => this.state.records;
 
     fn journalSyncs(borrow this) -> u64 => this.journal.syncCount();
+
+    /// The cumulative counters (ADR-0021).
+    fn counters(borrow this) -> StoreCounters => StoreCounters {
+        payloadBytes: this.counts.payloadBytes,
+        journalBytesWritten: this.counts.journalBytesWritten,
+        extentBytesWritten: this.counts.extentBytesWritten,
+        checkpointBytesWritten: this.counts.checkpointBytesWritten,
+        compactionBytesCopied: this.counts.compactionBytesCopied,
+        segmentsCompacted: this.counts.segmentsCompacted,
+        checkpoints: this.counts.checkpoints,
+    };
 
     /// (total, live) bytes of a segment.
     fn segmentUsage(borrow this, segment: u64) -> SegmentUsage => match (this.state.segments.get(borrow segment)) {

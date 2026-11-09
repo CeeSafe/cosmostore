@@ -953,3 +953,27 @@ Browser form uploads with a SigV4 POST policy.
   - checkpointing without the store's lock;
   - group commit across concurrent PUTs (ADR-0008 §4);
   - an ordered index for listing and lifecycle.
+
+### 9 Nov 2026: M4 slice 1, the baseline (ADR-0021)
+
+- **Instruments:**
+  - the store counts its work (`StoreCounters`): payload bytes, and journal, extent and checkpoint bytes written;
+  - `GET /_cosmostore/stats` returns those counters (SigV4-authenticated);
+  - `tools/bench`, a Go load generator: fixed seeds, every GET verified, p50 to p99.9, and syncs per 1,000 writes
+    and write amplification from the stats endpoint;
+  - `tools/bench.sh` runs it against a fresh server and runs fsck afterwards.
+- **Baseline** (`docs/benchmarks/2026-11-09-baseline.md`, Apple M1, sizes 0 B to 1 MiB, concurrency 1 to 128):
+  1. **Writes are serialized:** one sync per write, and about 200 writes/s at any concurrency. A tiny PUT's p99 goes
+     from 6 to 9 ms at concurrency 1 to 700 ms at 128.
+  2. **Reads of stored bytes cap at about 2,300 ops/s,** because inline records are read under the store's lock.
+  3. **Stalls of hundreds of ms in some phases.** The hypothesis is checkpoints under the lock.
+  4. **1 MiB:** about 100 MiB/s PUT and 650 MiB/s GET. Write amplification is 1.00 to 1.04.
+- **Targets proposed** (`docs/targets.md`, T1 to T12), awaiting confirmation. Among them:
+  - tiny PUT ≥ 3,000 ops/s at concurrency 32, with ≤ 50 syncs per 1,000;
+  - tiny GET ≥ 15,000 ops/s;
+  - p99.9 ≤ 50 ms under upkeep;
+  - ≤ 400 bytes per object at 1M objects;
+  - listing independent of the key count;
+  - recovery ≤ 3 s at 1M objects.
+- **Next:** group commit across requests (T1 to T4), then reads without the lock (T5, T6), then checkpoints without
+  the lock (T7).

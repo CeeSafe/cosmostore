@@ -1,0 +1,78 @@
+// The stats endpoint (ADR-0021): `GET /_cosmostore/stats`, SigV4-authenticated like any request, returns the store's
+// state and cumulative counters as JSON, for benchmarks (syncs per 1,000 PUTs, write amplification) and monitoring.
+// `_cosmostore` cannot be a bucket (`_` is not allowed in bucket names), so the path never shadows one.
+import web_core;
+import web_http;
+import web_server;
+
+const STATS_BUCKET: StringView = "_cosmostore";
+
+/// The numbers, read under the lock.
+struct StoreStats {
+    objects: u64;
+    segments: u64;
+    uploads: u64;
+    usedBytes: u64;
+    journalBytes: u64;
+    journalSyncs: u64;
+    recordsApplied: u64;
+    deferredExtents: u64;
+    pinnedExtents: u64;
+    counters: StoreCounters;
+}
+
+fn readStats(store: borrow ObjectStore) -> StoreStats => StoreStats {
+    objects: store.objectCount() as u64,
+    segments: store.segmentCount() as u64,
+    uploads: store.uploadCount() as u64,
+    usedBytes: store.usedBytes(),
+    journalBytes: store.journalBytes(),
+    journalSyncs: store.journalSyncs(),
+    recordsApplied: store.recordsApplied(),
+    deferredExtents: store.deferredExtentCount() as u64,
+    pinnedExtents: store.pinnedExtentCount() as u64,
+    counters: store.counters(),
+};
+
+fn jsonField(out: borrow mut Vector<u8>, name: StringView, value: u64, last: bool) -> Result<void, AllocError> {
+    out.push('"')?;
+    out.extend(name.bytes())?;
+    out.extend("\": ".bytes())?;
+    appendDecimal(out, value)?;
+    out.extend(if (last) "\n".bytes() else ",\n  ".bytes())?;
+    return Ok();
+}
+
+async fn statsOf(app: borrow S3App) -> Result<StoreStats, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return Ok(await Async.blocking(() => readStats(store)));
+}
+
+async fn serveStats(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    if (req.key.view() != "stats" || !isMethod(req.method, Method.Get)) { return Err(S3Fail.Code(S3Code.NoSuchKey)); }
+    let s = await statsOf(app)?;
+    var body = Vector<u8>.create();
+    body.extend("{\n  ".bytes())?;
+    jsonField(mut body, "objects", s.objects, false)?;
+    jsonField(mut body, "segments", s.segments, false)?;
+    jsonField(mut body, "uploads", s.uploads, false)?;
+    jsonField(mut body, "usedBytes", s.usedBytes, false)?;
+    jsonField(mut body, "journalBytes", s.journalBytes, false)?;
+    jsonField(mut body, "journalSyncs", s.journalSyncs, false)?;
+    jsonField(mut body, "recordsApplied", s.recordsApplied, false)?;
+    jsonField(mut body, "deferredExtents", s.deferredExtents, false)?;
+    jsonField(mut body, "pinnedExtents", s.pinnedExtents, false)?;
+    jsonField(mut body, "payloadBytes", s.counters.payloadBytes, false)?;
+    jsonField(mut body, "journalBytesWritten", s.counters.journalBytesWritten, false)?;
+    jsonField(mut body, "extentBytesWritten", s.counters.extentBytesWritten, false)?;
+    jsonField(mut body, "checkpointBytesWritten", s.counters.checkpointBytesWritten, false)?;
+    jsonField(mut body, "compactionBytesCopied", s.counters.compactionBytesCopied, false)?;
+    jsonField(mut body, "segmentsCompacted", s.counters.segmentsCompacted, false)?;
+    jsonField(mut body, "checkpoints", s.counters.checkpoints, false)?;
+    jsonField(mut body, "requests", app.requests.load(), true)?;
+    body.extend("}\n".bytes())?;
+    exchange.header("content-type", "application/json".bytes())?;
+    await exchange.send(Status.ok(), body.view())?;
+    return Ok();
+}
