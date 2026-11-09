@@ -9,8 +9,11 @@
 - bounded recovery.
 
 These turn them into numbers for this reference machine, from the baseline (`benchmarks/2026-11-09-baseline.md`).
-Every target is measured with `tools/bench` (ADR-0021) unless it says otherwise. The M4 exit, and the p99 regression
-gates, check against them.
+Every target is measured with `tools/bench` (ADR-0021) unless it says otherwise. The M4 exit checks against them.
+
+`tools/bench/targets.json` holds the same targets as data. `go run ./gate -targets targets.json -run matrix.json
+-scale DIR` (in `tools/bench`) checks a run of the whole matrix and a `tools/scale.sh` run against them. CI does not:
+its p99 regression gate compares a change with its base on the same runner, by ratios (ADR-0030).
 
 **Reference machine:** Apple M1, internal SSD with `F_FULLFSYNC` (about 5 ms per sync), loopback, plain HTTP. On
 other hardware the ratios (scaling, syncs per write) carry over; the absolute numbers do not.

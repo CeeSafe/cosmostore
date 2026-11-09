@@ -1,0 +1,98 @@
+# CosmoStore CI (ADR-0030): the checks every change passes (AGENTS.md, "Before finishing"), and the p99 regression
+# gate, which runs the base and the head builds in turns on the same runner and compares them phase by phase.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CEESAFE_VERSION: v0.24.2 # the compiler the M4 reference was built with
+  # CeeSafe.Web, used by path from ../../CeeSafe.Web (ceesafe.toml): the commit CosmoStore was last built against.
+  CEESAFE_WEB_REF: 0f7290c218ef0e265b8bf57cb012e8dab9ccce49
+
+jobs:
+  check:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain, CeeSafe.Web and test tools
+        run: |
+          curl -fsSL https://ceesafe.github.io/CeeSafe/install.sh | sh
+          echo "$HOME/.ceesafe/bin" >> "$GITHUB_PATH"
+          git clone --filter=blob:none https://github.com/CeeSafe/CeeSafe.Web.git ../../CeeSafe.Web
+          git -C ../../CeeSafe.Web checkout --quiet "$CEESAFE_WEB_REF"
+          brew list openssl@3 > /dev/null 2>&1 || brew install openssl@3
+          command -v rclone > /dev/null || brew install rclone
+          aws --version
+      - name: Check and format
+        run: |
+          ceesafec --version
+          ceesafec check
+          ceesafec fmt --check
+      - name: Tests (no leaks)
+        run: ceesafec test
+      - name: Build and the end-to-end checks
+        run: |
+          ceesafec build
+          tools/s3_smoke.sh
+          tools/tls_smoke.sh
+
+  perf:
+    # The p99 regression gate: base and head on the same runner, so the runner's speed cancels out (ADR-0030).
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/bench/go.mod
+          cache-dependency-path: tools/bench/go.sum
+      - name: Toolchain and CeeSafe.Web
+        run: |
+          curl -fsSL https://ceesafe.github.io/CeeSafe/install.sh | sh
+          echo "$HOME/.ceesafe/bin" >> "$GITHUB_PATH"
+          git clone --filter=blob:none https://github.com/CeeSafe/CeeSafe.Web.git ../../CeeSafe.Web
+          git -C ../../CeeSafe.Web checkout --quiet "$CEESAFE_WEB_REF"
+          brew list openssl@3 > /dev/null 2>&1 || brew install openssl@3
+      - name: Choose the base
+        id: base
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          base=${PR_BASE:-$PUSH_BEFORE}
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2> /dev/null; then base=$(git rev-parse HEAD^); fi
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+          echo "base: $(git log -1 --format='%h %s' "$base")"
+      - name: Build head and base
+        run: |
+          ceesafec build
+          mkdir -p ../bins && cp out/cosmostore ../bins/head
+          # Two levels below the directory holding CeeSafe.Web, as ceesafe.toml's paths expect.
+          git worktree add ../base "${{ steps.base.outputs.sha }}"
+          (cd ../base && ceesafec build && cp out/cosmostore ../bins/base)
+      - name: Regression gate
+        run: |
+          status=0
+          PERF_DIR="$RUNNER_TEMP/perf" tools/perf_gate.sh ../bins/base ../bins/head || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "::warning title=perf gate inconclusive::the runner was too noisy to judge p99; see the job summary"
+            status=0
+          fi
+          exit "$status"
+      - name: Report
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/perf/report.md" ] && cat "$RUNNER_TEMP/perf/report.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-gate
+          path: |
+            ${{ runner.temp }}/perf/*.json
+            ${{ runner.temp }}/perf/*.txt
+            ${{ runner.temp }}/perf/*/server.log
+            ${{ runner.temp }}/perf/report.md

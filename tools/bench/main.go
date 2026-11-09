@@ -80,7 +80,8 @@ var (
 	label    = flag.String("label", "", "what is being measured (commit, build, settings)")
 	jsonOut  = flag.String("json", "", "write the results as JSON here")
 	// GET checks each body against the original bytes, so it runs before overwrite in the default order.
-	phases = flag.String("phases", "put,get,head,overwrite,delete", "phases to run, in order")
+	readRepeat = flag.Int("read-repeat", 1, "GET and HEAD phases of objects up to 64 KiB go over the keys this many times")
+	phases     = flag.String("phases", "put,get,head,overwrite,delete", "phases to run, in order")
 	// The scale modes (T9 to T11, tools/scale.sh): "fill" writes -objects keys of the first size at the first
 	// concurrency; "list" samples ListObjectsV2 pages across them and reads the server's RSS.
 	mode      = flag.String("mode", "matrix", "matrix, fill, list, or bucket (only creates the bucket)")
@@ -174,6 +175,9 @@ func percentile(sorted []time.Duration, p float64) float64 {
 // runPhase performs n operations of op with conc workers and measures them.
 func runPhase(op string, size, conc, n int, bodies [][]byte, sums [][16]byte) phaseResult {
 	before := serverStats()
+	if (op == "get" || op == "head") && size <= 65536 {
+		n *= max(*readRepeat, 1)
+	}
 	lat := make([]time.Duration, n)
 	var next, errs int64 = -1, 0
 	var wg sync.WaitGroup
@@ -183,10 +187,11 @@ func runPhase(op string, size, conc, n int, bodies [][]byte, sums [][16]byte) ph
 		go func() {
 			defer wg.Done()
 			for {
-				i := int(atomic.AddInt64(&next, 1))
-				if i >= n {
+				slot := int(atomic.AddInt64(&next, 1))
+				if slot >= n {
 					return
 				}
+				i := slot % len(bodies) // read phases may go over the keys more than once (-read-repeat)
 				key := keyOf(size, conc, i)
 				t0 := time.Now()
 				var status int
@@ -212,7 +217,7 @@ func runPhase(op string, size, conc, n int, bodies [][]byte, sums [][16]byte) ph
 				case "delete":
 					status, _, err = do("DELETE", key, nil)
 				}
-				lat[i] = time.Since(t0)
+				lat[slot] = time.Since(t0)
 				if err != nil || status >= 300 {
 					if atomic.AddInt64(&errs, 1) <= 3 {
 						fmt.Fprintf(os.Stderr, "bench: %s %s: status %d, %v\n", op, key, status, err)

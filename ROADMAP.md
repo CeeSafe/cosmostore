@@ -1170,3 +1170,27 @@ Browser form uploads with a SigV4 POST policy.
   - journal shards and per-core appenders;
   - the comparison against SeaweedFS, Garage and RustFS;
   - p99 regression gates in CI.
+
+### 9 Nov 2026: M4 p99 regression gates (ADR-0030)
+
+- **CI** (`.github/workflows/ci.yml`, macOS 15, compiler and CeeSafe.Web pinned):
+  - `check` runs `ceesafec check`, `fmt --check` and `test`, then the build and both smokes;
+  - `perf` runs the p99 regression gate.
+- **The gate compares builds, not numbers** (`tools/perf_gate.sh`, `tools/bench/gate`):
+  - the base and the head run in turns on the same runner, 3 rounds, and every ratio is taken within a round;
+  - a group of phases (writes, GETs or metadata reads; small or large; one concurrency) fails past p99 × 1.25 for
+    writes or × 1.5 for reads, or ops/s × 0.80, and only beyond the base's own spread between rounds;
+  - errors, and syncs per 1,000 writes, fail per phase;
+  - a run too noisy to judge (median group noise above 2) is inconclusive: a warning in CI, not a pass or a failure.
+- **Targets as data** (`tools/bench/targets.json`): `gate -targets` checks a matrix run and a `tools/scale.sh` run
+  against T1 to T12. On the M4 reference it reports what the reference's report does (T1 at 4 KiB and T7 in one
+  phase short; T12 1.09).
+- **Trials** on this machine, under other sessions' load (average 3 to 50):
+  - the same build against itself passed at normal load and was inconclusive when the machine was busy;
+  - slice 3 (`767a811`) against now failed every time: deletes at 1,000 syncs per 1,000, and, at normal load,
+    small writes (p99 × 2.62, ops/s × 0.34) and small GETs (ops/s × 0.58).
+- `tools/bench -read-repeat`: small GET and HEAD phases go over their keys several times, so they last seconds.
+- **Next:**
+  - the first CI runs measure the runner's noise; the tolerances may move with them;
+  - the rest of M4: journal shards and per-core appenders, and the comparison run.
+
