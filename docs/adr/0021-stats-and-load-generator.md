@@ -53,3 +53,21 @@ bench`, which calls the store directly with one writer and no HTTP.
 
 - **The first baseline** (`docs/benchmarks/2026-11-09-baseline.md`) is the reference for M4's targets.
 - **The p99 regression gates** M4 asks for will compare runs of this generator.
+
+## Amendment (9 Nov 2026, M4 slice 6): the scale run
+
+T9 to T11 need a store with many keys, which the per-phase matrix does not build.
+
+- **`tools/bench -mode fill`** writes `-objects` keys (`scale/k00000000` on) of the first size, at the first
+  concurrency. **`-mode list`** times `-list-pages` ListObjectsV2 pages of 1,000 at the first, middle and last keys,
+  and checks that each page holds the 1,000 keys that follow, in order.
+- **`tools/scale.sh`** runs them against a fresh server:
+  - fill;
+  - memory after the fill and after `IDLE` seconds;
+  - listing;
+  - a SIGKILL and a restart, timed from launch to the first HTTP answer (`serve` opens the store before it listens,
+    so that is recovery plus startup);
+  - listing again, then fsck.
+- **Memory is the physical footprint on macOS** (`footprint -p`), in both the script and the generator's RSS column.
+  macOS compresses idle pages, and RSS then drops: a store with 1M keys read 3 MiB of RSS after 30 s idle. Elsewhere
+  it is RSS.

@@ -1059,3 +1059,19 @@ Browser form uploads with a SigV4 POST policy.
   - a quiet reference run of the whole matrix;
   - T2;
   - T7 and T9 to T11 (stalls, memory, listing and recovery at scale).
+
+### 9 Nov 2026: M4 slice 6, the scale run (ADR-0021 amendment)
+
+- **`tools/scale.sh`** fills a fresh server with 1M objects (`tools/bench -mode fill`), measures its memory, samples
+  listing pages (`-mode list`, each page checked), kills and restarts it to time recovery, lists again, and runs fsck.
+- **Memory is the physical footprint on macOS:** RSS dropped to 3 MiB while 1M keys sat idle in compressed pages.
+- **First results** (`docs/benchmarks/2026-11-09-scale-1m.md`, a loaded machine), at 1M 128 B objects:
+  - T9: 362 bytes per object, idle and after recovery. But listing leaves 30 to 135 MiB behind.
+  - T10: a page of 1,000 takes 164 ms (p50) at the first key, since every page scans and sorts the whole index. Not
+    met.
+  - T11: 0.87 s from launch to serving after a SIGKILL. Met.
+  - T7, seen in the fill: the slowest PUT took 446 ms, behind a 168 MB checkpoint written under the store's lock.
+- **Next:**
+  - an ordered index for listing (T10, and listing's memory);
+  - checkpoints that do not hold the lock (T7);
+  - quiet runs.
