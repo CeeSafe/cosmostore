@@ -1516,6 +1516,20 @@ struct ObjectStore {
         return Ok();
     }
 
+    /// Stages the delete of `key` without committing it (ADR-0025), as `putFinishedDeferred` stages a PUT: the caller
+    /// acknowledges it once `isPublished` says so. Returns the delete record's LSN, or null when there is nothing to
+    /// write: the key is missing and no write is staged or in flight that could still create it.
+    fn deleteObjectDeferred(borrow mut this, bucket: StringView, key: StringView) -> Result<u64?, StoreError> {
+        this.checkWritable()?;
+        ObjectStore.checkKey(key)?;
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        // The index shows only published writes. A PUT of this key may be staged or in its sync, and the delete
+        // must then still follow it; a delete of a missing key applies as nothing.
+        let unpublished = this.pendingApplies.length > 0 || this.inflightApplies.length > 0;
+        if (!unpublished && this.currentGeneration(bucket, key)?.isNull()) { return Ok(null); }
+        return Ok(this.stageDelete(bucket.bytes(), key.bytes(), Clock.unixMillis())?);
+    }
+
     /// Deletes many keys of `bucket` with one commit: one journal write and one sync for the batch (ADR-0010). The
     /// result says, per key, whether it was valid; a missing key is deleted, as in S3. Nothing is acknowledged
     /// before the batch is durable: on an error none of it is.
@@ -1535,7 +1549,7 @@ struct ObjectStore {
             let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key)? };
             if (!this.state.index.contains(borrow k)) { continue; }
             match (this.stageDelete(bucket.bytes(), key, now)) {
-                Ok() => {}
+                Ok(_) => {}
                 Err(e) => {
                     this.journal.discardPending();
                     this.pendingApplies.clear();
@@ -1547,12 +1561,13 @@ struct ObjectStore {
         return Ok(valid);
     }
 
-    /// Stages the DeleteVersion record of `key`; a full batch is committed first.
-    fn stageDelete(borrow mut this, bucket: Slice<u8>, key: Slice<u8>, now: i64) -> Result<void, StoreError> {
+    /// Stages the DeleteVersion record of `key` and returns its LSN; a full batch, or a full segment, is committed
+    /// first (ADR-0022).
+    fn stageDelete(borrow mut this, bucket: Slice<u8>, key: Slice<u8>, now: i64) -> Result<u64, StoreError> {
         var meta = Vector<u8>.create();
         encodeDeleteMeta(mut meta, bucket, key, nullVersionId(), now)?;
         let empty = [0u8; 1];
-        if (this.journal.wouldOverflow(meta.length, 0)) { this.commitStaged()?; }
+        if (this.journal.wouldOverflow(meta.length, 0) || this.journal.needsRotation()) { this.commitStaged()?; }
         this.pendingApplies.reserve(1)?;
         let pos = this.journal.stage(RecordType.DeleteVersion, meta.view(), empty[0..0])?;
         this.pendingApplies.push(PendingApply {
@@ -1565,7 +1580,7 @@ struct ObjectStore {
             payloadLen: 0,
             manifest: Vector<u8>.create(),
         })?;
-        return Ok();
+        return Ok(pos.lsn);
     }
 
     // ---- Multipart uploads (ADR-0009) ----

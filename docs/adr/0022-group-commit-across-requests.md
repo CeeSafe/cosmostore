@@ -70,6 +70,8 @@
   round-trip per write. The leader/follower turn gets the same batching with the existing lock.
 - **Group commit for DELETE and the other mutations.** They are rarer, and they stay one commit each. Each still
   takes a batch in flight with it.
+  - **Amended by ADR-0025 (M4 slice 5):** DeleteObject now goes through group commit too. DeleteObjects and the
+    other mutations still commit at once.
 
 ## Consequences
 

@@ -629,15 +629,21 @@ async fn listPage(
 }
 
 async fn deleteObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    // Staged, then acknowledged once published: deletes share syncs with PUTs (ADR-0025).
+    var staged: u64? = null;
     {
         var guard = await lockStore(app)?;
         let store = guard.data();
         let bucket = req.bucket.view();
         let key = req.key.view();
-        match (await Async.blocking(() => store.deleteObject(bucket, key))) {
-            Ok() => {}
+        staged = match (await Async.blocking(() => store.deleteObjectDeferred(bucket, key))) {
+            Ok(lsn) => lsn,
             Err(e) => { return Err(storeFail(e, key.length)); }
-        }
+        };
+    }
+    match (staged) {
+        Some(lsn) => { await awaitPublished(app, lsn)?; }
+        null => {}
     }
     await exchange.send(Status.noContent(), "".bytes())?;
     return Ok();

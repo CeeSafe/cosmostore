@@ -150,6 +150,46 @@ fn groupSyncRotatesFullSegments() -> Result<void, TestFailure> {
     return Ok();
 }
 
+@test
+fn deferredDeletesFollowUnpublishedWrites() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("group-delete");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("grp")!;
+        // Nothing staged and no such key: nothing to write, and nothing to wait for.
+        let records = s.recordsApplied();
+        Check.isTrue(s.deleteObjectDeferred("grp", "never")!.isNull(), "a missing key needs no record")?;
+        Check.equalU64(records, s.recordsApplied())?;
+        // A PUT staged and not yet published is not in the index, but its delete must still follow it.
+        let put = deferText(mut s, "k", "short-lived");
+        let del = match (s.deleteObjectDeferred("grp", "k")!) {
+            Some(lsn) => lsn,
+            null => { return Check.fail("a delete after an unpublished PUT is written"); }
+        };
+        Check.isTrue(del > put && !s.isPublished(del), "the delete is staged after the PUT")?;
+        let ticket = takeTicket(mut s)?;
+        // A write staged during the sync, then deleted while its own batch is in flight.
+        let kept = deferText(mut s, "kept", "stays");
+        s.finishGroupSync(ticket.lastLsn, ticket.sync())!;
+        Check.isTrue(s.isPublished(put) && s.isPublished(del), "both are published together")?;
+        Check.isTrue(missing(borrow s, "k"), "the later delete wins")?;
+        let next = takeTicket(mut s)?;
+        let gone = s.deleteObjectDeferred("grp", "kept")!;
+        Check.isTrue(gone.isSome(), "a delete staged behind a batch in flight is written")?;
+        s.finishGroupSync(next.lastLsn, next.sync())!;
+        Check.isTrue(s.isPublished(kept), "the PUT in flight is published")?;
+        checkText("stays", s.getObject("grp", "kept")!)?;
+        // A commit under the lock publishes the staged delete.
+        let _ = s.commitStaged()!;
+        Check.isTrue(missing(borrow s, "kept"), "the staged delete is applied in order")?;
+        Check.equalU64(0, s.objectCount() as u64)?;
+    }
+    let r = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.isTrue(missing(borrow r, "k") && missing(borrow r, "kept"), "the deletes survive a reopen")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
 // ---- Fault sweeps (ADR-0004) ----
 
 /// Stages a deferred write of `seed` to key `k`, recording it in the model.
@@ -174,8 +214,18 @@ fn deferSeed(s: borrow mut ObjectStore, m: borrow mut FaultModel, k: usize, seed
     m.observe(s);
 }
 
-/// One leader's round: write the staged batch, stage `seed` for key `k` while it syncs (k < FKEYS), then sync and
-/// publish.
+/// Stages a deferred delete of key `k` (ADR-0025), recording it in the model.
+fn deferDelete(s: borrow mut ObjectStore, m: borrow mut FaultModel, k: usize) {
+    match (s.deleteObjectDeferred("bkt", keyName(k))) {
+        Ok(Some(lsn)) => { m.deferred(k, 0, lsn); }
+        Ok(null) => { m.succeeded(k, 0); }
+        Err(e) => { m.failed(k, 0, borrow e); }
+    }
+    m.observe(s);
+}
+
+/// One leader's round: write the staged batch, stage `seed` for key `k` while it syncs (k < FKEYS; seed 0 deletes
+/// the key), then sync and publish.
 fn groupRound(s: borrow mut ObjectStore, m: borrow mut FaultModel, k: usize, seed: u64) {
     let ticket = match (s.beginGroupSync()) {
         Ok(Some(t)) => t,
@@ -185,7 +235,13 @@ fn groupRound(s: borrow mut ObjectStore, m: borrow mut FaultModel, k: usize, see
             return;
         }
     };
-    if (k < FKEYS) { deferSeed(s, m, k, seed); }
+    if (k < FKEYS) {
+        if (seed == 0) {
+            deferDelete(s, m, k);
+        } else {
+            deferSeed(s, m, k, seed);
+        }
+    }
     let synced = ticket.sync();
     match (s.finishGroupSync(ticket.lastLsn, synced)) {
         Ok() => {}
@@ -195,10 +251,10 @@ fn groupRound(s: borrow mut ObjectStore, m: borrow mut FaultModel, k: usize, see
 }
 
 /// What `groupWorkload` leaves each key holding when nothing fails.
-const GROUP_WORKLOAD_RESULT: [u64; 5] = [5u64, 2, 3, 4, 7];
+const GROUP_WORKLOAD_RESULT: [u64; 5] = [5u64, 2, 0, 4, 7];
 
-/// Group commit under faults: batches with writes staged during their sync, inline and extent-backed; a batch in
-/// flight taken by `commitStaged`; and the leader's late result.
+/// Group commit under faults: batches with writes staged during their sync, inline and extent-backed; a delete
+/// staged during a sync; a batch in flight taken by `commitStaged`; and the leader's late result.
 fn groupWorkload(dir: StringView, m: borrow mut FaultModel) {
     var s = match (ObjectStore.open(dir, faultStoreConfig())) {
         Ok(s) => s,
@@ -220,6 +276,7 @@ fn groupWorkload(dir: StringView, m: borrow mut FaultModel) {
     deferSeed(mut s, m, 1, 2);
     groupRound(mut s, m, 2, 3);
     groupRound(mut s, m, 3, 4);
+    groupRound(mut s, m, 2, 0); // key 2's delete, staged while key 3's write syncs
     deferSeed(mut s, m, 0, 5);
     // A batch in flight, a write staged behind it, and a commit under the lock before the leader returns.
     match (s.beginGroupSync()) {

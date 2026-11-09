@@ -1041,3 +1041,21 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - deletes through group commit;
   - T2.
+
+### 9 Nov 2026: M4 slice 5, deletes through group commit (ADR-0025)
+
+- **DeleteObject is staged and acknowledged once published** (`deleteObjectDeferred`, `awaitPublished`), so deletes
+  share batches and syncs with PUTs, and no delete holds the store's lock across a sync.
+- **A key missing from the index may still have a PUT staged or in flight.** The delete is then written anyway, so it
+  applies after that PUT and wins. With nothing pending, a missing key needs no record, as before.
+- **DeleteObjects (the batch) still commits at once,** so a failure cannot leave part of it durable (ADR-0010).
+- **Results** (`docs/benchmarks/2026-11-09-group-deletes.md`, a loaded machine; only DELETE compared):
+  - 2,300 to 3,200/s at concurrency 32 (from about 200), p99 11 to 28 ms (from 165 to 356);
+  - 5,100 to 8,800/s at 128, with 16 syncs per 1,000;
+  - concurrency 1 unchanged.
+- **Tests:** deferred deletes after unpublished writes, and the group fault sweeps (once, sticky, torn, crash) with a
+  delete staged during a sync. 113 tests, s3-tests subset 252, the SDK checks, both smokes.
+- **Next:**
+  - a quiet reference run of the whole matrix;
+  - T2;
+  - T7 and T9 to T11 (stalls, memory, listing and recovery at scale).
