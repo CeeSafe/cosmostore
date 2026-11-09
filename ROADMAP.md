@@ -1007,3 +1007,20 @@ Browser form uploads with a SigV4 POST policy.
   - deletes through group commit;
   - T2's definition.
 
+
+### 9 Nov 2026: M4 slice 3, reads on the event loop (ADR-0023)
+
+- **Store calls that only touch memory run on the event loop,** with no worker thread: `headObject`, `bucketExists`,
+  `listBucketInfo` and the GET plan. The compiler's N0295 check proves they do no I/O, and fails the build if a later
+  change adds some.
+- **A GET with a body makes one worker-thread call** (the reader's open), and an inline body goes out in one write.
+- **Results** (`docs/benchmarks/2026-11-09-reads.md`), at concurrency 32:
+  - HEAD at 37,000 to 42,000/s (from 15,800 to 17,300), p99 1.2 to 2.1 ms;
+  - 128 B to 4 KiB GET at 15,500 to 16,200/s (from 11,100 to 12,100), p99 about 3 ms;
+  - met: T5 (with little margin) and T6.
+- **Still open:** GET at concurrency 128 (about 9,000/s), since the inline record is read under the store's lock.
+- **Tests:** s3-tests subset 252, the boto3, Go, JS and rclone checks, and both smokes.
+- **Next:**
+  - inline reads without the store's lock (segment pins);
+  - deletes through group commit;
+  - T2.

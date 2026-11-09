@@ -764,8 +764,8 @@ fn checkConditions(
     return Ok();
 }
 
-/// Under the lock: the object's metadata, its conditions and range, and (for GET) a reader that pins its extents.
-fn planGet(store: borrow mut ObjectStore, req: borrow S3Request, withBody: bool) -> Result<GetPlan, S3Fail> {
+/// Under the lock, with no I/O: the object's metadata, its conditions and its range. `openGet` adds the reader.
+fn planGet(store: borrow ObjectStore, req: borrow S3Request) -> Result<GetPlan, S3Fail> {
     let bucket = req.bucket.view();
     let key = req.key.view();
     let info = match (store.headObject(bucket, key)) {
@@ -833,16 +833,9 @@ fn planGet(store: borrow mut ObjectStore, req: borrow S3Request, withBody: bool)
         }
         null => {}
     }
-    var reader: ObjectReader? = null;
-    if (withBody && end > start) {
-        reader = match (store.openReader(bucket, key, start, end)) {
-            Ok(r) => r,
-            Err(e) => { return Err(storeFail(e, key.length)); }
-        };
-    }
     return Ok(GetPlan {
         info: info,
-        reader: reader,
+        reader: null,
         start: start,
         end: end,
         partial: partial,
@@ -855,7 +848,20 @@ fn planGet(store: borrow mut ObjectStore, req: borrow S3Request, withBody: bool)
 async fn openGet(app: borrow S3App, req: borrow S3Request, withBody: bool) -> Result<GetPlan, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return await Async.blocking(() => planGet(store, req, withBody));
+    // The plan is an index lookup, on the event loop. Only a body's reader may do I/O (an inline record's read, or
+    // an extent reader's open), so only a GET with bytes to send takes a worker thread (ADR-0023).
+    var plan = planGet(store, req)?;
+    if (withBody && !plan.notModified && plan.end > plan.start) {
+        let bucket = req.bucket.view();
+        let key = req.key.view();
+        let start = plan.start;
+        let end = plan.end;
+        plan.reader = match (await Async.blocking(() => store.openReader(bucket, key, start, end))) {
+            Ok(r) => r,
+            Err(e) => { return Err(storeFail(e, key.length)); }
+        };
+    }
+    return Ok(plan);
 }
 
 async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
@@ -952,6 +958,15 @@ async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
     exchange.setContentLength(plan.end - plan.start);
     match (plan.reader.asBorrowMut()) {
         Some(reader) => {
+            // An inline object is already in memory: sent as it is, without a worker thread per read.
+            match (reader.takeInline()) {
+                Some(bytes) => {
+                    await exchange.write(bytes.view())?;
+                    await exchange.finish()?;
+                    return Ok();
+                }
+                null => {}
+            }
             var buf = Vector<u8>.create();
             buf.resize(bodyStep(plan.end - plan.start), 0)?;
             while (true) {

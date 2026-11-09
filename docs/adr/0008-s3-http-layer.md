@@ -23,6 +23,8 @@ shape this ADR:
    `127.0.0.1:<port>` over HTTP/1.1. The bind address and virtual-host addressing come later in M3.
 2. **One `AsyncMutex<ObjectStore>`.** A handler takes the lock, makes its store calls inside `Async.blocking`, and
    drops the lock before it touches the network. Waiting tasks park; they do not block the event loop.
+   - **Amended by ADR-0023 (M4 slice 3):** store calls that only touch memory (`headObject`, `bucketExists`,
+     `listBucketInfo`, the GET plan) run on the event loop under the lock, with no worker thread.
 3. **Bodies move without the lock.**
    - **PUT:** the handler takes an `ObjectWriter` under the lock and releases it. It then reads the body in pieces
      of at most 1 MiB. Each piece is written to the writer on a worker thread (`Async.blocking`), while other

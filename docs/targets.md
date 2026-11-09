@@ -48,3 +48,4 @@ other hardware the ratios (scaling, syncs per write) carry over; the absolute nu
 | After | Met | Not yet |
 |---|---|---|
 | Slice 2, group commit (ADR-0022, `benchmarks/2026-11-09-group-commit.md`) | T1, T3, T4, T8, T12 | T2 (64 syncs per 1,000: batches hold half of the closed-loop clients); T5 (1 to 4 KiB GET at 11,000 to 12,000/s); T6 (HEAD at 15,800 to 17,300/s); T7, T9 to T11 not measured |
+| Slice 3, reads on the event loop (ADR-0023, `benchmarks/2026-11-09-reads.md`) | T5 (15,500 to 16,200/s, p99 3.1 to 3.3 ms), T6 (37,000 to 42,000/s), T8 | T2; T7, T9 to T11 not measured |
