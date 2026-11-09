@@ -1,0 +1,149 @@
+// Group commit across requests (ADR-0022): leader/follower, as ROADMAP issue 7 asks. A PUT stages its record under the
+// store's lock and releases it, then waits here for the record to be published.
+//
+// - The leader holds the commit turn. Under the store's lock it writes every staged record without syncing, then
+//   hands the turn on and syncs on a worker thread without the lock. Meanwhile other requests stage the next batch,
+//   and the next leader waits for this sync to end before it writes. The batch is published under the lock again.
+// - Each batch in flight has a barrier, one of two locks by the batch's parity, which its leader holds while it syncs.
+//   A request whose record is in that batch waits on the barrier only, not behind the next leader.
+// - An idle store syncs at once, with no timer.
+//
+// Async tasks run on the event loop's thread, so the marks in S3App change only between awaits.
+
+/// Waits until the record at `lsn` is published (durable and applied), syncing as the leader when it is not.
+async fn awaitPublished(app: borrow S3App, lsn: u64) -> Result<void, S3Fail> {
+    var waited = false;
+    while (true) {
+        if (lsn < app.published.load()) { return Ok(); }
+        // In the batch in flight: wait for its sync, once. If that does not publish it (the leader failed, or was
+        // cancelled), lead instead, and the store reports why.
+        if (!waited && app.syncing.load() && lsn <= app.syncingLast.load()) {
+            waited = true;
+            await passBarrier(app, app.syncingBatch.load())?;
+            continue;
+        }
+        let lead = await takeLead(app, lsn, waited)?;
+        // The barrier stays held until the batch is published or failed.
+        let _barrier = lead.barrier;
+        let ticket = match (lead.ticket) {
+            Some(t) => t,
+            null => {
+                if (lead.retry) { continue; }
+                return Ok();
+            }
+        };
+        let synced = await Async.blocking(() => ticket.sync());
+        let below = await finishLead(app, ticket.lastLsn, synced, lsn);
+        app.syncing.store(false);
+        app.published.store(below?);
+        return Ok();
+    }
+    return Ok();
+}
+
+/// The barrier of a batch, by parity.
+fn barrierOf<region a>(app: borrow(a) S3App, batch: u64) -> borrow(a) AsyncMutex<u8> =>
+    if (batch % 2 == 0) borrow app.barrierEven else borrow app.barrierOdd;
+
+/// Waits until batch `batch`'s leader has ended its sync.
+async fn passBarrier(app: borrow S3App, batch: u64) -> Result<void, S3Fail> {
+    let _pass = match (await barrierOf(app, batch).lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(S3Fail.Code(S3Code.ServiceUnavailable)); }
+    };
+    return Ok();
+}
+
+/// What `takeLead` decided: the batch to sync, with its barrier held; or nothing, because `lsn` is published
+/// (`retry` false) or is now in a batch another leader syncs (`retry` true).
+struct Lead<region r> {
+    ticket: SyncTicket?;
+    barrier: AsyncMutexGuard<r, u8>?;
+    retry: bool;
+}
+
+/// With the commit turn: waits for the batch in flight to end, then writes the next batch under the store's lock and
+/// holds its barrier. The turn is handed on when this returns.
+async fn takeLead<region a>(app: borrow(a) S3App, lsn: u64, waited: bool) -> Result<Lead<a>, S3Fail> {
+    let _turn = match (await app.commitTurn.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(S3Fail.Code(S3Code.ServiceUnavailable)); }
+    };
+    if (lsn < app.published.load()) { return Ok(Lead { ticket: null, barrier: null, retry: false }); }
+    // In the batch in flight, and not waited for yet: wait on its barrier. Waited for already, its leader went away.
+    if (!waited && app.syncing.load() && lsn <= app.syncingLast.load()) {
+        return Ok(Lead { ticket: null, barrier: null, retry: true });
+    }
+    let batch = app.syncingBatch.load() + 1;
+    let barrier = match (await barrierOf(app, batch).lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(S3Fail.Code(S3Code.ServiceUnavailable)); }
+    };
+    // One batch in flight at a time: wait for the previous one's sync.
+    if (app.syncing.load()) { await passBarrier(app, batch - 1)?; }
+    let begun = await beginLead(app, lsn)?;
+    app.published.store(begun.publishedBelow);
+    return match (begun.ticket) {
+        Some(t) => {
+            app.syncingLast.store(t.lastLsn);
+            app.syncingBatch.store(batch);
+            app.syncing.store(true);
+            Ok(Lead { ticket: t, barrier: barrier, retry: false })
+        }
+        null => {
+            app.syncing.store(false);
+            Ok(Lead { ticket: null, barrier: null, retry: false })
+        }
+    };
+}
+
+/// What the leader found under the store's lock: the ticket of the batch it wrote, or null when `lsn` is published;
+/// and the store's published mark.
+struct Begun {
+    ticket: SyncTicket?;
+    publishedBelow: u64;
+}
+
+async fn beginLead(app: borrow S3App, lsn: u64) -> Result<Begun, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => writeBatch(store, lsn))) {
+        Ok(b) => Ok(b),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+fn writeBatch(store: borrow mut ObjectStore, lsn: u64) -> Result<Begun, StoreError> {
+    if (store.isPublished(lsn)) { return Ok(Begun { ticket: null, publishedBelow: store.publishedBelow() }); }
+    if (store.hasFailed()) { return Err(StoreError.Journal(JournalError.Failed)); }
+    match (store.beginGroupSync()?) {
+        Some(t) => { return Ok(Begun { ticket: t, publishedBelow: store.publishedBelow() }); }
+        null => {}
+    }
+    // Nothing to write but `lsn` unpublished: a batch is in flight whose leader went away (its request was
+    // cancelled while it synced). Commit everything here, under the lock.
+    let _ = store.commitStaged()?;
+    if (!store.isPublished(lsn)) { return Err(StoreError.Journal(JournalError.Failed)); }
+    return Ok(Begun { ticket: null, publishedBelow: store.publishedBelow() });
+}
+
+/// Under the store's lock: publishes the batch the ticket synced, or fails it. Returns the store's published mark.
+async fn finishLead(app: borrow S3App, lastLsn: u64, synced: Result<void, IoFailure>, lsn: u64) -> Result<u64, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => endLead(store, lastLsn, synced, lsn))) {
+        Ok(b) => Ok(b),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+fn endLead(
+    store: borrow mut ObjectStore,
+    lastLsn: u64,
+    synced: Result<void, IoFailure>,
+    lsn: u64,
+) -> Result<u64, StoreError> {
+    store.finishGroupSync(lastLsn, synced)?;
+    if (!store.isPublished(lsn)) { return Err(StoreError.Journal(JournalError.Failed)); }
+    return Ok(store.publishedBelow());
+}

@@ -10,6 +10,8 @@ import web_server;
 const MAX_PUT_BYTES: u64 = 5368709120;
 /// Body bytes read and written per step.
 const BODY_STEP: usize = 1048576;
+/// Room beyond the declared size in a body buffer: aws-chunked framing, and a read of the end of the stream.
+const BODY_SLACK: usize = 16384;
 const S3_XMLNS: StringView = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 struct S3App {
@@ -20,6 +22,25 @@ struct S3App {
     /// With virtual-host addressing, the domain under which `<bucket>.<domain>` names a bucket (empty: path-style
     /// only). ADR-0011.
     domain: Vector<u8>;
+    /// The commit turn of group commit (ADR-0022): its holder is the leader that syncs the journal.
+    commitTurn: AsyncMutex<u8>;
+    /// Every record with a lower LSN is published, as the last leader saw it: followers check it without the
+    /// store's lock. It may lag the store (other commits publish too), never lead it.
+    published: AtomicU64;
+    /// The batch a leader is syncing (ADR-0022): whether there is one, its number and last LSN.
+    syncing: AtomicBool;
+    syncingBatch: AtomicU64;
+    syncingLast: AtomicU64;
+    /// Batch barriers by parity: a leader holds its batch's while it syncs.
+    barrierEven: AsyncMutex<u8>;
+    barrierOdd: AsyncMutex<u8>;
+}
+
+/// The buffer for moving a body of `expected` bytes: at most BODY_STEP, and no larger than the body and some slack
+/// for aws-chunked framing. A small request must not pay for zeroing a 1 MiB buffer (ADR-0022).
+fn bodyStep(expected: u64) -> usize {
+    let wanted = expected + BODY_SLACK as u64;
+    return if (wanted < BODY_STEP as u64) truncate<usize>(wanted) else BODY_STEP;
 }
 
 fn statusOf(code: u16) -> StatusCode => StatusCode.of(code) ?? Status.internalServerError();

@@ -977,3 +977,33 @@ Browser form uploads with a SigV4 POST policy.
   - recovery ≤ 3 s at 1M objects.
 - **Next:** group commit across requests (T1 to T4), then reads without the lock (T5, T6), then checkpoints without
   the lock (T7).
+
+### 9 Nov 2026: M4 slice 2, group commit across requests (ADR-0022)
+
+- **Leader/follower group commit, without a timer** (issue 7):
+  - the journal writes a batch, then syncs it on a worker thread without the store's lock, while the next batch
+    stages;
+  - the store publishes in LSN order;
+  - `commitStaged`, which every other mutation calls, takes a batch in flight with it;
+  - a PUT is acknowledged once its record is published;
+  - per-batch barriers keep followers from waiting behind the next leader.
+- **Body buffers sized to the body.** Every request used to zero a fresh 1 MiB buffer on the event loop's thread,
+  and that, not the store's lock, was what capped small GETs.
+- **Results** (`docs/benchmarks/2026-11-09-group-commit.md`):
+  - tiny PUT at 3,300/s at concurrency 32 (from 200), p99 11 ms (from 190 to 550);
+  - 5,000 to 5,600/s at 128;
+  - concurrency 1 unchanged;
+  - small GET at 11,000 to 15,700/s (from about 2,300).
+  - Met: T1, T3, T4, T8, T12. Not yet: T2 (64 syncs per 1,000), T5 and T6.
+- **Measured:** this SSD serializes `F_FULLFSYNC` (about 210/s from 1, 2 or 4 threads), so one batch in flight is
+  enough.
+- **CeeSafe:** `Async.blocking` starts a thread per call (CEESAFE_GAPS G28).
+- **Tests:**
+  - group-commit store tests;
+  - fault sweeps (once, sticky, torn, crash) of a group workload;
+  - s3-tests subset 252, the boto3, Go, JS and rclone checks, and both smokes.
+- **Next:**
+  - reads and HEAD without the store's lock (T5, T6);
+  - deletes through group commit;
+  - T2's definition.
+

@@ -65,6 +65,8 @@ struct FaultModel {
     /// Staged, not yet committed (0: nothing staged for the key).
     pending: [u64; 5];
     hasPending: [bool; 5];
+    /// A deferred write's LSN (0: committed by `commitStaged`): it counts as acknowledged once published (ADR-0022).
+    pendingLsn: [u64; 5];
 
     fn create() -> FaultModel => FaultModel {
         bucket: false,
@@ -73,7 +75,25 @@ struct FaultModel {
         alt: [0u64; 5],
         pending: [0u64; 5],
         hasPending: [false; 5],
+        pendingLsn: [0u64; 5],
     };
+
+    /// A deferred write staged for key `k` at `lsn`.
+    fn deferred(borrow mut this, k: usize, seed: u64, lsn: u64) {
+        this.pending[k] = seed;
+        this.hasPending[k] = true;
+        this.pendingLsn[k] = lsn;
+    }
+
+    /// Deferred writes the store has published are acknowledged, whichever commit published them.
+    fn observe(borrow mut this, s: borrow ObjectStore) {
+        for (k in 0..FKEYS) {
+            if (this.hasPending[k] && this.pendingLsn[k] > 0 && s.isPublished(this.pendingLsn[k])) {
+                this.succeeded(k, this.pending[k]);
+                this.hasPending[k] = false;
+            }
+        }
+    }
 
     fn succeeded(borrow mut this, k: usize, seed: u64) {
         this.cur[k] = seed;
@@ -99,7 +119,10 @@ struct FaultModel {
     }
 
     fn dropPending(borrow mut this) {
-        for (i in 0..FKEYS) { this.hasPending[i] = false; }
+        for (i in 0..FKEYS) {
+            this.hasPending[i] = false;
+            this.pendingLsn[i] = 0;
+        }
     }
 }
 

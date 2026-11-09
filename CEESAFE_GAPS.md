@@ -36,6 +36,7 @@ boilerplate; **P2** ergonomics.
 | G25 | P2 | std/console | No `Console.flush()`: standard output written before a SIGKILL is lost when it is redirected **Fixed in CeeSafe 0.21.0** (ADR 0077) |
 | G26 | P3 | std/checksums | No CRC-32 (IEEE), the AWS CLI's `x-amz-checksum-crc32`: lib/std has CRC-32C and CRC-64/NVME only. CosmoStore computes it in CeeSafe (`src/storage/checksums/crc32.cee`) |
 | G27 | P2 | std/async-console | `AsyncConsole.writeError` fails when standard error is `/dev/null` (macOS), so a server that checks it exits under `2>/dev/null` |
+| G28 | P2 | runtime/async | `Async.blocking` starts and joins a new OS thread for every call: no pool, so each blocking step costs a `pthread_create` and a join |
 
 ## Status (2026-11-06)
 
@@ -320,6 +321,23 @@ error log lines.
 
 Suggested: when a descriptor cannot be polled, AsyncConsole should fall back to a blocking write on the blocking
 pool. Writing to `/dev/null` never blocks.
+
+### G28: `Async.blocking` has no thread pool (P2)
+
+**Evidence.** `runtime/hosted/ceesafe_rt_async.c`: `ceesafe_async_blocking_start` calls `ceesafe_thread_start(body,
+arg)` for each call, and `ceesafe_async_blocking_ready` joins the thread. A 4-second `sample` of `cosmostore serve`
+under 32 concurrent 0-byte PUTs (M4 slice 2, ADR-0022) shows 579 distinct worker threads. In the event loop's
+thread, `pthread_create` and `pthread_join` (with their `mach_vm_map`/`mach_vm_deallocate` of the stack) account for
+about 60 of the 1,600 samples in the request path.
+
+**Why it matters.** A storage server sends every store call and every body step through `Async.blocking` (N0295
+requires it), so a small request makes four or five of them. Thread creation then costs about as much as the work.
+
+**Repro.** Any loop of `await Async.blocking(() => 0)` in `Async.run`, and count the threads with `ps -M` or `sample`.
+
+**Suggested.** A small pool of reusable workers, growing up to a bound and parking idle threads, as Tokio's
+`spawn_blocking` and libuv's thread pool do. The semantics need not change: each call still runs on some thread
+other than the event loop's.
 
 ## Not gaps (checked)
 

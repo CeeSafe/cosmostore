@@ -81,12 +81,29 @@ struct PayloadLocator {
     length: u32;
 }
 
+/// A batch written but not yet durable (`Journal.writeStaged`): its own handle of the segment,
+/// so the sync can run on a worker thread without the journal.
+struct SyncTicket {
+    private file: DurableFile;
+    lastLsn: u64;
+
+    /// Makes the batch durable (F_FULLFSYNC on macOS). Pass the result to `finishSync`.
+    fn sync(borrow this) -> Result<void, IoFailure> => this.file.syncData();
+}
+
 struct Journal {
     private dir: String;
     private file: DurableFile;
     private segmentId: u64;
     /// The end of the last durable batch in the active segment.
     private writeOffset: u64;
+    /// The end of the bytes written to the active segment: `writeOffset`, plus the batch in flight.
+    private writtenEnd: u64;
+    /// A batch written by `writeStaged` whose sync has not finished: its last LSN, records and end.
+    private inflight: bool;
+    private inflightLast: u64;
+    private inflightCount: u32;
+    private inflightEnd: u64;
     private nextLsn: u64;
     private pending: Vector<u8>;
     private pendingCount: u32;
@@ -187,6 +204,11 @@ struct Journal {
             file: file,
             segmentId: segmentId,
             writeOffset: writeOffset,
+            writtenEnd: writeOffset,
+            inflight: false,
+            inflightLast: 0,
+            inflightCount: 0,
+            inflightEnd: writeOffset,
             nextLsn: nextLsn,
             pending: Vector<u8>.create(),
             pendingCount: 0,
@@ -240,7 +262,7 @@ struct Journal {
         if (this.pending.length + length > this.config.maxBatchBytes) { return Err(JournalError.TooLarge); }
         let position = RecordPosition {
             segmentId: this.segmentId,
-            offset: this.writeOffset + this.pending.length as u64,
+            offset: this.writtenEnd + this.pending.length as u64,
             lsn: this.nextLsn,
         };
         encodeRecord(mut this.pending, kind, 0, this.nextLsn, 0, meta, payload)?;
@@ -253,13 +275,19 @@ struct Journal {
     fn wouldOverflow(borrow this, metaLen: usize, payloadLen: usize) -> bool =>
         this.pending.length + recordLength(metaLen, payloadLen) > this.config.maxBatchBytes;
 
-    /// Makes every staged record durable with one write and one sync, then rotates the
-    /// segment if it is full. On error the journal is failed; the batch may or may not have
-    /// reached the disk, and must not be published.
+    /// Whether the active segment is full, so the next commit with nothing in flight rotates it.
+    fn needsRotation(borrow this) -> bool => this.writtenEnd >= this.config.segmentTargetBytes;
+
+    /// Whether a batch written by `writeStaged` is waiting for its sync.
+    fn hasInflight(borrow this) -> bool => this.inflight;
+
+    /// Makes every staged record durable with one write and one sync, together with a batch in
+    /// flight (`writeStaged`), then rotates the segment if it is full. On error the journal is
+    /// failed; the batch may or may not have reached the disk, and must not be published.
     fn commit(borrow mut this) -> Result<void, JournalError> {
         if (this.failed) { return Err(JournalError.Failed); }
-        if (this.pendingCount == 0) { return Ok(); }
-        match (this.file.writeAt(this.pending.view(), this.writeOffset)) {
+        if (this.pendingCount == 0 && !this.inflight) { return Ok(); }
+        match (this.file.writeAt(this.pending.view(), this.writtenEnd)) {
             Ok() => {}
             Err(e) => { return this.fail(e); }
         }
@@ -269,7 +297,10 @@ struct Journal {
         }
         this.syncs += 1;
         this.committed += this.pendingCount as u64;
-        this.writeOffset += this.pending.length as u64;
+        if (this.inflight) { this.committed += this.inflightCount as u64; }
+        this.inflight = false;
+        this.writtenEnd += this.pending.length as u64;
+        this.writeOffset = this.writtenEnd;
         this.pending.clear();
         this.pendingCount = 0;
         // The batch is durable, so it is acknowledged even if the rotation fails: the caller
@@ -278,6 +309,66 @@ struct Journal {
             let _ = this.rotate();
         }
         return Ok();
+    }
+
+    /// Group commit, first half (ADR-0022): writes the staged batch without syncing it, and
+    /// returns a ticket whose `sync` makes it durable. The sync runs without the caller's lock,
+    /// while later records are staged; `finishSync` then records its result. Returns null when
+    /// nothing is staged, or when a batch is already in flight (one at a time). On error the
+    /// journal is failed.
+    fn writeStaged(borrow mut this) -> Result<SyncTicket?, JournalError> {
+        if (this.failed) { return Err(JournalError.Failed); }
+        if (this.pendingCount == 0 || this.inflight) { return Ok(null); }
+        let path = segmentPath(this.dir.view(), this.segmentId)?;
+        let handle = match (DurableFile.openReadWrite(path.view())) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = this.fail(e);
+                return Err(JournalError.Io(e));
+            }
+        };
+        match (this.file.writeAt(this.pending.view(), this.writtenEnd)) {
+            Ok() => {}
+            Err(e) => {
+                let _ = this.fail(e);
+                return Err(JournalError.Io(e));
+            }
+        }
+        this.writtenEnd += this.pending.length as u64;
+        this.inflight = true;
+        this.inflightLast = this.nextLsn - 1;
+        this.inflightCount = this.pendingCount;
+        this.inflightEnd = this.writtenEnd;
+        this.pending.clear();
+        this.pendingCount = 0;
+        return Ok(SyncTicket { file: handle, lastLsn: this.inflightLast });
+    }
+
+    /// Group commit, second half: records the result of a ticket's sync. Ok(true) means the
+    /// ticket's batch is durable now and must be published; Ok(false), that `commit` already
+    /// made it durable (or it is not this journal's batch). A failed sync fails the journal.
+    fn finishSync(borrow mut this, lastLsn: u64, synced: Result<void, IoFailure>) -> Result<bool, JournalError> {
+        if (!this.inflight || this.inflightLast != lastLsn) {
+            if (this.failed) { return Err(JournalError.Failed); }
+            return Ok(false);
+        }
+        if (this.failed) { return Err(JournalError.Failed); }
+        match (synced) {
+            Ok() => {}
+            Err(e) => {
+                let _ = this.fail(e);
+                return Err(JournalError.Io(e));
+            }
+        }
+        this.syncs += 1;
+        this.committed += this.inflightCount as u64;
+        this.inflight = false;
+        this.writeOffset = this.inflightEnd;
+        // Rotate only when nothing is staged: staged records hold positions in this segment.
+        if (this.pendingCount == 0 && this.writeOffset >= this.config.segmentTargetBytes) {
+            let _ = this.rotate();
+        }
+        return Ok(true);
     }
 
     /// Discards the staged records (used when a batch cannot be built).
@@ -289,6 +380,7 @@ struct Journal {
 
     fn fail(borrow mut this, e: IoFailure) -> Result<void, JournalError> {
         this.failed = true;
+        this.inflight = false;
         this.pending.clear();
         this.pendingCount = 0;
         return Err(JournalError.Io(e));
@@ -311,6 +403,7 @@ struct Journal {
                 this.file = file;
                 this.segmentId = id;
                 this.writeOffset = SEGMENT_HEADER_LEN as u64;
+                this.writtenEnd = this.writeOffset;
                 return Ok();
             }
             Err(e) => {

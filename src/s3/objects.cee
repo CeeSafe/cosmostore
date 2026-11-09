@@ -325,7 +325,7 @@ async fn receiveBody(
     var checksum = RunningChecksum.create(spec.checksumKind);
     var decoder = ChunkDecoder.create(auth.signer);
     var buf = Vector<u8>.create();
-    buf.resize(BODY_STEP, 0)?;
+    buf.resize(bodyStep(size), 0)?;
     var decoded = Vector<u8>.create();
     var received: u64 = 0;
     while (true) {
@@ -594,8 +594,24 @@ async fn discardPut(app: borrow S3App, finished: borrow FinishedObject) -> Resul
     return Ok();
 }
 
-/// Under the lock: the precondition, then the commit (ADR-0008 §9).
+/// The precondition and the staging under the lock (ADR-0008 §9), then the wait for group commit (ADR-0022).
 async fn commitPut(
+    app: borrow S3App,
+    bucket: StringView,
+    key: StringView,
+    contentType: StringView,
+    metadata: Slice<u8>,
+    extras: Slice<u8>,
+    finished: borrow FinishedObject,
+    condition: PutIf,
+    ifMatch: Slice<u8>,
+) -> Result<PutOutcome, S3Fail> {
+    let outcome = await stagePut(app, bucket, key, contentType, metadata, extras, finished, condition, ifMatch)?;
+    await awaitPublished(app, outcome.generation)?;
+    return Ok(outcome);
+}
+
+async fn stagePut(
     app: borrow S3App,
     bucket: StringView,
     key: StringView,
@@ -634,7 +650,7 @@ fn commitWith(
             return Err(e);
         }
     };
-    return store.putFinishedWith(bucket, key, contentType, metadata, extras, finished, cond);
+    return store.putFinishedDeferred(bucket, key, contentType, metadata, extras, finished, cond);
 }
 
 // ---- GetObject and HeadObject ----
@@ -937,7 +953,7 @@ async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
     match (plan.reader.asBorrowMut()) {
         Some(reader) => {
             var buf = Vector<u8>.create();
-            buf.resize(BODY_STEP, 0)?;
+            buf.resize(bodyStep(plan.end - plan.start), 0)?;
             while (true) {
                 let chunk = buf.viewMut();
                 let got = await Async.blocking(() => reader.read(chunk));

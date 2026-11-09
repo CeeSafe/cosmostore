@@ -33,6 +33,8 @@ shape this ADR:
 4. **Commits are serialized.** Each PUT is one journal commit with its own sync, so concurrent PUTs do not share a
    group commit yet. Batching them across requests is M4 work (perf hardening). It needs the store to commit from
    one place, for example a commit task.
+   - **Amended by ADR-0022 (M4 slice 2):** PUTs now share syncs through leader/follower group commit. The sync runs
+     without the store's lock.
 
 ### Authentication
 
@@ -144,4 +146,4 @@ path dependency (`../../CeeSafe.Web/packages`, `web_server` 0.3.1).
   - the response checksum;
   - a bucket's creation date (ListBuckets says 1970). Done in slice 4 (ADR-0011).
 - **One address:** only 127.0.0.1 is served, without TLS.
-- **No shared group commit:** PUTs are serialized on the store's lock, each with its own commit.
+- **No shared group commit:** PUTs are serialized on the store's lock, each with its own commit. Done in M4 slice 2 (ADR-0022).

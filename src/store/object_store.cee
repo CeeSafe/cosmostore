@@ -594,12 +594,42 @@ const LIFECYCLE_BATCH: usize = 1000;
 /// Abandoned extents queued between reaps; more are left to the orphan sweep at open.
 const ABANDONED_CAPACITY: usize = 4096;
 
+/// Applies a durable batch's records to the state, in order.
+fn applyBatch(
+    state: borrow mut StoreState,
+    batch: borrow Vector<PendingApply>,
+    sinceCheckpoint: borrow mut u64,
+    counts: borrow mut StoreCounters,
+) -> Result<void, StoreError> {
+    for (i in 0..batch.length) {
+        let p = borrow batch[i];
+        sinceCheckpoint += p.total as u64;
+        counts.journalBytesWritten += p.total as u64;
+        applyRecord(
+            mut state,
+            p.kind,
+            p.lsn,
+            p.segment,
+            p.offset,
+            p.total,
+            p.meta.view(),
+            p.payloadLen,
+            p.manifest.view(),
+        )?;
+    }
+    return Ok();
+}
+
 struct ObjectStore {
     private journal: Journal;
     private state: StoreState;
     private config: StoreConfig;
     private scratch: Vector<u8>;
     private pendingApplies: Vector<PendingApply>;
+    /// The batch written by `beginGroupSync` whose sync has not finished (ADR-0022).
+    private inflightApplies: Vector<PendingApply>;
+    /// Every record with a lower LSN is published (durable and applied).
+    private publishedNext: u64;
     private extentDir: String;
     private dir: String;
     /// The newest durable checkpoint: its LSN and the first segment it does not cover
@@ -694,12 +724,15 @@ struct ObjectStore {
         extentDir.append(dir)?;
         extentDir.append("/extents")?;
         sio(Fs.ensureDirectory(extentDir.view()))?;
+        let publishedNext = journal.upcomingLsn();
         var store = ObjectStore {
             journal: journal,
             state: state,
             config: config,
             scratch: Vector<u8>.create(),
             pendingApplies: Vector<PendingApply>.create(),
+            inflightApplies: Vector<PendingApply>.create(),
+            publishedNext: publishedNext,
             extentDir: extentDir,
             dir: root,
             checkpointLsn: start.lsn,
@@ -922,6 +955,7 @@ struct ObjectStore {
             truncate<u32>(payload.length),
             if (carriesManifest(kind)) payload else payload[0..0],
         )?;
+        this.publishedNext = pos.lsn + 1;
         this.reapExtents();
         return Ok(pos.lsn);
     }
@@ -1081,6 +1115,38 @@ struct ObjectStore {
 
     /// `putFinished` with stored fields, a blob from `metadataAdd` (ADR-0012), and its checksum, a blob from
     /// `ObjectExtras.encode` (ADR-0015).
+    /// Like `putFinishedWith`, but an unconditional PUT is only staged: it is published, and may
+    /// be acknowledged, once `isPublished(outcome.generation)` (group commit, ADR-0022). A
+    /// conditional PUT is checked against every earlier write, so it commits as `putFinishedWith`.
+    fn putFinishedDeferred(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        contentType: StringView,
+        metadata: Slice<u8>,
+        extras: Slice<u8>,
+        obj: borrow FinishedObject,
+        condition: PutCondition,
+    ) -> Result<PutOutcome, StoreError> {
+        match (condition) {
+            PutCondition.None => {}
+            _ => { return this.putFinishedWith(bucket, key, contentType, metadata, extras, obj, condition); }
+        }
+        if (metadata.length > MAX_METADATA_BYTES) {
+            this.discardFinished(obj);
+            return Err(StoreError.MetadataTooLarge);
+        }
+        match (this.checkPut(bucket, key, contentType, obj, condition)) {
+            Ok() => {}
+            Err(e) => {
+                this.discardFinished(obj);
+                return Err(e);
+            }
+        }
+        let lsn = this.stageFinished(bucket, key, contentType, metadata, extras, obj)?;
+        return Ok(PutOutcome { md5: obj.md5, generation: lsn, parts: 0, extras: copyBytes(extras)? });
+    }
+
     fn putFinishedWith(
         borrow mut this,
         bucket: StringView,
@@ -1211,7 +1277,8 @@ struct ObjectStore {
             ObjectBody.Inline(data) => data.view(),
             ObjectBody.Extents(_) => manifest.view(),
         };
-        if (this.journal.wouldOverflow(meta.length, payload.length)) {
+        // A full segment rotates at a commit with nothing staged after it (ADR-0022).
+        if (this.journal.wouldOverflow(meta.length, payload.length) || this.journal.needsRotation()) {
             this.commitStaged()?;
         }
         this.pendingApplies.reserve(1)?;
@@ -1231,38 +1298,74 @@ struct ObjectStore {
         return Ok(pos.lsn);
     }
 
-    /// Commits the staged batch with one write and one sync, then publishes it. Returns how
-    /// many writes were published. On error nothing staged is published.
+    /// Commits the staged batch, and a batch in flight, with one write and one sync, then
+    /// publishes them in LSN order. Returns how many writes were published. On error nothing
+    /// staged or in flight is published.
     fn commitStaged(borrow mut this) -> Result<usize, StoreError> {
-        if (this.pendingApplies.length == 0) { return Ok(0); }
+        if (this.pendingApplies.length == 0 && this.inflightApplies.length == 0) { return Ok(0); }
         match (this.journal.commit()) {
             Ok() => {}
+            Err(e) => {
+                this.pendingApplies.clear();
+                this.inflightApplies.clear();
+                return Err(StoreError.Journal(e));
+            }
+        }
+        let n = this.inflightApplies.length + this.pendingApplies.length;
+        applyBatch(mut this.state, borrow this.inflightApplies, mut this.sinceCheckpoint, mut this.counts)?;
+        applyBatch(mut this.state, borrow this.pendingApplies, mut this.sinceCheckpoint, mut this.counts)?;
+        this.inflightApplies.clear();
+        this.pendingApplies.clear();
+        this.publishedNext = this.journal.upcomingLsn();
+        this.reapExtents();
+        return Ok(n);
+    }
+
+    /// Group commit, first half (ADR-0022): writes the staged batch to the journal without
+    /// syncing it, and returns the ticket to sync it with, without the store's lock. Null when
+    /// nothing is staged or a batch is already in flight.
+    fn beginGroupSync(borrow mut this) -> Result<SyncTicket?, StoreError> {
+        if (this.pendingApplies.length == 0 || this.inflightApplies.length > 0) { return Ok(null); }
+        match (this.journal.writeStaged()) {
+            Ok(Some(ticket)) => {
+                let staged = replace(mut this.pendingApplies, Vector<PendingApply>.create());
+                this.inflightApplies = staged;
+                return Ok(ticket);
+            }
+            Ok(null) => { return Ok(null); }
             Err(e) => {
                 this.pendingApplies.clear();
                 return Err(StoreError.Journal(e));
             }
         }
-        let n = this.pendingApplies.length;
-        for (i in 0..n) {
-            let p = borrow this.pendingApplies[i];
-            this.sinceCheckpoint += p.total as u64;
-            this.counts.journalBytesWritten += p.total as u64;
-            applyRecord(
-                mut this.state,
-                p.kind,
-                p.lsn,
-                p.segment,
-                p.offset,
-                p.total,
-                p.meta.view(),
-                p.payloadLen,
-                p.manifest.view(),
-            )?;
-        }
-        this.pendingApplies.clear();
-        this.reapExtents();
-        return Ok(n);
     }
+
+    /// Group commit, second half: takes the ticket's sync result and, if that made the batch
+    /// durable, publishes it. A failed sync fails the journal, and the batch is never published.
+    fn finishGroupSync(borrow mut this, lastLsn: u64, synced: Result<void, IoFailure>) -> Result<void, StoreError> {
+        match (this.journal.finishSync(lastLsn, synced)) {
+            Ok(true) => {}
+            Ok(false) => { return Ok(); }
+            Err(e) => {
+                this.inflightApplies.clear();
+                return Err(StoreError.Journal(e));
+            }
+        }
+        applyBatch(mut this.state, borrow this.inflightApplies, mut this.sinceCheckpoint, mut this.counts)?;
+        this.inflightApplies.clear();
+        this.publishedNext = lastLsn + 1;
+        this.reapExtents();
+        return Ok();
+    }
+
+    /// Whether the record at `lsn` is published: durable, applied, and safe to acknowledge.
+    fn isPublished(borrow this, lsn: u64) -> bool => lsn < this.publishedNext;
+
+    /// The LSN after the last published record: every lower one is published.
+    fn publishedBelow(borrow this) -> u64 => this.publishedNext;
+
+    /// Whether a write that is staged or in flight can no longer be published: the journal failed.
+    fn hasFailed(borrow this) -> bool => this.journal.isFailed();
 
     fn headObject(borrow this, bucket: StringView, key: StringView) -> Result<ObjectInfo, StoreError> {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }

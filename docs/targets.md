@@ -42,3 +42,9 @@ other hardware the ratios (scaling, syncs per write) carry over; the absolute nu
 - **T9 to T11, scale.** These need a large-key-count run, which the generator does not do yet. T10 is the ordered
   index ROADMAP M4 lists.
 - **T12** keeps compaction honest as the write path changes.
+
+## Progress
+
+| After | Met | Not yet |
+|---|---|---|
+| Slice 2, group commit (ADR-0022, `benchmarks/2026-11-09-group-commit.md`) | T1, T3, T4, T8, T12 | T2 (64 syncs per 1,000: batches hold half of the closed-loop clients); T5 (1 to 4 KiB GET at 11,000 to 12,000/s); T6 (HEAD at 15,800 to 17,300/s); T7, T9 to T11 not measured |

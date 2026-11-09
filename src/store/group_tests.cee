@@ -1,0 +1,260 @@
+// Group commit across requests (ADR-0022): a deferred PUT is staged, written by `beginGroupSync`, synced without the
+// store, and published by `finishGroupSync`, or by any `commitStaged` that comes first. Then the fault sweeps.
+
+/// Stages an unconditional PUT of `body` without committing it; returns its LSN.
+fn deferText(s: borrow mut ObjectStore, key: StringView, body: StringView) -> u64 {
+    let obj = s.writeAll(body.bytes())!;
+    return s.putFinishedDeferred("grp", key, "text/plain", "".bytes(), "".bytes(), borrow obj, PutCondition.None)!
+        .generation;
+}
+
+fn takeTicket(s: borrow mut ObjectStore) -> Result<SyncTicket, TestFailure> => match (s.beginGroupSync()!) {
+    Some(t) => Ok(t),
+    null => Err(TestFailure.create("a staged batch gives a ticket")),
+};
+
+fn missing(s: borrow ObjectStore, key: StringView) -> bool => match (s.getObject("grp", key)) {
+    Err(StoreError.NoSuchKey) => true,
+    _ => false,
+};
+
+@test
+fn groupSyncPublishesOnlyItsBatch() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("group-basic");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("grp")!;
+        let syncs = s.journalSyncs();
+        let a = deferText(mut s, "a", "one");
+        let b = deferText(mut s, "b", "two");
+        Check.isTrue(!s.isPublished(a) && !s.isPublished(b), "staged writes are not published")?;
+        Check.isTrue(missing(borrow s, "a"), "a staged write is not visible")?;
+        let ticket = takeTicket(mut s)?;
+        // Only one batch in flight.
+        Check.isTrue(s.beginGroupSync()!.isNull(), "a second batch waits for the first")?;
+        // Staged while the batch syncs: not in it.
+        let c = deferText(mut s, "c", "three");
+        Check.isTrue(missing(borrow s, "a"), "a written, unsynced batch is not visible")?;
+        s.finishGroupSync(ticket.lastLsn, ticket.sync())!;
+        Check.isTrue(s.isPublished(a) && s.isPublished(b), "the synced batch is published")?;
+        Check.isTrue(!s.isPublished(c), "a write staged during the sync is not")?;
+        checkText("one", s.getObject("grp", "a")!)?;
+        checkText("two", s.getObject("grp", "b")!)?;
+        Check.isTrue(missing(borrow s, "c"), "the next batch is not visible yet")?;
+        Check.equalU64(syncs + 1, s.journalSyncs())?;
+        // The next round publishes it.
+        let next = takeTicket(mut s)?;
+        s.finishGroupSync(next.lastLsn, next.sync())!;
+        checkText("three", s.getObject("grp", "c")!)?;
+        Check.equalU64(syncs + 2, s.journalSyncs())?;
+        Check.isTrue(s.beginGroupSync()!.isNull(), "nothing staged, nothing to write")?;
+        // All of it survives a reopen.
+    }
+    let r = ObjectStore.open(dir.view(), storeConfig())!;
+    checkText("one", r.getObject("grp", "a")!)?;
+    checkText("three", r.getObject("grp", "c")!)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn commitStagedTakesTheBatchInFlight() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("group-absorb");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("grp")!;
+        let first = deferText(mut s, "k", "older");
+        let ticket = takeTicket(mut s)?;
+        // An overwrite staged behind the batch in flight, then a commit under the lock (as a DELETE or a checkpoint
+        // makes): both publish, in LSN order, so the overwrite wins.
+        let second = deferText(mut s, "k", "newer");
+        Check.equalU64(2, s.commitStaged()! as u64)?;
+        Check.isTrue(s.isPublished(first) && s.isPublished(second), "both are published")?;
+        checkText("newer", s.getObject("grp", "k")!)?;
+        Check.equalU64(1, s.objectCount() as u64)?;
+        // The leader's late result changes nothing: the batch is not applied twice.
+        let records = s.recordsApplied();
+        s.finishGroupSync(ticket.lastLsn, ticket.sync())!;
+        Check.equalU64(records, s.recordsApplied())?;
+        checkText("newer", s.getObject("grp", "k")!)?;
+        // A conditional PUT sees every earlier write: it commits at once.
+        let obj = s.writeAll("third".bytes())!;
+        let cond = PutCondition.IfGeneration(second);
+        let done = s.putFinishedDeferred("grp", "k", "text/plain", "".bytes(), "".bytes(), borrow obj, cond)!;
+        Check.isTrue(s.isPublished(done.generation), "a conditional PUT is published when it returns")?;
+    }
+    let r = ObjectStore.open(dir.view(), storeConfig())!;
+    checkText("third", r.getObject("grp", "k")!)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn failedGroupSyncPublishesNothing() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("group-fail");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("grp")!;
+        let lsn = deferText(mut s, "k", "lost");
+        let ticket = takeTicket(mut s)?;
+        let _ = ticket.sync();
+        match (s.finishGroupSync(ticket.lastLsn, Err(IoFailure { op: IoOp.Sync, errno: 5 }))) {
+            Err(StoreError.Journal(JournalError.Io(_))) => {}
+            _ => { return Check.fail("a failed sync fails the batch"); }
+        }
+        Check.isTrue(!s.isPublished(lsn) && s.hasFailed(), "nothing is published, and the store has failed")?;
+        Check.isTrue(missing(borrow s, "k"), "the failed batch is not visible")?;
+        match (s.createBucket("c")) {
+            Err(StoreError.Journal(JournalError.Failed)) => {}
+            _ => { return Check.fail("writes are refused after a failed sync"); }
+        }
+    }
+    // The bytes reached the file, so a reopen may find the write: it was never acknowledged, either way is allowed.
+    var r = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(0, r.verify()!.orphanExtents as u64)?;
+    putText(mut r, "grp", "after", "fine");
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn groupSyncRotatesFullSegments() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("group-rotate");
+    var config = storeConfig();
+    config.journal.segmentTargetBytes = 4096;
+    let body = "a body of some length, so that a few of them fill a small segment";
+    var keys = Vector<String>.create();
+    for (i in 0..80) {
+        var key = String.create();
+        key.append("key-")!;
+        key.appendNumber(i)!;
+        keys.push(key)!;
+    }
+    {
+        var s = ObjectStore.open(dir.view(), config)!;
+        s.createBucket("grp")!;
+        // Every round stages one write before the batch and one while it syncs, as concurrent requests do.
+        let _ = deferText(mut s, keys[0].view(), body);
+        for (i in 1..80) {
+            let ticket = takeTicket(mut s)?;
+            let _ = deferText(mut s, keys[i].view(), body);
+            s.finishGroupSync(ticket.lastLsn, ticket.sync())!;
+        }
+        let _ = s.commitStaged()!;
+        Check.isTrue(s.segmentCount() >= 3, "full segments rotate")?;
+    }
+    let r = ObjectStore.open(dir.view(), config)!;
+    Check.equalU64(80, r.objectCount() as u64)?;
+    for (i in 0..80) { checkText(body, r.getObject("grp", keys[i].view())!)?; }
+    removeTree(dir.view());
+    return Ok();
+}
+
+// ---- Fault sweeps (ADR-0004) ----
+
+/// Stages a deferred write of `seed` to key `k`, recording it in the model.
+fn deferSeed(s: borrow mut ObjectStore, m: borrow mut FaultModel, k: usize, seed: u64) {
+    let data = patterned(seedSize(seed), seed);
+    let staged = match (s.writeAll(data.view())) {
+        Ok(obj) => s.putFinishedDeferred(
+            "bkt",
+            keyName(k),
+            "application/octet-stream",
+            "".bytes(),
+            "".bytes(),
+            borrow obj,
+            PutCondition.None,
+        ),
+        Err(e) => Err(e),
+    };
+    match (staged) {
+        Ok(outcome) => { m.deferred(k, seed, outcome.generation); }
+        Err(e) => { m.failed(k, seed, borrow e); }
+    }
+    m.observe(s);
+}
+
+/// One leader's round: write the staged batch, stage `seed` for key `k` while it syncs (k < FKEYS), then sync and
+/// publish.
+fn groupRound(s: borrow mut ObjectStore, m: borrow mut FaultModel, k: usize, seed: u64) {
+    let ticket = match (s.beginGroupSync()) {
+        Ok(Some(t)) => t,
+        Ok(null) => { return; }
+        Err(e) => {
+            m.failed(FKEYS, 0, borrow e);
+            return;
+        }
+    };
+    if (k < FKEYS) { deferSeed(s, m, k, seed); }
+    let synced = ticket.sync();
+    match (s.finishGroupSync(ticket.lastLsn, synced)) {
+        Ok() => {}
+        Err(e) => { m.failed(FKEYS, 0, borrow e); }
+    }
+    m.observe(s);
+}
+
+/// What `groupWorkload` leaves each key holding when nothing fails.
+const GROUP_WORKLOAD_RESULT: [u64; 5] = [5u64, 2, 3, 4, 7];
+
+/// Group commit under faults: batches with writes staged during their sync, inline and extent-backed; a batch in
+/// flight taken by `commitStaged`; and the leader's late result.
+fn groupWorkload(dir: StringView, m: borrow mut FaultModel) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    match (s.createBucket("bkt")) {
+        Ok() => {
+            m.bucket = true;
+            m.bucketAlt = true;
+        }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.bucketAlt = true; }
+        }
+    }
+    match (putSeed(mut s, 0, 1)) {
+        Ok() => { m.succeeded(0, 1); }
+        Err(e) => { m.failed(0, 1, borrow e); }
+    }
+    deferSeed(mut s, m, 1, 2);
+    groupRound(mut s, m, 2, 3);
+    groupRound(mut s, m, 3, 4);
+    deferSeed(mut s, m, 0, 5);
+    // A batch in flight, a write staged behind it, and a commit under the lock before the leader returns.
+    match (s.beginGroupSync()) {
+        Ok(Some(ticket)) => {
+            deferSeed(mut s, m, 4, 6);
+            match (s.commitStaged()) {
+                Ok(_) => {}
+                Err(e) => { m.failed(FKEYS, 0, borrow e); }
+            }
+            m.observe(borrow s);
+            match (s.finishGroupSync(ticket.lastLsn, ticket.sync())) {
+                Ok() => {}
+                Err(e) => { m.failed(FKEYS, 0, borrow e); }
+            }
+            m.observe(borrow s);
+        }
+        Ok(null) => {}
+        Err(e) => { m.failed(FKEYS, 0, borrow e); }
+    }
+    deferSeed(mut s, m, 4, 7);
+    groupRound(mut s, m, FKEYS, 0);
+}
+
+@test
+fn groupFaultsOnce() -> Result<void, TestFailure> =>
+    sweepStore("gfault-once", SweepMode.Once, groupWorkload, GROUP_WORKLOAD_RESULT);
+
+@test
+fn groupFaultsSticky() -> Result<void, TestFailure> =>
+    sweepStore("gfault-sticky", SweepMode.Sticky, groupWorkload, GROUP_WORKLOAD_RESULT);
+
+@test
+fn groupFaultsTorn() -> Result<void, TestFailure> =>
+    sweepStore("gfault-torn", SweepMode.StickyTorn, groupWorkload, GROUP_WORKLOAD_RESULT);
+
+@test
+fn groupFaultsCrash() -> Result<void, TestFailure> =>
+    sweepStore("gfault-crash", SweepMode.Crash, groupWorkload, GROUP_WORKLOAD_RESULT);
