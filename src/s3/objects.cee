@@ -344,6 +344,17 @@ async fn receiveBody(
         received += data.length as u64;
         if (received > size) { return Err(S3Fail.Code(S3Code.IncompleteBody)); }
         if (data.length == 0) { continue; }
+        if (w.fitsInline(data.length)) {
+            // Bytes that stay in memory need no worker thread (ADR-0031).
+            if (hashing) { sha.update(data); }
+            checksum.update(data);
+            storedSum.update(data);
+            match (w.writeInline(data)) {
+                Ok() => {}
+                Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+            }
+            continue;
+        }
         let wrote = await Async.blocking(() => writeStep(mut w, mut sha, mut checksum, mut storedSum, hashing, data));
         match (wrote) {
             Ok() => {}
@@ -351,9 +362,9 @@ async fn receiveBody(
         }
     }
     if (received != size || (chunked && !decoder.isDone())) { return Err(S3Fail.Code(S3Code.IncompleteBody)); }
-    let finished = match (await Async.blocking(() => w.finish())) {
-        Ok(f) => f,
-        Err(f) => { return Err(storeFail(StoreError.Io(f), 0)); }
+    let finished = match (w.finishInline()) {
+        Some(f) => f,
+        null => await finishSpilled(mut w)?,
     };
 
     var refusal: S3Code? = null;
@@ -403,6 +414,14 @@ async fn receiveBody(
         storedAlgorithm: if (separate) storedAlgorithm else spec.checksumKind,
         stored: stored,
     });
+}
+
+/// Completes a body that spilled into extents, on a worker thread: its extents are synced.
+async fn finishSpilled(w: borrow mut ObjectWriter) -> Result<FinishedObject, S3Fail> {
+    return match (await Async.blocking(() => w.finish())) {
+        Ok(f) => Ok(f),
+        Err(f) => Err(storeFail(StoreError.Io(f), 0)),
+    };
 }
 
 /// A stored body's response: its ETag and the checksum the client named, then 200.
@@ -575,6 +594,13 @@ fn appendChecksumName(out: borrow mut Vector<u8>, kind: ChecksumAlgorithm) -> Re
 async fn startPut(app: borrow S3App, bucket: StringView, size: u64) -> Result<ObjectWriter, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
+    if (size <= store.inlineMaxBytes() as u64) {
+        // An object that will stay inline: the checks and the writer are in memory, so no worker thread (ADR-0031).
+        return match (beginPut(store, bucket, size)) {
+            Ok(w) => Ok(w),
+            Err(e) => Err(storeFail(e, 0)),
+        };
+    }
     return match (await Async.blocking(() => beginPut(store, bucket, size))) {
         Ok(w) => Ok(w),
         Err(e) => Err(storeFail(e, 0)),
@@ -624,6 +650,18 @@ async fn stagePut(
 ) -> Result<PutOutcome, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
+    match (condition) {
+        PutIf.None => {
+            // An inline object is staged in memory, without a worker thread, unless the batch must be committed
+            // first (ADR-0031).
+            match (store.putInlineDeferred(bucket, key, contentType, metadata, extras, finished)) {
+                Ok(Some(o)) => { return Ok(o); }
+                Ok(null) => {}
+                Err(e) => { return Err(storeFail(e, key.length)); }
+            }
+        }
+        _ => {}
+    }
     return match (await Async.blocking(
         () => commitWith(store, bucket, key, contentType, metadata, extras, finished, condition, ifMatch),
     )) {

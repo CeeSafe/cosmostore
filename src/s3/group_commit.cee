@@ -13,8 +13,18 @@
 /// Waits until the record at `lsn` is published (durable and applied), syncing as the leader when it is not.
 async fn awaitPublished(app: borrow S3App, lsn: u64) -> Result<void, S3Fail> {
     var waited = false;
+    var waitedOnLeader: u64 = 0;
     while (true) {
         if (lsn < app.published.load()) { return Ok(); }
+        // A leader is cutting the next batch, which takes this write if it was staged before the cut: wait for
+        // that batch on its barrier, rather than queue for the turn behind the leader. Once per batch, so a
+        // leader that went away is not waited on again.
+        let leader = app.leadingBatch.load();
+        if (app.leading.load() && leader != waitedOnLeader && !(app.syncing.load() && lsn <= app.syncingLast.load())) {
+            waitedOnLeader = leader;
+            await passBarrier(app, leader)?;
+            continue;
+        }
         // In the batch in flight: wait for its sync, once. If that does not publish it (the leader failed, or was
         // cancelled), lead instead, and the store reports why.
         if (!waited && app.syncing.load() && lsn <= app.syncingLast.load()) {
@@ -41,9 +51,12 @@ async fn awaitPublished(app: borrow S3App, lsn: u64) -> Result<void, S3Fail> {
     return Ok();
 }
 
-/// The barrier of a batch, by parity.
+/// The barriers group commit uses in turn.
+const BARRIERS: usize = 8;
+
+/// The barrier of a batch.
 fn barrierOf<region a>(app: borrow(a) S3App, batch: u64) -> borrow(a) AsyncMutex<u8> =>
-    if (batch % 2 == 0) borrow app.barrierEven else borrow app.barrierOdd;
+    borrow app.barriers[truncate<usize>(batch % BARRIERS as u64)];
 
 /// Waits until batch `batch`'s leader has ended its sync.
 async fn passBarrier(app: borrow S3App, batch: u64) -> Result<void, S3Fail> {
@@ -79,6 +92,9 @@ async fn takeLead<region a>(app: borrow(a) S3App, lsn: u64, waited: bool) -> Res
         Ok(g) => g,
         Err(_) => { return Err(S3Fail.Code(S3Code.ServiceUnavailable)); }
     };
+    app.leadingBatch.store(batch);
+    app.leading.store(true);
+    let _leading = Leading { app: app };
     // One batch in flight at a time: wait for the previous one's sync.
     if (app.syncing.load()) { await passBarrier(app, batch - 1)?; }
     let begun = await beginLead(app, lsn)?;
@@ -146,4 +162,11 @@ fn endLead(
     store.finishGroupSync(lastLsn, synced)?;
     if (!store.isPublished(lsn)) { return Err(StoreError.Journal(JournalError.Failed)); }
     return Ok(store.publishedBelow());
+}
+
+/// Marks the turn's holder as leading until it hands the turn on, or its request is cancelled.
+struct Leading<region r> {
+    app: borrow(r) S3App;
+
+    drop { this.app.leading.store(false); }
 }

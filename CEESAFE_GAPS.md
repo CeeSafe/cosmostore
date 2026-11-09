@@ -38,6 +38,7 @@ boilerplate; **P2** ergonomics.
 | G27 | P2 | std/async-console | `AsyncConsole.writeError` fails when standard error is `/dev/null` (macOS), so a server that checks it exits under `2>/dev/null` |
 | G28 | P2 | runtime/async | `Async.blocking` starts and joins a new OS thread for every call: no pool, so each blocking step costs a `pthread_create` and a join |
 | G29 | P2 | lib/std | `OrderedMap` leaves nodes about half full when keys arrive in order, and reserves a full node's room for whole values: 2.6 times the entries' bytes for in-order inserts |
+| G30 | P2 | runtime/async | Waking a task always writes a byte to the executor's wake pipe, even from the executor's own thread: every `AsyncMutex` unlock with a waiter is a `write` system call |
 
 ## Status (2026-11-06)
 
@@ -358,6 +359,26 @@ build a large one, and it gives the worst fill.
 **Suggested.** Split unevenly when the insert is at the right edge of the tree, keeping the left node full, as
 many B-tree implementations do for appends. Alternatively, offer a bulk load from sorted input that packs nodes.
 Allocating a node's vectors for its current count, not for 32, would also bound the waste for large values.
+
+### G30: a same-thread wake writes to the wake pipe (P2)
+
+**Evidence.** `runtime/hosted/ceesafe_rt_async.c`: `cee_wake_task` always calls `cee_poke`, which `write`s a byte
+to `exec->wake_pipe[1]`. `AsyncMutexGuard`'s drop (`lib/std/channel.cee`) unlocks with `token.trySend(0)`, and
+`ceesafe_chan_end_send` wakes every waiter through `cee_chan_changed`. So with tasks waiting, each unlock is a system
+call, though the waker is the event loop itself. A 5-second `sample` of `cosmostore serve` under 128 concurrent
+128-byte PUTs (ADR-0031) puts about 530 of the event loop's 1,930 busy samples (27%) in that `write`, under the two
+unlocks of the store's `AsyncMutex` each PUT makes. With G28 avoided for small PUTs, it is the largest overhead left.
+
+**Why it matters.** An `AsyncMutex` shared by many tasks on one loop is the natural way to guard state in async
+code; under contention every unlock pays a kernel round trip for a wake that needs none.
+
+**Repro.** In `Async.run`, spawn 100 tasks that each lock one `AsyncMutex<u64>` 1,000 times and, holding it,
+`await Async.blocking(() => 0)` (so the others queue on the lock), then increment it. `sample` the process: the
+event loop's thread shows `write` under `ceesafe_chan_end_send`.
+
+**Suggested.** When `cee_wake_task` runs on the executor's own thread, mark the task runnable without poking: the
+loop checks its run queue before it blocks in `kevent`. Only a wake from another thread needs the pipe (and one
+`write` per loop iteration is enough: skip it while a poke is already pending).
 
 ## Not gaps (checked)
 

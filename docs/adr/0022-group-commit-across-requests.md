@@ -98,3 +98,25 @@
 - **End to end:**
   - `tools/s3_smoke.sh`, `tools/tls_smoke.sh`, the s3-tests subset (252), and the SDK checks;
   - `tools/bench` at up to 128 concurrent clients, with every GET verified and fsck clean afterwards.
+
+## Amendment (10 Nov 2026, ADR-0031): no waiting in the turn's queue
+
+When small PUTs were staged on the event loop (ADR-0031), batches at concurrency 32 fell from about 16 writes to 3
+to 10, and throughput to 500 to 1,700/s, with a p99 of 70 to 150 ms. Counters in `awaitPublished` showed why: a
+request spent 10.8 ms of its 13.5 ms waiting for the commit turn.
+- **The turn's queue mixed two kinds of request:** the next leader, and requests already in the batch being cut,
+  which queued only to find that out. The turn's holder keeps it until its batch is written, and waiters take it in
+  no fixed order. So a request in the batch in flight could wait behind the following leader, through a sync it did
+  not need, and fall into a later batch. Clients then drifted into many small groups.
+- **Two barriers by parity were reused too soon:** batch N + 2's leader could lock the barrier batch N's followers
+  had not yet passed.
+
+Before, each request's worker-thread steps spread the requests out enough that these orderings were rare. Now:
+1. **The leader marks itself** (`S3App.leading`, `leadingBatch`) once it holds the turn and its batch's barrier, and
+   a guard's drop clears the mark when it hands the turn on or its request is cancelled.
+2. **A request that finds a leader marked waits on that leader's barrier,** not in the turn's queue. The barrier is
+   released when the batch is published, or failed, and the request checks again. It waits once per batch number,
+   so a leader that went away is not waited on twice.
+3. **Eight barriers in turn,** not two.
+
+At concurrency 32 a batch again holds about 16 writes (62.7 syncs per 1,000), and nothing waits for the turn.

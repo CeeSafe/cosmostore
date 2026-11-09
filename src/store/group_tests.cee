@@ -150,6 +150,110 @@ fn groupSyncRotatesFullSegments() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// Stages `body` for `key` in memory only (ADR-0031); null when the batch must be committed first.
+fn stageInline(s: borrow mut ObjectStore, key: StringView, body: StringView) -> Result<u64?, TestFailure> {
+    var w = s.newWriter()!;
+    Check.isTrue(w.fitsInline(body.length), "a small body fits inline")?;
+    w.writeInline(body.bytes())!;
+    let obj = match (w.finishInline()) {
+        Some(o) => o,
+        null => { return Err(TestFailure.create("an inline writer finishes in memory")); }
+    };
+    return Ok(match (s.putInlineDeferred("grp", key, "text/plain", "".bytes(), "".bytes(), borrow obj)!) {
+        Some(o) => o.generation,
+        null => null,
+    });
+}
+
+@test
+fn inlinePutsStageWithoutCommitting() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("group-inline");
+    var config = storeConfig();
+    config.journal.maxBatchBytes = 2048;
+    let body = "a body of some length, so that a few of them fill a small batch";
+    var keys = Vector<String>.create();
+    for (i in 0..40) {
+        var key = String.create();
+        key.append("key-")!;
+        key.appendNumber(i)!;
+        keys.push(key)!;
+    }
+    {
+        var s = ObjectStore.open(dir.view(), config)!;
+        s.createBucket("grp")!;
+        let syncs = s.journalSyncs();
+        // The in-memory writer gives what writeAll gives.
+        var w = s.newWriter()!;
+        w.writeInline("he".bytes())!;
+        w.writeInline("llo".bytes())!;
+        let viaInline = w.finishInline() ?? s.writeAll("x".bytes())!;
+        let viaAll = s.writeAll("hello".bytes())!;
+        Check.equalU64(5, viaInline.size)?;
+        Check.isTrue(viaInline.md5[..] == viaAll.md5[..], "the same MD5 either way")?;
+        // Staged, not committed: no sync, not visible, not published.
+        let first = match (stageInline(mut s, keys[0].view(), body)?) {
+            Some(lsn) => lsn,
+            null => { return Err(TestFailure.create("an empty batch has room")); }
+        };
+        Check.isTrue(!s.isPublished(first) && missing(borrow s, keys[0].view()), "a staged inline PUT is unpublished")?;
+        Check.equalU64(syncs, s.journalSyncs())?;
+        // Refusals stage nothing.
+        let obj = s.writeAll("x".bytes())!;
+        match (s.putInlineDeferred("nobucket", "k", "text/plain", "".bytes(), "".bytes(), borrow obj)) {
+            Err(StoreError.NoSuchBucket) => {}
+            _ => { return Err(TestFailure.create("a missing bucket is refused")); }
+        }
+        var big = Vector<u8>.create();
+        big.resize(MAX_METADATA_BYTES + 1, 'a')!;
+        match (s.putInlineDeferred("grp", "k", "text/plain", big.view(), "".bytes(), borrow obj)) {
+            Err(StoreError.MetadataTooLarge) => {}
+            _ => { return Err(TestFailure.create("too much metadata is refused")); }
+        }
+        // An object in extents is not taken: the caller commits it on a worker thread.
+        var large = Vector<u8>.create();
+        large.resize(20000, 'z')!;
+        let spilled = s.writeAll(large.view())!;
+        Check.isTrue(
+            s.putInlineDeferred("grp", "k", "text/plain", "".bytes(), "".bytes(), borrow spilled)!.isNull(),
+            "an extent-backed object takes the worker's path",
+        )?;
+        s.discardFinished(borrow spilled);
+        var sw = s.newWriter()!;
+        Check.isTrue(!sw.fitsInline(20000), "a large body does not fit inline")?;
+        sw.write(large.view())!;
+        Check.isTrue(sw.finishInline().isNull(), "a spilled writer does not finish in memory")?;
+        let finished = sw.finish()!;
+        s.discardFinished(borrow finished);
+        // Stage until the batch is full: then nothing is staged, and the fallback commits first.
+        var staged: u64 = 1;
+        var full = false;
+        var next: usize = 1;
+        while (next < 40 && !full) {
+            match (stageInline(mut s, keys[next].view(), body)?) {
+                Some(_) => {
+                    staged += 1;
+                    next += 1;
+                }
+                null => { full = true; }
+            }
+        }
+        Check.isTrue(full, "a small batch fills")?;
+        Check.equalU64(syncs, s.journalSyncs())?;
+        let fallback = deferText(mut s, keys[next].view(), body);
+        Check.isTrue(s.journalSyncs() > syncs, "the fallback committed the full batch first")?;
+        Check.isTrue(s.isPublished(first), "and published it")?;
+        Check.isTrue(!s.isPublished(fallback), "its own write waits for the next batch")?;
+        Check.equalU64(1, s.commitStaged()! as u64)?;
+        Check.equalU64(staged + 1, s.objectCount() as u64)?;
+    }
+    let r = ObjectStore.open(dir.view(), config)!;
+    for (i in 0..40) {
+        if (r.objectCount() as usize > i) { checkText(body, r.getObject("grp", keys[i].view())!)?; }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
 @test
 fn deferredDeletesFollowUnpublishedWrites() -> Result<void, TestFailure> {
     let dir = scratchDirectory("group-delete");
@@ -196,15 +300,7 @@ fn deferredDeletesFollowUnpublishedWrites() -> Result<void, TestFailure> {
 fn deferSeed(s: borrow mut ObjectStore, m: borrow mut FaultModel, k: usize, seed: u64) {
     let data = patterned(seedSize(seed), seed);
     let staged = match (s.writeAll(data.view())) {
-        Ok(obj) => s.putFinishedDeferred(
-            "bkt",
-            keyName(k),
-            "application/octet-stream",
-            "".bytes(),
-            "".bytes(),
-            borrow obj,
-            PutCondition.None,
-        ),
+        Ok(obj) => stageEitherWay(s, keyName(k), borrow obj),
         Err(e) => Err(e),
     };
     match (staged) {
@@ -212,6 +308,29 @@ fn deferSeed(s: borrow mut ObjectStore, m: borrow mut FaultModel, k: usize, seed
         Err(e) => { m.failed(k, seed, borrow e); }
     }
     m.observe(s);
+}
+
+/// Stages a PUT as the server does: in memory if it is inline and the batch has room (ADR-0031), else through
+/// `putFinishedDeferred`.
+fn stageEitherWay(
+    s: borrow mut ObjectStore,
+    key: StringView,
+    obj: borrow FinishedObject,
+) -> Result<PutOutcome, StoreError> {
+    match (s.putInlineDeferred("bkt", key, "application/octet-stream", "".bytes(), "".bytes(), obj)) {
+        Ok(Some(o)) => { return Ok(o); }
+        Ok(null) => {}
+        Err(e) => { return Err(e); }
+    }
+    return s.putFinishedDeferred(
+        "bkt",
+        key,
+        "application/octet-stream",
+        "".bytes(),
+        "".bytes(),
+        obj,
+        PutCondition.None,
+    );
 }
 
 /// Stages a deferred delete of key `k` (ADR-0025), recording it in the model.

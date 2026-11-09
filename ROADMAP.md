@@ -1194,3 +1194,31 @@ Browser form uploads with a SigV4 POST policy.
   - the first CI runs measure the runner's noise; the tolerances may move with them;
   - the rest of M4: journal shards and per-core appenders, and the comparison run.
 
+### 10 Nov 2026: small PUTs on the event loop (ADR-0031)
+
+- **Journal shards do not help this device.** A probe of parallel `F_FULLFSYNC`s on separate files: 221 syncs/s with
+  one writer, 219 with two, 419 with eight at four times the latency each. The SSD flushes about one at a time, and
+  at concurrency 8 and 32 the store already runs at that rate. Shards stay in the plan for devices with parallel
+  flushes, measured with the same probe first.
+- **What did limit it, at concurrency 128:** serial work on the event loop between syncs. A profile put 19% of the
+  loop in `Async.blocking`'s thread per call (G28) and 20% in the `AsyncMutex` wake-up's `write` (new gap G30).
+- **An inline object's PUT now runs on the event loop:** the writer's in-memory steps and `putInlineDeferred`, which
+  stages without committing or gives null when the batch is full. N0295 proves no I/O on that path. Larger objects,
+  conditional PUTs and full batches take the worker thread as before.
+- **That exposed a group-commit ordering problem,** fixed in an ADR-0022 amendment. Requests already in the batch
+  being cut queued for the commit turn behind the next leader, and two barriers by parity were reused too soon.
+  Batches at concurrency 32 fell to 3 to 10 writes. Now a request waits on the leader's barrier, and eight barriers
+  are used in turn.
+- **Results** (`tools/perf_gate.sh`, `docs/benchmarks/2026-11-10-small-puts-on-the-loop.md`):
+  - small writes at concurrency 128: 1.76 times the throughput, 0.56 times the p99 (0 B and 1 KiB PUTs 10,600 to
+    11,800/s);
+  - at concurrency 32: 1.09 and 0.89, 4 KiB PUT at 3,118/s;
+  - the gate passed.
+- **Tests:** `inlinePutsStageWithoutCommitting`; the group-commit fault sweeps stage through the new path. 131 tests,
+  the s3-tests subset 252, the SDK checks, both smokes.
+- **CI:** the S3 smoke's virtual-host checks need `smoke.localhost` in the runner's `/etc/hosts`.
+- **Next:**
+  - a quiet reference run, for T1 at 4 KiB;
+  - G30, and the remaining lock round per PUT;
+  - the comparison run.
+

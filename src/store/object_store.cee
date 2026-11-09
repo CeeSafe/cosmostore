@@ -1129,6 +1129,9 @@ struct ObjectStore {
         }
     }
 
+    /// The largest object kept inline in the journal.
+    fn inlineMaxBytes(borrow this) -> usize => this.config.inlineMaxBytes;
+
     /// A writer for a new object's bytes; commit it with `putFinished` or `stageFinished`.
     fn newWriter(borrow this) -> Result<ObjectWriter, StoreError> =>
         Ok(ObjectWriter.create(
@@ -1359,6 +1362,31 @@ struct ObjectStore {
         return Ok(PutOutcome { md5: obj.md5, generation: lsn, parts: 0, extras: copyBytes(extras)? });
     }
 
+    /// `putFinishedDeferred` for an unconditional PUT of an inline object, in memory only, so async code may call it
+    /// (ADR-0031). null, with nothing staged, when the object is not inline or the batch must be committed first:
+    /// the caller then takes `putFinishedDeferred` on a worker thread.
+    fn putInlineDeferred(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        contentType: StringView,
+        metadata: Slice<u8>,
+        extras: Slice<u8>,
+        obj: borrow FinishedObject,
+    ) -> Result<PutOutcome?, StoreError> {
+        match (borrow obj.body) {
+            ObjectBody.Inline(_) => {}
+            ObjectBody.Extents(_) => { return Ok(null); }
+        }
+        // An inline object has no extents, so a refusal has nothing to discard.
+        if (metadata.length > MAX_METADATA_BYTES) { return Err(StoreError.MetadataTooLarge); }
+        this.checkPut(bucket, key, contentType, obj, PutCondition.None)?;
+        return match (this.stageWithoutCommit(bucket, key, contentType, metadata, extras, obj)?) {
+            Some(lsn) => Ok(Some(PutOutcome { md5: obj.md5, generation: lsn, parts: 0, extras: copyBytes(extras)? })),
+            null => Ok(null),
+        };
+    }
+
     fn putFinishedWith(
         borrow mut this,
         bucket: StringView,
@@ -1461,51 +1489,61 @@ struct ObjectStore {
         extras: Slice<u8>,
         obj: borrow FinishedObject,
     ) -> Result<u64, StoreError> {
-        var meta = Vector<u8>.create();
+        let rec = encodePut(bucket, key, contentType, metadata, extras, obj)?;
+        // A full segment rotates at a commit with nothing staged after it (ADR-0022).
+        if (this.mustCommitBefore(borrow rec, obj)) { this.commitStaged()?; }
+        return this.stageEncoded(rec, obj);
+    }
 
-        encodePutMeta(
-            mut meta,
-            bucket.bytes(),
-            key.bytes(),
-            nullVersionId(),
-            Clock.unixMillis(),
-            obj.size,
-            obj.md5,
-            contentType.bytes(),
-            metadata,
-        )?;
-        appendExtrasSection(mut meta, extras)?;
-        var manifest = Vector<u8>.create();
-        let kind = match (borrow obj.body) {
-            ObjectBody.Inline(_) => RecordType.PutInline,
-            ObjectBody.Extents(extents) => {
-                encodeManifest(mut manifest, extents.view())?;
-                this.counts.extentBytesWritten += extentRefBytes(extents.view());
-                RecordType.PutExtent
-            }
+    /// `stageFinished` in memory only, so async code may call it (ADR-0031): null, with nothing staged, when the
+    /// batch must be committed first.
+    fn stageWithoutCommit(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        contentType: StringView,
+        metadata: Slice<u8>,
+        extras: Slice<u8>,
+        obj: borrow FinishedObject,
+    ) -> Result<u64?, StoreError> {
+        let rec = encodePut(bucket, key, contentType, metadata, extras, obj)?;
+        if (this.mustCommitBefore(borrow rec, obj)) { return Ok(null); }
+        return Ok(Some(this.stageEncoded(rec, obj)?));
+    }
+
+    /// Whether a record must wait for a commit: it would overflow the segment, or the segment is due to rotate.
+    fn mustCommitBefore(borrow this, rec: borrow EncodedPut, obj: borrow FinishedObject) -> bool {
+        let payloadLength = match (borrow obj.body) {
+            ObjectBody.Inline(data) => data.length,
+            ObjectBody.Extents(_) => rec.manifest.length,
         };
-        this.counts.payloadBytes += obj.size;
+        return this.journal.wouldOverflow(rec.meta.length, payloadLength) || this.journal.needsRotation();
+    }
+
+    /// Stages an encoded PUT record into the current batch; returns its LSN.
+    fn stageEncoded(borrow mut this, rec: EncodedPut, obj: borrow FinishedObject) -> Result<u64, StoreError> {
+        this.pendingApplies.reserve(1)?;
         let payload = match (borrow obj.body) {
             ObjectBody.Inline(data) => data.view(),
-            ObjectBody.Extents(_) => manifest.view(),
+            ObjectBody.Extents(_) => rec.manifest.view(),
         };
-        // A full segment rotates at a commit with nothing staged after it (ADR-0022).
-        if (this.journal.wouldOverflow(meta.length, payload.length) || this.journal.needsRotation()) {
-            this.commitStaged()?;
-        }
-        this.pendingApplies.reserve(1)?;
-        let pos = this.journal.stage(kind, meta.view(), payload)?;
-        let total = truncate<u32>(recordLength(meta.length, payload.length));
+        let pos = this.journal.stage(rec.kind, rec.meta.view(), payload)?;
+        let total = truncate<u32>(recordLength(rec.meta.length, payload.length));
         let payloadLen = truncate<u32>(payload.length);
+        match (borrow obj.body) {
+            ObjectBody.Inline(_) => {}
+            ObjectBody.Extents(extents) => { this.counts.extentBytesWritten += extentRefBytes(extents.view()); }
+        }
+        this.counts.payloadBytes += obj.size;
         this.pendingApplies.push(PendingApply {
-            kind: kind,
+            kind: rec.kind,
             lsn: pos.lsn,
             segment: pos.segmentId,
             offset: pos.offset,
             total: total,
-            meta: meta,
+            meta: rec.meta,
             payloadLen: payloadLen,
-            manifest: manifest,
+            manifest: rec.manifest,
         })?;
         return Ok(pos.lsn);
     }
@@ -2914,4 +2952,43 @@ struct ObjectReader {
         this.inlinePosition += n;
         return Ok(n);
     }
+}
+
+/// A PUT's journal record, encoded but not staged.
+struct EncodedPut {
+    kind: RecordType;
+    meta: Vector<u8>;
+    manifest: Vector<u8>;
+}
+
+fn encodePut(
+    bucket: StringView,
+    key: StringView,
+    contentType: StringView,
+    metadata: Slice<u8>,
+    extras: Slice<u8>,
+    obj: borrow FinishedObject,
+) -> Result<EncodedPut, StoreError> {
+    var meta = Vector<u8>.create();
+    encodePutMeta(
+        mut meta,
+        bucket.bytes(),
+        key.bytes(),
+        nullVersionId(),
+        Clock.unixMillis(),
+        obj.size,
+        obj.md5,
+        contentType.bytes(),
+        metadata,
+    )?;
+    appendExtrasSection(mut meta, extras)?;
+    var manifest = Vector<u8>.create();
+    let kind = match (borrow obj.body) {
+        ObjectBody.Inline(_) => RecordType.PutInline,
+        ObjectBody.Extents(extents) => {
+            encodeManifest(mut manifest, extents.view())?;
+            RecordType.PutExtent
+        }
+    };
+    return Ok(EncodedPut { kind: kind, meta: meta, manifest: manifest });
 }
