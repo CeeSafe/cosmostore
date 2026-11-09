@@ -108,6 +108,8 @@ struct BucketEntry {
 }
 
 struct BucketInfo {
+    /// The bucket's number in index keys (ADR-0027): given in memory by `StoreState.addBucket`, never on disk.
+    number: u32;
     createdMillis: i64;
     objects: u64;
     /// The bucket's tags (canonical, as object tags are) and lifecycle rules (`encodeLifecycle`); empty for none
@@ -215,11 +217,17 @@ struct ListPage {
     nextMarkerIsPrefix: bool;
 }
 
+/// The bucket number of a lookup key whose bucket is not there (ADR-0027): never given to a bucket.
+const NO_BUCKET: u32 = 0xFFFFFFFF;
+
 /// Everything recovery rebuilds from the journal.
 struct StoreState {
     /// In (bucket, key) order, so a listing seeks to its first key and reads only its page (ADR-0026).
     index: VersionIndex;
     buckets: HashMap<BucketKey, BucketInfo>;
+    /// Each bucket's name by its number, and the next number to give (ADR-0027).
+    bucketNames: HashMap<u32, Vector<u8>>;
+    nextBucket: u32;
     segments: HashMap<u64, SegmentUsage>;
     records: u64;
     /// Extents of versions superseded or deleted by applied records; the store removes the
@@ -236,6 +244,8 @@ struct StoreState {
     fn create() -> StoreState => StoreState {
         index: VersionIndex.create(),
         buckets: HashMap<BucketKey, BucketInfo>.create(),
+        bucketNames: HashMap<u32, Vector<u8>>.create(),
+        nextBucket: 0,
         segments: HashMap<u64, SegmentUsage>.create(),
         records: 0,
         deadExtents: Vector<ExtentRef>.create(),
@@ -254,6 +264,64 @@ struct StoreState {
         }
         return Ok();
     }
+
+    /// Adds bucket `name` under a new number; one that is already there keeps its number, and its info is replaced.
+    /// Returns whether it was new.
+    fn addBucket(borrow mut this, name: Vector<u8>, info: BucketInfo) -> Result<bool, StoreError> {
+        var entry = info;
+        let k = BucketKey { name: copyBytes(name.view())? };
+        match (this.buckets.get(borrow k)) {
+            Some(b) => {
+                entry.number = b.number;
+                let _ = this.buckets.put(k, entry)?;
+                return Ok(false);
+            }
+            null => {}
+        }
+        if (this.nextBucket == NO_BUCKET) { return Err(StoreError.InsufficientStorage); } // 4 billion creations
+        entry.number = this.nextBucket;
+        // If the second put fails, the name stays under a number no bucket has, and the next add reuses the number.
+        this.bucketNames.put(entry.number, name)?;
+        this.buckets.put(k, entry)?;
+        this.nextBucket += 1;
+        return Ok(true);
+    }
+
+    /// Removes bucket `name` and its number.
+    fn removeBucket(borrow mut this, name: Slice<u8>) -> Result<void, StoreError> {
+        let k = BucketKey { name: copyBytes(name)? };
+        match (this.buckets.remove(borrow k)) {
+            Some(b) => { let _ = this.bucketNames.remove(borrow b.number); }
+            null => {}
+        }
+        return Ok();
+    }
+
+    /// The key to look `bucket`'s `key` up by. A bucket that is not there gets NO_BUCKET, which no bucket has, so the
+    /// key finds nothing, as a bucket with no keys would.
+    fn keyFor(borrow this, bucket: Slice<u8>, key: Slice<u8>) -> Result<IndexKey, StoreError> {
+        let k = BucketKey { name: copyBytes(bucket)? };
+        let number = match (this.buckets.get(borrow k)) {
+            Some(b) => b.number,
+            null => NO_BUCKET,
+        };
+        return Ok(IndexKey { bucket: number, key: copyBytes(key)? });
+    }
+
+    /// The index key of `bucket`'s `key`, or null if there is no such bucket.
+    fn indexKey(borrow this, bucket: Slice<u8>, key: Slice<u8>) -> Result<IndexKey?, StoreError> {
+        let k = BucketKey { name: copyBytes(bucket)? };
+        return match (this.buckets.get(borrow k)) {
+            Some(b) => Ok(IndexKey { bucket: b.number, key: copyBytes(key)? }),
+            null => Ok(null),
+        };
+    }
+
+    /// The name of bucket number `number` (empty if there is none).
+    fn bucketName(borrow this, number: u32) -> Slice<u8> => match (this.bucketNames.get(borrow number)) {
+        Some(n) => n.view(),
+        null => "".bytes(),
+    };
 
     fn hasBucket(borrow this, name: Slice<u8>) -> Result<bool, StoreError> {
         let k = BucketKey { name: copyBytes(name)? };
@@ -360,10 +428,13 @@ fn applyRecord(
                 Ok(m) => m,
                 Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
             };
+            let key = match (state.indexKey(m.bucket.view(), m.key.view())?) {
+                Some(k) => k,
+                null => { return Ok(); } // no such bucket: no such version
+            };
             let tags = m.tags;
             let generation = m.generation;
             let versionId = m.versionId;
-            let key = IndexKey { bucket: m.bucket, key: m.key };
             match (state.index.getMut(borrow key)) {
                 Some(v) => {
                     if (v.lsn == generation && v.versionId[..] == versionId[..]) {
@@ -400,11 +471,15 @@ fn applyRecord(
                 Ok(m) => m,
                 Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
             };
-            let key = IndexKey { bucket: m.bucket, key: m.key };
-            match (state.index.remove(borrow key)) {
-                Some(old) => {
-                    state.retire(borrow old)?;
-                    state.bumpObjects(key.bucket.view(), false)?;
+            match (state.indexKey(m.bucket.view(), m.key.view())?) {
+                Some(key) => {
+                    match (state.index.remove(borrow key)) {
+                        Some(old) => {
+                            state.retire(borrow old)?;
+                            state.bumpObjects(m.bucket.view(), false)?;
+                        }
+                        null => {}
+                    }
                 }
                 null => {}
             }
@@ -420,12 +495,13 @@ fn applyRecord(
                 Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
             };
             let info = BucketInfo {
+                number: 0,
                 createdMillis: created,
                 objects: 0,
                 tags: Vector<u8>.create(),
                 lifecycle: Vector<u8>.create(),
             };
-            let _ = state.buckets.put(BucketKey { name: name }, info)?;
+            let _ = state.addBucket(name, info)?;
         }
         RecordType.BucketConfig => {
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
@@ -450,11 +526,14 @@ fn applyRecord(
             };
             // The copy takes over only if the version it copied is still current; otherwise
             // it is garbage from the moment it is written.
-            let key = IndexKey { bucket: m.bucket, key: m.key };
             var moved = false;
             var oldSegment: u64 = 0;
             var oldLength: u32 = 0;
-            match (state.index.getMut(borrow key)) {
+            let found = match (state.indexKey(m.bucket.view(), m.key.view())?) {
+                Some(key) => state.index.getMut(borrow key),
+                null => null,
+            };
+            match (found) {
                 Some(v) => {
                     if (v.lsn == m.generation && v.versionId[..] == m.versionId[..] && v.extents.length == 0) {
                         oldSegment = v.recordSegment;
@@ -481,8 +560,7 @@ fn applyRecord(
                 Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
             };
             dropBucketUploads(state, name.view())?;
-            let gone = BucketKey { name: name };
-            let _ = state.buckets.remove(borrow gone);
+            state.removeBucket(name.view())?;
         }
         _ => {
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
@@ -509,7 +587,8 @@ fn applyPut(
     // in every checkpoint (ADR-0005).
     let live = if (extents.length == 0) totalLen as u64 else 0;
     state.addSegmentBytes(segment, totalLen as u64, live)?;
-    let bucketCopy = copyBytes(m.bucket.view())?;
+    let key = state.indexKey(m.bucket.view(), m.key.view())?;
+    let bucket = m.bucket;
     let version = ObjectVersion {
         versionId: m.versionId,
         lsn: lsn,
@@ -530,10 +609,16 @@ fn applyPut(
         metadata: m.metadata,
         extras: m.extras,
     };
-    let key = IndexKey { bucket: m.bucket, key: m.key };
-    match (state.index.put(key, version)?) {
-        Some(old) => { state.retire(borrow old)?; }
-        null => { state.bumpObjects(bucketCopy.view(), true)?; }
+    match (key) {
+        Some(k) => {
+            match (state.index.put(k, version)?) {
+                Some(old) => { state.retire(borrow old)?; }
+                null => { state.bumpObjects(bucket.view(), true)?; }
+            }
+        }
+        // Admission checks the bucket under the lock, so this does not happen. If it did, the version would have no
+        // bucket to be listed in: it is retired at once, its extents reaped and its record dead.
+        null => { state.retire(borrow version)?; }
     }
     return Ok();
 }
@@ -643,12 +728,12 @@ fn laterOf(
 /// incremented). Null when nothing in the bucket follows.
 fn seekPast(
     index: borrow VersionIndex,
-    bucket: Slice<u8>,
+    bucket: u32,
     marker: Slice<u8>,
     wholePrefix: bool,
 ) -> Result<OrderedCursor?, AllocError> {
     if (!wholePrefix) {
-        let after = IndexKey { bucket: copyBytes(bucket)?, key: copyBytes(marker)? };
+        let after = IndexKey { bucket: bucket, key: copyBytes(marker)? };
         return Ok(index.seekAfter(borrow after));
     }
     var end = copyBytes(marker)?;
@@ -657,7 +742,7 @@ fn seekPast(
     if (end.length == 0) { return Ok(null); }
     let last = end.length - 1;
     end[last] = end[last] + 1;
-    let from = IndexKey { bucket: copyBytes(bucket)?, key: end };
+    let from = IndexKey { bucket: bucket, key: end };
     return Ok(index.seek(borrow from));
 }
 
@@ -887,7 +972,7 @@ struct ObjectStore {
             let k = this.state.index.keyAt(i);
             let v = this.state.index.valueAt(i);
             report.objects += 1;
-            let bucket = StringView.fromUtf8(k.bucket.view()) ?? "";
+            let bucket = StringView.fromUtf8(this.state.bucketName(k.bucket)) ?? "";
             let key = StringView.fromUtf8(k.key.view()) ?? "";
             var fault: VerifyFault? = null;
             match (this.openUnpinned(bucket, key, 0, 0xFFFFFFFFFFFFFFFF)) {
@@ -922,7 +1007,7 @@ struct ObjectStore {
             match (fault) {
                 Some(f) => {
                     report.problems.push(VerifyProblem {
-                        bucket: copyBytes(k.bucket.view())?,
+                        bucket: copyBytes(this.state.bucketName(k.bucket))?,
                         key: copyBytes(k.key.view())?,
                         fault: f,
                     })?;
@@ -1079,7 +1164,7 @@ struct ObjectStore {
         this.commitStaged()?;
         this.checkWritable()?;
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
         var generation: u64 = 0;
         var versionId = [0u8; 16];
         match (this.state.index.get(borrow k)) {
@@ -1132,7 +1217,7 @@ struct ObjectStore {
 
     /// The current version's generation, or null if the key has no object.
     fn currentGeneration(borrow this, bucket: StringView, key: StringView) -> Result<u64?, StoreError> {
-        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
         return Ok(match (this.state.index.get(borrow k)) {
             Some(v) => v.lsn,
             null => null,
@@ -1431,7 +1516,7 @@ struct ObjectStore {
 
     fn headObject(borrow this, bucket: StringView, key: StringView) -> Result<ObjectInfo, StoreError> {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
         match (this.state.index.get(borrow k)) {
             Some(v) => {
                 return Ok(ObjectInfo {
@@ -1472,7 +1557,7 @@ struct ObjectStore {
         to: u64,
     ) -> Result<PreparedReader, StoreError> {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
         let v = match (this.state.index.get(borrow k)) {
             Some(v) => v,
             null => { return Err(StoreError.NoSuchKey); }
@@ -1516,7 +1601,7 @@ struct ObjectStore {
         to: u64,
     ) -> Result<ObjectReader, StoreError> {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
         let v = match (this.state.index.get(borrow k)) {
             Some(v) => v,
             null => { return Err(StoreError.NoSuchKey); }
@@ -1605,7 +1690,7 @@ struct ObjectStore {
                 continue;
             }
             valid.push(true)?;
-            let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key)? };
+            let k = this.state.keyFor(bucket.bytes(), key)?;
             if (!this.state.index.contains(borrow k)) { continue; }
             match (this.stageDelete(bucket.bytes(), key, now)) {
                 Ok(_) => {}
@@ -1922,7 +2007,7 @@ struct ObjectStore {
         this.scratch.clear();
         this.scratch.extend(meta.view())?;
         let lsn = this.commitOne(RecordType.UploadComplete, manifest.view())?;
-        let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
         let md5 = match (this.state.index.get(borrow k)) {
             Some(v) => v.md5,
             null => [0u8; 16],
@@ -1939,7 +2024,7 @@ struct ObjectStore {
     ) -> Result<PutOutcome?, StoreError> {
         for (c in this.state.completions.view()) {
             if (c.id[..] != id[..] || c.bucket.view() != bucket.bytes() || c.key.view() != key.bytes()) { continue; }
-            let k = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(key.bytes())? };
+            let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
             match (this.state.index.get(borrow k)) {
                 Some(v) => {
                     if (v.lsn == c.generation) {
@@ -2128,10 +2213,10 @@ struct ObjectStore {
         // The first candidate: the first key at or after the prefix, or past the marker if that comes later. A
         // marker that is a common prefix skips every key under it, even one that sorts before the prefix ("a" with
         // prefix "a/" skips everything).
-        let first = IndexKey { bucket: copyBytes(bucket.bytes())?, key: copyBytes(prefix.bytes())? };
+        let first = this.state.keyFor(bucket.bytes(), prefix.bytes())?;
         var cursor = index.seek(borrow first);
         if (startAfter.length > 0) {
-            cursor = laterOf(index, cursor, seekPast(index, bucket.bytes(), startAfter, startAfterIsPrefix)?);
+            cursor = laterOf(index, cursor, seekPast(index, first.bucket, startAfter, startAfterIsPrefix)?);
         }
         var returned: usize = 0;
         while (true) {
@@ -2141,7 +2226,7 @@ struct ObjectStore {
             };
             let entry = index.keyAt(at);
             // Keys are in (bucket, key) order: the first one outside the bucket or the prefix ends the listing.
-            if (entry.bucket.view() != bucket.bytes() || !startsWithBytes(entry.key.view(), prefix.bytes())) { break; }
+            if (entry.bucket != first.bucket || !startsWithBytes(entry.key.view(), prefix.bytes())) { break; }
             let key = entry.key.view();
             var rolled: usize? = null;
             if (delimiter.length > 0) {
@@ -2162,7 +2247,7 @@ struct ObjectStore {
                     page.nextMarker.extend(cp)?;
                     page.nextMarkerIsPrefix = true;
                     // The other keys under this common prefix are rolled up into it: seek past them.
-                    cursor = seekPast(index, bucket.bytes(), cp, true)?;
+                    cursor = seekPast(index, first.bucket, cp, true)?;
                 }
                 null => {
                     page.keys.push(copyBytes(key)?)?;
@@ -2244,7 +2329,7 @@ struct ObjectStore {
             let v = this.state.index.valueAt(i);
             if (v.extents.length != 0 || !chosen.contains(borrow v.recordSegment)) { continue; }
             plan.push(Relocation {
-                bucket: copyBytes(k.bucket.view())?,
+                bucket: copyBytes(this.state.bucketName(k.bucket))?,
                 key: copyBytes(k.key.view())?,
                 versionId: v.versionId,
                 generation: v.lsn,
@@ -2400,7 +2485,9 @@ struct ObjectStore {
             };
             // Objects that some rule has expired.
             var expired = Vector<Vector<u8>>.create();
-            var cursor = this.state.index.first();
+            // The bucket's keys are one run of the index: from its first key to the next bucket's.
+            let start = this.state.keyFor(bucketName, "".bytes())?;
+            var cursor = this.state.index.seek(borrow start);
             while (true) {
                 let i = match (cursor) {
                     Some(c) => c,
@@ -2409,7 +2496,7 @@ struct ObjectStore {
                 cursor = this.state.index.next(i);
                 if (expired.length == LIFECYCLE_BATCH) { break; }
                 let key = this.state.index.keyAt(i);
-                if (key.bucket.view() != bucketName) { continue; }
+                if (key.bucket != start.bucket) { break; }
                 let v = this.state.index.valueAt(i);
                 let tags = match (metadataValue(v.metadata.view(), TAGS_FIELD.bytes())) {
                     Ok(t) => t,

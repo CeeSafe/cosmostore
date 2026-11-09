@@ -58,6 +58,8 @@
 - **Point lookups** do a B-tree descent of about 5 levels at 1M keys, each a binary search in a node.
 - **Memory is 423 bytes per object** at 1M objects, over T9's 400; the hash map took 362. The keys still sit in
   half-empty nodes (G29), and each key carries its own copy of the bucket name. Both are follow-ups.
+  - **Amended by ADR-0027 (M4 slice 8):** index keys hold a bucket number instead of the name, and memory is 376
+    bytes per object.
 - **Recovery** builds a B-tree instead of a hash map: 1.54 s at 1M objects, from 0.87 s (T11 asks for 3).
 - **Results** are in `docs/benchmarks/2026-11-09-ordered-index.md`.
 

@@ -1094,3 +1094,18 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - T9: a bucket number in index keys, and smaller versions;
   - T7: checkpoints without the lock.
+
+### 9 Nov 2026: M4 slice 8, bucket numbers in index keys (ADR-0027)
+
+- **An index key holds its bucket's number,** given in memory when the bucket is created or recovered, instead of a
+  copy of the name. A key goes from 48 to 32 bytes, with one heap allocation instead of two. Nothing on disk changes.
+- **Lookups for a missing bucket** use a number no bucket has, so they find nothing, as before.
+- **Lifecycle expiry** seeks to its bucket's keys instead of walking the whole index.
+- **Results at 1M objects** (`docs/benchmarks/2026-11-09-bucket-numbers.md`):
+  - T9 met again: 376 bytes per object (from 423), 396 after recovery;
+  - T10 and T11 still met (about 1 ms a page; 1.43 to 1.55 s to serving).
+- **Tests:** `bucketNumbersSurviveRecreateAndReopen`, plus 115 others. s3-tests subset 252, the SDK checks, both
+  smokes.
+- **Next:**
+  - T7: checkpoints without the store's lock;
+  - T9's margin: the version's rarely used fields out of line.

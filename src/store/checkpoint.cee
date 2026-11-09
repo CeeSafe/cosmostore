@@ -139,11 +139,12 @@ fn encodeCheckpointHeader(lsn: u64, segment: u64, buckets: u64, objects: u64, up
 
 fn encodeObjectEntry(
     out: borrow mut Vector<u8>,
+    bucket: Slice<u8>,
     k: borrow IndexKey,
     v: borrow ObjectVersion,
 ) -> Result<void, AllocError> {
     out.clear();
-    pushText16(out, k.bucket.view())?;
+    pushText16(out, bucket)?; // the name: bucket numbers are not on disk (ADR-0027)
     pushText16(out, k.key.view())?;
     out.extend(v.versionId[..])?;
     out.pushLE(v.lsn)?;
@@ -255,7 +256,7 @@ fn writeCheckpointFile(path: StringView, lsn: u64, segment: u64, state: borrow S
         cursor = state.index.next(i);
         let k = state.index.keyAt(i);
         let v = state.index.valueAt(i);
-        encodeObjectEntry(mut body, k, v)?;
+        encodeObjectEntry(mut body, state.bucketName(k.bucket), k, v)?;
         w.add(CHECKPOINT_OBJECT, body.view())?;
     }
     for (i in 0..state.uploads.length()) {
@@ -366,7 +367,11 @@ fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16
         extras: extras,
     };
     state.extentBytes += extentFileBytes(borrow version);
-    match (state.index.put(IndexKey { bucket: bucket, key: key }, version)?) {
+    let indexKey = match (state.indexKey(bucket.view(), key.view())?) {
+        Some(k) => k,
+        null => { return Err(StoreError.CheckpointCorrupt); }
+    };
+    match (state.index.put(indexKey, version)?) {
         Some(_) => { return Err(StoreError.CheckpointCorrupt); } // a key twice
         null => {}
     }
@@ -489,6 +494,7 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
             let name = corrupt(readText16(body, mut at))?;
             let created = corrupt(readI64(body, mut at))?;
             var info = BucketInfo {
+                number: 0,
                 createdMillis: created,
                 objects: 0,
                 tags: Vector<u8>.create(),
@@ -499,10 +505,7 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
                 info.lifecycle = corrupt(readBlob32(body, mut at))?;
             }
             if (at != body.length) { return Err(StoreError.CheckpointCorrupt); }
-            match (state.buckets.put(BucketKey { name: name }, info)?) {
-                Some(_) => { return Err(StoreError.CheckpointCorrupt); }
-                null => {}
-            }
+            if (!state.addBucket(name, info)?) { return Err(StoreError.CheckpointCorrupt); } // a bucket twice
         } else if (kind == CHECKPOINT_OBJECT) {
             decodeObjectEntry(body, mut state, format)?;
         } else {

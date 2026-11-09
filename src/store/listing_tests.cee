@@ -183,3 +183,69 @@ fn listingMatchesTheReference() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// Every key of `bucket`, listed in one page.
+fn keysOf(s: borrow ObjectStore, bucket: StringView) -> Vector<Vector<u8>> {
+    let page = s.listObjects(bucket, "", "", "".bytes(), false, 1000)!;
+    return page.keys;
+}
+
+fn sameKeys(got: Vector<Vector<u8>>, want: Slice<StringView>) -> bool {
+    if (got.length != want.length) { return false; }
+    for (i in 0..want.length) {
+        if (got[i].view() != want[i].bytes()) { return false; }
+    }
+    return true;
+}
+
+/// Bucket numbers (ADR-0027) are the store's own: a re-created bucket gets a new one and none of the old keys, and a
+/// reopen numbers buckets afresh, from a checkpoint or from the journal, with every key still in its bucket.
+@test
+fn bucketNumbersSurviveRecreateAndReopen() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("list-bucket-numbers");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("one")!;
+        s.createBucket("two")!;
+        s.createBucket("three")!;
+        putText(mut s, "one", "k", "1");
+        putText(mut s, "two", "k", "2");
+        putText(mut s, "two", "m", "2m");
+        putText(mut s, "three", "k", "3");
+        // "two" emptied, deleted and created again: none of its keys come back.
+        s.deleteObject("two", "k")!;
+        s.deleteObject("two", "m")!;
+        s.deleteBucket("two")!;
+        s.createBucket("two")!;
+        Check.equalU64(0, keysOf(borrow s, "two").length as u64)?;
+        match (s.getObject("two", "k")) {
+            Err(StoreError.NoSuchKey) => {}
+            _ => { return Check.fail("a re-created bucket is empty"); }
+        }
+        putText(mut s, "two", "n", "2n");
+        // A missing bucket's key finds nothing.
+        Check.isTrue(s.currentGeneration("none", "k")!.isNull(), "no bucket, no object")?;
+        Check.isTrue(s.checkpoint()!, "checkpoint")?;
+        // After the checkpoint: a bucket created and filled in the journal only.
+        s.createBucket("four")!;
+        putText(mut s, "four", "k", "4");
+        putText(mut s, "one", "j", "1j");
+    }
+    // Twice: from the checkpoint and its tail, then again after a checkpoint of the reopened store.
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.isTrue(sameKeys(keysOf(borrow s, "one"), ["j", "k"][..]), "one's keys")?;
+        Check.isTrue(sameKeys(keysOf(borrow s, "two"), ["n"][..]), "two's keys")?;
+        Check.isTrue(sameKeys(keysOf(borrow s, "three"), ["k"][..]), "three's keys")?;
+        Check.isTrue(sameKeys(keysOf(borrow s, "four"), ["k"][..]), "four's keys")?;
+        checkText("2n", s.getObject("two", "n")!)?;
+        checkText("4", s.getObject("four", "k")!)?;
+        Check.equalU64(5, s.objectCount() as u64)?;
+        let report = s.verify()!;
+        Check.equalU64(5, report.objects)?;
+        Check.equalU64(0, report.problems.length as u64)?;
+        if (round == 0) { let _ = s.checkpoint()!; }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
