@@ -1129,3 +1129,24 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - T7: time the upkeep's parts, then compaction's plan out from under the lock;
   - a quiet run.
+
+### 9 Nov 2026: M4 slice 10, upkeep timing and compaction in steps (ADR-0029)
+
+- **Upkeep's holds of the store are timed:**
+  - the stats endpoint counts them, the slow ones (10 ms or more), and the longest;
+  - the server logs each checkpoint, each compaction and each slow hold, with its parts;
+  - `tools/bench` records each phase's slow holds.
+- **That found T7's last stall:** compaction held the store for 111 ms while copying 576 records. Checkpoints in steps
+  held it for under a millisecond.
+- **Compaction runs in steps:**
+  - it plans 4,096 index entries a step and reads the records to copy without the lock;
+  - it commits the copies about 1 MiB a step;
+  - a copy of a version changed meanwhile is garbage when applied, as before (ADR-0005 §9).
+- **Results** (`docs/benchmarks/2026-11-09-upkeep-in-steps.md`): at concurrency 8, 29 of 30 phases within 50 ms. The
+  30th was at 53 ms, with no upkeep hold during it. Two compactions of 800 to 900 copies ran with p99.9 at most 36 ms
+  beside them.
+- **Tests:** hold counting; a compaction with an overwrite, a delete and writes between its steps; fault sweeps
+  (once, sticky, torn, crash) of a stepped compaction. 130 tests, s3-tests subset 252, the SDK checks, both smokes.
+- **Next:**
+  - a quiet reference run of the whole matrix;
+  - T2.

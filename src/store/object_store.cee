@@ -148,6 +148,11 @@ struct StoreCounters {
     compactionBytesCopied: u64;
     segmentsCompacted: u64;
     checkpoints: u64;
+    /// Upkeep's holds of the store (ADR-0029): each checkpoint step and each `upkeep`, how many took
+    /// UPKEEP_SLOW_MICROS or more, and the longest, in microseconds.
+    upkeepHolds: u64;
+    upkeepSlowHolds: u64;
+    upkeepLongestMicros: u64;
 }
 
 /// What `maintain` did.
@@ -158,6 +163,12 @@ struct MaintenanceReport {
     uploadsExpired: u64;
     /// What lifecycle rules did this time (zeros when they did not run).
     lifecycle: LifecycleReport;
+    /// How long each part held the store, in microseconds (ADR-0029); the checkpoint's only when it ran here.
+    reapMicros: u64;
+    checkpointMicros: u64;
+    compactionMicros: u64;
+    lifecycleMicros: u64;
+    totalMicros: u64;
 }
 
 /// What one application of the lifecycle rules did.
@@ -176,6 +187,47 @@ struct Relocation {
     recordOffset: u64;
     recordLength: u32;
     payloadLength: u32;
+}
+
+/// A compaction in steps (ADR-0029): `ObjectStore.beginCompaction`, `compactionPlanStep` until the index is planned,
+/// then `readBatch` (without the store) and `compactionCopyStep` (under it) until every copy is made, and
+/// `finishCompaction`.
+struct CompactionJob {
+    /// The chosen segments, with their files' paths for `readBatch`.
+    chosen: HashMap<u64, String>;
+    plan: Vector<Relocation>;
+    /// The last index key planned (null: none yet).
+    planned: IndexKey?;
+    /// The next copy to read.
+    next: usize;
+    /// The records read for the next copy step: `plan[batchStart..]`, in order.
+    batch: Vector<Vector<u8>>;
+    batchStart: usize;
+    stats: CompactStats;
+
+    /// Reads and verifies the next copies' records, about `maxBytes` of them, from their segments' files (I/O,
+    /// without the store: only compaction removes segments, and it has not yet). Returns whether it read any.
+    fn readBatch(borrow mut this, maxBytes: u64) -> Result<bool, StoreError> {
+        this.batch.clear();
+        this.batchStart = this.next;
+        var bytes: u64 = 0;
+        while (this.next < this.plan.length && (bytes == 0 || bytes < maxBytes)) {
+            let r = borrow this.plan[this.next];
+            let path = match (this.chosen.get(borrow r.segment)) {
+                Some(p) => p.view(),
+                null => { return Err(StoreError.DataCorrupt); } // planned only from chosen segments
+            };
+            let record = match (readRecordFile(path, r.segment, r.recordOffset, r.recordLength)) {
+                Ok(b) => b,
+                Err(JournalError.Corrupt(_, _)) => { return Err(StoreError.DataCorrupt); }
+                Err(e) => { return Err(StoreError.Journal(e)); }
+            };
+            bytes += record.length as u64;
+            this.batch.push(record)?;
+            this.next += 1;
+        }
+        return Ok(this.batch.length > 0);
+    }
 }
 
 /// What HEAD returns.
@@ -219,6 +271,13 @@ struct ListPage {
 
 /// Index entries a checkpoint step encodes under the store (ADR-0028): about 0.7 MB and a millisecond or two.
 const CHECKPOINT_STEP_ENTRIES: usize = 4096;
+
+/// Index entries a compaction plan step reads, and the bytes of records a copy step stages and commits (ADR-0029).
+const COMPACTION_PLAN_ENTRIES: usize = 4096;
+const COMPACTION_COPY_BYTES: u64 = 1048576;
+
+/// An upkeep hold of the store this long or longer is slow (ADR-0029): counted, and logged by the server.
+const UPKEEP_SLOW_MICROS: u64 = 10000;
 
 /// The bucket number of a lookup key whose bucket is not there (ADR-0027): never given to a bucket.
 const NO_BUCKET: u32 = 0xFFFFFFFF;
@@ -889,6 +948,9 @@ struct ObjectStore {
                 compactionBytesCopied: 0,
                 segmentsCompacted: 0,
                 checkpoints: 0,
+                upkeepHolds: 0,
+                upkeepSlowHolds: 0,
+                upkeepLongestMicros: 0,
             },
         };
         // Every extent not referenced by a live version is garbage: superseded or deleted
@@ -2329,7 +2391,10 @@ struct ObjectStore {
     /// Encodes the job's next `max` index entries (memory only). Returns whether it has all of them. On an error the
     /// snapshot ends; the caller abandons the job.
     fn checkpointStep(borrow mut this, job: borrow mut CheckpointJob, max: usize) -> Result<bool, StoreError> {
-        return match (checkpointStepOf(job, mut this.state, max)) {
+        let started = Clock.monotonicNanos();
+        let stepped = checkpointStepOf(job, mut this.state, max);
+        job.noteStep(this.upkeepHeld(started));
+        return match (stepped) {
             Ok(f) => Ok(f),
             Err(e) => {
                 this.state.index.endSnapshot();
@@ -2362,9 +2427,22 @@ struct ObjectStore {
     /// and once those are durable the segments are removed. Copies at most `maxCopyBytes` of
     /// live data, but always removes segments with nothing live.
     fn compact(borrow mut this, maxCopyBytes: u64) -> Result<CompactStats, StoreError> {
+        // The steps of ADR-0029 in a row, holding the store throughout; the server releases it between them.
+        var job = match (this.beginCompaction(maxCopyBytes)?) {
+            Some(j) => j,
+            null => { return Ok(CompactStats { segmentsRemoved: 0, bytesFreed: 0, relocated: 0, bytesCopied: 0 }); }
+        };
+        while (!this.compactionPlanStep(mut job, COMPACTION_PLAN_ENTRIES)?) {}
+        while (job.readBatch(COMPACTION_COPY_BYTES)?) { this.compactionCopyStep(mut job)?; }
+        return this.finishCompaction(mut job);
+    }
+
+    /// Starts a compaction (ADR-0005, in steps by ADR-0029): chooses the covered segments to reclaim, fewest live
+    /// bytes first within `maxCopyBytes`, and always the empty ones. Null when none qualifies.
+    fn beginCompaction(borrow mut this, maxCopyBytes: u64) -> Result<CompactionJob?, StoreError> {
+        let started = Clock.monotonicNanos();
         this.commitStaged()?;
         this.checkWritable()?;
-        var stats = CompactStats { segmentsRemoved: 0, bytesFreed: 0, relocated: 0, bytesCopied: 0 };
         // Candidates, fewest live bytes first.
         var candidates = Vector<SegmentFile>.create();
         for (i in 0..this.state.segments.length()) {
@@ -2375,29 +2453,58 @@ struct ObjectStore {
                 candidates.push(SegmentFile { id: id, size: u.liveBytes })?;
             }
         }
-        if (candidates.length == 0) { return Ok(stats); }
+        if (candidates.length == 0) {
+            let _ = this.upkeepHeld(started);
+            return Ok(null);
+        }
         candidates.viewMut().sortBy((a, b) => if (a.size < b.size) -1 else if (a.size > b.size) 1 else 0);
-        var chosen = HashMap<u64, bool>.create();
+        var chosen = HashMap<u64, String>.create();
         var budget: u64 = 0;
         for (i in 0..candidates.length) {
             let c = borrow candidates[i];
             if (c.size > 0 && budget + c.size > maxCopyBytes && chosen.length() > 0) { break; }
             budget += c.size;
-            let _ = chosen.put(c.id, true)?;
+            let path = match (this.journal.segmentFile(c.id)) {
+                Ok(p) => p,
+                Err(e) => { return Err(StoreError.Journal(e)); }
+            };
+            let _ = chosen.put(c.id, path)?;
         }
-        // The live inline versions in the chosen segments.
-        var plan = Vector<Relocation>.create();
-        var cursor = this.state.index.first();
-        while (true) {
+        let _ = this.upkeepHeld(started);
+        return Ok(CompactionJob {
+            chosen: chosen,
+            plan: Vector<Relocation>.create(),
+            planned: null,
+            next: 0,
+            batch: Vector<Vector<u8>>.create(),
+            batchStart: 0,
+            stats: CompactStats { segmentsRemoved: 0, bytesFreed: 0, relocated: 0, bytesCopied: 0 },
+        });
+    }
+
+    /// Plans the copies of up to `max` more index entries (memory only): the live inline versions in the chosen
+    /// segments. Returns whether the whole index is planned. The index may change between steps; a copy of a version
+    /// that is no longer current is garbage when it is applied (ADR-0005 §9).
+    fn compactionPlanStep(borrow mut this, job: borrow mut CompactionJob, max: usize) -> Result<bool, StoreError> {
+        let started = Clock.monotonicNanos();
+        var cursor = match (job.planned.asBorrow()) {
+            Some(k) => this.state.index.seekAfter(k),
+            null => this.state.index.first(),
+        };
+        var seen: usize = 0;
+        var last: IndexKey? = null;
+        while (seen < max) {
             let i = match (cursor) {
                 Some(c) => c,
                 null => { break; }
             };
             cursor = this.state.index.next(i);
+            seen += 1;
             let k = this.state.index.keyAt(i);
             let v = this.state.index.valueAt(i);
-            if (v.extents.length != 0 || !chosen.contains(borrow v.recordSegment)) { continue; }
-            plan.push(Relocation {
+            if (seen == max) { last = copyIndexKey(k)?; }
+            if (v.extents.length != 0 || !job.chosen.contains(borrow v.recordSegment)) { continue; }
+            job.plan.push(Relocation {
                 bucket: copyBytes(this.state.bucketName(k.bucket))?,
                 key: copyBytes(k.key.view())?,
                 versionId: v.versionId,
@@ -2409,26 +2516,49 @@ struct ObjectStore {
                 payloadLength: v.payload.length,
             })?;
         }
-        for (i in 0..plan.length) {
-            match (this.stageRelocation(borrow plan[i])) {
+        let finished = cursor.isNull();
+        job.planned = last;
+        let _ = this.upkeepHeld(started);
+        return Ok(finished);
+    }
+
+    /// Stages and commits the copies `job.readBatch` read (one batch, about COMPACTION_COPY_BYTES): one journal write
+    /// and one sync under the store. What other requests staged is committed first, so a failure here discards only
+    /// the copies.
+    fn compactionCopyStep(borrow mut this, job: borrow mut CompactionJob) -> Result<void, StoreError> {
+        let started = Clock.monotonicNanos();
+        this.commitStaged()?;
+        for (b in 0..job.batch.length) {
+            let r = borrow job.plan[job.batchStart + b];
+            match (this.stageRelocationOf(r, job.batch[b].view())) {
                 Ok() => {}
                 Err(e) => {
                     this.journal.discardPending();
                     this.pendingApplies.clear();
+                    let _ = this.upkeepHeld(started);
                     return Err(e);
                 }
             }
-            stats.relocated += 1;
-            stats.bytesCopied += plan[i].payloadLength as u64;
-            this.counts.compactionBytesCopied += plan[i].payloadLength as u64;
+            job.stats.relocated += 1;
+            job.stats.bytesCopied += r.payloadLength as u64;
+            this.counts.compactionBytesCopied += r.payloadLength as u64;
         }
-        this.commitStaged()?;
-        // Every copy is durable and applied: the chosen segments hold nothing live.
-        for (i in 0..chosen.length()) {
-            let id: u64 = chosen.keyAt(i);
+        job.batch.clear();
+        let committed = this.commitStaged();
+        let _ = this.upkeepHeld(started);
+        let _ = committed?;
+        return Ok();
+    }
+
+    /// Removes the chosen segments that hold nothing live now that every copy is durable and applied, unless a reader
+    /// pins one (ADR-0024): a later pass removes that one.
+    fn finishCompaction(borrow mut this, job: borrow mut CompactionJob) -> Result<CompactStats, StoreError> {
+        let started = Clock.monotonicNanos();
+        var stats = job.stats;
+        for (i in 0..job.chosen.length()) {
+            let id: u64 = job.chosen.keyAt(i);
             let usage = this.segmentUsage(id);
             if (usage.liveBytes != 0) { continue; }
-            // A reader still reads a record of it (ADR-0024): a later pass removes it, as after a crash here.
             if (this.segmentPins.isPinned(id)) { continue; }
             this.journal.removeSegment(id)?;
             let _ = this.state.segments.remove(borrow id);
@@ -2437,6 +2567,7 @@ struct ObjectStore {
             stats.bytesFreed += usage.totalBytes;
         }
         if (stats.segmentsRemoved > 0) { this.journal.syncDirectory()?; }
+        let _ = this.upkeepHeld(started);
         return Ok(stats);
     }
 
@@ -2451,17 +2582,15 @@ struct ObjectStore {
     }
 
     /// Reads and verifies one live record, then stages its Relocate copy.
-    fn stageRelocation(borrow mut this, r: borrow Relocation) -> Result<void, StoreError> {
-        let record = match (this.journal.readRecord(r.segment, r.recordOffset, r.recordLength)) {
-            Ok(bytes) => bytes,
-            Err(JournalError.Corrupt(_, _)) => { return Err(StoreError.DataCorrupt); }
-            Err(e) => { return Err(StoreError.Journal(e)); }
-        };
+    /// Stages the Relocate copy of `r` from its verified record (`record`, read by `CompactionJob.readBatch`).
+    fn stageRelocationOf(borrow mut this, r: borrow Relocation, record: Slice<u8>) -> Result<void, StoreError> {
         let end = r.recordLength as usize - RECORD_TRAILER_LEN;
-        let payload = record.view()[end - r.payloadLength as usize..end];
+        let payload = record[end - r.payloadLength as usize..end];
         var meta = Vector<u8>.create();
         encodeRelocateMeta(mut meta, r.bucket.view(), r.key.view(), r.versionId, r.generation)?;
-        if (this.journal.wouldOverflow(meta.length, payload.length)) { this.commitStaged()?; }
+        if (this.journal.wouldOverflow(meta.length, payload.length) || this.journal.needsRotation()) {
+            this.commitStaged()?;
+        }
         this.pendingApplies.reserve(1)?;
         let pos = this.journal.stage(RecordType.Relocate, meta.view(), payload)?;
         this.pendingApplies.push(PendingApply {
@@ -2480,8 +2609,13 @@ struct ObjectStore {
     /// Background upkeep: a checkpoint when one is due, then compaction.
     fn maintain(borrow mut this) -> Result<MaintenanceReport, StoreError> => this.upkeep(true);
 
-    /// `maintain`, with or without its checkpoint: the server writes checkpoints in steps of its own (ADR-0028).
-    fn upkeep(borrow mut this, withCheckpoint: bool) -> Result<MaintenanceReport, StoreError> {
+    /// The compaction budget `maintain` uses.
+    fn compactionBudget(borrow this) -> u64 => this.config.compactMaxCopyBytes;
+
+    /// `maintain`, with or without its checkpoint and compaction: the server runs those in steps of its own, with the
+    /// store's lock released between them (ADR-0028, ADR-0029).
+    fn upkeep(borrow mut this, withSteps: bool) -> Result<MaintenanceReport, StoreError> {
+        let started = Clock.monotonicNanos();
         this.reapDeferred();
         this.reapAbandoned();
         this.pins.prune();
@@ -2490,21 +2624,42 @@ struct ObjectStore {
         let expiry = this.config.uploadExpiryMillis;
         let now = Clock.unixMillis();
         if (expiry > 0 && now > truncate<i64>(expiry)) { expired = this.expireUploads(now - truncate<i64>(expiry))?; }
+        let reaped = Clock.monotonicNanos();
         var checkpointed = false;
-        if (withCheckpoint && this.checkpointDue()) { checkpointed = this.checkpoint()?; }
-        let compaction = this.compact(this.config.compactMaxCopyBytes)?;
+        if (withSteps && this.checkpointDue()) { checkpointed = this.checkpoint()?; }
+        let checkpointDone = Clock.monotonicNanos();
+        var compaction = CompactStats { segmentsRemoved: 0, bytesFreed: 0, relocated: 0, bytesCopied: 0 };
+        if (withSteps) { compaction = this.compact(this.config.compactMaxCopyBytes)?; }
+        let compacted = Clock.monotonicNanos();
         var lifecycle = LifecycleReport { objectsExpired: 0, uploadsAborted: 0 };
         let lifecycleEvery = this.config.lifecycleEveryMillis;
         if (lifecycleEvery > 0 && now - this.lifecycleRan >= truncate<i64>(lifecycleEvery)) {
             lifecycle = this.applyLifecycle(now)?;
             this.lifecycleRan = now;
         }
+        let total = this.upkeepHeld(started);
+        let ended = Clock.monotonicNanos();
         return Ok(MaintenanceReport {
             checkpointed: checkpointed,
             compaction: compaction,
             uploadsExpired: expired,
             lifecycle: lifecycle,
+            reapMicros: (reaped - started) / 1000,
+            checkpointMicros: (checkpointDone - reaped) / 1000,
+            compactionMicros: (compacted - checkpointDone) / 1000,
+            lifecycleMicros: (ended - compacted) / 1000,
+            totalMicros: total,
         });
+    }
+
+    /// An upkeep step that has held the store since `started` (`Clock.monotonicNanos`) is done: it is counted, and
+    /// its time is returned in microseconds (ADR-0029).
+    fn upkeepHeld(borrow mut this, started: u64) -> u64 {
+        let micros = (Clock.monotonicNanos() - started) / 1000;
+        this.counts.upkeepHolds += 1;
+        if (micros >= UPKEEP_SLOW_MICROS) { this.counts.upkeepSlowHolds += 1; }
+        if (micros > this.counts.upkeepLongestMicros) { this.counts.upkeepLongestMicros = micros; }
+        return micros;
     }
 
     // ---- Bucket configuration (ADR-0020) ----
@@ -2680,6 +2835,9 @@ struct ObjectStore {
         compactionBytesCopied: this.counts.compactionBytesCopied,
         segmentsCompacted: this.counts.segmentsCompacted,
         checkpoints: this.counts.checkpoints,
+        upkeepHolds: this.counts.upkeepHolds,
+        upkeepSlowHolds: this.counts.upkeepSlowHolds,
+        upkeepLongestMicros: this.counts.upkeepLongestMicros,
     };
 
     /// (total, live) bytes of a segment.

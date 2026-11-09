@@ -44,6 +44,9 @@ Recovery time and disk use therefore grew with everything ever written, not with
 8. **Each live payload is read back and verified, then copied** into a new `Relocate` record (type 8). Its meta
    names (bucket, key, version id, generation). If the read fails verification, compaction stops with
    `DataCorrupt` and removes nothing. A corrupt payload is never copied under a fresh checksum.
+   - **Amended by ADR-0029 (M4 slice 10):** compaction runs in steps. It plans a few thousand index entries at a
+     time and reads the payloads without the store's lock. Then it commits the copies about 1 MiB at a time, under the
+     lock, releasing it between steps.
 9. **Applying a `Relocate` record moves the version's locator only if that version is still current** (same
    generation and version id). The generation, which conditional writes use, does not change. If the version
    is no longer current, the copy is garbage from the start.

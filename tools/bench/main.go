@@ -51,6 +51,9 @@ type phaseResult struct {
 	SyncsPer1k   float64 `json:"syncsPer1kOps"`
 	WriteAmp     float64 `json:"writeAmplification"`
 	ServerRSSMiB float64 `json:"serverRssMiB"` // the physical footprint on macOS
+	// The server's upkeep holds of the store during the phase that took 10 ms or more (ADR-0029), so a latency
+	// spike can be matched to upkeep or ruled out.
+	UpkeepSlowHolds float64 `json:"upkeepSlowHolds"`
 }
 
 type report struct {
@@ -240,6 +243,7 @@ func runPhase(op string, size, conc, n int, bodies [][]byte, sums [][16]byte) ph
 		if payload > 0 {
 			res.WriteAmp = written / payload
 		}
+		res.UpkeepSlowHolds = after["upkeepSlowHolds"] - before["upkeepSlowHolds"]
 	}
 	return res
 }
@@ -414,8 +418,8 @@ func main() {
 		}
 		return
 	}
-	fmt.Printf("| size | conc | op | ops/s | MiB/s | p50 ms | p95 ms | p99 ms | p99.9 ms | syncs/1k | write amp | RSS MiB | errors |\n")
-	fmt.Printf("|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	fmt.Printf("| size | conc | op | ops/s | MiB/s | p50 ms | p95 ms | p99 ms | p99.9 ms | syncs/1k | write amp | RSS MiB | errors | slow upkeep |\n")
+	fmt.Printf("|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	failed := false
 	for _, size := range ints(*sizesArg) {
 		n := *opsArg
@@ -435,9 +439,9 @@ func main() {
 				if r.Errors > 0 {
 					failed = true
 				}
-				fmt.Printf("| %d | %d | %s | %.0f | %.1f | %.2f | %.2f | %.2f | %.2f | %.1f | %.2f | %.0f | %d |\n",
+				fmt.Printf("| %d | %d | %s | %.0f | %.1f | %.2f | %.2f | %.2f | %.2f | %.1f | %.2f | %.0f | %d | %.0f |\n",
 					r.Size, r.Concurrency, r.Op, r.OpsPerSec, r.MiBPerSec, r.P50, r.P95, r.P99, r.P999,
-					r.SyncsPer1k, r.WriteAmp, r.ServerRSSMiB, r.Errors)
+					r.SyncsPer1k, r.WriteAmp, r.ServerRSSMiB, r.Errors, r.UpkeepSlowHolds)
 			}
 		}
 	}

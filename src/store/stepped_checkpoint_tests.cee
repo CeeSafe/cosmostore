@@ -250,3 +250,199 @@ fn steppedFaultsCrash() -> Result<void, TestFailure> =>
 @test
 fn steppedFaultsCrashDuringOpen() -> Result<void, TestFailure> =>
     sweepStoreOpen("sfault-open", SweepMode.Crash, steppedWorkload);
+
+/// Upkeep's holds of the store are counted (ADR-0029): each checkpoint step, and each `upkeep`, with its parts timed.
+@test
+fn upkeepHoldsAreCounted() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("ckpt-holds");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    for (i in 0u64..10) { putText(mut s, "bkt", twoDigit("k", i).view(), "v"); }
+    var job = match (s.beginCheckpoint()!) {
+        Some(j) => j,
+        null => { return Check.fail("a checkpoint is due"); }
+    };
+    while (!step(mut s, mut job)) {}
+    Check.equalU64(4, job.steps)?; // 10 entries, 3 a step
+    Check.equalU64(4, s.counters().upkeepHolds)?;
+    Check.isTrue(s.counters().upkeepLongestMicros >= job.longestStepMicros, "the longest hold is kept")?;
+    let size = job.publish()!;
+    s.checkpointPublished(borrow job, size);
+    Check.equalU64(11, job.entries())?; // the bucket and 10 objects
+    let report = s.upkeep(false)!;
+    Check.equalU64(5, s.counters().upkeepHolds)?;
+    Check.isTrue(!report.checkpointed, "upkeep(false) leaves checkpoints to the server's steps")?;
+    Check.isTrue(report.totalMicros >= report.compactionMicros, "the parts fit in the whole")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+// ---- Compaction in steps (ADR-0029) ----
+
+/// "keep-00" to "keep-09" written once each among many overwrites of other keys, so their segments are mostly
+/// garbage, then a checkpoint: compaction has copies to make.
+fn compactableStore(dir: StringView) -> ObjectStore {
+    let ctype = "application/octet-stream";
+    var s = ObjectStore.open(dir, faultStoreConfig())!;
+    s.createBucket("bkt")!;
+    for (r in 0u64..40) {
+        for (k in 0u64..10) {
+            s.putObject(
+                "bkt",
+                twoDigit("hot-", k).view(),
+                ctype,
+                patterned(900, r * 100 + k).view(),
+                PutCondition.None,
+            )!;
+        }
+        if (r < 10) {
+            s.putObject("bkt", twoDigit("keep-", r).view(), ctype, patterned(300, r).view(), PutCondition.None)!;
+        }
+    }
+    let _ = s.checkpoint()!;
+    return s;
+}
+
+@test
+fn steppedCompactionAllowsChangesBetweenSteps() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("compact-stepped");
+    var s = compactableStore(dir.view());
+    var kept = Vector<u64>.create();
+    for (k in 0u64..10) { kept.push(s.headObject("bkt", twoDigit("keep-", k).view())!.generation)!; }
+    var job = match (s.beginCompaction(1073741824)!) {
+        Some(j) => j,
+        null => { return Check.fail("segments to reclaim"); }
+    };
+    var planSteps: u64 = 1;
+    while (!s.compactionPlanStep(mut job, 3)!) { planSteps += 1; }
+    Check.equalU64(7, planSteps)?; // 20 keys, 3 a step
+    Check.isTrue(job.plan.length >= 10, "every keep- version is planned")?;
+    // After the plan, before any copy: keep-03 is overwritten and keep-04 deleted. Their copies become garbage.
+    putText(mut s, "bkt", "keep-03", "newer");
+    s.deleteObject("bkt", "keep-04")!;
+    // Copies one at a time, with a write between each.
+    var copies: u64 = 0;
+    while (job.readBatch(1)!) {
+        s.compactionCopyStep(mut job)!;
+        copies += 1;
+        putText(mut s, "bkt", "between", "a write between copy steps");
+    }
+    Check.equalU64(job.plan.length as u64, copies)?; // one copy a step
+    let stats = s.finishCompaction(mut job)!;
+    Check.equalU64(copies, stats.relocated)?;
+    Check.isTrue(stats.segmentsRemoved > 0, "segments are removed")?;
+    Check.equalU64(s.segmentCount() as u64, countFiles(dir.view(), "seg-", ".cj"))?;
+    // Unchanged keys keep their bytes and generations; the changed ones keep their changes.
+    for (k in 0u64..10) {
+        let name = twoDigit("keep-", k);
+        if (k == 3) {
+            checkText("newer", s.getObject("bkt", name.view())!)?;
+        } else if (k == 4) {
+            match (s.getObject("bkt", name.view())) {
+                Err(StoreError.NoSuchKey) => {}
+                _ => { return Check.fail("a deleted key stays deleted"); }
+            }
+        } else {
+            Check.equalU64(kept[k as usize], s.headObject("bkt", name.view())!.generation)?;
+            Check.equalBytes(patterned(300, k).view(), s.getObject("bkt", name.view())!.view())?;
+        }
+    }
+    Check.isTrue(s.counters().upkeepHolds > copies, "every step's hold is counted")?;
+    let r = ObjectStore.open(dir.view(), faultStoreConfig())!;
+    checkText("newer", r.getObject("bkt", "keep-03")!)?;
+    Check.equalBytes(patterned(300, 5).view(), r.getObject("bkt", "keep-05")!.view())?;
+    Check.equalU64(0, r.verify()!.problems.length as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// What `steppedCompactionWorkload` leaves each key holding when nothing fails.
+const STEPPED_COMPACTION_RESULT: [u64; 5] = [8u64, 2, 0, 4, 5];
+
+/// Puts, a checkpoint, then a compaction in steps of one copy, with a write and a delete between the steps.
+fn steppedCompactionWorkload(dir: StringView, m: borrow mut FaultModel) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    match (s.createBucket("bkt")) {
+        Ok() => {
+            m.bucket = true;
+            m.bucketAlt = true;
+        }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.bucketAlt = true; }
+        }
+    }
+    for (k in 0usize..5) { putStep(mut s, m, k, (k + 1) as u64); }
+    // Overwrites so the first segments are mostly garbage.
+    for (r in 0u64..3) { putStep(mut s, m, 0, 6 + r); }
+    let _ = s.checkpoint();
+    match (s.beginCompaction(1073741824)) {
+        Ok(Some(job)) => {
+            var j = job;
+            var ok = true;
+            while (ok) {
+                match (s.compactionPlanStep(mut j, 1)) {
+                    Ok(true) => { break; }
+                    Ok(false) => {}
+                    Err(_) => { ok = false; }
+                }
+            }
+            var between = 0;
+            while (ok) {
+                match (j.readBatch(1)) {
+                    Ok(true) => {}
+                    Ok(false) => { break; }
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (s.compactionCopyStep(mut j).isErr()) { ok = false; }
+                if (between == 0) {
+                    match (s.deleteObject("bkt", keyName(2))) {
+                        Ok() => { m.succeeded(2, 0); }
+                        Err(e) => { m.failed(2, 0, borrow e); }
+                    }
+                }
+                between += 1;
+            }
+            if (ok) { let _ = s.finishCompaction(mut j); }
+        }
+        _ => {}
+    }
+    putStep(mut s, m, 4, 5);
+}
+
+@test
+fn steppedCompactionWorkloadCompacts() -> Result<void, TestFailure> {
+    // The sweeps below are only meaningful if the workload copies records and removes segments.
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory("compact-stepped-workload");
+    var m = FaultModel.create();
+    steppedCompactionWorkload(dir.view(), mut m);
+    for (k in 0..FKEYS) { Check.equalU64(STEPPED_COMPACTION_RESULT[k], m.cur[k])?; }
+    let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+    Check.isTrue(listSegmentIds(dir.view())!.view()[0] > 1, "the first segments were compacted away")?;
+    Check.isTrue(s.counters().compactionBytesCopied == 0, "a reopened store's counters start at zero")?;
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn steppedCompactionFaultsOnce() -> Result<void, TestFailure> =>
+    sweepStore("scfault-once", SweepMode.Once, steppedCompactionWorkload, STEPPED_COMPACTION_RESULT);
+
+@test
+fn steppedCompactionFaultsSticky() -> Result<void, TestFailure> =>
+    sweepStore("scfault-sticky", SweepMode.Sticky, steppedCompactionWorkload, STEPPED_COMPACTION_RESULT);
+
+@test
+fn steppedCompactionFaultsTorn() -> Result<void, TestFailure> =>
+    sweepStore("scfault-torn", SweepMode.StickyTorn, steppedCompactionWorkload, STEPPED_COMPACTION_RESULT);
+
+@test
+fn steppedCompactionFaultsCrash() -> Result<void, TestFailure> =>
+    sweepStore("scfault-crash", SweepMode.Crash, steppedCompactionWorkload, STEPPED_COMPACTION_RESULT);

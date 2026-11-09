@@ -55,3 +55,4 @@ other hardware the ratios (scaling, syncs per write) carry over; the absolute nu
 | Slice 7, the ordered index (ADR-0026, `benchmarks/2026-11-09-ordered-index.md`) | T10 (0.8 to 1.3 ms p99 per page at 1M keys); T9's no-growth; T11 (1.54 s) | T9's bytes (423 per object, from 362: B-tree nodes half full, G29); T7; T2 |
 | Slice 8, bucket numbers in index keys (ADR-0027, `benchmarks/2026-11-09-bucket-numbers.md`) | T9 (376 bytes per object, 396 after recovery), T10, T11 (1.43 to 1.55 s) | T7; T2 |
 | Slice 9, checkpoints in steps (ADR-0028, `benchmarks/2026-11-09-stepped-checkpoints.md`) | T9, T10, T11 still; the 1M fill's slowest PUT 72 ms (from 446 to 662) | T7 (28 of 30 phases at concurrency 8; 55 and 109 ms in two); T2 |
+| Slice 10, upkeep timing and compaction in steps (ADR-0029, `benchmarks/2026-11-09-upkeep-in-steps.md`) | T7 for the store's part: 29 of 30 phases, the 30th at 53 ms with no upkeep hold during it (a quiet run to confirm) | T2 |
