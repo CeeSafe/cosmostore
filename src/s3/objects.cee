@@ -468,7 +468,7 @@ async fn putObject(
     var contentType = String.create();
     contentTypeOf(req, mut contentType)?;
     let metadata = withRequestTags(req, metadataOf(req)?)?; // refused before the body is read
-    let writer = await startPut(app, req.bucket.view(), spec.size)?;
+    let writer = await startPutObject(app, req.bucket.view(), spec.size)?;
     // Every object gets a checksum: the client's, else CRC64NVME, as S3 does (ADR-0015).
     let storeAs = match (spec.checksumKind) {
         ChecksumAlgorithm.None => ChecksumAlgorithm.Crc64Nvme,
@@ -602,6 +602,17 @@ async fn startPut(app: borrow S3App, bucket: StringView, size: u64) -> Result<Ob
         };
     }
     return match (await Async.blocking(() => beginPut(store, bucket, size))) {
+        Ok(w) => Ok(w),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+/// PutObject's start. An object whose declared size keeps it inline needs no lock round: its writer is made without
+/// the store, and the bucket check and admission run when it is staged (`checkPut`), after a body of at most
+/// `inlineMaxBytes` (ADR-0032). A larger one is refused, if it must be, before its body is read.
+async fn startPutObject(app: borrow S3App, bucket: StringView, size: u64) -> Result<ObjectWriter, S3Fail> {
+    if (!app.writers.keepsInline(size)) { return await startPut(app, bucket, size); }
+    return match (app.writers.newWriter()) {
         Ok(w) => Ok(w),
         Err(e) => Err(storeFail(e, 0)),
     };

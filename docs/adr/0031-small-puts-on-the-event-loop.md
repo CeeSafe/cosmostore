@@ -73,6 +73,7 @@
   11,100 with staging on the loop.
 - **One lock round instead of two** (`startPut` and `stagePut`). `startPut` refuses a missing bucket or a full store
   before the body is read; merging would read the body first. It can follow if the unlock's cost still shows.
+  (ADR-0032 did it for inline PUTs, whose body is at most 128 KiB.)
 - **A thread pool in CosmoStore for `Async.blocking`.** G28 belongs in CeeSafe's runtime; avoiding the call where no
   I/O is done is right either way.
 

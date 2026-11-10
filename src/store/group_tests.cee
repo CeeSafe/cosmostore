@@ -254,6 +254,84 @@ fn inlinePutsStageWithoutCommitting() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// ADR-0032: writers made without the store are the store's writers. Their objects stage, commit and are refused the
+/// same way, and an abandoned one's extents are removed.
+@test
+fn factoryWritersAreTheStores() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("group-factory");
+    let large = patterned(40000, 3);
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("grp")!;
+        let f = s.writerFactory()!;
+        Check.isTrue(f.keepsInline(16384) && !f.keepsInline(16385), "inline as far as inlineMaxBytes")?;
+        // Inline: staged in memory, published by the batch's commit.
+        var w = f.newWriter()!;
+        Check.isTrue(w.fitsInline(5), "a factory writer keeps a small body inline")?;
+        w.writeInline("hello".bytes())!;
+        let small = match (w.finishInline()) {
+            Some(o) => o,
+            null => { return Err(TestFailure.create("an inline writer finishes in memory")); }
+        };
+        let lsn = match (s.putInlineDeferred("grp", "small", "text/plain", "".bytes(), "".bytes(), borrow small)!) {
+            Some(o) => o.generation,
+            null => { return Err(TestFailure.create("an empty batch has room")); }
+        };
+        // The bucket check that startPut made now comes at staging (ADR-0032).
+        match (s.putInlineDeferred("nobucket", "k", "text/plain", "".bytes(), "".bytes(), borrow small)) {
+            Err(StoreError.NoSuchBucket) => {}
+            _ => { return Err(TestFailure.create("a missing bucket is refused at staging")); }
+        }
+        // Spilled: a refusal at staging removes its extents, and a staged one keeps them.
+        var refused = f.newWriter()!;
+        refused.write(large.view())!;
+        let refusedObj = refused.finish()!;
+        Check.isTrue(extentFiles(dir.view()) > 0, "a large body spills into extents")?;
+        match (s.putFinishedDeferred(
+            "nobucket",
+            "k",
+            "text/plain",
+            "".bytes(),
+            "".bytes(),
+            borrow refusedObj,
+            PutCondition.None,
+        )) {
+            Err(StoreError.NoSuchBucket) => {}
+            _ => { return Err(TestFailure.create("a spilled object for a missing bucket is refused")); }
+        }
+        Check.equalU64(0, extentFiles(dir.view()))?;
+        var kept = f.newWriter()!;
+        kept.write(large.view())!;
+        let keptObj = kept.finish()!;
+        let _ = s.putFinishedDeferred(
+            "grp",
+            "large",
+            "application/octet-stream",
+            "".bytes(),
+            "".bytes(),
+            borrow keptObj,
+            PutCondition.None,
+        )!;
+        s.commitStaged()!;
+        Check.isTrue(s.isPublished(lsn), "the inline PUT is published with the batch")?;
+        let extents = extentFiles(dir.view());
+        // Abandoned after spilling: its drop queues its extents for the store to remove.
+        {
+            var gone = f.newWriter()!;
+            gone.write(large.view())!;
+        }
+        Check.isTrue(extentFiles(dir.view()) > extents, "the abandoned writer left extents")?;
+        let _ = deferText(mut s, "after", "a commit reaps abandoned extents");
+        s.commitStaged()!;
+        Check.equalU64(extents, extentFiles(dir.view()))?;
+    }
+    let r = ObjectStore.open(dir.view(), storeConfig())!;
+    checkText("hello", r.getObject("grp", "small")!)?;
+    Check.isTrue(r.getObject("grp", "large")!.view() == large.view(), "the spilled object reads back")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
 @test
 fn deferredDeletesFollowUnpublishedWrites() -> Result<void, TestFailure> {
     let dir = scratchDirectory("group-delete");

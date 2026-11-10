@@ -240,6 +240,9 @@ aws s3api delete-object --bucket smoke --key a/nothing > /dev/null 2>&1
 # Errors and auth.
 check "no such key" "$(code s3api get-object --bucket smoke --key nope x)" NoSuchKey
 check "no such bucket" "$(code s3api get-object --bucket missing --key nope x)" NoSuchBucket
+# A small PUT is refused at staging, after its body (ADR-0032); a large one before.
+check "small PUT, no such bucket" "$(code s3api put-object --bucket missing --key k --body small.txt)" NoSuchBucket
+check "large PUT, no such bucket" "$(code s3api put-object --bucket missing --key k --body big.bin)" NoSuchBucket
 check "bucket not empty" "$(code s3api delete-bucket --bucket smoke)" BucketNotEmpty
 check "wrong secret" "$(AWS_SECRET_ACCESS_KEY=wrong code s3api list-buckets)" SignatureDoesNotMatch
 check "unknown key id" "$(AWS_ACCESS_KEY_ID=AKIAUNKNOWN code s3api list-buckets)" InvalidAccessKeyId

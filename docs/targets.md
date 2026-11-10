@@ -70,3 +70,4 @@ other hardware the ratios (scaling, syncs per write) carry over; the absolute nu
 | T2 restated (≤ 70 at concurrency 32, see above) | T2 (64) | — |
 | **M4 reference** (`7e99bb0`, quiet machine, `benchmarks/2026-11-09-m4-reference.md`) | T2 to T6, T8 to T12 | T1 at 4 KiB (2,908/s, 3% short; 0 B to 1 KiB at 3,161 to 3,267); T7 in one phase of 30 (53.1 ms, no upkeep hold during it) |
 | Small PUTs on the event loop (ADR-0031, `benchmarks/2026-11-10-small-puts-on-the-loop.md`, under load) | T1 at 4 KiB in that run (3,118/s); small PUTs at concurrency 128 at 1.76 times | T1 and T7 to confirm in a quiet reference run |
+| Inline PUTs without the first lock round (ADR-0032, `benchmarks/2026-11-10-inline-puts-without-the-lock.md`, under load) | T1 at 4 KiB in both builds (3,169 to 3,186/s); small writes at concurrency 128 at 1.03 times, within the noise | T1 and T7 to confirm in a quiet reference run |

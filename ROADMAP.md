@@ -1216,9 +1216,22 @@ Browser form uploads with a SigV4 POST policy.
   - the gate passed.
 - **Tests:** `inlinePutsStageWithoutCommitting`; the group-commit fault sweeps stage through the new path. 131 tests,
   the s3-tests subset 252, the SDK checks, both smokes.
-- **CI:** the S3 smoke's virtual-host checks need `smoke.localhost` in the runner's `/etc/hosts`.
+- **CI:** the S3 smoke's virtual-host checks need `smoke.localhost` in the runner's `/etc/hosts`. tls_smoke's test
+  certificate needs `serverAuth` in its extended key usage: AWS CLI 2.39 uploads through its CRT client, which on
+  macOS verifies with Apple's TLS. CI passed on `5c81a49`.
+
+### 10 Nov 2026: inline PUTs start without the store's lock (ADR-0032)
+
+- **An inline-sized PUT takes the store's lock once, to stage.** Its writer comes from a `WriterFactory` that `serve`
+  takes from the store when it opens. The bucket check and admission run at staging (`checkPut`), after a body of at
+  most 128 KiB. Larger PUTs and POST object still start under the lock, refused before the body.
+- **Results** (`tools/perf_gate.sh` against `5c81a49`, `docs/benchmarks/2026-11-10-inline-puts-without-the-lock.md`):
+  small writes at concurrency 128 at 1.03 times the throughput and 0.95 times the p99, mostly within the noise;
+  overwrites gained most. The gate passed.
+- **Tests:** `factoryWritersAreTheStores`; s3_smoke checks a small and a large PUT to a missing bucket. 132 tests, the
+  s3-tests subset 252, the SDK checks, both smokes.
 - **Next:**
-  - a quiet reference run, for T1 at 4 KiB;
-  - G30, and the remaining lock round per PUT;
+  - a profile at concurrency 128, before more work on the PUT path (G30's wake-ups remain at staging);
+  - a quiet reference run, for T1 at 4 KiB and T7;
   - the comparison run.
 
