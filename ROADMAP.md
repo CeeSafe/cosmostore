@@ -1306,6 +1306,18 @@ Browser form uploads with a SigV4 POST policy.
 - **Local builds:** the shared CeeSafe.Web checkout moved to a commit needing ceesafec 0.27; checks ran against a
   clone at CI's pinned `0f7290c`.
 - **Next:**
-  - find the 20 to 30 ms stall in small reads' tail;
   - a quiet reference run on the M1, for T1 at 4 KiB and T7;
   - the CRC32C instruction when CeeSafe has it (G31), then the comparison run again for large objects.
+
+### 11 Nov 2026: small reads' tail was the CPU quota
+
+- **The 20 to 30 ms tail of small reads** on the Debian server came from `--cpus 2`: the container (client and server)
+  used its 200 ms per 100 ms period early, on several of the host's threads, and stalled for the rest of it, in 10
+  of 11 periods. On 2 pinned cores: 0-byte GETs' p99 7.7 ms at concurrency 32 (30 ms) and 15.2 ms at 128 (39 ms).
+- **The signing-key cache on pinned cores:** small reads' p99 0.86 and 0.87 times, writes' 0.98 to 1.00,
+  throughput 1.00 to 1.08 (ADR-0035, amended).
+- **The comparison run's p99 columns** may hold such stalls too (its servers ran under the quota, its client
+  outside): noted in its caveats. `tools/compare/compare.sh` takes `CPUSET` to pin cores instead.
+- **Next:**
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7;
+  - the comparison run again on pinned cores, when large objects change (G31).

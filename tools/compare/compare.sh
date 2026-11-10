@@ -9,6 +9,8 @@
 #   WORK      the directory for data and results (default /root/cosmostore-prof/cmp)
 #   BENCH     tools/bench built for this host (default $WORK/../bench)
 #   COSMOSTORE_BIN  the cosmostore binary (default $WORK/../bins/head); run in debian:trixie
+#   CPUSET    cores to pin the server to (e.g. 2,3) instead of a CPU quota; a quota lets a busy server stall
+#             for the rest of each 100 ms period, which shows in the p99 (ADR-0035)
 #   CPUS (2), SIZES (0,4096,65536,1048576), CONCURRENCY (1,32,128), OPS (2000), READ_REPEAT (3)
 # Needs Docker and the images below. Every server listens on loopback only (host network, no proxy).
 set -eu
@@ -16,6 +18,7 @@ server=$1 config=$2
 work=${WORK:-/root/cosmostore-prof/cmp}
 bench=${BENCH:-$work/../bench}
 cpus=${CPUS:-2}
+if [ -n "${CPUSET:-}" ]; then limit="--cpuset-cpus $CPUSET"; else limit="--cpus $cpus"; fi
 SEAWEEDFS_IMAGE=chrislusf/seaweedfs:4.53
 GARAGE_IMAGE=dxflrs/garage:v2.5.0
 RUSTFS_IMAGE=rustfs/rustfs:1.0.4
@@ -39,7 +42,7 @@ cosmostore)
     port=19000
     [ "$config" = durable ] || [ "$config" = default ] # one configuration: it always syncs
     echo "$KEY $SECRET" > "$run/credentials"
-    docker run -d --name "$name" --network host --cpus "$cpus" -v "$run:/run-dir" \
+    docker run -d --name "$name" --network host $limit -v "$run:/run-dir" \
         -v "${COSMOSTORE_BIN:-$work/../bins/head}:/cosmostore:ro" debian:trixie \
         /cosmostore serve /run-dir/data "127.0.0.1:$port" /run-dir/credentials > /dev/null
     wait_for "http://127.0.0.1:$port/"
@@ -50,7 +53,7 @@ seaweedfs)
     printf '{"identities":[{"name":"bench","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}\n' \
         "$KEY" "$SECRET" > "$run/s3.json"
     # The image runs as user seaweed and gives it /data only.
-    docker run -d --name "$name" --network host --cpus "$cpus" -v "$run:/run-dir:ro" -v "$run/data:/data" \
+    docker run -d --name "$name" --network host $limit -v "$run:/run-dir:ro" -v "$run/data:/data" \
         "$SEAWEEDFS_IMAGE" server -dir=/data -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3 -s3.port=$port -s3.config=/run-dir/s3.json \
         -volume.max=0 -master.volumeSizeLimitMB=1024 > /dev/null
     wait_for "http://127.0.0.1:$port/"
@@ -83,7 +86,7 @@ rpc_secret = "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 s3_region = "us-east-1"
 api_bind_addr = "127.0.0.1:$port"
 EOF
-    docker run -d --name "$name" --network host --cpus "$cpus" -v "$run:/run-dir" \
+    docker run -d --name "$name" --network host $limit -v "$run:/run-dir" \
         -e GARAGE_CONFIG_FILE=/run-dir/garage.toml "$GARAGE_IMAGE" /garage server > /dev/null
     wait_for "http://127.0.0.1:$port/"
     g() { docker exec "$name" /garage -c /run-dir/garage.toml "$@"; }
@@ -99,7 +102,7 @@ rustfs)
     port=19900
     mode=strict # its default; the same for both configurations
     chown -R 10001:10001 "$run/data"
-    docker run -d --name "$name" --network host --cpus "$cpus" -v "$run/data:/data" \
+    docker run -d --name "$name" --network host $limit -v "$run/data:/data" \
         -e RUSTFS_ACCESS_KEY="$KEY" -e RUSTFS_SECRET_KEY="$SECRET" -e RUSTFS_VOLUMES=/data \
         -e RUSTFS_ADDRESS="127.0.0.1:$port" -e RUSTFS_REGION=us-east-1 -e RUSTFS_CONSOLE_ENABLE=false \
         -e RUSTFS_DURABILITY_MODE=$mode "$RUSTFS_IMAGE" > /dev/null

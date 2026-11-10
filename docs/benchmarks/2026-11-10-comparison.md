@@ -68,6 +68,12 @@ what these servers do as shipped, and lose acknowledged writes on a power cut.
   them (63 to 64 syncs per 1,000 at concurrency 32, as on the M1).
 - **Two CPUs per server** suits a single-node store; a server built to spread over more cores could do relatively
   better with more.
+- **`--cpus 2` is a quota, not two cores** (found 11 Nov 2026, ADR-0035): each 100 ms, a container may use 200 ms of
+  CPU on any of the host's 8 threads, then waits for the next period. A server busy on many threads at once uses its
+  quota early and stalls for the rest of the period, which shows in the p99, not in the throughput. Measured on
+  CosmoStore with the client inside the quota: 0-byte GETs' p99 30 ms with the quota, 7.7 ms on 2 pinned cores, at
+  about the same rate. Here the client was outside it, but the p99 columns may still hold such stalls, likely more
+  for servers that spread over many threads. `CPUSET=2,3` pins the cores instead, for a later run.
 
 ## Tables
 

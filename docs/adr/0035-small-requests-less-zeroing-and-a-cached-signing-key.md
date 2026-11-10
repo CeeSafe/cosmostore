@@ -58,9 +58,23 @@
 
 - **4 KiB PUTs** with the slack: 1.07 times at concurrency 32 and 1.04 at 128 (phase medians), p99 unchanged.
 - **The cache** raises throughput 8 to 13% in four of six groups, in both runs. Every gate passed.
-- **The p99 of small reads rose 7 to 18% while their p50 fell 15 to 28%.** These phases' p99 is not the requests'
-  own cost: at concurrency 32 a 0-byte GET's p50 is 1 ms and its p99 23 ms, a stall that some requests wait
-  behind, and with faster requests more of them do. The stall is the next thing to find (ROADMAP).
+- **The p99 of small reads rose 7 to 18% in those two runs while their p50 fell 15 to 28%.** Their tail (a 0-byte
+  GET's p99 23 ms at concurrency 32, against a p50 of 1 ms) was the container's CPU quota, not the server:
+  `--cpus 2` lets the container, client and server together, use 200 ms of CPU each 100 ms on any of the host's 8
+  threads, and reads, which never wait on a disk, used it early and stalled for the rest of 10 of 11 periods
+  (`cpu.stat`). Faster requests used it sooner. On 2 pinned cores (`--cpuset-cpus 2,3`), no period was throttled,
+  0-byte GETs' p99 at concurrency 32 was 7.7 ms against 30 ms, and the cache's gate gave:
+
+  | Group | p99 | ops/s |
+  |---|---:|---:|
+  | small writes, c32 | 0.98 | 1.06 |
+  | small metadata reads, c32 | 0.86 | 1.00 |
+  | small writes, c128 | 1.00 | 1.06 |
+  | small metadata reads, c128 | 0.87 | 1.08 |
+  | small GETs, c32 | 1.02 | 1.03 |
+  | small GETs, c128 | 0.95 | 1.04 |
+
+  Gates on that server pin cores from now on; `tools/compare/compare.sh` takes `CPUSET` for the same reason.
 - **G30 stays open** in CEESAFE_GAPS.md, but costs nothing measurable at staging now.
 
 ## Tests
