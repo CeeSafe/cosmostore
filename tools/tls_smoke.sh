@@ -30,7 +30,8 @@ check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1: expected [$3], got 
     -keyout ca.key -out ca.pem 2> /dev/null
 "$openssl" req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=localhost" \
     -keyout server.key -out server.csr 2> /dev/null
-printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' > san.ext
+# Apple's TLS (the AWS CLI's CRT client on macOS) also requires serverAuth in an extended key usage.
+printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature\n' > san.ext
 "$openssl" x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile san.ext \
     -out server.pem 2> /dev/null
 [ -s server.pem ] && pass "certificate made" || fail "certificate made"
