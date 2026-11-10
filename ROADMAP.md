@@ -1230,6 +1230,19 @@ Browser form uploads with a SigV4 POST policy.
   overwrites gained most. The gate passed.
 - **Tests:** `factoryWritersAreTheStores`; s3_smoke checks a small and a large PUT to a missing bucket. 132 tests, the
   s3-tests subset 252, the SDK checks, both smokes.
+
+### 10 Nov 2026: allocations per request (`docs/benchmarks/2026-11-10-allocations.md`)
+
+- **Counted with heaptrack** on Linux (a container on a Debian server, CosmoStore `47fb72e`), 128 B objects: 112
+  allocations per PUT, 87 per GET, 74 per HEAD, 83 per DELETE. macOS's `malloc_history` sees only live blocks.
+- **Where:** about 31 in `S3Request.of` (two vectors per header, names lowercased byte by byte), about 34 in SigV4
+  (a vector per Authorization field, the canonical request and string to sign grown as built, hex), about 15 in the
+  response headers, about 15 in the store.
+- **What they cost: under 1% of the CPU samples** in the ADR-0031 profiles at concurrency 128. No change now; the
+  document lists the changes (one buffer with offsets for the headers and the Authorization fields, buffers sized
+  once) for hardware where the allocator shows.
+- **Arenas per request do not fit CeeSafe as it is:** an `Arena` gives scoped slices, which struct fields cannot
+  hold (N0246), and `Vector` cannot allocate from one. The M4 item is closed as measured.
 - **Next:**
   - a profile at concurrency 128, before more work on the PUT path (G30's wake-ups remain at staging);
   - a quiet reference run, for T1 at 4 KiB and T7;
