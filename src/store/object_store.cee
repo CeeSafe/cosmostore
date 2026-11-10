@@ -2856,6 +2856,24 @@ struct ObjectStore {
 
     fn segmentCount(borrow this) -> usize => this.state.segments.length();
 
+    /// The work upkeep has not done yet (ADR-0033): what compaction would free and copy in the segments it would
+    /// choose now (covered by the checkpoint, live share under `compactBelowLivePercent`), and the journal bytes no
+    /// checkpoint covers, which recovery replays.
+    fn upkeepDebt(borrow this) -> UpkeepDebt {
+        var debt = UpkeepDebt { compactionFrees: 0, compactionCopies: 0, uncheckpointed: 0 };
+        for (i in 0..this.state.segments.length()) {
+            let id: u64 = this.state.segments.keyAt(i);
+            let u = this.state.segments.valueAt(i);
+            if (id >= this.checkpointSegment) {
+                debt.uncheckpointed += u.totalBytes;
+            } else if (u.liveBytes == 0 || u.liveBytes * 100 < u.totalBytes * this.config.compactBelowLivePercent) {
+                debt.compactionFrees += u.totalBytes - u.liveBytes;
+                debt.compactionCopies += u.liveBytes;
+            }
+        }
+        return debt;
+    }
+
     /// Retired extents that wait for readers, and extents that open readers pin (ADR-0007).
     fn deferredExtentCount(borrow this) -> usize => this.deferred.length;
     fn pinnedExtentCount(borrow this) -> usize => this.pins.pinnedCount();
@@ -2965,6 +2983,16 @@ struct ObjectReader {
         this.inlinePosition += n;
         return Ok(n);
     }
+}
+
+/// `ObjectStore.upkeepDebt`, in bytes.
+struct UpkeepDebt {
+    /// Journal bytes the compactions due now would remove, net of what they copy.
+    compactionFrees: u64;
+    /// Live inline payloads those compactions copy first.
+    compactionCopies: u64;
+    /// Journal bytes in segments no checkpoint covers: what recovery replays.
+    uncheckpointed: u64;
 }
 
 /// Makes the store's object writers without the store (`ObjectStore.writerFactory`): no lock and no I/O.

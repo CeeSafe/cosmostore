@@ -726,3 +726,34 @@ fn lifecycleXmlParsesAndWritesBack() -> Result<void, TestFailure> {
     for (r in refused) { Check.isTrue(parseLifecycle(r.bytes()).isErr(), "a configuration S3 refuses")?; }
     return Ok();
 }
+
+/// ADR-0033: the latency buckets cover every duration, each top is in its bucket, and percentiles are bucket tops.
+@test
+fn latencyHistogramBuckets() -> Result<void, TestFailure> {
+    // Exact to 15 µs; then each bucket's top is the last value before the next bucket.
+    Check.equalU64(0, latencyBucket(0) as u64)?;
+    Check.equalU64(15, latencyBucket(15) as u64)?;
+    Check.equalU64(16, latencyBucket(16) as u64)?;
+    for (i in 0..LATENCY_BUCKETS - 1) {
+        let top = latencyBucketTop(i);
+        Check.equalU64(i as u64, latencyBucket(top) as u64)?;
+        Check.equalU64(i as u64 + 1, latencyBucket(top + 1) as u64)?;
+    }
+    Check.equalU64(LATENCY_BUCKETS as u64 - 1, latencyBucket(0xFFFFFFFFFFFFFFFF) as u64)?;
+    // Within 12.5% above: 1,000 µs reports as at most 1,023.
+    let t = latencyBucketTop(latencyBucket(1000));
+    Check.isTrue(t >= 1000 && t * 8 <= 1000 * 9, "a bucket is at most 12.5% wide")?;
+    // Percentiles: 990 requests at 100 µs and 10 at 50 ms.
+    let l = Latencies.create()!;
+    Check.equalU64(0, l.percentile(LATENCY_GET, 500000))?;
+    for (i in 0..990) { l.record(LATENCY_GET, 100); }
+    for (i in 0..10) { l.record(LATENCY_GET, 50000); }
+    l.record(200, 7); // an unknown class counts as other
+    Check.equalU64(1000, l.count(LATENCY_GET))?;
+    Check.equalU64(1, l.count(LATENCY_OTHER))?;
+    Check.equalU64(0, l.count(LATENCY_PUT))?;
+    Check.equalU64(latencyBucketTop(latencyBucket(100)), l.percentile(LATENCY_GET, 500000))?;
+    Check.equalU64(latencyBucketTop(latencyBucket(100)), l.percentile(LATENCY_GET, 990000))?;
+    Check.equalU64(latencyBucketTop(latencyBucket(50000)), l.percentile(LATENCY_GET, 999000))?;
+    return Ok();
+}

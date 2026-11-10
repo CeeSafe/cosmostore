@@ -37,6 +37,8 @@ struct S3App {
     /// meanwhile waits on that barrier, not in the turn's queue (ADR-0031).
     leading: AtomicBool;
     leadingBatch: AtomicU64;
+    /// Request latencies by class, for the stats endpoint (ADR-0033).
+    latencies: Latencies;
     /// The store's writers without its lock: an inline-sized PUT starts with no lock round (ADR-0032).
     writers: WriterFactory;
 }
@@ -80,7 +82,25 @@ impl Handler<S3App> for S3Handler {
         }
         exchange.header("x-amz-request-id", requestId.view())?;
         exchange.header("server", "CosmoStore".bytes())?;
-        match (await serveS3(app, request, exchange)) {
+        // Timed to the last byte of the response, an error's included (ADR-0033).
+        let started = Clock.monotonicNanos();
+        var kind = LATENCY_OTHER;
+        let done = await respond(app, request, exchange, mut kind, requestId.view());
+        app.latencies.record(kind, (Clock.monotonicNanos() - started) / 1000);
+        return done;
+    }
+}
+
+/// The response to one request, and its latency class (`kind`).
+async fn respond(
+    app: borrow S3App,
+    request: borrow Request,
+    exchange: borrow mut Exchange,
+    kind: borrow mut u8,
+    requestId: Slice<u8>,
+) -> Result<void, HandlerError> {
+    {
+        match (await serveS3(app, request, exchange, kind)) {
             Ok() => { return Ok(); }
             Err(S3Fail.Http(e)) => { return Err(e); }
             Err(S3Fail.Code(code)) => {
@@ -92,10 +112,10 @@ impl Handler<S3App> for S3Handler {
                     let _ = await AsyncConsole.writeError(request.path());
                     let _ = await AsyncConsole.writeError("\n");
                 }
-                return await sendError(exchange, code, request.path().bytes(), requestId.view());
+                return await sendError(exchange, code, request.path().bytes(), requestId);
             }
             Err(S3Fail.OutOfMemory(_)) => {
-                return await sendError(exchange, S3Code.InternalError, request.path().bytes(), requestId.view());
+                return await sendError(exchange, S3Code.InternalError, request.path().bytes(), requestId);
             }
         }
     }
@@ -150,8 +170,14 @@ async fn sendXml(exchange: borrow mut Exchange, body: borrow Vector<u8>) -> Resu
 fn isMethod(m: Method, want: Method) -> bool => Methods.same(m, want);
 
 /// Authenticates and dispatches one request.
-async fn serveS3(app: borrow S3App, request: borrow Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+async fn serveS3(
+    app: borrow S3App,
+    request: borrow Request,
+    exchange: borrow mut Exchange,
+    kind: borrow mut u8,
+) -> Result<void, S3Fail> {
     let req = S3Request.of(request, app.domain.view())?;
+    kind = latencyClass(borrow req);
     // A browser form upload is authenticated by its form's policy signature, not its headers (ADR-0018).
     if (isPostObject(borrow req)) { return await postObject(app, borrow req, exchange); }
     let now = Clock.unixMillis() / 1000;

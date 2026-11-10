@@ -1,0 +1,82 @@
+// Request latency histograms for the stats endpoint (ADR-0033): one per class of request, in buckets of about 12.5%,
+// counted with atomics so that recording takes no lock.
+
+import web_http;
+
+/// The classes: PutObject, GetObject, HeadObject and DeleteObject (a key and no query parameters), and the rest,
+/// the stats endpoint among them.
+const LATENCY_PUT: u8 = 0;
+const LATENCY_GET: u8 = 1;
+const LATENCY_HEAD: u8 = 2;
+const LATENCY_DELETE: u8 = 3;
+const LATENCY_OTHER: u8 = 4;
+const LATENCY_CLASSES: usize = 5;
+
+/// Exact below 16 µs, then 8 buckets per power of two up to 2^47 µs (about 4.5 years); longer goes in the last.
+const LATENCY_EXACT: usize = 16;
+const LATENCY_BUCKETS: usize = 16 + 44 * 8;
+
+/// The bucket of a duration in microseconds.
+fn latencyBucket(micros: u64) -> usize {
+    if (micros < LATENCY_EXACT as u64) { return truncate<usize>(micros); }
+    let exp = 63 - micros.leadingZeros() as u64; // 4 or more
+    let sub = (micros >> (exp - 3)) & 7;
+    let i = LATENCY_EXACT as u64 + (exp - 4) * 8 + sub;
+    return if (i >= LATENCY_BUCKETS as u64) LATENCY_BUCKETS - 1 else truncate<usize>(i);
+}
+
+/// The largest duration, in microseconds, that bucket `i` holds.
+fn latencyBucketTop(i: usize) -> u64 {
+    if (i < LATENCY_EXACT) { return i as u64; }
+    let exp = 4 + ((i - LATENCY_EXACT) / 8) as u64;
+    let sub = ((i - LATENCY_EXACT) % 8) as u64;
+    return ((8 + sub + 1) << (exp - 3)) - 1;
+}
+
+struct Latencies {
+    /// LATENCY_CLASSES rows of LATENCY_BUCKETS counts.
+    counts: Vector<AtomicU64>;
+
+    fn create() -> Result<Latencies, AllocError> {
+        var counts = Vector<AtomicU64>.create();
+        for (i in 0..LATENCY_CLASSES * LATENCY_BUCKETS) { counts.push(AtomicU64.create(0))?; }
+        return Ok(Latencies { counts: counts });
+    }
+
+    fn record(borrow this, kind: u8, micros: u64) {
+        let row = if (kind as usize >= LATENCY_CLASSES) LATENCY_OTHER as usize else kind as usize;
+        let _ = this.counts[row * LATENCY_BUCKETS + latencyBucket(micros)].fetchAdd(1);
+    }
+
+    fn count(borrow this, kind: u8) -> u64 {
+        var n: u64 = 0;
+        for (i in 0..LATENCY_BUCKETS) { n += this.counts[kind as usize * LATENCY_BUCKETS + i].load(); }
+        return n;
+    }
+
+    /// The duration, in microseconds, under which `perMillion` millionths of the class's requests finished: the top
+    /// of the bucket that holds that rank (so at most 12.5% above the true value). 0 with no request.
+    fn percentile(borrow this, kind: u8, perMillion: u64) -> u64 {
+        let total = this.count(kind);
+        if (total == 0) { return 0; }
+        let rank = (total * perMillion + 999999) / 1000000; // the ceiling, at least 1 for perMillion > 0
+        var seen: u64 = 0;
+        for (i in 0..LATENCY_BUCKETS) {
+            seen += this.counts[kind as usize * LATENCY_BUCKETS + i].load();
+            if (seen >= rank && seen > 0) { return latencyBucketTop(i); }
+        }
+        return latencyBucketTop(LATENCY_BUCKETS - 1); // counts grew while reading
+    }
+}
+
+/// The class of a parsed request.
+fn latencyClass(req: borrow S3Request) -> u8 {
+    if (req.bucket.length == 0 || req.key.length == 0 || req.query.length > 0) { return LATENCY_OTHER; }
+    if (req.bucket.view() == STATS_BUCKET) { return LATENCY_OTHER; } // the stats endpoint itself
+    let m = req.method;
+    if (isMethod(m, Method.Put)) { return LATENCY_PUT; }
+    if (isMethod(m, Method.Get)) { return LATENCY_GET; }
+    if (isMethod(m, Method.Head)) { return LATENCY_HEAD; }
+    if (isMethod(m, Method.Delete)) { return LATENCY_DELETE; }
+    return LATENCY_OTHER;
+}

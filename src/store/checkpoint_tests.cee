@@ -72,6 +72,44 @@ fn checkpointBoundsReplay() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// ADR-0033: the upkeep debt follows the checkpoint and the compaction.
+@test
+fn upkeepDebtFollowsCheckpointAndCompaction() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("ckpt-debt");
+    let ctype = "application/octet-stream";
+    var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+    s.createBucket("bkt")!;
+    s.putObject("bkt", "keep", ctype, patterned(300, 1).view(), PutCondition.None)!;
+    for (r in 0u64..40) {
+        for (k in 0u64..10) {
+            var name = String.create();
+            name.append("hot-")!;
+            name.appendNumber(k)!;
+            s.putObject("bkt", name.view(), ctype, patterned(900, r * 100 + k).view(), PutCondition.None)!;
+        }
+    }
+    // No checkpoint: everything is to replay, nothing is compaction's yet.
+    var d = s.upkeepDebt();
+    Check.equalU64(s.journalBytes(), d.uncheckpointed)?;
+    Check.equalU64(0, d.compactionFrees + d.compactionCopies)?;
+    // Checkpointed: the covered, mostly overwritten segments are compaction's debt.
+    Check.isTrue(s.checkpoint()!, "checkpoint")?;
+    d = s.upkeepDebt();
+    Check.isTrue(d.uncheckpointed < s.journalBytes() / 4, "the checkpoint covers most of the journal")?;
+    Check.isTrue(d.compactionFrees > s.journalBytes() / 2, "most of the journal is garbage to compact")?;
+    Check.isTrue(d.compactionCopies > 0, "with live payloads to copy")?;
+    let before = s.journalBytes();
+    let owed = d.compactionFrees + d.compactionCopies;
+    // Compacted: nothing is due; the copies are new, uncovered records.
+    let stats = s.compact(1073741824)!;
+    Check.isTrue(stats.bytesFreed <= owed && stats.bytesFreed * 10 >= owed * 9, "it freed what the debt said")?;
+    d = s.upkeepDebt();
+    Check.equalU64(0, d.compactionFrees + d.compactionCopies)?;
+    Check.isTrue(s.journalBytes() < before, "the journal shrank")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
 @test
 fn compactionRelocatesAndKeepsGenerations() -> Result<void, TestFailure> {
     let dir = scratchDirectory("ckpt-compact");

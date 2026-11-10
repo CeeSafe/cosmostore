@@ -19,6 +19,7 @@ struct StoreStats {
     deferredExtents: u64;
     pinnedExtents: u64;
     counters: StoreCounters;
+    debt: UpkeepDebt;
 }
 
 fn readStats(store: borrow ObjectStore) -> StoreStats => StoreStats {
@@ -32,6 +33,7 @@ fn readStats(store: borrow ObjectStore) -> StoreStats => StoreStats {
     deferredExtents: store.deferredExtentCount() as u64,
     pinnedExtents: store.pinnedExtentCount() as u64,
     counters: store.counters(),
+    debt: store.upkeepDebt(),
 };
 
 fn jsonField(out: borrow mut Vector<u8>, name: StringView, value: u64, last: bool) -> Result<void, AllocError> {
@@ -40,6 +42,25 @@ fn jsonField(out: borrow mut Vector<u8>, name: StringView, value: u64, last: boo
     out.extend("\": ".bytes())?;
     appendDecimal(out, value)?;
     out.extend(if (last) "\n".bytes() else ",\n  ".bytes())?;
+    return Ok();
+}
+
+/// `<name>Count`, and `<name>P50Micros`, `P99Micros` and `P999Micros`, each the top of its histogram bucket (ADR-0033).
+fn latencyFields(
+    out: borrow mut Vector<u8>,
+    l: borrow Latencies,
+    name: StringView,
+    kind: u8,
+) -> Result<void, AllocError> {
+    let suffixes = ["Count", "P50Micros", "P99Micros", "P999Micros"];
+    let perMillion = [0u64, 500000, 990000, 999000];
+    for (i in 0..4) {
+        var field = String.create();
+        field.append(name)?;
+        field.append(suffixes[i])?;
+        let value = if (i == 0) l.count(kind) else l.percentile(kind, perMillion[i]);
+        jsonField(out, field.view(), value, false)?;
+    }
     return Ok();
 }
 
@@ -73,6 +94,14 @@ async fn serveStats(app: borrow S3App, req: borrow S3Request, exchange: borrow m
     jsonField(mut body, "upkeepHolds", s.counters.upkeepHolds, false)?;
     jsonField(mut body, "upkeepSlowHolds", s.counters.upkeepSlowHolds, false)?;
     jsonField(mut body, "upkeepLongestMicros", s.counters.upkeepLongestMicros, false)?;
+    jsonField(mut body, "compactionDebtBytes", s.debt.compactionFrees, false)?;
+    jsonField(mut body, "compactionDebtCopyBytes", s.debt.compactionCopies, false)?;
+    jsonField(mut body, "uncheckpointedBytes", s.debt.uncheckpointed, false)?;
+    latencyFields(mut body, borrow app.latencies, "putObject", LATENCY_PUT)?;
+    latencyFields(mut body, borrow app.latencies, "getObject", LATENCY_GET)?;
+    latencyFields(mut body, borrow app.latencies, "headObject", LATENCY_HEAD)?;
+    latencyFields(mut body, borrow app.latencies, "deleteObject", LATENCY_DELETE)?;
+    latencyFields(mut body, borrow app.latencies, "otherRequests", LATENCY_OTHER)?;
     jsonField(mut body, "requests", app.requests.load(), true)?;
     body.extend("}\n".bytes())?;
     exchange.header("content-type", "application/json".bytes())?;

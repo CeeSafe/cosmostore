@@ -1243,6 +1243,19 @@ Browser form uploads with a SigV4 POST policy.
   once) for hardware where the allocator shows.
 - **Arenas per request do not fit CeeSafe as it is:** an `Arena` gives scoped slices, which struct fields cannot
   hold (N0246), and `Vector` cannot allocate from one. The M4 item is closed as measured.
+
+### 10 Nov 2026: latencies and upkeep debt in the stats endpoint (ADR-0033)
+
+- **The dashboards' figures, from the server:** `GET /_cosmostore/stats` now reports, besides the syncs and bytes
+  written that give syncs per 1,000 PUTs and write amplification:
+  - p50, p99 and p99.9 of PutObject, GetObject, HeadObject, DeleteObject and the other requests, from histograms of
+    atomic counters (buckets at most 12.5% wide), timed to the end of each response;
+  - compaction debt: the bytes the compactions due now would free and copy;
+  - the journal bytes no checkpoint covers, which recovery replays.
+- **No dashboard in the server:** the JSON is for whatever draws it. Percentiles cover the server's life; per-window
+  ones wait for a dashboard that needs them.
+- **Tests:** `latencyHistogramBuckets`, `upkeepDebtFollowsCheckpointAndCompaction`. 134 tests, the s3-tests subset
+  252, the SDK checks, both smokes.
 - **Next:**
   - a profile at concurrency 128, before more work on the PUT path (G30's wake-ups remain at staging);
   - a quiet reference run, for T1 at 4 KiB and T7;
