@@ -39,6 +39,7 @@ boilerplate; **P2** ergonomics.
 | G28 | P2 | runtime/async | `Async.blocking` starts and joins a new OS thread for every call: no pool, so each blocking step costs a `pthread_create` and a join |
 | G29 | P2 | lib/std | `OrderedMap` leaves nodes about half full when keys arrive in order, and reserves a full node's room for whole values: 2.6 times the entries' bytes for in-order inserts |
 | G30 | P2 | runtime/async | Waking a task always writes a byte to the executor's wake pipe, even from the executor's own thread: every `AsyncMutex` unlock with a waiter is a `write` system call |
+| G31 | P2 | lib/std/checksums | `Crc32c` is software only (slicing-by-8, 1.5 GB/s on an M1): no way to use the CPU's CRC32C instructions (ARMv8 `crc32c`, x86 SSE4.2), 4.7 times faster in one chain |
 
 ## Status (2026-11-06)
 
@@ -379,6 +380,27 @@ event loop's thread shows `write` under `ceesafe_chan_end_send`.
 **Suggested.** When `cee_wake_task` runs on the executor's own thread, mark the task runnable without poking: the
 loop checks its run queue before it blocks in `kevent`. Only a wake from another thread needs the pipe (and one
 `write` per loop iteration is enough: skip it while a poke is already pending).
+
+### G31: no hardware CRC32C (P2)
+
+**Evidence.** `lib/std/checksums.cee`: `Crc32c.update` is slicing-by-8 over eight 256-entry tables, with a bounds
+check on each lookup. CosmoStore verifies an extent's CRC32C as it reads it (ADR-0003). A 5-second `sample` of
+`cosmostore serve` under 8 concurrent 1 MiB GETs on an M1 (ADR-0034) puts 740 to 811 of about 2,000 to 2,900 busy
+samples in `Crc32c.update`, more than the socket's `sendmsg` (430 to 534). With the buffer zeroing and a worker thread per GET gone, it is the largest cost of a large GET. The same
+checksum is computed over every PUT's bytes.
+
+**Why it matters.** A storage server checks every byte it reads and writes. With the CPU's instruction (ARMv8
+`crc32cx`, x86 SSE4.2 `crc32q`, 8 bytes per instruction) the check would cost a fraction of what it does.
+G9 noted the missing intrinsics; this is what they cost.
+
+**Repro.** `Crc32c.of` over a 64 MiB buffer, 20 times, timed with `Clock.monotonicNanos`: 1.5 GB/s on an M1 (best
+of five runs). The same loop in C with `__crc32cd` (`clang -O2 -march=armv8-a+crc`), one dependency chain: 7.0 GB/s,
+4.7 times; interleaving three chains, as zlib and others do, is faster still. Both measured on a loaded machine (load
+average 60), best of five.
+
+**Suggested.** An intrinsic or a lib/std path that uses the instruction when the target has it (`__crc32cd` on
+AArch64 with the CRC extension, `_mm_crc32_u64` on x86-64 with SSE4.2), with the table as the fallback. A safe
+`Crc32c.update` keeps its signature, so callers need no change.
 
 ## Not gaps (checked)
 

@@ -12,6 +12,9 @@ const MAX_PUT_BYTES: u64 = 5368709120;
 const BODY_STEP: usize = 1048576;
 /// Room beyond the declared size in a body buffer: aws-chunked framing, and a read of the end of the stream.
 const BODY_SLACK: usize = 16384;
+/// Full-size body buffers kept for reuse (ADR-0034). Few, so that they stay in the CPU's cache: a pool of 32,
+/// handed out in turn, raised 1 MiB GETs' p99 at concurrency 32 by half on a server with an 8 MiB L3.
+const BODY_BUFFERS: usize = 4;
 const S3_XMLNS: StringView = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 struct S3App {
@@ -37,6 +40,8 @@ struct S3App {
     /// meanwhile waits on that barrier, not in the turn's queue (ADR-0031).
     leading: AtomicBool;
     leadingBatch: AtomicU64;
+    /// Full-size body buffers for reuse (ADR-0034).
+    bodyBuffers: Channel<Vector<u8>>;
     /// Request latencies by class, for the stats endpoint (ADR-0033).
     latencies: Latencies;
     /// The store's writers without its lock: an inline-sized PUT starts with no lock round (ADR-0032).
@@ -48,6 +53,26 @@ struct S3App {
 fn bodyStep(expected: u64) -> usize {
     let wanted = expected + BODY_SLACK as u64;
     return if (wanted < BODY_STEP as u64) truncate<usize>(wanted) else BODY_STEP;
+}
+
+/// A buffer of `bodyStep(expected)` bytes. A full-size one comes from the pool when it has one (ADR-0034): it is
+/// not zeroed and holds an earlier body's bytes, so a caller uses only the part a read has just filled.
+fn takeBodyBuffer(app: borrow S3App, expected: u64) -> Result<Vector<u8>, AllocError> {
+    let size = bodyStep(expected);
+    if (size == BODY_STEP) {
+        match (app.bodyBuffers.tryRecv()) {
+            Some(b) => { return Ok(b); }
+            null => {}
+        }
+    }
+    var b = Vector<u8>.create();
+    b.resize(size, 0)?;
+    return Ok(b);
+}
+
+/// Returns a buffer from `takeBodyBuffer`: a full-size one to the pool, unless it is full.
+fn giveBodyBuffer(app: borrow S3App, b: Vector<u8>) {
+    if (b.length == BODY_STEP) { let _ = app.bodyBuffers.trySend(b); }
 }
 
 fn statusOf(code: u16) -> StatusCode => StatusCode.of(code) ?? Status.internalServerError();

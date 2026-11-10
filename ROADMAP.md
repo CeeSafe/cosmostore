@@ -1274,8 +1274,21 @@ Browser form uploads with a SigV4 POST policy.
 - **Memory:** 216 MiB peak, against 121 for Garage, 783 for RustFS and 1.8 GiB for SeaweedFS. No errors anywhere.
 - **Garage's 4 KiB GETs** take 44 ms each at every concurrency (a delayed-ACK pattern, just above its inline size):
   noted as an anomaly, to report upstream.
+
+### 10 Nov 2026: large GETs (ADR-0034, `docs/benchmarks/2026-11-10-large-gets.md`)
+
+- **Profile of 1 MiB GETs:** 28% `Crc32c.update` (the extent's check), 26% worker threads (three `Async.blocking`
+  per GET, G28), 18% the socket, 12% zeroing a new 1 MiB buffer.
+- **Changes:** the read loop stops at the planned length (no last read to find the end); an extent reader is taken
+  without a worker thread (`takeReady`); 1 MiB body buffers are reused from a pool of 4.
+- **A pool of 32 raised the p99 of 1 MiB GETs at concurrency 32 by half** on the Debian server: first in, first out,
+  32 MiB cycled through an 8 MiB cache. Five variants, 5 rounds each, separated the three changes.
+- **Results on the Debian server:** 1 MiB GETs 1.20 times at concurrency 1, unchanged at 32; PUTs 1.06 and 1.00.
+  On the M1, 1 MiB GETs went from 394 to 508/s to 701 to 761/s (under load).
+- **What bounds large GETs is the CRC32C:** lib/std's software CRC runs at 1.5 GB/s against 7 GB/s for the CPU's
+  instruction. New gap G31; the comparison's gap stays until CeeSafe can use it.
 - **Next:**
-  - the 1 MiB GET path (half SeaweedFS's rate with 2 CPUs): a profile of large reads;
   - a quiet reference run on the M1, for T1 at 4 KiB and T7;
-  - a profile at concurrency 128 (G30's wake-ups remain at staging).
+  - a profile at concurrency 128 (G30's wake-ups remain at staging);
+  - the CRC32C instruction when CeeSafe has it (G31), then the comparison run again for large objects.
 

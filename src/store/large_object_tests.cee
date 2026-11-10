@@ -286,3 +286,41 @@ fn largeCrashAtEveryJournalByte() -> Result<void, TestFailure> {
     removeTree(source.view());
     return Ok();
 }
+
+/// ADR-0034: an extent reader is ready without I/O; an inline record is not, and `open` reads it.
+@test
+fn extentReadersAreReadyWithoutOpening() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("large-ready");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    let ctype = "application/octet-stream";
+    let large = patterned(100000, 7);
+    s.putObject("bkt", "large", ctype, large.view(), PutCondition.None)!;
+    s.putObject("bkt", "small", ctype, "inline bytes".bytes(), PutCondition.None)!;
+    // In extents: ready at once, and only once.
+    var p = s.prepareReader("bkt", "large", 0, 0xFFFFFFFFFFFFFFFF)!;
+    var r = match (p.takeReady()) {
+        Some(reader) => reader,
+        null => { return Err(TestFailure.create("an extent reader is ready")); }
+    };
+    Check.isTrue(p.takeReady().isNull(), "taken once")?;
+    var got = Vector<u8>.create();
+    var buf = Vector<u8>.create();
+    buf.resize(30000, 0)!;
+    while (true) {
+        let n = r.read(buf.viewMut())!;
+        if (n == 0) { break; }
+        got.extend(buf.view()[0..n])!;
+    }
+    Check.equalBytes(large.view(), got.view())?;
+    // Inline: not ready; open reads the record.
+    var q = s.prepareReader("bkt", "small", 0, 0xFFFFFFFFFFFFFFFF)!;
+    Check.isTrue(q.takeReady().isNull(), "an inline record needs reading")?;
+    var inline = q.open()!;
+    match (inline.takeInline()) {
+        Some(b) => { Check.equalBytes("inline bytes".bytes(), b.view())?; }
+        null => { return Err(TestFailure.create("an opened inline reader holds the bytes")); }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
