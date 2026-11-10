@@ -1256,8 +1256,26 @@ Browser form uploads with a SigV4 POST policy.
   ones wait for a dashboard that needs them.
 - **Tests:** `latencyHistogramBuckets`, `upkeepDebtFollowsCheckpointAndCompaction`. 134 tests, the s3-tests subset
   252, the SDK checks, both smokes.
+- **Cost:** none measurable. The CI gate showed small groups at concurrency 32 at 0.82 times; on a quiet Debian server
+  (3 rounds, `tools/perf_gate.sh`) every group was within 0.96 to 1.01 times, so that was the runner's noise.
+
+### 10 Nov 2026: the comparison run (`docs/benchmarks/2026-11-10-comparison.md`)
+
+- **`tools/compare/compare.sh`** runs CosmoStore, SeaweedFS 4.53, Garage v2.5.0 or RustFS 1.0.4 in a container (same
+  CPU limit, same filesystem, host network) and measures it with `tools/bench`; `report.py` makes the tables. Each
+  server ran with every fsync option on (like for like) and as shipped; RustFS's default is already durable.
+- **Host:** a Debian 13 server (Xeon E3-1245 V2, a data-center SATA SSD with power-loss protection), 2 CPUs per
+  server, one run per configuration.
+- **Small objects, durable:** CosmoStore's PUTs at 8,200 to 10,400/s at concurrency 32 and 128, 2.7 to 7.7 times
+  the next (SeaweedFS with fsync), and ahead of SeaweedFS and Garage without fsync; p99 4.7 to 6.3 ms at concurrency
+  32. GET 1.5 to 2.9 times the next, HEAD about twice RustFS, deletes about twice SeaweedFS.
+- **1 MiB:** PUT in the middle (160/s against 145 to 252). **GET behind:** 460/s against 920 for SeaweedFS and 760
+  for RustFS.
+- **Memory:** 216 MiB peak, against 121 for Garage, 783 for RustFS and 1.8 GiB for SeaweedFS. No errors anywhere.
+- **Garage's 4 KiB GETs** take 44 ms each at every concurrency (a delayed-ACK pattern, just above its inline size):
+  noted as an anomaly, to report upstream.
 - **Next:**
-  - a profile at concurrency 128, before more work on the PUT path (G30's wake-ups remain at staging);
-  - a quiet reference run, for T1 at 4 KiB and T7;
-  - the comparison run.
+  - the 1 MiB GET path (half SeaweedFS's rate with 2 CPUs): a profile of large reads;
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7;
+  - a profile at concurrency 128 (G30's wake-ups remain at staging).
 
