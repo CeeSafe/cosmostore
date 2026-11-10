@@ -56,8 +56,17 @@ check "notice" "$(head -1 server.log)" "cosmostore: serving S3 over TLS on 0.0.0
 export AWS_CA_BUNDLE="$work/ca.pem"
 head -c 12000000 /dev/urandom > big.bin
 aws s3api create-bucket --bucket tls-smoke > /dev/null 2>&1 && pass "create-bucket over TLS" || fail "create-bucket over TLS"
-aws s3 cp big.bin s3://tls-smoke/big.bin > /dev/null 2>&1 && aws s3 cp s3://tls-smoke/big.bin got.bin > /dev/null 2>&1
-cmp -s got.bin big.bin && pass "multipart cp both ways over TLS" || fail "multipart cp both ways over TLS"
+aws s3 cp --only-show-errors big.bin s3://tls-smoke/big.bin > cp.txt 2>&1 &&
+    aws s3 cp --only-show-errors s3://tls-smoke/big.bin got.bin >> cp.txt 2>&1
+if cmp -s got.bin big.bin; then
+    pass "multipart cp both ways over TLS"
+else
+    # What the client and the server said, so a failure on another machine (CI) can be read from its log.
+    fail "multipart cp both ways over TLS"
+    aws --version
+    sed 's/^/  aws: /' cp.txt | tail -20
+    sed 's/^/  server: /' server.log | tail -20
+fi
 check "TLS version" "$(curl -s -o /dev/null -w '%{ssl_verify_result} %{http_version}' --cacert ca.pem "https://localhost:$port/")" "0 1.1"
 check "anonymous over TLS" "$(curl -s --cacert ca.pem "https://127.0.0.1:$port/" | sed -n 's/.*<Code>\(.*\)<\/Code>.*/\1/p')" AccessDenied
 url=$(aws s3 presign s3://tls-smoke/big.bin --expires-in 60)
