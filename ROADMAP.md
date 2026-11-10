@@ -1292,3 +1292,20 @@ Browser form uploads with a SigV4 POST policy.
   - a profile at concurrency 128 (G30's wake-ups remain at staging);
   - the CRC32C instruction when CeeSafe has it (G31), then the comparison run again for large objects.
 
+
+### 11 Nov 2026: small requests, the profile at concurrency 128 (ADR-0035, `docs/benchmarks/2026-11-11-c128-profile.md`)
+
+- **Profile** (Debian server, `gdb` stack samples, 4 KiB PUTs at concurrency 128): G30's wake-pipe write is not in
+  a single sample. The event loop spent 13% zeroing a 20 KiB body buffer (16 KiB of slack) and 6% deriving the
+  SigV4 signing key.
+- **Changes:** body-buffer slack 1 KiB; the signing key cached per credential for its date and region (a sequence
+  lock over atomics).
+- **Results on the Debian server:** 4 KiB PUTs 1.07 and 1.04 times with the slack; the cache adds 8 to 13% in four
+  of six groups, in two runs. Small reads' p50 fell 15 to 28%, but their p99 (a stall of 20 to 30 ms, against a p50
+  of 1 to 5 ms) rose 7 to 18%. Gates passed.
+- **Local builds:** the shared CeeSafe.Web checkout moved to a commit needing ceesafec 0.27; checks ran against a
+  clone at CI's pinned `0f7290c`.
+- **Next:**
+  - find the 20 to 30 ms stall in small reads' tail;
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7;
+  - the CRC32C instruction when CeeSafe has it (G31), then the comparison run again for large objects.

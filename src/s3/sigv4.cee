@@ -232,6 +232,115 @@ fn signingKey(
     return Ok(HmacSha256.of(kService[..], "aws4_request".bytes()));
 }
 
+/// The date and region a signing key was derived for, packed into words: a date of 8 bytes, a region of up to 16.
+struct KeyScope {
+    date: u64;
+    region0: u64;
+    region1: u64;
+    /// The region's length plus one; 0 marks an empty cache.
+    regionTag: u64;
+}
+
+/// Up to 8 bytes as one word, the first byte highest.
+fn packedWord(bytes: Slice<u8>) -> u64 {
+    var w: u64 = 0;
+    for (b in bytes) { w = (w << 8) | b as u64; }
+    return w;
+}
+
+/// The packed scope, or null when the date or region does not fit (such a key is not cached).
+fn keyScope(date: Slice<u8>, region: Slice<u8>) -> KeyScope? {
+    if (date.length != 8 || region.length > 16) { return null; }
+    let split = if (region.length < 8) region.length else 8;
+    return KeyScope {
+        date: packedWord(date),
+        region0: packedWord(region[0..split]),
+        region1: packedWord(region[split..]),
+        regionTag: region.length as u64 + 1,
+    };
+}
+
+/// The last signing key derived for one credential (ADR-0035). Each request derived it anew, four HMACs, about 6% of
+/// the event loop's time in 4 KiB PUTs at concurrency 128; it changes once a day. A sequence lock over atomics, so it
+/// needs no lock: `seq` is odd while a write is under way, and a read that sees it change, or odd, is a miss.
+struct SigningKeyCache {
+    seq: AtomicU64;
+    date: AtomicU64;
+    region0: AtomicU64;
+    region1: AtomicU64;
+    regionTag: AtomicU64;
+    key0: AtomicU64;
+    key1: AtomicU64;
+    key2: AtomicU64;
+    key3: AtomicU64;
+
+    fn create() -> SigningKeyCache => SigningKeyCache {
+        seq: AtomicU64.create(0),
+        date: AtomicU64.create(0),
+        region0: AtomicU64.create(0),
+        region1: AtomicU64.create(0),
+        regionTag: AtomicU64.create(0),
+        key0: AtomicU64.create(0),
+        key1: AtomicU64.create(0),
+        key2: AtomicU64.create(0),
+        key3: AtomicU64.create(0),
+    };
+
+    /// The cached key for `scope`, if this cache holds it and no write overlapped the read.
+    fn find(borrow this, scope: borrow KeyScope) -> [u8; 32]? {
+        let before = this.seq.load();
+        if (before & 1 != 0) { return null; }
+        let same = this.date.load() == scope.date && this.region0.load() == scope.region0 &&
+            this.region1.load() == scope.region1 && this.regionTag.load() == scope.regionTag;
+        let words = [this.key0.load(), this.key1.load(), this.key2.load(), this.key3.load()];
+        if (!same || this.seq.load() != before) { return null; }
+        var key = [0u8; 32];
+        for (i in 0..32usize) { key[i] = truncate<u8>(words[i / 8] >> ((7 - (i % 8)) * 8) as u64); }
+        return Some(key);
+    }
+
+    /// Keeps `key` for `scope`; skipped when another write is under way.
+    fn keep(borrow this, scope: borrow KeyScope, key: borrow [u8; 32]) {
+        let before = this.seq.load();
+        if (before & 1 != 0) { return; }
+        match (this.seq.compareExchange(before, before + 1)) {
+            Ok(_) => {}
+            Err(_) => { return; }
+        }
+        this.date.store(scope.date);
+        this.region0.store(scope.region0);
+        this.region1.store(scope.region1);
+        this.regionTag.store(scope.regionTag);
+        this.key0.store(packedWord(key[0..8]));
+        this.key1.store(packedWord(key[8..16]));
+        this.key2.store(packedWord(key[16..24]));
+        this.key3.store(packedWord(key[24..32]));
+        this.seq.store(before + 2);
+    }
+}
+
+/// `signingKey` for S3, through `cache`: derived only when the date or region differs from the last request's.
+fn cachedSigningKey(
+    cache: borrow SigningKeyCache,
+    secret: Slice<u8>,
+    date: Slice<u8>,
+    region: Slice<u8>,
+    service: Slice<u8>,
+) -> Result<[u8; 32], AllocError> {
+    if (service != "s3".bytes()) { return signingKey(secret, date, region, service); }
+    let scope = match (keyScope(date, region)) {
+        Some(s) => s,
+        null => { return signingKey(secret, date, region, service); }
+    };
+    match (cache.find(borrow scope)) {
+        Some(k) => { return Ok(k); }
+        null => {}
+    }
+    let key = signingKey(secret, date, region, service)?;
+    cache.keep(borrow scope, borrow key);
+    return Ok(key);
+}
+
 /// The hex signature of a string to sign made of `kind`, the date, the scope, and `lines`.
 fn signLines(
     key: borrow [u8; 32],

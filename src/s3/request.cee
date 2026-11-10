@@ -6,6 +6,8 @@ import web_http;
 struct Credential {
     accessKey: Vector<u8>;
     secret: Vector<u8>;
+    /// Its last signing key (ADR-0035).
+    signing: SigningKeyCache;
 }
 
 /// Parses a credentials file: one `access-key secret-key` pair per line; `#` starts a comment.
@@ -22,7 +24,11 @@ fn parseCredentials(text: Slice<u8>) -> Result<Vector<Credential>, AllocError> {
         if (trimmed.length == 0) { continue; }
         let space = pieceEnd(trimmed, 0, ' ');
         if (space == trimmed.length) { continue; }
-        var c = Credential { accessKey: Vector<u8>.create(), secret: Vector<u8>.create() };
+        var c = Credential {
+            accessKey: Vector<u8>.create(),
+            secret: Vector<u8>.create(),
+            signing: SigningKeyCache.create(),
+        };
         c.accessKey.extend(trimmed[0..space])?;
         c.secret.extend(trimSpaces(trimmed[space + 1..]))?;
         out.push(c)?;
@@ -291,14 +297,12 @@ struct S3Request {
         query: Slice<u8>,
     ) -> Result<Authenticated, S3Code> {
         if (auth.service.view() != "s3".bytes()) { return Err(S3Code.AuthorizationHeaderMalformed); }
-        var secret: Slice<u8>? = null;
+        var found: usize? = null;
         for (i in 0..credentials.length) {
-            if (sameSignature(credentials[i].accessKey.view(), auth.accessKey.view())) {
-                secret = Some(credentials[i].secret.view());
-            }
+            if (sameSignature(credentials[i].accessKey.view(), auth.accessKey.view())) { found = Some(i); }
         }
-        let key = match (secret) {
-            Some(s) => s,
+        let credential = match (found) {
+            Some(i) => borrow credentials[i],
             null => { return Err(S3Code.InvalidAccessKeyId); }
         };
         if (amzDate.length < 8 || amzDate[0..8] != auth.date.view()) { return Err(S3Code.SignatureDoesNotMatch); }
@@ -313,7 +317,13 @@ struct S3Request {
             mut canonical,
         ))?;
         if (!complete) { return Err(S3Code.SignatureDoesNotMatch); }
-        let signing = mapOom(signingKey(key, auth.date.view(), auth.region.view(), auth.service.view()))?;
+        let signing = mapOom(cachedSigningKey(
+            borrow credential.signing,
+            credential.secret.view(),
+            auth.date.view(),
+            auth.region.view(),
+            auth.service.view(),
+        ))?;
         var seed = Vector<u8>.create();
         mapOom(seedSignature(borrow signing, amzDate, auth.scope.view(), canonical.view(), mut seed))?;
         if (!sameSignature(seed.view(), auth.signature.view())) { return Err(S3Code.SignatureDoesNotMatch); }

@@ -12,6 +12,45 @@ fn pair(name: StringView, value: StringView) -> HeaderPair {
 
 fn utf8(v: borrow Vector<u8>) -> StringView => StringView.fromUtf8(v.view()) ?? "<not utf-8>";
 
+/// The signing-key cache (ADR-0035) returns the key `signingKey` derives, and only for the date and region it was
+/// derived for.
+@test
+fn signingKeyCacheKeepsOneScope() -> Result<void, TestFailure> {
+    let cache = SigningKeyCache.create();
+    let secret = EXAMPLE_SECRET.bytes();
+    let may24 = signingKey(secret, "20130524".bytes(), "us-east-1".bytes(), "s3".bytes())!;
+    let may25 = signingKey(secret, "20130525".bytes(), "us-east-1".bytes(), "s3".bytes())!;
+    let west = signingKey(secret, "20130524".bytes(), "eu-west-1".bytes(), "s3".bytes())!;
+    let scope = keyScope("20130524".bytes(), "us-east-1".bytes())!;
+    Check.isTrue(cache.find(borrow scope).isNull(), "an empty cache finds nothing")?;
+    let first = cachedSigningKey(borrow cache, secret, "20130524".bytes(), "us-east-1".bytes(), "s3".bytes())!;
+    Check.equalBytes(may24[..], first[..])?;
+    let found = cache.find(borrow scope)!;
+    Check.equalBytes(may24[..], found[..])?;
+    let again = cachedSigningKey(borrow cache, secret, "20130524".bytes(), "us-east-1".bytes(), "s3".bytes())!;
+    Check.equalBytes(may24[..], again[..])?;
+    // Another day or region is derived, and replaces the cached key.
+    let next = cachedSigningKey(borrow cache, secret, "20130525".bytes(), "us-east-1".bytes(), "s3".bytes())!;
+    Check.equalBytes(may25[..], next[..])?;
+    Check.isTrue(cache.find(borrow scope).isNull(), "the earlier day is gone")?;
+    let other = cachedSigningKey(borrow cache, secret, "20130524".bytes(), "eu-west-1".bytes(), "s3".bytes())!;
+    Check.equalBytes(west[..], other[..])?;
+    // A region of one letter less, or one that does not fit, is not the cached one.
+    let short = keyScope("20130524".bytes(), "eu-west-".bytes())!;
+    Check.isTrue(cache.find(borrow short).isNull(), "a prefix of the region misses")?;
+    Check.isTrue(keyScope("20130524".bytes(), "a-region-name-of-17".bytes()).isNull(), "a long region is not cached")?;
+    let long = signingKey(secret, "20130524".bytes(), "a-region-name-of-17".bytes(), "s3".bytes())!;
+    let viaCache = cachedSigningKey(
+        borrow cache,
+        secret,
+        "20130524".bytes(),
+        "a-region-name-of-17".bytes(),
+        "s3".bytes(),
+    )!;
+    Check.equalBytes(long[..], viaCache[..])?;
+    return Ok();
+}
+
 /// The "GET Object" example of AWS's SigV4 header-auth documentation.
 @test
 fn sigv4GetObjectExample() -> Result<void, TestFailure> {
