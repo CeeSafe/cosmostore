@@ -73,7 +73,7 @@ what these servers do as shipped, and lose acknowledged writes on a power cut.
   quota early and stalls for the rest of the period, which shows in the p99, not in the throughput. Measured on
   CosmoStore with the client inside the quota: 0-byte GETs' p99 30 ms with the quota, 7.7 ms on 2 pinned cores, at
   about the same rate. Here the client was outside it, but the p99 columns may still hold such stalls, likely more
-  for servers that spread over many threads. `CPUSET=2,3` pins the cores instead, for a later run.
+  for servers that spread over many threads. `CPUSET=2,3` pins the cores instead: the run again on pinned cores, 11 Nov, is `2026-11-11-comparison-pinned.md`.
 
 ## Tables
 

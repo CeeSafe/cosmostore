@@ -1336,6 +1336,27 @@ Browser form uploads with a SigV4 POST policy.
   compiles still builds.
 - **Speed:** a 1 MiB A/B on the M1 was inconclusive (load average 3 to 4.7; noise 2.56 against the gate's 2.00), and
   its writes wait on `fsync`. Measured next on the Debian server's pinned cores.
+- **On the Debian server's pinned cores** (perf gate, 5 rounds): 1 MiB GETs 1.19 and 1.20 times, PUTs and overwrites
+  1.05 and 1.06, small requests unchanged; noise 1.01 to 1.60, gate passed.
+
+### 11 Nov 2026: the comparison run on pinned cores (`docs/benchmarks/2026-11-11-comparison-pinned.md`)
+
+- **Setup:** each server on cores 2 and 3 (no quota), `tools/bench` on 0, 1, 4 and 5. CosmoStore `d509388`
+  (ceesafec 0.30.0). A first run with the client on 4 to 7 was discarded: cpu N and N+4 are one core's two threads,
+  so the client shared the servers' cores. `compare.sh` takes `CLIENT_CPUSET` now.
+- **CosmoStore against 10 Nov:** 1.17 times the throughput and 0.82 times the p99 (geometric means over 60 phases);
+  the other servers moved 2 to 9%.
+- **Where it stands:**
+  - small writes, durable: 3.5 to 8.0 times the next durable server;
+  - small reads: 1.5 to 3.7 times;
+  - 64 KiB PUTs: 2.1 times;
+  - 1 MiB PUTs: in the middle.
+- **Behind:**
+  - 1 MiB GETs at concurrency 32 and 128: 582 to 632/s against 930 to 1,050 for SeaweedFS and RustFS (0.59 to
+    0.67 times; up from 459 to 465);
+  - 64 KiB GETs: 0.78 to 0.87 times RustFS.
+- **Builds on pinned cores** (64 KiB and 1 MiB GETs, two rounds): `1aa265d`, `d98531b`, `f7a52bd` and `d509388`. No
+  regression between them. ADR-0034 gives 9% on 1 MiB GETs at concurrency 32, the CRC32C instruction 7 to 14%.
 - **Next:**
-  - the 1 MiB A/B, 0.24.2 against 0.30.0, on the Debian server's pinned cores; then the comparison run again;
+  - profile 1 MiB GETs at concurrency 32 on pinned cores: what bounds them at 60% of SeaweedFS and RustFS;
   - a quiet reference run on the M1, for T1 at 4 KiB and T7.

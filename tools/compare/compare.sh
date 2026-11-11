@@ -11,6 +11,8 @@
 #   COSMOSTORE_BIN  the cosmostore binary (default $WORK/../bins/head); run in debian:trixie
 #   CPUSET    cores to pin the server to (e.g. 2,3) instead of a CPU quota; a quota lets a busy server stall
 #             for the rest of each 100 ms period, which shows in the p99 (ADR-0035)
+#   CLIENT_CPUSET  cores to pin tools/bench to (taskset). With CPUSET, give it other physical cores than the server's:
+#             on the 8-thread Xeon, server 2,3 and client 0,1,4,5 (cpu N and N+4 are one core's two threads)
 #   CPUS (2), SIZES (0,4096,65536,1048576), CONCURRENCY (1,32,128), OPS (2000), READ_REPEAT (3)
 # Needs Docker and the images below. Every server listens on loopback only (host network, no proxy).
 set -eu
@@ -19,6 +21,7 @@ work=${WORK:-/root/cosmostore-prof/cmp}
 bench=${BENCH:-$work/../bench}
 cpus=${CPUS:-2}
 if [ -n "${CPUSET:-}" ]; then limit="--cpuset-cpus $CPUSET"; else limit="--cpus $cpus"; fi
+if [ -n "${CLIENT_CPUSET:-}" ]; then pin="taskset -c $CLIENT_CPUSET"; else pin=; fi
 SEAWEEDFS_IMAGE=chrislusf/seaweedfs:4.53
 GARAGE_IMAGE=dxflrs/garage:v2.5.0
 RUSTFS_IMAGE=rustfs/rustfs:1.0.4
@@ -120,11 +123,11 @@ docker inspect "$name" --format '{{.Config.Image}}' > "$run/image.txt"
 # bucket's volumes at its first write, which would otherwise land in the first measured phase.
 # It is retried for a minute: RustFS answers 503 for a few seconds after it starts listening.
 for _ in $(seq 1 60); do
-    if AWS_ACCESS_KEY_ID=$KEY AWS_SECRET_ACCESS_KEY=$SECRET "$bench" -endpoint "http://127.0.0.1:$port" -sizes 7 \
+    if AWS_ACCESS_KEY_ID=$KEY AWS_SECRET_ACCESS_KEY=$SECRET $pin "$bench" -endpoint "http://127.0.0.1:$port" -sizes 7 \
         -concurrency 1 -ops 20 -phases put > "$run/warmup.md" 2>&1; then break; fi
     sleep 1
 done
-AWS_ACCESS_KEY_ID=$KEY AWS_SECRET_ACCESS_KEY=$SECRET "$bench" -endpoint "http://127.0.0.1:$port" -pid "${pid:-0}" \
+AWS_ACCESS_KEY_ID=$KEY AWS_SECRET_ACCESS_KEY=$SECRET $pin "$bench" -endpoint "http://127.0.0.1:$port" -pid "${pid:-0}" \
     -sizes "${SIZES:-0,4096,65536,1048576}" -concurrency "${CONCURRENCY:-1,32,128}" -ops "${OPS:-2000}" \
     -read-repeat "${READ_REPEAT:-3}" -label "$server $config" -json "$run/bench.json" > "$run/bench.md" 2>&1 || status=$?
 docker logs "$name" > "$run/server.log" 2>&1
