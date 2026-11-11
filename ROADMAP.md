@@ -1374,3 +1374,20 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - G28 in CeeSafe: a thread pool for `Async.blocking` (an ADR there, then a release);
   - a quiet reference run on the M1, for T1 at 4 KiB and T7.
+
+### 11 Nov 2026: ceesafec 0.36.0, a thread pool for `Async.blocking` (G28 fixed)
+
+- **CeeSafe 0.36.0** fixes G28 (its ADR 0094, raised from this repo's profile): each `Async.run` keeps a pool of
+  worker threads for its `Async.blocking` calls, reused from call to call; idle ones leave after 10 seconds, and the
+  rest are joined when the run ends. A call on Linux goes from 20–27 to 7–9 µs.
+- **What it gives CosmoStore** (b712ef8 without and with the pool, server on two pinned cores, `tools/perf_gate.sh`,
+  5 alternating rounds, passed): small GETs at concurrency 32 1.43 times the throughput, 1 MiB PUTs at 32 1.28 times
+  (p99 0.82 times), small writes 1.07 to 1.10 times, the rest within noise. 1 MiB GETs at 32: about 839 to 1,073 a
+  second; at 128 unchanged (about 740).
+- **The move:** `ceesafe.toml` requires `>=0.36.0`; CI pins v0.36.0. CeeSafe.Web stays at `82a3a73` (its later
+  commits are fuzzing, docs and plans).
+- **Checks on 0.36.0:** check, fmt, the 136 tests (no leaks), S3 and TLS smoke, the 252 s3-tests, boto3, Go, JS and
+  rclone, all passed.
+- **Next:**
+  - profile 1 MiB GETs again on 0.36.0, where `sendmsg` (52% before) is the largest share left;
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7.

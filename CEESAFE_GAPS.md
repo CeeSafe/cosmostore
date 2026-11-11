@@ -36,7 +36,7 @@ boilerplate; **P2** ergonomics.
 | G25 | P2 | std/console | No `Console.flush()`: standard output written before a SIGKILL is lost when it is redirected **Fixed in CeeSafe 0.21.0** (ADR 0077) |
 | G26 | P3 | std/checksums | No CRC-32 (IEEE), the AWS CLI's `x-amz-checksum-crc32`: lib/std has CRC-32C and CRC-64/NVME only. CosmoStore computes it in CeeSafe (`src/storage/checksums/crc32.cee`) |
 | G27 | P2 | std/async-console | `AsyncConsole.writeError` fails when standard error is `/dev/null` (macOS), so a server that checks it exits under `2>/dev/null` |
-| G28 | P2 | runtime/async | `Async.blocking` starts and joins a new OS thread for every call: no pool, so each blocking step costs a `pthread_create` and a join |
+| G28 | P2 | runtime/async | `Async.blocking` starts and joins a new OS thread for every call: no pool, so each blocking step costs a `pthread_create` and a join. **Fixed in CeeSafe 0.36.0** (ADR 0094: a pool of worker threads per `Async.run`, idle ones leaving after 10 s; a call 20–27 to 7–9 µs on Linux). CosmoStore builds with 0.36.0 since 11 Nov 2026 |
 | G29 | P2 | lib/std | `OrderedMap` leaves nodes about half full when keys arrive in order, and reserves a full node's room for whole values: 2.6 times the entries' bytes for in-order inserts |
 | G30 | P2 | runtime/async | Waking a task always writes a byte to the executor's wake pipe, even from the executor's own thread: every `AsyncMutex` unlock with a waiter is a `write` system call |
 | G31 | P2 | lib/std/checksums | `Crc32c` is software only (slicing-by-8, 1.5 GB/s on an M1): no way to use the CPU's CRC32C instructions (ARMv8 `crc32c`, x86 SSE4.2), 4.7 times faster in one chain. **Fixed in CeeSafe 0.30.0** (ADR 0089: the instruction where the CPU has it, asked at run time; `Crc32c.of` 1,652 to 8,147 MB/s on the M1). CosmoStore builds with 0.30.0 since 11 Nov 2026 |
@@ -345,6 +345,14 @@ requires it), so a small request makes four or five of them. Thread creation the
 **Suggested.** A small pool of reusable workers, growing up to a bound and parking idle threads, as Tokio's
 `spawn_blocking` and libuv's thread pool do. The semantics need not change: each call still runs on some thread
 other than the event loop's.
+
+**Fixed in CeeSafe 0.36.0** (2026-11-11, ADR 0094). Each `Async.run` keeps a pool of worker threads for its blocking
+calls, shared by `Async.runWorkers`' workers and reused from call to call; a worker idle for 10 seconds ends, and the
+rest are joined when the run ends. No bound on concurrent calls, so the semantics are unchanged. A loop of
+`Async.blocking` calls on Linux goes from 20–27 to 7–9 µs a call (14–17 to 4–6 µs from 32 tasks). CosmoStore
+(b712ef8, server on two pinned cores, `tools/perf_gate.sh`, 5 rounds): small GETs at concurrency 32 1.43 times the
+throughput, 1 MiB PUTs 1.28 times (p99 0.82 times), small writes 1.07 to 1.10 times; 1 MiB GETs at 32 about 839 to
+1,073 a second. CosmoStore moved to 0.36.0 the same day.
 
 ### G29: `OrderedMap` is half empty after in-order inserts (P2)
 
