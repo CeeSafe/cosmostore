@@ -1391,3 +1391,19 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - profile 1 MiB GETs again on 0.36.0, where `sendmsg` (52% before) is the largest share left;
   - a quiet reference run on the M1, for T1 at 4 KiB and T7.
+
+### 11 Nov 2026: 1 MiB GETs on 0.36.0 and a write buffer of 64 KiB (ADR-0037, `docs/benchmarks/2026-11-11-get-1mib-profile-0.36.md`)
+
+- **Profile on 0.36.0** (Debian server, server on two pinned cores, 60 `gdb` samples, GETs at concurrency 32): no
+  thread starts and no zeroing are left. The event loop, still never idle:
+  - 58% `sendmsg`;
+  - 15% copying the body into CeeSafe.Web's 16 KiB write buffer (`Exchange.write`);
+  - 10% waking a pooled worker for each read.
+- **The pool alone** (A/B, client on other cores): 1 MiB GETs at concurrency 32 from 839–847/s to 1,012–1,079/s.
+- **Change:** `Limits.writeBufferBytes` 64 KiB, from 16 KiB: 1,290–1,322 GETs/s at concurrency 32, 911–1,011 at
+  128 (712–838 before). The gate passed: large GETs 1.11–1.12 times, p99 0.84–0.92; the rest within noise. About
+  9 MiB more RSS after a load at 128; 256 KiB gained little more for 57 MiB.
+- **Next:**
+  - a CeeSafe.Web ADR: `Exchange.write` sending a large slice without copying it into the write buffer;
+  - the pinned comparison again, on 0.36.0 with ADR-0037;
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7.
