@@ -39,7 +39,7 @@ boilerplate; **P2** ergonomics.
 | G28 | P2 | runtime/async | `Async.blocking` starts and joins a new OS thread for every call: no pool, so each blocking step costs a `pthread_create` and a join |
 | G29 | P2 | lib/std | `OrderedMap` leaves nodes about half full when keys arrive in order, and reserves a full node's room for whole values: 2.6 times the entries' bytes for in-order inserts |
 | G30 | P2 | runtime/async | Waking a task always writes a byte to the executor's wake pipe, even from the executor's own thread: every `AsyncMutex` unlock with a waiter is a `write` system call |
-| G31 | P2 | lib/std/checksums | `Crc32c` is software only (slicing-by-8, 1.5 GB/s on an M1): no way to use the CPU's CRC32C instructions (ARMv8 `crc32c`, x86 SSE4.2), 4.7 times faster in one chain |
+| G31 | P2 | lib/std/checksums | `Crc32c` is software only (slicing-by-8, 1.5 GB/s on an M1): no way to use the CPU's CRC32C instructions (ARMv8 `crc32c`, x86 SSE4.2), 4.7 times faster in one chain. **Fixed in CeeSafe 0.30.0** (ADR 0089: the instruction where the CPU has it, asked at run time; `Crc32c.of` 1,652 to 8,147 MB/s on the M1). CosmoStore takes it with its next toolchain move |
 
 ## Status (2026-11-06)
 
@@ -401,6 +401,12 @@ average 60), best of five.
 **Suggested.** An intrinsic or a lib/std path that uses the instruction when the target has it (`__crc32cd` on
 AArch64 with the CRC extension, `_mm_crc32_u64` on x86-64 with SSE4.2), with the table as the fallback. A safe
 `Crc32c.update` keeps its signature, so callers need no change.
+
+**Fixed in CeeSafe 0.30.0** (2026-11-11, ADR 0089). Two hosted runtime functions: one asks the CPU or system once
+(`cpuid`, `sysctlbyname`, `getauxval`), the other runs `crc32q` or `crc32cx`. `Crc32c.update` uses them where the
+instruction exists and the tables elsewhere, with the same API and results. The repro above gives 8,147 MB/s against
+1,652 with 0.29.0 (M1, one chain). CosmoStore builds with 0.24.2 and CeeSafe.Web at `0f7290c`, so it gains this when
+it moves its toolchain (CeeSafe.Web's newer commits need 0.27 or later).
 
 ## Not gaps (checked)
 
