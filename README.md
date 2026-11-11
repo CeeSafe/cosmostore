@@ -118,7 +118,7 @@ There are no dependencies beyond CeeSafe's standard library.
 
 ## Building
 
-You need `ceesafec` 0.20.0 or later (`ceesafe.toml` requires it) and a C compiler.
+You need `ceesafec` 0.30.0 or later (`ceesafe.toml` requires it) and a C compiler.
 
 ```sh
 git clone https://github.com/CeeSafe/cosmostore.git

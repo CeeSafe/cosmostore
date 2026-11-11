@@ -1321,3 +1321,21 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - a quiet reference run on the M1, for T1 at 4 KiB and T7;
   - the comparison run again on pinned cores, when large objects change (G31).
+
+### 11 Nov 2026: ceesafec 0.30.0 and CeeSafe.Web `82a3a73`
+
+- **CeeSafe 0.30.0** fixes G31 (its ADR 0089): `Crc32c` uses the CPU's CRC-32C instruction where the CPU has it,
+  asked at run time, and the tables elsewhere; 1,652 to 8,147 MB/s on the M1, one chain. `ceesafe.toml` now
+  requires 0.30.0, so no build checksums at the old speed.
+- **CeeSafe.Web `82a3a73`** (its toolchain 0.27 move, CeeSafe ADR 0084): route handlers are `Send + Share`. The one
+  change in CosmoStore is `s3Handler`'s type in `src/s3/serve.cee`.
+- **Checks on 0.30.0:** check, fmt, the 136 tests (no leaks), S3 and TLS smoke, the 252 s3-tests, boto3, Go, JS and
+  rclone, all passed.
+- **CI** pins v0.30.0 and `82a3a73`. The perf gate's base now builds with its own commit's pins (`CEESAFE_VERSION`,
+  `CEESAFE_WEB_REF` in its `ci.yml`), so a toolchain move is measured, and a base the new CeeSafe.Web no longer
+  compiles still builds.
+- **Speed:** a 1 MiB A/B on the M1 was inconclusive (load average 3 to 4.7; noise 2.56 against the gate's 2.00), and
+  its writes wait on `fsync`. Measured next on the Debian server's pinned cores.
+- **Next:**
+  - the 1 MiB A/B, 0.24.2 against 0.30.0, on the Debian server's pinned cores; then the comparison run again;
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7.
