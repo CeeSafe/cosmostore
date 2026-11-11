@@ -333,6 +333,10 @@ under 32 concurrent 0-byte PUTs (M4 slice 2, ADR-0022) shows 579 distinct worker
 thread, `pthread_create` and `pthread_join` (with their `mach_vm_map`/`mach_vm_deallocate` of the stack) account for
 about 60 of the 1,600 samples in the request path.
 
+**On Linux, 1 MiB GETs** (11 Nov 2026, `docs/benchmarks/2026-11-11-get-1mib-profile.md`): at concurrency 32 on two
+pinned cores, `clone` and `pthread_create` were 15% of the event loop's samples (9 of 60). The event loop was never
+idle, so this bounds the throughput directly.
+
 **Why it matters.** A storage server sends every store call and every body step through `Async.blocking` (N0295
 requires it), so a small request makes four or five of them. Thread creation then costs about as much as the work.
 

@@ -1360,3 +1360,17 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - profile 1 MiB GETs at concurrency 32 on pinned cores: what bounds them at 60% of SeaweedFS and RustFS;
   - a quiet reference run on the M1, for T1 at 4 KiB and T7.
+
+### 11 Nov 2026: 1 MiB GETs, the profile and a pool of 32 (ADR-0036, `docs/benchmarks/2026-11-11-get-1mib-profile.md`)
+
+- **Profile** (Debian server, server on two pinned cores, 60 `gdb` samples, GETs at concurrency 32): the event
+  loop is never idle. Its time:
+  - 52% `sendmsg` of responses;
+  - 15% zeroing fresh 1 MiB buffers (the pool of 4 ran dry);
+  - 15% starting a thread per `Async.blocking` read (G28).
+- **Change:** the body-buffer pool keeps 32 buffers. Gate on pinned cores: 1 MiB GETs at concurrency 32 1.13 times
+  the throughput, p99 0.90; nothing else moved. With the client on other cores, 819 to 859/s from 664 to 715.
+  Idle RSS after load about 220 MiB, from 100. ADR-0034's p99 rise with 32 did not come back.
+- **Next:**
+  - G28 in CeeSafe: a thread pool for `Async.blocking` (an ADR there, then a release);
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7.

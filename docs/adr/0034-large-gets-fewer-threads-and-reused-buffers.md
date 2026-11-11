@@ -32,7 +32,8 @@
 - **A pool of 32 buffers.** On the Debian server (8 MiB L3) it raised 1 MiB GETs' p99 at concurrency 32 by about
   half (1.51 to 1.58 times, over 5 rounds, in each variant that had it), for no throughput. The channel hands its
   buffers out in turn, so 32 MiB cycled through the cache, where glibc's `malloc` gives back the block just freed.
-  With 4, the p99 is unchanged.
+  With 4, the p99 is unchanged. *Revisited in ADR-0036:* on pinned cores, without the CPU quota, a pool of 32 gave
+  1 MiB GETs at concurrency 32 1.13 times the throughput and 0.90 times the p99.
 - **Skipping the CRC check on reads.** It is the largest cost, but it is what finds a damaged extent (ADR-0003).
   SeaweedFS checks its CRC on reads too. The fix is a faster CRC32C, which is CeeSafe's (G31).
 - **A smaller body buffer,** to make zeroing cheaper: more reads, and so more worker threads (G28).
