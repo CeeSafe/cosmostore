@@ -143,7 +143,7 @@ The dependencies are CeeSafe's standard library and CeeSafe.Web's packages (`cee
 
 ## Building
 
-You need `ceesafec` 0.36.0 or later (`ceesafe.toml` requires it), a C compiler and OpenSSL 3 (Homebrew `openssl@3`
+You need `ceesafec` 0.38.0 or later (`ceesafe.toml` requires it), a C compiler and OpenSSL 3 (Homebrew `openssl@3`
 on macOS). CeeSafe.Web is used by path, from a checkout two directories up; CI pins the commit it was last built
 against (`CEESAFE_WEB_REF` in `.github/workflows/ci.yml`).
 

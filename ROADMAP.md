@@ -1475,3 +1475,19 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - a quiet reference run on the M1, for T1 at 4 KiB and T7;
   - `serve` raising its own open-file limit once CeeSafe can (G32).
+
+### 12 Nov 2026: ceesafec 0.38.0
+
+- **CeeSafe 0.37.0 and 0.38.0** (released by other sessions): a plain static of scalar data is C's `const`
+  (ADR 0098); `resize` takes zeroed memory (ADR 0099); check elimination for equality tests, binary searches and
+  resized vectors (ADR 0100); the system allocator's inline path (ADR 0101).
+- **The move:** `ceesafe.toml` requires `>=0.38.0`; CI pins v0.38.0. CeeSafe.Web stays at `c799f14` (nothing newer).
+- **Gate** (`70396d5` built with 0.36.0 and with 0.38.0, Debian, pinned cores, 5 rounds): passed, every group
+  within noise (throughput 0.98 to 1.02, p99 0.98 to 1.01).
+- **1 MiB GETs** (client on other cores, 3 rounds): at concurrency 128, 1,451–1,506/s from 1,182–1,250 (1.2 times),
+  median 77–81 ms from 88–101, p99 within noise; at 32 unchanged.
+- **Checks on 0.38.0:** check, fmt, the 143 tests (no leaks), S3 and TLS smoke, the 252 s3-tests, boto3, Go, JS and
+  rclone, all passed.
+- **Next:**
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7 (this Mac was busy: a VM at a full core, load average 44);
+  - `serve` raising its own open-file limit once CeeSafe can (G32).
