@@ -73,7 +73,9 @@ gaps where compaction removed segments.
   could not be *read* is an I/O error, and the open fails. Treating it as torn would wipe the segment
   (ADR-0004, bug 1).
 - **A rotation that fails after its batch was synced** does not un-acknowledge the batch. `commit` returns Ok,
-  and the journal is failed, so the next commit reports the error (ADR-0004, bug 4).
+  and the journal is failed, so the next commit reports the error (ADR-0004, bug 4). *Amended by ADR-0039:* the
+  journal fails only when the rotation leaves a file it cannot remove; otherwise the active segment grows and the next
+  commit rotates.
 
 Tests: `journal_tests.cee` truncates at every byte, flips bits in sealed and acknowledged regions, and checks
 rotation. `object_store_tests.cee` has the store-level crash-at-every-byte consistency test.

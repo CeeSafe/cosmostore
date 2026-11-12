@@ -123,7 +123,7 @@ through CeeSafe.Web's `web_tls` ([ADR-0016](docs/adr/0016-listen-address-and-tls
 | `src/storage/extent/` | Extent files, the manifest codec, `ObjectWriter` and `ExtentReader`. |
 | `src/metadata/` | The version-first object model, its codecs, S3 bucket-name rules, and the ordered index. |
 | `src/store/` | `ObjectStore` (buckets, objects, listing, uploads, space, verify), checkpoints and compaction, and their tests. |
-| `docs/adr/` | The design decisions, ADR-0001 to ADR-0038. |
+| `docs/adr/` | The design decisions, ADR-0001 to ADR-0039. |
 | `docs/benchmarks/` | Dated benchmark reports, with their raw data. |
 | `tools/` | The S3 smoke and TLS tests, the SDK checks (`sdk/`), the s3-tests runner (`s3tests/`), the load generator (`bench/`), the p99 gate (`perf_gate.sh`), the comparison run (`compare/`) and the soak. |
 
@@ -175,6 +175,11 @@ cosmostore soak  <dir> <seconds> <keys> <capacity-bytes>
   addresses a bucket as well as `/<bucket>/` paths. With `--tls-cert` and `--tls-key` it serves TLS, and reloads the
   files when they change. `--maintain-seconds` (10) sets the upkeep round, and `--upload-expiry-hours` (168; 0 never)
   when unfinished multipart uploads are aborted.
+
+  Raise the open-file limit first (`ulimit -n 10240`): the server holds a descriptor per connection and per upload in
+  progress, and macOS's default of 256 ran out under 128 concurrent uploads above 128 KiB. It cannot raise the limit
+  itself yet (CEESAFE_GAPS G32); when it runs out, requests get 503 and the store keeps going
+  ([ADR-0039](docs/adr/0039-out-of-descriptors-the-journal-keeps-going.md)).
 
   ```sh
   echo "mykey mysecret" > creds
@@ -263,7 +268,7 @@ Other entry points:
 ## Testing
 
 ```sh
-ceesafec test                 # unit, crash and fault-injection tests (136)
+ceesafec test                 # unit, crash and fault-injection tests (143)
 ceesafec test --sweep alloc   # the same tests, failing each allocation in turn
 ceesafec fmt --check
 ceesafec build && tools/s3_smoke.sh   # the server through the AWS CLI v2

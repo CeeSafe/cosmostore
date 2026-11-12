@@ -199,10 +199,21 @@ fn journalFaultsOnceDuringRecovery() -> Result<void, TestFailure> =>
 fn journalFaultsCrashDuringRecovery() -> Result<void, TestFailure> =>
     sweepJournalRecovery("jfault-recover-crash", SweepMode.Crash);
 
+/// How many segment files `dir` holds.
+fn segmentFileCount(dir: StringView) -> u64 {
+    var n: u64 = 0;
+    let names = Directory.list(dir)!;
+    for (name in names) {
+        if (name.view().startsWith("seg-")) { n += 1; }
+    }
+    return n;
+}
+
 @test
 fn journalRotationFailureStillAcknowledges() -> Result<void, TestFailure> {
-    // The batch that fills a segment is synced before the next segment is created. If creating
-    // it fails, the batch is still durable, so commit is Ok and the next commit fails.
+    // The batch that fills a segment is synced before the next segment is created (ADR-0004, bug 4). If creating it
+    // fails, the batch is still durable, so commit is Ok; nothing was created, so the journal keeps the active
+    // segment and rotates at the next commit (ADR-0039).
     let dir = scratchDirectory("jfault-rotate");
     let config = JournalConfig { segmentTargetBytes: 100, maxBatchBytes: 4096, shardId: 0 };
     {
@@ -214,10 +225,116 @@ fn journalRotationFailureStillAcknowledges() -> Result<void, TestFailure> {
         j.commit()!;
         Faults.disarm();
         Check.equalU64(1, Faults.fired())?;
+        Check.isTrue(!j.isFailed(), "a rotation that created nothing does not fail the journal")?;
+        Check.equalU64(1, j.activeSegment())?;
+        Check.equalU64(1, j.rotationFailureCount())?;
+        Check.equalU64(1, segmentFileCount(dir.view()))?;
+        // The next commit writes to the same segment, then rotates.
+        payloadFor(2, mut payload);
+        j.stage(RecordType.PutInline, "bucket\0key".bytes(), payload.view())!;
+        j.commit()!;
+        Check.equalU64(2, j.activeSegment())?;
+    }
+    let lsns = replay(dir.view(), config)!;
+    checkContiguous(borrow lsns, 2, 2)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// A rotation that fails after creating the next segment's file (`op`: 4 the header's write, 5 its sync, 6 the
+/// directory's sync) removes the file durably and goes on; a crash afterwards finds the active segment the newest.
+fn rotationFailsAfterCreating(name: StringView, op: u64) -> Result<void, TestFailure> {
+    let dir = scratchDirectory(name);
+    let config = JournalConfig { segmentTargetBytes: 100, maxBatchBytes: 4096, shardId: 0 };
+    {
+        var j = Journal.open(dir.view(), config, (s, o, h, b) => {})!;
+        var payload = Vector<u8>.create();
+        payloadFor(1, mut payload);
+        j.stage(RecordType.PutInline, "bucket\0key".bytes(), payload.view())!;
+        Faults.track();
+        Faults.failAt(op, false, false);
+        j.commit()!;
+        Check.equalU64(1, Faults.fired())?;
+        Check.isTrue(!j.isFailed(), "a rotation whose file was removed does not fail the journal")?;
+        Check.equalU64(1, j.activeSegment())?;
+        Check.equalU64(1, segmentFileCount(dir.view()))?;
+        // A torn batch in the active segment must still read as torn after a crash, not as corruption: write one
+        // without syncing it.
+        payloadFor(2, mut payload);
+        j.stage(RecordType.PutInline, "bucket\0key".bytes(), payload.view())!;
+        let ticket = j.writeStaged()!;
+        Check.isTrue(ticket.isSome(), "the batch is written")?;
+    }
+    Faults.disarm();
+    Check.equalU64(0, Faults.violations())?;
+    Faults.crash(dir.view())!;
+    Check.equalU64(1, segmentFileCount(dir.view()))?;
+    let lsns = replay(dir.view(), config)!;
+    checkContiguous(borrow lsns, 1, 2)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn journalRotationFailsAtTheHeaderWrite() -> Result<void, TestFailure> =>
+    rotationFailsAfterCreating("jfault-rotate-header", 4);
+
+@test
+fn journalRotationFailsAtTheHeaderSync() -> Result<void, TestFailure> =>
+    rotationFailsAfterCreating("jfault-rotate-sync", 5);
+
+@test
+fn journalRotationFailsAtTheDirectorySync() -> Result<void, TestFailure> =>
+    rotationFailsAfterCreating("jfault-rotate-dirsync", 6);
+
+@test
+fn journalRotationThatCannotBeUndoneFailsTheJournal() -> Result<void, TestFailure> {
+    // The header's write fails, and so does every later operation: the new file cannot be removed, so the journal
+    // fails (ADR-0001), though the batch that filled the segment is acknowledged.
+    let dir = scratchDirectory("jfault-rotate-stuck");
+    let config = JournalConfig { segmentTargetBytes: 100, maxBatchBytes: 4096, shardId: 0 };
+    {
+        var j = Journal.open(dir.view(), config, (s, o, h, b) => {})!;
+        var payload = Vector<u8>.create();
+        payloadFor(1, mut payload);
+        j.stage(RecordType.PutInline, "bucket\0key".bytes(), payload.view())!;
+        Faults.failAt(4, true, false);
+        j.commit()!;
+        Faults.disarm();
+        Check.isTrue(j.isFailed(), "a file that cannot be removed fails the journal")?;
+        Check.isTrue(j.failureCause().isSome(), "the cause is kept")?;
         match (j.stage(RecordType.PutInline, "bucket\0key".bytes(), payload.view())) {
             Err(JournalError.Failed) => {}
-            _ => { return Check.fail("a journal whose rotation failed must refuse writes"); }
+            _ => { return Check.fail("a failed journal refuses writes"); }
         }
+    }
+    let lsns = replay(dir.view(), config)!;
+    checkContiguous(borrow lsns, 1, 1)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn journalSyncHandleFailureFallsBackToCommit() -> Result<void, TestFailure> {
+    // `writeStaged` opens the sync ticket's handle before it writes. If that open fails (out of descriptors), nothing
+    // was written: no ticket, the journal is not failed, and `commit` makes the batch durable (ADR-0039).
+    let dir = scratchDirectory("jfault-ticket");
+    let config = JournalConfig { segmentTargetBytes: 1 << 20, maxBatchBytes: 4096, shardId: 0 };
+    {
+        var j = Journal.open(dir.view(), config, (s, o, h, b) => {})!;
+        var payload = Vector<u8>.create();
+        payloadFor(1, mut payload);
+        j.stage(RecordType.PutInline, "bucket\0key".bytes(), payload.view())!;
+        Faults.failAt(1, false, false); // the open of the ticket's handle
+        let ticket = j.writeStaged()!;
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired())?;
+        Check.isTrue(ticket.isNull(), "no ticket without a handle")?;
+        Check.isTrue(!j.isFailed(), "a failed open before any write does not fail the journal")?;
+        Check.equalU64(1, j.syncHandleFallbackCount())?;
+        Check.equalU64(1, j.pendingRecords() as u64)?;
+        j.commit()!;
+        Check.equalU64(1, j.committedCount())?;
     }
     let lsns = replay(dir.view(), config)!;
     checkContiguous(borrow lsns, 1, 1)?;

@@ -1457,3 +1457,21 @@ Browser form uploads with a SigV4 POST policy.
   - an ADR: a failed open before any write does not fail the journal, a failed rotation is retried, and the cause is
     logged (with a fault sweep);
   - a quiet reference run on the M1, for T1 at 4 KiB and T7.
+
+### 12 Nov 2026: out of descriptors, the journal keeps going (ADR-0039)
+
+- **The Mac mini's failure, fixed:** a group commit whose sync handle cannot be opened gives no ticket, and the
+  leader commits the batch under the store's lock instead; nothing was written, so nothing is failed or rewound. A
+  failed rotation leaves the journal running when nothing it created is left behind: the file is removed and the
+  directory synced before the active segment takes another record, or the journal fails as before.
+- **"Too many open files" is a 503**, which SDKs retry; the journal's failure is logged once with its cause, and
+  maintenance errors name the operation and errno. The stats count `journalRotationFailures` and
+  `journalSyncHandleFallbacks`.
+- **On the mini at 256 open files:** 84 of 1,000 concurrent 256 KiB PUTs and 9 overwrites got 503, then every later
+  phase ran without errors; fsck clean. Before, the store refused every write until a restart.
+- **Tests:** five journal fault tests (each rotation step, the crash model with an unsynced batch, a removal that
+  fails, the ticket's open), one for the store, one for the 503. Breaking the fix in a copy is caught. The fault
+  sweeps pass unchanged.
+- **Next:**
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7;
+  - `serve` raising its own open-file limit once CeeSafe can (G32).

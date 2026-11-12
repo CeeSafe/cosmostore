@@ -108,10 +108,16 @@ struct Journal {
     private pending: Vector<u8>;
     private pendingCount: u32;
     private failed: bool;
+    /// The I/O failure that failed the journal, for the log (ADR-0039).
+    private failure: IoFailure?;
     private config: JournalConfig;
     /// Stats: data syncs performed and records committed.
     private syncs: u64;
     private committed: u64;
+    /// Stats: rotations that failed and left the journal running, and group commits that synced under the caller's
+    /// lock because the sync ticket's handle could not be opened (ADR-0039).
+    private rotationFailures: u64;
+    private syncHandleFallbacks: u64;
     /// Sealed segments that recovery skipped (before the checkpoint's segment), with sizes.
     private unscanned: Vector<SegmentFile>;
     /// Read handles of sealed segments, so a GET of an inline object does not open a file.
@@ -213,9 +219,12 @@ struct Journal {
             pending: Vector<u8>.create(),
             pendingCount: 0,
             failed: false,
+            failure: null,
             config: config,
             syncs: 0,
             committed: 0,
+            rotationFailures: 0,
+            syncHandleFallbacks: 0,
             unscanned: unscanned,
             sealedFiles: sealedFiles,
         });
@@ -225,10 +234,22 @@ struct Journal {
     fn createSegment(dir: StringView, id: u64, firstLsn: u64, shardId: u32) -> Result<DurableFile, JournalError> {
         let path = segmentPath(dir, id)?;
         let file = DurableFile.createNew(path.view())?;
-        writeSegmentHeader(borrow file, id, firstLsn, shardId)?;
+        Journal.initSegment(borrow file, dir, id, firstLsn, shardId)?;
+        return Ok(file);
+    }
+
+    /// Writes a new segment's header and makes the file and its directory entry durable.
+    fn initSegment(
+        file: borrow DurableFile,
+        dir: StringView,
+        id: u64,
+        firstLsn: u64,
+        shardId: u32,
+    ) -> Result<void, JournalError> {
+        writeSegmentHeader(file, id, firstLsn, shardId)?;
         file.syncData()?;
         Fs.syncDirectory(dir)?;
-        return Ok(file);
+        return Ok();
     }
 
     /// The LSN the next staged record gets.
@@ -242,8 +263,18 @@ struct Journal {
 
     fn syncCount(borrow this) -> u64 => this.syncs;
 
-    /// Whether a write, sync or rotation failed; the journal refuses records until reopened.
+    /// Whether a write or sync failed (or a failed rotation could not be undone); the journal refuses records until
+    /// reopened.
     fn isFailed(borrow this) -> bool => this.failed;
+
+    /// The I/O failure that failed the journal, if one did.
+    fn failureCause(borrow this) -> IoFailure? => this.failure;
+
+    /// Rotations that failed and left the journal running (ADR-0039).
+    fn rotationFailureCount(borrow this) -> u64 => this.rotationFailures;
+
+    /// Group commits whose sync handle could not be opened, so they synced under the caller's lock (ADR-0039).
+    fn syncHandleFallbackCount(borrow this) -> u64 => this.syncHandleFallbacks;
 
     fn committedCount(borrow this) -> u64 => this.committed;
 
@@ -314,17 +345,20 @@ struct Journal {
     /// Group commit, first half (ADR-0022): writes the staged batch without syncing it, and
     /// returns a ticket whose `sync` makes it durable. The sync runs without the caller's lock,
     /// while later records are staged; `finishSync` then records its result. Returns null when
-    /// nothing is staged, or when a batch is already in flight (one at a time). On error the
-    /// journal is failed.
+    /// nothing is staged, when a batch is already in flight (one at a time), or when the ticket's
+    /// handle cannot be opened (out of descriptors): then nothing was written, and the caller
+    /// commits the batch with `commit` (ADR-0039). A failed write fails the journal.
     fn writeStaged(borrow mut this) -> Result<SyncTicket?, JournalError> {
         if (this.failed) { return Err(JournalError.Failed); }
         if (this.pendingCount == 0 || this.inflight) { return Ok(null); }
         let path = segmentPath(this.dir.view(), this.segmentId)?;
         let handle = match (DurableFile.openReadWrite(path.view())) {
             Ok(f) => f,
-            Err(e) => {
-                let _ = this.fail(e);
-                return Err(JournalError.Io(e));
+            Err(_) => {
+                // Nothing was written, so the journal is as it was: the batch stays staged, and the caller commits it
+                // with the journal's own handle (ADR-0039).
+                this.syncHandleFallbacks += 1;
+                return Ok(null);
             }
         };
         match (this.file.writeAt(this.pending.view(), this.writtenEnd)) {
@@ -380,37 +414,66 @@ struct Journal {
 
     fn fail(borrow mut this, e: IoFailure) -> Result<void, JournalError> {
         this.failed = true;
+        this.failure = e;
         this.inflight = false;
         this.pending.clear();
         this.pendingCount = 0;
         return Err(JournalError.Io(e));
     }
 
+    /// Starts the next segment. If that fails, the journal keeps the active segment, which grows past its target until
+    /// a later commit rotates (ADR-0039), unless a file was left that cannot be removed: a crash could then find it as
+    /// the newest segment with this one sealed behind it, and a torn batch here would read as corruption (ADR-0001).
+    /// Then the journal fails.
     fn rotate(borrow mut this) -> Result<void, JournalError> {
         let id = this.segmentId + 1;
-        match (Journal.createSegment(this.dir.view(), id, this.nextLsn, this.config.shardId)) {
-            Ok(file) => {
-                // Keep a read handle of the segment being sealed (best effort: a cache).
-                match (segmentPath(this.dir.view(), this.segmentId)) {
-                    Ok(path) => {
-                        match (DurableFile.openRead(path.view())) {
-                            Ok(sealed) => { let _ = this.sealedFiles.put(this.segmentId, sealed); }
-                            Err(_) => {}
-                        }
-                    }
-                    Err(_) => {}
-                }
-                this.file = file;
-                this.segmentId = id;
-                this.writeOffset = SEGMENT_HEADER_LEN as u64;
-                this.writtenEnd = this.writeOffset;
-                return Ok();
-            }
+        let path = segmentPath(this.dir.view(), id)?;
+        let file = match (DurableFile.createNew(path.view())) {
+            Ok(f) => f,
             Err(e) => {
-                this.failed = true;
+                // An existing file is not this rotation's: leave it, and stop.
+                if (e.isAlreadyExists()) {
+                    this.failed = true;
+                    this.failure = e;
+                }
+                this.rotationFailures += 1;
+                return Err(JournalError.Io(e));
+            }
+        };
+        match (Journal.initSegment(borrow file, this.dir.view(), id, this.nextLsn, this.config.shardId)) {
+            Ok() => {}
+            Err(e) => {
+                // The new file must be gone, durably, before the active segment takes another record.
+                let removed = match (Fs.unlink(path.view())) {
+                    Ok() => Fs.syncDirectory(this.dir.view()).isOk(),
+                    Err(_) => false,
+                };
+                if (!removed) {
+                    this.failed = true;
+                    this.failure = match (e) {
+                        JournalError.Io(f) => f,
+                        _ => null,
+                    };
+                }
+                this.rotationFailures += 1;
                 return Err(e);
             }
         }
+        // Keep a read handle of the segment being sealed (best effort: a cache).
+        match (segmentPath(this.dir.view(), this.segmentId)) {
+            Ok(sealedPath) => {
+                match (DurableFile.openRead(sealedPath.view())) {
+                    Ok(sealed) => { let _ = this.sealedFiles.put(this.segmentId, sealed); }
+                    Err(_) => {}
+                }
+            }
+            Err(_) => {}
+        }
+        this.file = file;
+        this.segmentId = id;
+        this.writeOffset = SEGMENT_HEADER_LEN as u64;
+        this.writtenEnd = this.writeOffset;
+        return Ok();
     }
 
     /// Reads committed bytes of a segment: `into.length` bytes at `offset`.

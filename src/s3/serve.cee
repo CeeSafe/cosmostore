@@ -239,15 +239,63 @@ async fn maintainAndReload(
     return Err(NetError.Closed);
 }
 
+/// Whether the journal's failure has been logged: once per process, since a failed journal stays failed.
+static JOURNAL_FAILURE_LOGGED: AtomicBool = AtomicBool.constant(false);
+
 async fn upkeep(store: borrow Arc<AsyncMutex<ObjectStore>>) {
+    await logJournalFailure(store);
     match (await maintainOnce(store)) {
         Ok() => {}
         Err(e) => {
             let _ = await AsyncConsole.writeError("cosmostore: maintenance failed: ");
-            let _ = await AsyncConsole.writeError(describe(e));
-            let _ = await AsyncConsole.writeError("\n");
+            let _ = await AsyncConsole.writeError(storeErrorLine(e).view());
         }
     }
+}
+
+/// Logs once, with its cause, that the journal failed and the store refuses writes (ADR-0039).
+async fn logJournalFailure(store: borrow Arc<AsyncMutex<ObjectStore>>) {
+    if (JOURNAL_FAILURE_LOGGED.load()) { return; }
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return; }
+    };
+    let s = guard.data();
+    if (!s.hasFailed()) { return; }
+    JOURNAL_FAILURE_LOGGED.store(true);
+    var line = String.create();
+    let _ = line.append("cosmostore: the journal failed");
+    match (s.journalFailure()) {
+        Some(f) => {
+            let _ = line.append(" (");
+            appendIoFailure(mut line, f);
+            let _ = line.append(")");
+        }
+        null => {}
+    }
+    let _ = line.append("; writes are refused until a restart\n");
+    let _ = await AsyncConsole.writeError(line.view());
+}
+
+/// A store error for the log, with the OS error number of an I/O failure: "open (errno 24)\n".
+fn storeErrorLine(e: StoreError) -> String {
+    var line = String.create();
+    match (e) {
+        StoreError.Journal(JournalError.Io(f)) => {
+            let _ = line.append("journal ");
+            appendIoFailure(mut line, f);
+        }
+        StoreError.Io(f) => { appendIoFailure(mut line, f); }
+        _ => { let _ = line.append(describe(e)); }
+    }
+    let _ = line.append("\n");
+    return line;
+}
+
+fn appendIoFailure(line: borrow mut String, f: IoFailure) {
+    let _ = line.append(ioOpName(f.op));
+    let _ = line.append(" failed, errno ");
+    let _ = line.appendNumber(f.errno as i64);
 }
 
 async fn maintainOnce(store: borrow Arc<AsyncMutex<ObjectStore>>) -> Result<void, StoreError> {

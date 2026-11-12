@@ -19,6 +19,33 @@ fn missing(s: borrow ObjectStore, key: StringView) -> bool => match (s.getObject
 };
 
 @test
+fn groupSyncWithoutAHandleCommitsUnderTheLock() -> Result<void, TestFailure> {
+    // Out of descriptors, the ticket's handle cannot be opened: `beginGroupSync` gives no ticket and leaves the batch
+    // staged, the journal running, and `commitStaged` (the leader's fallback in `writeBatch`) publishes it (ADR-0039).
+    let dir = scratchDirectory("group-no-handle");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("grp")!;
+        let a = deferText(mut s, "a", "one");
+        Faults.failAt(1, false, false); // the open of the ticket's handle
+        let ticket = s.beginGroupSync()!;
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired())?;
+        Check.isTrue(ticket.isNull(), "no ticket without a handle")?;
+        Check.isTrue(!s.hasFailed(), "the store keeps going")?;
+        Check.isTrue(!s.isPublished(a), "nothing was written yet")?;
+        Check.equalU64(1, s.journalSyncHandleFallbacks())?;
+        let _ = s.commitStaged()!;
+        Check.isTrue(s.isPublished(a), "the commit under the lock publishes the batch")?;
+        checkText("one", s.getObject("grp", "a")!)?;
+    }
+    let r = ObjectStore.open(dir.view(), storeConfig())!;
+    checkText("one", r.getObject("grp", "a")!)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
 fn groupSyncPublishesOnlyItsBatch() -> Result<void, TestFailure> {
     let dir = scratchDirectory("group-basic");
     {

@@ -75,7 +75,8 @@ they keep every extent file. So three questions were untested:
 4. **A rotation failure discarded a durable batch.** If creating the next segment failed after a batch was
    synced, `commit` reported an error and the store did not apply that batch. Later reads were stale, and the
    batch reappeared after a restart. Now `commit` is Ok because the batch is durable, and the failed rotation
-   fails the journal, so the next commit reports it.
+   fails the journal, so the next commit reports it. *Amended by ADR-0039:* the journal fails only when the
+   rotation leaves a file it cannot remove.
 
 ## Consequences
 
