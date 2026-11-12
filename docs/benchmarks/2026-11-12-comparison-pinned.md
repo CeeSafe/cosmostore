@@ -71,8 +71,8 @@ without a copy). Each change's own A/B is in its ADR and the ROADMAP.
 
 ## Anomalies and limits
 
-- **p99 of 1 MiB GETs at concurrency 128:** 183 ms here, down from 267 ms on 11 Nov, but ADR-0038's A/B found it 20%
-  above ADR-0037's 64 KiB build; that is still open.
+- **p99 of 1 MiB GETs at concurrency 128:** 183 ms here, down from 267 ms on 11 Nov. Against ADR-0037's 64 KiB
+  build, ADR-0038 found the p99 within noise and the p99.9 higher.
 - **Garage, 4 KiB GET:** the 48 ms p99 at concurrency 1 and 32 in both configurations (23 and 720/s) is still there,
   as on 10 and 11 Nov.
 - **One run per configuration.** Differences under about 20% between servers should not be read as real.

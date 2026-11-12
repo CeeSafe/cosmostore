@@ -1416,8 +1416,8 @@ Browser form uploads with a SigV4 POST policy.
 - **Change:** `s3Server` drops ADR-0037's 64 KiB `Limits.writeBufferBytes`; the default, 16 KiB, is back, and each
   HTTP/1.1 connection holds 32 KiB of write buffers, not 128.
 - **1 MiB GETs** (Debian server, server on two pinned cores, client on others, 3 alternating rounds, against
-  `fe50ca3`): 1,333–1,360/s at concurrency 32 (1,284–1,331 before); 1,218–1,343/s at 128 (924–981), with p99 at 128
-  223–278 ms from 187–206.
+  `fe50ca3`, 5 rounds): about the same at concurrency 32; 1,237–1,294/s at 128 (875–964 before), median latency
+  87–96 ms from 128–144, p99 within noise (180–222 against 175–195 ms), p99.9 192–253 from 180–201.
 - **Gate** (`tools/perf_gate.sh` against `fe50ca3`, 5 rounds, pinned cores): passed; large GETs 1.06–1.08 times,
   p99 0.98–1.00; the rest within noise.
 - **Checks:** check, fmt, the 136 tests (no leaks), S3 and TLS smoke, the 252 s3-tests, boto3, Go, JS and rclone,
@@ -1438,5 +1438,4 @@ Browser form uploads with a SigV4 POST policy.
 - **Behind the servers without fsync** only at concurrency 1 (small writes and deletes, 1 MiB writes and deletes)
   and for 1 MiB PUTs and overwrites at 32 (0.87 to 0.91 times). Peak RSS 279 MiB.
 - **Next:**
-  - the p99 of 1 MiB GETs at concurrency 128 (ADR-0038: 20% above the 64 KiB build);
   - a quiet reference run on the M1, for T1 at 4 KiB and T7.

@@ -22,19 +22,21 @@
 
 ## Measurements
 
-Debian server, server on cores 2 and 3, `tools/bench` on 0, 1, 4 and 5, no quota, 1 MiB PUTs then GETs, 3
-alternating rounds. Base: `fe50ca3` (64 KiB, CeeSafe.Web `82a3a73`); head: this change (16 KiB, `c799f14`); both on
-ceesafec 0.36.0.
+Debian server, server on cores 2 and 3, `tools/bench` on 0, 1, 4 and 5, no quota, 1 MiB PUTs then GETs (1,000
+a phase), 5 alternating rounds. Base: `fe50ca3` (64 KiB, CeeSafe.Web `82a3a73`); head: this change (16 KiB,
+`c799f14`); both on ceesafec 0.36.0. Latencies in ms.
 
-| Build | GETs/s, c32 | p99, c32 (ms) | GETs/s, c128 | p99, c128 (ms) |
-|---|---:|---:|---:|---:|
-| 64 KiB, with the copy (`fe50ca3`) | 1,284 to 1,331 | 74 to 94 | 924 to 981 | 187 to 206 |
-| **16 KiB, without the copy** | **1,333 to 1,360** | **64 to 81** | **1,218 to 1,343** | **223 to 278** |
+| Build | GETs/s, c32 | p99, c32 | GETs/s, c128 | p50, c128 | p99, c128 | p99.9, c128 |
+|---|---:|---:|---:|---:|---:|---:|
+| 64 KiB, with the copy (`fe50ca3`) | 1,289 to 1,329 | 53 to 62 | 875 to 964 | 128 to 144 | 175 to 195 | 180 to 201 |
+| **16 KiB, without the copy** | **1,285 to 1,362** | **57 to 66** | **1,237 to 1,294** | **87 to 96** | **180 to 222** | **192 to 253** |
 
-- **Concurrency 128:** about 1.3 times the GETs. Its p99 rose by about a fifth, not yet explained; a likely
-  reason is that more requests are in flight at once, each sent in one large write, so the slowest wait longer for
-  their turn on two cores. The gate (concurrency 1 and 32) does not run at 128.
-- **Concurrency 32:** a little more throughput, p99 within noise.
+- **Concurrency 128:** about 1.35 times the GETs, and the median request a third faster. The p99 ranges overlap
+  (medians 193 and 193 ms). The p99.9, at 1,000 GETs a phase about the slowest request, is higher: the latencies
+  spread out once requests no longer queue behind 64 copies each.
+- **Concurrency 32:** throughput and p99 within noise.
+- *Corrected 12 Nov 2026:* a first 3-round run reported 223 to 278 ms against 187 to 206 as the p99 at concurrency
+  128; its script printed the p99.9 column under that name. The table above prints every percentile.
 - **Memory:** after a load at concurrency 128, 228 and 264 MiB at 64 KiB, 250 and 199 MiB at 16 KiB. The run to run
   spread (the body-buffer pool, the allocator) hides the 12 MiB the smaller buffers save at 128 connections.
 
