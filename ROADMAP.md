@@ -1407,3 +1407,21 @@ Browser form uploads with a SigV4 POST policy.
   - a CeeSafe.Web ADR: `Exchange.write` sending a large slice without copying it into the write buffer;
   - the pinned comparison again, on 0.36.0 with ADR-0037;
   - a quiet reference run on the M1, for T1 at 4 KiB and T7.
+
+### 12 Nov 2026: CeeSafe.Web `c799f14` and back to a 16 KiB write buffer (ADR-0038)
+
+- **CeeSafe.Web** (its ADR 0013 amendment 4, PR #12 from this repo's profile): over HTTP/1.1, `Exchange.write`
+  sends a slice at least as large as its write buffer straight to the socket, without copying it into the buffer.
+  CI pins `c799f14`, from `82a3a73`.
+- **Change:** `s3Server` drops ADR-0037's 64 KiB `Limits.writeBufferBytes`; the default, 16 KiB, is back, and each
+  HTTP/1.1 connection holds 32 KiB of write buffers, not 128.
+- **1 MiB GETs** (Debian server, server on two pinned cores, client on others, 3 alternating rounds, against
+  `fe50ca3`): 1,333–1,360/s at concurrency 32 (1,284–1,331 before); 1,218–1,343/s at 128 (924–981), with p99 at 128
+  223–278 ms from 187–206.
+- **Gate** (`tools/perf_gate.sh` against `fe50ca3`, 5 rounds, pinned cores): passed; large GETs 1.06–1.08 times,
+  p99 0.98–1.00; the rest within noise.
+- **Checks:** check, fmt, the 136 tests (no leaks), S3 and TLS smoke, the 252 s3-tests, boto3, Go, JS and rclone,
+  all passed.
+- **Next:**
+  - the pinned comparison again, on 0.36.0 and `c799f14`;
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7.

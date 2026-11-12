@@ -1,6 +1,6 @@
 # ADR-0037: A write buffer of 64 KiB
 
-**Status:** accepted for M4 (`src/s3/serve.cee`), 11 Nov 2026
+**Status:** accepted for M4 (`src/s3/serve.cee`), 11 Nov 2026; superseded by ADR-0038 (12 Nov 2026), once CeeSafe.Web sent large writes without the copy
 
 ## Context
 
