@@ -1439,3 +1439,21 @@ Browser form uploads with a SigV4 POST policy.
   and for 1 MiB PUTs and overwrites at 32 (0.87 to 0.91 times). Peak RSS 279 MiB.
 - **Next:**
   - a quiet reference run on the M1, for T1 at 4 KiB and T7.
+
+### 12 Nov 2026: the M4 matrix on an Intel Mac mini (`docs/benchmarks/2026-11-12-mac-mini-intel.md`)
+
+- **A second machine, not the reference:** a 2018 Mac mini (Intel Core i7-8700B, Apple SSD), `805464a` on
+  ceesafec 0.36.0's `osx-x64` build, the reference run's matrix. One sync costs 22 ms there, 4.3 times the M1's.
+- **Counted in syncs, it matches the M1:** 64 syncs per 1,000 tiny PUTs at concurrency 32 (T2) on both, so T1 runs
+  at 688 to 694/s, 0.23 times the M1 as the sync rate; T3's p99 is 2.1 to 2.3 syncs on both. T5, T6 and T12 are
+  met outright; reads are 1.1 to 1.3 times the M1, 1 MiB GETs 2.95 times. T7: 13 of 30 phases over 50 ms, the worst
+  140.6 ms (6.3 syncs; the M1's 50 ms is 9.6). 64 KiB deletes at concurrency 8 are slower even in syncs: compaction's
+  steps each wait on a 22 ms sync.
+- **Found:** with the default 256 open files, 128 concurrent 256 KiB PUTs ran out of descriptors; the journal
+  fail-stopped on a failed open (a group commit's sync handle, before anything was written) and refused every write
+  until a restart, logging only `journal error`. Nothing acknowledged was lost (fsck clean). With `ulimit -n 10240`
+  the run was clean. CeeSafe cannot raise the limit: CEESAFE_GAPS G32.
+- **Next:**
+  - an ADR: a failed open before any write does not fail the journal, a failed rotation is retried, and the cause is
+    logged (with a fault sweep);
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7.

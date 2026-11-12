@@ -40,6 +40,7 @@ boilerplate; **P2** ergonomics.
 | G29 | P2 | lib/std | `OrderedMap` leaves nodes about half full when keys arrive in order, and reserves a full node's room for whole values: 2.6 times the entries' bytes for in-order inserts |
 | G30 | P2 | runtime/async | Waking a task always writes a byte to the executor's wake pipe, even from the executor's own thread: every `AsyncMutex` unlock with a waiter is a `write` system call |
 | G31 | P2 | lib/std/checksums | `Crc32c` is software only (slicing-by-8, 1.5 GB/s on an M1): no way to use the CPU's CRC32C instructions (ARMv8 `crc32c`, x86 SSE4.2), 4.7 times faster in one chain. **Fixed in CeeSafe 0.30.0** (ADR 0089: the instruction where the CPU has it, asked at run time; `Crc32c.of` 1,652 to 8,147 MB/s on the M1). CosmoStore builds with 0.30.0 since 11 Nov 2026 |
+| G32 | P2 | std/process | No way to read or raise the open-file limit (`getrlimit`/`setrlimit` `RLIMIT_NOFILE`): a server cannot lift its soft limit (256 on macOS) to the hard one at start, as servers usually do |
 
 ## Status (2026-11-06)
 
@@ -418,6 +419,28 @@ AArch64 with the CRC extension, `_mm_crc32_u64` on x86-64 with SSE4.2), with the
 (`cpuid`, `sysctlbyname`, `getauxval`), the other runs `crc32q` or `crc32cx`. `Crc32c.update` uses them where the
 instruction exists and the tables elsewhere, with the same API and results. The repro above gives 8,147 MB/s against
 1,652 with 0.29.0 (M1, one chain). CosmoStore moved to 0.30.0 (and CeeSafe.Web `82a3a73`) the same day.
+
+### G32: no open-file limit (P2)
+
+**Evidence.** On an Intel Mac mini over ssh (`ulimit -n` 256, macOS's default soft limit; the hard limit is
+unlimited, `kern.maxfilesperproc` 122,880), `cosmostore serve` under 128 concurrent 256 KiB PUTs needs more than 256
+descriptors: 128 sockets, an extent file for each upload in progress, the journal's segments and the listener. An
+open failed with `EMFILE` and the journal fail-stopped (`docs/benchmarks/2026-11-12-mac-mini-intel.md`). With
+`ulimit -n 10240` the same load ran clean. lib/std has no `Process` or `System` call that reads or sets
+`RLIMIT_NOFILE`. `EMFILE` reaches a caller only as `IoError.Other(24)`, the platform's errno number.
+
+**Why it matters.** A server opens a descriptor per connection and per open file. Servers raise their soft limit to
+the hard one at start (nginx's `worker_rlimit_nofile`, Go's runtime does it since 1.19) because the soft default is
+far below what they need; without it, the operator has to know to run `ulimit -n` first, and the failure shows up only
+under load.
+
+**Repro.** Under `ulimit -n 256`, a CeeSafe program that opens 300 files (`File.openRead` of one file, kept in a
+`Vector`) fails at about the 250th; it has no way to learn the limit beforehand or to raise it.
+
+**Suggested.** `Process.openFileLimit() -> Result<OpenFileLimit, IoError>` with the soft and hard limits, and
+`Process.raiseOpenFileLimit(to: u64)` (up to the hard limit; on Windows, `_setmaxstdio` or a no-op where handles are
+not limited). A named `IoError` kind for "too many open files" would let a caller tell a shortage it may wait out from a failed
+disk without a platform's errno number.
 
 ## Not gaps (checked)
 
