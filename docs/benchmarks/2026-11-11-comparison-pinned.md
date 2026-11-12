@@ -4,6 +4,7 @@ The 10 Nov comparison (`2026-11-10-comparison.md`) again, on the same server and
 Two things changed. Each server now runs on two pinned cores, not under a CPU quota, and the client has two
 physical cores of its own. CosmoStore is built from `d509388` (ceesafec 0.30.0, ADR-0034 and ADR-0035), not
 `1aa265d`. Made with `tools/compare/compare.sh` (`CPUSET`, `CLIENT_CPUSET`) and `tools/compare/report.py`.
+The run again with CosmoStore `56cc1d2` (ceesafec 0.36.0), 12 Nov, is `2026-11-12-comparison-pinned.md`.
 
 ## Environment
 

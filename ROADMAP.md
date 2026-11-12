@@ -1425,3 +1425,18 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - the pinned comparison again, on 0.36.0 and `c799f14`;
   - a quiet reference run on the M1, for T1 at 4 KiB and T7.
+
+### 12 Nov 2026: the pinned comparison again (`docs/benchmarks/2026-11-12-comparison-pinned.md`)
+
+- **The 11 Nov run again**, same server, images, matrix and pinning; CosmoStore `56cc1d2` (ceesafec 0.36.0, CeeSafe.Web
+  `c799f14`) instead of `d509388`. The other servers moved 0 to 2%; CosmoStore 1.20 times the throughput (geometric
+  mean over its 60 phases), p99 0.84 times.
+- **CosmoStore leads the durable servers in 59 of 60 cells;** the exception is 1 MiB deletes at concurrency 128
+  (0.87 times SeaweedFS with fsync).
+- **1 MiB GETs:** 1,539/s at concurrency 32 and 1,231/s at 128, 1.21 to 1.51 times SeaweedFS and RustFS (0.59 to 0.67
+  times on 11 Nov). 4 KiB and 64 KiB GETs 2.1 to 2.2 times 11 Nov.
+- **Behind the servers without fsync** only at concurrency 1 (small writes and deletes, 1 MiB writes and deletes)
+  and for 1 MiB PUTs and overwrites at 32 (0.87 to 0.91 times). Peak RSS 279 MiB.
+- **Next:**
+  - the p99 of 1 MiB GETs at concurrency 128 (ADR-0038: 20% above the 64 KiB build);
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7.
