@@ -52,7 +52,7 @@ rule and ADR-0004's bug 4
   handle across the unlocked sync, so the spare needs returning on every path, cancellation included. The fallback
   above is enough while the open is cheap; revisit if the open shows in a profile.
 - **Raising the soft limit in `serve`:** needs `setrlimit`, which CeeSafe lacks (G32). Until then, the operator raises
-  it (`ulimit -n`), as the README's `serve` section says.
+  it (`ulimit -n`), as the README's `serve` section says. *Done since (amendment below).*
 
 ## Consequences
 
@@ -82,3 +82,16 @@ rule and ADR-0004's bug 4
   ticket's open still failing the journal, the fallback test fails.
 - The fault sweeps of ADR-0004 and ADR-0022 (journal, store, group commit; once, sticky, torn and crash) pass
   unchanged.
+
+## Amendment (13 Nov 2026): `serve` raises its limit
+
+CeeSafe 0.41.0 (its ADR 0104, from G32) added `ProcessLimits.raiseOpenFiles` and `IoError.TooManyOpenFiles`.
+
+- **`serve` raises its soft open-file limit at start** as far as the system allows (the hard limit; on macOS,
+  `kern.maxfilesperproc`), and logs `cosmostore: open-file limit N` on the line after the serving notice, which stays
+  the first line. A failure leaves the limit as it was. The operator no longer has to run `ulimit -n`.
+- **`IoFailure` maps `IoError.TooManyOpenFiles` to `EMFILE`.** Before 0.41.0 the shortage arrived as `Other(24)`;
+  without the mapping, the new variant would have fallen to EIO and turned §3's 503 into a 500.
+- The decisions above stand: a server can still run out (another process's descriptors, a lower hard limit), and then
+  requests get 503 and the store keeps going.
+

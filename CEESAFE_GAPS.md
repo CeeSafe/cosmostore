@@ -40,7 +40,7 @@ boilerplate; **P2** ergonomics.
 | G29 | P2 | lib/std | `OrderedMap` leaves nodes about half full when keys arrive in order, and reserves a full node's room for whole values: 2.6 times the entries' bytes for in-order inserts |
 | G30 | P2 | runtime/async | Waking a task always writes a byte to the executor's wake pipe, even from the executor's own thread: every `AsyncMutex` unlock with a waiter is a `write` system call |
 | G31 | P2 | lib/std/checksums | `Crc32c` is software only (slicing-by-8, 1.5 GB/s on an M1): no way to use the CPU's CRC32C instructions (ARMv8 `crc32c`, x86 SSE4.2), 4.7 times faster in one chain. **Fixed in CeeSafe 0.30.0** (ADR 0089: the instruction where the CPU has it, asked at run time; `Crc32c.of` 1,652 to 8,147 MB/s on the M1). CosmoStore builds with 0.30.0 since 11 Nov 2026 |
-| G32 | P2 | std/process | No way to read or raise the open-file limit (`getrlimit`/`setrlimit` `RLIMIT_NOFILE`): a server cannot lift its soft limit (256 on macOS) to the hard one at start, as servers usually do |
+| G32 | P2 | std/process | No way to read or raise the open-file limit (`getrlimit`/`setrlimit` `RLIMIT_NOFILE`): a server cannot lift its soft limit (256 on macOS) to the hard one at start, as servers usually do **Fixed in CeeSafe 0.41.0** (ADR 0104: `ProcessLimits.openFiles`, `raiseOpenFiles`, `IoError.TooManyOpenFiles`); `serve` raises its limit at start since 13 Nov 2026 |
 
 ## Status (2026-11-06)
 
@@ -441,6 +441,11 @@ under load.
 `Process.raiseOpenFileLimit(to: u64)` (up to the hard limit; on Windows, `_setmaxstdio` or a no-op where handles are
 not limited). A named `IoError` kind for "too many open files" would let a caller tell a shortage it may wait out from a failed
 disk without a platform's errno number.
+
+**Fixed in CeeSafe 0.41.0** (2026-11-13, ADR 0104, accepted by the owner as proposed). lib/std's
+`ProcessLimits.openFiles()` reads the soft and hard limits, `raiseOpenFiles(to)` raises the soft one (clamped on Apple
+systems to `kern.maxfilesperproc`), and `IoError.TooManyOpenFiles` names `EMFILE` and `ENFILE`. `cosmostore serve`
+raises its limit at start and logs it; `IoFailure` maps the new variant to `EMFILE`, so ADR-0039's 503 holds.
 
 ## Not gaps (checked)
 

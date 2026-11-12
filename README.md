@@ -143,7 +143,7 @@ The dependencies are CeeSafe's standard library and CeeSafe.Web's packages (`cee
 
 ## Building
 
-You need `ceesafec` 0.38.0 or later (`ceesafe.toml` requires it), a C compiler and OpenSSL 3 (Homebrew `openssl@3`
+You need `ceesafec` 0.41.0 or later (`ceesafe.toml` requires it), a C compiler and OpenSSL 3 (Homebrew `openssl@3`
 on macOS). CeeSafe.Web is used by path, from a checkout two directories up; CI pins the commit it was last built
 against (`CEESAFE_WEB_REF` in `.github/workflows/ci.yml`).
 
@@ -176,10 +176,9 @@ cosmostore soak  <dir> <seconds> <keys> <capacity-bytes>
   files when they change. `--maintain-seconds` (10) sets the upkeep round, and `--upload-expiry-hours` (168; 0 never)
   when unfinished multipart uploads are aborted.
 
-  Raise the open-file limit first (`ulimit -n 10240`): the server holds a descriptor per connection and per upload in
-  progress, and macOS's default of 256 ran out under 128 concurrent uploads above 128 KiB. It cannot raise the limit
-  itself yet (CEESAFE_GAPS G32); when it runs out, requests get 503 and the store keeps going
-  ([ADR-0039](docs/adr/0039-out-of-descriptors-the-journal-keeps-going.md)).
+  The server raises its open-file limit to the most the system allows at start, and logs it: it holds a descriptor per
+  connection and per upload in progress, and macOS starts processes at 256. If it still runs out, requests get 503 and
+  the store keeps going ([ADR-0039](docs/adr/0039-out-of-descriptors-the-journal-keeps-going.md)).
 
   ```sh
   echo "mykey mysecret" > creds
@@ -330,7 +329,6 @@ advanced S3 features.
 - a single node: no replication or erasure coding yet;
 - no versioning, bucket policies, ACLs, CORS or Object Lock, and no SigV2 or session tokens;
 - HTTP/1.1 only;
-- the open-file limit must be raised by the operator (`ulimit -n`): CeeSafe cannot raise it yet (CEESAFE_GAPS G32);
 - Windows is not supported.
 
 ## License

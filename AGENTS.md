@@ -76,11 +76,12 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
   holding it has been synced (ADR-0001).
 - All file and directory I/O goes through `DurableFile`/`Fs` (`src/storage/io/durable.cee`), so the fault
   injector and crash model of ADR-0004 cover it. A durability change needs a fault sweep.
-- **Toolchain: ceesafec 0.38.0 or later**, which `ceesafe.toml` requires (`ceesafec = ">=0.38.0"`, CeeSafe ADR 0076):
+- **Toolchain: ceesafec 0.41.0 or later**, which `ceesafe.toml` requires (`ceesafec = ">=0.41.0"`, CeeSafe ADR 0076):
   an older compiler stops at that line. CeeSafe.Web's pinned commit (CI's `CEESAFE_WEB_REF`) needs 0.27 (its route
   handlers are `Send + Share`, CeeSafe ADR 0084); 0.30.0 adds `Crc32c` on the CPU's instruction (ADR 0089, G31);
   0.36.0 runs `Async.blocking` on a pool of reused threads (ADR 0094, G28); 0.38.0 resizes into zeroed memory, removes
-  more bounds checks and inlines the allocator's fast path (ADRs 0099 to 0101).
+  more bounds checks and inlines the allocator's fast path (ADRs 0099 to 0101); 0.41.0 lets `serve` raise its open-file
+  limit (`ProcessLimits`, `IoError.TooManyOpenFiles`; ADR 0104, G32).
 - CosmoStore calls no C and has no `unsafe` (since CeeSafe 0.19). A CeeSafe limitation goes in `CEESAFE_GAPS.md`
   (with evidence and a repro) for the CeeSafe repo, not around it with C or `unsafe`. The one C below it is
   CeeSafe.Web's `web_tls` (OpenSSL 3 through its shim) for TLS, a dependency chosen in ADR-0016; building needs

@@ -1507,3 +1507,15 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - a quiet reference run on the M1, for T1 at 4 KiB and T7;
   - CeeSafe ADR 0102 for G32 (the open-file limit), for the owner's decision.
+
+### 13 Nov 2026: ceesafec 0.41.0, and `serve` raises its open-file limit (G32 fixed)
+
+- **CeeSafe 0.41.0** (its ADR 0104, from G32, accepted by the owner as proposed; 0.39.0 and 0.40.0 went to other
+  sessions' ADRs 0102 and 0103 the same day): `ProcessLimits.openFiles()` and `raiseOpenFiles(to)`, and the built-in
+  `IoError.TooManyOpenFiles` (`EMFILE`, `ENFILE`).
+- **Change:** `serve` raises its soft open-file limit at start as far as the system allows and logs it (ADR-0039
+  amendment). `IoFailure` maps the new variant to `EMFILE`, so ADR-0039's 503 holds; a unit test checks it.
+- **The move:** `ceesafe.toml` requires `>=0.41.0`; CI pins v0.41.0; CeeSafe.Web stays at `c799f14`.
+- **Next:**
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7.
+
