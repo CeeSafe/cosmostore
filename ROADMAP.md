@@ -1491,3 +1491,19 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - a quiet reference run on the M1, for T1 at 4 KiB and T7 (this Mac was busy: a VM at a full core, load average 44);
   - `serve` raising its own open-file limit once CeeSafe can (G32).
+
+### 12 Nov 2026: the volume's free space in admission (ADR-0040)
+
+- **G24 had been fixed in CeeSafe 0.21.0** (`Directory.space`), but CosmoStore never used it: with the default
+  configuration (no `capacityBytes`), nothing stopped writes before the volume filled, and the journal then failed on
+  `ENOSPC`.
+- **Change:** the store measures the volume at open and at the start of each upkeep round (through `Fs.space`, with
+  a failpoint), and admission keeps each write and the reserve (256 MiB) within the measured available bytes, less
+  what the store has grown since. Deletes, checkpoints and compaction still never ask. A failed measurement keeps the
+  last one. The stats show `volumeBytes` and `volumeAvailableBytes`.
+- **Tests:** measured at open; a nearly full volume admits one write, counts it and refuses the next, deletes work,
+  and a new measurement admits again; a failed measurement keeps the last figure. Breaking the fix in a copy is
+  caught.
+- **Next:**
+  - a quiet reference run on the M1, for T1 at 4 KiB and T7;
+  - CeeSafe ADR 0102 for G32 (the open-file limit), for the owner's decision.

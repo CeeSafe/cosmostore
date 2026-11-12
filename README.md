@@ -123,7 +123,7 @@ through CeeSafe.Web's `web_tls` ([ADR-0016](docs/adr/0016-listen-address-and-tls
 | `src/storage/extent/` | Extent files, the manifest codec, `ObjectWriter` and `ExtentReader`. |
 | `src/metadata/` | The version-first object model, its codecs, S3 bucket-name rules, and the ordered index. |
 | `src/store/` | `ObjectStore` (buckets, objects, listing, uploads, space, verify), checkpoints and compaction, and their tests. |
-| `docs/adr/` | The design decisions, ADR-0001 to ADR-0039. |
+| `docs/adr/` | The design decisions, ADR-0001 to ADR-0040. |
 | `docs/benchmarks/` | Dated benchmark reports, with their raw data. |
 | `tools/` | The S3 smoke and TLS tests, the SDK checks (`sdk/`), the s3-tests runner (`s3tests/`), the load generator (`bench/`), the p99 gate (`perf_gate.sh`), the comparison run (`compare/`) and the soak. |
 
@@ -256,8 +256,8 @@ Other entry points:
 | `checkpointEveryBytes` | 64 MiB | `maintain` checkpoints after this many journal bytes (0: never). |
 | `compactBelowLivePercent` | 50 | Compact a covered segment whose live bytes are below this percentage. |
 | `compactMaxCopyBytes` | 64 MiB | The most live bytes one `compact` call copies. |
-| `capacityBytes` | 0 (no limit) | The most the store may occupy. Set it below the volume's free space: CeeSafe has no free-space query yet (CEESAFE_GAPS G24). |
-| `reserveBytes` | 256 MiB | Kept free below `capacityBytes` for deletes, checkpoints and compaction. |
+| `capacityBytes` | 0 (no limit) | The most the store may occupy. Writes also stop when the volume's free space, measured at open and each upkeep round, would fall into the reserve ([ADR-0040](docs/adr/0040-the-volumes-free-space-in-admission.md)). |
+| `reserveBytes` | 256 MiB | Kept free, below `capacityBytes` and on the volume, for deletes, checkpoints and compaction. |
 | `journal.segmentTargetBytes` | 128 MiB | A segment is sealed and a new one started at this size. |
 | `journal.maxBatchBytes` | 32 MiB | The largest group-commit batch. |
 | `minPartBytes` | 5 MiB | The smallest multipart part, except the last. |
@@ -268,7 +268,7 @@ Other entry points:
 ## Testing
 
 ```sh
-ceesafec test                 # unit, crash and fault-injection tests (143)
+ceesafec test                 # unit, crash and fault-injection tests (146)
 ceesafec test --sweep alloc   # the same tests, failing each allocation in turn
 ceesafec fmt --check
 ceesafec build && tools/s3_smoke.sh   # the server through the AWS CLI v2
@@ -330,7 +330,7 @@ advanced S3 features.
 - a single node: no replication or erasure coding yet;
 - no versioning, bucket policies, ACLs, CORS or Object Lock, and no SigV2 or session tokens;
 - HTTP/1.1 only;
-- a capacity must be configured for the space reserve: CeeSafe has no free-space query yet (CEESAFE_GAPS G24);
+- the open-file limit must be raised by the operator (`ulimit -n`): CeeSafe cannot raise it yet (CEESAFE_GAPS G32);
 - Windows is not supported.
 
 ## License

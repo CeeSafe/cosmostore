@@ -35,6 +35,8 @@ free space. Its journal then fails on `ENOSPC` and stops accepting writes (ADR-0
    `GetDiskFreeSpaceExW`; CEESAFE_GAPS G24). The operator sets `capacityBytes` below the volume's free space.
    - If the volume is shared and fills anyway, the journal fails on `ENOSPC`, and a restart recovers.
    - The default, 0, is no limit, as before.
+   - *Amended by ADR-0040:* CeeSafe has had the query since 0.21.0. The store measures the volume at open and each
+     upkeep round, and admission also keeps the write and the reserve within what the volume has left.
 
 ### fsck
 

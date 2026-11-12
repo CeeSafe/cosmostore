@@ -20,11 +20,12 @@ struct StoreConfig {
     compactBelowLivePercent: u64;
     /// The most live bytes one `compact` call copies.
     compactMaxCopyBytes: u64;
-    /// The most bytes the store may occupy, journal and extents together (0: no limit). Set it below the volume's
-    /// free space: CeeSafe has no free-space query yet (CEESAFE_GAPS G24). ADR-0006.
+    /// The most bytes the store may occupy, journal and extents together (0: no limit beyond the volume's). Writes
+    /// also stop when the volume's available space, measured at open and each upkeep round, would fall into the
+    /// reserve (ADR-0006, ADR-0040).
     capacityBytes: u64;
-    /// Kept free below `capacityBytes` for what frees space or keeps the store recoverable: deletes, checkpoints
-    /// and compaction never count against it, writes do (ADR-0006).
+    /// Kept free below `capacityBytes`, and on the volume, for what frees space or keeps the store recoverable:
+    /// deletes, checkpoints and compaction never count against it, writes do (ADR-0006, ADR-0040).
     reserveBytes: u64;
     /// The least size of a multipart upload's parts, all but the last (S3: 5 MiB), and the largest object an upload
     /// may complete (S3: 5 TiB). ADR-0009.
@@ -838,6 +839,12 @@ struct ObjectStore {
     /// When `maintain` last applied lifecycle rules (Unix milliseconds).
     private lifecycleRan: i64;
     private counts: StoreCounters;
+    /// The volume as last measured (ADR-0040): its size, the bytes this process could write then, and what the store
+    /// occupied then, so admission can count what it wrote since. Not measured: no volume limit.
+    private volumeMeasured: bool;
+    private volumeTotal: u64;
+    private volumeAvailable: u64;
+    private usedAtMeasure: u64;
 
     /// Opens the store in `dir`: loads the newest checkpoint, if any, then replays the journal
     /// records after it.
@@ -940,6 +947,10 @@ struct ObjectStore {
             deferred: Vector<DeferredExtent>.create(),
             deferredBytes: 0,
             lifecycleRan: 0,
+            volumeMeasured: false,
+            volumeTotal: 0,
+            volumeAvailable: 0,
+            usedAtMeasure: 0,
             counts: StoreCounters {
                 payloadBytes: 0,
                 journalBytesWritten: 0,
@@ -957,7 +968,41 @@ struct ObjectStore {
         // versions, and uploads that never committed (ADR-0003).
         store.state.deadExtents.clear();
         store.sweepOrphanExtents()?;
+        store.measureVolume();
         return Ok(store);
+    }
+
+    /// Measures the volume that holds the store (ADR-0040). A failed measurement keeps the last one: admission goes on
+    /// with what it knew, and the next upkeep round asks again.
+    fn measureVolume(borrow mut this) {
+        match (Fs.space(this.dir.view())) {
+            Ok(v) => { this.noteVolume(v.total, v.available); }
+            Err(_) => {}
+        }
+    }
+
+    /// Takes a measurement of the volume: `available` is what this process could write when the store occupied what
+    /// it occupies now.
+    fn noteVolume(borrow mut this, total: u64, available: u64) {
+        this.volumeMeasured = true;
+        this.volumeTotal = total;
+        this.volumeAvailable = available;
+        this.usedAtMeasure = this.usedBytes();
+    }
+
+    /// The volume's size and the bytes still available to the store's writes by its estimate, null when not measured
+    /// (ADR-0040).
+    fn volumeSpace(borrow this) -> VolumeSpace? {
+        if (!this.volumeMeasured) { return null; }
+        return VolumeSpace { total: this.volumeTotal, free: this.volumeEstimate(), available: this.volumeEstimate() };
+    }
+
+    /// The bytes available on the volume now, by estimate: the last measurement, less what the store has grown since.
+    /// What it shrank is not credited until the next measurement.
+    fn volumeEstimate(borrow this) -> u64 {
+        let used = this.usedBytes();
+        let grown = if (used > this.usedAtMeasure) used - this.usedAtMeasure else 0;
+        return if (grown >= this.volumeAvailable) 0 else this.volumeAvailable - grown;
     }
 
     /// Removes extent files that no live version references. Only safe while no writer is
@@ -1202,11 +1247,17 @@ struct ObjectStore {
 
     /// Admits a write of `incoming` object bytes, plus its record, unless it would take the store into its
     /// reserve: InsufficientStorage. Deletes, checkpoints and compaction never ask (ADR-0006).
+    /// The volume counts too, as measured (ADR-0040): the write and the reserve must fit in what is left of it.
     fn admit(borrow this, incoming: u64) -> Result<void, StoreError> {
         let capacity = this.config.capacityBytes;
-        if (capacity == 0) { return Ok(); }
-        let need = this.usedBytes() + incoming + ADMIT_RECORD_BYTES + this.config.reserveBytes;
-        if (need > capacity) { return Err(StoreError.InsufficientStorage); }
+        if (capacity > 0) {
+            let need = this.usedBytes() + incoming + ADMIT_RECORD_BYTES + this.config.reserveBytes;
+            if (need > capacity) { return Err(StoreError.InsufficientStorage); }
+        }
+        if (this.volumeMeasured) {
+            let need = incoming + ADMIT_RECORD_BYTES + this.config.reserveBytes;
+            if (need > this.volumeEstimate()) { return Err(StoreError.InsufficientStorage); }
+        }
         return Ok();
     }
 
@@ -2667,6 +2718,7 @@ struct ObjectStore {
     /// store's lock released between them (ADR-0028, ADR-0029).
     fn upkeep(borrow mut this, withSteps: bool) -> Result<MaintenanceReport, StoreError> {
         let started = Clock.monotonicNanos();
+        this.measureVolume();
         this.reapDeferred();
         this.reapAbandoned();
         this.pins.prune();

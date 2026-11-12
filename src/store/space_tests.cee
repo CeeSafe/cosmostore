@@ -71,6 +71,82 @@ fn capacityRejectsWritesButNotDeletes() -> Result<void, TestFailure> {
 }
 
 @test
+fn theVolumeIsMeasuredAtOpen() -> Result<void, TestFailure> {
+    // ADR-0040: the store asks the volume's size and free space when it opens.
+    let dir = scratchDirectory("space-volume");
+    {
+        let s = ObjectStore.open(dir.view(), spaceConfig(0, 1048576))!;
+        match (s.volumeSpace()) {
+            Some(v) => {
+                Check.isTrue(v.total > 0, "the volume has a size")?;
+                Check.isTrue(v.available <= v.total, "what is available fits in the volume")?;
+            }
+            null => { return Check.fail("the volume is measured at open"); }
+        }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// Writes `size` bytes under key `k`, and tells whether it was admitted.
+fn admitted(s: borrow mut ObjectStore, k: u64, size: usize) -> Result<bool, TestFailure> {
+    var name = String.create();
+    name.append("v")!;
+    name.appendNumber(k)!;
+    return match (s.putObject("bkt", name.view(), "", patterned(size, k).view(), PutCondition.None)) {
+        Ok(_) => Ok(true),
+        Err(StoreError.InsufficientStorage) => Ok(false),
+        Err(_) => Err(TestFailure.create("a write failed otherwise")),
+    };
+}
+
+@test
+fn aFullVolumeRefusesWritesButNotDeletes() -> Result<void, TestFailure> {
+    // Without a capacity, the volume limits writes (ADR-0040): a measurement leaving the reserve and 100 KiB admits
+    // one 60 KiB write, counts it, and refuses the next. Deletes still work, and a new measurement admits again.
+    let dir = scratchDirectory("space-volume-full");
+    let reserve: u64 = 1048576;
+    {
+        var s = ObjectStore.open(dir.view(), spaceConfig(0, reserve))!;
+        s.createBucket("bkt")!;
+        Check.isTrue(admitted(mut s, 0, 1000)?, "a store with room takes writes")?;
+        s.noteVolume(1 << 30, reserve + 102400);
+        Check.isTrue(admitted(mut s, 1, 61440)?, "the first write fits")?;
+        Check.isTrue(!admitted(mut s, 2, 61440)?, "the second does not: the first is counted")?;
+        Check.isTrue(!admitted(mut s, 3, 61440)?, "nor a third")?;
+        s.deleteObject("bkt", "v1")!;
+        s.deleteObject("bkt", "v0")!;
+        // A fresh measurement of the real volume admits again.
+        let _ = s.maintain()!;
+        Check.isTrue(admitted(mut s, 4, 61440)?, "after a measurement with room, writes are admitted")?;
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn aFailedMeasurementKeepsTheLastOne() -> Result<void, TestFailure> {
+    // The measurement goes through Fs (ADR-0004's fault injector). If it fails, admission keeps what it knew, and
+    // upkeep goes on (ADR-0040).
+    let dir = scratchDirectory("space-volume-fault");
+    let reserve: u64 = 1048576;
+    {
+        var s = ObjectStore.open(dir.view(), spaceConfig(0, reserve))!;
+        s.createBucket("bkt")!;
+        s.noteVolume(1 << 30, reserve + 10240);
+        Faults.failAt(1, false, false); // upkeep's first operation is the measurement
+        let _ = s.maintain()!;
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired())?;
+        Check.isTrue(!admitted(mut s, 0, 61440)?, "the last measurement still holds")?;
+        let _ = s.maintain()!;
+        Check.isTrue(admitted(mut s, 1, 61440)?, "the next measurement admits again")?;
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
 fn usageSurvivesRecovery() -> Result<void, TestFailure> {
     let dir = scratchDirectory("space-usage");
     let config = spaceConfig(0, 0);

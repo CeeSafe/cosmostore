@@ -32,7 +32,7 @@ boilerplate; **P2** ergonomics.
 | G21 | P1 | language/std | No safe process-wide table: arrays of atomics are rejected (N0259) and `Mutex` has no constant constructor |
 | G22 | P2 | parser | No explicit dereference: `let id = *m.keyAt(0);` is N0102, even though spec §13.3 writes `*r` |
 | G23 | P2 | tooling | `ceesafe.toml` cannot require a compiler version, so an older ceesafec gives type errors instead of "needs 0.19.1". **Fixed in CeeSafe 0.20.0** (ADR 0076): CosmoStore's manifest says `ceesafec = ">=0.20.0"` |
-| G24 | P1 | std/files | No free-space query (`statvfs`, `GetDiskFreeSpaceExW`): a store cannot learn how much room its volume has **Fixed in CeeSafe 0.21.0** (ADR 0077: `Directory.space`, `Console.flush`) |
+| G24 | P1 | std/files | No free-space query (`statvfs`, `GetDiskFreeSpaceExW`): a store cannot learn how much room its volume has **Fixed in CeeSafe 0.21.0** (ADR 0077: `Directory.space`, `Console.flush`); CosmoStore uses it since ADR-0040 (12 Nov 2026) |
 | G25 | P2 | std/console | No `Console.flush()`: standard output written before a SIGKILL is lost when it is redirected **Fixed in CeeSafe 0.21.0** (ADR 0077) |
 | G26 | P3 | std/checksums | No CRC-32 (IEEE), the AWS CLI's `x-amz-checksum-crc32`: lib/std has CRC-32C and CRC-64/NVME only. CosmoStore computes it in CeeSafe (`src/storage/checksums/crc32.cee`) |
 | G27 | P2 | std/async-console | `AsyncConsole.writeError` fails when standard error is `/dev/null` (macOS), so a server that checks it exits under `2>/dev/null` |
