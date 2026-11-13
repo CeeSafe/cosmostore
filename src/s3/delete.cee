@@ -156,22 +156,41 @@ async fn deleteObjects(
     app: borrow S3App,
     req: borrow S3Request,
     auth: Authenticated,
+    who: borrow Requester,
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
     let xml = await readSmallBody(auth, exchange, MAX_DELETE_BODY)?;
     verifySmallBody(req, xml.view(), true)?;
     let request = parseDeleteBody(xml.view())?;
-    let outcomes = await storeDeleteMany(app, req.bucket.view(), request.targets.view())?;
+    // Each key by the bucket's policy, read once (ADR-0043 §5): a refused key gets an error, the others go on.
+    let bucket = req.bucket.view();
+    let gate = await policyGate(app, who, bucket)?;
+    var refused = Vector<bool>.create();
+    var allowed = Vector<DeleteTarget>.create();
+    for (i in 0..request.targets.length) {
+        let t = borrow request.targets[i];
+        let action = if (t.versionId.isSome()) "s3:DeleteObjectVersion" else "s3:DeleteObject";
+        let ok = gateAllows(app, borrow gate, req, who, action, bucket, t.key.view())?;
+        refused.push(!ok)?;
+        if (ok) { allowed.push(DeleteTarget { key: copyBytes(t.key.view())?, versionId: t.versionId })?; }
+    }
+    let outcomes = await storeDeleteMany(app, bucket, allowed.view())?;
     var body = Vector<u8>.create();
     xmlHead(mut body, "DeleteResult")?;
     var id = Vector<u8>.create();
+    var target: usize = 0;
     var next: usize = 0;
     for (i in 0..request.keys.length) {
         let key = request.keys[i].view();
         var valid = false;
+        var denied = false;
         if (!request.badVersion[i]) {
+            denied = refused[target];
+            target += 1;
+        }
+        if (!request.badVersion[i] && !denied) {
             let o = borrow outcomes[next];
-            let named = request.targets[next].versionId.isSome();
+            let named = allowed[next].versionId.isSome();
             next += 1;
             valid = o.valid;
             if (valid && !request.quiet) {
@@ -197,7 +216,8 @@ async fn deleteObjects(
             body.extend("<Error>".bytes())?;
             xmlElement(mut body, "Key", key, false)?;
             let code =
-                if (request.badVersion[i]) S3Code.NoSuchVersion
+                if (denied) S3Code.AccessDenied
+                    else if (request.badVersion[i]) S3Code.NoSuchVersion
                     else if (key.length > MAX_KEY_BYTES) S3Code.KeyTooLongError
                     else S3Code.InvalidArgument;
             xmlElement(mut body, "Code", s3CodeName(code).bytes(), false)?;

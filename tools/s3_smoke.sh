@@ -341,6 +341,63 @@ check "every version deleted" "$(aws s3api list-object-versions --bucket ver --q
 aws s3api delete-bucket --bucket ver > /dev/null 2>&1 && pass "delete-bucket without versions" || fail "delete-bucket without versions"
 check "an unversioned bucket's versions" "$(aws s3api list-object-versions --bucket smoke --max-keys 2 --no-paginate --query 'Versions[].[VersionId,IsLatest]' --output text | tr '\t\n' ' ;')" "null True;null True;"
 
+# Bucket policies (ADR-0043): anonymous reads by an Allow, a key refused by a Deny, conditions, and no lockout.
+anon() { curl -s -o anon.out -w '%{http_code}' "$@"; }
+aws s3api create-bucket --bucket pol > /dev/null 2>&1
+printf 'public bytes' > pub.txt
+aws s3api put-object --bucket pol --key pub/a.txt --body pub.txt > /dev/null 2>&1
+aws s3api put-object --bucket pol --key priv/b.txt --body pub.txt > /dev/null 2>&1
+aws s3api put-object --bucket pol --key keep/k.txt --body pub.txt > /dev/null 2>&1
+check "no policy" "$(code s3api get-bucket-policy --bucket pol)" NoSuchBucketPolicy
+check "anonymous without a policy" "$(anon "$AWS_ENDPOINT_URL/pol/pub/a.txt")" 403
+cat > policy.json <<JSON
+{"Version": "2012-10-17", "Statement": [
+  {"Sid": "read", "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::pol/pub/*"},
+  {"Sid": "drop", "Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "s3:PutObject", "Resource": "arn:aws:s3:::pol/drop/*"},
+  {"Sid": "keep", "Effect": "Deny", "Principal": {"AWS": "arn:aws:iam:::user/$AWS_ACCESS_KEY_ID"},
+   "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"], "Resource": "arn:aws:s3:::pol/keep/*"}]}
+JSON
+aws s3api put-bucket-policy --bucket pol --policy file://policy.json > /dev/null 2>&1 || fail "put-bucket-policy"
+check "get-bucket-policy" "$(aws s3api get-bucket-policy --bucket pol --query Policy --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["Statement"][0]["Sid"])')" read
+check "anonymous read by the policy" "$(anon "$AWS_ENDPOINT_URL/pol/pub/a.txt") $(cat anon.out)" "200 public bytes"
+check "anonymous head" "$(anon -I "$AWS_ENDPOINT_URL/pol/pub/a.txt")" 200
+check "anonymous read outside it" "$(anon "$AWS_ENDPOINT_URL/pol/priv/b.txt")" 403
+check "anonymous list" "$(anon "$AWS_ENDPOINT_URL/pol?list-type=2")" 403
+check "anonymous put outside it" "$(anon -X PUT --data-binary @pub.txt "$AWS_ENDPOINT_URL/pol/pub/x.txt")" 403
+check "anonymous put by the policy" "$(anon -X PUT --data-binary @pub.txt "$AWS_ENDPOINT_URL/pol/drop/x.txt")" 200
+check "the anonymous object" "$(aws s3api head-object --bucket pol --key drop/x.txt --query ContentLength)" 12
+check "anonymous service" "$(anon "$AWS_ENDPOINT_URL/")" 403
+check "anonymous create-bucket" "$(anon -X PUT "$AWS_ENDPOINT_URL/anon-made")" 403
+check "a key denied by the policy" "$(code s3api delete-object --bucket pol --key keep/k.txt)" AccessDenied
+check "a key allowed elsewhere" "$(aws s3api get-object --bucket pol --key keep/k.txt got.txt > /dev/null 2>&1 && cat got.txt)" "public bytes"
+check "delete-objects, one key denied" "$(aws s3api delete-objects --bucket pol --delete '{"Objects":[{"Key":"keep/k.txt"},{"Key":"drop/x.txt"}]}' --query '[Errors[0].Key,Errors[0].Code,Deleted[0].Key]' --output text)" "keep/k.txt	AccessDenied	drop/x.txt"
+cat > policy.json <<JSON
+{"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::pol/pub/*",
+  "Condition": {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}}]}
+JSON
+aws s3api put-bucket-policy --bucket pol --policy file://policy.json > /dev/null 2>&1
+check "anonymous from outside the range" "$(anon "$AWS_ENDPOINT_URL/pol/pub/a.txt")" 403
+sed 's|10.0.0.0/8|127.0.0.0/8|' policy.json > policy2.json
+aws s3api put-bucket-policy --bucket pol --policy file://policy2.json > /dev/null 2>&1
+check "anonymous from inside it" "$(anon "$AWS_ENDPOINT_URL/pol/pub/a.txt")" 200
+printf '%s' '{"Statement": [{"Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": ["arn:aws:s3:::pol", "arn:aws:s3:::pol/*"]}]}' > deny.json
+aws s3api put-bucket-policy --bucket pol --policy file://deny.json > /dev/null 2>&1
+check "a key under a Deny of everything" "$(code s3api list-objects-v2 --bucket pol)" AccessDenied
+check "the policy calls stay open" "$(aws s3api get-bucket-policy --bucket pol --query Policy --output text | cut -c1-14)" '{"Statement": '
+check "a malformed policy" "$(code s3api put-bucket-policy --bucket pol --policy '{"Statement": []}')" MalformedPolicy
+check "another bucket's resource" "$(code s3api put-bucket-policy --bucket pol --policy '{"Statement": {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::smoke/*"}}')" MalformedPolicy
+check "a key that is not configured" "$(code s3api put-bucket-policy --bucket pol --policy '{"Statement": {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam:::user/AKIANOBODY"}, "Action": "s3:GetObject", "Resource": "arn:aws:s3:::pol/*"}}')" MalformedPolicy
+check "a condition not evaluated" "$(code s3api put-bucket-policy --bucket pol --policy '{"Statement": {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::pol/*", "Condition": {"DateGreaterThan": {"aws:CurrentTime": "2030-01-01T00:00:00Z"}}}}')" NotImplemented
+aws s3api delete-bucket-policy --bucket pol > /dev/null 2>&1 || fail "delete-bucket-policy"
+check "no policy again" "$(code s3api get-bucket-policy --bucket pol)" NoSuchBucketPolicy
+check "anonymous after it" "$(anon "$AWS_ENDPOINT_URL/pol/pub/a.txt")" 403
+check "the key after it" "$(aws s3api delete-object --bucket pol --key keep/k.txt > /dev/null 2>&1 && echo deleted)" deleted
+aws s3 rm --recursive s3://pol/ > /dev/null 2>&1
+aws s3api put-bucket-policy --bucket pol --policy file://deny.json > /dev/null 2>&1
+aws s3api delete-bucket --bucket pol > /dev/null 2>&1 && fail "delete-bucket under a Deny" || pass "delete-bucket under a Deny"
+aws s3api delete-bucket-policy --bucket pol > /dev/null 2>&1
+aws s3api delete-bucket --bucket pol > /dev/null 2>&1 && pass "delete-bucket after it" || fail "delete-bucket after it"
+
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket smoke > /dev/null 2>&1 && pass "delete-bucket" || fail "delete-bucket"

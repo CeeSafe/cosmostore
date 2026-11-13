@@ -117,3 +117,61 @@ fn lifecycleExpiresAndAborts() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// A bucket policy (ADR-0043) is kept as it was put: through recovery from the journal and from a format 7
+/// checkpoint, listed by `bucketPolicies`, cleared, and gone with its bucket.
+@test
+fn bucketPolicySurvivesAndGoesWithTheBucket() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("bucket-policy");
+    let doc =
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}";
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("pub")!;
+        s.createBucket("other")!;
+        s.createBucket("plain")!;
+        s.setBucketConfig("pub", BUCKET_CONFIG_POLICY, doc.bytes())!;
+        s.setBucketConfig("other", BUCKET_CONFIG_POLICY, "{\"x\": 1}".bytes())!; // the store keeps any bytes
+        // At most 20 KiB, as S3 takes.
+        var big = Vector<u8>.create();
+        big.resize(MAX_POLICY_BYTES + 1, 'x')!;
+        match (s.setBucketConfig("plain", BUCKET_CONFIG_POLICY, big.view())) {
+            Err(StoreError.MetadataTooLarge) => {}
+            _ => { return Check.fail("a policy over 20 KiB"); }
+        }
+        match (s.setBucketConfig("plain", 9, "x".bytes())) {
+            Err(StoreError.InvalidKey) => {}
+            _ => { return Check.fail("a kind of configuration there is not"); }
+        }
+    }
+    for (round in 0..3) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.equalBytes(doc.bytes(), s.bucketConfig("pub", BUCKET_CONFIG_POLICY)!.view())?;
+        Check.equalU64(0, s.bucketConfig("plain", BUCKET_CONFIG_POLICY)!.length as u64)?;
+        let all = s.bucketPolicies()!;
+        if (round < 2) {
+            Check.equalU64(2, all.names.length as u64)?;
+            let at: usize = if (all.names[0].view() == "pub".bytes()) 0 else 1;
+            Check.equalBytes("pub".bytes(), all.names[at].view())?;
+            Check.equalBytes(doc.bytes(), all.documents[at].view())?;
+            Check.equalBytes("other".bytes(), all.names[1 - at].view())?;
+        } else {
+            Check.equalU64(1, all.names.length as u64)?;
+        }
+        if (round == 0) { let _ = s.checkpoint()!; } // format 7 holds the policies
+        if (round == 1) {
+            s.setBucketConfig("other", BUCKET_CONFIG_POLICY, "".bytes())!; // cleared
+            let _ = s.checkpoint()!;
+        }
+    }
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.deleteBucket("pub")!;
+        s.createBucket("pub")!;
+    }
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(0, s.bucketConfig("pub", BUCKET_CONFIG_POLICY)!.length as u64)?; // a new bucket starts bare
+    Check.equalU64(0, s.bucketPolicies()!.names.length as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}

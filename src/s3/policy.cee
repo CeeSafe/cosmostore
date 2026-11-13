@@ -1,0 +1,1119 @@
+// Bucket policies (ADR-0043): the document, checked when it is put and parsed again when it is used; the decision
+// for a request; who a request is; and the policy calls.
+import web_core;
+import web_http;
+import web_server;
+
+/// A condition key a policy may test (ADR-0043 §3).
+enum PolicyKey {
+    SecureTransport,
+    SourceIp,
+    Referer,
+    UserAgent,
+    Prefix,
+    Delimiter,
+    MaxKeys,
+}
+
+/// A condition operator, without its `Not`: `PolicyTest.negated` says whether it had one.
+enum PolicyOp {
+    StringEquals,
+    StringEqualsIgnoreCase,
+    StringLike,
+    Bool,
+    IpAddress,
+    NumericEquals,
+    NumericLessThan,
+    NumericLessThanEquals,
+    NumericGreaterThan,
+    NumericGreaterThanEquals,
+    Null,
+}
+
+/// An IPv4 or IPv6 range: the address (IPv4 in the first four bytes) and its prefix's bits.
+struct IpRange {
+    v6: bool;
+    bytes: [u8; 16];
+    bits: u32;
+}
+
+/// One operator on one key, with its values: any value may match.
+struct PolicyTest {
+    op: PolicyOp;
+    /// A negated operator (`StringNotEquals`, `NotIpAddress`, `NumericNotEquals`...): it holds where the plain one
+    /// fails, and when the request does not have the key.
+    negated: bool;
+    key: PolicyKey;
+    /// String values (lower case for the `IgnoreCase` operators, `true` or `false` for `Bool` and `Null`).
+    values: Vector<Vector<u8>>;
+    ranges: Vector<IpRange>;
+    numbers: Vector<u64>;
+}
+
+struct PolicyStatement {
+    allow: bool;
+    /// The access keys it names; `anyone` for `*`. With `notPrincipal` it is for every requester but those.
+    keys: Vector<Vector<u8>>;
+    anyone: bool;
+    notPrincipal: bool;
+    /// Patterns with `*` and `?`: actions in lower case, matched without regard to case; resources after
+    /// `arn:aws:s3:::`, matched as they are.
+    actions: Vector<Vector<u8>>;
+    notAction: bool;
+    resources: Vector<Vector<u8>>;
+    notResource: bool;
+    tests: Vector<PolicyTest>;
+}
+
+/// A parsed bucket policy.
+struct BucketPolicy {
+    statements: Vector<PolicyStatement>;
+    /// Some statement is a Deny: a key's requests to the bucket must read it (ADR-0043 §8).
+    denies: bool;
+}
+
+fn malformedPolicy() -> S3Fail => S3Fail.Code(S3Code.MalformedPolicy);
+
+fn notImplemented() -> S3Fail => S3Fail.Code(S3Code.NotImplemented);
+
+// ---- The document ----
+
+/// A JSON string, or a non-empty array of them, appended to `out`.
+fn policyStrings<region a>(r: borrow mut JsonReader<a>, out: borrow mut Vector<Vector<u8>>) -> Result<void, S3Fail> {
+    var s = Vector<u8>.create();
+    if (r.peek() != '[') {
+        if (!r.string(mut s)?) { return Err(malformedPolicy()); }
+        out.push(copyBytes(s.view())?)?;
+        return Ok();
+    }
+    let _ = r.take('[');
+    if (r.take(']')) { return Err(malformedPolicy()); }
+    while (true) {
+        if (!r.string(mut s)?) { return Err(malformedPolicy()); }
+        out.push(copyBytes(s.view())?)?;
+        if (r.take(',')) { continue; }
+        if (r.take(']')) { return Ok(); }
+        return Err(malformedPolicy());
+    }
+    return Ok();
+}
+
+/// A condition value: a JSON string, or a bare `true`, `false` or non-negative integer, as its text.
+fn policyScalar<region a>(r: borrow mut JsonReader<a>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    out.clear();
+    if (r.peek() == '"') { return r.string(out); }
+    let start = r.at;
+    while (r.at < r.text.length) {
+        let c = r.text[r.at];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) { break; }
+        r.at += 1;
+    }
+    if (r.at == start) { return Ok(false); }
+    out.extend(r.text[start..r.at])?;
+    let t = out.view();
+    return Ok(t == "true".bytes() || t == "false".bytes() || parseDecimal(t).isSome());
+}
+
+/// A condition's values: one scalar, or a non-empty array of them.
+fn policyScalars<region a>(r: borrow mut JsonReader<a>, out: borrow mut Vector<Vector<u8>>) -> Result<void, S3Fail> {
+    var s = Vector<u8>.create();
+    if (r.peek() != '[') {
+        if (!policyScalar(r, mut s)?) { return Err(malformedPolicy()); }
+        out.push(copyBytes(s.view())?)?;
+        return Ok();
+    }
+    let _ = r.take('[');
+    if (r.take(']')) { return Err(malformedPolicy()); }
+    while (true) {
+        if (!policyScalar(r, mut s)?) { return Err(malformedPolicy()); }
+        out.push(copyBytes(s.view())?)?;
+        if (r.take(',')) { continue; }
+        if (r.take(']')) { return Ok(); }
+        return Err(malformedPolicy());
+    }
+    return Ok();
+}
+
+/// Whether `key` is one of the configured access keys.
+fn configuredKey(credentials: Slice<Credential>, key: Slice<u8>) -> bool {
+    for (i in 0..credentials.length) {
+        if (credentials[i].accessKey.view() == key) { return true; }
+    }
+    return false;
+}
+
+const POLICY_USER_ARN: StringView = "arn:aws:iam:::user/";
+const POLICY_S3_ARN: StringView = "arn:aws:s3:::";
+
+/// `Principal` or `NotPrincipal`: `"*"`, or `{"AWS": ...}` with `*` and user ARNs naming access keys (ADR-0043 §3).
+fn parsePrincipal<region a>(
+    r: borrow mut JsonReader<a>,
+    st: borrow mut PolicyStatement,
+    credentials: Slice<Credential>,
+    checkKeys: bool,
+) -> Result<void, S3Fail> {
+    var text = Vector<u8>.create();
+    if (r.peek() == '"') {
+        if (!r.string(mut text)?) { return Err(malformedPolicy()); }
+        if (text.view() != "*".bytes()) { return Err(malformedPolicy()); }
+        st.anyone = true;
+        return Ok();
+    }
+    if (!r.take('{') || r.take('}')) { return Err(malformedPolicy()); }
+    var aws = false;
+    while (true) {
+        if (!r.string(mut text)?) { return Err(malformedPolicy()); }
+        if (!r.take(':')) { return Err(malformedPolicy()); }
+        let kind = text.view();
+        if (kind == "CanonicalUser".bytes() || kind == "Service".bytes() || kind == "Federated".bytes()) {
+            return Err(notImplemented());
+        }
+        if (kind != "AWS".bytes() || aws) { return Err(malformedPolicy()); }
+        aws = true;
+        var values = Vector<Vector<u8>>.create();
+        policyStrings(r, mut values)?;
+        let prefix = POLICY_USER_ARN.bytes();
+        for (i in 0..values.length) {
+            let v = values[i].view();
+            if (v == "*".bytes()) {
+                st.anyone = true;
+                continue;
+            }
+            if (!startsWithBytes(v, prefix) || v.length == prefix.length) {
+                // Accounts, roles and the like are principals CosmoStore has not; anything else is not one.
+                if (startsWithBytes(v, "arn:aws:iam:".bytes())) { return Err(notImplemented()); }
+                return Err(malformedPolicy());
+            }
+            let key = v[prefix.length..];
+            if (checkKeys && !configuredKey(credentials, key)) { return Err(malformedPolicy()); }
+            st.keys.push(copyBytes(key)?)?;
+        }
+        if (r.take(',')) { continue; }
+        if (r.take('}')) { return Ok(); }
+        return Err(malformedPolicy());
+    }
+    return Ok();
+}
+
+/// An action pattern: `*`, or `s3:` and a name of letters with `*` and `?`; kept in lower case.
+fn actionPattern(text: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
+    var out = Vector<u8>.create();
+    if (text == "*".bytes()) {
+        out.push('*')?;
+        return Ok(out);
+    }
+    if (text.length <= 3 || !equalsIgnoreCase(text[0..3], "s3:".bytes())) { return Err(malformedPolicy()); }
+    for (c in text) {
+        let lower = lowerAscii(c);
+        out.push(lower)?;
+    }
+    for (c in out.view()[3..]) {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '*' || c == '?')) {
+            return Err(malformedPolicy());
+        }
+    }
+    return Ok(out);
+}
+
+/// The text before a pattern's first wildcard.
+fn literalPrefix(pattern: Slice<u8>) -> Slice<u8> {
+    for (i in 0..pattern.length) {
+        if (pattern[i] == '*' || pattern[i] == '?') { return pattern[0..i]; }
+    }
+    return pattern;
+}
+
+/// A resource pattern of this bucket, after `arn:aws:s3:::`: the bucket, or objects in it (ADR-0043 §3). A pattern
+/// that could name nothing in the bucket is MalformedPolicy, as S3 answers.
+fn resourcePattern(text: Slice<u8>, bucket: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
+    let arn = POLICY_S3_ARN.bytes();
+    if (!startsWithBytes(text, arn)) { return Err(malformedPolicy()); }
+    if (findBytes(text, "${".bytes(), 0).isSome()) { return Err(notImplemented()); } // policy variables
+    let pattern = text[arn.length..];
+    var objects = copyBytes(bucket)?;
+    objects.push('/')?;
+    let fixed = literalPrefix(pattern);
+    let ofBucket = pattern == bucket || startsWithBytes(fixed, objects.view()) ||
+        (fixed.length < pattern.length && startsWithBytes(objects.view(), fixed));
+    if (!ofBucket) { return Err(malformedPolicy()); }
+    return Ok(copyBytes(pattern)?);
+}
+
+/// A condition operator's name: the operator and whether it is negated; null for one CosmoStore does not evaluate.
+fn policyOpOf(name: Slice<u8>) -> PolicyTest? {
+    let ops = [
+        "StringEquals",
+        "StringNotEquals",
+        "StringEqualsIgnoreCase",
+        "StringNotEqualsIgnoreCase",
+        "StringLike",
+        "StringNotLike",
+        "Bool",
+        "IpAddress",
+        "NotIpAddress",
+        "NumericEquals",
+        "NumericNotEquals",
+        "NumericLessThan",
+        "NumericLessThanEquals",
+        "NumericGreaterThan",
+        "NumericGreaterThanEquals",
+        "Null",
+    ];
+    var found: usize? = null;
+    for (i in 0..ops.length) {
+        if (ops[i].bytes() == name) { found = Some(i); }
+    }
+    let i = match (found) {
+        Some(i) => i,
+        null => { return null; }
+    };
+    let op = match (i) {
+        0 | 1 => PolicyOp.StringEquals,
+        2 | 3 => PolicyOp.StringEqualsIgnoreCase,
+        4 | 5 => PolicyOp.StringLike,
+        6 => PolicyOp.Bool,
+        7 | 8 => PolicyOp.IpAddress,
+        9 | 10 => PolicyOp.NumericEquals,
+        11 => PolicyOp.NumericLessThan,
+        12 => PolicyOp.NumericLessThanEquals,
+        13 => PolicyOp.NumericGreaterThan,
+        14 => PolicyOp.NumericGreaterThanEquals,
+        _ => PolicyOp.Null,
+    };
+    return PolicyTest {
+        op: op,
+        negated: i == 1 || i == 3 || i == 5 || i == 8 || i == 10,
+        key: PolicyKey.Referer,
+        values: Vector<Vector<u8>>.create(),
+        ranges: Vector<IpRange>.create(),
+        numbers: Vector<u64>.create(),
+    };
+}
+
+/// A condition key's name, without regard to case; null for one CosmoStore does not have.
+fn policyKeyOf(name: Slice<u8>) -> PolicyKey? {
+    if (equalsIgnoreCase(name, "aws:SecureTransport".bytes())) { return PolicyKey.SecureTransport; }
+    if (equalsIgnoreCase(name, "aws:SourceIp".bytes())) { return PolicyKey.SourceIp; }
+    if (equalsIgnoreCase(name, "aws:Referer".bytes())) { return PolicyKey.Referer; }
+    if (equalsIgnoreCase(name, "aws:UserAgent".bytes())) { return PolicyKey.UserAgent; }
+    if (equalsIgnoreCase(name, "s3:prefix".bytes())) { return PolicyKey.Prefix; }
+    if (equalsIgnoreCase(name, "s3:delimiter".bytes())) { return PolicyKey.Delimiter; }
+    if (equalsIgnoreCase(name, "s3:max-keys".bytes())) { return PolicyKey.MaxKeys; }
+    return null;
+}
+
+/// Whether CosmoStore evaluates this operator on this key (ADR-0043 §3): IP operators on `aws:SourceIp`, `Bool` on
+/// `aws:SecureTransport`, numeric operators on `s3:max-keys`, string operators on the text keys, `Null` on all.
+fn opFitsKey(op: PolicyOp, key: PolicyKey) -> bool => match (op) {
+    PolicyOp.Null => true,
+    PolicyOp.IpAddress => match (key) {
+        PolicyKey.SourceIp => true,
+        _ => false,
+    },
+    PolicyOp.Bool => match (key) {
+        PolicyKey.SecureTransport => true,
+        _ => false,
+    },
+    PolicyOp.NumericEquals | PolicyOp.NumericLessThan | PolicyOp.NumericLessThanEquals | PolicyOp.NumericGreaterThan | PolicyOp.NumericGreaterThanEquals =>
+        match (key) {
+            PolicyKey.MaxKeys => true,
+            _ => false,
+        },
+    _ => match (key) {
+        PolicyKey.Referer | PolicyKey.UserAgent | PolicyKey.Prefix | PolicyKey.Delimiter => true,
+        _ => false,
+    },
+};
+
+/// `Condition`: operators, each with keys and their values (ADR-0043 §3).
+fn parseCondition<region a>(r: borrow mut JsonReader<a>, tests: borrow mut Vector<PolicyTest>) -> Result<void, S3Fail> {
+    if (!r.take('{')) { return Err(malformedPolicy()); }
+    if (r.take('}')) { return Ok(); }
+    var name = Vector<u8>.create();
+    while (true) {
+        if (!r.string(mut name)?) { return Err(malformedPolicy()); }
+        if (!r.take(':')) { return Err(malformedPolicy()); }
+        // `...IfExists`, `ForAllValues:`, `ForAnyValue:` and the operators of other types (dates, ARNs, binary)
+        // are valid in S3 and not evaluated here: refused, never ignored.
+        let template = match (policyOpOf(name.view())) {
+            Some(t) => t,
+            null => { return Err(notImplemented()); }
+        };
+        if (!r.take('{') || r.take('}')) { return Err(malformedPolicy()); }
+        while (true) {
+            if (!r.string(mut name)?) { return Err(malformedPolicy()); }
+            if (!r.take(':')) { return Err(malformedPolicy()); }
+            let key = match (policyKeyOf(name.view())) {
+                Some(k) => k,
+                null => { return Err(notImplemented()); }
+            };
+            if (!opFitsKey(template.op, key)) { return Err(notImplemented()); }
+            var raw = Vector<Vector<u8>>.create();
+            policyScalars(r, mut raw)?;
+            var test = PolicyTest {
+                op: template.op,
+                negated: template.negated,
+                key: key,
+                values: Vector<Vector<u8>>.create(),
+                ranges: Vector<IpRange>.create(),
+                numbers: Vector<u64>.create(),
+            };
+            for (i in 0..raw.length) {
+                let v = raw[i].view();
+                match (test.op) {
+                    PolicyOp.IpAddress => {
+                        match (parseIpRange(v)) {
+                            Some(range) => { test.ranges.push(range)?; }
+                            null => { return Err(malformedPolicy()); }
+                        }
+                    }
+                    PolicyOp.Bool | PolicyOp.Null => {
+                        var lower = Vector<u8>.create();
+                        for (c in v) { lower.push(lowerAscii(c))?; }
+                        if (lower.view() != "true".bytes() && lower.view() != "false".bytes()) {
+                            return Err(malformedPolicy());
+                        }
+                        test.values.push(lower)?;
+                    }
+                    PolicyOp.StringEquals | PolicyOp.StringEqualsIgnoreCase | PolicyOp.StringLike => {
+                        if (findBytes(v, "${".bytes(), 0).isSome()) { return Err(notImplemented()); }
+                        var kept = Vector<u8>.create();
+                        let ignoreCase = match (test.op) {
+                            PolicyOp.StringEqualsIgnoreCase => true,
+                            _ => false,
+                        };
+                        for (c in v) { kept.push(if (ignoreCase) lowerAscii(c) else c)?; }
+                        test.values.push(kept)?;
+                    }
+                    _ => {
+                        match (parseDecimal(v)) {
+                            Some(n) => { test.numbers.push(n)?; }
+                            null => { return Err(malformedPolicy()); }
+                        }
+                    }
+                }
+            }
+            tests.push(test)?;
+            if (r.take(',')) { continue; }
+            if (r.take('}')) { break; }
+            return Err(malformedPolicy());
+        }
+        if (r.take(',')) { continue; }
+        if (r.take('}')) { return Ok(); }
+        return Err(malformedPolicy());
+    }
+    return Ok();
+}
+
+/// One statement (ADR-0043 §3): an Effect, a principal, actions and resources (each or its `Not`), and conditions.
+fn parseStatement<region a>(
+    r: borrow mut JsonReader<a>,
+    bucket: Slice<u8>,
+    credentials: Slice<Credential>,
+    checkKeys: bool,
+) -> Result<PolicyStatement, S3Fail> {
+    var st = PolicyStatement {
+        allow: false,
+        keys: Vector<Vector<u8>>.create(),
+        anyone: false,
+        notPrincipal: false,
+        actions: Vector<Vector<u8>>.create(),
+        notAction: false,
+        resources: Vector<Vector<u8>>.create(),
+        notResource: false,
+        tests: Vector<PolicyTest>.create(),
+    };
+    if (!r.take('{') || r.take('}')) { return Err(malformedPolicy()); }
+    let fields = [
+        "Sid",
+        "Effect",
+        "Principal",
+        "NotPrincipal",
+        "Action",
+        "NotAction",
+        "Resource",
+        "NotResource",
+        "Condition",
+    ];
+    var seen: u32 = 0;
+    var name = Vector<u8>.create();
+    var text = Vector<u8>.create();
+    while (true) {
+        if (!r.string(mut name)?) { return Err(malformedPolicy()); }
+        if (!r.take(':')) { return Err(malformedPolicy()); }
+        var field: u32 = 99;
+        for (i in 0..fields.length) {
+            if (fields[i].bytes() == name.view()) { field = truncate<u32>(i); }
+        }
+        if (field == 99 || (seen & (1u32 << field)) != 0) { return Err(malformedPolicy()); }
+        seen |= 1u32 << field;
+        if (field == 0) {
+            if (!r.string(mut text)?) { return Err(malformedPolicy()); }
+        } else if (field == 1) {
+            if (!r.string(mut text)?) { return Err(malformedPolicy()); }
+            if (text.view() == "Allow".bytes()) {
+                st.allow = true;
+            } else if (text.view() != "Deny".bytes()) {
+                return Err(malformedPolicy());
+            }
+        } else if (field == 2 || field == 3) {
+            // `Allow` with `NotPrincipal` grants to everyone else, anonymous requests too: S3 refuses it.
+            if (field == 3 && st.allow) { return Err(malformedPolicy()); }
+            st.notPrincipal = field == 3;
+            parsePrincipal(r, mut st, credentials, checkKeys)?;
+        } else if (field == 4 || field == 5) {
+            st.notAction = field == 5;
+            var raw = Vector<Vector<u8>>.create();
+            policyStrings(r, mut raw)?;
+            for (i in 0..raw.length) { st.actions.push(actionPattern(raw[i].view())?)?; }
+        } else if (field == 6 || field == 7) {
+            st.notResource = field == 7;
+            var raw = Vector<Vector<u8>>.create();
+            policyStrings(r, mut raw)?;
+            for (i in 0..raw.length) { st.resources.push(resourcePattern(raw[i].view(), bucket)?)?; }
+        } else {
+            parseCondition(r, mut st.tests)?;
+        }
+        if (r.take(',')) { continue; }
+        if (r.take('}')) { break; }
+        return Err(malformedPolicy());
+    }
+    // An Effect, and exactly one of each pair: a bucket policy names its principals.
+    let pairs = [12u32, 48u32, 192u32];
+    if ((seen & 2) == 0 || (st.allow && st.notPrincipal)) { return Err(malformedPolicy()); }
+    for (p in pairs) {
+        if ((seen & p) == 0 || (seen & p) == p) { return Err(malformedPolicy()); }
+    }
+    return Ok(st);
+}
+
+/// A bucket policy's JSON (ADR-0043 §3). With `checkKeys`, as when it is put, a user ARN must name a configured key;
+/// without, as when a stored policy is used, one that does not just matches nothing.
+fn parseBucketPolicy(
+    json: Slice<u8>,
+    bucket: Slice<u8>,
+    credentials: Slice<Credential>,
+    checkKeys: bool,
+) -> Result<BucketPolicy, S3Fail> {
+    var policy = BucketPolicy { statements: Vector<PolicyStatement>.create(), denies: false };
+    if (json.length == 0 || json.length > MAX_POLICY_BYTES) { return Err(malformedPolicy()); }
+    var r = JsonReader { text: json, at: 0 };
+    if (!r.take('{') || r.take('}')) { return Err(malformedPolicy()); }
+    var seen: u32 = 0;
+    var name = Vector<u8>.create();
+    var text = Vector<u8>.create();
+    while (true) {
+        if (!r.string(mut name)?) { return Err(malformedPolicy()); }
+        if (!r.take(':')) { return Err(malformedPolicy()); }
+        let field: u32 =
+            if (name.view() == "Version".bytes()) 1
+                else if (name.view() == "Id".bytes()) 2
+                else if (name.view() == "Statement".bytes()) 4
+                else 0;
+        if (field == 0 || (seen & field) != 0) { return Err(malformedPolicy()); }
+        seen |= field;
+        if (field == 1) {
+            if (!r.string(mut text)?) { return Err(malformedPolicy()); }
+            if (text.view() != "2012-10-17".bytes() && text.view() != "2008-10-17".bytes()) {
+                return Err(malformedPolicy());
+            }
+        } else if (field == 2) {
+            if (!r.string(mut text)?) { return Err(malformedPolicy()); }
+        } else if (r.peek() == '[') {
+            let _ = r.take('[');
+            if (r.take(']')) { return Err(malformedPolicy()); }
+            while (true) {
+                policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys)?)?;
+                if (r.take(',')) { continue; }
+                if (r.take(']')) { break; }
+                return Err(malformedPolicy());
+            }
+        } else {
+            policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys)?)?;
+        }
+        if (r.take(',')) { continue; }
+        if (r.take('}')) { break; }
+        return Err(malformedPolicy());
+    }
+    r.skipSpace();
+    if (r.at != json.length || (seen & 4) == 0) { return Err(malformedPolicy()); }
+    for (i in 0..policy.statements.length) {
+        if (!policy.statements[i].allow) { policy.denies = true; }
+    }
+    return Ok(policy);
+}
+
+// ---- Addresses ----
+
+/// A decimal octet, 0 to 255.
+fn octetOf(text: Slice<u8>) -> u8? {
+    if (text.length == 0 || text.length > 3) { return null; }
+    return match (parseDecimal(text)) {
+        Some(v) => if (v <= 255) Some(truncate<u8>(v)) else null,
+        null => null,
+    };
+}
+
+/// `a.b.c.d` into `out[0..4]`.
+fn parseIpv4(text: Slice<u8>, out: borrow mut [u8; 16], at: usize) -> bool {
+    var start: usize = 0;
+    for (i in 0..4) {
+        let end = pieceEnd(text, start, '.');
+        if (i < 3 && end == text.length) { return false; }
+        match (octetOf(text[start..end])) {
+            Some(v) => { out[at + i] = v; }
+            null => { return false; }
+        }
+        start = end + 1;
+    }
+    return start == text.length + 1;
+}
+
+/// An IPv6 address: hex groups with at most one `::`, and an IPv4 address as its last 32 bits if it ends with one.
+fn parseIpv6(text: Slice<u8>, out: borrow mut [u8; 16]) -> bool {
+    var head = Vector<u16>.create();
+    var tail = Vector<u16>.create();
+    var gap = false;
+    var v4 = false;
+    var at: usize = 0;
+    if (startsWithBytes(text, "::".bytes())) {
+        gap = true;
+        at = 2;
+    }
+    while (at < text.length) {
+        let end = pieceEnd(text, at, ':');
+        let group = text[at..end];
+        if (group.length == 0) {
+            // `::` in the middle or at the end: one gap only.
+            if (gap || end != at) { return false; }
+            gap = true;
+            at = end + 1;
+            continue;
+        }
+        if (end == text.length && findBytes(group, ".".bytes(), 0).isSome()) {
+            var four = [0u8; 16];
+            if (!parseIpv4(group, mut four, 0)) { return false; }
+            let hi = ((four[0] as u16) << 8) | four[1] as u16;
+            let lo = ((four[2] as u16) << 8) | four[3] as u16;
+            let into = if (gap) borrow mut tail else borrow mut head;
+            if (into.push(hi).isErr() || into.push(lo).isErr()) { return false; }
+            v4 = true;
+            at = end + 1;
+            break;
+        }
+        if (group.length > 4) { return false; }
+        var v: u16 = 0;
+        for (c in group) {
+            match (hexValue(c)) {
+                Some(d) => { v = (v << 4) | d as u16; }
+                null => { return false; }
+            }
+        }
+        let into = if (gap) borrow mut tail else borrow mut head;
+        if (into.push(v).isErr()) { return false; }
+        // A `::` right after this group starts the gap.
+        if (end + 1 < text.length && text[end + 1] == ':') {
+            if (gap) { return false; }
+            gap = true;
+            at = end + 2;
+            continue;
+        }
+        at = end + 1;
+    }
+    if (at < text.length && !v4) { return false; }
+    let total = head.length + tail.length;
+    if ((gap && total > 7) || (!gap && total != 8)) { return false; }
+    for (i in 0..16) { out[i] = 0; }
+    for (i in 0..head.length) {
+        out[i * 2] = truncate<u8>(head[i] >> 8);
+        out[i * 2 + 1] = truncate<u8>(head[i]);
+    }
+    let from = 8 - tail.length;
+    for (i in 0..tail.length) {
+        out[(from + i) * 2] = truncate<u8>(tail[i] >> 8);
+        out[(from + i) * 2 + 1] = truncate<u8>(tail[i]);
+    }
+    return true;
+}
+
+/// An address or CIDR range, IPv4 or IPv6.
+fn parseIpRange(text: Slice<u8>) -> IpRange? {
+    let slash = pieceEnd(text, 0, '/');
+    let address = text[0..slash];
+    var range = IpRange { v6: false, bytes: [0u8; 16], bits: 0 };
+    if (findBytes(address, ":".bytes(), 0).isSome()) {
+        range.v6 = true;
+        if (!parseIpv6(address, mut range.bytes)) { return null; }
+    } else if (!parseIpv4(address, mut range.bytes, 0)) {
+        return null;
+    }
+    let most: u64 = if (range.v6) 128 else 32;
+    range.bits = truncate<u32>(most);
+    if (slash < text.length) {
+        let bits = text[slash + 1..];
+        if (bits.length == 0 || bits.length > 3) { return null; }
+        match (parseDecimal(bits)) {
+            Some(b) => {
+                if (b > most) { return null; }
+                range.bits = truncate<u32>(b);
+            }
+            null => { return null; }
+        }
+    }
+    return range;
+}
+
+/// Whether the first `bits` bits of `a` and `b` are the same.
+fn samePrefix(a: Slice<u8>, b: Slice<u8>, bits: u32) -> bool {
+    var left = bits;
+    var i: usize = 0;
+    while (left >= 8) {
+        if (a[i] != b[i]) { return false; }
+        i += 1;
+        left -= 8;
+    }
+    if (left == 0) { return true; }
+    let mask = truncate<u8>(0xFF00u32 >> left);
+    return (a[i] & mask) == (b[i] & mask);
+}
+
+/// Whether the range holds the peer. An IPv4 client seen as an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is that
+/// IPv4 address, and an IPv4 client is its mapped address to an IPv6 range.
+fn rangeHolds(range: borrow IpRange, peer: SocketAddress) -> bool {
+    var mapped = [0u8; 16];
+    mapped[10] = 0xFF;
+    mapped[11] = 0xFF;
+    match (peer) {
+        SocketAddress.V4(a, _) => {
+            if (!range.v6) { return samePrefix(range.bytes[0..4], a[..], range.bits); }
+            for (i in 0..4) { mapped[12 + i] = a[i]; }
+            return samePrefix(range.bytes[..], mapped[..], range.bits);
+        }
+        SocketAddress.V6(a, _, _) => {
+            if (range.v6) { return samePrefix(range.bytes[..], a[..], range.bits); }
+            if (a[0..12] != mapped[0..12]) { return false; }
+            return samePrefix(range.bytes[0..4], a[12..16], range.bits);
+        }
+    }
+}
+
+// ---- The decision ----
+
+/// `*` and `?` wildcards; without regard to ASCII case when `ignoreCase`.
+fn wildMatch(pattern: Slice<u8>, text: Slice<u8>, ignoreCase: bool) -> bool {
+    var p: usize = 0;
+    var t: usize = 0;
+    var star: usize? = null;
+    var mark: usize = 0;
+    while (t < text.length) {
+        if (p < pattern.length && pattern[p] == '*') {
+            star = Some(p);
+            mark = t;
+            p += 1;
+            continue;
+        }
+        if (p < pattern.length) {
+            let a = if (ignoreCase) lowerAscii(pattern[p]) else pattern[p];
+            let b = if (ignoreCase) lowerAscii(text[t]) else text[t];
+            if (pattern[p] == '?' || a == b) {
+                p += 1;
+                t += 1;
+                continue;
+            }
+        }
+        match (star) {
+            Some(s) => {
+                p = s + 1;
+                mark += 1;
+                t = mark;
+            }
+            null => { return false; }
+        }
+    }
+    while (p < pattern.length && pattern[p] == '*') { p += 1; }
+    return p == pattern.length;
+}
+
+/// What a request brings to a policy's conditions (ADR-0043 §6); null for a key it does not have.
+struct PolicyFacts {
+    secure: bool;
+    peer: SocketAddress?;
+    referer: Vector<u8>?;
+    userAgent: Vector<u8>?;
+    prefix: Vector<u8>?;
+    delimiter: Vector<u8>?;
+    maxKeys: Vector<u8>?;
+}
+
+fn ownedOf(v: Slice<u8>?) -> Result<Vector<u8>?, AllocError> => match (v) {
+    Some(b) => Ok(Some(copyBytes(b)?)),
+    null => Ok(null),
+};
+
+/// The facts of `req`; the listing keys only for a listing's action.
+fn policyFacts(
+    req: borrow S3Request,
+    listing: bool,
+    secure: bool,
+    peer: SocketAddress?,
+) -> Result<PolicyFacts, AllocError> {
+    var facts = PolicyFacts {
+        secure: secure,
+        peer: peer,
+        referer: ownedOf(headerOf(req, "referer"))?,
+        userAgent: ownedOf(headerOf(req, "user-agent"))?,
+        prefix: null,
+        delimiter: null,
+        maxKeys: null,
+    };
+    if (listing) {
+        facts.prefix = copyBytes(paramOf(req, "prefix") ?? "".bytes())?;
+        facts.delimiter = ownedOf(paramOf(req, "delimiter"))?;
+        facts.maxKeys = ownedOf(paramOf(req, "max-keys"))?;
+    }
+    return Ok(facts);
+}
+
+/// The text of a string key, when the request has it.
+fn factText(facts: borrow PolicyFacts, key: PolicyKey) -> Slice<u8>? => match (key) {
+    PolicyKey.Referer => match (facts.referer.asBorrow()) {
+        Some(v) => Some(v.view()),
+        null => null,
+    },
+    PolicyKey.UserAgent => match (facts.userAgent.asBorrow()) {
+        Some(v) => Some(v.view()),
+        null => null,
+    },
+    PolicyKey.Prefix => match (facts.prefix.asBorrow()) {
+        Some(v) => Some(v.view()),
+        null => null,
+    },
+    PolicyKey.Delimiter => match (facts.delimiter.asBorrow()) {
+        Some(v) => Some(v.view()),
+        null => null,
+    },
+    PolicyKey.MaxKeys => match (facts.maxKeys.asBorrow()) {
+        Some(v) => Some(v.view()),
+        null => null,
+    },
+    PolicyKey.SecureTransport => if (facts.secure) Some("true".bytes()) else Some("false".bytes()),
+    PolicyKey.SourceIp => null,
+};
+
+/// Whether the request has the key at all.
+fn factPresent(facts: borrow PolicyFacts, key: PolicyKey) -> bool => match (key) {
+    PolicyKey.SourceIp => facts.peer.isSome(),
+    _ => factText(facts, key).isSome(),
+};
+
+/// One condition test (ADR-0043 §3): any value matches; a key the request does not have fails it unless it is
+/// negated; `Null` asks whether the key is absent.
+fn testHolds(t: borrow PolicyTest, facts: borrow PolicyFacts) -> bool {
+    let present = factPresent(facts, t.key);
+    match (t.op) {
+        PolicyOp.Null => {
+            for (i in 0..t.values.length) {
+                let wantsAbsent = t.values[i].view() == "true".bytes();
+                if (wantsAbsent != present) { return true; }
+            }
+            return false;
+        }
+        _ => {}
+    }
+    if (!present) { return t.negated; }
+    var matched = false;
+    match (t.op) {
+        PolicyOp.IpAddress => {
+            match (facts.peer) {
+                Some(peer) => {
+                    for (i in 0..t.ranges.length) {
+                        if (rangeHolds(borrow t.ranges[i], peer)) { matched = true; }
+                    }
+                }
+                null => {}
+            }
+        }
+        PolicyOp.NumericEquals | PolicyOp.NumericLessThan | PolicyOp.NumericLessThanEquals | PolicyOp.NumericGreaterThan | PolicyOp.NumericGreaterThanEquals => {
+            // A value that is not a number matches no number.
+            match (parseDecimal(factText(facts, t.key) ?? "".bytes())) {
+                Some(n) => {
+                    for (i in 0..t.numbers.length) {
+                        let v = t.numbers[i];
+                        let hit = match (t.op) {
+                            PolicyOp.NumericEquals => n == v,
+                            PolicyOp.NumericLessThan => n < v,
+                            PolicyOp.NumericLessThanEquals => n <= v,
+                            PolicyOp.NumericGreaterThan => n > v,
+                            _ => n >= v,
+                        };
+                        if (hit) { matched = true; }
+                    }
+                }
+                null => {}
+            }
+        }
+        _ => {
+            let text = factText(facts, t.key) ?? "".bytes();
+            for (i in 0..t.values.length) {
+                let v = t.values[i].view();
+                let hit = match (t.op) {
+                    PolicyOp.StringEqualsIgnoreCase | PolicyOp.Bool => equalsIgnoreCase(text, v),
+                    PolicyOp.StringLike => wildMatch(v, text, false),
+                    _ => text == v,
+                };
+                if (hit) { matched = true; }
+            }
+        }
+    }
+    return matched != t.negated;
+}
+
+enum PolicyDecision {
+    Allow,
+    Deny,
+    Neither,
+}
+
+/// Whether a statement applies: its principal, action, resource and every condition match.
+fn statementApplies(
+    st: borrow PolicyStatement,
+    who: Slice<u8>?,
+    action: StringView,
+    resource: Slice<u8>,
+    facts: borrow PolicyFacts,
+) -> bool {
+    var principal = st.anyone;
+    match (who) {
+        Some(key) => {
+            for (i in 0..st.keys.length) {
+                if (st.keys[i].view() == key) { principal = true; }
+            }
+        }
+        null => {}
+    }
+    if (principal == st.notPrincipal) { return false; }
+    var acts = false;
+    for (i in 0..st.actions.length) {
+        if (wildMatch(st.actions[i].view(), action.bytes(), true)) { acts = true; }
+    }
+    if (acts == st.notAction) { return false; }
+    var covers = false;
+    for (i in 0..st.resources.length) {
+        if (wildMatch(st.resources[i].view(), resource, false)) { covers = true; }
+    }
+    if (covers == st.notResource) { return false; }
+    for (i in 0..st.tests.length) {
+        if (!testHolds(borrow st.tests[i], facts)) { return false; }
+    }
+    return true;
+}
+
+/// A policy's answer for a request (ADR-0043 §4): Deny if a Deny applies, else Allow if an Allow does.
+fn decidePolicy(
+    policy: borrow BucketPolicy,
+    who: Slice<u8>?,
+    action: StringView,
+    resource: Slice<u8>,
+    facts: borrow PolicyFacts,
+) -> PolicyDecision {
+    var allowed = false;
+    for (i in 0..policy.statements.length) {
+        let st = borrow policy.statements[i];
+        if (!statementApplies(st, who, action, resource, facts)) { continue; }
+        if (!st.allow) { return PolicyDecision.Deny; }
+        allowed = true;
+    }
+    return if (allowed) PolicyDecision.Allow else PolicyDecision.Neither;
+}
+
+// ---- Requests ----
+
+/// Who sent a request (ADR-0043 §1): a configured key, by its place in the credentials, or no one; and from where.
+struct Requester {
+    key: usize?;
+    peer: SocketAddress?;
+}
+
+/// The policy calls, which a key is never refused and an anonymous request always is (ADR-0043 §4).
+fn isPolicyAction(action: StringView) -> bool =>
+    action == "s3:GetBucketPolicy" || action == "s3:PutBucketPolicy" || action == "s3:DeleteBucketPolicy";
+
+/// The listings, which have the `s3:prefix`, `s3:delimiter` and `s3:max-keys` keys.
+fn isListingAction(action: StringView) -> bool => action == "s3:ListBucket" || action == "s3:ListBucketVersions";
+
+/// What a request's checks need of its bucket's policy, read once (DeleteObjects checks every key with it).
+enum PolicyGate {
+    /// Nothing to read: a key, and no policy has a Deny.
+    Open,
+    /// Nothing to read: anonymous, and no bucket has a policy.
+    Closed,
+    /// The bucket has no policy, or is not there.
+    Absent,
+    Read(BucketPolicy),
+    /// A stored policy that does not parse (ADR-0043 §9).
+    Broken,
+}
+
+/// The bucket's policy, as a request by `who` needs it (ADR-0043 §8).
+async fn policyGate(app: borrow S3App, who: borrow Requester, bucket: StringView) -> Result<PolicyGate, S3Fail> {
+    if (who.key.isSome()) {
+        if (app.denyBuckets.load() == 0) { return Ok(PolicyGate.Open); }
+    } else if (app.policyBuckets.load() == 0) {
+        return Ok(PolicyGate.Closed);
+    }
+    var document = Vector<u8>.create();
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        // An index lookup and a copy: on the event loop.
+        match (store.bucketConfig(bucket, BUCKET_CONFIG_POLICY)) {
+            Ok(d) => { document = d; }
+            Err(_) => { return Ok(PolicyGate.Absent); }
+        }
+    }
+    if (document.length == 0) { return Ok(PolicyGate.Absent); }
+    return match (parseBucketPolicy(document.view(), bucket.bytes(), app.credentials.view(), false)) {
+        Ok(p) => Ok(PolicyGate.Read(p)),
+        Err(S3Fail.OutOfMemory(e)) => Err(S3Fail.OutOfMemory(e)),
+        Err(_) => Ok(PolicyGate.Broken),
+    };
+}
+
+/// Whether the gate lets `who` do `action` on `bucket` or `bucket/key` (`key` empty: the bucket).
+fn gateAllows(
+    app: borrow S3App,
+    gate: borrow PolicyGate,
+    req: borrow S3Request,
+    who: borrow Requester,
+    action: StringView,
+    bucket: StringView,
+    key: Slice<u8>,
+) -> Result<bool, AllocError> {
+    let anonymous = who.key.isNull();
+    if (isPolicyAction(action)) { return Ok(!anonymous); }
+    let policy = match (gate) {
+        PolicyGate.Open => { return Ok(true); }
+        PolicyGate.Closed | PolicyGate.Broken => { return Ok(false); }
+        PolicyGate.Absent => { return Ok(!anonymous); }
+        PolicyGate.Read(p) => p,
+    };
+    var resource = copyBytes(bucket.bytes())?;
+    if (key.length > 0) {
+        resource.push('/')?;
+        resource.extend(key)?;
+    }
+    let facts = policyFacts(req, isListingAction(action), app.secure, who.peer)?;
+    let principal = match (who.key) {
+        Some(i) => Some(app.credentials[i].accessKey.view()),
+        null => null,
+    };
+    return Ok(match (decidePolicy(policy, principal, action, resource.view(), borrow facts)) {
+        PolicyDecision.Deny => false,
+        PolicyDecision.Allow => true,
+        PolicyDecision.Neither => !anonymous,
+    });
+}
+
+/// AccessDenied unless `who` may do `action` on `bucket` or `bucket/key` (ADR-0043 §4).
+async fn authorize(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    action: StringView,
+    bucket: StringView,
+    key: Slice<u8>,
+) -> Result<void, S3Fail> {
+    if (who.key.isSome() && (app.denyBuckets.load() == 0 || isPolicyAction(action))) { return Ok(); }
+    let gate = await policyGate(app, who, bucket)?;
+    if (!gateAllows(app, borrow gate, req, who, action, bucket, key)?) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    return Ok();
+}
+
+/// `authorize` for the request's own object, with the action's version form when it names a version.
+async fn authorizeObject(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    action: StringView,
+    versionAction: StringView,
+) -> Result<void, S3Fail> {
+    let named = if (req.hasParam("versionId")) versionAction else action;
+    return await authorize(app, req, who, named, req.bucket.view(), req.key.view().bytes());
+}
+
+/// The counts of ADR-0043 §8, made again from the store: buckets with a policy, and those whose policy has a Deny
+/// (or does not parse, so a key's requests read it and are refused).
+fn countPolicies(all: borrow BucketPolicies, credentials: Slice<Credential>) -> PolicyCounts {
+    var counts = PolicyCounts { policies: 0, denies: 0 };
+    for (i in 0..all.names.length) {
+        counts.policies += 1;
+        let denies = match (parseBucketPolicy(all.documents[i].view(), all.names[i].view(), credentials, false)) {
+            Ok(p) => p.denies,
+            Err(_) => true,
+        };
+        if (denies) { counts.denies += 1; }
+    }
+    return counts;
+}
+
+struct PolicyCounts {
+    policies: u64;
+    denies: u64;
+}
+
+/// After a policy is put or deleted, or a bucket deleted: the counts again, before the response (ADR-0043 §8).
+async fn recountPolicies(app: borrow S3App) -> Result<void, S3Fail> {
+    var all = BucketPolicies { names: Vector<Vector<u8>>.create(), documents: Vector<Vector<u8>>.create() };
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        all = match (store.bucketPolicies()) {
+            Ok(a) => a,
+            Err(e) => { return Err(storeFail(e, 0)); }
+        };
+    }
+    let counts = countPolicies(borrow all, app.credentials.view());
+    app.policyBuckets.store(counts.policies);
+    app.denyBuckets.store(counts.denies);
+    return Ok();
+}
+
+// ---- The policy calls ----
+
+async fn getBucketPolicy(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let document = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_POLICY)?;
+    if (document.length == 0) { return Err(S3Fail.Code(S3Code.NoSuchBucketPolicy)); }
+    exchange.header("content-type", "application/json".bytes())?;
+    await exchange.send(Status.ok(), document.view())?;
+    return Ok();
+}
+
+async fn putBucketPolicy(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let json = await readSmallBody(auth, exchange, MAX_POLICY_BYTES + 1)?;
+    verifySmallBody(req, json.view(), true)?;
+    let _ = parseBucketPolicy(json.view(), req.bucket.view().bytes(), app.credentials.view(), true)?;
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_POLICY, json.view())?;
+    await recountPolicies(app)?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}
+
+async fn deleteBucketPolicy(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_POLICY, "".bytes())?;
+    await recountPolicies(app)?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}

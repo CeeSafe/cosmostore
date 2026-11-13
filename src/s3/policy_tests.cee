@@ -1,0 +1,446 @@
+// Bucket policies (ADR-0043): the document's checks, the matching, and the decisions.
+import web_core;
+import web_http;
+import web_server;
+
+fn policyKeys() -> Vector<Credential> {
+    var out = Vector<Credential>.create();
+    let names = ["AKIAPOLICYKEY0000001", "AKIAPOLICYKEY0000002"];
+    for (n in names) {
+        out.push(Credential {
+            accessKey: copyBytes(n.bytes())!,
+            secret: copyBytes("secret".bytes())!,
+            signing: SigningKeyCache.create(),
+        })!;
+    }
+    return out;
+}
+
+fn policyOf(json: StringView) -> Result<BucketPolicy, TestFailure> {
+    let keys = policyKeys();
+    match (parseBucketPolicy(json.bytes(), "pub".bytes(), keys.view(), true)) {
+        Ok(p) => { return Ok(p); }
+        Err(_) => {
+            Check.fail("the policy parses")?;
+            return Err(TestFailure.create("the policy parses"));
+        }
+    }
+}
+
+/// The code a policy is refused with; "ok" if it is not.
+fn refusalOf(json: StringView) -> StringView {
+    let keys = policyKeys();
+    return match (parseBucketPolicy(json.bytes(), "pub".bytes(), keys.view(), true)) {
+        Ok(_) => "ok",
+        Err(S3Fail.Code(code)) => s3CodeName(code),
+        Err(_) => "out of memory",
+    };
+}
+
+fn plainFacts() -> PolicyFacts => PolicyFacts {
+    secure: false,
+    peer: null,
+    referer: null,
+    userAgent: null,
+    prefix: null,
+    delimiter: null,
+    maxKeys: null,
+};
+
+fn decisionName(d: PolicyDecision) -> StringView => match (d) {
+    PolicyDecision.Allow => "allow",
+    PolicyDecision.Deny => "deny",
+    PolicyDecision.Neither => "neither",
+};
+
+fn decide(
+    policy: borrow BucketPolicy,
+    who: StringView,
+    action: StringView,
+    resource: StringView,
+    facts: borrow PolicyFacts,
+) -> Vector<u8> {
+    let principal: Slice<u8>? = if (who.length == 0) null else Some(who.bytes());
+    return copyBytes(decisionName(decidePolicy(policy, principal, action, resource.bytes(), facts)).bytes())!;
+}
+
+@test
+fn policyWildcards() -> Result<void, TestFailure> {
+    Check.isTrue(wildMatch("*".bytes(), "".bytes(), false), "* matches nothing too")?;
+    Check.isTrue(wildMatch("pub/*".bytes(), "pub/a/b.txt".bytes(), false), "a prefix")?;
+    Check.isTrue(wildMatch("pub/*.jpg".bytes(), "pub/x/y.jpg".bytes(), false), "a suffix")?;
+    Check.isTrue(!wildMatch("pub/*.jpg".bytes(), "pub/x/y.jpgz".bytes(), false), "not past the end")?;
+    Check.isTrue(wildMatch("a?c".bytes(), "abc".bytes(), false), "? is one byte")?;
+    Check.isTrue(!wildMatch("a?c".bytes(), "ac".bytes(), false), "? is not none")?;
+    Check.isTrue(wildMatch("*a*b*".bytes(), "xxaxxbxx".bytes(), false), "several stars")?;
+    Check.isTrue(!wildMatch("Pub/*".bytes(), "pub/x".bytes(), false), "resources keep case")?;
+    Check.isTrue(wildMatch("s3:get*".bytes(), "s3:GetObject".bytes(), true), "actions do not")?;
+    return Ok();
+}
+
+@test
+fn policyAddresses() -> Result<void, TestFailure> {
+    let net = parseIpRange("192.168.1.0/24".bytes())!;
+    Check.isTrue(!net.v6 && net.bits == 24, "an IPv4 range")?;
+    Check.isTrue(rangeHolds(borrow net, SocketAddress.V4([192u8, 168, 1, 77], 5000)), "inside")?;
+    Check.isTrue(!rangeHolds(borrow net, SocketAddress.V4([192u8, 168, 2, 1], 5000)), "outside")?;
+    // A prefix that ends inside a byte.
+    let half = parseIpRange("10.1.2.128/25".bytes())!;
+    Check.isTrue(rangeHolds(borrow half, SocketAddress.V4([10u8, 1, 2, 200], 1)), "the upper half")?;
+    Check.isTrue(!rangeHolds(borrow half, SocketAddress.V4([10u8, 1, 2, 100], 1)), "not the lower")?;
+    let twelve = parseIpRange("172.16.0.0/12".bytes())!;
+    Check.isTrue(rangeHolds(borrow twelve, SocketAddress.V4([172u8, 31, 255, 1], 1)), "172.31 is in /12")?;
+    Check.isTrue(!rangeHolds(borrow twelve, SocketAddress.V4([172u8, 32, 0, 1], 1)), "172.32 is not")?;
+    let one = parseIpRange("127.0.0.1".bytes())!;
+    Check.equalU64(32, one.bits as u64)?;
+    // An IPv4 client seen through an IPv6 socket is still that address.
+    var mapped = [0u8; 16];
+    mapped[10] = 0xFF;
+    mapped[11] = 0xFF;
+    mapped[12] = 127;
+    mapped[15] = 1;
+    Check.isTrue(rangeHolds(borrow one, SocketAddress.V6(mapped, 1, 0)), "IPv4-mapped")?;
+    let v6 = parseIpRange("2001:db8::/32".bytes())!;
+    var inside = [0u8; 16];
+    inside[0] = 0x20;
+    inside[1] = 0x01;
+    inside[2] = 0x0d;
+    inside[3] = 0xb8;
+    inside[15] = 9;
+    Check.isTrue(v6.v6 && rangeHolds(borrow v6, SocketAddress.V6(inside, 1, 0)), "an IPv6 range")?;
+    inside[3] = 0xb9;
+    Check.isTrue(!rangeHolds(borrow v6, SocketAddress.V6(inside, 1, 0)), "outside it")?;
+    Check.isTrue(!rangeHolds(borrow v6, SocketAddress.V4([127u8, 0, 0, 1], 1)), "an IPv4 client")?;
+    // The forms of IPv6.
+    let loop6 = parseIpRange("::1".bytes())!;
+    Check.isTrue(loop6.bytes[15] == 1 && loop6.bytes[0] == 0 && loop6.bits == 128, "::1")?;
+    let tailV4 = parseIpRange("::ffff:10.1.2.3/128".bytes())!;
+    Check.isTrue(tailV4.bytes[11] == 0xFF && tailV4.bytes[12] == 10 && tailV4.bytes[15] == 3, "a dotted tail")?;
+    let full = parseIpRange("fe80:0:0:0:0:0:0:1".bytes())!;
+    Check.isTrue(full.bytes[0] == 0xFE && full.bytes[1] == 0x80 && full.bytes[15] == 1, "eight groups")?;
+    let bad = [
+        "256.1.1.1",
+        "1.2.3",
+        "1.2.3.4.5",
+        "1.2.3.4/33",
+        "1.2.3.4/",
+        "::1::2",
+        "1:2:3:4:5:6:7:8:9",
+        "1:2:3:4:5:6:7",
+        "12345::",
+        "g::1",
+        "::/129",
+        "",
+    ];
+    for (b in bad) { Check.isTrue(parseIpRange(b.bytes()).isNull(), "not an address or range")?; }
+    return Ok();
+}
+
+@test
+fn policyPublicRead() -> Result<void, TestFailure> {
+    let policy = policyOf(
+        """
+        {"Version": "2012-10-17", "Statement": [{"Sid": "read", "Effect": "Allow", "Principal": "*",
+          "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::pub/*"}]}
+        """,
+    )?;
+    Check.isTrue(!policy.denies, "no Deny")?;
+    let facts = plainFacts();
+    Check.equalBytes("allow".bytes(), decide(borrow policy, "", "s3:GetObject", "pub/a.txt", borrow facts).view())?;
+    Check.equalBytes(
+        "neither".bytes(),
+        decide(borrow policy, "", "s3:PutObject", "pub/a.txt", borrow facts).view(),
+    )?;
+    Check.equalBytes("neither".bytes(), decide(borrow policy, "", "s3:ListBucket", "pub", borrow facts).view())?;
+    // `*` is everyone, keys too.
+    Check.equalBytes(
+        "allow".bytes(),
+        decide(borrow policy, "AKIAPOLICYKEY0000001", "s3:GetObject", "pub/a", borrow facts).view(),
+    )?;
+    return Ok();
+}
+
+@test
+fn policyDeniesAndTheNotForms() -> Result<void, TestFailure> {
+    let policy = policyOf(
+        """
+        {"Statement": [
+          {"Effect": "Deny", "Principal": {"AWS": ["arn:aws:iam:::user/AKIAPOLICYKEY0000002"]},
+           "Action": "s3:*", "Resource": ["arn:aws:s3:::pub/secret/*"]},
+          {"Effect": "Deny", "NotPrincipal": {"AWS": "arn:aws:iam:::user/AKIAPOLICYKEY0000001"},
+           "NotAction": ["s3:Get*", "s3:List*"], "Resource": "arn:aws:s3:::pub/*"},
+          {"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "s3:GetObject",
+           "NotResource": "arn:aws:s3:::pub/secret/*"}
+        ]}
+        """,
+    )?;
+    Check.isTrue(policy.denies, "a Deny")?;
+    let facts = plainFacts();
+    let one = "AKIAPOLICYKEY0000001";
+    let two = "AKIAPOLICYKEY0000002";
+    // The second key may not touch secret/ at all; the first may.
+    Check.equalBytes("deny".bytes(), decide(borrow policy, two, "s3:GetObject", "pub/secret/x", borrow facts).view())?;
+    Check.equalBytes(
+        "neither".bytes(),
+        decide(borrow policy, one, "s3:GetObject", "pub/secret/x", borrow facts).view(),
+    )?;
+    // Everyone but the first key is denied writes: the second key, and anonymous requests.
+    Check.equalBytes("deny".bytes(), decide(borrow policy, two, "s3:PutObject", "pub/a", borrow facts).view())?;
+    Check.equalBytes("deny".bytes(), decide(borrow policy, "", "s3:DeleteObject", "pub/a", borrow facts).view())?;
+    Check.equalBytes("neither".bytes(), decide(borrow policy, one, "s3:PutObject", "pub/a", borrow facts).view())?;
+    // Reads are not denied by the NotAction statement; anyone may read outside secret/.
+    Check.equalBytes("allow".bytes(), decide(borrow policy, "", "s3:GetObject", "pub/a", borrow facts).view())?;
+    Check.equalBytes(
+        "neither".bytes(),
+        decide(borrow policy, "", "s3:GetObject", "pub/secret/x", borrow facts).view(),
+    )?;
+    return Ok();
+}
+
+@test
+fn policyConditions() -> Result<void, TestFailure> {
+    let policy = policyOf(
+        """
+        {"Statement": [
+          {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::pub/*",
+           "Condition": {"IpAddress": {"aws:SourceIp": ["10.0.0.0/8", "2001:db8::/32"]},
+                         "Bool": {"aws:SecureTransport": true}}},
+          {"Effect": "Allow", "Principal": "*", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::pub",
+           "Condition": {"StringLike": {"s3:prefix": ["", "home/*"]}, "NumericLessThanEquals": {"s3:max-keys": 100}}},
+          {"Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": "arn:aws:s3:::pub/*",
+           "Condition": {"StringNotEquals": {"aws:Referer": "https://example.com/"}}},
+          {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObjectTagging", "Resource": "arn:aws:s3:::pub/*",
+           "Condition": {"Null": {"aws:UserAgent": "true"}}}
+        ]}
+        """,
+    )?;
+    var facts = plainFacts();
+    facts.referer = copyBytes("https://example.com/".bytes())!;
+    // Both conditions of the first statement must hold.
+    facts.peer = SocketAddress.V4([10u8, 9, 8, 7], 1);
+    Check.equalBytes("neither".bytes(), decide(borrow policy, "", "s3:GetObject", "pub/a", borrow facts).view())?;
+    facts.secure = true;
+    Check.equalBytes("allow".bytes(), decide(borrow policy, "", "s3:GetObject", "pub/a", borrow facts).view())?;
+    facts.peer = SocketAddress.V4([11u8, 0, 0, 1], 1);
+    Check.equalBytes("neither".bytes(), decide(borrow policy, "", "s3:GetObject", "pub/a", borrow facts).view())?;
+    // A request without a peer has no aws:SourceIp: IpAddress fails.
+    facts.peer = null;
+    Check.equalBytes("neither".bytes(), decide(borrow policy, "", "s3:GetObject", "pub/a", borrow facts).view())?;
+    // A negated operator holds when the key is absent: no Referer is a Deny.
+    facts.peer = SocketAddress.V4([10u8, 0, 0, 1], 1);
+    facts.referer = null;
+    Check.equalBytes("deny".bytes(), decide(borrow policy, "", "s3:GetObject", "pub/a", borrow facts).view())?;
+    facts.referer = copyBytes("https://elsewhere/".bytes())!;
+    Check.equalBytes("deny".bytes(), decide(borrow policy, "", "s3:GetObject", "pub/a", borrow facts).view())?;
+    facts.referer = copyBytes("https://example.com/".bytes())!;
+    // Listing: the prefix (empty when not given), and max-keys, which this policy needs.
+    facts.prefix = copyBytes("".bytes())!;
+    facts.maxKeys = copyBytes("10".bytes())!;
+    Check.equalBytes("allow".bytes(), decide(borrow policy, "", "s3:ListBucket", "pub", borrow facts).view())?;
+    facts.prefix = copyBytes("home/me".bytes())!;
+    facts.maxKeys = copyBytes("100".bytes())!;
+    Check.equalBytes("allow".bytes(), decide(borrow policy, "", "s3:ListBucket", "pub", borrow facts).view())?;
+    facts.maxKeys = copyBytes("101".bytes())!;
+    Check.equalBytes("neither".bytes(), decide(borrow policy, "", "s3:ListBucket", "pub", borrow facts).view())?;
+    facts.maxKeys = null; // not given: NumericLessThanEquals fails
+    Check.equalBytes("neither".bytes(), decide(borrow policy, "", "s3:ListBucket", "pub", borrow facts).view())?;
+    facts.maxKeys = copyBytes("5".bytes())!;
+    facts.prefix = copyBytes("other/".bytes())!;
+    Check.equalBytes("neither".bytes(), decide(borrow policy, "", "s3:ListBucket", "pub", borrow facts).view())?;
+    // Null: only without a User-Agent.
+    Check.equalBytes(
+        "allow".bytes(),
+        decide(borrow policy, "", "s3:GetObjectTagging", "pub/a", borrow facts).view(),
+    )?;
+    facts.userAgent = copyBytes("curl".bytes())!;
+    Check.equalBytes(
+        "neither".bytes(),
+        decide(borrow policy, "", "s3:GetObjectTagging", "pub/a", borrow facts).view(),
+    )?;
+    return Ok();
+}
+
+@test
+fn policyDocumentsRefused() -> Result<void, TestFailure> {
+    let malformed = [
+        "",
+        "not json",
+        "{}",
+        "{\"Statement\": []}",
+        "{\"Version\": \"2010-01-01\", \"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Maybe\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"NotPrincipal\": {\"AWS\": \"arn:aws:iam:::user/AKIAPOLICYKEY0000001\"}, \"Effect\": \"Allow\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"NotPrincipal\": {\"AWS\": \"arn:aws:iam::123456789012:root\"}, \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"NotPrincipal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"iam:PassRole\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::other/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pubx\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"someone\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": {\"AWS\": \"arn:aws:iam:::user/AKIANOTCONFIGURED\"}, \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\", \"Extra\": 1}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}} trailing",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\", \"Condition\": {\"IpAddress\": {\"aws:SourceIp\": \"10.0.0.0/40\"}}}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\", \"Condition\": {\"Bool\": {\"aws:SecureTransport\": \"yes\"}}}}",
+    ];
+    for (m in malformed) {
+        let got = refusalOf(m);
+        if (got != "MalformedPolicy") {
+            Check.equalBytes(m.bytes(), got.bytes())?; // names the document that was not refused so
+        }
+    }
+    // Valid in S3, not evaluated here: refused rather than ignored.
+    let unsupported = [
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": {\"Service\": \"logging.s3.amazonaws.com\"}, \"Action\": \"s3:PutObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": {\"AWS\": \"arn:aws:iam::123456789012:root\"}, \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/${aws:username}/*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\", \"Condition\": {\"StringEqualsIfExists\": {\"aws:Referer\": \"x\"}}}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\", \"Condition\": {\"ForAnyValue:StringEquals\": {\"aws:Referer\": \"x\"}}}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\", \"Condition\": {\"DateGreaterThan\": {\"aws:CurrentTime\": \"2030-01-01T00:00:00Z\"}}}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\", \"Condition\": {\"StringEquals\": {\"s3:ExistingObjectTag/k\": \"v\"}}}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\", \"Condition\": {\"StringEquals\": {\"aws:SourceIp\": \"10.0.0.1\"}}}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\", \"Condition\": {\"StringLike\": {\"aws:Referer\": \"${aws:username}\"}}}}",
+    ];
+    for (u in unsupported) {
+        let got = refusalOf(u);
+        if (got != "NotImplemented") { Check.equalBytes(u.bytes(), got.bytes())?; }
+    }
+    // Accepted: the 2008 version, one statement as an object, a wildcard bucket resource, and a principal list.
+    let accepted = [
+        "{\"Version\": \"2008-10-17\", \"Id\": \"x\", \"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"*\", \"Resource\": [\"arn:aws:s3:::pub\", \"arn:aws:s3:::pub/*\"]}}",
+        "{\"Statement\": [{\"Effect\": \"Deny\", \"Principal\": {\"AWS\": [\"*\", \"arn:aws:iam:::user/AKIAPOLICYKEY0000002\"]}, \"Action\": \"s3:Delete*\", \"Resource\": \"arn:aws:s3:::*\"}]}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObjectAcl\", \"Resource\": \"arn:aws:s3:::pu*\"}}",
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\", \"Condition\": {}}}",
+    ];
+    for (a in accepted) {
+        let got = refusalOf(a);
+        if (got != "ok") { Check.equalBytes(a.bytes(), got.bytes())?; }
+    }
+    // A stored policy is parsed again without the credentials: a key that left them matches nothing.
+    let gone =
+        "{\"Statement\": {\"Effect\": \"Deny\", \"Principal\": {\"AWS\": \"arn:aws:iam:::user/AKIAGONE\"}, \"Action\": \"s3:*\", \"Resource\": \"arn:aws:s3:::pub/*\"}}";
+    let none = Vector<Credential>.create();
+    match (parseBucketPolicy(gone.bytes(), "pub".bytes(), none.view(), false)) {
+        Ok(p) => {
+            let facts = plainFacts();
+            Check.equalBytes(
+                "neither".bytes(),
+                decide(borrow p, "AKIAPOLICYKEY0000001", "s3:GetObject", "pub/a", borrow facts).view(),
+            )?;
+        }
+        Err(_) => { return Check.fail("a stored policy parses without the credentials"); }
+    }
+    return Ok();
+}
+
+@test
+fn policyCounts() -> Result<void, TestFailure> {
+    var all = BucketPolicies { names: Vector<Vector<u8>>.create(), documents: Vector<Vector<u8>>.create() };
+    let allow =
+        "{\"Statement\": {\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::a/*\"}}";
+    let deny =
+        "{\"Statement\": {\"Effect\": \"Deny\", \"Principal\": \"*\", \"Action\": \"s3:PutObject\", \"Resource\": \"arn:aws:s3:::b/*\"}}";
+    all.names.push(copyBytes("a".bytes())!)!;
+    all.documents.push(copyBytes(allow.bytes())!)!;
+    all.names.push(copyBytes("b".bytes())!)!;
+    all.documents.push(copyBytes(deny.bytes())!)!;
+    // A document that does not parse counts as a Deny: a key's requests read it, and are refused (ADR-0043 §9).
+    all.names.push(copyBytes("c".bytes())!)!;
+    all.documents.push(copyBytes("{broken".bytes())!)!;
+    let keys = policyKeys();
+    let counts = countPolicies(borrow all, keys.view());
+    Check.equalU64(3, counts.policies)?;
+    Check.equalU64(2, counts.denies)?;
+    return Ok();
+}
+
+fn policyHeader(name: StringView, value: StringView) -> HeaderPair =>
+    HeaderPair { name: copyBytes(name.bytes())!, value: copyBytes(value.bytes())! };
+
+fn policyParam(name: StringView, value: StringView) -> QueryParam =>
+    QueryParam { name: copyBytes(name.bytes())!, value: copyBytes(value.bytes())! };
+
+fn bareRequest() -> S3Request => S3Request {
+    method: Method.Get,
+    methodText: copyBytes("GET".bytes())!,
+    headers: Vector<HeaderPair>.create(),
+    rawPath: copyBytes("/pub".bytes())!,
+    rawQuery: Vector<u8>.create(),
+    bucket: String.create(),
+    key: String.create(),
+    query: Vector<QueryParam>.create(),
+};
+
+/// What a request gives a policy (ADR-0043 §6), and how an anonymous one is told and its body taken (§1, §7).
+@test
+fn policyFactsAndAnonymousRequests() -> Result<void, TestFailure> {
+    var req = bareRequest();
+    req.headers.push(policyHeader("referer", "https://example.com/"))!;
+    req.headers.push(policyHeader("user-agent", "curl/8"))!;
+    req.query.push(policyParam("prefix", "home/"))!;
+    req.query.push(policyParam("max-keys", "5"))!;
+    let listing = policyFacts(borrow req, true, true, SocketAddress.V4([127u8, 0, 0, 1], 9))!;
+    Check.equalBytes("https://example.com/".bytes(), factText(borrow listing, PolicyKey.Referer)!)?;
+    Check.equalBytes("curl/8".bytes(), factText(borrow listing, PolicyKey.UserAgent)!)?;
+    Check.equalBytes("home/".bytes(), factText(borrow listing, PolicyKey.Prefix)!)?;
+    Check.equalBytes("5".bytes(), factText(borrow listing, PolicyKey.MaxKeys)!)?;
+    Check.isTrue(!factPresent(borrow listing, PolicyKey.Delimiter), "no delimiter given")?;
+    Check.equalBytes("true".bytes(), factText(borrow listing, PolicyKey.SecureTransport)!)?;
+    Check.isTrue(factPresent(borrow listing, PolicyKey.SourceIp), "the peer")?;
+    // Not a listing: the listing keys are absent, whatever the query says.
+    let object = policyFacts(borrow req, false, false, null)!;
+    Check.isTrue(!factPresent(borrow object, PolicyKey.Prefix), "no s3:prefix")?;
+    Check.isTrue(!factPresent(borrow object, PolicyKey.MaxKeys), "no s3:max-keys")?;
+    Check.isTrue(!factPresent(borrow object, PolicyKey.SourceIp), "no peer")?;
+    // A listing without a prefix has the empty one.
+    let plain = bareRequest();
+    let bare = policyFacts(borrow plain, true, false, null)!;
+    Check.equalBytes("".bytes(), factText(borrow bare, PolicyKey.Prefix)!)?;
+    Check.isTrue(!factPresent(borrow bare, PolicyKey.Referer), "no referer")?;
+    Check.isTrue(isListingAction("s3:ListBucket") && isListingAction("s3:ListBucketVersions"), "the listings")?;
+    Check.isTrue(!isListingAction("s3:ListBucketMultipartUploads"), "not this one")?;
+
+    // Anonymous: no Authorization and no presigned parameters.
+    Check.isTrue(plain.isAnonymous(), "no credentials")?;
+    var signed = bareRequest();
+    signed.headers.push(policyHeader("authorization", "AWS4-HMAC-SHA256 ..."))!;
+    Check.isTrue(!signed.isAnonymous(), "a header")?;
+    var presigned = bareRequest();
+    presigned.query.push(policyParam("X-Amz-Algorithm", "AWS4-HMAC-SHA256"))!;
+    Check.isTrue(!presigned.isAnonymous(), "a presigned URL")?;
+    var v2 = bareRequest();
+    v2.query.push(policyParam("AWSAccessKeyId", "AKIA"))!;
+    Check.isTrue(!v2.isAnonymous(), "SigV2, refused as such")?;
+    // Its body: unsigned, a digest to check, unsigned aws-chunked, never a signed stream.
+    let none = plain.anonymous()!;
+    Check.isTrue(none.key.isNull() && none.signer.isNull(), "no key")?;
+    match (none.payload) {
+        PayloadMode.Unsigned => {}
+        _ => { return Check.fail("unsigned"); }
+    }
+    var hashed = bareRequest();
+    hashed.headers.push(
+        pair("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+    )!;
+    match (hashed.anonymous()!.payload) {
+        PayloadMode.Hashed(d) => { Check.equalU64(0xe3, d[0] as u64)?; }
+        _ => { return Check.fail("a digest"); }
+    }
+    var chunked = bareRequest();
+    chunked.headers.push(policyHeader("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"))!;
+    match (chunked.anonymous()!.payload) {
+        PayloadMode.Chunked => {}
+        _ => { return Check.fail("aws-chunked"); }
+    }
+    var stream = bareRequest();
+    stream.headers.push(policyHeader("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"))!;
+    match (stream.anonymous()) {
+        Err(S3Code.InvalidRequest) => {}
+        _ => { return Check.fail("a signed stream without a signature"); }
+    }
+    return Ok();
+}

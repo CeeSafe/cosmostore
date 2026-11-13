@@ -49,6 +49,8 @@ enum PayloadMode {
 struct Authenticated {
     payload: PayloadMode;
     signer: ChunkSigner?;
+    /// The access key that signed, by its place in the credentials; null for an anonymous request (ADR-0043).
+    key: usize?;
 }
 
 struct S3Request {
@@ -200,6 +202,35 @@ struct S3Request {
     }
 
     /// The SigV4 check: the Authorization header (ADR-0008 §5), or a presigned URL's query (ADR-0011).
+    /// Whether the request carries no credentials at all: no Authorization header and no presigned-URL parameters
+    /// (ADR-0043 §1).
+    fn isAnonymous(borrow this) -> bool =>
+        headerOf(this, "authorization").isNull() && paramOf(this, "X-Amz-Algorithm").isNull() &&
+            paramOf(this, "AWSAccessKeyId").isNull();
+
+    /// An anonymous request's body (ADR-0043 §7): unsigned, unless `x-amz-content-sha256` gives a digest to check or
+    /// unsigned aws-chunked; a signed stream without a signature is InvalidRequest.
+    fn anonymous(borrow this) -> Result<Authenticated, S3Code> {
+        let none = Authenticated { payload: PayloadMode.Unsigned, signer: null, key: null };
+        let hash = match (headerOf(this, "x-amz-content-sha256")) {
+            Some(h) => h,
+            null => { return Ok(none); }
+        };
+        if (hash == "UNSIGNED-PAYLOAD".bytes()) { return Ok(none); }
+        if (hash == "STREAMING-UNSIGNED-PAYLOAD-TRAILER".bytes()) {
+            return Ok(Authenticated { payload: PayloadMode.Chunked, signer: null, key: null });
+        }
+        if (hash.length != 64) { return Err(S3Code.InvalidRequest); }
+        var digest = [0u8; 32];
+        for (i in 0..32) {
+            let hi = hexValue(hash[i * 2]);
+            let lo = hexValue(hash[i * 2 + 1]);
+            if (hi.isNull() || lo.isNull()) { return Err(S3Code.InvalidArgument); }
+            digest[i] = ((hi ?? 0) << 4) | (lo ?? 0);
+        }
+        return Ok(Authenticated { payload: PayloadMode.Hashed(digest), signer: null, key: null });
+    }
+
     fn authenticate(borrow this, credentials: Slice<Credential>, now: i64) -> Result<Authenticated, S3Code> {
         match (headerOf(this, "authorization")) {
             Some(value) => {
@@ -329,10 +360,10 @@ struct S3Request {
         if (!sameSignature(seed.view(), auth.signature.view())) { return Err(S3Code.SignatureDoesNotMatch); }
 
         if (payloadHash == "UNSIGNED-PAYLOAD".bytes()) {
-            return Ok(Authenticated { payload: PayloadMode.Unsigned, signer: null });
+            return Ok(Authenticated { payload: PayloadMode.Unsigned, signer: null, key: found });
         }
         if (payloadHash == "STREAMING-UNSIGNED-PAYLOAD-TRAILER".bytes()) {
-            return Ok(Authenticated { payload: PayloadMode.Chunked, signer: null });
+            return Ok(Authenticated { payload: PayloadMode.Chunked, signer: null, key: found });
         }
         if (payloadHash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".bytes() ||
             payloadHash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER".bytes()) {
@@ -345,7 +376,7 @@ struct S3Request {
             mapOom(signer.amzDate.extend(amzDate))?;
             mapOom(signer.scope.extend(auth.scope.view()))?;
             mapOom(signer.previous.extend(seed.view()))?;
-            return Ok(Authenticated { payload: PayloadMode.Chunked, signer: signer });
+            return Ok(Authenticated { payload: PayloadMode.Chunked, signer: signer, key: found });
         }
         if (payloadHash.length == 64) {
             var digest = [0u8; 32];
@@ -355,7 +386,7 @@ struct S3Request {
                 if (hi.isNull() || lo.isNull()) { return Err(S3Code.InvalidArgument); }
                 digest[i] = ((hi ?? 0) << 4) | (lo ?? 0);
             }
-            return Ok(Authenticated { payload: PayloadMode.Hashed(digest), signer: null });
+            return Ok(Authenticated { payload: PayloadMode.Hashed(digest), signer: null, key: found });
         }
         return Err(S3Code.InvalidArgument);
     }

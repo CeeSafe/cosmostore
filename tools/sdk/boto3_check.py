@@ -262,6 +262,36 @@ check("no versions left", [k for k in s3.list_object_versions(Bucket=V) if k in 
 s3.delete_bucket(Bucket=V)
 check("versioned bucket deleted", code_of(lambda: s3.head_bucket(Bucket=V)), "404")
 
+# Bucket policies (ADR-0043): an anonymous client (no signature) reads what a policy allows, and nothing else.
+from botocore import UNSIGNED
+anonymous = boto3.client("s3", endpoint_url=endpoint, config=Config(signature_version=UNSIGNED, retries={"max_attempts": 1}))
+P = "boto3-policy"
+s3.create_bucket(Bucket=P)
+s3.put_object(Bucket=P, Key="pub/a", Body=b"public")
+s3.put_object(Bucket=P, Key="priv/b", Body=b"private")
+check("anonymous before a policy", code_of(lambda: anonymous.get_object(Bucket=P, Key="pub/a")), "AccessDenied")
+check("no policy", code_of(lambda: s3.get_bucket_policy(Bucket=P)), "NoSuchBucketPolicy")
+import json
+s3.put_bucket_policy(Bucket=P, Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::%s/pub/*" % P},
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::%s" % P,
+     "Condition": {"StringLike": {"s3:prefix": "pub/*"}}},
+    {"Effect": "Deny", "Principal": {"AWS": "arn:aws:iam:::user/%s" % os.environ["AWS_ACCESS_KEY_ID"]},
+     "Action": "s3:PutObject", "Resource": "arn:aws:s3:::%s/frozen/*" % P}]}))
+check("get_bucket_policy", json.loads(s3.get_bucket_policy(Bucket=P)["Policy"])["Statement"][0]["Action"], "s3:GetObject")
+check("anonymous read", anonymous.get_object(Bucket=P, Key="pub/a")["Body"].read(), b"public")
+check("anonymous read refused", code_of(lambda: anonymous.get_object(Bucket=P, Key="priv/b")), "AccessDenied")
+check("anonymous list under the prefix", [o["Key"] for o in anonymous.list_objects_v2(Bucket=P, Prefix="pub/").get("Contents", [])], ["pub/a"])
+check("anonymous list elsewhere", code_of(lambda: anonymous.list_objects_v2(Bucket=P, Prefix="priv/")), "AccessDenied")
+check("anonymous write", code_of(lambda: anonymous.put_object(Bucket=P, Key="pub/x", Body=b"x")), "AccessDenied")
+check("a key denied", code_of(lambda: s3.put_object(Bucket=P, Key="frozen/x", Body=b"x")), "AccessDenied")
+check("a key elsewhere", s3.put_object(Bucket=P, Key="open/x", Body=b"x")["ResponseMetadata"]["HTTPStatusCode"], 200)
+check("a malformed policy", code_of(lambda: s3.put_bucket_policy(Bucket=P, Policy="{}")), "MalformedPolicy")
+s3.delete_bucket_policy(Bucket=P)
+check("anonymous after the delete", code_of(lambda: anonymous.get_object(Bucket=P, Key="pub/a")), "AccessDenied")
+boto3.resource("s3", endpoint_url=endpoint).Bucket(P).objects.all().delete()
+s3.delete_bucket(Bucket=P)
+
 check("wrong secret", code_of(lambda: boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
                                                        aws_secret_access_key="wrong").list_buckets()),
       "SignatureDoesNotMatch")

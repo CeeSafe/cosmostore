@@ -368,7 +368,7 @@ fn lengthRange(policy: borrow Policy, min: borrow mut u64, max: borrow mut u64) 
 /// The SigV4 POST signature (ADR-0018): `x-amz-algorithm` AWS4-HMAC-SHA256, `x-amz-credential`, `x-amz-date`, and
 /// `x-amz-signature`, the hex HMAC of the policy (base64, as sent) with the credential's signing key. SigV2 forms
 /// (`AWSAccessKeyId`, `signature`) are refused as SigV2 is.
-fn checkPostSignature(fields: borrow Vector<FormField>, credentials: Slice<Credential>) -> Result<void, S3Fail> {
+fn checkPostSignature(fields: borrow Vector<FormField>, credentials: Slice<Credential>) -> Result<usize, S3Fail> {
     if (fieldOf(fields, "awsaccesskeyid").isSome()) { return Err(S3Fail.Code(S3Code.AuthorizationMechanism)); }
     let policy = match (fieldOf(fields, "policy")) {
         Some(v) => v,
@@ -408,10 +408,11 @@ fn checkPostSignature(fields: borrow Vector<FormField>, credentials: Slice<Crede
     for (i in 0..credentials.length) {
         if (sameSignature(credentials[i].accessKey.view(), auth.accessKey.view())) { found = Some(i); }
     }
-    let owner = match (found) {
-        Some(i) => borrow credentials[i],
+    let index = match (found) {
+        Some(i) => i,
         null => { return Err(S3Fail.Code(S3Code.InvalidAccessKeyId)); }
     };
+    let owner = borrow credentials[index];
     let signing = cachedSigningKey(
         borrow owner.signing,
         owner.secret.view(),
@@ -423,7 +424,7 @@ fn checkPostSignature(fields: borrow Vector<FormField>, credentials: Slice<Crede
     var hex = Vector<u8>.create();
     appendHexBytes(mut hex, mac[..])?;
     if (!sameSignature(hex.view(), auth.signature.view())) { return Err(S3Fail.Code(S3Code.SignatureDoesNotMatch)); }
-    return Ok();
+    return Ok(index);
 }
 
 // ---- The request ----
@@ -449,7 +450,12 @@ fn postStep(
     return writer.write(data);
 }
 
-async fn postObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+async fn postObject(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+    peer: SocketAddress?,
+) -> Result<void, S3Fail> {
     var boundary = Vector<u8>.create();
     if (!formBoundary(headerOf(req, "content-type") ?? "".bytes(), mut boundary)?) {
         return Err(S3Fail.Code(S3Code.MalformedPOSTRequest));
@@ -511,7 +517,10 @@ async fn postObject(app: borrow S3App, req: borrow S3Request, exchange: borrow m
         }
     }
     // Who, and what the policy allows.
-    checkPostSignature(borrow fields, app.credentials.view())?;
+    let signer = checkPostSignature(borrow fields, app.credentials.view())?;
+    // The form's key puts the object: `s3:PutObject` by the bucket's policy (ADR-0043 §5).
+    let who = Requester { key: signer, peer: peer };
+    await authorize(app, req, borrow who, "s3:PutObject", req.bucket.view(), key.view())?;
     let policyText = fieldOf(borrow fields, "policy") ?? "".bytes();
     var json = Vector<u8>.create();
     if (!decodeBase64(policyText, mut json)?) { return Err(S3Fail.Code(S3Code.InvalidPolicyDocument)); }

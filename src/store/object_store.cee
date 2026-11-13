@@ -123,6 +123,8 @@ struct BucketInfo {
     lifecycle: Vector<u8>;
     /// VERSIONING_OFF, VERSIONING_ENABLED or VERSIONING_SUSPENDED (ADR-0041).
     versioning: u8;
+    /// The bucket policy's JSON as it was put; empty for none (ADR-0043).
+    policy: Vector<u8>;
 }
 
 /// Space use of one segment, for compaction (ADR-0005). `liveBytes` counts the records that
@@ -176,6 +178,12 @@ struct MaintenanceReport {
     compactionMicros: u64;
     lifecycleMicros: u64;
     totalMicros: u64;
+}
+
+/// The buckets that have a policy, and their policies' JSON (ADR-0043).
+struct BucketPolicies {
+    names: Vector<Vector<u8>>;
+    documents: Vector<Vector<u8>>;
 }
 
 /// What one application of the lifecycle rules did.
@@ -675,6 +683,7 @@ fn applyRecord(
                 tags: Vector<u8>.create(),
                 lifecycle: Vector<u8>.create(),
                 versioning: VERSIONING_OFF,
+                policy: Vector<u8>.create(),
             };
             let _ = state.addBucket(name, info)?;
         }
@@ -693,6 +702,8 @@ fn applyRecord(
                         b.tags = value;
                     } else if (configKind == BUCKET_CONFIG_LIFECYCLE) {
                         b.lifecycle = value;
+                    } else if (configKind == BUCKET_CONFIG_POLICY) {
+                        b.policy = value;
                     } else {
                         b.versioning = value[0]; // one valid byte: `decodeBucketConfigMeta` checked it
                     }
@@ -3534,6 +3545,10 @@ struct ObjectStore {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         if (value.length > 1048576) { return Err(StoreError.MetadataTooLarge); }
         if (kind == BUCKET_CONFIG_VERSIONING && !isVersioningValue(value)) { return Err(StoreError.InvalidKey); }
+        if (kind == BUCKET_CONFIG_POLICY && value.length > MAX_POLICY_BYTES) {
+            return Err(StoreError.MetadataTooLarge);
+        }
+        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_POLICY) { return Err(StoreError.InvalidKey); }
         this.scratch.clear();
         encodeBucketConfigMeta(mut this.scratch, bucket.bytes(), kind, value)?;
         let empty = [0u8; 1];
@@ -3541,7 +3556,7 @@ struct ObjectStore {
         return Ok();
     }
 
-    /// A bucket's tags or lifecycle rules, as stored, or its versioning state as one byte; empty for none.
+    /// A bucket's tags, lifecycle rules or policy, as stored, or its versioning state as one byte; empty for none.
     fn bucketConfig(borrow this, bucket: StringView, kind: u8) -> Result<Vector<u8>, StoreError> {
         let k = BucketKey { name: copyBytes(bucket.bytes())? };
         return match (this.state.buckets.get(borrow k)) {
@@ -3551,10 +3566,23 @@ struct ObjectStore {
                     if (b.versioning != VERSIONING_OFF) { state.push(b.versioning)?; }
                     return Ok(state);
                 }
+                if (kind == BUCKET_CONFIG_POLICY) { return Ok(copyBytes(b.policy.view())?); }
                 Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?)
             }
             null => Err(StoreError.NoSuchBucket),
         };
+    }
+
+    /// Every bucket's policy (ADR-0043): the names of the buckets that have one, and the documents, in no order.
+    fn bucketPolicies(borrow this) -> Result<BucketPolicies, StoreError> {
+        var out = BucketPolicies { names: Vector<Vector<u8>>.create(), documents: Vector<Vector<u8>>.create() };
+        for (i in 0..this.state.buckets.length()) {
+            let b = this.state.buckets.valueAt(i);
+            if (b.policy.length == 0) { continue; }
+            out.names.push(copyBytes(this.state.buckets.keyAt(i).name.view())?)?;
+            out.documents.push(copyBytes(b.policy.view())?)?;
+        }
+        return Ok(out);
     }
 
     /// Applies every bucket's lifecycle rules as of `nowMillis`: deletes the objects a rule has expired (one batch per

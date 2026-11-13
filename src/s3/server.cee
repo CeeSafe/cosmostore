@@ -49,6 +49,11 @@ struct S3App {
     latencies: Latencies;
     /// The store's writers without its lock: an inline-sized PUT starts with no lock round (ADR-0032).
     writers: WriterFactory;
+    /// Buckets with a policy, and those whose policy has a Deny (ADR-0043 §8): while both are 0, no request reads one.
+    policyBuckets: AtomicU64;
+    denyBuckets: AtomicU64;
+    /// Whether the server listens with TLS: `aws:SecureTransport` (ADR-0043 §6).
+    secure: bool;
 }
 
 /// The buffer for moving a body of `expected` bytes: at most BODY_STEP, and no larger than the body and some slack
@@ -113,7 +118,8 @@ impl Handler<S3App> for S3Handler {
         // Timed to the last byte of the response, an error's included (ADR-0033).
         let started = Clock.monotonicNanos();
         var kind = LATENCY_OTHER;
-        let done = await respond(app, request, exchange, mut kind, requestId.view());
+        let peer = ctx.connection().peerAddress();
+        let done = await respond(app, request, exchange, mut kind, requestId.view(), peer);
         app.latencies.record(kind, (Clock.monotonicNanos() - started) / 1000);
         return done;
     }
@@ -126,9 +132,10 @@ async fn respond(
     exchange: borrow mut Exchange,
     kind: borrow mut u8,
     requestId: Slice<u8>,
+    peer: SocketAddress?,
 ) -> Result<void, HandlerError> {
     {
-        match (await serveS3(app, request, exchange, kind)) {
+        match (await serveS3(app, request, exchange, kind, peer)) {
             Ok() => { return Ok(); }
             Err(S3Fail.Http(e)) => { return Err(e); }
             Err(S3Fail.Code(code)) => {
@@ -197,24 +204,34 @@ async fn sendXml(exchange: borrow mut Exchange, body: borrow Vector<u8>) -> Resu
 
 fn isMethod(m: Method, want: Method) -> bool => Methods.same(m, want);
 
-/// Authenticates and dispatches one request.
+/// Authenticates and dispatches one request; each call is first checked against its bucket's policy (ADR-0043).
 async fn serveS3(
     app: borrow S3App,
     request: borrow Request,
     exchange: borrow mut Exchange,
     kind: borrow mut u8,
+    peer: SocketAddress?,
 ) -> Result<void, S3Fail> {
     let req = S3Request.of(request, app.domain.view())?;
     kind = latencyClass(borrow req);
     // A browser form upload is authenticated by its form's policy signature, not its headers (ADR-0018).
-    if (isPostObject(borrow req)) { return await postObject(app, borrow req, exchange); }
+    if (isPostObject(borrow req)) { return await postObject(app, borrow req, exchange, peer); }
     let now = Clock.unixMillis() / 1000;
-    let auth = match (req.authenticate(app.credentials.view(), now)) {
+    let attempt = if (req.isAnonymous()) req.anonymous() else req.authenticate(app.credentials.view(), now);
+    let auth = match (attempt) {
         Ok(a) => a,
         Err(code) => { return Err(S3Fail.Code(code)); }
     };
+    let who = Requester { key: auth.key, peer: peer };
     let m = req.method;
-    if (req.bucket.view() == STATS_BUCKET) { return await serveStats(app, borrow req, exchange); } // ADR-0021
+    let bucket = req.bucket.view();
+    let none = "".bytes();
+    // The service, the stats endpoint and new buckets have no bucket policy: keys only.
+    if (who.key.isNull() && (req.bucket.length == 0 || bucket == STATS_BUCKET ||
+        (isMethod(m, Method.Put) && req.key.length == 0 && req.query.length == 0))) {
+        return Err(S3Fail.Code(S3Code.AccessDenied));
+    }
+    if (bucket == STATS_BUCKET) { return await serveStats(app, borrow req, exchange); } // ADR-0021
     if (req.bucket.length == 0) {
         if (isMethod(m, Method.Get) || isMethod(m, Method.Head)) {
             if (!req.onlyParams("max-buckets,continuation-token,prefix")) {
@@ -225,11 +242,37 @@ async fn serveS3(
         return Err(S3Fail.Code(S3Code.MethodNotAllowed));
     }
     if (req.key.length == 0) {
+        // A bucket's policy (ADR-0043).
+        if (req.hasParam("policy")) {
+            if (!req.onlyParams("policy")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            if (isMethod(m, Method.Get)) {
+                await authorize(app, borrow req, borrow who, "s3:GetBucketPolicy", bucket, none)?;
+                return await getBucketPolicy(app, borrow req, exchange);
+            }
+            if (isMethod(m, Method.Put)) {
+                await authorize(app, borrow req, borrow who, "s3:PutBucketPolicy", bucket, none)?;
+                return await putBucketPolicy(app, borrow req, auth, exchange);
+            }
+            if (isMethod(m, Method.Delete)) {
+                await authorize(app, borrow req, borrow who, "s3:DeleteBucketPolicy", bucket, none)?;
+                return await deleteBucketPolicy(app, borrow req, exchange);
+            }
+            return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+        }
         // A bucket's tags and lifecycle rules (ADR-0020).
         if (req.hasParam("tagging") || req.hasParam("lifecycle")) {
             let tagging = req.hasParam("tagging");
             if (!req.onlyParams(if (tagging) "tagging" else "lifecycle")) {
                 return Err(S3Fail.Code(S3Code.NotImplemented));
+            }
+            let reads = isMethod(m, Method.Get);
+            let action = if (tagging) {
+                if (reads) "s3:GetBucketTagging" else "s3:PutBucketTagging"
+            } else {
+                if (reads) "s3:GetLifecycleConfiguration" else "s3:PutLifecycleConfiguration"
+            };
+            if (isMethod(m, Method.Get) || isMethod(m, Method.Put) || isMethod(m, Method.Delete)) {
+                await authorize(app, borrow req, borrow who, action, bucket, none)?;
             }
             if (isMethod(m, Method.Get)) {
                 if (tagging) { return await getBucketTagging(app, borrow req, exchange); }
@@ -248,35 +291,44 @@ async fn serveS3(
         if (isMethod(m, Method.Put)) {
             if (req.hasParam("versioning")) {
                 if (!req.onlyParams("versioning")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+                await authorize(app, borrow req, borrow who, "s3:PutBucketVersioning", bucket, none)?;
                 return await putBucketVersioning(app, borrow req, auth, exchange);
             }
             if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
             return await createBucket(app, borrow req, exchange);
         }
-        if (isMethod(m, Method.Head)) { return await headBucket(app, borrow req, exchange); }
+        if (isMethod(m, Method.Head)) {
+            await authorize(app, borrow req, borrow who, "s3:ListBucket", bucket, none)?;
+            return await headBucket(app, borrow req, exchange);
+        }
         if (isMethod(m, Method.Delete)) {
             if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            await authorize(app, borrow req, borrow who, "s3:DeleteBucket", bucket, none)?;
             return await deleteBucket(app, borrow req, exchange);
         }
         if (isMethod(m, Method.Get)) {
             if (req.hasParam("location")) {
                 if (!req.onlyParams("location")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+                await authorize(app, borrow req, borrow who, "s3:GetBucketLocation", bucket, none)?;
                 return await bucketLocation(app, borrow req, exchange);
             }
             if (req.hasParam("versions")) {
                 if (!req.onlyParams("versions,prefix,delimiter,key-marker,version-id-marker,max-keys,encoding-type")) {
                     return Err(S3Fail.Code(S3Code.NotImplemented));
                 }
+                await authorize(app, borrow req, borrow who, "s3:ListBucketVersions", bucket, none)?;
                 return await listObjectVersions(app, borrow req, exchange);
             }
             if (req.hasParam("versioning")) {
                 if (!req.onlyParams("versioning")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+                await authorize(app, borrow req, borrow who, "s3:GetBucketVersioning", bucket, none)?;
                 return await getBucketVersioning(app, borrow req, exchange);
             }
             if (req.hasParam("uploads")) {
                 if (!req.onlyParams("uploads,prefix,delimiter,key-marker,upload-id-marker,max-uploads,encoding-type")) {
                     return Err(S3Fail.Code(S3Code.NotImplemented));
                 }
+                await authorize(app, borrow req, borrow who, "s3:ListBucketMultipartUploads", bucket, none)?;
                 return await listMultipartUploads(app, borrow req, exchange);
             }
             if (!req.onlyParams(
@@ -284,11 +336,13 @@ async fn serveS3(
             )) {
                 return Err(S3Fail.Code(S3Code.NotImplemented));
             }
+            await authorize(app, borrow req, borrow who, "s3:ListBucket", bucket, none)?;
             return await listObjects(app, borrow req, exchange);
         }
         if (isMethod(m, Method.Post)) {
+            // Each key is checked against the policy with its own action (ADR-0043 §5).
             if (req.hasParam("delete") && req.onlyParams("delete")) {
-                return await deleteObjects(app, borrow req, auth, exchange);
+                return await deleteObjects(app, borrow req, auth, borrow who, exchange);
             }
             return Err(S3Fail.Code(S3Code.NotImplemented));
         }
@@ -297,30 +351,61 @@ async fn serveS3(
     if (req.key.length > MAX_KEY_BYTES) { return Err(S3Fail.Code(S3Code.KeyTooLongError)); }
     if (req.hasParam("tagging")) {
         if (!req.onlyParams("tagging,versionId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-        if (isMethod(m, Method.Get)) { return await getObjectTagging(app, borrow req, exchange); }
-        if (isMethod(m, Method.Put)) { return await putObjectTagging(app, borrow req, auth, exchange); }
-        if (isMethod(m, Method.Delete)) { return await deleteObjectTagging(app, borrow req, exchange); }
+        if (isMethod(m, Method.Get)) {
+            await authorizeObject(app, borrow req, borrow who, "s3:GetObjectTagging", "s3:GetObjectVersionTagging")?;
+            return await getObjectTagging(app, borrow req, exchange);
+        }
+        if (isMethod(m, Method.Put)) {
+            await authorizeObject(app, borrow req, borrow who, "s3:PutObjectTagging", "s3:PutObjectVersionTagging")?;
+            return await putObjectTagging(app, borrow req, auth, exchange);
+        }
+        if (isMethod(m, Method.Delete)) {
+            await authorizeObject(
+                app,
+                borrow req,
+                borrow who,
+                "s3:DeleteObjectTagging",
+                "s3:DeleteObjectVersionTagging",
+            )?;
+            return await deleteObjectTagging(app, borrow req, exchange);
+        }
         return Err(S3Fail.Code(S3Code.MethodNotAllowed));
     }
     if (isMethod(m, Method.Put)) {
         let copying = headerOf(borrow req, "x-amz-copy-source").isSome();
         if (req.hasParam("uploadId") || req.hasParam("partNumber")) {
             if (!req.onlyParams("partNumber,uploadId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-            if (copying) { return await uploadPartCopy(app, borrow req, exchange); }
+            await authorizeObject(app, borrow req, borrow who, "s3:PutObject", "s3:PutObject")?;
+            if (copying) { return await uploadPartCopy(app, borrow req, borrow who, exchange); }
             return await uploadPart(app, borrow req, auth, exchange);
         }
         if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-        if (copying) { return await copyObject(app, borrow req, exchange); }
+        await authorizeObject(app, borrow req, borrow who, "s3:PutObject", "s3:PutObject")?;
+        if (copying) { return await copyObject(app, borrow req, borrow who, exchange); }
         return await putObject(app, borrow req, auth, exchange);
     }
     if (isMethod(m, Method.Get) && req.hasParam("attributes")) {
         if (!req.onlyParams("attributes,versionId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        await authorizeObject(
+            app,
+            borrow req,
+            borrow who,
+            "s3:GetObjectAttributes",
+            "s3:GetObjectVersionAttributes",
+        )?;
         return await getObjectAttributes(app, borrow req, exchange);
     }
     if (isMethod(m, Method.Get) && req.hasParam("uploadId")) {
         if (!req.onlyParams("uploadId,max-parts,part-number-marker,encoding-type")) {
             return Err(S3Fail.Code(S3Code.NotImplemented));
         }
+        await authorizeObject(
+            app,
+            borrow req,
+            borrow who,
+            "s3:ListMultipartUploadParts",
+            "s3:ListMultipartUploadParts",
+        )?;
         return await listParts(app, borrow req, exchange);
     }
     if (isMethod(m, Method.Get) || isMethod(m, Method.Head)) {
@@ -329,21 +414,26 @@ async fn serveS3(
         )) {
             return Err(S3Fail.Code(S3Code.NotImplemented));
         }
+        await authorizeObject(app, borrow req, borrow who, "s3:GetObject", "s3:GetObjectVersion")?;
         return await getObject(app, borrow req, exchange);
     }
     if (isMethod(m, Method.Delete)) {
         if (req.hasParam("uploadId")) {
             if (!req.onlyParams("uploadId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            await authorizeObject(app, borrow req, borrow who, "s3:AbortMultipartUpload", "s3:AbortMultipartUpload")?;
             return await abortMultipartUpload(app, borrow req, exchange);
         }
         if (!req.onlyParams("versionId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        await authorizeObject(app, borrow req, borrow who, "s3:DeleteObject", "s3:DeleteObjectVersion")?;
         return await deleteObject(app, borrow req, exchange);
     }
     if (isMethod(m, Method.Post)) {
         if (req.hasParam("uploads") && req.onlyParams("uploads")) {
+            await authorizeObject(app, borrow req, borrow who, "s3:PutObject", "s3:PutObject")?;
             return await createMultipartUpload(app, borrow req, exchange);
         }
         if (req.hasParam("uploadId") && req.onlyParams("uploadId")) {
+            await authorizeObject(app, borrow req, borrow who, "s3:PutObject", "s3:PutObject")?;
             return await completeMultipartUpload(app, borrow req, auth, exchange);
         }
         return Err(S3Fail.Code(S3Code.NotImplemented));
@@ -478,6 +568,8 @@ async fn deleteBucket(app: borrow S3App, req: borrow S3Request, exchange: borrow
             Err(e) => { return Err(storeFail(e, 0)); }
         }
     }
+    // Its policy, if it had one, no longer counts (ADR-0043 §8).
+    if (app.policyBuckets.load() > 0) { await recountPolicies(app)?; }
     await exchange.send(Status.noContent(), "".bytes())?;
     return Ok();
 }

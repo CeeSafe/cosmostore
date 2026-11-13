@@ -1693,3 +1693,44 @@ Browser form uploads with a SigV4 POST policy.
 - **Not shown anywhere:** what a run did (`LifecycleReport`) is not in the stats or the log, as before.
 - **Next:** M5 item 3 (bucket policies, an ACL compatibility mode, the public-access block). Object tagging is done
   (ADR-0017).
+
+### 13 Nov 2026: M5 item 3, slice 1: bucket policies (ADR-0043)
+
+- **Principals, chosen with the user** (continue, after the question of 13 Nov): the access keys of the credentials
+  file, as `arn:aws:iam:::user/<access-key-id>`, and `*` for anyone. No users or accounts: every key is of the one
+  account that owns every bucket, may do what no policy denies it, and is never refused the policy calls. A request
+  with no credentials at all is *anonymous*, and may do only what a policy allows.
+- **Stored as put** (`BucketConfig` kind 4, at most 20 KiB; checkpoint format 7) and parsed when used. Put-, Get- and
+  DeleteBucketPolicy; MalformedPolicy and NoSuchBucketPolicy.
+- **The language** (`src/s3/policy.cee`): Allow and Deny; `Principal`, `Action`, `Resource` and their `Not` forms
+  (`NotPrincipal` with Deny only, as S3); wildcards; conditions with the string, IP (v4, v6, mapped v4), numeric,
+  `Bool` and `Null` operators on `aws:SecureTransport`, `aws:SourceIp`, `aws:Referer`, `aws:UserAgent`, `s3:prefix`,
+  `s3:delimiter` and `s3:max-keys`. What it cannot evaluate exactly (other keys and operators, `IfExists`,
+  `ForAllValues`, policy variables, principals other than keys) is refused when put, never stored and ignored.
+- **Every call is checked before it runs** (`serveS3`), with S3's action names; a copy's source by its bucket's
+  policy, DeleteObjects key by key (a refused key gets AccessDenied in the result), POST object as its form's key.
+- **No cost without policies:** two counts in the app (buckets with a policy, and with a Deny) are made at start and
+  again after each policy change and bucket delete, before the response. A key's request reads its bucket's policy
+  only when some policy has a Deny; an anonymous one only when some bucket has a policy, and is refused at once
+  otherwise, as before.
+- **Tests (9 new, 175 in all, no leaks; 18 ways of breaking the policy code in a copy are each caught, one only
+  after a prefix ending inside a byte got its case):** the policy language (wildcards, addresses, a public-read policy, Deny and
+  the Not forms, every condition operator with present and absent keys, 23 malformed documents, 9 refused as
+  NotImplemented, 4 accepted, a stored policy without the credentials, the counts), the request's facts and the
+  anonymous body modes; in the store, a policy through recovery, a format 7 checkpoint and the bucket's deletion.
+- **Clients:** `tools/s3_smoke.sh` 187 checks (28 new: anonymous reads and writes by a policy, a key denied, a Deny of
+  everything that leaves the policy calls open, `aws:SourceIp` in and out of range, DeleteObjects with a denied key,
+  the refusals); boto3 86 checks (12 new, with an unsigned client); the s3-tests subset 296 (496 in scope, 308 pass) with the `bucket_policy` marker in scope
+  (10 new: `test_bucket_policy`, `test_bucketv2_policy`, both `*_another_bucket`, `test_set_get_del_bucket_policy`,
+  `test_bucket_policy_allow_notprincipal`, `test_multipart_upload_on_a_bucket_with_policy`, and three tag tests on a
+  public bucket).
+- **The p99 gate gave no verdict, twice** (`tools/perf_gate.sh`, `94fe87e`'s build against this one): other sessions'
+  builds loaded the M1 during both runs (group noise 1.8 to 7.5, and 1.1 to 8.8; the limit is 2). No group failed in
+  either, and the p99 ratios point both ways (small writes at concurrency 1: 1.26 in the first run, 0.77 in the
+  second). What the change adds to a request without policies is two atomic loads and three header and parameter
+  lookups; that it costs nothing measurable is not shown yet. The gate has to be run again on a quiet machine.
+- **Ceph policy tests still failing, and why:** most use the `alt` user as a second account refused by default (every
+  key here is of one account); the rest need ACLs, GetBucketPolicyStatus, the public-access block, tenants, or
+  condition keys refused here (`s3:x-amz-copy-source`, `s3:ExistingObjectTag`, `...IfExists`).
+- **Next:** slice 2, the public-access block and GetBucketPolicyStatus; then an ACL compatibility mode.
+

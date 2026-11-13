@@ -273,7 +273,23 @@ async fn sendCopyResult(
     return await sendXml(exchange, borrow body);
 }
 
-async fn copyObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+/// A copy's source is read: `s3:GetObject` (or `s3:GetObjectVersion`) on it, by its own bucket's policy (ADR-0043 §5).
+async fn authorizeSource(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    src: borrow CopySource,
+) -> Result<void, S3Fail> {
+    let action = if (src.versionId.isSome()) "s3:GetObjectVersion" else "s3:GetObject";
+    return await authorize(app, req, who, action, src.bucket.view(), src.key.view().bytes());
+}
+
+async fn copyObject(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
     // If-Match / If-None-Match on the destination, checked with the commit as for PUT (ADR-0017).
     var etags = Vector<u8>.create();
     let condition = putConditionOf(req, mut etags)?;
@@ -293,6 +309,7 @@ async fn copyObject(app: borrow S3App, req: borrow S3Request, exchange: borrow m
     if (!replace && src.bucket.view() == req.bucket.view() && src.key.view() == req.key.view()) {
         return Err(S3Fail.Code(S3Code.InvalidRequest)); // a copy onto itself must change something
     }
+    await authorizeSource(app, req, who, borrow src)?;
     let plan = await openCopy(app, req, borrow src, CopyTarget.Object, [0u8; 16])?;
     // The source's version, when its bucket has versioning (ADR-0041).
     if (plan.source.versioned) { versionHeader(exchange, "x-amz-copy-source-version-id", plan.source.versionId)?; }
@@ -351,11 +368,13 @@ async fn copyObject(app: borrow S3App, req: borrow S3Request, exchange: borrow m
 async fn uploadPartCopy(
     app: borrow S3App,
     req: borrow S3Request,
+    who: borrow Requester,
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
     let number = partNumberOf(req)?;
     let id = uploadIdOf(req)?;
     let src = copySourceOf(req)?;
+    await authorizeSource(app, req, who, borrow src)?;
     let plan = await openCopy(app, req, borrow src, CopyTarget.Part(number), id)?;
     if (plan.source.versioned) { versionHeader(exchange, "x-amz-copy-source-version-id", plan.source.versionId)?; }
     let copied = await runCopy(plan)?;
