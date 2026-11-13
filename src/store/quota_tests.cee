@@ -1,0 +1,130 @@
+// Bucket quotas in the store (ADR-0052): what a bucket holds, counted as its versions come and go, and the write
+// that would take it past a limit.
+
+fn quotaOf(maxBytes: u64, maxObjects: u64) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    out.pushLE(maxBytes)!;
+    out.pushLE(maxObjects)!;
+    return out;
+}
+
+fn refusedByQuota(s: borrow mut ObjectStore, key: StringView, body: StringView) -> bool =>
+    match (s.putObject("bkt", key, "text/plain", body.bytes(), PutCondition.None)) {
+        Err(StoreError.QuotaExceeded) => true,
+        _ => false,
+    };
+
+@test
+fn bucketUseIsCounted() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("bucket-use");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        s.createBucket("other")!;
+        Check.isTrue(s.bucketUsage("bkt")![0] == 0 && s.bucketUsage("bkt")![1] == 0, "empty")?;
+        putText(mut s, "bkt", "a", "12345");
+        putText(mut s, "bkt", "b", "123");
+        putText(mut s, "other", "a", "1234567890");
+        Check.isTrue(s.bucketUsage("bkt")![0] == 8 && s.bucketUsage("bkt")![1] == 2, "two objects")?;
+        // An overwrite replaces: the count stays, the bytes follow.
+        putText(mut s, "bkt", "a", "1");
+        Check.isTrue(s.bucketUsage("bkt")![0] == 4 && s.bucketUsage("bkt")![1] == 2, "an overwrite")?;
+        s.deleteObject("bkt", "b")!;
+        Check.isTrue(s.bucketUsage("bkt")![0] == 1 && s.bucketUsage("bkt")![1] == 1, "a delete")?;
+        // With versioning every version counts, and a delete marker is a version of no bytes.
+        setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+        let v = putVersion(mut s, "bkt", "a", "1234").versionId;
+        s.deleteObject("bkt", "a")!;
+        Check.isTrue(s.bucketUsage("bkt")![0] == 5 && s.bucketUsage("bkt")![1] == 3, "versions and a marker")?;
+        let _ = s.deleteVersion("bkt", "a", v)!;
+        Check.isTrue(s.bucketUsage("bkt")![0] == 1 && s.bucketUsage("bkt")![1] == 2, "a version removed")?;
+        match (s.bucketUsage("missing")) {
+            Err(StoreError.NoSuchBucket) => {}
+            _ => { return Check.fail("the use of a bucket that is not there"); }
+        }
+    }
+    // Counted again from the journal, and from a checkpoint's objects: the same.
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.isTrue(s.bucketUsage("bkt")![0] == 1 && s.bucketUsage("bkt")![1] == 2, "after recovery")?;
+        Check.isTrue(s.bucketUsage("other")![0] == 10 && s.bucketUsage("other")![1] == 1, "the other bucket")?;
+        if (round == 0) { let _ = s.checkpoint()!; }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn quotaRefusesTheWritePastIt() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("bucket-quota");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        // The store keeps a quota of two limits, not both none.
+        let refused = ["x", "0123456789abcde", "0123456789abcdefg"];
+        for (r in refused) {
+            match (s.setBucketConfig("bkt", BUCKET_CONFIG_QUOTA, r.bytes())) {
+                Err(StoreError.InvalidKey) => {}
+                _ => { return Check.fail("a quota that is not one"); }
+            }
+        }
+        match (s.setBucketConfig("bkt", BUCKET_CONFIG_QUOTA, quotaOf(0, 0).view())) {
+            Err(StoreError.InvalidKey) => {}
+            _ => { return Check.fail("a quota without a limit"); }
+        }
+        // Ten bytes.
+        s.setBucketConfig("bkt", BUCKET_CONFIG_QUOTA, quotaOf(10, 0).view())!;
+        putText(mut s, "bkt", "a", "123456");
+        Check.isTrue(refusedByQuota(mut s, "b", "12345"), "past the bytes")?;
+        Check.isTrue(!refusedByQuota(mut s, "b", "1234"), "exactly at them")?;
+        // An overwrite is counted without what it replaces.
+        Check.isTrue(!refusedByQuota(mut s, "a", "123456"), "the same size again")?;
+        Check.isTrue(refusedByQuota(mut s, "a", "1234567"), "an overwrite that grows past them")?;
+        Check.isTrue(s.bucketUsage("bkt")![0] == 10, "the refused writes left nothing")?;
+        Check.equalBytes("123456".bytes(), s.getObject("bkt", "a")!.view())?;
+        // A delete is never refused, and frees its bytes.
+        s.deleteObject("bkt", "b")!;
+        Check.isTrue(!refusedByQuota(mut s, "c", "1234"), "after a delete")?;
+        // Two versions: a third key is refused whatever its size, an overwrite is not.
+        s.setBucketConfig("bkt", BUCKET_CONFIG_QUOTA, quotaOf(0, 2).view())!;
+        Check.isTrue(refusedByQuota(mut s, "d", ""), "past the count")?;
+        Check.isTrue(!refusedByQuota(mut s, "a", "a much longer body than ten bytes"), "an overwrite, no byte limit")?;
+        // A multipart upload is counted when it is completed.
+        s.setBucketConfig("bkt", BUCKET_CONFIG_QUOTA, quotaOf(100, 0).view())!;
+        let id = s.createUpload("bkt", "big", "")!;
+        var part = Vector<u8>.create();
+        part.resize(200, 'p')!;
+        let md5 = sendPart(mut s, "bkt", "big", id, 1, part.view())!;
+        let chosen = [choice(1, md5)];
+        match (s.completeUpload("bkt", "big", id, chosen[..])) {
+            Err(StoreError.QuotaExceeded) => {}
+            _ => { return Check.fail("an upload completed past the quota"); }
+        }
+        s.setBucketConfig("bkt", BUCKET_CONFIG_QUOTA, quotaOf(1000, 0).view())!;
+        let _ = s.completeUpload("bkt", "big", id, chosen[..])!; // the upload was kept: completed once there is room
+        // With versioning every put is a new version, counted with the old ones.
+        setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+        let used = s.bucketUsage("bkt")!;
+        s.setBucketConfig("bkt", BUCKET_CONFIG_QUOTA, quotaOf(used[0] + 3, used[1] + 1).view())!;
+        Check.isTrue(refusedByQuota(mut s, "a", "1234"), "a new version past the bytes")?;
+        Check.isTrue(!refusedByQuota(mut s, "a", "123"), "a new version within them")?;
+        Check.isTrue(refusedByQuota(mut s, "a", ""), "a new version past the count")?;
+        s.deleteObject("bkt", "a")!; // a marker is written all the same
+        Check.equalU64(used[1] + 2, s.bucketUsage("bkt")![1])?;
+    }
+    // The quota through recovery from the journal, then from a format 13 checkpoint; then taken off.
+    for (round in 0..3) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        if (round < 2) {
+            Check.equalU64(16, s.bucketConfig("bkt", BUCKET_CONFIG_QUOTA)!.length as u64)?;
+            Check.isTrue(refusedByQuota(mut s, "z", "x"), "still at its limit")?;
+        } else {
+            Check.equalU64(0, s.bucketConfig("bkt", BUCKET_CONFIG_QUOTA)!.length as u64)?;
+            Check.isTrue(!refusedByQuota(mut s, "z", "x"), "no quota")?;
+        }
+        if (round == 0) { let _ = s.checkpoint()!; }
+        if (round == 1) { s.setBucketConfig("bkt", BUCKET_CONFIG_QUOTA, "".bytes())!; }
+    }
+    removeTree(dir.view());
+    return Ok();
+}

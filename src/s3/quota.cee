@@ -1,0 +1,101 @@
+// Bucket quotas (ADR-0052): the calls that set, read and remove one. The store counts a bucket's bytes and versions
+// and refuses the write that would pass a limit (`ObjectStore.checkQuota`).
+import web_core;
+import web_http;
+import web_server;
+
+/// The limits of a `<Quota>`: `MaxBytes`, `MaxObjects` or both, whole numbers; one left out, or 0, is no limit of
+/// that kind, and a quota needs one at least.
+fn parseQuota(xml: Slice<u8>) -> Result<[u64; 2], S3Fail> {
+    let malformed = S3Fail.Code(S3Code.MalformedXML);
+    if (findBytes(xml, "<Quota".bytes(), 0).isNull()) { return Err(malformed); }
+    let names = ["MaxBytes", "MaxObjects"];
+    var limits = [0u64; 2];
+    for (i in 0..2) {
+        match (elementText(xml, names[i])) {
+            Some(t) => {
+                limits[i] = match (parseDecimal(trimBlank(t))) {
+                    Some(n) => n,
+                    null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                };
+            }
+            null => {}
+        }
+    }
+    if (limits[0] == 0 && limits[1] == 0) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    return Ok(limits);
+}
+
+/// A bucket's limits (0: none) and its use, as GET `?quota` answers.
+fn quotaXml(limits: [u64; 2], usage: [u64; 2], out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let names = ["MaxBytes", "MaxObjects", "Bytes", "Objects"];
+    let values = [limits[0], limits[1], usage[0], usage[1]];
+    xmlHead(out, "Quota")?;
+    for (i in 0..4) {
+        var n = Vector<u8>.create();
+        appendDecimal(mut n, values[i])?;
+        xmlElement(out, names[i], n.view(), false)?;
+    }
+    out.extend("</Quota>".bytes())?;
+    return Ok();
+}
+
+/// GET `?quota`: the bucket's limits and what it holds, with or without a quota.
+async fn getBucketQuota(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    var stored = Vector<u8>.create();
+    var usage = [0u64; 2];
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let bucket = req.bucket.view();
+        // Two index lookups: on the event loop.
+        stored = match (store.bucketConfig(bucket, BUCKET_CONFIG_QUOTA)) {
+            Ok(q) => q,
+            Err(e) => { return Err(storeFail(e, 0)); }
+        };
+        usage = match (store.bucketUsage(bucket)) {
+            Ok(u) => u,
+            Err(e) => { return Err(storeFail(e, 0)); }
+        };
+    }
+    var limits = [0u64; 2];
+    if (stored.length == 16) {
+        limits[0] = stored.view().readLE<u64>(0);
+        limits[1] = stored.view().readLE<u64>(8);
+    }
+    var body = Vector<u8>.create();
+    quotaXml(limits, usage, mut body)?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// PUT `?quota`: the limits replace the bucket's. A bucket already past them keeps what it has, and takes no more.
+async fn putBucketQuota(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    verifySmallBody(req, xml.view(), true)?;
+    let limits = parseQuota(xml.view())?;
+    var stored = Vector<u8>.create();
+    stored.pushLE(limits[0])?;
+    stored.pushLE(limits[1])?;
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_QUOTA, stored.view())?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn deleteBucketQuota(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_QUOTA, "".bytes())?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}

@@ -9,7 +9,7 @@
 // than fall back, because segments it covered may already be gone. Little-endian:
 //
 // Header (64 bytes):
-//   0 u64 magic "CSCKPT01"   8 u16 format (12; 1 to 11 still load)   10 u16 header length (64)
+//   0 u64 magic "CSCKPT01"   8 u16 format (13; 1 to 12 still load)   10 u16 header length (64)
 //  12 u32 event count (format 11; 0 before)
 //  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count (versions, in format 6)   48 i64 created ms
 //  56 u32 upload count (format 2; reserved, 0, in format 1)   60 u32 crc32c of bytes 0..60
@@ -21,7 +21,7 @@
 //           its settings; ADR-0044), and in format 9 u32+bytes the bucket's ACL (empty, or its three characters;
 //           ADR-0045), and in format 10 u32+bytes the object lock configuration (empty for none; ADR-0047), and in
 //           format 11 u32+bytes the notification rules (ADR-0048), and in format 12 u32+bytes the CORS rules
-//           (ADR-0049)
+//           (ADR-0049), and in format 13 u32+bytes the quota (ADR-0052)
 //   event:  an undelivered event of the outbox, as `encodeEvent` writes one (ADR-0048)
 //   object: u16+bytes bucket, u16+bytes key, 16 version id, u64 lsn, u64 size, i64 mtime ms,
 //           16 md5, u16+bytes content type, u64 payload segment, u64 payload offset,
@@ -40,7 +40,7 @@ const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 12;
+const CHECKPOINT_FORMAT: u16 = 13;
 const CHECKPOINT_BUCKET: u8 = 1;
 const CHECKPOINT_OBJECT: u8 = 2;
 const CHECKPOINT_UPLOAD: u8 = 3;
@@ -339,6 +339,8 @@ fn beginCheckpointJob(
         body.extend(b.notification.view())?;
         body.pushLE(truncate<u32>(b.cors.length))?;
         body.extend(b.cors.view())?;
+        body.pushLE(truncate<u32>(b.quota.length))?;
+        body.extend(b.quota.view())?;
         w.add(CHECKPOINT_BUCKET, body.view())?;
     }
     var uploads = Vector<Vector<u8>>.create();
@@ -508,7 +510,7 @@ fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16
     }
     if (at != bytes.length) { return Err(StoreError.CheckpointCorrupt); }
     if (!state.hasBucket(bucket.view())?) { return Err(StoreError.CheckpointCorrupt); }
-    state.bumpObjects(bucket.view(), true)?;
+    state.bumpObjects(bucket.view(), true, size)?;
     let version = ObjectVersion {
         versionId: versionId,
         lsn: lsn,
@@ -667,6 +669,8 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
                 number: 0,
                 createdMillis: created,
                 objects: 0,
+                bytes: 0,
+                quota: Vector<u8>.create(),
                 tags: Vector<u8>.create(),
                 lifecycle: Vector<u8>.create(),
                 versioning: VERSIONING_OFF,
@@ -712,6 +716,10 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
             if (format >= 12) {
                 info.cors = corrupt(readBlob32(body, mut at))?;
                 if (decodeCors(info.cors.view()).isErr()) { return Err(StoreError.CheckpointCorrupt); }
+            }
+            if (format >= 13) {
+                info.quota = corrupt(readBlob32(body, mut at))?;
+                if (!isQuotaValue(info.quota.view())) { return Err(StoreError.CheckpointCorrupt); }
             }
             if (at != body.length) { return Err(StoreError.CheckpointCorrupt); }
             if (!state.addBucket(name, info)?) { return Err(StoreError.CheckpointCorrupt); } // a bucket twice

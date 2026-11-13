@@ -9,7 +9,8 @@ storage engine (journal, large-object extents, checkpoints, compaction, the spac
 rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 377 Ceph s3-tests pass against it
 ([compatibility](docs/compatibility.md)). Milestones M0 to M4 of the [roadmap](ROADMAP.md) are done; M5, production
 features, is under way: S3 versioning (ADR-0041), bucket policies (ADR-0043), the public-access block (ADR-0044)
-ACLs (ADR-0045), Object Lock (ADR-0047), event notifications to webhooks (ADR-0048) and CORS (ADR-0049) are in. There is no
+ACLs (ADR-0045), Object Lock (ADR-0047), event notifications to webhooks (ADR-0048), CORS (ADR-0049) and bucket
+quotas (ADR-0052) are in. There is no
 replication or clustering yet.
 
 CosmoStore's own code is pure CeeSafe, with no C and no `unsafe` blocks. The one C below it is OpenSSL 3, for TLS,

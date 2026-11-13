@@ -1,0 +1,53 @@
+// Bucket quotas over S3 (ADR-0052): the document.
+import web_core;
+import web_http;
+import web_server;
+
+fn quotaAnswer(xml: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    match (parseQuota(xml.bytes())) {
+        Ok(limits) => {
+            appendDecimal(mut out, limits[0])!;
+            out.push('/')!;
+            appendDecimal(mut out, limits[1])!;
+        }
+        Err(S3Fail.Code(code)) => { out.extend(s3CodeName(code).bytes())!; }
+        Err(_) => { out.extend("failed".bytes())!; }
+    }
+    return out;
+}
+
+@test
+fn quotaDocument() -> Result<void, TestFailure> {
+    Check.equalBytes(
+        "1073741824/1000".bytes(),
+        quotaAnswer("<Quota><MaxBytes>1073741824</MaxBytes><MaxObjects> 1000 </MaxObjects></Quota>").view(),
+    )?;
+    Check.equalBytes("5/0".bytes(), quotaAnswer("<Quota><MaxBytes>5</MaxBytes></Quota>").view())?;
+    Check.equalBytes(
+        "0/7".bytes(),
+        quotaAnswer("<Quota><MaxObjects>7</MaxObjects><MaxBytes>0</MaxBytes></Quota>").view(),
+    )?;
+    Check.equalBytes("MalformedXML".bytes(), quotaAnswer("<Other/>").view())?;
+    Check.equalBytes("InvalidArgument".bytes(), quotaAnswer("<Quota/>").view())?;
+    Check.equalBytes("InvalidArgument".bytes(), quotaAnswer("<Quota><MaxBytes>0</MaxBytes></Quota>").view())?;
+    Check.equalBytes("InvalidArgument".bytes(), quotaAnswer("<Quota><MaxBytes>-5</MaxBytes></Quota>").view())?;
+    Check.equalBytes("InvalidArgument".bytes(), quotaAnswer("<Quota><MaxBytes>1 GiB</MaxBytes></Quota>").view())?;
+    // What GET writes: the limits and the use; PUT reads the limits back.
+    var xml = Vector<u8>.create();
+    quotaXml([100u64, 0u64], [42u64, 3u64], mut xml)!;
+    Check.isTrue(
+        findBytes(
+            xml.view(),
+            "<MaxBytes>100</MaxBytes><MaxObjects>0</MaxObjects><Bytes>42</Bytes><Objects>3</Objects></Quota>".bytes(),
+            0,
+        ).isSome(),
+        "the limits and the use",
+    )?;
+    let text = match (StringView.fromUtf8(xml.view())) {
+        Some(t) => t,
+        null => { return Check.fail("the document is text"); }
+    };
+    Check.equalBytes("100/0".bytes(), quotaAnswer(text).view())?;
+    return Ok();
+}

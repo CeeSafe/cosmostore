@@ -97,6 +97,8 @@ enum StoreError {
     ObjectLocked,
     /// The bucket has no object lock configuration: its versions cannot be locked.
     ObjectLockOff,
+    /// The write would take the bucket past its quota (ADR-0052).
+    QuotaExceeded,
 }
 
 fn sio<T>(r: Result<T, IoFailure>) -> Result<T, StoreError> => match (r) {
@@ -124,6 +126,12 @@ struct BucketInfo {
     number: u32;
     createdMillis: i64;
     objects: u64;
+    /// The bytes of the bucket's versions, as S3 reports their sizes (ADR-0052). Counted as records are applied,
+    /// and again from a checkpoint's objects: never stored.
+    bytes: u64;
+    /// The bucket's quota as it is stored: 16 bytes, the most bytes and the most versions (0: no limit); empty for
+    /// none (ADR-0052).
+    quota: Vector<u8>;
     /// The bucket's tags (canonical, as object tags are) and lifecycle rules (`encodeLifecycle`); empty for none
     /// (ADR-0020).
     tags: Vector<u8>;
@@ -587,12 +595,29 @@ struct StoreState {
         }
     }
 
-    fn bumpObjects(borrow mut this, bucket: Slice<u8>, up: bool) -> Result<void, StoreError> {
+    /// A version of `bucket` came (`up`) or went: the bucket's count of versions, and of their bytes (ADR-0052).
+    fn bumpObjects(borrow mut this, bucket: Slice<u8>, up: bool, size: u64) -> Result<void, StoreError> {
         let k = BucketKey { name: copyBytes(bucket)? };
         match (this.buckets.getMut(borrow k)) {
             Some(b) => {
-                if (up) { b.objects += 1; } else { b.objects -= 1; }
+                if (up) {
+                    b.objects += 1;
+                    b.bytes += size;
+                } else {
+                    b.objects -= 1;
+                    b.bytes = if (b.bytes > size) b.bytes - size else 0;
+                }
             }
+            null => {}
+        }
+        return Ok();
+    }
+
+    /// A version of `bucket` was replaced in place: its bytes went and the new one's came.
+    fn swapBytes(borrow mut this, bucket: Slice<u8>, came: u64, went: u64) -> Result<void, StoreError> {
+        let k = BucketKey { name: copyBytes(bucket)? };
+        match (this.buckets.getMut(borrow k)) {
+            Some(b) => { b.bytes = if (b.bytes + came > went) b.bytes + came - went else 0; }
             null => {}
         }
         return Ok();
@@ -717,7 +742,7 @@ fn applyRecord(
                     match (state.index.removeVersion(borrow key, m.versionId)) {
                         Some(old) => {
                             state.retire(borrow old)?;
-                            state.bumpObjects(m.bucket.view(), false)?;
+                            state.bumpObjects(m.bucket.view(), false, old.size)?;
                             state.noteEvent(
                                 EVENT_DELETE,
                                 m.bucket.view(),
@@ -780,6 +805,8 @@ fn applyRecord(
                 number: 0,
                 createdMillis: created,
                 objects: 0,
+                bytes: 0,
+                quota: Vector<u8>.create(),
                 tags: Vector<u8>.create(),
                 lifecycle: Vector<u8>.create(),
                 versioning: VERSIONING_OFF,
@@ -826,6 +853,8 @@ fn applyRecord(
                         b.notification = value;
                     } else if (configKind == BUCKET_CONFIG_CORS) {
                         b.cors = value;
+                    } else if (configKind == BUCKET_CONFIG_QUOTA) {
+                        b.quota = value;
                     } else {
                         b.versioning = value[0]; // one valid byte: `decodeBucketConfigMeta` checked it
                     }
@@ -953,32 +982,36 @@ fn installVersion(
     key: IndexKey,
     version: ObjectVersion,
 ) -> Result<void, StoreError> {
+    let size = version.size;
     if (!isNullVersionId(version.versionId)) {
         state.index.push(key, version)?;
-        return state.bumpObjects(bucket, true);
+        return state.bumpObjects(bucket, true, size);
     }
     let newestIsNull = match (state.index.get(borrow key)) {
         Some(v) => isNullVersionId(v.versionId),
         null => {
             let _ = state.index.put(key, version)?;
-            return state.bumpObjects(bucket, true);
+            return state.bumpObjects(bucket, true, size);
         }
     };
     if (newestIsNull) {
         // In place, as an unversioned bucket's overwrite always was: nothing to allocate, and the count stays.
         match (state.index.put(key, version)?) {
-            Some(old) => { state.retire(borrow old)?; }
-            null => {}
+            Some(old) => {
+                state.retire(borrow old)?;
+                state.swapBytes(bucket, size, old.size)?;
+            }
+            null => { state.swapBytes(bucket, size, 0)?; }
         }
         return Ok();
     }
     let k = copyIndexKey(borrow key)?;
     state.index.push(key, version)?;
-    state.bumpObjects(bucket, true)?;
+    state.bumpObjects(bucket, true, size)?;
     match (state.index.removeOlder(borrow k, nullVersionId())) {
         Some(old) => {
             state.retire(borrow old)?;
-            state.bumpObjects(bucket, false)?;
+            state.bumpObjects(bucket, false, old.size)?;
         }
         null => {}
     }
@@ -1985,6 +2018,7 @@ struct ObjectStore {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         if (obj.size > this.config.maxObjectBytes) { return Err(StoreError.EntityTooLarge); }
         this.admit(obj.size)?;
+        this.checkQuota(bucket.bytes(), key.bytes(), obj.size)?;
         let current = this.currentGeneration(bucket, key)?;
         match (condition) {
             PutCondition.None => {}
@@ -2073,6 +2107,46 @@ struct ObjectStore {
         };
         if (this.mustCommitBefore(borrow rec, obj)) { return Ok(null); }
         return Ok(Some(this.stageEncoded(rec, obj)?));
+    }
+
+    /// QuotaExceeded if a new version of `size` bytes at `key` would take the bucket past its quota (ADR-0052 §2).
+    /// In a bucket whose versioning is not enabled the key's null version goes as the new one comes: its bytes are
+    /// not counted against the new one, and the count of versions stays. Counted against what is published: writes
+    /// staged or in their sync are not in the bucket's totals yet.
+    fn checkQuota(borrow this, bucket: Slice<u8>, key: Slice<u8>, size: u64) -> Result<void, StoreError> {
+        let k = BucketKey { name: copyBytes(bucket)? };
+        let b = match (this.state.buckets.get(borrow k)) {
+            Some(b) => b,
+            null => { return Ok(); }
+        };
+        if (b.quota.length != 16) { return Ok(); }
+        let maxBytes = b.quota.view().readLE<u64>(0);
+        let maxObjects = b.quota.view().readLE<u64>(8);
+        var went: u64 = 0;
+        var replaces = false;
+        if (b.versioning != VERSIONING_ENABLED) {
+            let ik = this.state.keyFor(bucket, key)?;
+            match (this.state.index.find(borrow ik, nullVersionId())) {
+                Some(v) => {
+                    went = v.size;
+                    replaces = true;
+                }
+                null => {}
+            }
+        }
+        let kept = if (b.bytes > went) b.bytes - went else 0;
+        if (maxBytes > 0 && kept + size > maxBytes) { return Err(StoreError.QuotaExceeded); }
+        if (maxObjects > 0 && !replaces && b.objects + 1 > maxObjects) { return Err(StoreError.QuotaExceeded); }
+        return Ok();
+    }
+
+    /// A bucket's use: the bytes of its versions and how many it has, delete markers included.
+    fn bucketUsage(borrow this, bucket: StringView) -> Result<[u64; 2], StoreError> {
+        let k = BucketKey { name: copyBytes(bucket.bytes())? };
+        return match (this.state.buckets.get(borrow k)) {
+            Some(b) => Ok([b.bytes, b.objects]),
+            null => Err(StoreError.NoSuchBucket),
+        };
     }
 
     /// How many buckets have CORS rules (ADR-0049 §4).
@@ -3088,6 +3162,7 @@ struct ObjectStore {
                 md5s.push(part.md5)?;
             }
             if (size > this.config.maxUploadBytes) { return Err(StoreError.EntityTooLarge); }
+            this.checkQuota(bucket.bytes(), key.bytes(), size)?;
             if (allChecksummed) {
                 extras.algorithm = u.checksumAlgorithm;
                 extras.kind = u.checksumType;
@@ -3882,7 +3957,8 @@ struct ObjectStore {
         if (kind == BUCKET_CONFIG_CORS && (value.length > MAX_CORS_BYTES || decodeCors(value).isErr())) {
             return Err(StoreError.InvalidKey);
         }
-        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_CORS) { return Err(StoreError.InvalidKey); }
+        if (kind == BUCKET_CONFIG_QUOTA && !isQuotaValue(value)) { return Err(StoreError.InvalidKey); }
+        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_QUOTA) { return Err(StoreError.InvalidKey); }
         // Object lock needs versioning enabled, keeps it so, and is never taken off a bucket (ADR-0047 §1).
         let locks = this.lockConfigOf(bucket.bytes())?.length > 0;
         if (kind == BUCKET_CONFIG_OBJECT_LOCK) {
@@ -3917,6 +3993,7 @@ struct ObjectStore {
                 if (kind == BUCKET_CONFIG_OBJECT_LOCK) { return Ok(copyBytes(b.objectLock.view())?); }
                 if (kind == BUCKET_CONFIG_NOTIFICATION) { return Ok(copyBytes(b.notification.view())?); }
                 if (kind == BUCKET_CONFIG_CORS) { return Ok(copyBytes(b.cors.view())?); }
+                if (kind == BUCKET_CONFIG_QUOTA) { return Ok(copyBytes(b.quota.view())?); }
                 Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?)
             }
             null => Err(StoreError.NoSuchBucket),

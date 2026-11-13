@@ -615,6 +615,30 @@ check "no rules, no events" "$(sleep 1; events)" 3
 aws s3 rm --recursive s3://notify/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket notify > /dev/null 2>&1 && pass "delete-bucket after notifications" || fail "delete-bucket after notifications"
 
+# Bucket quotas (ADR-0052): `?quota` is not an S3 call, so it is sent presigned, with curl.
+quota() { curl -s -o quota.out -w '%{http_code}' -X "$1" ${3:+--data-binary "$3"} "$(python3 -I "$here/s3_raw.py" presign "$AWS_ENDPOINT_URL" "$1" "$2" "" 60 quota)"; }
+quotaxml() { tr -d '\n' < quota.out | sed 's/.*<MaxBytes>//; s/<\/Objects>.*//'; }
+aws s3api create-bucket --bucket quota > /dev/null 2>&1
+printf 1234 > four.txt
+check "a bucket's use without a quota" "$(quota GET quota) $(quotaxml)" "200 0</MaxBytes><MaxObjects>0</MaxObjects><Bytes>0</Bytes><Objects>0"
+check "a quota is put" "$(quota PUT quota '<Quota><MaxBytes>20</MaxBytes><MaxObjects>2</MaxObjects></Quota>')" 200
+aws s3api put-object --bucket quota --key a --body pub.txt > /dev/null 2>&1 || fail "a write within the quota"
+check "a write past the bytes" "$(code s3api put-object --bucket quota --key b --body pub.txt)" QuotaExceeded
+aws s3api put-object --bucket quota --key b --body four.txt > /dev/null 2>&1 || fail "a smaller write"
+check "a write past the count" "$(code s3api put-object --bucket quota --key c --body four.txt)" QuotaExceeded
+aws s3api put-object --bucket quota --key a --body four.txt > /dev/null 2>&1 && pass "an overwrite at the count" || fail "an overwrite at the count"
+check "a copy past the count" "$(code s3api copy-object --bucket quota --key c --copy-source quota/a)" QuotaExceeded
+check "the limits and the use" "$(quota GET quota) $(quotaxml)" "200 20</MaxBytes><MaxObjects>2</MaxObjects><Bytes>8</Bytes><Objects>2"
+check "a quota without a limit" "$(quota PUT quota '<Quota></Quota>')" 400
+check "an anonymous quota read" "$(anon "$AWS_ENDPOINT_URL/quota?quota")" 403
+aws s3api delete-object --bucket quota --key b > /dev/null 2>&1
+aws s3api put-object --bucket quota --key c --body four.txt > /dev/null 2>&1 && pass "a write after a delete" || fail "a write after a delete"
+check "the quota is taken off" "$(quota DELETE quota)" 204
+aws s3api put-object --bucket quota --key d --body pub.txt > /dev/null 2>&1 && pass "a write without a quota" || fail "a write without a quota"
+check "the use after it" "$(quota GET quota) $(quotaxml)" "200 0</MaxBytes><MaxObjects>0</MaxObjects><Bytes>20</Bytes><Objects>3"
+aws s3 rm --recursive s3://quota/ > /dev/null 2>&1
+aws s3api delete-bucket --bucket quota > /dev/null 2>&1 && pass "delete-bucket after a quota" || fail "delete-bucket after a quota"
+
 # Credential rotation (ADR-0050): the credentials file is read again when it changes, within an upkeep round (2 s).
 second() { ( export AWS_ACCESS_KEY_ID=AKIASMOKETEST0000002; export AWS_SECRET_ACCESS_KEY="$1"; shift; "$@" ); }
 check "a key the file does not have" "$(second second/secret/one code s3api list-buckets)" InvalidAccessKeyId

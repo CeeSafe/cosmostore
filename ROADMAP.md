@@ -2006,3 +2006,29 @@ Browser form uploads with a SigV4 POST policy.
   .NET scripts and `tools/tls_smoke.sh`.
 - **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
 - **Next:** the rest of item 7 (quotas, rate limits, an admin API and CLI); item 4's rest when G33 is fixed.
+
+### 14 Nov 2026: M5 item 7, fourth part: bucket quotas (ADR-0052)
+
+- **Chosen with the user** (yes, 14 Nov): a limit per bucket on bytes and objects, checked at admission.
+- **A bucket's use** is now two numbers with the bucket: the bytes of its versions beside the count of them it
+  already had. Both follow the index as records are applied (a version installed, removed, or replaced in place),
+  and are counted again from a checkpoint's objects; neither is stored.
+- **A quota** is `BucketConfig` kind 10 (the most bytes and the most versions, 0 for none; checkpoint format 13,
+  formats 1 to 12 load). `checkQuota` sits with the store's other admissions (`checkPut`, and the completion of a
+  multipart upload): QuotaExceeded (403). An overwrite is counted without the version it replaces; a delete is
+  never refused.
+- **The calls are not S3's:** `PUT`, `GET` and `DELETE /<bucket>?quota`, with a small XML document; GET gives
+  the limits and the use, with or without a quota. `s3:GetBucketQuota` and `s3:PutBucketQuota`.
+- **Counted against what is published:** writes in flight are not in the total yet, so the limit can be passed
+  by at most what was in flight.
+- **Tests (3 new, 212 in all, no leaks):** a bucket's use through puts, an overwrite, deletes, versions and a
+  marker, recovery and a checkpoint; the quota (the bytes exactly, an overwrite that fits and one that does not,
+  the count, a multipart upload refused at completion and completed once there is room, versions, recovery, a
+  format 13 checkpoint, taken off); the document.
+- **Clients:** `tools/s3_smoke.sh` 343 checks (14 new), the quota calls presigned by `tools/s3_raw.py` (which can
+  now sign a subresource) and sent with curl, the writes with the AWS CLI. boto3 139 and the s3-tests subset 377,
+  as before.
+- **Not run:** the p99 gate (every version installed now also adds to its bucket's bytes, where it added to its
+  count), the rclone, Go, JavaScript, Java and .NET scripts and `tools/tls_smoke.sh`.
+- **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
+- **Next:** the rest of item 7 (rate limits, an admin API and CLI); item 4's rest when G33 is fixed.
