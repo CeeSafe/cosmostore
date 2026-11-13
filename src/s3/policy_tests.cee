@@ -444,3 +444,137 @@ fn policyFactsAndAnonymousRequests() -> Result<void, TestFailure> {
     }
     return Ok();
 }
+
+fn statementOf(principal: StringView, effect: StringView, condition: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    out.extend("{\"Effect\": \"".bytes())!;
+    out.extend(effect.bytes())!;
+    out.extend("\", \"Principal\": ".bytes())!;
+    out.extend(principal.bytes())!;
+    out.extend(", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::pub/*\"".bytes())!;
+    if (condition.length > 0) {
+        out.extend(", \"Condition\": ".bytes())!;
+        out.extend(condition.bytes())!;
+    }
+    out.extend("}".bytes())!;
+    return out;
+}
+
+/// Whether a policy of one statement is public (ADR-0044 §2).
+fn publicWith(principal: StringView, effect: StringView, condition: StringView) -> Result<bool, TestFailure> {
+    var json = Vector<u8>.create();
+    json.extend("{\"Statement\": [".bytes())!;
+    json.extend(statementOf(principal, effect, condition).view())!;
+    json.extend("]}".bytes())!;
+    let text = match (StringView.fromUtf8(json.view())) {
+        Some(t) => t,
+        null => { return Err(TestFailure.create("the policy is text")); }
+    };
+    let policy = policyOf(text)?;
+    return Ok(policyIsPublic(borrow policy));
+}
+
+/// What makes a policy public (ADR-0044 §2): an Allow for anyone that is not kept to fixed addresses.
+@test
+fn policyIsPublicOrNot() -> Result<void, TestFailure> {
+    let key = "{\"AWS\": \"arn:aws:iam:::user/AKIAPOLICYKEY0000001\"}";
+    Check.isTrue(publicWith("\"*\"", "Allow", "")?, "an Allow for anyone")?;
+    Check.isTrue(publicWith("{\"AWS\": \"*\"}", "Allow", "")?, "an Allow for any AWS principal")?;
+    Check.isTrue(!publicWith(key, "Allow", "")?, "an Allow for a key")?;
+    Check.isTrue(!publicWith("\"*\"", "Deny", "")?, "a Deny for anyone")?;
+    Check.isTrue(
+        publicWith("{\"AWS\": [\"*\", \"arn:aws:iam:::user/AKIAPOLICYKEY0000001\"]}", "Allow", "")?,
+        "anyone and a key",
+    )?;
+    // Fixed addresses: no wider than /8, or /32 for IPv6, and every range of the test.
+    Check.isTrue(
+        !publicWith("\"*\"", "Allow", "{\"IpAddress\": {\"aws:SourceIp\": \"10.0.0.0/32\"}}")?,
+        "one address",
+    )?;
+    Check.isTrue(!publicWith("\"*\"", "Allow", "{\"IpAddress\": {\"aws:SourceIp\": \"10.0.0.0/8\"}}")?, "a /8")?;
+    Check.isTrue(publicWith("\"*\"", "Allow", "{\"IpAddress\": {\"aws:SourceIp\": \"10.0.0.0/7\"}}")?, "a /7")?;
+    Check.isTrue(publicWith("\"*\"", "Allow", "{\"IpAddress\": {\"aws:SourceIp\": \"0.0.0.0/0\"}}")?, "every address")?;
+    Check.isTrue(
+        !publicWith("\"*\"", "Allow", "{\"IpAddress\": {\"aws:SourceIp\": \"2001:db8::/32\"}}")?,
+        "an IPv6 /32",
+    )?;
+    Check.isTrue(
+        publicWith("\"*\"", "Allow", "{\"IpAddress\": {\"aws:SourceIp\": \"2001:db8::/31\"}}")?,
+        "an IPv6 /31",
+    )?;
+    Check.isTrue(
+        publicWith("\"*\"", "Allow", "{\"IpAddress\": {\"aws:SourceIp\": [\"10.1.2.0/24\", \"0.0.0.0/1\"]}}")?,
+        "a narrow range and a wide one",
+    )?;
+    // Everything but the fixed addresses is anyone's to meet.
+    Check.isTrue(
+        publicWith("\"*\"", "Allow", "{\"NotIpAddress\": {\"aws:SourceIp\": \"10.0.0.0/8\"}}")?,
+        "everywhere but a range",
+    )?;
+    Check.isTrue(
+        publicWith("\"*\"", "Allow", "{\"StringLike\": {\"aws:Referer\": \"https://example.com/*\"}}")?,
+        "a referer",
+    )?;
+    Check.isTrue(publicWith("\"*\"", "Allow", "{\"Bool\": {\"aws:SecureTransport\": \"true\"}}")?, "TLS only")?;
+    Check.isTrue(
+        !publicWith(
+            "\"*\"",
+            "Allow",
+            "{\"Bool\": {\"aws:SecureTransport\": \"true\"}, \"IpAddress\": {\"aws:SourceIp\": \"192.168.1.0/24\"}}",
+        )?,
+        "TLS and a fixed range",
+    )?;
+    // One public statement is enough, whatever the others say.
+    let two = policyOf(
+        """
+        {"Statement": [
+          {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::pub/*",
+           "Condition": {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}},
+          {"Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": "arn:aws:s3:::pub/*"},
+          {"Effect": "Allow", "Principal": "*", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::pub"}]}
+        """,
+    )?;
+    Check.isTrue(policyIsPublic(borrow two), "a public statement among others")?;
+    return Ok();
+}
+
+fn accessBlockOf(xml: StringView) -> i32 => match (parsePublicAccessBlock(xml.bytes())) {
+    Ok(bits) => bits as i32,
+    Err(_) => -1,
+};
+
+/// The public-access block's document (ADR-0044 §1): four settings, each off when it is left out.
+@test
+fn publicAccessBlockDocument() -> Result<void, TestFailure> {
+    Check.equalI64(0, accessBlockOf("<PublicAccessBlockConfiguration/>") as i64)?;
+    Check.equalI64(
+        15,
+        accessBlockOf(
+            """
+            <PublicAccessBlockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+              <BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls>
+              <BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets>
+            </PublicAccessBlockConfiguration>
+            """,
+        ) as i64,
+    )?;
+    let one = [
+        "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls></PublicAccessBlockConfiguration>",
+        "<PublicAccessBlockConfiguration><IgnorePublicAcls>TRUE</IgnorePublicAcls></PublicAccessBlockConfiguration>",
+        "<PublicAccessBlockConfiguration><BlockPublicPolicy>true</BlockPublicPolicy><BlockPublicAcls>false</BlockPublicAcls></PublicAccessBlockConfiguration>",
+        "<PublicAccessBlockConfiguration><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+    ];
+    let bits = [1i64, 2i64, 4i64, 8i64];
+    for (i in 0..one.length) { Check.equalI64(bits[i], accessBlockOf(one[i]) as i64)?; }
+    Check.equalI64(-1, accessBlockOf("<Other><BlockPublicAcls>true</BlockPublicAcls></Other>") as i64)?;
+    Check.equalI64(
+        -1,
+        accessBlockOf(
+            "<PublicAccessBlockConfiguration><BlockPublicAcls>yes</BlockPublicAcls></PublicAccessBlockConfiguration>",
+        ) as i64,
+    )?;
+    Check.isTrue(publicAccessHas([8u8][..], PUBLIC_ACCESS_RESTRICT_BUCKETS), "the setting that is on")?;
+    Check.isTrue(!publicAccessHas([7u8][..], PUBLIC_ACCESS_RESTRICT_BUCKETS), "the settings that are not")?;
+    Check.isTrue(!publicAccessHas("".bytes(), PUBLIC_ACCESS_BLOCK_POLICY), "no block at all")?;
+    return Ok();
+}

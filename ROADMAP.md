@@ -1734,3 +1734,32 @@ Browser form uploads with a SigV4 POST policy.
   condition keys refused here (`s3:x-amz-copy-source`, `s3:ExistingObjectTag`, `...IfExists`).
 - **Next:** slice 2, the public-access block and GetBucketPolicyStatus; then an ACL compatibility mode.
 
+
+### 13 Nov 2026: M5 item 3, slice 2: the public-access block and a policy's status (ADR-0044)
+
+- **Stored with the bucket** (`BucketConfig` kind 5, one byte of four settings; checkpoint format 8, formats 1 to 7
+  load). Put-, Get- and DeletePublicAccessBlock; NoSuchPublicAccessBlockConfiguration. A block with every setting
+  off is still a block.
+- **A policy is public** when an Allow is for anyone and is not kept to fixed addresses (an `IpAddress` test on
+  `aws:SourceIp`, every range no wider than /8, or /32 for IPv6). Deny statements are not counted: the answer errs
+  towards public. GetBucketPolicyStatus says it, and answers `false` for a bucket without a policy, as RGW does (S3
+  answers NoSuchBucketPolicy).
+- **`BlockPublicPolicy`** refuses a public policy when it is put (AccessDenied); the one a bucket has stays.
+  **`RestrictPublicBuckets`** refuses every anonymous request to a bucket whose policy is public; keys are not
+  touched. **`BlockPublicAcls` and `IgnorePublicAcls`** are stored and do nothing until there are ACLs.
+- **No new cost:** the block is read only by an anonymous request to a bucket with a policy, under the lock it
+  already takes, and by a PutBucketPolicy whose policy is public. The two counts of ADR-0043 §8 are as they were.
+- **Tests (3 new, 178 in all, no leaks):** what is public (principals, the widths of ranges, the other conditions,
+  one public statement among others), the block's document, and in the store a block through recovery, a format 8
+  checkpoint, clearing and the bucket's deletion.
+- **Clients:** `tools/s3_smoke.sh` 203 checks (16 new), boto3 95 (9 new), the s3-tests subset 305 (496 in scope,
+  317 pass; 9 new: `test_get_bucket_policy_status`, the two `*policy_acl_bucket_policy_status`,
+  `test_get_undefined_public_block`, `test_get_public_block_deny_bucket_policy`, `test_put_public_block`,
+  `test_block_public_policy`, `test_block_public_restrict_public_buckets`, `test_put_get_delete_public_block`). Of
+  the 16 tests of this area, 5 need ACLs and 2 name a tenant's root as principal.
+- **Not run:** the p99 gate (still owed from slice 1, on a quiet machine), the other SDK scripts (they do not use
+  these calls) and `tools/tls_smoke.sh` (how `serve` listens did not change).
+- **The toolchain on this machine:** the installed `ceesafec` is 0.40.0 and CeeSafe's `out/ceesafec` is 0.42.0, which
+  CeeSafe.Web's pinned commit does not compile with (`AsyncError.Closed` is not matched in `web_core`). This slice
+  was checked, tested and built with the 0.41.0 build kept as `out/ceesafec.good3`.
+- **Next:** slice 3, an ACL compatibility mode, which gives the two ACL settings their meaning.

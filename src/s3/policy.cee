@@ -926,6 +926,43 @@ fn decidePolicy(
     return if (allowed) PolicyDecision.Allow else PolicyDecision.Neither;
 }
 
+/// Whether a statement's conditions keep it to fixed addresses (ADR-0044 §2): an `IpAddress` test on `aws:SourceIp`
+/// whose ranges are each no wider than /8 (IPv4) or /32 (IPv6), as S3 draws the line.
+fn fixedAddresses(st: borrow PolicyStatement) -> bool {
+    for (i in 0..st.tests.length) {
+        let t = borrow st.tests[i];
+        if (t.negated || t.ranges.length == 0) { continue; }
+        let narrow = match (t.op) {
+            PolicyOp.IpAddress => match (t.key) {
+                PolicyKey.SourceIp => true,
+                _ => false,
+            },
+            _ => false,
+        };
+        if (!narrow) { continue; }
+        var wide = false;
+        for (j in 0..t.ranges.length) {
+            let least: u32 = if (t.ranges[j].v6) 32 else 8;
+            if (t.ranges[j].bits < least) { wide = true; }
+        }
+        if (!wide) { return true; }
+    }
+    return false;
+}
+
+/// Whether a policy is public (ADR-0044 §2): some Allow is for anyone and is not kept to fixed addresses. What its
+/// Deny statements take back is not counted.
+fn policyIsPublic(policy: borrow BucketPolicy) -> bool {
+    for (i in 0..policy.statements.length) {
+        let st = borrow policy.statements[i];
+        if (st.allow && st.anyone && !fixedAddresses(st)) { return true; }
+    }
+    return false;
+}
+
+/// Whether a stored public-access block has the setting `bit` on.
+fn publicAccessHas(block: Slice<u8>, bit: u8) -> bool => block.length == 1 && (block[0] & bit) != 0;
+
 // ---- Requests ----
 
 /// Who sent a request (ADR-0043 §1): a configured key, by its place in the credentials, or no one; and from where.
@@ -945,7 +982,8 @@ fn isListingAction(action: StringView) -> bool => action == "s3:ListBucket" || a
 enum PolicyGate {
     /// Nothing to read: a key, and no policy has a Deny.
     Open,
-    /// Nothing to read: anonymous, and no bucket has a policy.
+    /// Anonymous, and no bucket has a policy (nothing to read), or this bucket's public policy is restricted by its
+    /// public-access block (ADR-0044 §3).
     Closed,
     /// The bucket has no policy, or is not there.
     Absent,
@@ -962,21 +1000,33 @@ async fn policyGate(app: borrow S3App, who: borrow Requester, bucket: StringView
         return Ok(PolicyGate.Closed);
     }
     var document = Vector<u8>.create();
+    var block = Vector<u8>.create();
     {
         var guard = await lockStore(app)?;
         let store = guard.data();
-        // An index lookup and a copy: on the event loop.
+        // Index lookups and copies: on the event loop.
         match (store.bucketConfig(bucket, BUCKET_CONFIG_POLICY)) {
             Ok(d) => { document = d; }
             Err(_) => { return Ok(PolicyGate.Absent); }
         }
+        if (document.length > 0 && who.key.isNull()) {
+            match (store.bucketConfig(bucket, BUCKET_CONFIG_PUBLIC_ACCESS)) {
+                Ok(b) => { block = b; }
+                Err(_) => { return Ok(PolicyGate.Absent); }
+            }
+        }
     }
     if (document.length == 0) { return Ok(PolicyGate.Absent); }
-    return match (parseBucketPolicy(document.view(), bucket.bytes(), app.credentials.view(), false)) {
-        Ok(p) => Ok(PolicyGate.Read(p)),
-        Err(S3Fail.OutOfMemory(e)) => Err(S3Fail.OutOfMemory(e)),
-        Err(_) => Ok(PolicyGate.Broken),
+    let policy = match (parseBucketPolicy(document.view(), bucket.bytes(), app.credentials.view(), false)) {
+        Ok(p) => p,
+        Err(S3Fail.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
+        Err(_) => { return Ok(PolicyGate.Broken); }
     };
+    // RestrictPublicBuckets: a public policy opens nothing to a requester outside the account (ADR-0044 §3).
+    if (publicAccessHas(block.view(), PUBLIC_ACCESS_RESTRICT_BUCKETS) && policyIsPublic(borrow policy)) {
+        return Ok(PolicyGate.Closed);
+    }
+    return Ok(PolicyGate.Read(policy));
 }
 
 /// Whether the gate lets `who` do `action` on `bucket` or `bucket/key` (`key` empty: the bucket).
@@ -1100,7 +1150,12 @@ async fn putBucketPolicy(
 ) -> Result<void, S3Fail> {
     let json = await readSmallBody(auth, exchange, MAX_POLICY_BYTES + 1)?;
     verifySmallBody(req, json.view(), true)?;
-    let _ = parseBucketPolicy(json.view(), req.bucket.view().bytes(), app.credentials.view(), true)?;
+    let policy = parseBucketPolicy(json.view(), req.bucket.view().bytes(), app.credentials.view(), true)?;
+    // BlockPublicPolicy: a public policy is not taken (ADR-0044 §3).
+    if (policyIsPublic(borrow policy)) {
+        let block = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_PUBLIC_ACCESS)?;
+        if (publicAccessHas(block.view(), PUBLIC_ACCESS_BLOCK_POLICY)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    }
     await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_POLICY, json.view())?;
     await recountPolicies(app)?;
     await exchange.send(Status.noContent(), "".bytes())?;
@@ -1114,6 +1169,99 @@ async fn deleteBucketPolicy(
 ) -> Result<void, S3Fail> {
     await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_POLICY, "".bytes())?;
     await recountPolicies(app)?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}
+
+// ---- The policy's status and the public-access block (ADR-0044) ----
+
+/// GetBucketPolicyStatus: whether the bucket's policy is public; a bucket without a policy is not.
+async fn getBucketPolicyStatus(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let bucket = req.bucket.view();
+    let document = await storeBucketConfig(app, bucket, BUCKET_CONFIG_POLICY)?;
+    var isPublic = false;
+    if (document.length > 0) {
+        match (parseBucketPolicy(document.view(), bucket.bytes(), app.credentials.view(), false)) {
+            Ok(p) => { isPublic = policyIsPublic(borrow p); }
+            Err(S3Fail.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
+            Err(_) => {} // a stored policy that does not parse opens nothing (ADR-0043 §9)
+        }
+    }
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "PolicyStatus")?;
+    xmlElement(mut body, "IsPublic", if (isPublic) "true".bytes() else "false".bytes(), false)?;
+    body.extend("</PolicyStatus>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// The settings a `<PublicAccessBlockConfiguration>` turns on, as the store keeps them: a setting it leaves out is
+/// off.
+fn parsePublicAccessBlock(xml: Slice<u8>) -> Result<u8, S3Fail> {
+    if (findBytes(xml, "<PublicAccessBlockConfiguration".bytes(), 0).isNull()) {
+        return Err(S3Fail.Code(S3Code.MalformedXML));
+    }
+    // The four settings, in the order of their bits.
+    let names = ["BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"];
+    var bits: u8 = 0;
+    for (i in 0..names.length) {
+        match (elementText(xml, names[i])) {
+            Some(v) => {
+                if (v == "true".bytes() || v == "TRUE".bytes()) {
+                    bits |= 1u8 << truncate<u8>(i);
+                } else if (v != "false".bytes() && v != "FALSE".bytes()) {
+                    return Err(S3Fail.Code(S3Code.MalformedXML));
+                }
+            }
+            null => {}
+        }
+    }
+    return Ok(bits);
+}
+
+/// GetPublicAccessBlock: the four settings, or 404 for a bucket that was given none.
+async fn getPublicAccessBlock(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let block = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_PUBLIC_ACCESS)?;
+    if (block.length == 0) { return Err(S3Fail.Code(S3Code.NoSuchPublicAccessBlockConfiguration)); }
+    let names = ["BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"];
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "PublicAccessBlockConfiguration")?;
+    for (i in 0..names.length) {
+        let on = (block[0] & (1u8 << truncate<u8>(i))) != 0;
+        xmlElement(mut body, names[i], if (on) "true".bytes() else "false".bytes(), false)?;
+    }
+    body.extend("</PublicAccessBlockConfiguration>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// PutPublicAccessBlock. A policy the bucket already has stays; `RestrictPublicBuckets` is what closes it.
+async fn putPublicAccessBlock(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    verifySmallBody(req, xml.view(), true)?;
+    let block = [parsePublicAccessBlock(xml.view())?];
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_PUBLIC_ACCESS, block[..])?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn deletePublicAccessBlock(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_PUBLIC_ACCESS, "".bytes())?;
     await exchange.send(Status.noContent(), "".bytes())?;
     return Ok();
 }

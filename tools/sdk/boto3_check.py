@@ -287,7 +287,24 @@ check("anonymous write", code_of(lambda: anonymous.put_object(Bucket=P, Key="pub
 check("a key denied", code_of(lambda: s3.put_object(Bucket=P, Key="frozen/x", Body=b"x")), "AccessDenied")
 check("a key elsewhere", s3.put_object(Bucket=P, Key="open/x", Body=b"x")["ResponseMetadata"]["HTTPStatusCode"], 200)
 check("a malformed policy", code_of(lambda: s3.put_bucket_policy(Bucket=P, Policy="{}")), "MalformedPolicy")
+# The policy's status and the public-access block (ADR-0044).
+def block_of(**on):
+    names = ["BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"]
+    return {n: on.get(n, False) for n in names}
+check("the status of a public policy", s3.get_bucket_policy_status(Bucket=P)["PolicyStatus"]["IsPublic"], True)
+check("no public-access block", code_of(lambda: s3.get_public_access_block(Bucket=P)), "NoSuchPublicAccessBlockConfiguration")
+s3.put_public_access_block(Bucket=P, PublicAccessBlockConfiguration=block_of(RestrictPublicBuckets=True))
+check("get_public_access_block", s3.get_public_access_block(Bucket=P)["PublicAccessBlockConfiguration"], block_of(RestrictPublicBuckets=True))
+check("anonymous read under RestrictPublicBuckets", code_of(lambda: anonymous.get_object(Bucket=P, Key="pub/a")), "AccessDenied")
+check("a key under it", s3.get_object(Bucket=P, Key="pub/a")["Body"].read(), b"public")
+public_policy = s3.get_bucket_policy(Bucket=P)["Policy"]
+s3.put_public_access_block(Bucket=P, PublicAccessBlockConfiguration=block_of(BlockPublicPolicy=True))
+check("a public policy under BlockPublicPolicy", code_of(lambda: s3.put_bucket_policy(Bucket=P, Policy=public_policy)), "AccessDenied")
+check("the policy it already had", anonymous.get_object(Bucket=P, Key="pub/a")["Body"].read(), b"public")
+s3.delete_public_access_block(Bucket=P)
+check("the block deleted", code_of(lambda: s3.get_public_access_block(Bucket=P)), "NoSuchPublicAccessBlockConfiguration")
 s3.delete_bucket_policy(Bucket=P)
+check("the status without a policy", s3.get_bucket_policy_status(Bucket=P)["PolicyStatus"]["IsPublic"], False)
 check("anonymous after the delete", code_of(lambda: anonymous.get_object(Bucket=P, Key="pub/a")), "AccessDenied")
 boto3.resource("s3", endpoint_url=endpoint).Bucket(P).objects.all().delete()
 s3.delete_bucket(Bucket=P)

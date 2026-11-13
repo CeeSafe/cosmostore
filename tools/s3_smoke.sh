@@ -392,6 +392,34 @@ aws s3api delete-bucket-policy --bucket pol > /dev/null 2>&1 || fail "delete-buc
 check "no policy again" "$(code s3api get-bucket-policy --bucket pol)" NoSuchBucketPolicy
 check "anonymous after it" "$(anon "$AWS_ENDPOINT_URL/pol/pub/a.txt")" 403
 check "the key after it" "$(aws s3api delete-object --bucket pol --key keep/k.txt > /dev/null 2>&1 && echo deleted)" deleted
+
+# The policy's status and the public-access block (ADR-0044).
+status() { aws s3api get-bucket-policy-status --bucket pol --query PolicyStatus.IsPublic; }
+block() { aws s3api put-public-access-block --bucket pol --public-access-block-configuration "$1" > /dev/null 2>&1; }
+check "no public-access block" "$(code s3api get-public-access-block --bucket pol)" NoSuchPublicAccessBlockConfiguration
+check "the status without a policy" "$(status)" false
+aws s3api put-bucket-policy --bucket pol --policy file://policy2.json > /dev/null 2>&1
+check "the status of a policy for fixed addresses" "$(status)" false
+printf '%s' '{"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::pol/pub/*"}]}' > public.json
+aws s3api put-bucket-policy --bucket pol --policy file://public.json > /dev/null 2>&1
+check "the status of a public policy" "$(status)" true
+check "anonymous status" "$(anon "$AWS_ENDPOINT_URL/pol?policyStatus")" 403
+block BlockPublicAcls=true,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=true || fail "put-public-access-block"
+check "get-public-access-block" "$(aws s3api get-public-access-block --bucket pol --query 'PublicAccessBlockConfiguration.[BlockPublicAcls,IgnorePublicAcls,BlockPublicPolicy,RestrictPublicBuckets]' --output text | tr '\t' ' ')" "True False False True"
+check "anonymous under RestrictPublicBuckets" "$(anon "$AWS_ENDPOINT_URL/pol/pub/a.txt")" 403
+check "a key under it" "$(aws s3api get-object --bucket pol --key pub/a.txt got.txt > /dev/null 2>&1 && cat got.txt)" "public bytes"
+check "the policy stays" "$(status)" true
+aws s3api put-bucket-policy --bucket pol --policy file://policy2.json > /dev/null 2>&1
+check "anonymous by a policy that is not public" "$(anon "$AWS_ENDPOINT_URL/pol/pub/a.txt")" 200
+block BlockPublicPolicy=true || fail "put-public-access-block again"
+check "the block replaced" "$(aws s3api get-public-access-block --bucket pol --query 'PublicAccessBlockConfiguration.[BlockPublicAcls,IgnorePublicAcls,BlockPublicPolicy,RestrictPublicBuckets]' --output text | tr '\t' ' ')" "False False True False"
+check "a public policy under BlockPublicPolicy" "$(code s3api put-bucket-policy --bucket pol --policy file://public.json)" AccessDenied
+aws s3api put-bucket-policy --bucket pol --policy file://policy2.json > /dev/null 2>&1 && pass "one that is not public" || fail "one that is not public"
+aws s3api delete-public-access-block --bucket pol > /dev/null 2>&1 || fail "delete-public-access-block"
+check "no public-access block again" "$(code s3api get-public-access-block --bucket pol)" NoSuchPublicAccessBlockConfiguration
+aws s3api put-bucket-policy --bucket pol --policy file://public.json > /dev/null 2>&1 && pass "a public policy after it" || fail "a public policy after it"
+check "anonymous after it" "$(anon "$AWS_ENDPOINT_URL/pol/pub/a.txt")" 200
+aws s3api delete-bucket-policy --bucket pol > /dev/null 2>&1
 aws s3 rm --recursive s3://pol/ > /dev/null 2>&1
 aws s3api put-bucket-policy --bucket pol --policy file://deny.json > /dev/null 2>&1
 aws s3api delete-bucket --bucket pol > /dev/null 2>&1 && fail "delete-bucket under a Deny" || pass "delete-bucket under a Deny"

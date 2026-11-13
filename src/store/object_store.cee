@@ -125,6 +125,8 @@ struct BucketInfo {
     versioning: u8;
     /// The bucket policy's JSON as it was put; empty for none (ADR-0043).
     policy: Vector<u8>;
+    /// The public-access block: empty for none, or one byte of the PUBLIC_ACCESS bits (ADR-0044).
+    publicAccess: Vector<u8>;
 }
 
 /// Space use of one segment, for compaction (ADR-0005). `liveBytes` counts the records that
@@ -684,6 +686,7 @@ fn applyRecord(
                 lifecycle: Vector<u8>.create(),
                 versioning: VERSIONING_OFF,
                 policy: Vector<u8>.create(),
+                publicAccess: Vector<u8>.create(),
             };
             let _ = state.addBucket(name, info)?;
         }
@@ -704,6 +707,8 @@ fn applyRecord(
                         b.lifecycle = value;
                     } else if (configKind == BUCKET_CONFIG_POLICY) {
                         b.policy = value;
+                    } else if (configKind == BUCKET_CONFIG_PUBLIC_ACCESS) {
+                        b.publicAccess = value;
                     } else {
                         b.versioning = value[0]; // one valid byte: `decodeBucketConfigMeta` checked it
                     }
@@ -3548,7 +3553,8 @@ struct ObjectStore {
         if (kind == BUCKET_CONFIG_POLICY && value.length > MAX_POLICY_BYTES) {
             return Err(StoreError.MetadataTooLarge);
         }
-        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_POLICY) { return Err(StoreError.InvalidKey); }
+        if (kind == BUCKET_CONFIG_PUBLIC_ACCESS && !isPublicAccessValue(value)) { return Err(StoreError.InvalidKey); }
+        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_PUBLIC_ACCESS) { return Err(StoreError.InvalidKey); }
         this.scratch.clear();
         encodeBucketConfigMeta(mut this.scratch, bucket.bytes(), kind, value)?;
         let empty = [0u8; 1];
@@ -3556,7 +3562,8 @@ struct ObjectStore {
         return Ok();
     }
 
-    /// A bucket's tags, lifecycle rules or policy, as stored, or its versioning state as one byte; empty for none.
+    /// A bucket's tags, lifecycle rules, policy or public-access block, as stored, or its versioning state as one
+    /// byte; empty for none.
     fn bucketConfig(borrow this, bucket: StringView, kind: u8) -> Result<Vector<u8>, StoreError> {
         let k = BucketKey { name: copyBytes(bucket.bytes())? };
         return match (this.state.buckets.get(borrow k)) {
@@ -3567,6 +3574,7 @@ struct ObjectStore {
                     return Ok(state);
                 }
                 if (kind == BUCKET_CONFIG_POLICY) { return Ok(copyBytes(b.policy.view())?); }
+                if (kind == BUCKET_CONFIG_PUBLIC_ACCESS) { return Ok(copyBytes(b.publicAccess.view())?); }
                 Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?)
             }
             null => Err(StoreError.NoSuchBucket),

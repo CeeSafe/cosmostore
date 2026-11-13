@@ -175,3 +175,55 @@ fn bucketPolicySurvivesAndGoesWithTheBucket() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// A public-access block (ADR-0044) is one byte of settings: through recovery from the journal and from a format 8
+/// checkpoint, cleared, and gone with its bucket. A block with every setting off is still a block.
+@test
+fn publicAccessBlockSurvivesAndGoesWithTheBucket() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("public-access-block");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("shut")!;
+        s.createBucket("bare")!;
+        s.createBucket("plain")!;
+        s.setBucketConfig("shut", BUCKET_CONFIG_PUBLIC_ACCESS, [12u8][..])!;
+        s.setBucketConfig("bare", BUCKET_CONFIG_PUBLIC_ACCESS, [0u8][..])!;
+        match (s.setBucketConfig("plain", BUCKET_CONFIG_PUBLIC_ACCESS, [16u8][..])) {
+            Err(StoreError.InvalidKey) => {}
+            _ => { return Check.fail("a setting there is not"); }
+        }
+        match (s.setBucketConfig("plain", BUCKET_CONFIG_PUBLIC_ACCESS, [1u8, 2u8][..])) {
+            Err(StoreError.InvalidKey) => {}
+            _ => { return Check.fail("two bytes"); }
+        }
+        match (s.setBucketConfig("plain", 6, "x".bytes())) {
+            Err(StoreError.InvalidKey) => {}
+            _ => { return Check.fail("a kind of configuration there is not"); }
+        }
+    }
+    for (round in 0..3) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.equalBytes([12u8][..], s.bucketConfig("shut", BUCKET_CONFIG_PUBLIC_ACCESS)!.view())?;
+        Check.equalU64(0, s.bucketConfig("plain", BUCKET_CONFIG_PUBLIC_ACCESS)!.length as u64)?;
+        let bare = s.bucketConfig("bare", BUCKET_CONFIG_PUBLIC_ACCESS)!;
+        if (round < 2) {
+            Check.equalBytes([0u8][..], bare.view())?;
+        } else {
+            Check.equalU64(0, bare.length as u64)?;
+        }
+        if (round == 0) { let _ = s.checkpoint()!; } // format 8 holds the blocks
+        if (round == 1) {
+            s.setBucketConfig("bare", BUCKET_CONFIG_PUBLIC_ACCESS, "".bytes())!; // cleared
+            let _ = s.checkpoint()!;
+        }
+    }
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.deleteBucket("shut")!;
+        s.createBucket("shut")!;
+    }
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(0, s.bucketConfig("shut", BUCKET_CONFIG_PUBLIC_ACCESS)!.length as u64)?; // a new bucket starts bare
+    removeTree(dir.view());
+    return Ok();
+}
