@@ -1519,3 +1519,37 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:**
   - a quiet reference run on the M1, for T1 at 4 KiB and T7.
 
+### 13 Nov 2026: the second M1 reference run (`docs/benchmarks/2026-11-13-m1-reference.md`)
+
+- **The quiet run, at last:** the matrix and the 1M scale run at `48709f4` (ceesafec 0.41.0, CeeSafe.Web `c799f14`)
+  on the M1 at a load average of 2.2 to 3.2, then 8 repeats of the tiny phases. No errors; fsck clean.
+- **It does not settle T1 or T7; it shows what they are:**
+  - T1 is short at every size in the matrix (2,580 to 2,991/s), not only at 4 KiB. Every phase costs 64 syncs per
+    1,000 PUTs, so 3,000/s needs a sync of 5.2 ms; the device's median was 5.6 ms (168 to 202 syncs a second over 28
+    phases). Over 36 phases at concurrency 32, 11 reached 3,000 (2,260 to 3,262). The store's part has not moved
+    since slice 2.
+  - T7: 29 of 30 again, the same phase as the first reference (4 KiB PUT, 51.2 ms, no upkeep hold), but not a fixed
+    cause: three more runs of the same sequence gave 19 to 42 ms, and none of 120 phases in the repeats passed
+    50 ms.
+  - T4 at 128 B (174/s against the baseline's 196) and T5's p99 at 4 KiB in one phase (6.0 ms; 1.6 to 3.5 in the
+    repeats) are short by the gate's rules in this run.
+- **Met:** T2, T3, T6, T8 to T12 (386 bytes per object, pages in 0.85 ms, recovery in 1.48 s, amplification 1.02).
+- **Since the first reference:** tiny PUTs at concurrency 128 at 9,200 to 11,100/s from 4,800 to 5,600; 1 MiB GETs
+  at 1,769 MiB/s from 856; GETs 1.35 times and HEADs 1.24 times at the median; the 1M fill at 11,094/s from 5,030.
+- **On the Intel Mac mini** (same commit, `osx-x64`, started at 256 open files): `serve` raised its limit to
+  122,880 and the matrix ran without an error where the journal had fail-stopped (G32's fix confirmed); the 146
+  tests pass. Its timings are not recorded: another session's tests loaded it.
+- **The mini's footprint at 1M objects** was 543 bytes per object (466 after recovery), over T9's figure. It is the
+  system's allocator, not the store: the same store recovers into the same 3.2 million blocks and 376 MB on both
+  machines, and macOS 15 keeps freed large blocks as reusable pages in the footprint (156 MB after a fill, 78 MB
+  after recovery; `vmmap --summary`). Live memory is 355 to 376 bytes per object on both.
+- **T1 restated** (the user's decision): tiny PUT at concurrency 32 ≥ 12 times the same run's rate at concurrency
+  1, where a PUT costs one sync; it was ≥ 3,000 ops/s. 64 syncs per 1,000 give 15.6 times; the floor allows for a
+  phase of 64 syncs (12.4 to 18.0 times in 28 phases) and fails at two syncs a batch (7.8). `gate -targets` has the
+  rule (`minTimesConcurrency1`); both M1 references and the mini's run meet it, the baseline does not (1.0 times).
+- **M4's targets:** all met on the reference machine but for single phases of this run: T4 at 128 B, T5's p99 at
+  4 KiB and T7, none of which repeated.
+- **Next:**
+  - M4's exit, for the user's word: the targets above, memory bounded, no compaction stalls, and the gates in CI
+    are in place; journal shards stay for devices that sync in parallel. Then M5.
+

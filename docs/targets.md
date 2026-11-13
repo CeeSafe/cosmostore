@@ -20,7 +20,7 @@ other hardware the ratios (scaling, syncs per write) carry over; the absolute nu
 
 | # | Target | Baseline | Proposed |
 |---|---|---|---|
-| T1 | Tiny PUT (0 B to 4 KiB) at concurrency 32 | about 200 ops/s | ≥ 3,000 ops/s |
+| T1 | Tiny PUT (0 B to 4 KiB) at concurrency 32 | about 200 ops/s, as at concurrency 1 | ≥ 12 times the same run's rate at concurrency 1 for the size (restated 13 Nov 2026, was ≥ 3,000 ops/s) |
 | T2 | Syncs per 1,000 tiny PUTs at concurrency 32 | 1,000 | ≤ 70: about 2 per client per 1,000 writes, with closed-loop clients (restated 9 Nov 2026, was ≤ 50) |
 | T3 | Tiny PUT p99 at concurrency 32 | about 190 ms | ≤ 25 ms |
 | T4 | Tiny PUT at concurrency 1 | about 200 ops/s, p99 6 ms | no worse: one write still costs one sync, and no timer adds idle latency (ROADMAP issue 7) |
@@ -46,6 +46,15 @@ other hardware the ratios (scaling, syncs per write) carry over; the absolute nu
   adds latency at low load (ROADMAP issue 7). Throughput and p99, which are what clients see, are T1 and T3, and both
   are met. T2 now asks for what leader/follower group commit gives closed-loop clients, and it fails if a batch stops
   sharing its sync.
+- **T1, restated (13 Nov 2026, the user's decision).** It was ≥ 3,000 ops/s. With 64 syncs per 1,000 PUTs that
+  needs a sync of 5.2 ms, and this device's syncs take 5.0 to 6.0 ms from one phase to the next: over 36 quiet phases
+  at one commit, 11 reached 3,000 (2,260 to 3,262; `benchmarks/2026-11-13-m1-reference.md`). The number measured the
+  device. Now the device is measured in the same run: at concurrency 1 a PUT costs one sync, so that phase's rate
+  is the sync rate, and 64 syncs per 1,000 make concurrency 32 run at 15.6 times it. The floor is 12 because a
+  phase of 1,000 PUTs is 64 syncs, a third of a second, and came out at 12.4 to 18.0 times in 28 phases. It fails
+  if a PUT waits for anything but its batch's sync: two syncs a batch would give 7.8 times. On this machine, 12
+  times is about 2,000 to 2,400 PUTs a second; the earlier 3,000 is no longer promised. It carries to other
+  hardware as it stands (15.2 times on the Intel Mac mini, at 22 ms a sync).
 - **T5 and T6, reads.** These need the read path out from under the store's lock: a record read on a worker thread
   without the lock, or a cache. 15,000 is about what HEAD reaches now, and HEAD reads no bytes.
 - **T7, stalls.** The baseline's stalls fit a checkpoint taken under the lock (to verify). The target asks for the
@@ -71,3 +80,5 @@ other hardware the ratios (scaling, syncs per write) carry over; the absolute nu
 | **M4 reference** (`7e99bb0`, quiet machine, `benchmarks/2026-11-09-m4-reference.md`) | T2 to T6, T8 to T12 | T1 at 4 KiB (2,908/s, 3% short; 0 B to 1 KiB at 3,161 to 3,267); T7 in one phase of 30 (53.1 ms, no upkeep hold during it) |
 | Small PUTs on the event loop (ADR-0031, `benchmarks/2026-11-10-small-puts-on-the-loop.md`, under load) | T1 at 4 KiB in that run (3,118/s); small PUTs at concurrency 128 at 1.76 times | T1 and T7 to confirm in a quiet reference run |
 | Inline PUTs without the first lock round (ADR-0032, `benchmarks/2026-11-10-inline-puts-without-the-lock.md`, under load) | T1 at 4 KiB in both builds (3,169 to 3,186/s); small writes at concurrency 128 at 1.03 times, within the noise | T1 and T7 to confirm in a quiet reference run |
+| **Second M1 reference** (`48709f4`, ceesafec 0.41.0, quiet machine, `benchmarks/2026-11-13-m1-reference.md`) | T2, T3, T6, T8 to T12; T7 in 29 of 30 phases and in all 120 of the repeats | T1 as it then stood, at every size in the matrix (2,580 to 2,991/s; 2,260 to 3,262 over 36 phases, 11 at 3,000 or more): 64 syncs per 1,000 PUTs needs a sync of 5.2 ms, and the device's median was 5.6; T4 at 128 B for the same reason (174/s against 196); T5's p99 at 4 KiB in one phase (6.0 ms; 1.6 to 3.5 in eight repeats); T7 in one phase (51.2 ms, no upkeep hold) |
+| T1 restated (≥ 12 times the run's rate at concurrency 1, see above) | T1: 14.8 to 17.1 times in the second reference, 15.6 to 18.6 in the first | T4 at 128 B, T5's p99 at 4 KiB and T7, each in one phase of the second reference |

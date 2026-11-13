@@ -323,14 +323,15 @@ type target struct {
 	Target      string             `json:"target"`
 	What        string             `json:"what"`
 	Ops         []string           `json:"ops"`
-	Sizes       []int              `json:"sizes"`            // empty: every size in the run
-	MaxSize     int                `json:"maxSize"`          // 0: no limit
-	Concurrency int                `json:"concurrency"`      // 0: every level
-	Min         map[string]float64 `json:"min"`              // metric name (as in the results) to its least value
-	Max         map[string]float64 `json:"max"`              // metric name to its greatest value
-	NotBelow    []string           `json:"notBelowBaseline"` // metrics that may not fall below the baseline's
-	NotAbove    []string           `json:"notAboveBaseline"` // metrics that may not rise above the baseline's
-	Weighted    map[string]float64 `json:"weightedMax"`      // metric averaged over the phases by bytes written
+	Sizes       []int              `json:"sizes"`                // empty: every size in the run
+	MaxSize     int                `json:"maxSize"`              // 0: no limit
+	Concurrency int                `json:"concurrency"`          // 0: every level
+	Min         map[string]float64 `json:"min"`                  // metric name (as in the results) to its least value
+	Max         map[string]float64 `json:"max"`                  // metric name to its greatest value
+	MinTimesC1  map[string]float64 `json:"minTimesConcurrency1"` // metric name to its least multiple of the same run's phase at concurrency 1
+	NotBelow    []string           `json:"notBelowBaseline"`     // metrics that may not fall below the baseline's
+	NotAbove    []string           `json:"notAboveBaseline"`     // metrics that may not rise above the baseline's
+	Weighted    map[string]float64 `json:"weightedMax"`          // metric averaged over the phases by bytes written
 }
 
 type targets struct {
@@ -438,6 +439,31 @@ func checkTargets() bool {
 					}
 				}
 				worst = append(worst, fmt.Sprintf("%s %.4g", name, metric(hi, name)))
+			}
+			for _, name := range sortedKeys(t.MinTimesC1) {
+				// The phase at concurrency 1 of the same run is the device's measure: there a write costs one sync.
+				least := 0.0
+				for i, p := range ps {
+					k := key{p.Size, p.Concurrency, p.Op}
+					var one *phase
+					for j := range r.Results {
+						if q := r.Results[j]; q.Size == p.Size && q.Op == p.Op && q.Concurrency == 1 {
+							one = &r.Results[j]
+						}
+					}
+					if one == nil || metric(*one, name) <= 0 {
+						fails = append(fails, fmt.Sprintf("%s: no phase at concurrency 1 in the run", k))
+						continue
+					}
+					times := metric(p, name) / metric(*one, name)
+					if i == 0 || times < least {
+						least = times
+					}
+					if times < t.MinTimesC1[name] {
+						fails = append(fails, fmt.Sprintf("%s: %s %.4g is %.3g times concurrency 1's %.4g, under %.3g times", k, name, metric(p, name), times, metric(*one, name), t.MinTimesC1[name]))
+					}
+				}
+				worst = append(worst, fmt.Sprintf("%s %.3g times concurrency 1", name, least))
 			}
 			for _, name := range append(append([]string(nil), t.NotBelow...), t.NotAbove...) {
 				below := contains(t.NotBelow, name)
