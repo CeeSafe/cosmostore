@@ -1980,3 +1980,29 @@ Browser form uploads with a SigV4 POST policy.
   ACLs, CORS rules or notification rules in place (the bench uses none), or anonymous requests, which now take a
   lock round (ADR-0045 §6).
 - Results: `~/cosmo-ref/run-gate-m5`, `run-gate-m5b` and `run-gate-m5c` on the mini.
+
+### 14 Nov 2026: M5 item 7, third part: the audit log (ADR-0051)
+
+- **Chosen with the user** (yes, 14 Nov): the audit log first of what is left of item 7.
+- **`serve --audit-log <file>`** appends a line of JSON for every request the S3 handler answers: the time, the
+  request id, the peer's address, the requester (the access key, `anonymous`, or `-` when it was not
+  authenticated), the method and path, the names of the query's parameters, the result (`ok`, an S3 code with its
+  status, or `aborted`) and the time it took.
+- **A query's values are never logged:** a presigned URL's are its credentials while it lasts.
+- **Written after the response, by a task beside the server:** the handler queues the line (8,192 lines; a full
+  queue drops it and counts it, `auditLinesDropped`); the task appends what is waiting with one write and one sync
+  on a worker thread, opening the file for each batch so a rotated log begins again. No request waits for it.
+- **What it is not** (ADR-0051, Consequences): a record that loses nothing. A crash loses the queue; that would
+  need the line before the response.
+- **Tests (2 new, 209 in all, no leaks):** a line byte for byte (an address of each family, a path that needs
+  escaping, a query's names and no value, an error's status, an aborted request) and the file (made, appended,
+  begun again after a rename, a directory that is not there).
+- **Clients:** `tools/s3_smoke.sh` 329 checks (11 new): its server now logs every request, and at the end the
+  log's 482 lines are all JSON with every field; the key that signed, the second key while it was accepted,
+  anonymous requests refused and not, preflights, a delete's `versionId` by name, no `X-Amz-Signature=` anywhere,
+  and no line dropped. Three of the checks were wrong at first (a count, a path, and a body signature that fails
+  after its key is known); the log was right.
+- **Not run:** the p99 gate with the log on (it is off unless asked for), the rclone, Go, JavaScript, Java and
+  .NET scripts and `tools/tls_smoke.sh`.
+- **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
+- **Next:** the rest of item 7 (quotas, rate limits, an admin API and CLI); item 4's rest when G33 is fixed.

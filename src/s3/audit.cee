@@ -1,0 +1,185 @@
+// The audit log (ADR-0051): a line for every request, written after its response by a task beside the server.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+/// Lines waiting to be written: past this, a request's line is dropped and counted rather than the request held.
+const AUDIT_QUEUE: usize = 8192;
+/// The most bytes written and synced at once.
+const AUDIT_BATCH_BYTES: usize = 262144;
+
+/// What a request's line needs that only its handling knows.
+struct AuditFacts {
+    /// The access key that signed the request, `anonymous` for one without credentials, `-` when it was not
+    /// authenticated (a signature that did not check, a preflight, a form upload).
+    requester: Vector<u8>;
+    /// The S3 error it was answered with, if it was.
+    code: S3Code?;
+    /// It ended without an answer: the connection failed.
+    aborted: bool;
+}
+
+/// The queue of the audit log, as the requests see it.
+struct AuditLog {
+    lines: Channel<Vector<u8>>;
+    dropped: AtomicU64;
+}
+
+/// The queue and the file, as the writer task sees them. Not `enabled`: `serve` was given no `--audit-log`.
+struct AuditWriter {
+    lines: Channel<Vector<u8>>;
+    path: String;
+    enabled: bool;
+}
+
+/// A peer's address as text, without its port: dotted for IPv4, eight hex groups for IPv6.
+fn appendAddress(out: borrow mut Vector<u8>, peer: SocketAddress?) -> Result<void, AllocError> {
+    let digits = "0123456789abcdef".bytes();
+    match (peer) {
+        Some(SocketAddress.V4(a, _)) => {
+            for (i in 0..4) {
+                if (i > 0) { out.push('.')?; }
+                appendDecimal(out, a[i] as u64)?;
+            }
+        }
+        Some(SocketAddress.V6(a, _, _)) => {
+            for (i in 0..8) {
+                if (i > 0) { out.push(':')?; }
+                let group = ((a[i * 2] as u32) << 8) | (a[i * 2 + 1] as u32);
+                var started = false;
+                for (n in 0..4) {
+                    let nibble = (group >> truncate<u32>((3 - n) * 4)) & 15;
+                    if (nibble != 0 || started || n == 3) {
+                        out.push(digits[nibble as usize])?;
+                        started = true;
+                    }
+                }
+            }
+        }
+        null => { out.push('-')?; }
+    }
+    return Ok();
+}
+
+/// The names of a query's parameters, joined with `&`, without their values: a presigned URL's values are its
+/// credentials while it lasts (ADR-0051 §2).
+fn appendQueryNames(out: borrow mut Vector<u8>, query: Slice<u8>) -> Result<void, AllocError> {
+    var at: usize = 0;
+    var first = true;
+    while (at < query.length) {
+        let end = pieceEnd(query, at, '&');
+        let piece = query[at..end];
+        at = end + 1;
+        let name = piece[0..pieceEnd(piece, 0, '=')];
+        if (name.length == 0) { continue; }
+        if (!first) { out.push('&')?; }
+        first = false;
+        appendJsonText(out, name)?;
+    }
+    return Ok();
+}
+
+/// One request as a line of JSON (ADR-0051 §2).
+fn auditLine(
+    out: borrow mut Vector<u8>,
+    nowMillis: i64,
+    requestId: Slice<u8>,
+    peer: SocketAddress?,
+    facts: borrow AuditFacts,
+    method: Slice<u8>,
+    path: Slice<u8>,
+    query: Slice<u8>,
+    micros: u64,
+) -> Result<void, AllocError> {
+    out.extend("{\"time\":\"".bytes())?;
+    appendIso8601(out, nowMillis)?;
+    out.extend("\",\"id\":\"".bytes())?;
+    appendJsonText(out, requestId)?;
+    out.extend("\",\"remote\":\"".bytes())?;
+    appendAddress(out, peer)?;
+    out.extend("\",\"requester\":\"".bytes())?;
+    appendJsonText(out, facts.requester.view())?;
+    out.extend("\",\"method\":\"".bytes())?;
+    appendJsonText(out, method)?;
+    out.extend("\",\"path\":\"".bytes())?;
+    appendJsonText(out, path)?;
+    out.extend("\",\"query\":\"".bytes())?;
+    appendQueryNames(out, query)?;
+    out.extend("\",\"result\":\"".bytes())?;
+    match (facts.code) {
+        Some(code) => {
+            out.extend(s3CodeName(code).bytes())?;
+            out.extend("\",\"status\":".bytes())?;
+            appendDecimal(out, s3Status(code) as u64)?;
+        }
+        null => { out.extend(if (facts.aborted) "aborted\"".bytes() else "ok\"".bytes())?; }
+    }
+    out.extend(",\"micros\":".bytes())?;
+    appendDecimal(out, micros)?;
+    out.extend("}\n".bytes())?;
+    return Ok();
+}
+
+/// Appends `bytes` to the audit log and syncs it: the file is opened for each batch, so a log that was renamed
+/// away is begun again under its name.
+fn appendAudit(path: StringView, bytes: Slice<u8>) -> Result<void, IoFailure> {
+    var made = false;
+    let file = match (DurableFile.openReadWrite(path)) {
+        Ok(f) => f,
+        Err(e) => {
+            if (!e.isNotFound()) { return Err(e); }
+            made = true;
+            DurableFile.createNew(path)?
+        }
+    };
+    let size = file.size()?;
+    file.writeAt(bytes, size)?;
+    file.syncData()?;
+    if (made) { Fs.syncDirectory(Fs.parentOf(path))?; }
+    return Ok();
+}
+
+/// Writes the queue to the file until it is cancelled: what is waiting, up to AUDIT_BATCH_BYTES, in one write and
+/// one sync. A write that fails loses its lines; it is reported once, until a write succeeds again.
+async fn auditForever(w: borrow AuditWriter) -> Result<ServerReport, NetError> {
+    while (!w.enabled) { await deliveryPause(DELIVERY_RETRY_MOST_MS)?; }
+    var failing = false;
+    while (true) {
+        var batch = match (await w.lines.recvAsync()) {
+            Ok(Some(line)) => line,
+            Ok(null) => { return Err(NetError.Closed); }
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        };
+        while (batch.length < AUDIT_BATCH_BYTES) {
+            match (w.lines.tryRecv()) {
+                Some(line) => {
+                    if (batch.extend(line.view()).isErr()) { break; }
+                }
+                null => { break; }
+            }
+        }
+        let path = w.path.view();
+        let written = await Async.blocking(() => appendAudit(path, batch.view()));
+        if (written.isErr() && !failing) {
+            let _ = await AsyncConsole.writeError(
+                "cosmostore: the audit log could not be written; its lines are lost\n",
+            );
+        }
+        failing = written.isErr();
+    }
+    return Err(NetError.Closed);
+}
+
+/// The delivery of event notifications, and beside it the audit log's writer.
+async fn deliverAndAudit(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    targets: borrow Vector<NotifyTarget>,
+    audit: borrow AuditWriter,
+) -> Result<ServerReport, NetError> {
+    let raced = await Async.race(
+        async () => await deliverForever(store, targets),
+        async () => await auditForever(audit),
+    );
+    return Ok(raced?.value);
+}

@@ -24,7 +24,7 @@ start_hook() { python3 -I "$here/webhook.py" "$hookport" "$work/hook.out" & hook
 start_hook
 printf 'hook http://127.0.0.1:%s/events\n# a comment\n' "$hookport" > "$work/targets"
 start_server() {
-    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 2>> "$work/server.log" &
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" 2>> "$work/server.log" &
     server=$!
     sleep 1
 }
@@ -633,6 +633,23 @@ sleep 4
 check "a key taken out of the file" "$(second second/secret/two code s3api list-buckets)" InvalidAccessKeyId
 check "the first key through it all" "$(aws s3api list-buckets --query 'length(Buckets)')" 1
 check "the reloads in the log" "$(grep -c 'credentials reloaded' server.log) $(grep -c 'credentials reload failed' server.log)" "3 1"
+
+# The audit log (ADR-0051): a line of JSON for every request so far, written within a moment of its response.
+audit() { python3 -I -c 'import json,sys
+lines=[json.loads(l) for l in open("audit.log")]
+print(eval(sys.argv[1]))' "$1"; }
+sleep 1
+check "every line is a request" "$(audit 'all(set(l) >= {"time","id","remote","requester","method","path","query","result","micros"} for l in lines) and len(lines) > 400')" True
+check "the key that signed" "$(audit 'len([l for l in lines if l["requester"] == "AKIASMOKETEST0000001" and l["method"] == "PUT" and l["path"] == "/smoke/a/small.txt" and l["result"] == "ok"]) > 0')" True
+check "the second key, while it was accepted" "$(audit 'len([l for l in lines if l["requester"] == "AKIASMOKETEST0000002" and l["result"] == "ok"])')" 3
+check "anonymous requests, refused and not" "$(audit 'sorted({l["result"] for l in lines if l["requester"] == "anonymous"} & {"ok", "AccessDenied"})')" "['AccessDenied', 'ok']"
+check "an error's status" "$(audit 'sorted({l["status"] for l in lines if l["result"] == "AccessDenied"})')" "[403]"
+check "a signature that did not check" "$(audit '"-" in {l["requester"] for l in lines if l["result"] == "SignatureDoesNotMatch"}')" True
+check "a preflight" "$(audit 'len([l for l in lines if l["method"] == "OPTIONS"]) > 5')" True
+check "where the requests came from" "$(audit 'sorted({l["remote"] for l in lines})')" "['127.0.0.1']"
+check "a query's names" "$(audit 'len([l for l in lines if l["query"] == "versionId" and l["method"] == "DELETE"]) > 0')" True
+check "no value of a presigned URL" "$(grep -c 'X-Amz-Signature=' audit.log) $(audit 'len([l for l in lines if "X-Amz-Signature" in l["query"]]) > 0')" "0 True"
+check "no line dropped" "$(stat auditLinesDropped)" 0
 
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1

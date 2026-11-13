@@ -57,6 +57,8 @@ struct S3App {
     denyBuckets: AtomicU64;
     /// Whether the server listens with TLS: `aws:SecureTransport` (ADR-0043 §6).
     secure: bool;
+    /// The audit log's queue (`serve --audit-log`, ADR-0051); null without one.
+    audit: AuditLog?;
     /// Buckets with CORS rules (ADR-0049 §4): while 0, a request's `Origin` is not looked at.
     corsBuckets: AtomicU64;
     /// The webhooks notification rules may name (`serve --notify-targets`, ADR-0048).
@@ -126,8 +128,34 @@ impl Handler<S3App> for S3Handler {
         let started = Clock.monotonicNanos();
         var kind = LATENCY_OTHER;
         let peer = ctx.connection().peerAddress();
-        let done = await respond(app, request, exchange, mut kind, requestId.view(), peer);
-        app.latencies.record(kind, (Clock.monotonicNanos() - started) / 1000);
+        var facts = AuditFacts { requester: Vector<u8>.create(), code: null, aborted: false };
+        let done = await respond(app, request, exchange, mut kind, requestId.view(), peer, mut facts);
+        let micros = (Clock.monotonicNanos() - started) / 1000;
+        app.latencies.record(kind, micros);
+        // The request's line for the audit log (ADR-0051), after its response: queued, or dropped and counted if
+        // the queue is full.
+        match (borrow app.audit) {
+            Some(audit) => {
+                var line = Vector<u8>.create();
+                let query = match (request.query()) {
+                    Some(q) => q.bytes(),
+                    null => "".bytes(),
+                };
+                let made = auditLine(
+                    mut line,
+                    Clock.unixMillis(),
+                    requestId.view(),
+                    peer,
+                    borrow facts,
+                    request.methodToken(),
+                    request.path().bytes(),
+                    query,
+                    micros,
+                );
+                if (made.isErr() || audit.lines.trySend(line).isErr()) { let _ = audit.dropped.fetchAdd(1); }
+            }
+            null => {}
+        }
         return done;
     }
 }
@@ -140,12 +168,17 @@ async fn respond(
     kind: borrow mut u8,
     requestId: Slice<u8>,
     peer: SocketAddress?,
+    facts: borrow mut AuditFacts,
 ) -> Result<void, HandlerError> {
     {
-        match (await serveS3(app, request, exchange, kind, peer)) {
+        match (await serveS3(app, request, exchange, kind, peer, facts)) {
             Ok() => { return Ok(); }
-            Err(S3Fail.Http(e)) => { return Err(e); }
+            Err(S3Fail.Http(e)) => {
+                facts.aborted = true;
+                return Err(e);
+            }
             Err(S3Fail.Code(code)) => {
+                facts.code = code;
                 if (s3Status(code) >= 500) {
                     // Standard error is unbuffered, so the line survives a crash (CEESAFE_GAPS G25).
                     let _ = await AsyncConsole.writeError("cosmostore: ");
@@ -157,6 +190,7 @@ async fn respond(
                 return await sendError(exchange, code, request.path().bytes(), requestId);
             }
             Err(S3Fail.OutOfMemory(_)) => {
+                facts.code = S3Code.InternalError;
                 return await sendError(exchange, S3Code.InternalError, request.path().bytes(), requestId);
             }
         }
@@ -218,7 +252,9 @@ async fn serveS3(
     exchange: borrow mut Exchange,
     kind: borrow mut u8,
     peer: SocketAddress?,
+    facts: borrow mut AuditFacts,
 ) -> Result<void, S3Fail> {
+    facts.requester.push('-')?;
     let req = S3Request.of(request, app.domain.view())?;
     kind = latencyClass(borrow req);
     // CORS (ADR-0049): a preflight is answered here, unsigned; a request that names its origin gets a matching
@@ -242,6 +278,15 @@ async fn serveS3(
     // in the clear.
     if (asksEncryption(borrow req)) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
     let who = Requester { key: auth.key, peer: peer };
+    // Who the request is, for its line in the audit log (ADR-0051).
+    if (app.audit.isSome()) {
+        facts.requester.clear();
+        let credentials = app.credentials.get().view();
+        match (auth.key) {
+            Some(i) => { facts.requester.extend(credentials[i].accessKey.view())?; }
+            null => { facts.requester.extend("anonymous".bytes())?; }
+        }
+    }
     let m = req.method;
     let bucket = req.bucket.view();
     let none = "".bytes();

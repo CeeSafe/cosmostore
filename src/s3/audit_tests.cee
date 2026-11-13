@@ -1,0 +1,107 @@
+// The audit log (ADR-0051): a request's line, and the file it is appended to.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+fn addressText(peer: SocketAddress?) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    appendAddress(mut out, peer)!;
+    return out;
+}
+
+@test
+fn auditLineOfARequest() -> Result<void, TestFailure> {
+    Check.equalBytes("192.168.1.20".bytes(), addressText(SocketAddress.V4([192u8, 168, 1, 20], 51000)).view())?;
+    var v6 = [0u8; 16];
+    v6[0] = 0x20;
+    v6[1] = 0x01;
+    v6[2] = 0x0d;
+    v6[3] = 0xb8;
+    v6[15] = 1;
+    Check.equalBytes("2001:db8:0:0:0:0:0:1".bytes(), addressText(SocketAddress.V6(v6, 443, 0)).view())?;
+    Check.equalBytes("-".bytes(), addressText(null).view())?;
+    // A query's names, never its values.
+    var names = Vector<u8>.create();
+    appendQueryNames(
+        mut names,
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2F20261114&X-Amz-Signature=abcdef&versionId=1&acl&&=x".bytes(),
+    )!;
+    Check.equalBytes("X-Amz-Algorithm&X-Amz-Credential&X-Amz-Signature&versionId&acl".bytes(), names.view())?;
+    var none = Vector<u8>.create();
+    appendQueryNames(mut none, "".bytes())!;
+    Check.equalU64(0, none.length as u64)?;
+
+    var facts = AuditFacts { requester: copyBytes("AKIAEXAMPLE".bytes())!, code: null, aborted: false };
+    var line = Vector<u8>.create();
+    auditLine(
+        mut line,
+        1767225600123,
+        "00ab".bytes(),
+        SocketAddress.V4([10u8, 0, 0, 7], 4000),
+        borrow facts,
+        "PUT".bytes(),
+        "/bkt/a \"quoted\" key".bytes(),
+        "versionId=abc&X-Amz-Signature=secret".bytes(),
+        1500,
+    )!;
+    Check.equalBytes(
+        "{\"time\":\"2026-01-01T00:00:00.123Z\",\"id\":\"00ab\",\"remote\":\"10.0.0.7\",\"requester\":\"AKIAEXAMPLE\",\"method\":\"PUT\",\"path\":\"/bkt/a \\\"quoted\\\" key\",\"query\":\"versionId&X-Amz-Signature\",\"result\":\"ok\",\"micros\":1500}\n".bytes(),
+        line.view(),
+    )?;
+    Check.isTrue(findBytes(line.view(), "secret".bytes(), 0).isNull(), "no value of the query")?;
+    // An error has its code and status; a request that ended without an answer says so.
+    facts.code = S3Code.AccessDenied;
+    facts.requester.clear();
+    facts.requester.extend("anonymous".bytes())!;
+    var denied = Vector<u8>.create();
+    auditLine(mut denied, 0, "01".bytes(), null, borrow facts, "GET".bytes(), "/b/k".bytes(), "".bytes(), 7)!;
+    Check.isTrue(
+        findBytes(
+            denied.view(),
+            "\"remote\":\"-\",\"requester\":\"anonymous\",\"method\":\"GET\",\"path\":\"/b/k\",\"query\":\"\",\"result\":\"AccessDenied\",\"status\":403,\"micros\":7}".bytes(),
+            0,
+        ).isSome(),
+        "a refused request",
+    )?;
+    facts.code = null;
+    facts.aborted = true;
+    var aborted = Vector<u8>.create();
+    auditLine(mut aborted, 0, "02".bytes(), null, borrow facts, "PUT".bytes(), "/b/k".bytes(), "".bytes(), 9)!;
+    Check.isTrue(
+        findBytes(aborted.view(), "\"result\":\"aborted\",\"micros\":9}".bytes(), 0).isSome(),
+        "an aborted one",
+    )?;
+    return Ok();
+}
+
+@test
+fn auditLogIsAppended() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("audit-log");
+    var path = String.create();
+    path.append(dir.view())!;
+    path.append("/audit.log")!;
+    // A new file, then more at its end; an empty batch makes the file and writes nothing.
+    appendAudit(path.view(), "".bytes())!;
+    appendAudit(path.view(), "one\n".bytes())!;
+    appendAudit(path.view(), "two\nthree\n".bytes())!;
+    {
+        let file = DurableFile.openRead(path.view())!;
+        Check.equalU64(14, file.size()!)?;
+        var bytes = [0u8; 14];
+        file.readExactAt(mut bytes[..], 0)!;
+        Check.equalBytes("one\ntwo\nthree\n".bytes(), bytes[..])?;
+    }
+    // Renamed away, as a log rotation does: the next batch begins the file again under its name.
+    var rotated = String.create();
+    rotated.append(path.view())!;
+    rotated.append(".1")!;
+    Fs.rename(path.view(), rotated.view())!;
+    appendAudit(path.view(), "four\n".bytes())!;
+    Check.equalU64(5, DurableFile.openRead(path.view())!.size()!)?;
+    Check.equalU64(14, DurableFile.openRead(rotated.view())!.size()!)?;
+    // A directory that is not there: the write fails, and says so.
+    Check.isTrue(appendAudit("/nonexistent-cosmostore-dir/audit.log", "x".bytes()).isErr(), "nowhere to write")?;
+    removeTree(dir.view());
+    return Ok();
+}
