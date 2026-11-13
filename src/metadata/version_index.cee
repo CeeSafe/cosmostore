@@ -4,12 +4,24 @@
 // order (a fill, or recovery from a checkpoint) leave them about half full. With an ObjectVersion of about 200 bytes
 // in every slot, that came to 600 to 700 bytes per object. So the B-tree holds only the key and a slot number, and
 // the versions sit in `versions`, where a removed one's slot is reused.
+//
+// A key's versions are a chain (ADR-0041): the B-tree gives the newest one's slot, and `links` gives each slot the
+// slot of the next older version.
+
+/// No slot: the end of a key's chain.
+const NO_VERSION_SLOT: u32 = 0xFFFFFFFF;
 
 /// Versions by key, in key order. A cursor is a position in that order (`first`, `seek`, `seekAfter`, `next`), read
 /// with `keyAt` and `valueAt`. Any change to the index invalidates it.
 struct VersionIndex {
+    /// Each key's newest version's slot.
     private order: OrderedMap<IndexKey, u32>;
     private versions: Vector<ObjectVersion>;
+    /// For a slot, the slot of its key's next older version; NO_VERSION_SLOT, or no entry, for none. Empty until a key has
+    /// two versions.
+    private links: Vector<u32>;
+    /// The versions held, over all keys.
+    private count: usize;
     /// Slots of removed versions, for the next put.
     private free: Vector<u32>;
     /// A snapshot in progress (ADR-0028): the index as it was when `beginSnapshot` was called, read in key order a
@@ -17,26 +29,33 @@ struct VersionIndex {
     private snapshot: bool;
     /// The last key the snapshot has given (null: none yet). Changes to it or to earlier keys need nothing kept.
     private snapshotDone: IndexKey?;
-    /// Keys after `snapshotDone` that changed since the snapshot began, with their version then (null: the key was
-    /// not there).
-    private before: OrderedMap<IndexKey, ObjectVersion?>;
+    /// Keys after `snapshotDone` that changed since the snapshot began, with their versions then, newest first
+    /// (none: the key was not there).
+    private before: OrderedMap<IndexKey, Vector<ObjectVersion>>;
     /// A version could not be kept (out of memory): the snapshot is not whole, and its reader must give it up.
     private broken: bool;
 
     fn create() -> VersionIndex => VersionIndex {
         order: OrderedMap<IndexKey, u32>.create(),
         versions: Vector<ObjectVersion>.create(),
+        links: Vector<u32>.create(),
+        count: 0,
         free: Vector<u32>.create(),
         snapshot: false,
         snapshotDone: null,
-        before: OrderedMap<IndexKey, ObjectVersion?>.create(),
+        before: OrderedMap<IndexKey, Vector<ObjectVersion>>.create(),
         broken: false,
     };
 
+    /// The keys.
     fn length(borrow this) -> usize => this.order.length();
+
+    /// The versions, over all keys.
+    fn versionCount(borrow this) -> usize => this.count;
 
     fn contains(borrow this, key: borrow IndexKey) -> bool => this.order.contains(key);
 
+    /// The key's newest version.
     fn get(borrow this, key: borrow IndexKey) -> borrow(this) ObjectVersion? {
         let slot = this.order.get(key)?;
         return borrow this.versions[slot as usize];
@@ -51,8 +70,78 @@ struct VersionIndex {
         return borrow mut this.versions[slot];
     }
 
-    /// Puts `version` at `key`: the old version if the key was there, else null. A failure leaves the index as it
-    /// was.
+    /// The slot of the key's newest version; NO_VERSION_SLOT if the key is not there.
+    fn headSlot(borrow this, key: borrow IndexKey) -> u32 => match (this.order.get(key)) {
+        Some(s) => s,
+        null => NO_VERSION_SLOT,
+    };
+
+    /// The slot of the next older version of `slot`'s key; NO_VERSION_SLOT at the oldest.
+    fn olderOf(borrow this, slot: u32) -> u32 =>
+        if ((slot as usize) < this.links.length) this.links[slot as usize] else NO_VERSION_SLOT;
+
+    fn versionAt(borrow this, slot: u32) -> borrow(this) ObjectVersion => borrow this.versions[slot as usize];
+
+    /// The slot of the key's version `versionId`; NO_VERSION_SLOT if it has none.
+    fn slotOf(borrow this, key: borrow IndexKey, versionId: [u8; 16]) -> u32 {
+        var slot = this.headSlot(key);
+        while (slot != NO_VERSION_SLOT) {
+            if (this.versions[slot as usize].versionId[..] == versionId[..]) { return slot; }
+            slot = this.olderOf(slot);
+        }
+        return NO_VERSION_SLOT;
+    }
+
+    /// The key's version `versionId`, wherever it is in the chain.
+    fn find(borrow this, key: borrow IndexKey, versionId: [u8; 16]) -> borrow(this) ObjectVersion? {
+        let slot = this.slotOf(key, versionId);
+        if (slot == NO_VERSION_SLOT) { return null; }
+        return borrow this.versions[slot as usize];
+    }
+
+    fn findMut(borrow mut this, key: borrow IndexKey, versionId: [u8; 16]) -> borrow mut(this) ObjectVersion? {
+        let slot = this.slotOf(key, versionId);
+        if (slot == NO_VERSION_SLOT) { return null; }
+        this.keep(key);
+        return borrow mut this.versions[slot as usize];
+    }
+
+    /// Sets `slot`'s next older version. Only a link to a version can fail, for memory.
+    private fn link(borrow mut this, slot: u32, older: u32) -> Result<void, AllocError> {
+        if ((slot as usize) >= this.links.length) {
+            if (older == NO_VERSION_SLOT) { return Ok(); }
+            this.links.resize(this.versions.length, NO_VERSION_SLOT)?;
+        }
+        this.links[slot as usize] = older;
+        return Ok();
+    }
+
+    /// A slot for a new version: a removed one's, or a new one at the end. `reused` says which.
+    private fn takeSlot(borrow mut this, reused: borrow mut bool) -> Result<u32, AllocError> {
+        match (this.free.pop()) {
+            Some(s) => {
+                reused = true;
+                return Ok(s);
+            }
+            null => {}
+        }
+        reused = false;
+        this.versions.push(vacantVersion())?;
+        return Ok(truncate<u32>(this.versions.length - 1));
+    }
+
+    /// Returns a slot `takeSlot` gave and that was not filled.
+    private fn giveBack(borrow mut this, slot: u32, reused: bool) {
+        let _ = this.link(slot, NO_VERSION_SLOT); // to no version: it cannot fail
+        if (reused) {
+            let _ = this.free.push(slot); // popped just now: its room is there
+        } else {
+            let _ = this.versions.pop();
+        }
+    }
+
+    /// Puts `version` at `key` in place of its newest version, which is returned; the key's older versions stay.
+    /// Null if the key was not there. A failure leaves the index as it was.
     fn put(borrow mut this, key: IndexKey, version: ObjectVersion) -> Result<ObjectVersion?, AllocError> {
         this.keep(borrow key);
         match (this.order.get(borrow key)) {
@@ -61,38 +150,90 @@ struct VersionIndex {
         }
         // A slot first, so the B-tree's put is the last step that can fail.
         var reused = false;
-        let slot = match (this.free.pop()) {
-            Some(s) => {
-                reused = true;
-                s
-            }
-            null => {
-                this.versions.push(vacantVersion())?;
-                truncate<u32>(this.versions.length - 1)
-            }
-        };
+        let slot = this.takeSlot(mut reused)?;
         match (this.order.put(key, slot)) {
             Ok(_) => {}
             Err(e) => {
-                if (reused) {
-                    let _ = this.free.push(slot); // popped just now: its room is there
-                } else {
-                    let _ = this.versions.pop();
-                }
+                this.giveBack(slot, reused);
                 return Err(e);
             }
         }
         this.versions[slot as usize] = version;
+        this.count += 1;
         return Ok(null);
     }
 
-    /// Removes `key`; its version, if it was there.
-    fn remove(borrow mut this, key: borrow IndexKey) -> ObjectVersion? {
+    /// Makes `version` the newest version of `key`, ahead of the versions it has (ADR-0041). A failure leaves the
+    /// index as it was.
+    fn push(borrow mut this, key: IndexKey, version: ObjectVersion) -> Result<void, AllocError> {
+        this.keep(borrow key);
+        let head = this.headSlot(borrow key);
+        var reused = false;
+        let slot = this.takeSlot(mut reused)?;
+        // The link first, then the B-tree, which for a key it already has only changes the slot.
+        match (this.link(slot, head)) {
+            Ok() => {}
+            Err(e) => {
+                this.giveBack(slot, reused);
+                return Err(e);
+            }
+        }
+        match (this.order.put(key, slot)) {
+            Ok(_) => {}
+            Err(e) => {
+                this.giveBack(slot, reused);
+                return Err(e);
+            }
+        }
+        this.versions[slot as usize] = version;
+        this.count += 1;
+        return Ok();
+    }
+
+    /// Removes the key's version `versionId`, wherever it is in the chain, and returns it; null if the key has no
+    /// such version. The next older version takes its place; a key without versions leaves the index.
+    fn removeVersion(borrow mut this, key: borrow IndexKey, versionId: [u8; 16]) -> ObjectVersion? =>
+        this.removeFrom(key, versionId, false);
+
+    /// As `removeVersion`, but never the key's newest version: for the null version a new null version replaces.
+    fn removeOlder(borrow mut this, key: borrow IndexKey, versionId: [u8; 16]) -> ObjectVersion? =>
+        this.removeFrom(key, versionId, true);
+
+    private fn removeFrom(
+        borrow mut this,
+        key: borrow IndexKey,
+        versionId: [u8; 16],
+        skipNewest: bool,
+    ) -> ObjectVersion? {
+        var newer = NO_VERSION_SLOT;
+        var slot = this.headSlot(key);
+        if (skipNewest && slot != NO_VERSION_SLOT) {
+            newer = slot;
+            slot = this.olderOf(slot);
+        }
+        while (slot != NO_VERSION_SLOT) {
+            if (this.versions[slot as usize].versionId[..] == versionId[..]) { break; }
+            newer = slot;
+            slot = this.olderOf(slot);
+        }
+        if (slot == NO_VERSION_SLOT) { return null; }
         this.keep(key);
-        let slot = this.order.remove(key)?;
+        let older = this.olderOf(slot);
+        if (newer != NO_VERSION_SLOT) {
+            this.links[newer as usize] = older; // `newer` links to `slot`, so it has an entry
+        } else if (older != NO_VERSION_SLOT) {
+            match (this.order.getMut(key)) {
+                Some(s) => { s = older; }
+                null => {}
+            }
+        } else {
+            let _ = this.order.remove(key);
+        }
+        let _ = this.link(slot, NO_VERSION_SLOT);
         let old = replace(mut this.versions[slot as usize], vacantVersion());
         // Without room to remember it, the slot stays unused: a few bytes, never a wrong answer.
         let _ = this.free.push(slot);
+        this.count -= 1;
         return old;
     }
 
@@ -122,7 +263,7 @@ struct VersionIndex {
     /// The versions kept for the snapshot, for tests and the stats.
     fn snapshotKept(borrow this) -> usize => this.before.length();
 
-    /// Before `key` changes: if the snapshot has not given it yet, keeps its version as the snapshot saw it, once.
+    /// Before `key` changes: if the snapshot has not given it yet, keeps its versions as the snapshot saw them, once.
     fn keep(borrow mut this, key: borrow IndexKey) {
         if (!this.snapshot || this.broken) { return; }
         let passed = match (this.snapshotDone.asBorrow()) {
@@ -130,18 +271,22 @@ struct VersionIndex {
             null => false,
         };
         if (passed || this.before.contains(key)) { return; }
-        let old: ObjectVersion? = match (this.order.get(key)) {
-            Some(s) => {
-                match (copyVersion(borrow this.versions[s as usize])) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        this.broken = true;
-                        return;
-                    }
+        var old = Vector<ObjectVersion>.create();
+        var slot = this.headSlot(key);
+        while (slot != NO_VERSION_SLOT) {
+            let copy = match (copyVersion(borrow this.versions[slot as usize])) {
+                Ok(v) => v,
+                Err(_) => {
+                    this.broken = true;
+                    return;
                 }
+            };
+            if (old.push(copy).isErr()) {
+                this.broken = true;
+                return;
             }
-            null => null,
-        };
+            slot = this.olderOf(slot);
+        }
         let copy = match (copyIndexKey(key)) {
             Ok(k) => k,
             Err(_) => {
@@ -191,19 +336,15 @@ struct VersionIndex {
         if (at.kept) this.before.keyAt(at.cursor) else this.order.keyAt(at.cursor);
 
     /// Whether the entry is a key that was not there when the snapshot began: it is skipped.
-    fn snapshotSkips(borrow this, at: SnapshotAt) -> bool => at.kept && this.before.valueAt(at.cursor).isNull();
+    fn snapshotSkips(borrow this, at: SnapshotAt) -> bool =>
+        at.kept && this.before.valueAt(at.cursor).length == 0;
 
-    /// The entry's version as the snapshot saw it. Not for an entry the snapshot skips.
-    fn snapshotVersion(borrow this, at: SnapshotAt) -> borrow(this) ObjectVersion {
-        if (!at.kept) {
-            let slot = this.order.valueAt(at.cursor);
-            return borrow this.versions[slot as usize];
-        }
-        return match (this.before.valueAt(at.cursor)) {
-            Some(v) => v,
-            null => { panic("snapshotVersion of a skipped entry"); }
-        };
-    }
+    /// A kept entry's versions as the snapshot saw them, newest first.
+    fn snapshotChain(borrow this, at: SnapshotAt) -> borrow(this) Vector<ObjectVersion> =>
+        this.before.valueAt(at.cursor);
+
+    /// The slot of the newest version of an entry that is not kept: the index holds it as the snapshot saw it.
+    fn snapshotSlot(borrow this, at: SnapshotAt) -> u32 => this.order.valueAt(at.cursor);
 
     /// Moves the snapshot past the entry, and frees its kept version if it had one.
     fn snapshotAdvance(borrow mut this, at: SnapshotAt) -> Result<void, AllocError> {
@@ -225,10 +366,14 @@ struct VersionIndex {
 
     fn keyAt(borrow this, at: OrderedCursor) -> borrow(this) IndexKey => this.order.keyAt(at);
 
+    /// The newest version of the key at `at`.
     fn valueAt(borrow this, at: OrderedCursor) -> borrow(this) ObjectVersion {
         let slot = this.order.valueAt(at);
         return borrow this.versions[slot as usize];
     }
+
+    /// The slot of the newest version of the key at `at`.
+    fn slotAt(borrow this, at: OrderedCursor) -> u32 => this.order.valueAt(at);
 }
 
 /// A snapshot's position (`VersionIndex.snapshotPeek`): a key in the index, or among the versions the snapshot kept.
@@ -314,7 +459,7 @@ fn sizeAt(index: borrow VersionIndex, bucket: u32, key: StringView) -> u64 {
 /// Removes bucket/key: the removed version's size, 0 if there was none.
 fn removeAt(index: borrow mut VersionIndex, bucket: u32, key: StringView) -> u64 {
     let k = indexKey(bucket, key);
-    return match (index.remove(borrow k)) {
+    return match (index.removeVersion(borrow k, nullVersionId())) {
         Some(v) => v.size,
         null => 0,
     };
@@ -361,5 +506,76 @@ fn versionIndexOrdersAndReusesSlots() -> Result<void, TestFailure> {
         Some(c) => { Check.equalU64(4, index.valueAt(c).size)?; }
         null => { return Check.fail("b/y is there"); }
     }
+    return Ok();
+}
+
+fn versioned(size: u64, id: u8) -> ObjectVersion {
+    var v = sized(size);
+    v.versionId[0] = id;
+    return v;
+}
+
+fn idOf(id: u8) -> [u8; 16] {
+    var v = [0u8; 16];
+    v[0] = id;
+    return v;
+}
+
+/// The sizes of a key's versions, newest first, each as one digit.
+fn chainSizes(index: borrow VersionIndex, bucket: u32, key: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    let k = indexKey(bucket, key);
+    var slot = index.headSlot(borrow k);
+    while (slot != NO_VERSION_SLOT) {
+        out.push('0' + truncate<u8>(index.versionAt(slot).size))!;
+        slot = index.olderOf(slot);
+    }
+    return out;
+}
+
+@test
+fn versionIndexChains() -> Result<void, TestFailure> {
+    var index = VersionIndex.create();
+    index.push(indexKey(1, "a"), versioned(1, 1))!;
+    index.push(indexKey(1, "b"), versioned(2, 1))!;
+    Check.equalU64(0, index.links.length as u64)?; // nothing is paid until a key has two versions
+    index.push(indexKey(1, "a"), versioned(3, 2))!;
+    index.push(indexKey(1, "a"), versioned(4, 3))!;
+    Check.equalU64(2, index.length() as u64)?;
+    Check.equalU64(4, index.versionCount() as u64)?;
+    Check.equalBytes("431".bytes(), chainSizes(borrow index, 1, "a").view())?;
+    Check.equalBytes("2".bytes(), chainSizes(borrow index, 1, "b").view())?;
+    let a = indexKey(1, "a");
+    let b = indexKey(1, "b");
+    match (index.find(borrow a, idOf(2))) {
+        Some(v) => { Check.equalU64(3, v.size)?; }
+        null => { return Check.fail("a version in the middle of the chain"); }
+    }
+    Check.isTrue(index.find(borrow b, idOf(2)).isNull(), "another key's id")?;
+    // From the middle, then the newest: the next older one takes its place.
+    Check.equalU64(3, (index.removeVersion(borrow a, idOf(2)) ?? sized(0)).size)?;
+    Check.equalBytes("41".bytes(), chainSizes(borrow index, 1, "a").view())?;
+    Check.equalU64(4, (index.removeVersion(borrow a, idOf(3)) ?? sized(0)).size)?;
+    Check.equalBytes("1".bytes(), chainSizes(borrow index, 1, "a").view())?;
+    Check.equalU64(1, sizeAt(borrow index, 1, "a"))?;
+    Check.isTrue(index.removeVersion(borrow a, idOf(3)).isNull(), "once")?;
+    // removeOlder never takes the newest.
+    index.push(indexKey(1, "a"), versioned(5, 1))!;
+    Check.equalBytes("51".bytes(), chainSizes(borrow index, 1, "a").view())?;
+    Check.equalU64(1, (index.removeOlder(borrow a, idOf(1)) ?? sized(0)).size)?;
+    Check.equalBytes("5".bytes(), chainSizes(borrow index, 1, "a").view())?;
+    Check.isTrue(index.removeOlder(borrow a, idOf(1)).isNull(), "the newest stays")?;
+    // Slots are reused, and a reused slot carries no link of its last life.
+    index.push(indexKey(1, "b"), versioned(6, 2))!;
+    index.push(indexKey(2, "c"), versioned(7, 1))!;
+    Check.equalBytes("62".bytes(), chainSizes(borrow index, 1, "b").view())?;
+    Check.equalBytes("7".bytes(), chainSizes(borrow index, 2, "c").view())?;
+    Check.equalU64(4, index.versions.length as u64)?;
+    // A key without versions leaves the index.
+    let _ = index.removeVersion(borrow b, idOf(1));
+    let _ = index.removeVersion(borrow b, idOf(2));
+    Check.isTrue(!index.contains(borrow b), "no versions, no key")?;
+    Check.equalU64(2, index.length() as u64)?;
+    Check.equalU64(2, index.versionCount() as u64)?;
     return Ok();
 }

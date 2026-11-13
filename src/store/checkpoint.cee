@@ -1,5 +1,5 @@
-// Checkpoint files (ADR-0005). A checkpoint is the store's whole state (buckets and the current
-// version of every key, with locators) after LSN `lsn`. It is taken right after the journal
+// Checkpoint files (ADR-0005). A checkpoint is the store's whole state (buckets and every
+// version of every key, with locators; ADR-0041) after LSN `lsn`. It is taken right after the journal
 // sealed its active segment, so every record up to `lsn` is in a segment before `segment`.
 // Recovery loads the newest checkpoint and replays only segments from `segment` on.
 //
@@ -9,17 +9,19 @@
 // than fall back, because segments it covered may already be gone. Little-endian:
 //
 // Header (64 bytes):
-//   0 u64 magic "CSCKPT01"   8 u16 format (5; 1 to 4 still load)   10 u16 header length (64)   12 u32 flags (0)
-//  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count   48 i64 created ms
+//   0 u64 magic "CSCKPT01"   8 u16 format (6; 1 to 5 still load)   10 u16 header length (64)   12 u32 flags (0)
+//  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count (versions, in format 6)   48 i64 created ms
 //  56 u32 upload count (format 2; reserved, 0, in format 1)   60 u32 crc32c of bytes 0..60
 // Entries, buckets, then objects, then uploads: u8 kind (1 bucket, 2 object, 3 upload), u32 body length, body.
-//   bucket: u16+bytes name, i64 created ms, and in format 5 u32+bytes tags and u32+bytes lifecycle rules (ADR-0020)
+//   bucket: u16+bytes name, i64 created ms, in format 5 u32+bytes tags and u32+bytes lifecycle rules (ADR-0020), and
+//           in format 6 u8 versioning (0 off, 1 enabled, 2 suspended; ADR-0041)
 //   object: u16+bytes bucket, u16+bytes key, 16 version id, u64 lsn, u64 size, i64 mtime ms,
 //           16 md5, u16+bytes content type, u64 payload segment, u64 payload offset,
 //           u32 payload length, u64 record segment, u32 record length, manifest (u32 count,
 //           then u64 id, u64 length, u32 crc32c per extent), in format 2 a u32 part count (ADR-0009), and in
 //           format 3 the metadata section (u16 pairs, each u16+bytes name, u16+bytes value; ADR-0012), and in
-//           format 4 the extras section (u32 length + the blob of ADR-0015)
+//           format 4 the extras section (u32 length + the blob of ADR-0015), and in format 6 u8 kind (0 object,
+//           1 delete marker). In format 6 a key's versions are consecutive entries, oldest first (ADR-0041).
 //   upload (format 2): 16 upload id, u16+bytes bucket, u16+bytes key, i64 initiated ms, u16+bytes content type,
 //           u32 part count, then per part u32 number, u64 size, 16 md5, i64 mtime ms, manifest; in format 3 the
 //           metadata section; in format 4 u8 checksum algorithm, u8 checksum type, then per part u8 length and its
@@ -30,7 +32,7 @@ const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 5;
+const CHECKPOINT_FORMAT: u16 = 6;
 const CHECKPOINT_BUCKET: u8 = 1;
 const CHECKPOINT_OBJECT: u8 = 2;
 const CHECKPOINT_UPLOAD: u8 = 3;
@@ -160,6 +162,7 @@ fn encodeObjectEntry(
     out.pushLE(v.parts)?;
     appendMetadataSection(out, v.metadata.view())?;
     appendExtrasSection(out, v.extras.view())?;
+    out.pushLE(if (isDeleteMarker(v)) 1u8 else 0u8)?;
     return Ok();
 }
 
@@ -210,6 +213,8 @@ struct CheckpointJob {
     /// The upload entries at `lsn`, encoded; they follow the objects.
     private uploads: Vector<Vector<u8>>;
     private body: Vector<u8>;
+    /// A key's version slots, newest first, while its entries are written oldest first.
+    private slots: Vector<u32>;
     /// The steps so far, and the longest one's hold of the store in microseconds (ADR-0029).
     steps: u64;
     longestStepMicros: u64;
@@ -261,7 +266,7 @@ fn beginCheckpointJob(
     let done = checkpointPath(dir, lsn, false)?;
     let _ = Fs.unlink(tmp.view()); // a leftover of an interrupted attempt
     let file = sio(DurableFile.createNew(tmp.view()))?;
-    let objects = state.index.length() as u64;
+    let objects = state.index.versionCount() as u64;
     let header = encodeCheckpointHeader(
         lsn,
         segment,
@@ -294,6 +299,7 @@ fn beginCheckpointJob(
         body.extend(b.tags.view())?;
         body.pushLE(truncate<u32>(b.lifecycle.length))?;
         body.extend(b.lifecycle.view())?;
+        body.pushLE(b.versioning)?;
         w.add(CHECKPOINT_BUCKET, body.view())?;
     }
     var uploads = Vector<Vector<u8>>.create();
@@ -320,13 +326,14 @@ fn beginCheckpointJob(
         names: names,
         uploads: uploads,
         body: body,
+        slots: Vector<u32>.create(),
         steps: 0,
         longestStepMicros: 0,
     });
 }
 
-/// Encodes up to `max` object entries of the index's snapshot into the job (memory only: under the store). Returns
-/// whether the snapshot is done.
+/// Encodes object entries of the index's snapshot into the job (memory only: under the store): keys until `max`
+/// entries are passed, each key with all its versions, oldest first. Returns whether the snapshot is done.
 fn checkpointStepOf(
     job: borrow mut CheckpointJob,
     state: borrow mut StoreState,
@@ -346,9 +353,30 @@ fn checkpointStepOf(
                 Some(b) => b.view(),
                 null => { return Err(StoreError.CheckpointCorrupt); } // a key of no bucket at `lsn`: a bug
             };
-            encodeObjectEntry(mut job.body, name, k, state.index.snapshotVersion(at))?;
-            job.writer.add(CHECKPOINT_OBJECT, job.body.view())?;
-            n += 1;
+            if (at.kept) {
+                let chain = state.index.snapshotChain(at);
+                var i = chain.length;
+                while (i > 0) {
+                    i -= 1;
+                    encodeObjectEntry(mut job.body, name, k, borrow chain[i])?;
+                    job.writer.add(CHECKPOINT_OBJECT, job.body.view())?;
+                    n += 1;
+                }
+            } else {
+                job.slots.clear();
+                var slot = state.index.snapshotSlot(at);
+                while (slot != NO_VERSION_SLOT) {
+                    job.slots.push(slot)?;
+                    slot = state.index.olderOf(slot);
+                }
+                var i = job.slots.length;
+                while (i > 0) {
+                    i -= 1;
+                    encodeObjectEntry(mut job.body, name, k, state.index.versionAt(job.slots[i]))?;
+                    job.writer.add(CHECKPOINT_OBJECT, job.body.view())?;
+                    n += 1;
+                }
+            }
         }
         state.index.snapshotAdvance(at)?;
     }
@@ -431,13 +459,20 @@ fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16
     if (format >= 3) { metadata = corrupt(readMetadataSection(bytes, mut at))?; }
     var extras = Vector<u8>.create();
     if (format >= 4) { extras = corrupt(readExtrasSection(bytes, mut at))?; }
+    var kind = VersionKind.Object;
+    if (format >= 6) {
+        corrupt(need(bytes, at, 1))?;
+        if (bytes[at] > 1) { return Err(StoreError.CheckpointCorrupt); }
+        if (bytes[at] == 1) { kind = VersionKind.DeleteMarker; }
+        at += 1;
+    }
     if (at != bytes.length) { return Err(StoreError.CheckpointCorrupt); }
     if (!state.hasBucket(bucket.view())?) { return Err(StoreError.CheckpointCorrupt); }
     state.bumpObjects(bucket.view(), true)?;
     let version = ObjectVersion {
         versionId: versionId,
         lsn: lsn,
-        kind: VersionKind.Object,
+        kind: kind,
         size: size,
         mtimeMillis: mtime,
         md5: md5,
@@ -455,9 +490,18 @@ fn decodeObjectEntry(bytes: Slice<u8>, state: borrow mut StoreState, format: u16
         Some(k) => k,
         null => { return Err(StoreError.CheckpointCorrupt); }
     };
-    match (state.index.put(indexKey, version)?) {
-        Some(_) => { return Err(StoreError.CheckpointCorrupt); } // a key twice
+    // A key's versions follow each other, oldest first (format 6): each is newer than the key's newest so far.
+    var newest: u64? = null;
+    match (state.index.get(borrow indexKey)) {
+        Some(v) => { newest = v.lsn; }
         null => {}
+    }
+    match (newest) {
+        Some(n) => {
+            if (format < 6 || n >= lsn) { return Err(StoreError.CheckpointCorrupt); } // a key, or a version, twice
+            state.index.push(indexKey, version)?;
+        }
+        null => { let _ = state.index.put(indexKey, version)?; }
     }
     return Ok();
 }
@@ -583,10 +627,17 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
                 objects: 0,
                 tags: Vector<u8>.create(),
                 lifecycle: Vector<u8>.create(),
+                versioning: VERSIONING_OFF,
             };
             if (format >= 5) {
                 info.tags = corrupt(readBlob32(body, mut at))?;
                 info.lifecycle = corrupt(readBlob32(body, mut at))?;
+            }
+            if (format >= 6) {
+                corrupt(need(body, at, 1))?;
+                if (body[at] > VERSIONING_SUSPENDED) { return Err(StoreError.CheckpointCorrupt); }
+                info.versioning = body[at];
+                at += 1;
             }
             if (at != body.length) { return Err(StoreError.CheckpointCorrupt); }
             if (!state.addBucket(name, info)?) { return Err(StoreError.CheckpointCorrupt); } // a bucket twice

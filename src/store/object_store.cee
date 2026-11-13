@@ -86,6 +86,10 @@ enum StoreError {
     MetadataTooLarge,
     /// A completed object's checksum is not the one the client named (ADR-0015).
     BadDigest,
+    /// The key has no version with the id asked for (ADR-0041).
+    NoSuchVersion,
+    /// The version asked for is a delete marker: it has nothing to read.
+    MethodNotAllowed,
 }
 
 fn sio<T>(r: Result<T, IoFailure>) -> Result<T, StoreError> => match (r) {
@@ -117,6 +121,8 @@ struct BucketInfo {
     /// (ADR-0020).
     tags: Vector<u8>;
     lifecycle: Vector<u8>;
+    /// VERSIONING_OFF, VERSIONING_ENABLED or VERSIONING_SUSPENDED (ADR-0041).
+    versioning: u8;
 }
 
 /// Space use of one segment, for compaction (ADR-0005). `liveBytes` counts the records that
@@ -244,6 +250,10 @@ struct ObjectInfo {
     metadata: Vector<u8>;
     /// The checksum and part layout (ADR-0015), as a blob (`decodeExtras` reads it).
     extras: Vector<u8>;
+    /// The version's id: the null id in a bucket without versioning (ADR-0041).
+    versionId: [u8; 16];
+    /// Whether the bucket's versioning is enabled or suspended: its responses then name the version.
+    versioned: bool;
 }
 
 struct PutOutcome {
@@ -252,6 +262,77 @@ struct PutOutcome {
     parts: u32;
     /// The version's checksum and part layout (ADR-0015).
     extras: Vector<u8>;
+    /// The new version's id: the null id unless the bucket's versioning is enabled (ADR-0041).
+    versionId: [u8; 16];
+}
+
+/// One version of a key, as `ObjectStore.versionsOf` lists them.
+struct VersionEntry {
+    versionId: [u8; 16];
+    generation: u64;
+    deleteMarker: bool;
+    size: u64;
+    mtimeMillis: i64;
+    md5: [u8; 16];
+    parts: u32;
+}
+
+fn objectInfoOf(v: borrow ObjectVersion) -> Result<ObjectInfo, StoreError> => Ok(ObjectInfo {
+    size: v.size,
+    mtimeMillis: v.mtimeMillis,
+    md5: v.md5,
+    generation: v.lsn,
+    contentType: copyBytes(v.contentType.view())?,
+    parts: v.parts,
+    metadata: copyBytes(v.metadata.view())?,
+    extras: copyBytes(v.extras.view())?,
+    versionId: v.versionId,
+    versioned: false,
+});
+
+/// One version in a page of `ObjectStore.listVersions`.
+struct ListedVersion {
+    key: Vector<u8>;
+    versionId: [u8; 16];
+    /// The key's newest version.
+    latest: bool;
+    deleteMarker: bool;
+    size: u64;
+    mtimeMillis: i64;
+    md5: [u8; 16];
+    parts: u32;
+}
+
+/// One page of a bucket's versions (ADR-0041): keys in byte order, each key's versions newest first, and rolled-up
+/// common prefixes after them.
+struct VersionPage {
+    versions: Vector<ListedVersion>;
+    commonPrefixes: Vector<Vector<u8>>;
+    truncated: bool;
+    /// Where the next page starts: after this key's version with `nextVersionId`, or, when the page ended with a
+    /// common prefix (`nextIsPrefix`), after every key under it.
+    nextKey: Vector<u8>;
+    nextVersionId: [u8; 16];
+    nextIsPrefix: bool;
+}
+
+/// One entry of `ObjectStore.deleteMany`: a key, and the version to remove for good, if one is named.
+struct DeleteTarget {
+    key: Vector<u8>;
+    versionId: [u8; 16]?;
+}
+
+/// What a delete did, or staged (ADR-0041).
+struct DeleteOutcome {
+    /// False for a key that is empty or too long: nothing was written for it.
+    valid: bool;
+    /// The record's LSN, for a deferred delete to wait on; null when nothing was written.
+    lsn: u64?;
+    /// The delete marker written (no version was named, in a bucket with versioning), or the id of the version
+    /// removed. Null when neither: a bucket without versioning and no version named.
+    versionId: [u8; 16]?;
+    /// A delete marker was written, or the version removed was one.
+    deleteMarker: bool;
 }
 
 /// One page of a listing: keys and rolled-up common prefixes, both in byte order.
@@ -316,6 +397,13 @@ struct StoreState {
         uploads: HashMap<UploadKey, Upload>.create(),
         completions: Vector<Completion>.create(),
     };
+
+    /// The key's current object: its newest version, unless that is a delete marker (ADR-0041).
+    fn current(borrow this, key: borrow IndexKey) -> borrow(this) ObjectVersion? {
+        let v = this.index.get(key)?;
+        if (isDeleteMarker(v)) { return null; }
+        return v;
+    }
 
     /// Releases a superseded or deleted version: its record bytes and its extents.
     fn retire(borrow mut this, old: borrow ObjectVersion) -> Result<void, StoreError> {
@@ -484,7 +572,7 @@ fn applyRecord(
             return applyPut(state, c.put, extents, c.parts, lsn, segment, offset, totalLen, meta.length, payloadLen);
         }
         RecordType.SetTags => {
-            // Like Relocate: it changes the version only if that is still the key's current one. Its record is never
+            // Like Relocate: it changes the version only if the key still has it. Its record is never
             // live: the index and every later checkpoint hold the tags.
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
             let m = match (decodeSetTagsMeta(meta)) {
@@ -498,9 +586,9 @@ fn applyRecord(
             let tags = m.tags;
             let generation = m.generation;
             let versionId = m.versionId;
-            match (state.index.getMut(borrow key)) {
+            match (state.index.findMut(borrow key, versionId)) {
                 Some(v) => {
-                    if (v.lsn == generation && v.versionId[..] == versionId[..]) {
+                    if (v.lsn == generation) {
                         v.metadata = match (metadataReplace(v.metadata.view(), TAGS_FIELD.bytes(), tags.view())) {
                             Ok(b) => b,
                             Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
@@ -536,13 +624,32 @@ fn applyRecord(
             };
             match (state.indexKey(m.bucket.view(), m.key.view())?) {
                 Some(key) => {
-                    match (state.index.remove(borrow key)) {
+                    match (state.index.removeVersion(borrow key, m.versionId)) {
                         Some(old) => {
                             state.retire(borrow old)?;
                             state.bumpObjects(m.bucket.view(), false)?;
                         }
                         null => {}
                     }
+                }
+                null => {}
+            }
+        }
+        RecordType.DeleteMarker => {
+            // Never live: the index and every later checkpoint hold the marker.
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
+            let m = match (decodeDeleteMeta(meta)) {
+                Ok(m) => m,
+                Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+            };
+            match (state.indexKey(m.bucket.view(), m.key.view())?) {
+                Some(key) => {
+                    var marker = vacantVersion();
+                    marker.versionId = m.versionId;
+                    marker.lsn = lsn;
+                    marker.kind = VersionKind.DeleteMarker;
+                    marker.mtimeMillis = m.mtimeMillis;
+                    installVersion(state, m.bucket.view(), key, marker)?;
                 }
                 null => {}
             }
@@ -563,6 +670,7 @@ fn applyRecord(
                 objects: 0,
                 tags: Vector<u8>.create(),
                 lifecycle: Vector<u8>.create(),
+                versioning: VERSIONING_OFF,
             };
             let _ = state.addBucket(name, info)?;
         }
@@ -577,7 +685,13 @@ fn applyRecord(
             let k = BucketKey { name: m.bucket };
             match (state.buckets.getMut(borrow k)) {
                 Some(b) => {
-                    if (configKind == BUCKET_CONFIG_TAGS) { b.tags = value; } else { b.lifecycle = value; }
+                    if (configKind == BUCKET_CONFIG_TAGS) {
+                        b.tags = value;
+                    } else if (configKind == BUCKET_CONFIG_LIFECYCLE) {
+                        b.lifecycle = value;
+                    } else {
+                        b.versioning = value[0]; // one valid byte: `decodeBucketConfigMeta` checked it
+                    }
                 }
                 null => {}
             }
@@ -587,18 +701,18 @@ fn applyRecord(
                 Ok(m) => m,
                 Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
             };
-            // The copy takes over only if the version it copied is still current; otherwise
+            // The copy takes over only if the key still has the version it copied; otherwise
             // it is garbage from the moment it is written.
             var moved = false;
             var oldSegment: u64 = 0;
             var oldLength: u32 = 0;
             let found = match (state.indexKey(m.bucket.view(), m.key.view())?) {
-                Some(key) => state.index.getMut(borrow key),
+                Some(key) => state.index.findMut(borrow key, m.versionId),
                 null => null,
             };
             match (found) {
                 Some(v) => {
-                    if (v.lsn == m.generation && v.versionId[..] == m.versionId[..] && v.extents.length == 0) {
+                    if (v.lsn == m.generation && v.extents.length == 0 && !isDeleteMarker(v)) {
                         oldSegment = v.recordSegment;
                         oldLength = v.recordLength;
                         v.payload = PayloadLocator {
@@ -673,17 +787,71 @@ fn applyPut(
         extras: m.extras,
     };
     match (key) {
-        Some(k) => {
-            match (state.index.put(k, version)?) {
-                Some(old) => { state.retire(borrow old)?; }
-                null => { state.bumpObjects(bucket.view(), true)?; }
-            }
-        }
+        Some(k) => { installVersion(state, bucket.view(), k, version)?; }
         // Admission checks the bucket under the lock, so this does not happen. If it did, the version would have no
         // bucket to be listed in: it is retired at once, its extents reaped and its record dead.
         null => { state.retire(borrow version)?; }
     }
     return Ok();
+}
+
+/// Makes `version` the newest version of `key` in `bucket` (ADR-0041). With the null id it replaces the key's null
+/// version, wherever that is in the chain; with another id it only adds. The bucket's count is of versions.
+fn installVersion(
+    state: borrow mut StoreState,
+    bucket: Slice<u8>,
+    key: IndexKey,
+    version: ObjectVersion,
+) -> Result<void, StoreError> {
+    if (!isNullVersionId(version.versionId)) {
+        state.index.push(key, version)?;
+        return state.bumpObjects(bucket, true);
+    }
+    let newestIsNull = match (state.index.get(borrow key)) {
+        Some(v) => isNullVersionId(v.versionId),
+        null => {
+            let _ = state.index.put(key, version)?;
+            return state.bumpObjects(bucket, true);
+        }
+    };
+    if (newestIsNull) {
+        // In place, as an unversioned bucket's overwrite always was: nothing to allocate, and the count stays.
+        match (state.index.put(key, version)?) {
+            Some(old) => { state.retire(borrow old)?; }
+            null => {}
+        }
+        return Ok();
+    }
+    let k = copyIndexKey(borrow key)?;
+    state.index.push(key, version)?;
+    state.bumpObjects(bucket, true)?;
+    match (state.index.removeOlder(borrow k, nullVersionId())) {
+        Some(old) => {
+            state.retire(borrow old)?;
+            state.bumpObjects(bucket, false)?;
+        }
+        null => {}
+    }
+    return Ok();
+}
+
+/// A staged delete: its record's LSN, and the id it carries (a delete marker's, or the null id).
+struct StagedDelete {
+    lsn: u64;
+    versionId: [u8; 16];
+}
+
+/// Everything a reader has left, in memory.
+fn readRemaining(reader: borrow mut ObjectReader) -> Result<Vector<u8>, StoreError> {
+    var out = Vector<u8>.create();
+    var chunk = Vector<u8>.create();
+    chunk.resize(65536, 0)?;
+    while (true) {
+        let n = reader.read(mut chunk.viewMut())?;
+        if (n == 0) { break; }
+        out.extend(chunk.view()[0..n])?;
+    }
+    return Ok(out);
 }
 
 /// A staged write waiting for its batch to commit before it is applied.
@@ -867,9 +1035,13 @@ struct ObjectStore {
                     null => { break; }
                 };
                 cursor = state.index.next(i);
-                let v = state.index.valueAt(i);
-                if (v.extents.length == 0) {
-                    live.push(SegmentFile { id: v.recordSegment, size: v.recordLength as u64 })?;
+                var slot = state.index.slotAt(i);
+                while (slot != NO_VERSION_SLOT) {
+                    let v = state.index.versionAt(slot);
+                    if (v.extents.length == 0 && !isDeleteMarker(v)) {
+                        live.push(SegmentFile { id: v.recordSegment, size: v.recordLength as u64 })?;
+                    }
+                    slot = state.index.olderOf(slot);
                 }
             }
             for (i in 0..live.length) { state.addSegmentBytes(live[i].id, 0, live[i].size)?; }
@@ -1025,9 +1197,13 @@ struct ObjectStore {
                 null => { break; }
             };
             cursor = this.state.index.next(i);
-            let v = this.state.index.valueAt(i);
-            for (k in 0..v.extents.length) {
-                let _ = live.put(v.extents[k].id, true)?;
+            var slot = this.state.index.slotAt(i);
+            while (slot != NO_VERSION_SLOT) {
+                let v = this.state.index.versionAt(slot);
+                for (k in 0..v.extents.length) {
+                    let _ = live.put(v.extents[k].id, true)?;
+                }
+                slot = this.state.index.olderOf(slot);
             }
         }
         for (i in 0..this.state.uploads.length()) {
@@ -1080,52 +1256,67 @@ struct ObjectStore {
             };
             cursor = this.state.index.next(i);
             let k = this.state.index.keyAt(i);
-            let v = this.state.index.valueAt(i);
-            report.objects += 1;
-            let bucket = StringView.fromUtf8(this.state.bucketName(k.bucket)) ?? "";
-            let key = StringView.fromUtf8(k.key.view()) ?? "";
-            var fault: VerifyFault? = null;
-            match (this.openUnpinned(bucket, key, 0, 0xFFFFFFFFFFFFFFFF)) {
-                Ok(reader) => {
-                    var r = reader;
-                    var md5 = Md5.create();
-                    var size: u64 = 0;
-                    loop {
-                        match (r.read(mut chunk.viewMut())) {
-                            Ok(n) => {
-                                if (n == 0) { break; }
-                                md5.update(chunk.view()[0..n]);
-                                size += n as u64;
-                            }
-                            Err(e) => {
-                                fault = verifyFault(e);
-                                break;
-                            }
-                        }
-                    }
-                    report.bytes += size;
-                    if (fault.isNull()) {
-                        let digest = md5.finish();
-                        // A multipart object's MD5 is its ETag's, not its bytes' (ADR-0009): its extents' CRCs cover it.
-                        if (size != v.size || (v.parts == 0 && digest[..] != v.md5[..])) {
-                            fault = VerifyFault.Mismatch;
-                        }
-                    }
-                }
-                Err(e) => { fault = verifyFault(e); }
-            }
-            match (fault) {
-                Some(f) => {
-                    report.problems.push(VerifyProblem {
-                        bucket: copyBytes(this.state.bucketName(k.bucket))?,
-                        key: copyBytes(k.key.view())?,
-                        fault: f,
-                    })?;
-                }
-                null => {}
+            var slot = this.state.index.slotAt(i);
+            while (slot != NO_VERSION_SLOT) {
+                let v = this.state.index.versionAt(slot);
+                slot = this.state.index.olderOf(slot);
+                if (isDeleteMarker(v)) { continue; } // nothing stored to read
+                this.verifyVersion(k, v, mut chunk, mut report)?;
             }
         }
         return Ok(report);
+    }
+
+    /// Reads one version whole and checks its size and MD5; a fault goes into `report`.
+    fn verifyVersion(
+        borrow this,
+        k: borrow IndexKey,
+        v: borrow ObjectVersion,
+        chunk: borrow mut Vector<u8>,
+        report: borrow mut VerifyReport,
+    ) -> Result<void, StoreError> {
+        report.objects += 1;
+        var fault: VerifyFault? = null;
+        match (this.openVersionUnpinned(v, 0, 0xFFFFFFFFFFFFFFFF)) {
+            Ok(reader) => {
+                var r = reader;
+                var md5 = Md5.create();
+                var size: u64 = 0;
+                loop {
+                    match (r.read(mut chunk.viewMut())) {
+                        Ok(n) => {
+                            if (n == 0) { break; }
+                            md5.update(chunk.view()[0..n]);
+                            size += n as u64;
+                        }
+                        Err(e) => {
+                            fault = verifyFault(e);
+                            break;
+                        }
+                    }
+                }
+                report.bytes += size;
+                if (fault.isNull()) {
+                    let digest = md5.finish();
+                    // A multipart object's MD5 is its ETag's, not its bytes' (ADR-0009): its extents' CRCs cover it.
+                    if (size != v.size || (v.parts == 0 && digest[..] != v.md5[..])) {
+                        fault = VerifyFault.Mismatch;
+                    }
+                }
+            }
+            Err(e) => { fault = verifyFault(e); }
+        }
+        match (fault) {
+            Some(f) => {
+                report.problems.push(VerifyProblem {
+                    bucket: copyBytes(this.state.bucketName(k.bucket))?,
+                    key: copyBytes(k.key.view())?,
+                    fault: f,
+                })?;
+            }
+            null => {}
+        }
+        return Ok();
     }
 
     /// Removes the extent files of versions retired by records that are now durable. An extent that an open reader
@@ -1292,14 +1483,35 @@ struct ObjectStore {
 
     /// Sets the current version's tags (URL-encoded; empty removes them), without a new version: its ETag, generation
     /// and modification time stay (ADR-0017). One SetTags record, durable before this returns.
-    fn setTags(borrow mut this, bucket: StringView, key: StringView, tags: Slice<u8>) -> Result<void, StoreError> {
+    fn setTags(borrow mut this, bucket: StringView, key: StringView, tags: Slice<u8>) -> Result<void, StoreError> =>
+        this.setTagsOf(bucket, key, null, tags);
+
+    /// `setTags` of the current version (no id), or of the version with the id (ADR-0041): NoSuchVersion if the key
+    /// has none such, MethodNotAllowed for a delete marker.
+    fn setTagsOf(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16]?,
+        tags: Slice<u8>,
+    ) -> Result<void, StoreError> {
         this.commitStaged()?;
         this.checkWritable()?;
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
         var generation: u64 = 0;
         var versionId = [0u8; 16];
-        match (this.state.index.get(borrow k)) {
+        let found = match (id) {
+            Some(i) => match (this.state.index.find(borrow k, i)) {
+                Some(v) => {
+                    if (isDeleteMarker(v)) { return Err(StoreError.MethodNotAllowed); }
+                    Some(v)
+                }
+                null => { return Err(StoreError.NoSuchVersion); }
+            },
+            null => this.state.current(borrow k),
+        };
+        match (found) {
             Some(v) => {
                 generation = v.lsn;
                 versionId = v.versionId;
@@ -1350,7 +1562,7 @@ struct ObjectStore {
     /// The current version's generation, or null if the key has no object.
     fn currentGeneration(borrow this, bucket: StringView, key: StringView) -> Result<u64?, StoreError> {
         let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
-        return Ok(match (this.state.index.get(borrow k)) {
+        return Ok(match (this.state.current(borrow k)) {
             Some(v) => v.lsn,
             null => null,
         });
@@ -1422,8 +1634,9 @@ struct ObjectStore {
                 return Err(e);
             }
         }
-        let lsn = this.stageFinished(bucket, key, contentType, metadata, extras, obj)?;
-        return Ok(PutOutcome { md5: obj.md5, generation: lsn, parts: 0, extras: copyBytes(extras)? });
+        let id = this.versionIdFor(bucket.bytes(), key.bytes())?;
+        let lsn = this.stageFinished(bucket, key, contentType, metadata, extras, id, obj)?;
+        return Ok(PutOutcome { md5: obj.md5, generation: lsn, parts: 0, extras: copyBytes(extras)?, versionId: id });
     }
 
     /// `putFinishedDeferred` for an unconditional PUT of an inline object, in memory only, so async code may call it
@@ -1445,8 +1658,15 @@ struct ObjectStore {
         // An inline object has no extents, so a refusal has nothing to discard.
         if (metadata.length > MAX_METADATA_BYTES) { return Err(StoreError.MetadataTooLarge); }
         this.checkPut(bucket, key, contentType, obj, PutCondition.None)?;
-        return match (this.stageWithoutCommit(bucket, key, contentType, metadata, extras, obj)?) {
-            Some(lsn) => Ok(Some(PutOutcome { md5: obj.md5, generation: lsn, parts: 0, extras: copyBytes(extras)? })),
+        let id = this.versionIdFor(bucket.bytes(), key.bytes())?;
+        return match (this.stageWithoutCommit(bucket, key, contentType, metadata, extras, id, obj)?) {
+            Some(lsn) => Ok(Some(PutOutcome {
+                md5: obj.md5,
+                generation: lsn,
+                parts: 0,
+                extras: copyBytes(extras)?,
+                versionId: id,
+            })),
             null => Ok(null),
         };
     }
@@ -1477,9 +1697,10 @@ struct ObjectStore {
                 return Err(e);
             }
         }
-        let lsn = this.stageFinished(bucket, key, contentType, metadata, extras, obj)?;
+        let id = this.versionIdFor(bucket.bytes(), key.bytes())?;
+        let lsn = this.stageFinished(bucket, key, contentType, metadata, extras, id, obj)?;
         this.commitStaged()?;
-        return Ok(PutOutcome { md5: obj.md5, generation: lsn, parts: 0, extras: copyBytes(extras)? });
+        return Ok(PutOutcome { md5: obj.md5, generation: lsn, parts: 0, extras: copyBytes(extras)?, versionId: id });
     }
 
     fn checkPut(
@@ -1539,7 +1760,8 @@ struct ObjectStore {
                 return Err(e);
             }
         }
-        return this.stageFinished(bucket, key, contentType, "".bytes(), "".bytes(), obj);
+        let id = this.versionIdFor(bucket.bytes(), key.bytes())?;
+        return this.stageFinished(bucket, key, contentType, "".bytes(), "".bytes(), id, obj);
     }
 
     /// Stages the record that publishes a finished object; returns its LSN (its generation).
@@ -1551,9 +1773,10 @@ struct ObjectStore {
         contentType: StringView,
         metadata: Slice<u8>,
         extras: Slice<u8>,
+        versionId: [u8; 16],
         obj: borrow FinishedObject,
     ) -> Result<u64, StoreError> {
-        let rec = encodePut(bucket, key, contentType, metadata, extras, obj)?;
+        let rec = encodePut(bucket, key, contentType, metadata, extras, versionId, obj)?;
         // A full segment rotates at a commit with nothing staged after it (ADR-0022).
         if (this.mustCommitBefore(borrow rec, obj)) { this.commitStaged()?; }
         return this.stageEncoded(rec, obj);
@@ -1568,11 +1791,34 @@ struct ObjectStore {
         contentType: StringView,
         metadata: Slice<u8>,
         extras: Slice<u8>,
+        versionId: [u8; 16],
         obj: borrow FinishedObject,
     ) -> Result<u64?, StoreError> {
-        let rec = encodePut(bucket, key, contentType, metadata, extras, obj)?;
+        let rec = encodePut(bucket, key, contentType, metadata, extras, versionId, obj)?;
         if (this.mustCommitBefore(borrow rec, obj)) { return Ok(null); }
         return Ok(Some(this.stageEncoded(rec, obj)?));
+    }
+
+    /// A bucket's versioning state; VERSIONING_OFF for a bucket that is not there.
+    fn versioningOf(borrow this, bucket: Slice<u8>) -> Result<u8, StoreError> {
+        let k = BucketKey { name: copyBytes(bucket)? };
+        return Ok(match (this.state.buckets.get(borrow k)) {
+            Some(b) => b.versioning,
+            null => VERSIONING_OFF,
+        });
+    }
+
+    /// The id of a version about to be written to `key` (ADR-0041 §3): a new one when the bucket's versioning is
+    /// enabled, else the null id.
+    fn versionIdFor(borrow this, bucket: Slice<u8>, key: Slice<u8>) -> Result<[u8; 16], StoreError> {
+        if (this.versioningOf(bucket)? != VERSIONING_ENABLED) { return Ok(nullVersionId()); }
+        let k = this.state.keyFor(bucket, key)?;
+        var id = [0u8; 16];
+        while (true) {
+            Random.fill(mut id[..])!;
+            if (!isNullVersionId(id) && this.state.index.slotOf(borrow k, id) == NO_VERSION_SLOT) { break; }
+        }
+        return Ok(id);
     }
 
     /// Whether a record must wait for a commit: it would overflow the segment, or the segment is due to rotate.
@@ -1684,21 +1930,101 @@ struct ObjectStore {
     fn headObject(borrow this, bucket: StringView, key: StringView) -> Result<ObjectInfo, StoreError> {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
-        match (this.state.index.get(borrow k)) {
-            Some(v) => {
-                return Ok(ObjectInfo {
-                    size: v.size,
-                    mtimeMillis: v.mtimeMillis,
-                    md5: v.md5,
-                    generation: v.lsn,
-                    contentType: copyBytes(v.contentType.view())?,
-                    parts: v.parts,
-                    metadata: copyBytes(v.metadata.view())?,
-                    extras: copyBytes(v.extras.view())?,
-                });
-            }
+        let v = match (this.state.current(borrow k)) {
+            Some(v) => v,
             null => { return Err(StoreError.NoSuchKey); }
+        };
+        var info = objectInfoOf(v)?;
+        info.versioned = this.versioningOf(bucket.bytes())? != VERSIONING_OFF;
+        return Ok(info);
+    }
+
+    /// `headObject` (no id) or `headVersion`.
+    fn headObjectOf(
+        borrow this,
+        bucket: StringView,
+        key: StringView,
+        versionId: [u8; 16]?,
+    ) -> Result<ObjectInfo, StoreError> => match (versionId) {
+        Some(id) => this.headVersion(bucket, key, id),
+        null => this.headObject(bucket, key),
+    };
+
+    /// The id of the delete marker that is the key's newest version, if it is one (ADR-0041): why a read of the key
+    /// finds no object.
+    fn currentMarker(borrow this, bucket: StringView, key: StringView) -> Result<[u8; 16]?, StoreError> {
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
+        let slot = this.state.index.headSlot(borrow k);
+        if (slot == NO_VERSION_SLOT) { return Ok(null); }
+        let v = this.state.index.versionAt(slot);
+        if (isDeleteMarker(v)) { return Ok(Some(v.versionId)); }
+        return Ok(null);
+    }
+
+    /// The bucket's versioning: VERSIONING_OFF, VERSIONING_ENABLED or VERSIONING_SUSPENDED.
+    fn versioningState(borrow this, bucket: StringView) -> Result<u8, StoreError> {
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        return this.versioningOf(bucket.bytes());
+    }
+
+    /// `headObject` of one version by its id (ADR-0041): NoSuchVersion if the key has none such, MethodNotAllowed
+    /// for a delete marker.
+    fn headVersion(
+        borrow this,
+        bucket: StringView,
+        key: StringView,
+        versionId: [u8; 16],
+    ) -> Result<ObjectInfo, StoreError> {
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
+        let v = match (this.state.index.find(borrow k, versionId)) {
+            Some(v) => v,
+            null => { return Err(StoreError.NoSuchVersion); }
+        };
+        if (isDeleteMarker(v)) { return Err(StoreError.MethodNotAllowed); }
+        var info = objectInfoOf(v)?;
+        info.versioned = this.versioningOf(bucket.bytes())? != VERSIONING_OFF;
+        return Ok(info);
+    }
+
+    /// The key's versions, newest first, delete markers among them (ADR-0041); none for a key that has none.
+    fn versionsOf(borrow this, bucket: StringView, key: StringView) -> Result<Vector<VersionEntry>, StoreError> {
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
+        var out = Vector<VersionEntry>.create();
+        var slot = this.state.index.headSlot(borrow k);
+        while (slot != NO_VERSION_SLOT) {
+            let v = this.state.index.versionAt(slot);
+            out.push(VersionEntry {
+                versionId: v.versionId,
+                generation: v.lsn,
+                deleteMarker: isDeleteMarker(v),
+                size: v.size,
+                mtimeMillis: v.mtimeMillis,
+                md5: v.md5,
+                parts: v.parts,
+            })?;
+            slot = this.state.index.olderOf(slot);
         }
+        return Ok(out);
+    }
+
+    /// The bytes of one version by its id, whole, in memory.
+    fn getObjectVersion(
+        borrow this,
+        bucket: StringView,
+        key: StringView,
+        versionId: [u8; 16],
+    ) -> Result<Vector<u8>, StoreError> {
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
+        let v = match (this.state.index.find(borrow k, versionId)) {
+            Some(v) => v,
+            null => { return Err(StoreError.NoSuchVersion); }
+        };
+        if (isDeleteMarker(v)) { return Err(StoreError.MethodNotAllowed); }
+        var reader = this.openVersionUnpinned(v, 0, 0xFFFFFFFFFFFFFFFF)?;
+        return readRemaining(mut reader);
     }
 
     /// A reader of the current version's bytes `[from, to)`, clamped to the object's size.
@@ -1713,6 +2039,17 @@ struct ObjectStore {
         return prepared.open();
     }
 
+    /// `prepareReader` of one version by its id (ADR-0041): NoSuchVersion if the key has none such,
+    /// MethodNotAllowed for a delete marker.
+    fn prepareVersionReader(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        versionId: [u8; 16],
+        from: u64,
+        to: u64,
+    ) -> Result<PreparedReader, StoreError> => this.prepareReaderOf(bucket, key, versionId, from, to);
+
     /// The first half of `openReader`, with no I/O (ADR-0024): the version's lookup and its pins. `open` then reads
     /// without the store, so it may run without the store's lock: the pins keep the version's extents, or the
     /// segment holding its inline record, on disk until the reader is dropped.
@@ -1722,12 +2059,31 @@ struct ObjectStore {
         key: StringView,
         from: u64,
         to: u64,
+    ) -> Result<PreparedReader, StoreError> => this.prepareReaderOf(bucket, key, null, from, to);
+
+    /// `prepareReader` of the current version (no id), or of the version with the id.
+    fn prepareReaderOf(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        versionId: [u8; 16]?,
+        from: u64,
+        to: u64,
     ) -> Result<PreparedReader, StoreError> {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
-        let v = match (this.state.index.get(borrow k)) {
-            Some(v) => v,
-            null => { return Err(StoreError.NoSuchKey); }
+        let v = match (versionId) {
+            Some(id) => match (this.state.index.find(borrow k, id)) {
+                Some(v) => {
+                    if (isDeleteMarker(v)) { return Err(StoreError.MethodNotAllowed); }
+                    v
+                }
+                null => { return Err(StoreError.NoSuchVersion); }
+            },
+            null => match (this.state.current(borrow k)) {
+                Some(v) => v,
+                null => { return Err(StoreError.NoSuchKey); }
+            },
         };
         let end = if (to > v.size) v.size else to;
         let start = if (from > end) end else from;
@@ -1769,10 +2125,20 @@ struct ObjectStore {
     ) -> Result<ObjectReader, StoreError> {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
-        let v = match (this.state.index.get(borrow k)) {
+        let v = match (this.state.current(borrow k)) {
             Some(v) => v,
             null => { return Err(StoreError.NoSuchKey); }
         };
+        return this.openVersionUnpinned(v, from, to);
+    }
+
+    /// `openUnpinned` of one version, current or not.
+    fn openVersionUnpinned(
+        borrow this,
+        v: borrow ObjectVersion,
+        from: u64,
+        to: u64,
+    ) -> Result<ObjectReader, StoreError> {
         let end = if (to > v.size) v.size else to;
         let start = if (from > end) end else from;
         if (v.extents.length == 0) {
@@ -1799,32 +2165,61 @@ struct ObjectStore {
         to: u64,
     ) -> Result<Vector<u8>, StoreError> {
         var reader = this.openUnpinned(bucket, key, from, to)?;
-        var out = Vector<u8>.create();
-        var chunk = Vector<u8>.create();
-        chunk.resize(65536, 0)?;
-        while (true) {
-            let n = reader.read(mut chunk.viewMut())?;
-            if (n == 0) { break; }
-            out.extend(chunk.view()[0..n])?;
-        }
-        return Ok(out);
+        return readRemaining(mut reader);
     }
 
     fn getObject(borrow this, bucket: StringView, key: StringView) -> Result<Vector<u8>, StoreError> =>
         this.getObjectRange(bucket, key, 0, 0xFFFFFFFFFFFFFFFF);
 
-    /// Deletes the key's object. Deleting a missing key succeeds, as in S3.
+    /// Deletes the key's object. Deleting a missing key succeeds, as in S3. In a bucket with versioning, enabled or
+    /// suspended, nothing is removed: a delete marker becomes the key's newest version (ADR-0041), also for a key
+    /// that has no version.
     fn deleteObject(borrow mut this, bucket: StringView, key: StringView) -> Result<void, StoreError> {
+        let _ = this.deleteCurrent(bucket, key)?;
+        return Ok();
+    }
+
+    /// `deleteObject`, telling what it wrote: null when the bucket has no versioning (the object is gone, or was
+    /// not there), else the delete marker's id.
+    fn deleteCurrent(borrow mut this, bucket: StringView, key: StringView) -> Result<[u8; 16]?, StoreError> {
         this.commitStaged()?;
         this.checkWritable()?;
         ObjectStore.checkKey(key)?;
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        if (this.currentGeneration(bucket, key)?.isNull()) { return Ok(); }
-        this.scratch.clear();
-        encodeDeleteMeta(mut this.scratch, bucket.bytes(), key.bytes(), nullVersionId(), Clock.unixMillis())?;
-        let empty = [0u8; 1];
-        this.commitOne(RecordType.DeleteVersion, empty[0..0])?;
-        return Ok();
+        let versioned = this.versioningOf(bucket.bytes())? != VERSIONING_OFF;
+        if (!versioned && this.currentGeneration(bucket, key)?.isNull()) { return Ok(null); }
+        let staged = this.stageDeleteOf(bucket.bytes(), key.bytes(), Clock.unixMillis())?;
+        this.commitStaged()?;
+        if (versioned) { return Ok(staged.versionId); }
+        return Ok(null);
+    }
+
+    /// Removes one version of the key for good, a delete marker too (ADR-0041): what it was, or null if the key has
+    /// no version with that id, which succeeds as in S3. The next older version becomes the key's newest.
+    fn deleteVersion(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        versionId: [u8; 16],
+    ) -> Result<VersionKind?, StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        ObjectStore.checkKey(key)?;
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
+        let kind = match (this.state.index.find(borrow k, versionId)) {
+            Some(v) => v.kind,
+            null => { return Ok(null); }
+        };
+        let _ = this.stageDeleteRecord(
+            RecordType.DeleteVersion,
+            bucket.bytes(),
+            key.bytes(),
+            versionId,
+            Clock.unixMillis(),
+        )?;
+        this.commitStaged()?;
+        return Ok(kind);
     }
 
     /// Stages the delete of `key` without committing it (ADR-0025), as `putFinishedDeferred` stages a PUT: the caller
@@ -1837,8 +2232,106 @@ struct ObjectStore {
         // The index shows only published writes. A PUT of this key may be staged or in its sync, and the delete
         // must then still follow it; a delete of a missing key applies as nothing.
         let unpublished = this.pendingApplies.length > 0 || this.inflightApplies.length > 0;
-        if (!unpublished && this.currentGeneration(bucket, key)?.isNull()) { return Ok(null); }
+        let versioned = this.versioningOf(bucket.bytes())? != VERSIONING_OFF;
+        if (!versioned && !unpublished && this.currentGeneration(bucket, key)?.isNull()) { return Ok(null); }
         return Ok(this.stageDelete(bucket.bytes(), key.bytes(), Clock.unixMillis())?);
+    }
+
+    /// `deleteObjectDeferred` for a request that may name a version (ADR-0041). Without one it is that, telling the
+    /// delete marker it staged in a bucket with versioning. With one, the version is removed for good; the null id
+    /// in a bucket without versioning names the key's one object, so that is the plain delete.
+    fn deleteDeferred(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        versionId: [u8; 16]?,
+    ) -> Result<DeleteOutcome, StoreError> {
+        this.checkWritable()?;
+        ObjectStore.checkKey(key)?;
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        let target = DeleteTarget { key: copyBytes(key.bytes())?, versionId: versionId };
+        let unpublished = this.pendingApplies.length > 0 || this.inflightApplies.length > 0;
+        return this.stageTarget(bucket.bytes(), borrow target, Clock.unixMillis(), unpublished);
+    }
+
+    /// Stages what one delete asks for, without committing it. The index shows only published writes, so a delete
+    /// that finds nothing is still staged when other requests' writes are staged or in their sync (`unpublished`):
+    /// it must follow a PUT of its key among them, and applies as nothing otherwise.
+    fn stageTarget(
+        borrow mut this,
+        bucket: Slice<u8>,
+        target: borrow DeleteTarget,
+        now: i64,
+        unpublished: bool,
+    ) -> Result<DeleteOutcome, StoreError> {
+        let key = target.key.view();
+        let versioning = this.versioningOf(bucket)?;
+        let k = this.state.keyFor(bucket, key)?;
+        var named: [u8; 16]? = target.versionId;
+        match (named) {
+            Some(id) => {
+                if (versioning == VERSIONING_OFF && isNullVersionId(id)) { named = null; }
+            }
+            null => {}
+        }
+        match (named) {
+            Some(id) => {
+                var found = false;
+                var marker = false;
+                match (this.state.index.find(borrow k, id)) {
+                    Some(v) => {
+                        found = true;
+                        marker = isDeleteMarker(v);
+                    }
+                    null => {}
+                }
+                var lsn: u64? = null;
+                if (found || unpublished) {
+                    lsn = this.stageDeleteRecord(RecordType.DeleteVersion, bucket, key, id, now)?;
+                }
+                return Ok(DeleteOutcome { valid: true, lsn: lsn, versionId: id, deleteMarker: marker });
+            }
+            null => {}
+        }
+        if (versioning == VERSIONING_OFF) {
+            var lsn: u64? = null;
+            if (unpublished || this.state.current(borrow k).isSome()) { lsn = this.stageDelete(bucket, key, now)?; }
+            return Ok(DeleteOutcome { valid: true, lsn: lsn, versionId: null, deleteMarker: false });
+        }
+        let staged = this.stageDeleteOf(bucket, key, now)?;
+        return Ok(DeleteOutcome { valid: true, lsn: staged.lsn, versionId: staged.versionId, deleteMarker: true });
+    }
+
+    /// `deleteObjects` for entries that may name versions (ADR-0041), telling what each did: one commit for all.
+    fn deleteMany(
+        borrow mut this,
+        bucket: StringView,
+        targets: Slice<DeleteTarget>,
+    ) -> Result<Vector<DeleteOutcome>, StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        var out = Vector<DeleteOutcome>.create();
+        let now = Clock.unixMillis();
+        // Before the batch stages anything of its own: what is in a sync now may hold a PUT of one of its keys.
+        let unpublished = this.pendingApplies.length > 0 || this.inflightApplies.length > 0;
+        for (i in 0..targets.length) {
+            let key = targets[i].key.view();
+            if (key.length == 0 || key.length > MAX_KEY_BYTES) {
+                out.push(DeleteOutcome { valid: false, lsn: null, versionId: null, deleteMarker: false })?;
+                continue;
+            }
+            match (this.stageTarget(bucket.bytes(), borrow targets[i], now, unpublished)) {
+                Ok(o) => { out.push(o)?; }
+                Err(e) => {
+                    this.journal.discardPending();
+                    this.pendingApplies.clear();
+                    return Err(e);
+                }
+            }
+        }
+        this.commitStaged()?;
+        return Ok(out);
     }
 
     /// Deletes many keys of `bucket` with one commit: one journal write and one sync for the batch (ADR-0010). The
@@ -1850,6 +2343,7 @@ struct ObjectStore {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         var valid = Vector<bool>.create();
         let now = Clock.unixMillis();
+        let versioned = this.versioningOf(bucket.bytes())? != VERSIONING_OFF;
         for (i in 0..keys.length) {
             let key = keys[i].view();
             if (key.length == 0 || key.length > MAX_KEY_BYTES) {
@@ -1858,7 +2352,7 @@ struct ObjectStore {
             }
             valid.push(true)?;
             let k = this.state.keyFor(bucket.bytes(), key)?;
-            if (!this.state.index.contains(borrow k)) { continue; }
+            if (!versioned && this.state.current(borrow k).isNull()) { continue; }
             match (this.stageDelete(bucket.bytes(), key, now)) {
                 Ok(_) => {}
                 Err(e) => {
@@ -1872,17 +2366,41 @@ struct ObjectStore {
         return Ok(valid);
     }
 
-    /// Stages the DeleteVersion record of `key` and returns its LSN; a full batch, or a full segment, is committed
-    /// first (ADR-0022).
-    fn stageDelete(borrow mut this, bucket: Slice<u8>, key: Slice<u8>, now: i64) -> Result<u64, StoreError> {
+    /// Stages the delete of `key`'s current object and returns the record's LSN.
+    fn stageDelete(borrow mut this, bucket: Slice<u8>, key: Slice<u8>, now: i64) -> Result<u64, StoreError> =>
+        Ok(this.stageDeleteOf(bucket, key, now)?.lsn);
+
+    /// Stages the delete of `key`'s current object as the bucket's versioning asks (ADR-0041 §3): without versioning
+    /// a DeleteVersion of the null version; enabled, a DeleteMarker with a new id; suspended, one with the null id.
+    fn stageDeleteOf(borrow mut this, bucket: Slice<u8>, key: Slice<u8>, now: i64) -> Result<StagedDelete, StoreError> {
+        let versioning = this.versioningOf(bucket)?;
+        if (versioning == VERSIONING_OFF) {
+            let lsn = this.stageDeleteRecord(RecordType.DeleteVersion, bucket, key, nullVersionId(), now)?;
+            return Ok(StagedDelete { lsn: lsn, versionId: nullVersionId() });
+        }
+        let id = this.versionIdFor(bucket, key)?;
+        let lsn = this.stageDeleteRecord(RecordType.DeleteMarker, bucket, key, id, now)?;
+        return Ok(StagedDelete { lsn: lsn, versionId: id });
+    }
+
+    /// Stages a DeleteVersion or DeleteMarker record of `key` and returns its LSN; a full batch, or a full segment,
+    /// is committed first (ADR-0022).
+    fn stageDeleteRecord(
+        borrow mut this,
+        kind: RecordType,
+        bucket: Slice<u8>,
+        key: Slice<u8>,
+        versionId: [u8; 16],
+        now: i64,
+    ) -> Result<u64, StoreError> {
         var meta = Vector<u8>.create();
-        encodeDeleteMeta(mut meta, bucket, key, nullVersionId(), now)?;
+        encodeDeleteMeta(mut meta, bucket, key, versionId, now)?;
         let empty = [0u8; 1];
         if (this.journal.wouldOverflow(meta.length, 0) || this.journal.needsRotation()) { this.commitStaged()?; }
         this.pendingApplies.reserve(1)?;
-        let pos = this.journal.stage(RecordType.DeleteVersion, meta.view(), empty[0..0])?;
+        let pos = this.journal.stage(kind, meta.view(), empty[0..0])?;
         this.pendingApplies.push(PendingApply {
-            kind: RecordType.DeleteVersion,
+            kind: kind,
             lsn: pos.lsn,
             segment: pos.segmentId,
             offset: pos.offset,
@@ -2075,6 +2593,7 @@ struct ObjectStore {
         this.commitStaged()?;
         this.checkWritable()?;
         var manifest = Vector<u8>.create();
+        let versionId = this.versionIdFor(bucket.bytes(), key.bytes())?;
         var meta = Vector<u8>.create();
         var extrasBlob = Vector<u8>.create();
         {
@@ -2161,6 +2680,7 @@ struct ObjectStore {
                 mut meta,
                 bucket.bytes(),
                 key.bytes(),
+                versionId,
                 Clock.unixMillis(),
                 size,
                 multipartEtag(md5s.view()),
@@ -2175,11 +2695,17 @@ struct ObjectStore {
         this.scratch.extend(meta.view())?;
         let lsn = this.commitOne(RecordType.UploadComplete, manifest.view())?;
         let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
-        let md5 = match (this.state.index.get(borrow k)) {
+        let md5 = match (this.state.current(borrow k)) {
             Some(v) => v.md5,
             null => [0u8; 16],
         };
-        return Ok(PutOutcome { md5: md5, generation: lsn, parts: truncate<u32>(chosen.length), extras: extrasBlob });
+        return Ok(PutOutcome {
+            md5: md5,
+            generation: lsn,
+            parts: truncate<u32>(chosen.length),
+            extras: extrasBlob,
+            versionId: versionId,
+        });
     }
 
     /// The first answer to the completion of `id`, if its object is still the key's current version.
@@ -2192,18 +2718,21 @@ struct ObjectStore {
         for (c in this.state.completions.view()) {
             if (c.id[..] != id[..] || c.bucket.view() != bucket.bytes() || c.key.view() != key.bytes()) { continue; }
             let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
-            match (this.state.index.get(borrow k)) {
-                Some(v) => {
-                    if (v.lsn == c.generation) {
-                        return Ok(PutOutcome {
-                            md5: v.md5,
-                            generation: v.lsn,
-                            parts: v.parts,
-                            extras: copyBytes(v.extras.view())?,
-                        });
-                    }
+            // The version the completion made, while the key has it: its newest, or, in a bucket with versioning,
+            // one under later versions (ADR-0041).
+            var slot = this.state.index.headSlot(borrow k);
+            while (slot != NO_VERSION_SLOT) {
+                let v = this.state.index.versionAt(slot);
+                if (v.lsn == c.generation && !isDeleteMarker(v)) {
+                    return Ok(PutOutcome {
+                        md5: v.md5,
+                        generation: v.lsn,
+                        parts: v.parts,
+                        extras: copyBytes(v.extras.view())?,
+                        versionId: v.versionId,
+                    });
                 }
-                null => {}
+                slot = this.state.index.olderOf(slot);
             }
             return Ok(null);
         }
@@ -2394,6 +2923,12 @@ struct ObjectStore {
             let entry = index.keyAt(at);
             // Keys are in (bucket, key) order: the first one outside the bucket or the prefix ends the listing.
             if (entry.bucket != first.bucket || !startsWithBytes(entry.key.view(), prefix.bytes())) { break; }
+            // A key whose newest version is a delete marker has no current object (ADR-0041): it is not listed, and
+            // it makes no common prefix.
+            if (isDeleteMarker(index.valueAt(at))) {
+                cursor = index.next(at);
+                continue;
+            }
             let key = entry.key.view();
             var rolled: usize? = null;
             if (delimiter.length > 0) {
@@ -2430,6 +2965,126 @@ struct ObjectStore {
                 }
             }
             returned += 1;
+        }
+        return Ok(page);
+    }
+
+    /// One page of the bucket's versions (ADR-0041), as ListObjectVersions asks: at most `max` versions and common
+    /// prefixes together. It starts after `keyMarker`: after every version of that key, or, with `versionMarker`,
+    /// after that version of it (a key that no longer has the version is passed whole).
+    fn listVersions(
+        borrow this,
+        bucket: StringView,
+        prefix: StringView,
+        delimiter: StringView,
+        keyMarker: Slice<u8>,
+        keyMarkerIsPrefix: bool,
+        versionMarker: [u8; 16]?,
+        max: usize,
+    ) -> Result<VersionPage, StoreError> {
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        let index = borrow this.state.index;
+        var page = VersionPage {
+            versions: Vector<ListedVersion>.create(),
+            commonPrefixes: Vector<Vector<u8>>.create(),
+            truncated: false,
+            nextKey: Vector<u8>.create(),
+            nextVersionId: nullVersionId(),
+            nextIsPrefix: false,
+        };
+        let first = this.state.keyFor(bucket.bytes(), prefix.bytes())?;
+        var cursor = index.seek(borrow first);
+        // The key whose versions the page resumes in, if a version marker names one.
+        var resume: [u8; 16]? = null;
+        if (keyMarker.length > 0) {
+            if (versionMarker.isSome() && !keyMarkerIsPrefix) {
+                resume = versionMarker;
+                let from = this.state.keyFor(bucket.bytes(), keyMarker)?;
+                cursor = laterOf(index, cursor, index.seek(borrow from));
+            } else {
+                cursor = laterOf(index, cursor, seekPast(index, first.bucket, keyMarker, keyMarkerIsPrefix)?);
+            }
+        }
+        var returned: usize = 0;
+        while (true) {
+            let at = match (cursor) {
+                Some(c) => c,
+                null => { break; }
+            };
+            let entry = index.keyAt(at);
+            if (entry.bucket != first.bucket || !startsWithBytes(entry.key.view(), prefix.bytes())) { break; }
+            let key = entry.key.view();
+            var slot = index.slotAt(at);
+            var latest = true;
+            // Resuming in the marker's key: pass its versions up to the marker's.
+            match (resume) {
+                Some(id) => {
+                    resume = null;
+                    if (key == keyMarker) {
+                        while (slot != NO_VERSION_SLOT) {
+                            let passed = index.versionAt(slot).versionId == id;
+                            slot = index.olderOf(slot);
+                            latest = false;
+                            if (passed) { break; }
+                        }
+                        if (slot == NO_VERSION_SLOT) {
+                            cursor = index.next(at);
+                            continue;
+                        }
+                    }
+                }
+                null => {}
+            }
+            var rolled: usize? = null;
+            if (delimiter.length > 0) {
+                match (findBytes(key, delimiter.bytes(), prefix.length)) {
+                    Some(d) => { rolled = d + delimiter.length; }
+                    null => {}
+                }
+            }
+            if (returned == max) {
+                page.truncated = true;
+                break;
+            }
+            match (rolled) {
+                Some(end) => {
+                    let cp = key[0..end];
+                    page.commonPrefixes.push(copyBytes(cp)?)?;
+                    page.nextKey.clear();
+                    page.nextKey.extend(cp)?;
+                    page.nextIsPrefix = true;
+                    cursor = seekPast(index, first.bucket, cp, true)?;
+                    returned += 1;
+                }
+                null => {
+                    while (slot != NO_VERSION_SLOT) {
+                        if (returned == max) {
+                            page.truncated = true;
+                            break;
+                        }
+                        let v = index.versionAt(slot);
+                        page.versions.push(ListedVersion {
+                            key: copyBytes(key)?,
+                            versionId: v.versionId,
+                            latest: latest,
+                            deleteMarker: isDeleteMarker(v),
+                            size: v.size,
+                            mtimeMillis: v.mtimeMillis,
+                            md5: v.md5,
+                            parts: v.parts,
+                        })?;
+                        page.nextKey.clear();
+                        page.nextKey.extend(key)?;
+                        page.nextVersionId = v.versionId;
+                        page.nextIsPrefix = false;
+                        returned += 1;
+                        latest = false;
+                        slot = index.olderOf(slot);
+                    }
+                    if (page.truncated) { break; }
+                    cursor = index.next(at);
+                }
+            }
         }
         return Ok(page);
     }
@@ -2603,20 +3258,27 @@ struct ObjectStore {
             cursor = this.state.index.next(i);
             seen += 1;
             let k = this.state.index.keyAt(i);
-            let v = this.state.index.valueAt(i);
             if (seen == max) { last = copyIndexKey(k)?; }
-            if (v.extents.length != 0 || !job.chosen.contains(borrow v.recordSegment)) { continue; }
-            job.plan.push(Relocation {
-                bucket: copyBytes(this.state.bucketName(k.bucket))?,
-                key: copyBytes(k.key.view())?,
-                versionId: v.versionId,
-                generation: v.lsn,
-                segment: v.recordSegment,
-                recordOffset: v.payload.offset +
-                    v.payload.length as u64 + RECORD_TRAILER_LEN as u64 - v.recordLength as u64,
-                recordLength: v.recordLength,
-                payloadLength: v.payload.length,
-            })?;
+            // Every version of the key, current or not: a noncurrent inline version's record is live too.
+            var slot = this.state.index.slotAt(i);
+            while (slot != NO_VERSION_SLOT) {
+                let v = this.state.index.versionAt(slot);
+                slot = this.state.index.olderOf(slot);
+                if (v.extents.length != 0 || isDeleteMarker(v) || !job.chosen.contains(borrow v.recordSegment)) {
+                    continue;
+                }
+                job.plan.push(Relocation {
+                    bucket: copyBytes(this.state.bucketName(k.bucket))?,
+                    key: copyBytes(k.key.view())?,
+                    versionId: v.versionId,
+                    generation: v.lsn,
+                    segment: v.recordSegment,
+                    recordOffset: v.payload.offset +
+                        v.payload.length as u64 + RECORD_TRAILER_LEN as u64 - v.recordLength as u64,
+                    recordLength: v.recordLength,
+                    payloadLength: v.payload.length,
+                })?;
+            }
         }
         let finished = cursor.isNull();
         job.planned = last;
@@ -2774,6 +3436,7 @@ struct ObjectStore {
         this.checkWritable()?;
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         if (value.length > 1048576) { return Err(StoreError.MetadataTooLarge); }
+        if (kind == BUCKET_CONFIG_VERSIONING && !isVersioningValue(value)) { return Err(StoreError.InvalidKey); }
         this.scratch.clear();
         encodeBucketConfigMeta(mut this.scratch, bucket.bytes(), kind, value)?;
         let empty = [0u8; 1];
@@ -2781,11 +3444,18 @@ struct ObjectStore {
         return Ok();
     }
 
-    /// A bucket's tags or lifecycle rules, as stored; empty for none.
+    /// A bucket's tags or lifecycle rules, as stored, or its versioning state as one byte; empty for none.
     fn bucketConfig(borrow this, bucket: StringView, kind: u8) -> Result<Vector<u8>, StoreError> {
         let k = BucketKey { name: copyBytes(bucket.bytes())? };
         return match (this.state.buckets.get(borrow k)) {
-            Some(b) => Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?),
+            Some(b) => {
+                if (kind == BUCKET_CONFIG_VERSIONING) {
+                    var state = Vector<u8>.create();
+                    if (b.versioning != VERSIONING_OFF) { state.push(b.versioning)?; }
+                    return Ok(state);
+                }
+                Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?)
+            }
             null => Err(StoreError.NoSuchBucket),
         };
     }
@@ -2817,6 +3487,13 @@ struct ObjectStore {
             // The bucket's keys are one run of the index: from its first key to the next bucket's.
             let start = this.state.keyFor(bucketName, "".bytes())?;
             var cursor = this.state.index.seek(borrow start);
+            // A versioned bucket's objects are not expired until there are noncurrent-version rules (ADR-0041 §9); its
+            // uploads still are.
+            let versioned = match (this.state.buckets.get(borrow k)) {
+                Some(b) => b.versioning != VERSIONING_OFF,
+                null => false,
+            };
+            if (versioned) { cursor = null; }
             while (true) {
                 let i = match (cursor) {
                     Some(c) => c,
@@ -2971,6 +3648,27 @@ struct ObjectStore {
     };
 
     /// (total, live) bytes of a segment.
+    /// The record bytes of every inline version, current or not: what the segments' live bytes must add up to, no
+    /// more and no less (for tests of the accounting).
+    fn inlineRecordBytes(borrow this) -> u64 {
+        var total: u64 = 0;
+        var cursor = this.state.index.first();
+        while (true) {
+            let i = match (cursor) {
+                Some(c) => c,
+                null => { break; }
+            };
+            cursor = this.state.index.next(i);
+            var slot = this.state.index.slotAt(i);
+            while (slot != NO_VERSION_SLOT) {
+                let v = this.state.index.versionAt(slot);
+                if (v.extents.length == 0 && !isDeleteMarker(v)) { total += v.recordLength as u64; }
+                slot = this.state.index.olderOf(slot);
+            }
+        }
+        return total;
+    }
+
     fn segmentUsage(borrow this, segment: u64) -> SegmentUsage => match (this.state.segments.get(borrow segment)) {
         Some(u) => SegmentUsage { totalBytes: u.totalBytes, liveBytes: u.liveBytes },
         null => SegmentUsage { totalBytes: 0, liveBytes: 0 },
@@ -3087,6 +3785,7 @@ fn encodePut(
     contentType: StringView,
     metadata: Slice<u8>,
     extras: Slice<u8>,
+    versionId: [u8; 16],
     obj: borrow FinishedObject,
 ) -> Result<EncodedPut, StoreError> {
     var meta = Vector<u8>.create();
@@ -3094,7 +3793,7 @@ fn encodePut(
         mut meta,
         bucket.bytes(),
         key.bytes(),
-        nullVersionId(),
+        versionId,
         Clock.unixMillis(),
         obj.size,
         obj.md5,

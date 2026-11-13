@@ -1,0 +1,876 @@
+// The versions of a key (ADR-0041): chains in the index, what the records mean, checkpoint format 6, compaction and
+// verify over noncurrent versions, a crash at every byte, and the fault sweeps.
+
+fn setVersioning(s: borrow mut ObjectStore, bucket: StringView, state: u8) {
+    var value = [0u8; 1];
+    value[0] = state;
+    s.setBucketConfig(bucket, BUCKET_CONFIG_VERSIONING, value[..])!;
+}
+
+/// One version as text: its generation, then `m` for a delete marker and `n` for the null id.
+fn appendVersionText(out: borrow mut Vector<u8>, generation: u64, marker: bool, versionId: [u8; 16]) {
+    appendDecimal(out, generation)!;
+    if (marker) { out.push('m')!; }
+    if (isNullVersionId(versionId)) { out.push('n')!; }
+}
+
+/// A key's versions, newest first, separated by spaces.
+fn chainText(s: borrow ObjectStore, bucket: StringView, key: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    let versions = s.versionsOf(bucket, key)!;
+    for (i in 0..versions.length) {
+        if (i > 0) { out.push(' ')!; }
+        appendVersionText(mut out, versions[i].generation, versions[i].deleteMarker, versions[i].versionId);
+    }
+    return out;
+}
+
+/// "key:chain" lines of the keys of `bucket` among `keys` that have a version.
+fn chainsOf(s: borrow ObjectStore, bucket: StringView, keys: Slice<StringView>) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    for (i in 0..keys.length) {
+        let chain = chainText(s, bucket, keys[i]);
+        if (chain.length == 0) { continue; }
+        out.extend(keys[i].bytes())!;
+        out.push(':')!;
+        out.extend(chain.view())!;
+        out.push('\n')!;
+    }
+    return out;
+}
+
+/// The same lines for every key a loaded checkpoint holds (one bucket), in key order.
+fn checkpointChains(dir: StringView, lsn: u64) -> Vector<u8> {
+    let loaded = readCheckpoint(dir, lsn)!;
+    var out = Vector<u8>.create();
+    var cursor = loaded.state.index.first();
+    while (true) {
+        let i = match (cursor) {
+            Some(c) => c,
+            null => { break; }
+        };
+        cursor = loaded.state.index.next(i);
+        out.extend(loaded.state.index.keyAt(i).key.view())!;
+        out.push(':')!;
+        var slot = loaded.state.index.slotAt(i);
+        var first = true;
+        while (slot != NO_VERSION_SLOT) {
+            let v = loaded.state.index.versionAt(slot);
+            if (!first) { out.push(' ')!; }
+            first = false;
+            appendVersionText(mut out, v.lsn, isDeleteMarker(v), v.versionId);
+            slot = loaded.state.index.olderOf(slot);
+        }
+        out.push('\n')!;
+    }
+    return out;
+}
+
+fn putVersion(s: borrow mut ObjectStore, bucket: StringView, key: StringView, body: StringView) -> PutOutcome =>
+    s.putObject(bucket, key, "text/plain", body.bytes(), PutCondition.None)!;
+
+fn expectNoSuchKey(r: Result<ObjectInfo, StoreError>) -> Result<void, TestFailure> => match (r) {
+    Err(StoreError.NoSuchKey) => Ok(),
+    _ => Check.fail("the key has no current object"),
+};
+
+@test
+fn versionsEnabledKeepEveryPut() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("versions-enabled");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    let g0 = putText(mut s, "bkt", "k", "v0");
+    Check.equalU64(0, s.bucketConfig("bkt", BUCKET_CONFIG_VERSIONING)!.length as u64)?;
+    setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+    Check.equalU64(VERSIONING_ENABLED as u64, s.bucketConfig("bkt", BUCKET_CONFIG_VERSIONING)![0] as u64)?;
+    let p1 = putVersion(mut s, "bkt", "k", "v1");
+    let p2 = putVersion(mut s, "bkt", "k", "v2");
+    Check.isTrue(!isNullVersionId(p1.versionId) && !isNullVersionId(p2.versionId), "new ids")?;
+    Check.isTrue(p1.versionId[..] != p2.versionId[..], "each its own")?;
+    // Newest first; the object from before versioning is the null version.
+    let versions = s.versionsOf("bkt", "k")!;
+    Check.equalU64(3, versions.length as u64)?;
+    Check.equalU64(p2.generation, versions[0].generation)?;
+    Check.equalBytes(p2.versionId[..], versions[0].versionId[..])?;
+    Check.equalU64(p1.generation, versions[1].generation)?;
+    Check.equalU64(g0, versions[2].generation)?;
+    Check.isTrue(isNullVersionId(versions[2].versionId), "the null version")?;
+    checkText("v2", s.getObject("bkt", "k")!)?;
+    checkText("v1", s.getObjectVersion("bkt", "k", p1.versionId)!)?;
+    checkText("v0", s.getObjectVersion("bkt", "k", nullVersionId())!)?;
+    Check.equalBytes(p1.versionId[..], s.headVersion("bkt", "k", p1.versionId)!.versionId[..])?;
+    Check.equalU64(1, s.objectCount() as u64)?;
+    // A delete adds a marker: the key has no current object, and every version is still there.
+    let marker = match (s.deleteCurrent("bkt", "k")!) {
+        Some(id) => id,
+        null => { return Check.fail("a delete in a versioned bucket writes a marker"); }
+    };
+    expectNoSuchKey(s.headObject("bkt", "k"))?;
+    Check.equalU64(0, s.listObjects("bkt", "", "", "".bytes(), false, 100)!.keys.length as u64)?;
+    let withMarker = s.versionsOf("bkt", "k")!;
+    Check.equalU64(4, withMarker.length as u64)?;
+    Check.isTrue(withMarker[0].deleteMarker, "the marker is the newest version")?;
+    checkText("v2", s.getObjectVersion("bkt", "k", p2.versionId)!)?;
+    match (s.headVersion("bkt", "k", marker)) {
+        Err(StoreError.MethodNotAllowed) => {}
+        _ => { return Check.fail("a delete marker has nothing to read"); }
+    }
+    var unknown = marker;
+    unknown[0] = unknown[0] ^ 255;
+    match (s.headVersion("bkt", "k", unknown)) {
+        Err(StoreError.NoSuchVersion) => {}
+        _ => { return Check.fail("no such version"); }
+    }
+    // A conditional create sees no object under the marker.
+    let p3 = s.putObject("bkt", "k", "text/plain", "v3".bytes(), PutCondition.IfAbsent)!;
+    checkText("v3", s.getObject("bkt", "k")!)?;
+    match (s.deleteVersion("bkt", "k", p3.versionId)!) {
+        Some(VersionKind.Object) => {}
+        _ => { return Check.fail("an object version removed"); }
+    }
+    expectNoSuchKey(s.headObject("bkt", "k"))?;
+    // Removing the marker brings the object back; removing the newest version shows the one before.
+    match (s.deleteVersion("bkt", "k", marker)!) {
+        Some(VersionKind.DeleteMarker) => {}
+        _ => { return Check.fail("a marker removed"); }
+    }
+    checkText("v2", s.getObject("bkt", "k")!)?;
+    Check.equalU64(1, s.listObjects("bkt", "", "", "".bytes(), false, 100)!.keys.length as u64)?;
+    let _ = s.deleteVersion("bkt", "k", p2.versionId)!;
+    checkText("v1", s.getObject("bkt", "k")!)?;
+    Check.isTrue(s.deleteVersion("bkt", "k", p2.versionId)!.isNull(), "a version is removed once")?;
+    // A bucket is empty only without versions.
+    match (s.deleteBucket("bkt")) {
+        Err(StoreError.BucketNotEmpty) => {}
+        _ => { return Check.fail("versions keep the bucket"); }
+    }
+    let _ = s.deleteVersion("bkt", "k", p1.versionId)!;
+    let _ = s.deleteVersion("bkt", "k", nullVersionId())!;
+    Check.equalU64(0, s.versionsOf("bkt", "k")!.length as u64)?;
+    Check.equalU64(0, s.objectCount() as u64)?;
+    s.deleteBucket("bkt")!;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn versionsSuspendedReplaceTheNullVersion() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("versions-suspended");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+    let a = putVersion(mut s, "bkt", "k", "a");
+    setVersioning(mut s, "bkt", VERSIONING_SUSPENDED);
+    // Suspended: writes carry the null id, and replace the null version only.
+    let b = putVersion(mut s, "bkt", "k", "b");
+    Check.isTrue(isNullVersionId(b.versionId), "the null id")?;
+    Check.equalU64(2, s.versionsOf("bkt", "k")!.length as u64)?;
+    let c = putVersion(mut s, "bkt", "k", "c");
+    let afterC = s.versionsOf("bkt", "k")!;
+    Check.equalU64(2, afterC.length as u64)?;
+    Check.equalU64(c.generation, afterC[0].generation)?;
+    Check.equalU64(a.generation, afterC[1].generation)?;
+    checkText("c", s.getObject("bkt", "k")!)?;
+    checkText("a", s.getObjectVersion("bkt", "k", a.versionId)!)?;
+    // A delete writes a null marker, which replaces the null version.
+    match (s.deleteCurrent("bkt", "k")!) {
+        Some(id) => { Check.isTrue(isNullVersionId(id), "a null marker")?; }
+        null => { return Check.fail("a marker"); }
+    }
+    let afterDelete = s.versionsOf("bkt", "k")!;
+    Check.equalU64(2, afterDelete.length as u64)?;
+    Check.isTrue(afterDelete[0].deleteMarker && isNullVersionId(afterDelete[0].versionId), "the null marker")?;
+    expectNoSuchKey(s.headObject("bkt", "k"))?;
+    // The null version below a newer one is replaced where it is.
+    setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+    let d = putVersion(mut s, "bkt", "k", "d");
+    setVersioning(mut s, "bkt", VERSIONING_SUSPENDED);
+    let e = putVersion(mut s, "bkt", "k", "e");
+    let last = s.versionsOf("bkt", "k")!;
+    Check.equalU64(3, last.length as u64)?;
+    Check.equalU64(e.generation, last[0].generation)?;
+    Check.equalU64(d.generation, last[1].generation)?;
+    Check.equalU64(a.generation, last[2].generation)?;
+    // Versioning is never off again.
+    var off = [0u8; 1];
+    match (s.setBucketConfig("bkt", BUCKET_CONFIG_VERSIONING, off[..])) {
+        Err(_) => {}
+        Ok() => { return Check.fail("a bucket is never unversioned again"); }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// The versioned bucket's state for the recovery test: chains, and what the versions hold.
+fn recoveryState(s: borrow ObjectStore, big: [u8; 16]) -> Vector<u8> {
+    let keys = ["a", "b", "c"];
+    var out = chainsOf(s, "ver", keys[..]);
+    let a = s.versionsOf("ver", "a")!;
+    for (i in 0..a.length) {
+        out.extend(s.getObjectVersion("ver", "a", a[i].versionId)!.view()[0..2])!;
+    }
+    let bytes = s.getObjectVersion("ver", "a", big)!;
+    let digest = Md5.of(bytes.view());
+    out.extend(digest[..])!;
+    out.extend(s.getObject("plain", "x")!.view())!;
+    return out;
+}
+
+/// The live bytes of every segment together: the records that must be copied before their segments can go.
+fn liveBytes(s: borrow ObjectStore) -> u64 {
+    var total: u64 = 0;
+    for (id in s.segmentIds().view()) { total += s.segmentUsage(id).liveBytes; }
+    return total;
+}
+
+@test
+fn versionsSurviveRecoveryCheckpointAndCompaction() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("versions-recovery");
+    var before = Vector<u8>.create();
+    var big = [0u8; 16];
+    var objects: u64 = 0;
+    var live: u64 = 0;
+    {
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        s.createBucket("ver")!;
+        s.createBucket("plain")!;
+        setVersioning(mut s, "ver", VERSIONING_ENABLED);
+        let _ = putVersion(mut s, "ver", "a", "a1");
+        let data = patterned(150000, 3);
+        big = s.putObject("ver", "a", "application/octet-stream", data.view(), PutCondition.None)!.versionId;
+        let _ = putVersion(mut s, "ver", "a", "a3");
+        let _ = putVersion(mut s, "ver", "b", "b1");
+        s.deleteObject("ver", "b")!;
+        let _ = putVersion(mut s, "ver", "c", "c1");
+        let c2 = putVersion(mut s, "ver", "c", "c2");
+        let _ = putVersion(mut s, "ver", "c", "c3");
+        let _ = s.deleteVersion("ver", "c", c2.versionId)!;
+        // A marker written and removed again: it never held a live record.
+        let gone = s.deleteCurrent("ver", "c")! ?? nullVersionId();
+        let _ = s.deleteVersion("ver", "c", gone)!;
+        Check.equalU64(s.inlineRecordBytes(), liveBytes(borrow s))?;
+        // Garbage, so the first segments are mostly dead and compaction takes them.
+        for (i in 0u64..120) { putText(mut s, "plain", "x", twoDigit("overwritten ", i % 100).view()); }
+        objects = 3 + 1 + 2 + 1; // a's three, b's one (its marker holds nothing), c's two, plain/x
+        before = recoveryState(borrow s, big);
+    }
+    {
+        // The journal alone.
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        Check.equalBytes(before.view(), recoveryState(borrow s, big).view())?;
+        Check.isTrue(s.checkpoint()!, "a checkpoint")?;
+        live = liveBytes(borrow s);
+    }
+    {
+        // A checkpoint (format 6), then compaction: the noncurrent inline versions' records are live and move.
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        Check.equalBytes(before.view(), recoveryState(borrow s, big).view())?;
+        // A noncurrent inline version's record is live after a checkpoint is loaded, as it was before.
+        Check.equalU64(live, liveBytes(borrow s))?;
+        Check.equalU64(s.inlineRecordBytes(), live)?;
+        let first = s.compact(1073741824)!;
+        Check.isTrue(first.relocated >= 2, "noncurrent inline versions are copied")?;
+        Check.isTrue(first.segmentsRemoved > 0, "their segments go")?;
+        var firstSegment = false;
+        for (id in s.segmentIds().view()) {
+            if (id == 1) { firstSegment = true; }
+        }
+        Check.isTrue(!firstSegment, "the first segment is gone")?;
+        Check.equalBytes(before.view(), recoveryState(borrow s, big).view())?;
+        let _ = s.checkpoint()!;
+        let _ = s.compact(1073741824)!;
+    }
+    let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+    Check.equalBytes(before.view(), recoveryState(borrow s, big).view())?;
+    Check.equalU64(s.inlineRecordBytes(), liveBytes(borrow s))?;
+    let report = s.verify()!;
+    Check.equalU64(0, report.problems.length as u64)?;
+    Check.equalU64(0, report.orphanExtents as u64)?;
+    Check.equalU64(objects, report.objects)?;
+    // Three extents: the big noncurrent version's, and nothing else.
+    Check.equalU64(3, extentFiles(dir.view()))?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn steppedCheckpointHoldsChainsAtItsLsn() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("versions-stepped");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+    let keys = ["k00", "k01", "k02", "k03", "k04", "k05", "k055", "k06", "k07", "k08", "k09", "k10", "k11"];
+    var newest = Vector<[u8; 16]>.create();
+    var oldest = Vector<[u8; 16]>.create();
+    for (i in 0..keys.length) {
+        if (i == 6) {
+            // k055 comes later.
+            newest.push(nullVersionId())!;
+            oldest.push(nullVersionId())!;
+            continue;
+        }
+        oldest.push(putVersion(mut s, "bkt", keys[i], "v0").versionId)!;
+        newest.push(putVersion(mut s, "bkt", keys[i], "v1").versionId)!;
+    }
+    s.deleteObject("bkt", "k11")!;
+    let atLsn = chainsOf(borrow s, "bkt", keys[..]);
+    var job = match (s.beginCheckpoint()!) {
+        Some(j) => j,
+        null => { return Check.fail("a checkpoint is due"); }
+    };
+    // The first keys are written; then chains change behind the walk and ahead of it.
+    Check.isTrue(!step(mut s, mut job), "more to come")?;
+    let _ = putVersion(mut s, "bkt", "k00", "behind");
+    let _ = s.deleteVersion("bkt", "k01", oldest[1])!;
+    let _ = putVersion(mut s, "bkt", "k08", "ahead");
+    s.deleteObject("bkt", "k08")!;
+    let _ = s.deleteVersion("bkt", "k09", newest[10])!;
+    let _ = s.deleteVersion("bkt", "k10", newest[11])!;
+    let _ = s.deleteVersion("bkt", "k10", oldest[11])!;
+    let _ = putVersion(mut s, "bkt", "k055", "new, ahead");
+    let _ = putVersion(mut s, "bkt", "k055", "twice");
+    Check.isTrue(!step(mut s, mut job), "more to come")?;
+    let _ = putVersion(mut s, "bkt", "k10", "gone, then back");
+    let _ = s.deleteVersion("bkt", "k11", oldest[12])!;
+    while (!step(mut s, mut job)) {}
+    let size = job.publish()!;
+    s.checkpointPublished(borrow job, size);
+    let inFile = checkpointChains(dir.view(), job.lsn);
+    if (inFile.view() != atLsn.view()) {
+        Console.writeLine(StringView.fromUtf8(atLsn.view()) ?? "");
+        Console.writeLine(StringView.fromUtf8(inFile.view()) ?? "");
+        return Check.fail("the checkpoint holds every chain as it was at its LSN");
+    }
+    // And recovery from it, with the journal after it, gives the state now.
+    let now = chainsOf(borrow s, "bkt", keys[..]);
+    Check.isTrue(now.view() != atLsn.view(), "the store went on")?;
+    let reopened = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalBytes(now.view(), chainsOf(borrow reopened, "bkt", keys[..]).view())?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn versionedCrashAtEveryByteIsConsistent() -> Result<void, TestFailure> {
+    // As `storeCrashAtEveryByteIsConsistent`, for a key's chain: after every cut, the chain is what the records
+    // that were wholly durable make.
+    let source = scratchDirectory("versions-crash-source");
+    {
+        var s = ObjectStore.open(source.view(), storeConfig())!;
+        s.createBucket("bkt")!;                                       // record 1
+        setVersioning(mut s, "bkt", VERSIONING_ENABLED);              // 2
+        let _ = putVersion(mut s, "bkt", "k", "one");                 // 3
+        let _ = putVersion(mut s, "bkt", "k", "two");                 // 4
+        let marker = s.deleteCurrent("bkt", "k")! ?? nullVersionId(); // 5
+        let _ = s.deleteVersion("bkt", "k", marker)!;                 // 6
+        setVersioning(mut s, "bkt", VERSIONING_SUSPENDED);            // 7
+        let _ = putVersion(mut s, "bkt", "k", "three");               // 8: the null version
+        s.deleteObject("bkt", "k")!;                                  // 9: a null marker in its place
+    }
+    let segment = segmentPath(source.view(), 1)!;
+    let whole = readWhole(segment.view());
+    let dir = scratchDirectory("versions-crash");
+    let target = segmentPath(dir.view(), 1)!;
+    let lengths = [0u64, 0, 0, 1, 2, 3, 2, 2, 3, 3];
+    let current = ["", "", "", "one", "two", "", "two", "two", "three", ""];
+    var last: u64 = 0;
+    for (cut in SEGMENT_HEADER_LEN..whole.length + 1) {
+        writeWhole(target.view(), whole.view()[0..cut]);
+        let s = ObjectStore.open(dir.view(), storeConfig())!;
+        let records = s.recordsApplied();
+        Check.isTrue(records >= last, "recovery never goes backwards as the cut grows")?;
+        last = records;
+        if (records == 0) { continue; }
+        let n = records as usize;
+        let versions = s.versionsOf("bkt", "k")!;
+        Check.equalU64(lengths[n], versions.length as u64)?;
+        match (s.getObject("bkt", "k")) {
+            Ok(v) => { Check.equalText(current[n], text(borrow v))?; }
+            Err(StoreError.NoSuchKey) => { Check.equalU64(0, current[n].length as u64)?; }
+            Err(_) => { return Check.fail("unexpected error"); }
+        }
+        let state = s.bucketConfig("bkt", BUCKET_CONFIG_VERSIONING)!;
+        let expected = if (records >= 7) VERSIONING_SUSPENDED else if (records >= 2) VERSIONING_ENABLED
+            else VERSIONING_OFF;
+        Check.equalU64(expected as u64, if (state.length == 0) 0 else state[0] as u64)?;
+        if (records == 9) {
+            Check.isTrue(versions[0].deleteMarker && isNullVersionId(versions[0].versionId), "the null marker")?;
+        }
+    }
+    Check.equalU64(9, last)?;
+    removeTree(source.view());
+    removeTree(dir.view());
+    return Ok();
+}
+
+// ---- The fault sweep ----
+//
+// One key in a versioned bucket. Each step either was acknowledged (it must show), failed with a journal I/O error
+// (it may show), or did not happen. After reopening, the key's chain, oldest first, must be the acknowledged steps
+// in their order, with any of the uncertain ones between them.
+
+const VSTEPS: usize = 8;
+const V_ABSENT: u8 = 0;
+const V_ACKED: u8 = 1;
+const V_MAYBE: u8 = 2;
+
+/// What step `i` writes: a seed's object, or 0 for a delete marker. Steps 6 and 7 are written with versioning
+/// suspended: null versions, the second replacing the first.
+fn stepSeed(i: usize) -> u64 => match (i) {
+    0 => 1,
+    1 => 2,
+    2 => 0,
+    3 => 7,
+    4 => 8,
+    5 => 5,
+    6 => 3,
+    _ => 6,
+};
+
+struct VersionModel {
+    wrote: [u8; 8];
+    /// The permanent delete of step 1's version: V_ACKED, V_MAYBE, or V_ABSENT.
+    removed: u8;
+
+    fn note(borrow mut this, i: usize, r: Result<void, StoreError>) {
+        match (r) {
+            Ok() => { this.wrote[i] = V_ACKED; }
+            Err(e) => {
+                if (mayBeDurable(borrow e)) { this.wrote[i] = V_MAYBE; }
+            }
+        }
+    }
+}
+
+fn putVersionStep(s: borrow mut ObjectStore, i: usize) -> Result<[u8; 16], StoreError> {
+    let seed = stepSeed(i);
+    let data = patterned(seedSize(seed), seed);
+    return Ok(s.putObject("bkt", "k", "application/octet-stream", data.view(), PutCondition.None)?.versionId);
+}
+
+fn putStepOnly(s: borrow mut ObjectStore, i: usize) -> Result<void, StoreError> {
+    let _ = putVersionStep(s, i)?;
+    return Ok();
+}
+
+fn configStep(s: borrow mut ObjectStore, state: u8) -> Result<void, StoreError> {
+    var value = [0u8; 1];
+    value[0] = state;
+    return s.setBucketConfig("bkt", BUCKET_CONFIG_VERSIONING, value[..]);
+}
+
+/// Runs the versioned workload, noting in `m` what each step's outcome allows. A step that fails ends it: what
+/// follows would depend on whether it took effect.
+fn versionWorkload(dir: StringView, m: borrow mut VersionModel) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    if (s.createBucket("bkt").isErr()) { return; }
+    if (configStep(mut s, VERSIONING_ENABLED).isErr()) { return; }
+    m.note(0, putStepOnly(mut s, 0));
+    if (m.wrote[0] != V_ACKED) { return; }
+    let second = match (putVersionStep(mut s, 1)) {
+        Ok(id) => {
+            m.wrote[1] = V_ACKED;
+            id
+        }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.wrote[1] = V_MAYBE; }
+            return;
+        }
+    };
+    m.note(2, s.deleteObject("bkt", "k"));
+    if (m.wrote[2] != V_ACKED) { return; }
+    m.note(3, putStepOnly(mut s, 3));
+    if (m.wrote[3] != V_ACKED) { return; }
+    // By the batch path, as the S3 layer removes a version (`deleteMany`).
+    var targets = Vector<DeleteTarget>.create();
+    if (targets.push(DeleteTarget { key: copyBytes("k".bytes())!, versionId: second }).isErr()) { return; }
+    match (s.deleteMany("bkt", targets.view())) {
+        Ok(_) => { m.removed = V_ACKED; }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.removed = V_MAYBE; }
+            return;
+        }
+    }
+    m.note(4, putStepOnly(mut s, 4));
+    if (m.wrote[4] != V_ACKED) { return; }
+    m.note(5, putStepOnly(mut s, 5));
+    if (m.wrote[5] != V_ACKED) { return; }
+    if (configStep(mut s, VERSIONING_SUSPENDED).isErr()) { return; }
+    m.note(6, putStepOnly(mut s, 6));
+    if (m.wrote[6] != V_ACKED) { return; }
+    m.note(7, putStepOnly(mut s, 7));
+}
+
+/// Which step a version is: by its size, or the marker.
+fn stepOf(v: borrow VersionEntry) -> usize {
+    if (v.deleteMarker) { return 2; }
+    for (i in 0..VSTEPS) {
+        if (stepSeed(i) != 0 && seedSize(stepSeed(i)) as u64 == v.size) { return i; }
+    }
+    return VSTEPS;
+}
+
+/// Checks the reopened store's chain against the model; returns the extents its versions need.
+fn checkVersions(s: borrow ObjectStore, m: borrow VersionModel) -> Result<u64, TestFailure> {
+    if (!s.bucketExists("bkt")!) { return Ok(0); }
+    let versions = s.versionsOf("bkt", "k")!;
+    var present = [false; 8];
+    var extents: u64 = 0;
+    var next: usize = 0;
+    var i = versions.length;
+    while (i > 0) {
+        i -= 1; // oldest first
+        let step = stepOf(borrow versions[i]);
+        Check.isTrue(step < VSTEPS, "every version is one the workload wrote")?;
+        Check.isTrue(step >= next, "versions are in the order they were written")?;
+        Check.isTrue(m.wrote[step] != V_ABSENT, "a version that was never written is not there")?;
+        present[step] = true;
+        next = step + 1;
+        extents += seedExtents(stepSeed(step));
+        if (!versions[i].deleteMarker) {
+            let bytes = s.getObjectVersion("bkt", "k", versions[i].versionId)!;
+            Check.isTrue(
+                bytes.view() == patterned(seedSize(stepSeed(step)), stepSeed(step)).view(),
+                "a version holds its bytes",
+            )?;
+        }
+    }
+    for (step in 0..VSTEPS) {
+        if (m.wrote[step] != V_ACKED) { continue; }
+        // Step 1's version was removed for good if that was acknowledged; step 6's null version is replaced by
+        // step 7's when that one is there.
+        if (step == 1 && m.removed != V_ABSENT) {
+            if (m.removed == V_ACKED) { Check.isTrue(!present[1], "a removed version stays removed")?; }
+            continue;
+        }
+        if (step == 6 && present[7]) {
+            Check.isTrue(!present[6], "one null version at a time")?;
+            continue;
+        }
+        Check.isTrue(present[step], "an acknowledged version is there")?;
+    }
+    Check.isTrue(!(present[6] && present[7]), "one null version at a time")?;
+    return Ok(extents);
+}
+
+fn sweepVersions(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    var clean = VersionModel { wrote: [0u8; 8], removed: V_ABSENT };
+    Faults.countOperations();
+    versionWorkload(dir.view(), mut clean);
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 40, "the workload performs I/O")?;
+    for (i in 0..VSTEPS) { Check.equalU64(V_ACKED as u64, clean.wrote[i] as u64)?; }
+    var furthest: usize = 0;
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        var m = VersionModel { wrote: [0u8; 8], removed: V_ABSENT };
+        armMode(borrow mode, n);
+        versionWorkload(dir.view(), mut m);
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired().min(1))?;
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        var chain = Vector<u8>.create();
+        {
+            var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+            let extents = checkVersions(borrow s, borrow m)?;
+            // Exactly the versions' extents, current or not: none missing, no orphans.
+            Check.equalU64(extents, extentFiles(dir.view()))?;
+            let report = s.verify()!;
+            Check.equalU64(0, report.orphanExtents as u64)?;
+            Check.equalU64(0, report.problems.length as u64)?;
+            if (s.bucketExists("bkt")!) { chain = chainText(borrow s, "bkt", "k"); }
+            // Maintenance on the recovered store keeps every version.
+            let _ = s.compact(1073741824)!;
+            let _ = s.checkpoint()!;
+            let _ = s.compact(1073741824)!;
+        }
+        let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        if (s.bucketExists("bkt")!) {
+            Check.equalBytes(chain.view(), chainText(borrow s, "bkt", "k").view())?;
+            Check.equalU64(0, s.verify()!.problems.length as u64)?;
+        }
+        var reached: usize = 0;
+        for (i in 0..VSTEPS) {
+            if (m.wrote[i] == V_ACKED) { reached += 1; }
+        }
+        if (reached > furthest) { furthest = reached; }
+    }
+    Check.isTrue(furthest + 1 >= VSTEPS, "some faulted runs got through most of the workload")?;
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn versionFaultsOnce() -> Result<void, TestFailure> => sweepVersions("vfault-once", SweepMode.Once);
+
+@test
+fn versionFaultsSticky() -> Result<void, TestFailure> => sweepVersions("vfault-sticky", SweepMode.Sticky);
+
+@test
+fn versionFaultsTorn() -> Result<void, TestFailure> => sweepVersions("vfault-torn", SweepMode.StickyTorn);
+
+@test
+fn versionFaultsCrash() -> Result<void, TestFailure> => sweepVersions("vfault-crash", SweepMode.Crash);
+
+/// A page of versions as text: `key:generation` with `m` for a delete marker, `n` for the null id and `L` for the
+/// latest, then the common prefixes as `P:prefix`, each followed by a space.
+fn pageText(page: borrow VersionPage, out: borrow mut Vector<u8>) {
+    for (i in 0..page.versions.length) {
+        let v = borrow page.versions[i];
+        out.extend(v.key.view())!;
+        out.push(':')!;
+        appendVersionText(out, 0, v.deleteMarker, v.versionId);
+        if (v.latest) { out.push('L')!; }
+        out.push(' ')!;
+    }
+    for (i in 0..page.commonPrefixes.length) {
+        out.extend("P:".bytes())!;
+        out.extend(page.commonPrefixes[i].view())!;
+        out.push(' ')!;
+    }
+}
+
+/// Every page of at most `max` entries, each started at the one before's markers, as one text.
+fn pagedText(s: borrow ObjectStore, prefix: StringView, delimiter: StringView, max: usize) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    var key = Vector<u8>.create();
+    var isPrefix = false;
+    var version: [u8; 16]? = null;
+    var pages: usize = 0;
+    while (true) {
+        let page = s.listVersions("bkt", prefix, delimiter, key.view(), isPrefix, version, max)!;
+        pageText(borrow page, mut out);
+        pages += 1;
+        if (!page.truncated || pages > 100) { break; }
+        key.clear();
+        key.extend(page.nextKey.view())!;
+        isPrefix = page.nextIsPrefix;
+        version = if (page.nextIsPrefix) null else Some(page.nextVersionId);
+    }
+    return out;
+}
+
+@test
+fn versionsListInPages() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("versions-list");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    s.createBucket("other")!;
+    let _ = putVersion(mut s, "bkt", "a", "null version"); // before versioning: the null id
+    setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+    let a2 = putVersion(mut s, "bkt", "a", "two");
+    let _ = putVersion(mut s, "bkt", "a", "three");
+    let _ = putVersion(mut s, "bkt", "b", "one");
+    s.deleteObject("bkt", "b")!;
+    let _ = putVersion(mut s, "bkt", "p/x", "one");
+    let _ = putVersion(mut s, "bkt", "p/y", "one");
+    let _ = putVersion(mut s, "bkt", "p/y", "two");
+    let _ = putVersion(mut s, "bkt", "q", "one");
+    let _ = putVersion(mut s, "other", "a", "elsewhere");
+
+    // Keys in order, each key's versions newest first, the first of each the latest; markers among them.
+    let whole = "a:0L a:0 a:0n b:0mL b:0 p/x:0L p/y:0L p/y:0 q:0L ";
+    Check.equalBytes(whole.bytes(), pagedText(borrow s, "", "", 1000).view())?;
+    // Pages of every size give the same listing: a page may end inside a key's versions.
+    var max: usize = 1;
+    while (max < 10) {
+        Check.equalBytes(whole.bytes(), pagedText(borrow s, "", "", max).view())?;
+        max += 1;
+    }
+    // A prefix, and a delimiter's common prefix, which counts as one entry and is passed whole by the next page.
+    Check.equalBytes("p/x:0L p/y:0L p/y:0 ".bytes(), pagedText(borrow s, "p/", "", 2).view())?;
+    Check.equalBytes(
+        "a:0L a:0 a:0n b:0mL b:0 q:0L P:p/ ".bytes(),
+        pagedText(borrow s, "", "/", 1000).view(),
+    )?;
+    Check.equalBytes("a:0L a:0 a:0n b:0mL b:0 P:p/ q:0L ".bytes(), pagedText(borrow s, "", "/", 1).view())?;
+    // Nothing is listed for max 0, and it is not truncated by the store's count alone.
+    let none = s.listVersions("bkt", "", "", "".bytes(), false, null, 0)!;
+    Check.equalU64(0, none.versions.length as u64)?;
+
+    // A key marker alone passes every version of that key.
+    var text = Vector<u8>.create();
+    let page1 = s.listVersions("bkt", "", "", "a".bytes(), false, null, 1000)!;
+    pageText(borrow page1, mut text);
+    Check.equalBytes("b:0mL b:0 p/x:0L p/y:0L p/y:0 q:0L ".bytes(), text.view())?;
+    // With a version marker the page goes on inside the key, after that version.
+    text.clear();
+    let page2 = s.listVersions("bkt", "", "", "a".bytes(), false, Some(a2.versionId), 2)!;
+    pageText(borrow page2, mut text);
+    Check.equalBytes("a:0n b:0mL ".bytes(), text.view())?;
+    // A marker whose version was removed since: the key is passed whole.
+    Check.isTrue(s.deleteVersion("bkt", "a", a2.versionId)!.isSome(), "the version was there")?;
+    text.clear();
+    let page3 = s.listVersions("bkt", "", "", "a".bytes(), false, Some(a2.versionId), 2)!;
+    pageText(borrow page3, mut text);
+    Check.equalBytes("b:0mL b:0 ".bytes(), text.view())?;
+
+    // The same listing after recovery.
+    let after = "a:0L a:0n b:0mL b:0 p/x:0L p/y:0L p/y:0 q:0L ";
+    Check.equalBytes(after.bytes(), pagedText(borrow s, "", "", 3).view())?;
+    var again = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalBytes(after.bytes(), pagedText(borrow again, "", "", 3).view())?;
+    match (again.listVersions("nope", "", "", "".bytes(), false, null, 10)) {
+        Err(StoreError.NoSuchBucket) => {}
+        _ => { return Check.fail("a missing bucket has no versions"); }
+    }
+    return Ok();
+}
+
+fn target(key: StringView, versionId: [u8; 16]?) -> DeleteTarget =>
+    DeleteTarget { key: copyBytes(key.bytes())!, versionId: versionId };
+
+@test
+fn versionsDeletedInBatchesAndTaggedById() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("versions-batch");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    s.createBucket("plain")!;
+    setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+    let a1 = putVersion(mut s, "bkt", "a", "one");
+    let a2 = putVersion(mut s, "bkt", "a", "two");
+    let b1 = putVersion(mut s, "bkt", "b", "one");
+    let _ = putVersion(mut s, "plain", "k", "one");
+    var unknown = [7u8; 16];
+
+    // One batch: a marker on `a`, `a`'s first version removed, an id `b` does not have, a key that is no key, and
+    // a marker on a key with no version.
+    var targets = Vector<DeleteTarget>.create();
+    targets.push(target("a", null))!;
+    targets.push(target("a", Some(a1.versionId)))!;
+    targets.push(target("b", Some(unknown)))!;
+    targets.push(target("", null))!;
+    targets.push(target("new", null))!;
+    let syncs = s.journalSyncs();
+    let done = s.deleteMany("bkt", targets.view())!;
+    Check.equalU64(1, s.journalSyncs() - syncs)?; // one commit for the batch
+    Check.equalU64(5, done.length as u64)?;
+    Check.isTrue(done[0].valid && done[0].deleteMarker && done[0].versionId.isSome(), "a marker on a")?;
+    Check.isTrue(done[1].valid && !done[1].deleteMarker, "a version removed")?;
+    Check.isTrue(done[2].valid && done[2].lsn.isNull(), "an unknown id writes nothing")?;
+    Check.isTrue(!done[3].valid, "an empty key is not valid")?;
+    Check.isTrue(done[4].valid && done[4].deleteMarker, "a marker on a key without versions")?;
+    let marker = match (done[0].versionId) {
+        Some(id) => id,
+        null => { return Check.fail("the marker has an id"); }
+    };
+    let versions = s.versionsOf("bkt", "a")!;
+    Check.equalU64(2, versions.length as u64)?;
+    Check.isTrue(versions[0].deleteMarker && versions[0].versionId[..] == marker[..], "the marker is newest")?;
+    Check.isTrue(versions[1].versionId[..] == a2.versionId[..], "the second version stays")?;
+    Check.equalU64(1, s.versionsOf("bkt", "b")!.length as u64)?;
+    Check.equalU64(1, s.versionsOf("bkt", "new")!.length as u64)?;
+    // Why the key reads as absent, for the response.
+    expectNoSuchKey(s.headObject("bkt", "a"))?;
+    match (s.currentMarker("bkt", "a")!) {
+        Some(id) => { Check.isTrue(id[..] == marker[..], "the current marker")?; }
+        null => { return Check.fail("a's newest version is a marker"); }
+    }
+    Check.isTrue(s.currentMarker("bkt", "b")!.isNull(), "b has an object")?;
+
+    // Removing the marker in a batch says it was one; the key has its object again.
+    var second = Vector<DeleteTarget>.create();
+    second.push(target("a", Some(marker)))!;
+    let undone = s.deleteMany("bkt", second.view())!;
+    Check.isTrue(undone[0].deleteMarker && undone[0].lsn.isSome(), "the marker was removed")?;
+    Check.equalBytes("two".bytes(), s.getObject("bkt", "a")!.view())?;
+    Check.isTrue(s.headObject("bkt", "a")!.versioned, "the bucket has versioning")?;
+
+    // Without versioning, the null id names the key's object, and nothing else names anything.
+    var plain = Vector<DeleteTarget>.create();
+    plain.push(target("k", Some(unknown)))!;
+    plain.push(target("k", Some(nullVersionId())))!;
+    plain.push(target("gone", null))!;
+    let third = s.deleteMany("plain", plain.view())!;
+    Check.isTrue(third[0].lsn.isNull(), "no such version")?;
+    Check.isTrue(third[1].lsn.isSome() && third[1].versionId.isNull() && !third[1].deleteMarker, "a plain delete")?;
+    Check.isTrue(third[2].valid && third[2].lsn.isNull(), "a missing key")?;
+    expectNoSuchKey(s.headObject("plain", "k"))?;
+
+    // A deferred delete of a version is acknowledged when its batch is published.
+    let staged = s.deleteDeferred("bkt", "b", Some(b1.versionId))!;
+    let lsn = match (staged.lsn) {
+        Some(l) => l,
+        null => { return Check.fail("the delete was staged"); }
+    };
+    Check.isTrue(!s.isPublished(lsn), "not published before its commit")?;
+    Check.equalU64(1, s.versionsOf("bkt", "b")!.length as u64)?;
+    let _ = s.commitStaged()!;
+    Check.isTrue(s.isPublished(lsn), "published")?;
+    Check.equalU64(0, s.versionsOf("bkt", "b")!.length as u64)?;
+    let markerStaged = s.deleteDeferred("bkt", "a", null)!;
+    Check.isTrue(markerStaged.deleteMarker && markerStaged.lsn.isSome(), "a marker is staged")?;
+    let _ = s.commitStaged()!;
+    let top = match (markerStaged.versionId) {
+        Some(id) => id,
+        null => { return Check.fail("the staged marker has an id"); }
+    };
+
+    // Tags by version id: the version named, not the current one; not a marker, not an id the key lacks.
+    s.setTagsOf("bkt", "a", Some(a2.versionId), "k=v".bytes())!;
+    let tagged = s.headVersion("bkt", "a", a2.versionId)!;
+    Check.equalBytes("k=v".bytes(), metadataValue(tagged.metadata.view(), TAGS_FIELD.bytes())!.view())?;
+    match (s.setTagsOf("bkt", "a", Some(top), "k=v".bytes())) {
+        Err(StoreError.MethodNotAllowed) => {}
+        _ => { return Check.fail("a delete marker has no tags"); }
+    }
+    match (s.setTagsOf("bkt", "a", Some(unknown), "k=v".bytes())) {
+        Err(StoreError.NoSuchVersion) => {}
+        _ => { return Check.fail("no such version to tag"); }
+    }
+    match (s.setTagsOf("bkt", "a", null, "k=v".bytes())) {
+        Err(StoreError.NoSuchKey) => {}
+        _ => { return Check.fail("the current version is a marker"); }
+    }
+
+    // All of it again after recovery.
+    var again = ObjectStore.open(dir.view(), storeConfig())!;
+    let back = again.versionsOf("bkt", "a")!;
+    Check.equalU64(2, back.length as u64)?;
+    Check.isTrue(back[0].deleteMarker && back[0].versionId[..] == top[..], "the marker after recovery")?;
+    let kept = again.headVersion("bkt", "a", a2.versionId)!;
+    Check.equalBytes("k=v".bytes(), metadataValue(kept.metadata.view(), TAGS_FIELD.bytes())!.view())?;
+    Check.equalU64(0, again.versionsOf("bkt", "b")!.length as u64)?;
+    Check.isTrue(again.verify()!.problems.length == 0, "fsck is clean")?;
+    return Ok();
+}
+
+@test
+fn completionRetryFindsItsVersionUnderLaterOnes() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("versions-retry");
+    var s = ObjectStore.open(dir.view(), uploadConfig())!;
+    s.createBucket("bkt")!;
+    setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+    let id = s.createUpload("bkt", "k", "")!;
+    let md5 = sendPart(mut s, "bkt", "k", id, 1, patterned(10, 1).view())!;
+    let chosen = [choice(1, md5)];
+    let first = s.completeUploadIf("bkt", "k", id, chosen[..], PutCondition.None, "".bytes())!;
+    Check.isTrue(!isNullVersionId(first.versionId), "the completion made a version with an id")?;
+    // A PUT and a delete marker later, the retry still gets its first answer, and writes nothing.
+    let _ = putVersion(mut s, "bkt", "k", "later");
+    s.deleteObject("bkt", "k")!;
+    let records = s.recordsApplied();
+    let again = s.completeUploadIf("bkt", "k", id, chosen[..], PutCondition.None, "".bytes())!;
+    Check.equalU64(first.generation, again.generation)?;
+    Check.isTrue(first.versionId[..] == again.versionId[..], "the same version")?;
+    Check.equalU64(records, s.recordsApplied())?;
+    // Once that version is removed, the upload is gone, as for a retry in a bucket without versioning.
+    Check.isTrue(s.deleteVersion("bkt", "k", first.versionId)!.isSome(), "the version was there")?;
+    match (s.completeUploadIf("bkt", "k", id, chosen[..], PutCondition.None, "".bytes())) {
+        Err(StoreError.NoSuchUpload) => {}
+        _ => { return Check.fail("the completed version is gone"); }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
