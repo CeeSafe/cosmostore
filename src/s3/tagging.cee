@@ -167,7 +167,8 @@ async fn getObjectTagging(
     req: borrow S3Request,
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
-    let info = await objectInfo(app, req.bucket.view(), req.key.view())?;
+    let info = await objectInfo(app, req, exchange)?;
+    readVersionHeader(exchange, borrow info)?;
     let stored = match (metadataValue(info.metadata.view(), TAGS_FIELD.bytes())) {
         Ok(t) => t,
         Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
@@ -197,7 +198,7 @@ async fn putObjectTagging(
     let tags = tagsOfXml(xml.view())?;
     var canonical = Vector<u8>.create();
     canonicalTags(borrow tags, mut canonical)?;
-    await storeSetTags(app, req.bucket.view(), req.key.view(), canonical.view())?;
+    await storeSetTags(app, req, canonical.view(), exchange)?;
     await exchange.send(Status.ok(), "".bytes())?;
     return Ok();
 }
@@ -207,16 +208,34 @@ async fn deleteObjectTagging(
     req: borrow S3Request,
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
-    await storeSetTags(app, req.bucket.view(), req.key.view(), "".bytes())?;
+    await storeSetTags(app, req, "".bytes(), exchange)?;
     await exchange.send(Status.noContent(), "".bytes())?;
     return Ok();
 }
 
-async fn storeSetTags(app: borrow S3App, bucket: StringView, key: StringView, tags: Slice<u8>) -> Result<void, S3Fail> {
+/// Sets the tags of the request's object: its current version, or the one `versionId` names, which the response
+/// then names too.
+async fn storeSetTags(
+    app: borrow S3App,
+    req: borrow S3Request,
+    tags: Slice<u8>,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let versionId = requestVersion(req)?;
+    let bucket = req.bucket.view();
+    let key = req.key.view();
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return match (await Async.blocking(() => store.setTags(bucket, key, tags))) {
-        Ok() => Ok(),
-        Err(e) => Err(storeFail(e, key.length)),
-    };
+    match (await Async.blocking(() => store.setTagsOf(bucket, key, versionId, tags))) {
+        Ok() => {}
+        Err(e) => {
+            deleteMarkerHeaders(store, bucket, key, versionId, exchange)?;
+            return Err(storeFail(e, key.length));
+        }
+    }
+    match (versionId) {
+        Some(id) => { versionHeader(exchange, "x-amz-version-id", id)?; }
+        null => {}
+    }
+    return Ok();
 }

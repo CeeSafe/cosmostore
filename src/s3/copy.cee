@@ -5,20 +5,30 @@ import web_core;
 import web_http;
 import web_server;
 
-/// `x-amz-copy-source`: `bucket/key` or `/bucket/key`, URL-encoded, with an optional `?versionId=null`.
+/// `x-amz-copy-source`: `bucket/key` or `/bucket/key`, URL-encoded, with an optional `?versionId=` naming the
+/// version to copy (ADR-0041).
 struct CopySource {
     bucket: String;
     key: String;
+    versionId: [u8; 16]?;
 }
 
 fn copySourceOf(req: borrow S3Request) -> Result<CopySource, S3Fail> {
     let raw = headerOf(req, "x-amz-copy-source") ?? "".bytes();
     var end = raw.length;
+    var versionId: [u8; 16]? = null;
     match (findBytes(raw, "?".bytes(), 0)) {
         Some(q) => {
             end = q;
-            // Only the null version exists in an unversioned bucket.
-            if (raw[q..] != "?versionId=null".bytes()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            let name = "?versionId=".bytes();
+            let rest = raw[q..];
+            if (rest.length < name.length || rest[0..name.length] != name) {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
+            versionId = match (parseVersionId(rest[name.length..])) {
+                Some(id) => id,
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            };
         }
         null => {}
     }
@@ -32,7 +42,7 @@ fn copySourceOf(req: borrow S3Request) -> Result<CopySource, S3Fail> {
     appendUtf8(mut bucket, path[0..slash])?;
     appendUtf8(mut key, path[slash + 1..])?;
     if (key.length > MAX_KEY_BYTES) { return Err(S3Fail.Code(S3Code.KeyTooLongError)); }
-    return Ok(CopySource { bucket: bucket, key: key });
+    return Ok(CopySource { bucket: bucket, key: key, versionId: versionId });
 }
 
 /// The `x-amz-copy-source-if-*` conditions. Every failure is PreconditionFailed, as S3 answers for a copy.
@@ -101,7 +111,7 @@ fn planCopy(
     target: CopyTarget,
     uploadId: [u8; 16],
 ) -> Result<CopyPlan, S3Fail> {
-    let info = match (store.headObject(src.bucket.view(), src.key.view())) {
+    let info = match (store.headObjectOf(src.bucket.view(), src.key.view(), src.versionId)) {
         Ok(i) => i,
         Err(e) => { return Err(storeFail(e, src.key.length)); }
     };
@@ -142,7 +152,11 @@ fn planCopy(
     };
     var reader: ObjectReader? = null;
     if (size > 0) {
-        reader = match (store.openReader(src.bucket.view(), src.key.view(), start, end)) {
+        var prepared = match (store.prepareReaderOf(src.bucket.view(), src.key.view(), src.versionId, start, end)) {
+            Ok(p) => p,
+            Err(e) => { return Err(storeFail(e, src.key.length)); }
+        };
+        reader = match (prepared.open()) {
             Ok(r) => r,
             Err(e) => { return Err(storeFail(e, src.key.length)); }
         };
@@ -280,6 +294,8 @@ async fn copyObject(app: borrow S3App, req: borrow S3Request, exchange: borrow m
         return Err(S3Fail.Code(S3Code.InvalidRequest)); // a copy onto itself must change something
     }
     let plan = await openCopy(app, req, borrow src, CopyTarget.Object, [0u8; 16])?;
+    // The source's version, when its bucket has versioning (ADR-0041).
+    if (plan.source.versioned) { versionHeader(exchange, "x-amz-copy-source-version-id", plan.source.versionId)?; }
     var contentType = String.create();
     var metadata = Vector<u8>.create();
     if (replace) {
@@ -328,6 +344,7 @@ async fn copyObject(app: borrow S3App, req: borrow S3Request, exchange: borrow m
         condition,
         etags.view(),
     )?;
+    writtenVersionHeader(exchange, borrow outcome)?;
     return await sendCopyResult(exchange, "CopyObjectResult", borrow outcome.md5, outcome.extras.view());
 }
 
@@ -340,6 +357,7 @@ async fn uploadPartCopy(
     let id = uploadIdOf(req)?;
     let src = copySourceOf(req)?;
     let plan = await openCopy(app, req, borrow src, CopyTarget.Part(number), id)?;
+    if (plan.source.versioned) { versionHeader(exchange, "x-amz-copy-source-version-id", plan.source.versionId)?; }
     let copied = await runCopy(plan)?;
     let md5 = await commitPart(
         app,

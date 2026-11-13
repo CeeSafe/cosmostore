@@ -246,6 +246,10 @@ async fn serveS3(
             return Err(S3Fail.Code(S3Code.MethodNotAllowed));
         }
         if (isMethod(m, Method.Put)) {
+            if (req.hasParam("versioning")) {
+                if (!req.onlyParams("versioning")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+                return await putBucketVersioning(app, borrow req, auth, exchange);
+            }
             if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
             return await createBucket(app, borrow req, exchange);
         }
@@ -267,7 +271,7 @@ async fn serveS3(
             }
             if (req.hasParam("versioning")) {
                 if (!req.onlyParams("versioning")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-                return await bucketVersioning(app, borrow req, exchange);
+                return await getBucketVersioning(app, borrow req, exchange);
             }
             if (req.hasParam("uploads")) {
                 if (!req.onlyParams("uploads,prefix,delimiter,key-marker,upload-id-marker,max-uploads,encoding-type")) {
@@ -308,13 +312,6 @@ async fn serveS3(
         if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
         if (copying) { return await copyObject(app, borrow req, exchange); }
         return await putObject(app, borrow req, auth, exchange);
-    }
-    // An unversioned bucket's one version is `null` (ADR-0014): naming it is the same as naming none.
-    match (paramOf(borrow req, "versionId")) {
-        Some(v) => {
-            if (v != "null".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
-        }
-        null => {}
     }
     if (isMethod(m, Method.Get) && req.hasParam("attributes")) {
         if (!req.onlyParams("attributes,versionId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
@@ -687,141 +684,56 @@ async fn listPage(
 }
 
 async fn deleteObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
-    // Staged, then acknowledged once published: deletes share syncs with PUTs (ADR-0025).
-    var staged: u64? = null;
+    // Staged, then acknowledged once published: deletes share syncs with PUTs (ADR-0025). With a version id the
+    // version is removed for good; without one a bucket with versioning gets a delete marker (ADR-0041).
+    let versionId = requestVersion(req)?;
+    var staged: DeleteOutcome? = null;
     {
         var guard = await lockStore(app)?;
         let store = guard.data();
         let bucket = req.bucket.view();
         let key = req.key.view();
-        staged = match (await Async.blocking(() => store.deleteObjectDeferred(bucket, key))) {
-            Ok(lsn) => lsn,
+        staged = match (await Async.blocking(() => store.deleteDeferred(bucket, key, versionId))) {
+            Ok(o) => o,
             Err(e) => { return Err(storeFail(e, key.length)); }
         };
     }
     match (staged) {
-        Some(lsn) => { await awaitPublished(app, lsn)?; }
+        Some(o) => {
+            match (o.lsn) {
+                Some(lsn) => { await awaitPublished(app, lsn)?; }
+                null => {}
+            }
+            match (o.versionId) {
+                Some(id) => { versionHeader(exchange, "x-amz-version-id", id)?; }
+                null => {}
+            }
+            if (o.deleteMarker) { exchange.header("x-amz-delete-marker", "true".bytes())?; }
+        }
         null => {}
     }
     await exchange.send(Status.noContent(), "".bytes())?;
     return Ok();
 }
 
-async fn objectInfo(app: borrow S3App, bucket: StringView, key: StringView) -> Result<ObjectInfo, S3Fail> {
+/// The request's object: its current version, or the one `versionId` names. A delete marker in the way adds its
+/// fields to the error's response.
+async fn objectInfo(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<ObjectInfo, S3Fail> {
+    let versionId = requestVersion(req)?;
+    let bucket = req.bucket.view();
+    let key = req.key.view();
     var guard = await lockStore(app)?;
     let store = guard.data();
     // An index lookup, no I/O: on the event loop, without a worker thread (ADR-0023).
-    return match (store.headObject(bucket, key)) {
-        Ok(i) => Ok(i),
-        Err(e) => Err(storeFail(e, key.length)),
-    };
-}
-
-/// GetBucketVersioning: buckets are never versioned (PutBucketVersioning is NotImplemented), so the configuration is
-/// empty, as S3 returns for a bucket whose versioning was never enabled. rclone reads it before a purge.
-async fn bucketVersioning(
-    app: borrow S3App,
-    req: borrow S3Request,
-    exchange: borrow mut Exchange,
-) -> Result<void, S3Fail> {
-    if (!await bucketExists(app, req.bucket.view())?) { return Err(S3Fail.Code(S3Code.NoSuchBucket)); }
-    var body = Vector<u8>.create();
-    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"".bytes())?;
-    body.extend(S3_XMLNS.bytes())?;
-    body.extend("\"></VersioningConfiguration>".bytes())?;
-    return await sendXml(exchange, borrow body);
-}
-
-/// ListObjectVersions in an unversioned bucket (ADR-0014): every object is its one version, `null`, and the latest.
-/// The key marker works as ListObjects v1's marker; a version-id marker can only name `null`, which is that key's
-/// one version, so it changes nothing.
-async fn listObjectVersions(
-    app: borrow S3App,
-    req: borrow S3Request,
-    exchange: borrow mut Exchange,
-) -> Result<void, S3Fail> {
-    let prefix = utf8Param(req, "prefix")?;
-    let delimiter = utf8Param(req, "delimiter")?;
-    let urlEncoded = match (paramOf(req, "encoding-type")) {
-        Some(t) => {
-            if (t != "url".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
-            true
+    match (store.headObjectOf(bucket, key, versionId)) {
+        Ok(i) => { return Ok(i); }
+        Err(e) => {
+            deleteMarkerHeaders(store, bucket, key, versionId, exchange)?;
+            return Err(storeFail(e, key.length));
         }
-        null => false,
-    };
-    var maxKeys: usize = 1000;
-    match (paramOf(req, "max-keys")) {
-        Some(t) => {
-            match (parseDecimal(t)) {
-                Some(v) => {
-                    if (v < 1000) { maxKeys = v as usize; }
-                }
-                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
-            }
-        }
-        null => {}
     }
-    var after = Vector<u8>.create();
-    var afterIsPrefix = false;
-    match (paramOf(req, "key-marker")) {
-        Some(m) => {
-            after.extend(m)?;
-            let d = delimiter.view().bytes();
-            afterIsPrefix = d.length > 0 && m.length >= d.length && m[m.length - d.length..] == d &&
-                startsWithBytes(m, prefix.view().bytes());
-        }
-        null => {}
-    }
-    let page = await listPage(
-        app,
-        req.bucket.view(),
-        prefix.view(),
-        delimiter.view(),
-        borrow after,
-        afterIsPrefix,
-        maxKeys,
-    )?;
-    let truncated = page.truncated && maxKeys > 0;
-    var body = Vector<u8>.create();
-    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"".bytes())?;
-    body.extend(S3_XMLNS.bytes())?;
-    body.extend("\"><Name>".bytes())?;
-    appendXmlEscaped(mut body, req.bucket.view().bytes())?;
-    body.extend("</Name>".bytes())?;
-    xmlElement(mut body, "Prefix", prefix.view().bytes(), urlEncoded)?;
-    xmlElement(mut body, "KeyMarker", paramOf(req, "key-marker") ?? "".bytes(), urlEncoded)?;
-    xmlElement(mut body, "VersionIdMarker", paramOf(req, "version-id-marker") ?? "".bytes(), false)?;
-    if (truncated) {
-        xmlElement(mut body, "NextKeyMarker", page.nextMarker.view(), urlEncoded)?;
-        if (!page.nextMarkerIsPrefix) { body.extend("<NextVersionIdMarker>null</NextVersionIdMarker>".bytes())?; }
-    }
-    if (delimiter.length > 0) { xmlElement(mut body, "Delimiter", delimiter.view().bytes(), urlEncoded)?; }
-    body.extend("<MaxKeys>".bytes())?;
-    appendDecimal(mut body, maxKeys as u64)?;
-    body.extend("</MaxKeys>".bytes())?;
-    if (urlEncoded) { body.extend("<EncodingType>url</EncodingType>".bytes())?; }
-    body.extend(
-        if (truncated) "<IsTruncated>true</IsTruncated>".bytes() else "<IsTruncated>false</IsTruncated>".bytes(),
-    )?;
-    for (i in 0..page.keys.length) {
-        body.extend("<Version>".bytes())?;
-        xmlElement(mut body, "Key", page.keys[i].view(), urlEncoded)?;
-        body.extend("<VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>".bytes())?;
-        appendIso8601(mut body, page.mtimes[i])?;
-        body.extend("</LastModified><ETag>".bytes())?;
-        var etag = Vector<u8>.create();
-        appendEtag(mut etag, borrow page.md5s[i], page.parts[i])?;
-        appendXmlEscaped(mut body, etag.view())?;
-        body.extend("</ETag><Size>".bytes())?;
-        appendDecimal(mut body, page.sizes[i])?;
-        body.extend("</Size><StorageClass>STANDARD</StorageClass>".bytes())?;
-        body.extend("<Owner><ID>cosmostore</ID><DisplayName>cosmostore</DisplayName></Owner></Version>".bytes())?;
-    }
-    for (i in 0..page.commonPrefixes.length) {
-        body.extend("<CommonPrefixes>".bytes())?;
-        xmlElement(mut body, "Prefix", page.commonPrefixes[i].view(), urlEncoded)?;
-        body.extend("</CommonPrefixes>".bytes())?;
-    }
-    body.extend("</ListVersionsResult>".bytes())?;
-    return await sendXml(exchange, borrow body);
 }

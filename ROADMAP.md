@@ -1553,3 +1553,73 @@ Browser form uploads with a SigV4 POST policy.
   - M4's exit, for the user's word: the targets above, memory bounded, no compaction stalls, and the gates in CI
     are in place; journal shards stay for devices that sync in parallel. Then M5.
 
+### 13 Nov 2026: M4 closed; M5 item 1, the versions of a key, in the store (ADR-0041, slices 1 and 2)
+
+- **M4 is closed** (the user: continue): its targets are met on the reference machine but for single phases that
+  did not repeat, memory is bounded, compaction and checkpoints run in steps, and the gates are in CI. Journal
+  shards stay for devices that sync in parallel.
+- **The formats had versions; the state did not.** Records have carried a version id since M1, but the index held
+  one version per key, a `DeleteVersion` removed the key whatever its id, and a `DeleteMarker` applied as nothing.
+- **The index holds chains** (`src/metadata/version_index.cee`): the B-tree gives a key's newest version, and a
+  vector of links gives each version the next older one. The links are empty until a key has two versions, so an
+  unversioned store pays nothing.
+- **A record means one thing, whatever the bucket's state at replay:** a put or delete marker with the null id
+  replaces the key's null version, wherever it is in the chain, and is the newest; with another id it only adds;
+  `DeleteVersion` removes the version with its id. Every journal written so far replays as before.
+- **Buckets have a versioning state** (a `BucketConfig` record of kind 3: enabled or suspended, never off again).
+  Enabled, a put gets a new random id and a delete writes a marker; suspended, both write the null version.
+- **Checkpoint format 6:** every version, a key's versions together and oldest first, a kind byte per version and
+  the versioning byte per bucket; formats 1 to 5 still load. The snapshot of ADR-0028 keeps a changed key's whole
+  chain.
+- **The walks follow the chains:** compaction copies noncurrent inline versions, `verify` reads every version, the
+  orphan sweep and the live-byte accounting count them, and a bucket is empty only without versions. HEAD, GET,
+  ListObjects and "if absent" see no object under a marker. Lifecycle expires nothing in a versioned bucket until
+  M5's item 2.
+- **The store's API:** `deleteCurrent` (the marker's id), `deleteVersion`, `headVersion`, `prepareVersionReader`,
+  `getObjectVersion`, `versionsOf`; a put's outcome and an object's info carry the version id. The S3 layer does not
+  use them yet.
+- **Tests (10 new, 156 in all, no leaks):** enabled and suspended behaviour; recovery from the journal, from a
+  format 6 checkpoint and after compaction, with the live-byte invariant; a checkpoint written in steps while
+  chains change behind and ahead of it; a crash at every byte of a versioned sequence; and fault sweeps of a
+  versioned workload in the four modes (once, sticky, torn, crash), each followed by compaction and a checkpoint.
+  Ten ways of breaking the change in a copy are each caught (two only after the tests were tightened: live bytes
+  after a reopen, and a marker's record counted live).
+- **Regression gate** (`tools/perf_gate.sh`, `0c85983`'s build against this one, on the M1 at load 1.8 to 2.2 with
+  no build running): passed. p99 of this build over the base's by group, 0.91 to 1.01 (the one 1 MiB GET phase at
+  concurrency 1 at 0.76, inside its noise of 3.24); operations per second 0.95 to 1.07; 64 syncs per 1,000 tiny
+  PUTs at concurrency 32 in both. A first run, made while another session was building, was too noisy to give a
+  verdict (noise 2.65) and is not counted.
+
+### 13 Nov 2026: M5 item 1, versions in the S3 API (ADR-0041, slice 3)
+
+- **The bucket's versioning:** PutBucketVersioning (`Enabled`, `Suspended`; MFA delete is NotImplemented) and
+  GetBucketVersioning, over the store's `BucketConfig` kind 3.
+- **A version id is 32 hex digits, `null` for the null id** (`src/s3/versions.cee`). Other text is InvalidArgument;
+  an id the key lacks is NoSuchVersion (new) on a read.
+- **Reads by version:** GET, HEAD, GetObjectAttributes, GetObjectTagging and a copy's source take `versionId`, and
+  name the version in `x-amz-version-id` (`x-amz-copy-source-version-id`) when the bucket has versioning. A read
+  that meets a delete marker says so: 404 with `x-amz-delete-marker: true` and the marker's id for a key under one,
+  405 for the marker by its id.
+- **Writes:** PUT, CopyObject, CompleteMultipartUpload and POST object return the new version's id.
+  PutObjectTagging and DeleteObjectTagging take `versionId` (`setTagsOf`).
+- **Deletes:** DELETE stays staged and acknowledged with its batch (`deleteDeferred`): without an id it returns the
+  marker it wrote, with one it removes the version and says whether it was a marker. DeleteObjects takes version
+  ids and reports markers, still in one commit (`deleteMany`); an entry whose id is no version id gets a
+  NoSuchVersion error and the rest go on.
+- **ListObjectVersions** (`listVersions`): versions and delete markers in key order, newest first, `IsLatest`,
+  prefix and delimiter; `max-keys` counts versions, markers and common prefixes; a page may end inside a key's
+  versions and the next starts after `key-marker` and `version-id-marker`. A marker whose version was removed in
+  between passes the key.
+- **A retried CompleteMultipartUpload finds its version under later ones** (`repeatedCompletion` walked only the
+  current version): in a bucket with versioning a PUT after the completion no longer turns the retry into
+  NoSuchUpload.
+- **Tests (5 new in the store and the S3 layer, 161 in all, no leaks; six ways of breaking the new store code in a copy are each caught; 34 new checks in `tools/s3_smoke.sh`, 157 in all,
+  with the AWS CLI):** pages of every size give the same listing; batches of deletes with and without ids, in
+  buckets with and without versioning; tags by id; version ids as text; the versioning configuration. The fault
+  sweep's permanent delete now goes through `deleteMany`.
+- **Docs:** ADR-0041 §10, README, `docs/compatibility.md`.
+- **Not done:** slice 4. The s3-tests subset and the SDK scripts have not been run against versioning; the smoke
+  test with the AWS CLI is the only client check so far. Lifecycle rules still expire nothing in a bucket with
+  versioning (M5 item 2).
+- **Next:** slice 4 (the s3-tests versioning tests into the subset, the SDK matrix), then M5 item 2, lifecycle
+  rules for noncurrent versions and expired delete markers.

@@ -7,8 +7,9 @@ giving up large-object throughput or crash correctness.
 **Status: a single-node alpha.** `cosmostore serve` speaks the S3 API over HTTP/1.1 and TLS, on a crash-tested
 storage engine (journal, large-object extents, checkpoints, compaction, the space reserve and `fsck`). The AWS CLI,
 rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 252 Ceph s3-tests pass against it
-([compatibility](docs/compatibility.md)). Milestones M0 to M3 of the [roadmap](ROADMAP.md) are done; M4, performance,
-is under way. There is no replication or clustering yet, and no versioning, policies or ACLs.
+([compatibility](docs/compatibility.md)). Milestones M0 to M4 of the [roadmap](ROADMAP.md) are done; M5, production
+features, is under way: S3 versioning is in (ADR-0041). There is no replication or clustering yet, and no policies or
+ACLs.
 
 CosmoStore's own code is pure CeeSafe, with no C and no `unsafe` blocks. The one C below it is OpenSSL 3, for TLS,
 through CeeSafe.Web's `web_tls` ([ADR-0016](docs/adr/0016-listen-address-and-tls.md)).
@@ -71,8 +72,9 @@ through CeeSafe.Web's `web_tls` ([ADR-0016](docs/adr/0016-listen-address-and-tls
 ### Object model
 
 - Buckets with S3's naming rules; PUT, GET, HEAD and DELETE; range reads.
-- **Versions from day one:** an unversioned bucket uses the `null` version, so S3 versioning can be enabled later
-  without migration.
+- **Versions from day one:** an unversioned bucket uses the `null` version, so S3 versioning is enabled on a bucket
+  without migration (ADR-0041): every PUT then keeps a version, a DELETE writes a delete marker, and a version is
+  read, tagged, copied and removed by its id.
 - **Conditional PUT:** `IfAbsent` (`If-None-Match: *`) and `IfGeneration` (`If-Match` on the generation).
 - **ListObjectsV2 semantics:** prefix, delimiter (common prefixes), start-after and pagination.
 - MD5 (the S3 ETag) and CRC32C computed while streaming.
@@ -317,17 +319,20 @@ limits.
 **Done:**
 - M0 and M1: the design records, the durability layer and the single-node storage core;
 - M2: checkpoints, compaction, the space reserve, `fsck`, and the 24-hour soak;
-- M3, the first alpha: the S3 API and the compatibility matrix.
+- M3, the first alpha: the S3 API and the compatibility matrix;
+- M4, performance: group commit across requests, upkeep in steps, the comparison runs, the p99 gates in CI, and the
+  targets ([docs/targets.md](docs/targets.md)) on the reference machine.
 
-**Now, M4 (performance):** most of it is done, from group commit across requests to the comparison runs and the p99
-gates in CI. Left: the M4 targets ([docs/targets.md](docs/targets.md)) on the reference machine.
+**Now, M5 (production features):** versioning, delete markers and ListObjectVersions are in (ADR-0041); the
+compatibility suites have not been run against them yet. Then lifecycle rules for noncurrent versions, policies,
+encryption and Object Lock.
 
-**Later:** M5 production features (versioning, policies, encryption, Object Lock), M6 a Raft-based cluster, and M7
-advanced S3 features.
+**Later:** M6 a Raft-based cluster, and M7 advanced S3 features.
 
 **Known limits:**
 - a single node: no replication or erasure coding yet;
-- no versioning, bucket policies, ACLs, CORS or Object Lock, and no SigV2 or session tokens;
+- no bucket policies, ACLs, CORS, Object Lock or MFA delete, and no SigV2 or session tokens;
+- lifecycle rules expire nothing in a bucket with versioning yet;
 - HTTP/1.1 only;
 - Windows is not supported.
 

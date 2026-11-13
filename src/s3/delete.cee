@@ -88,17 +88,25 @@ fn xmlUnescape(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, Allo
     return Ok(true);
 }
 
-/// A DeleteObjects body: the keys, and whether only errors are to be reported.
+/// A DeleteObjects body: the keys, each with the version it names if it names one (ADR-0041), and whether only
+/// errors are to be reported.
 struct DeleteRequest {
     keys: Vector<Vector<u8>>;
+    targets: Vector<DeleteTarget>;
+    /// Per key: its `<VersionId>` is not a version id, so the key gets an error and no target.
+    badVersion: Vector<bool>;
     quiet: bool;
 }
 
-/// Reads `<Delete><Quiet>?<Object><Key>…</Key></Object>…</Delete>`. A version id other than `null` is
-/// NotImplemented: buckets are unversioned.
+/// Reads `<Delete><Quiet>?<Object><Key>…</Key><VersionId>…</VersionId>?</Object>…</Delete>`.
 fn parseDeleteBody(xml: Slice<u8>) -> Result<DeleteRequest, S3Fail> {
     if (findBytes(xml, "<Delete".bytes(), 0).isNull()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
-    var request = DeleteRequest { keys: Vector<Vector<u8>>.create(), quiet: false };
+    var request = DeleteRequest {
+        keys: Vector<Vector<u8>>.create(),
+        targets: Vector<DeleteTarget>.create(),
+        badVersion: Vector<bool>.create(),
+        quiet: false,
+    };
     match (elementText(xml, "Quiet")) {
         Some(q) => { request.quiet = q == "true".bytes(); }
         null => {}
@@ -125,12 +133,17 @@ fn parseDeleteBody(xml: Slice<u8>) -> Result<DeleteRequest, S3Fail> {
         };
         var key = Vector<u8>.create();
         if (!xmlUnescape(inner[open..close], mut key)?) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        var versionId: [u8; 16]? = null;
+        var bad = false;
         match (elementText(inner, "VersionId")) {
             Some(v) => {
-                if (v != "null".bytes()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+                versionId = parseVersionId(v);
+                bad = versionId.isNull();
             }
             null => {}
         }
+        if (!bad) { request.targets.push(DeleteTarget { key: copyBytes(key.view())?, versionId: versionId })?; }
+        request.badVersion.push(bad)?;
         request.keys.push(key)?;
         if (request.keys.length > MAX_DELETE_KEYS) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
         at = end + 9;
@@ -148,20 +161,45 @@ async fn deleteObjects(
     let xml = await readSmallBody(auth, exchange, MAX_DELETE_BODY)?;
     verifySmallBody(req, xml.view(), true)?;
     let request = parseDeleteBody(xml.view())?;
-    let valid = await storeDeleteMany(app, req.bucket.view(), request.keys.view())?;
+    let outcomes = await storeDeleteMany(app, req.bucket.view(), request.targets.view())?;
     var body = Vector<u8>.create();
     xmlHead(mut body, "DeleteResult")?;
+    var id = Vector<u8>.create();
+    var next: usize = 0;
     for (i in 0..request.keys.length) {
         let key = request.keys[i].view();
-        if (valid[i]) {
-            if (request.quiet) { continue; }
-            body.extend("<Deleted>".bytes())?;
-            xmlElement(mut body, "Key", key, false)?;
-            body.extend("</Deleted>".bytes())?;
-        } else {
+        var valid = false;
+        if (!request.badVersion[i]) {
+            let o = borrow outcomes[next];
+            let named = request.targets[next].versionId.isSome();
+            next += 1;
+            valid = o.valid;
+            if (valid && !request.quiet) {
+                body.extend("<Deleted>".bytes())?;
+                xmlElement(mut body, "Key", key, false)?;
+                match (o.versionId) {
+                    Some(v) => {
+                        id.clear();
+                        appendVersionId(mut id, v)?;
+                        // The version removed, and, for a delete marker written or removed, the marker's id.
+                        if (named) { xmlElement(mut body, "VersionId", id.view(), false)?; }
+                        if (o.deleteMarker) {
+                            body.extend("<DeleteMarker>true</DeleteMarker>".bytes())?;
+                            xmlElement(mut body, "DeleteMarkerVersionId", id.view(), false)?;
+                        }
+                    }
+                    null => {}
+                }
+                body.extend("</Deleted>".bytes())?;
+            }
+        }
+        if (!valid) {
             body.extend("<Error>".bytes())?;
             xmlElement(mut body, "Key", key, false)?;
-            let code = if (key.length > MAX_KEY_BYTES) S3Code.KeyTooLongError else S3Code.InvalidArgument;
+            let code =
+                if (request.badVersion[i]) S3Code.NoSuchVersion
+                    else if (key.length > MAX_KEY_BYTES) S3Code.KeyTooLongError
+                    else S3Code.InvalidArgument;
             xmlElement(mut body, "Code", s3CodeName(code).bytes(), false)?;
             xmlElement(mut body, "Message", s3Message(code).bytes(), false)?;
             body.extend("</Error>".bytes())?;
@@ -174,11 +212,11 @@ async fn deleteObjects(
 async fn storeDeleteMany(
     app: borrow S3App,
     bucket: StringView,
-    keys: Slice<Vector<u8>>,
-) -> Result<Vector<bool>, S3Fail> {
+    targets: Slice<DeleteTarget>,
+) -> Result<Vector<DeleteOutcome>, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return match (await Async.blocking(() => store.deleteObjects(bucket, keys))) {
+    return match (await Async.blocking(() => store.deleteMany(bucket, targets))) {
         Ok(v) => Ok(v),
         Err(e) => Err(storeFail(e, 0)),
     };

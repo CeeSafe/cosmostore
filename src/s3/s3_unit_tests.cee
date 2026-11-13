@@ -414,9 +414,27 @@ fn deleteBodyParses() -> Result<void, TestFailure> {
     Check.equalU64(2, d.keys.length as u64)?;
     Check.equalBytes("a/one.txt".bytes(), d.keys[0].view())?;
     Check.equalBytes(" sp & <x> 'q' ".bytes(), d.keys[1].view())?; // spaces kept, entities decoded
-    match (parseDeleteBody("<Delete><Object><Key>k</Key><VersionId>abc</VersionId></Object></Delete>".bytes())) {
-        Err(S3Fail.Code(S3Code.NotImplemented)) => {}
-        _ => { return Check.fail("a real version id is not implemented"); }
+    // Each key's target names its version, if it names one (ADR-0041).
+    Check.equalU64(2, d.targets.length as u64)?;
+    Check.isTrue(d.targets[0].versionId.isNull(), "no version named")?;
+    match (d.targets[1].versionId) {
+        Some(id) => { Check.isTrue(isNullVersionId(id), "the null version")?; }
+        null => { return Check.fail("the null version is named"); }
+    }
+    // Text that is no version id gives its key an error, and no target.
+    let withId =
+        "<Delete><Object><Key>k</Key><VersionId>abc</VersionId></Object><Object><Key>l</Key><VersionId>000102030405060708090a0b0c0d0e0f</VersionId></Object></Delete>";
+    let v = match (parseDeleteBody(withId.bytes())) {
+        Ok(parsed) => parsed,
+        Err(_) => { return Check.fail("the body with version ids parses"); }
+    };
+    Check.equalU64(2, v.keys.length as u64)?;
+    Check.isTrue(v.badVersion[0] && !v.badVersion[1], "only the first id is bad")?;
+    Check.equalU64(1, v.targets.length as u64)?;
+    Check.equalBytes("l".bytes(), v.targets[0].key.view())?;
+    match (v.targets[0].versionId) {
+        Some(id) => { Check.equalU64(15, id[15] as u64)?; }
+        null => { return Check.fail("the version id is read"); }
     }
     let bad = [
         "<Delete></Delete>",
@@ -814,5 +832,65 @@ fn outOfDescriptorsIsServiceUnavailable() -> Result<void, TestFailure> {
     let named = IoFailure.of(IoOp.Open, IoError.TooManyOpenFiles);
     Check.isTrue(named.isOutOfDescriptors(), "IoError.TooManyOpenFiles is out of descriptors")?;
     Check.isTrue(codeOfStore(StoreError.Io(named), 0) == S3Code.ServiceUnavailable, "TooManyOpenFiles")?;
+    return Ok();
+}
+
+@test
+fn versionIdsAsText() -> Result<void, TestFailure> {
+    var id = [0u8; 16];
+    var text = Vector<u8>.create();
+    appendVersionId(mut text, id)!;
+    Check.equalBytes("null".bytes(), text.view())?;
+    for (i in 0..16) { id[i] = truncate<u8>(i * 17); }
+    text.clear();
+    appendVersionId(mut text, id)!;
+    Check.equalBytes("00112233445566778899aabbccddeeff".bytes(), text.view())?;
+    match (parseVersionId(text.view())) {
+        Some(back) => {
+            for (i in 0..16) { Check.equalU64(id[i] as u64, back[i] as u64)?; }
+        }
+        null => { return Check.fail("an id's text reads back"); }
+    }
+    match (parseVersionId("null".bytes())) {
+        Some(n) => { Check.isTrue(isNullVersionId(n), "null is the null id")?; }
+        null => { return Check.fail("null is a version id"); }
+    }
+    // Not ids: the wrong length, a digit that is not hex, and the null id spelled out.
+    let bad = ["", "abc", "00112233445566778899aabbccddeefg", "00000000000000000000000000000000"];
+    for (b in bad) { Check.isTrue(parseVersionId(b.bytes()).isNull(), "not a version id")?; }
+    return Ok();
+}
+
+@test
+fn versioningConfigurationParses() -> Result<void, TestFailure> {
+    let enabled =
+        "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>";
+    match (parseVersioning(enabled.bytes())) {
+        Ok(v) => { Check.equalU64(VERSIONING_ENABLED as u64, v as u64)?; }
+        Err(_) => { return Check.fail("Enabled parses"); }
+    }
+    let suspended =
+        "<VersioningConfiguration><Status>Suspended</Status><MfaDelete>Disabled</MfaDelete></VersioningConfiguration>";
+    match (parseVersioning(suspended.bytes())) {
+        Ok(v) => { Check.equalU64(VERSIONING_SUSPENDED as u64, v as u64)?; }
+        Err(_) => { return Check.fail("Suspended parses"); }
+    }
+    match (parseVersioning(
+        "<VersioningConfiguration><Status>Enabled</Status><MfaDelete>Enabled</MfaDelete></VersioningConfiguration>".bytes(),
+    )) {
+        Err(S3Fail.Code(S3Code.NotImplemented)) => {}
+        _ => { return Check.fail("MFA delete is not implemented"); }
+    }
+    let bad = [
+        "<VersioningConfiguration></VersioningConfiguration>",
+        "<VersioningConfiguration><Status>Off</Status></VersioningConfiguration>",
+        "<Other><Status>Enabled</Status></Other>",
+    ];
+    for (b in bad) {
+        match (parseVersioning(b.bytes())) {
+            Err(S3Fail.Code(S3Code.MalformedXML)) => {}
+            _ => { return Check.fail("a malformed versioning configuration"); }
+        }
+    }
     return Ok();
 }

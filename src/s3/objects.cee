@@ -488,6 +488,7 @@ async fn putObject(
         condition,
         ifMatch.view(),
     )?;
+    writtenVersionHeader(exchange, borrow outcome)?;
     return await sendStored(exchange, borrow outcome.md5, 0, borrow body);
 }
 
@@ -814,10 +815,10 @@ fn checkConditions(
 }
 
 /// Under the lock, with no I/O: the object's metadata, its conditions and its range. `openGet` adds the reader.
-fn planGet(store: borrow ObjectStore, req: borrow S3Request) -> Result<GetPlan, S3Fail> {
+fn planGet(store: borrow ObjectStore, req: borrow S3Request, versionId: [u8; 16]?) -> Result<GetPlan, S3Fail> {
     let bucket = req.bucket.view();
     let key = req.key.view();
-    let info = match (store.headObject(bucket, key)) {
+    let info = match (store.headObjectOf(bucket, key, versionId)) {
         Ok(i) => i,
         Err(e) => { return Err(storeFail(e, key.length)); }
     };
@@ -894,7 +895,13 @@ fn planGet(store: borrow ObjectStore, req: borrow S3Request) -> Result<GetPlan, 
     });
 }
 
-async fn openGet(app: borrow S3App, req: borrow S3Request, withBody: bool) -> Result<GetPlan, S3Fail> {
+async fn openGet(
+    app: borrow S3App,
+    req: borrow S3Request,
+    withBody: bool,
+    exchange: borrow mut Exchange,
+) -> Result<GetPlan, S3Fail> {
+    let versionId = requestVersion(req)?;
     // The plan and the reader's pins are index work, on the event loop under the lock (ADR-0023). Only an inline
     // record's read does I/O: on a worker thread, after the lock is released, while its segment is pinned (ADR-0024).
     var prepared: PreparedReader? = null;
@@ -902,9 +909,16 @@ async fn openGet(app: borrow S3App, req: borrow S3Request, withBody: bool) -> Re
     {
         var guard = await lockStore(app)?;
         let store = guard.data();
-        let p = planGet(store, req)?;
+        let p = match (planGet(store, req, versionId)) {
+            Ok(p) => p,
+            Err(f) => {
+                // A delete marker in the way names itself in the error's response (ADR-0041).
+                deleteMarkerHeaders(store, req.bucket.view(), req.key.view(), versionId, exchange)?;
+                return Err(f);
+            }
+        };
         if (withBody && !p.notModified && p.end > p.start) {
-            prepared = match (store.prepareReader(req.bucket.view(), req.key.view(), p.start, p.end)) {
+            prepared = match (store.prepareReaderOf(req.bucket.view(), req.key.view(), versionId, p.start, p.end)) {
                 Ok(r) => r,
                 Err(e) => { return Err(storeFail(e, req.key.length)); }
             };
@@ -933,7 +947,8 @@ async fn openGet(app: borrow S3App, req: borrow S3Request, withBody: bool) -> Re
 
 async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
     let withBody = !isMethod(req.method, Method.Head);
-    var plan = await openGet(app, req, withBody)?;
+    var plan = await openGet(app, req, withBody, exchange)?;
+    readVersionHeader(exchange, borrow plan.info)?;
     var field = Vector<u8>.create();
     appendEtag(mut field, borrow plan.info.md5, plan.info.parts)?;
     exchange.header("etag", field.view())?;
@@ -1103,7 +1118,8 @@ async fn getObjectAttributes(
         }
         null => {}
     }
-    let info = await objectInfo(app, req.bucket.view(), req.key.view())?;
+    let info = await objectInfo(app, req, exchange)?;
+    readVersionHeader(exchange, borrow info)?;
     let extras = match (decodeExtras(info.extras.view())) {
         Ok(e) => e,
         Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }

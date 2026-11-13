@@ -48,14 +48,17 @@ the checksum tests, only SHA-1 still fails, along with those that need ACLs, ver
 | Area | Supported | Not yet |
 |---|---|---|
 | Auth | SigV4 headers; presigned URLs, with hoisted `x-amz-*` query headers; aws-chunked, signed and unsigned, with trailers; POST object with a SigV4 policy | SigV2, session tokens |
-| Buckets | Create, Head, Delete, List (with creation dates and pagination), GetBucketLocation, GetBucketVersioning (always unversioned), ListObjectVersions (one `null` version per object); bucket tags; lifecycle rules (expiration by days or date, filtered by prefix, tags and size; AbortIncompleteMultipartUpload) | versioning, policies, ACLs, CORS; lifecycle transitions and noncurrent versions |
-| Objects | Put, Get, Head, Delete; Range; `?partNumber`; If-Match / If-None-Match / If-(Un)Modified-Since; conditional PUT and Complete (`If-None-Match`, `If-Match`); `response-*`; `versionId=null`; GetObjectAttributes | object lock |
+| Buckets | Create, Head, Delete, List (with creation dates and pagination), GetBucketLocation, PutBucketVersioning and GetBucketVersioning (`Enabled`, `Suspended`), ListObjectVersions (versions and delete markers, `key-marker` and `version-id-marker`); bucket tags; lifecycle rules (expiration by days or date, filtered by prefix, tags and size; AbortIncompleteMultipartUpload) | MFA delete, policies, ACLs, CORS; lifecycle transitions and noncurrent versions (rules expire nothing in a bucket with versioning) |
+| Objects | Put, Get, Head, Delete; Range; `?partNumber`; If-Match / If-None-Match / If-(Un)Modified-Since; conditional PUT and Complete (`If-None-Match`, `If-Match`); `response-*`; `versionId` on Get, Head, Delete, GetObjectAttributes and the tagging calls, with `x-amz-version-id` and `x-amz-delete-marker` in responses (ADR-0041); GetObjectAttributes | object lock |
 | Integrity | Content-MD5; `x-amz-checksum-{crc32,crc32c,crc64nvme,sha256}` checked and stored, CRC64NVME by default; returned with `x-amz-checksum-mode`; multipart COMPOSITE and FULL_OBJECT | SHA-1 checksums |
 | Metadata | `x-amz-meta-*` (2 KiB), Content-Encoding/-Disposition/-Language, Cache-Control, Expires; object tags (Get/Put/DeleteObjectTagging, `x-amz-tagging`, `x-amz-tagging-directive`, `x-amz-tagging-count`) | |
 | Listing | ListObjects v1 and v2: prefix, delimiter, pagination, `encoding-type=url` | |
 | Multipart | Create, UploadPart, UploadPartCopy (ranges), Complete (a retry gets its first answer), Abort, ListParts, ListMultipartUploads; uploads older than 7 days are aborted, and lifecycle rules may abort sooner | `delimiter` in ListMultipartUploads |
-| Copy and delete | CopyObject (COPY/REPLACE, `x-amz-copy-source-if-*`, If-Match / If-None-Match on the destination), DeleteObjects (one sync per batch) | |
+| Copy and delete | CopyObject (COPY/REPLACE, `x-amz-copy-source-if-*`, If-Match / If-None-Match on the destination, a source `?versionId=`), DeleteObjects (one sync per batch, version ids, delete markers reported) | |
 | Addressing | path-style; virtual-host under a configured domain | |
 | Network | HTTP/1.1 on any address (`[address:]port`, 127.0.0.1 by default); TLS 1.2/1.3 with `--tls-cert`/`--tls-key`, reloaded when the files change | SNI, HTTP/2 |
 
-Anything else gets S3's `NotImplemented` (501) XML error. Design notes: ADR-0008 to ADR-0020 in `docs/adr/`.
+Anything else gets S3's `NotImplemented` (501) XML error. Design notes: ADR-0008 to ADR-0020 and ADR-0041 in `docs/adr/`.
+
+Versioning (ADR-0041) is checked by `tools/s3_smoke.sh` with the AWS CLI. The s3-tests subset and the SDK scripts
+above were last run before it and do not exercise it yet.

@@ -281,6 +281,61 @@ check "transitions not implemented" "$(code s3api put-bucket-lifecycle-configura
 aws s3api delete-bucket-lifecycle --bucket smoke > /dev/null 2>&1
 check "lifecycle deleted" "$(code s3api get-bucket-lifecycle-configuration --bucket smoke)" NoSuchLifecycleConfiguration
 
+# Versions (ADR-0041): the bucket's versioning, version ids on writes and reads, delete markers, the listing.
+aws s3api create-bucket --bucket ver > /dev/null 2>&1
+check "versioning never set" "$(aws s3api get-bucket-versioning --bucket ver --query Status --output text)" None
+check "a bad versioning status" "$(code s3api put-bucket-versioning --bucket ver --versioning-configuration Status=Off)" MalformedXML
+aws s3api put-bucket-versioning --bucket ver --versioning-configuration Status=Enabled > /dev/null 2>&1 || fail "put-bucket-versioning"
+check "versioning enabled" "$(aws s3api get-bucket-versioning --bucket ver --query Status --output text)" Enabled
+printf one > v1.txt
+printf two > v2.txt
+v1=$(aws s3api put-object --bucket ver --key k --body v1.txt --query VersionId --output text)
+v2=$(aws s3api put-object --bucket ver --key k --body v2.txt --query VersionId --output text)
+check "each put has its version id" "$([ ${#v1} = 32 ] && [ ${#v2} = 32 ] && [ "$v1" != "$v2" ] && echo yes)" yes
+aws s3api get-object --bucket ver --key k --version-id "$v1" got.txt > /dev/null 2>&1
+check "get by version id" "$(cat got.txt)" one
+check "get names the current version" "$(aws s3api get-object --bucket ver --key k got.txt --query VersionId --output text)" "$v2"
+check "head by version id" "$(aws s3api head-object --bucket ver --key k --version-id "$v1" --query '[ContentLength,VersionId]' --output text)" "3	$v1"
+check "no such version" "$(code s3api get-object --bucket ver --key k --version-id 00112233445566778899aabbccddeeff got.txt)" NoSuchVersion
+check "not a version id" "$(code s3api get-object --bucket ver --key k --version-id nope got.txt)" InvalidArgument
+aws s3api put-object-tagging --bucket ver --key k --version-id "$v1" --tagging 'TagSet=[{Key=which,Value=first}]' > /dev/null 2>&1
+check "tags by version id" "$(aws s3api get-object-tagging --bucket ver --key k --version-id "$v1" --query 'TagSet[0].Value' --output text)" first
+check "the current version has no tags" "$(aws s3api get-object-tagging --bucket ver --key k --query 'length(TagSet)')" 0
+check "copy from a version" "$(aws s3api copy-object --bucket ver --key copy --copy-source "ver/k?versionId=$v1" --query CopySourceVersionId --output text)" "$v1"
+aws s3api get-object --bucket ver --key copy got.txt > /dev/null 2>&1
+check "the copy is that version" "$(cat got.txt)" one
+deleted=$(aws s3api delete-object --bucket ver --key k --query '[DeleteMarker,VersionId]' --output text)
+marker=$(printf '%s' "$deleted" | cut -f2)
+check "delete writes a marker" "$(printf '%s' "$deleted" | cut -f1)" True
+check "get under a marker" "$(code s3api get-object --bucket ver --key k got.txt)" NoSuchKey
+check "the 404 names the marker" "$(curl -s -o /dev/null -D - "$(aws s3 presign s3://ver/k)" | tr -d '\r' | grep -i '^x-amz-delete-marker\|^x-amz-version-id' | sort | cut -d' ' -f2 | tr '\n' ' ')" "true $marker "
+check "get a marker by its id" "$(code s3api get-object --bucket ver --key k --version-id "$marker" got.txt)" MethodNotAllowed
+check "a marker is not listed" "$(aws s3api list-objects-v2 --bucket ver --query 'Contents[].Key' --output text)" copy
+aws s3api get-object --bucket ver --key k --version-id "$v2" got.txt > /dev/null 2>&1
+check "versions stay under a marker" "$(cat got.txt)" two
+check "list-object-versions" "$(aws s3api list-object-versions --bucket ver --prefix k --query '[Versions[].VersionId,Versions[].IsLatest,DeleteMarkers[].VersionId,DeleteMarkers[].IsLatest]' --output text | tr '\t\n' ' ;')" "$v2 $v1;False False;$marker;True;"
+check "versions in pages of one" "$(aws s3api list-object-versions --bucket ver --page-size 1 --output json --query '[length(Versions),length(DeleteMarkers)]' | tr -d ' \n')" "[3,1]"
+check "one page of one" "$(aws s3api list-object-versions --bucket ver --max-keys 1 --no-paginate --query '[IsTruncated,NextKeyMarker,length(Versions)]' --output text)" "True	copy	1"
+check "delete-bucket with versions" "$(code s3api delete-bucket --bucket ver)" BucketNotEmpty
+check "delete the marker" "$(aws s3api delete-object --bucket ver --key k --version-id "$marker" --query '[DeleteMarker,VersionId]' --output text)" "True	$marker"
+check "the object is back" "$(aws s3api get-object --bucket ver --key k got.txt --query VersionId --output text)" "$v2"
+printf '{"Objects":[{"Key":"k","VersionId":"%s"},{"Key":"k"},{"Key":"k","VersionId":"nope"}]}' "$v1" > delete.json
+check "delete-objects with versions" "$(aws s3api delete-objects --bucket ver --delete file://delete.json --query '[Deleted[0].VersionId,Deleted[1].DeleteMarker,Errors[0].Code]' --output text)" "$v1	True	NoSuchVersion"
+aws s3api put-bucket-versioning --bucket ver --versioning-configuration Status=Suspended > /dev/null 2>&1
+check "versioning suspended" "$(aws s3api get-bucket-versioning --bucket ver --query Status --output text)" Suspended
+check "a suspended put has the null version" "$(aws s3api put-object --bucket ver --key k --body v1.txt --query VersionId --output text)" None
+check "the null version is the latest" "$(aws s3api list-object-versions --bucket ver --prefix k --query 'Versions[?IsLatest].VersionId' --output text)" null
+check "get the null version" "$(aws s3api get-object --bucket ver --key k --version-id null got.txt --query VersionId --output text)" null
+for kind in Versions DeleteMarkers; do
+    aws s3api list-object-versions --bucket ver --query "$kind[].[Key,VersionId]" --output text | while read -r k v; do
+        [ "$k" = None ] && continue
+        aws s3api delete-object --bucket ver --key "$k" --version-id "$v" > /dev/null 2>&1
+    done
+done
+check "every version deleted" "$(aws s3api list-object-versions --bucket ver --query '[Versions,DeleteMarkers]' --output text | tr '\t\n' '  ')" "None None "
+aws s3api delete-bucket --bucket ver > /dev/null 2>&1 && pass "delete-bucket without versions" || fail "delete-bucket without versions"
+check "an unversioned bucket's versions" "$(aws s3api list-object-versions --bucket smoke --max-keys 2 --no-paginate --query 'Versions[].[VersionId,IsLatest]' --output text | tr '\t\n' ' ;')" "null True;null True;"
+
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket smoke > /dev/null 2>&1 && pass "delete-bucket" || fail "delete-bucket"
