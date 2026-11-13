@@ -196,6 +196,59 @@ check("bucket not empty", code_of(lambda: s3.delete_bucket(Bucket=B)), "BucketNo
 boto3.resource("s3", endpoint_url=endpoint).Bucket(B).objects.all().delete()
 s3.delete_bucket(Bucket=B)
 check("bucket deleted", code_of(lambda: s3.head_bucket(Bucket=B)), "404")
+# Versions (ADR-0041): ids on writes, reads by id, a delete marker, the paginator over versions, and the resource's
+# object_versions, which is how boto3 empties a bucket with versioning.
+V = "boto3-versions"
+s3.create_bucket(Bucket=V)
+check("versioning never set", s3.get_bucket_versioning(Bucket=V).get("Status"), None)
+s3.put_bucket_versioning(Bucket=V, VersioningConfiguration={"Status": "Enabled"})
+check("versioning enabled", s3.get_bucket_versioning(Bucket=V).get("Status"), "Enabled")
+ids = [s3.put_object(Bucket=V, Key="k", Body=b"version %d" % i)["VersionId"] for i in range(3)]
+check("three version ids", (len(set(ids)), all(len(i) == 32 for i in ids)), (3, True))
+got = s3.get_object(Bucket=V, Key="k", VersionId=ids[0])
+check("get by version id", (got["Body"].read(), got["VersionId"]), (b"version 0", ids[0]))
+check("head names the current version", s3.head_object(Bucket=V, Key="k")["VersionId"], ids[2])
+check("no such version", code_of(lambda: s3.get_object(Bucket=V, Key="k", VersionId="0" * 31 + "1")), "NoSuchVersion")
+part = os.urandom(5 * 1024 * 1024)
+up = s3.create_multipart_upload(Bucket=V, Key="mp")["UploadId"]
+etag = s3.upload_part(Bucket=V, Key="mp", UploadId=up, PartNumber=1, Body=part)["ETag"]
+done = s3.complete_multipart_upload(Bucket=V, Key="mp", UploadId=up,
+                                    MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": etag}]})
+check("multipart version id", len(done.get("VersionId", "")), 32)
+copied = s3.copy_object(Bucket=V, Key="copy", CopySource={"Bucket": V, "Key": "k", "VersionId": ids[1]})
+check("copy from a version", (copied["CopySourceVersionId"], s3.get_object(Bucket=V, Key="copy")["Body"].read()),
+      (ids[1], b"version 1"))
+marker = s3.delete_object(Bucket=V, Key="k")
+check("delete marker", (marker.get("DeleteMarker"), len(marker["VersionId"])), (True, 32))
+try:
+    s3.head_object(Bucket=V, Key="k")
+    check("head under a marker", "found", "404")
+except ClientError as e:
+    headers = e.response["ResponseMetadata"]["HTTPHeaders"]
+    check("head under a marker", (e.response["Error"]["Code"], headers.get("x-amz-delete-marker"),
+                                  headers.get("x-amz-version-id")), ("404", "true", marker["VersionId"]))
+check("get a marker by id", code_of(lambda: s3.get_object(Bucket=V, Key="k", VersionId=marker["VersionId"])),
+      "MethodNotAllowed")
+listed = [(v["Key"], v["VersionId"], v["IsLatest"]) for page in
+          s3.get_paginator("list_object_versions").paginate(Bucket=V, Prefix="k", PaginationConfig={"PageSize": 2})
+          for v in page.get("Versions", [])]
+check("versions in pages of two", listed, [("k", ids[2], False), ("k", ids[1], False), ("k", ids[0], False)])
+markers = s3.list_object_versions(Bucket=V, Prefix="k").get("DeleteMarkers", [])
+check("the marker is the latest", [(m["VersionId"], m["IsLatest"]) for m in markers], [(marker["VersionId"], True)])
+r = s3.delete_objects(Bucket=V, Delete={"Objects": [{"Key": "k", "VersionId": marker["VersionId"]},
+                                                    {"Key": "k", "VersionId": ids[0]}]})
+check("delete_objects with versions", sorted((d["VersionId"], d.get("DeleteMarker", False)) for d in r["Deleted"]),
+      sorted([(marker["VersionId"], True), (ids[0], False)]))
+check("the key is back", s3.get_object(Bucket=V, Key="k")["Body"].read(), b"version 2")
+s3.put_bucket_versioning(Bucket=V, VersioningConfiguration={"Status": "Suspended"})
+check("a suspended put has no version id", s3.put_object(Bucket=V, Key="k", Body=b"null").get("VersionId"), None)
+check("the null version", s3.get_object(Bucket=V, Key="k", VersionId="null")["Body"].read(), b"null")
+check("bucket with versions not empty", code_of(lambda: s3.delete_bucket(Bucket=V)), "BucketNotEmpty")
+boto3.resource("s3", endpoint_url=endpoint).Bucket(V).object_versions.all().delete()
+check("no versions left", [k for k in s3.list_object_versions(Bucket=V) if k in ("Versions", "DeleteMarkers")], [])
+s3.delete_bucket(Bucket=V)
+check("versioned bucket deleted", code_of(lambda: s3.head_bucket(Bucket=V)), "404")
+
 check("wrong secret", code_of(lambda: boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
                                                        aws_secret_access_key="wrong").list_buckets()),
       "SignatureDoesNotMatch")

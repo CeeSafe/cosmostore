@@ -1623,3 +1623,21 @@ Browser form uploads with a SigV4 POST policy.
   versioning (M5 item 2).
 - **Next:** slice 4 (the s3-tests versioning tests into the subset, the SDK matrix), then M5 item 2, lifecycle
   rules for noncurrent versions and expired delete markers.
+
+### 13 Nov 2026: M5 item 1, the compatibility matrix with versioning (ADR-0041, slice 4)
+
+- **s3-tests** (`5b39871`, boto3 1.42.97 with the CRT): with the `versioning` and `delete_marker` markers in scope,
+  472 tests, 297 pass. The 33 new ones that are not `test_post_object*` join the subset, now 285, and all are
+  versioning tests (create, read and remove by version; suspend; null version overwrite and removal; multi-object
+  delete with markers; copies of versions; multipart version ids; the list marker; concurrent create and remove;
+  conditional writes on the current version). The subset passes whole.
+- **The suite's python needs the CRT.** A first run without it failed two date-header tests of the old subset and
+  passed five tests outside it; with it the results are those of 9 Nov. `tools/s3tests/run.sh` now says so.
+- **Versioning tests left out:** one expects `x-amz-delete-marker: false` on a plain 404 (S3 sends it only when
+  true), one creates its bucket twice and expects success (BucketAlreadyOwnedByYou here), the rest need ACLs or
+  Object Lock.
+- **SDK matrix, all against this build:** boto3 72 checks (20 new: version ids on PUT, multipart and copy, reads by
+  id, the marker's 404 fields, the paginator over versions, DeleteObjects with versions, suspended, and
+  `object_versions.all().delete()`); rclone 20, Go 22, JavaScript 28 (client-s3 3.1168.0), Java 25, .NET 22 pass as
+  before and do not exercise versioning.
+- **Next:** M5 item 2, lifecycle rules for noncurrent versions and expired delete markers.

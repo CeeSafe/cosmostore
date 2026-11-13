@@ -6,7 +6,7 @@ giving up large-object throughput or crash correctness.
 
 **Status: a single-node alpha.** `cosmostore serve` speaks the S3 API over HTTP/1.1 and TLS, on a crash-tested
 storage engine (journal, large-object extents, checkpoints, compaction, the space reserve and `fsck`). The AWS CLI,
-rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 252 Ceph s3-tests pass against it
+rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 285 Ceph s3-tests pass against it
 ([compatibility](docs/compatibility.md)). Milestones M0 to M4 of the [roadmap](ROADMAP.md) are done; M5, production
 features, is under way: S3 versioning is in (ADR-0041). There is no replication or clustering yet, and no policies or
 ACLs.
@@ -323,8 +323,8 @@ limits.
 - M4, performance: group commit across requests, upkeep in steps, the comparison runs, the p99 gates in CI, and the
   targets ([docs/targets.md](docs/targets.md)) on the reference machine.
 
-**Now, M5 (production features):** versioning, delete markers and ListObjectVersions are in (ADR-0041); the
-compatibility suites have not been run against them yet. Then lifecycle rules for noncurrent versions, policies,
+**Now, M5 (production features):** versioning, delete markers and ListObjectVersions are in (ADR-0041), checked
+with the AWS CLI, boto3 and the Ceph versioning tests. Then lifecycle rules for noncurrent versions, policies,
 encryption and Object Lock.
 
 **Later:** M6 a Raft-based cluster, and M7 advanced S3 features.

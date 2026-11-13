@@ -1,9 +1,9 @@
 # ADR-0041: The versions of a key
 
-**Status:** accepted for M5 (item 1: versioning, delete markers, ListObjectVersions), 13 Nov 2026. Slices 1 to 3
-are built (`src/metadata/version_index.cee`, `src/store/object_store.cee`, `src/store/checkpoint.cee`,
-`src/store/version_tests.cee`, `src/s3/versions.cee`): the store keeps versions and the S3 API offers them. Slice 4,
-the compatibility suites, is open.
+**Status:** accepted for M5 (item 1: versioning, delete markers, ListObjectVersions), 13 Nov 2026, and built
+(`src/metadata/version_index.cee`, `src/store/object_store.cee`, `src/store/checkpoint.cee`,
+`src/store/version_tests.cee`, `src/s3/versions.cee`): the store keeps versions, the S3 API offers them, and the
+compatibility matrix was run with them (`docs/compatibility.md`).
 
 ## Context
 
