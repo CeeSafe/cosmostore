@@ -1955,3 +1955,28 @@ Browser form uploads with a SigV4 POST policy.
 - **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
 - **Next:** the rest of item 7 (quotas, rate limits, an audit log, an admin API and CLI); item 4's rest when G33
   is fixed; the p99 gate for items 3 to 7 on a quiet machine.
+
+### 14 Nov 2026: the p99 gate for M5 items 3 to 7 (ADR-0030), on the Intel Mac mini
+
+- **Why there:** the gate gave no verdict twice on the M1 on 13 Nov (other sessions' builds), and nine slices went
+  in after it. Chosen with the user (yes, 14 Nov). Base `94fe87e` (before bucket policies), head `70cd5f8`
+  (credential rotation), both built there with ceesafec 0.41.0; the default matrix (0 B, 1 KiB, 4 KiB and 1 MiB
+  at concurrency 1 and 32, 3 rounds); the bench and the gate are the binaries cross-built for it (it has no Go).
+- **First run: failed in one group of ten.** Large GETs at concurrency 32: p99 × 2.09, ops/s × 0.61, and the 1 MiB
+  HEAD phase beside it at half its rate. Nine groups were within tolerance (p99 0.89 to 1.11). By round: head was
+  slow in rounds 1 and 3 (GET 1,557 and 1,258 ops/s, HEAD 16,515 and 17,180) and as the base in round 2 (2,670 and
+  36,860; the base's three rounds 2,371 to 2,638 and 35,333 to 39,216). The load log has two bursts in the whole
+  run (to 9.6 at 00:36 and to 5.7 at 01:04), at the ends of those two runs.
+- **That group alone, 5 rounds: passed.** Head 2,281 to 2,402 GETs/s and 36,644 to 37,967 HEADs/s against the
+  base's 2,323 to 2,396 and 36,250 to 38,716.
+- **Second full run, with the busiest processes sampled every 10 s: passed, every group.** p99 0.95 to 1.02,
+  ops/s 0.99 to 1.01, noise 1.00 to 1.19; no load above 3.2 in its 940 samples.
+- **What it shows:** M5 items 3 to 7 cost nothing the gate can see at these sizes and concurrencies. The first
+  run's failure sat on the machine's only two load bursts and did not come back in 8 more runs of those phases;
+  what made the bursts was not found (not the malware scanner's or Spotlight's processes by their start times).
+  Those phases last under a second each, so one burst halves them: a longer 1 MiB phase would make the gate
+  steadier there.
+- **Not shown:** anything in ms or ops/s for the M1 (the mini's sync is about 22 ms), requests with policies,
+  ACLs, CORS rules or notification rules in place (the bench uses none), or anonymous requests, which now take a
+  lock round (ADR-0045 §6).
+- Results: `~/cosmo-ref/run-gate-m5`, `run-gate-m5b` and `run-gate-m5c` on the mini.
