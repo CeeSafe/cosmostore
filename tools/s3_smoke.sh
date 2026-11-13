@@ -278,6 +278,11 @@ aws s3api put-bucket-lifecycle-configuration --bucket smoke --lifecycle-configur
   {"ID":"uploads","Filter":{"Prefix":""},"Status":"Enabled","AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}' > /dev/null 2>&1
 check "lifecycle rules" "$(aws s3api get-bucket-lifecycle-configuration --bucket smoke --query 'Rules[].[ID,Expiration.Days,AbortIncompleteMultipartUpload.DaysAfterInitiation]' --output text | tr '\t\n' ' ;')" "logs 30 None;uploads None 7;"
 check "transitions not implemented" "$(code s3api put-bucket-lifecycle-configuration --bucket smoke --lifecycle-configuration '{"Rules":[{"ID":"t","Filter":{"Prefix":""},"Status":"Enabled","Transitions":[{"Days":1,"StorageClass":"GLACIER"}]}]}')" NotImplemented
+aws s3api put-bucket-lifecycle-configuration --bucket smoke --lifecycle-configuration '{"Rules":[
+  {"ID":"old","Filter":{"Prefix":"docs/"},"Status":"Enabled","NoncurrentVersionExpiration":{"NoncurrentDays":30,"NewerNoncurrentVersions":3}},
+  {"ID":"markers","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"ExpiredObjectDeleteMarker":true}}]}' > /dev/null 2>&1
+check "lifecycle rules for versions" "$(aws s3api get-bucket-lifecycle-configuration --bucket smoke --query 'Rules[].[ID,NoncurrentVersionExpiration.NoncurrentDays,NoncurrentVersionExpiration.NewerNoncurrentVersions,Expiration.ExpiredObjectDeleteMarker]' --output text | tr '\t\n' ' ;')" "old 30 3 None;markers None None True;"
+check "too many versions to keep" "$(code s3api put-bucket-lifecycle-configuration --bucket smoke --lifecycle-configuration '{"Rules":[{"ID":"n","Filter":{"Prefix":""},"Status":"Enabled","NoncurrentVersionExpiration":{"NoncurrentDays":1,"NewerNoncurrentVersions":101}}]}')" InvalidArgument
 aws s3api delete-bucket-lifecycle --bucket smoke > /dev/null 2>&1
 check "lifecycle deleted" "$(code s3api get-bucket-lifecycle-configuration --bucket smoke)" NoSuchLifecycleConfiguration
 

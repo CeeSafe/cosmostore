@@ -784,6 +784,50 @@ fn lifecycleXmlParsesAndWritesBack() -> Result<void, TestFailure> {
     return Ok();
 }
 
+@test
+fn lifecycleXmlForVersions() -> Result<void, TestFailure> {
+    let xml = """
+        <LifecycleConfiguration>
+          <Rule><ID>old</ID><Filter><Prefix>docs/</Prefix></Filter><Status>Enabled</Status>
+            <NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays>
+              <NewerNoncurrentVersions>3</NewerNoncurrentVersions></NoncurrentVersionExpiration></Rule>
+          <Rule><ID>both</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status>
+            <Expiration><Days>7</Days></Expiration>
+            <NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule>
+          <Rule><ID>markers</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status>
+            <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule>
+        </LifecycleConfiguration>
+        """;
+    let rules = match (parseLifecycle(xml.bytes())) {
+        Ok(r) => r,
+        Err(_) => { return Check.fail("the configuration parses"); }
+    };
+    Check.equalU64(3, rules.length as u64)?;
+    Check.isTrue(rules[0].noncurrentDays == 30 && rules[0].newerNoncurrent == 3, "days and versions to keep")?;
+    Check.isTrue(rules[0].expirationDays == 0, "no expiration of the current version")?;
+    Check.isTrue(
+        rules[1].expirationDays == 7 && rules[1].noncurrentDays == 1 && rules[1].newerNoncurrent == 0,
+        "both",
+    )?;
+    Check.isTrue(rules[2].expiredDeleteMarker && rules[2].noncurrentDays == 0, "markers alone")?;
+    // The store keeps them: a version 2 blob, read back the same.
+    var blob = Vector<u8>.create();
+    encodeLifecycle(rules.view(), mut blob)!;
+    Check.equalU64(2, blob[0] as u64)?;
+    let back = decodeLifecycle(blob.view())!;
+    Check.isTrue(back[0].noncurrentDays == 30 && back[0].newerNoncurrent == 3 && back[2].expiredDeleteMarker, "kept")?;
+    let refused = [
+        "<LifecycleConfiguration><Rule><Status>Enabled</Status><NoncurrentVersionExpiration></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>0</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays><NewerNoncurrentVersions>101</NewerNoncurrentVersions></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays><NewerNoncurrentVersions>0</NewerNoncurrentVersions></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><Status>Enabled</Status><NoncurrentVersionTransition><NoncurrentDays>1</NoncurrentDays><StorageClass>GLACIER</StorageClass></NoncurrentVersionTransition></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><Filter><Tag><Key>k</Key><Value>v</Value></Tag></Filter><Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule></LifecycleConfiguration>",
+    ];
+    for (r in refused) { Check.isTrue(parseLifecycle(r.bytes()).isErr(), "a configuration S3 refuses")?; }
+    return Ok();
+}
+
 /// ADR-0033: the latency buckets cover every duration, each top is in its bucket, and percentiles are bucket tops.
 @test
 fn latencyHistogramBuckets() -> Result<void, TestFailure> {

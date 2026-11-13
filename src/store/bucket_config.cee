@@ -77,16 +77,25 @@ struct LifecycleRule {
     abortDays: u32;
     /// Given as the legacy top-level `<Prefix>`, so written back that way, as S3 does.
     legacyPrefix: bool;
-    /// `ExpiredObjectDeleteMarker`: kept and returned, and a no-op, since an unversioned bucket has no delete markers.
+    /// `ExpiredObjectDeleteMarker`: a delete marker that is its key's only version is removed (ADR-0042).
     expiredDeleteMarker: bool;
+    /// `NoncurrentVersionExpiration` (ADR-0042): a version is removed this many days after it stopped being the
+    /// current one (0: no such action), if at least `newerNoncurrent` noncurrent versions of its key are newer.
+    noncurrentDays: u32;
+    newerNoncurrent: u32;
 }
 
 /// Rules blob v1: u8 version (1), u16 rule count, then per rule: u16+bytes id, u8 flags (1 enabled, 2 a size floor,
 /// 4 a size ceiling, 8 a legacy prefix, 16 ExpiredObjectDeleteMarker), u16+bytes prefix, u8 tag count and each u16+bytes, u64 size floor, u64 size ceiling,
-/// u32 expiration days, i64 expiration date, u32 abort days.
+/// u32 expiration days, i64 expiration date, u32 abort days. Version 2 (ADR-0042), written only when a rule expires
+/// noncurrent versions, adds per rule: u32 noncurrent days, u32 newer noncurrent versions.
 fn encodeLifecycle(rules: Slice<LifecycleRule>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
     out.clear();
-    out.pushLE(1u8)?;
+    var version: u8 = 1;
+    for (r in rules) {
+        if (r.noncurrentDays > 0) { version = 2; }
+    }
+    out.pushLE(version)?;
     out.pushLE(truncate<u16>(rules.length))?;
     for (r in rules) {
         pushText16(out, r.id.view())?;
@@ -105,6 +114,10 @@ fn encodeLifecycle(rules: Slice<LifecycleRule>, out: borrow mut Vector<u8>) -> R
         out.pushLE(r.expirationDays)?;
         out.pushLE(r.expirationDate)?;
         out.pushLE(r.abortDays)?;
+        if (version == 2) {
+            out.pushLE(r.noncurrentDays)?;
+            out.pushLE(r.newerNoncurrent)?;
+        }
     }
     return Ok();
 }
@@ -114,7 +127,8 @@ fn decodeLifecycle(blob: Slice<u8>) -> Result<Vector<LifecycleRule>, MetaFault> 
     if (blob.length == 0) { return Ok(rules); }
     var at: usize = 0;
     need(blob, at, 3)?;
-    if (blob[0] != 1) { return Err(MetaFault.BadVersion); }
+    let version = blob[0];
+    if (version != 1 && version != 2) { return Err(MetaFault.BadVersion); }
     let count = blob.readLE<u16>(1);
     at = 3;
     for (i in 0..count) {
@@ -133,6 +147,12 @@ fn decodeLifecycle(blob: Slice<u8>) -> Result<Vector<LifecycleRule>, MetaFault> 
         let days = readU32(blob, mut at)?;
         let date = readI64(blob, mut at)?;
         let abort = readU32(blob, mut at)?;
+        var noncurrentDays: u32 = 0;
+        var newerNoncurrent: u32 = 0;
+        if (version == 2) {
+            noncurrentDays = readU32(blob, mut at)?;
+            newerNoncurrent = readU32(blob, mut at)?;
+        }
         rules.push(LifecycleRule {
             id: id,
             enabled: (flags & 1) != 0,
@@ -147,6 +167,8 @@ fn decodeLifecycle(blob: Slice<u8>) -> Result<Vector<LifecycleRule>, MetaFault> 
             abortDays: abort,
             legacyPrefix: (flags & 8) != 0,
             expiredDeleteMarker: (flags & 16) != 0,
+            noncurrentDays: noncurrentDays,
+            newerNoncurrent: newerNoncurrent,
         })?;
     }
     if (at != blob.length) { return Err(MetaFault.TooLong); }
@@ -187,6 +209,19 @@ fn expiresAt(r: borrow LifecycleRule, mtimeMillis: i64) -> i64? {
     return null;
 }
 
+/// Whether an enabled rule's filter takes a delete marker of this key (ADR-0042 §4): a marker has no size and no
+/// tags, so only a rule that filters by neither can.
+fn ruleTakesMarker(r: borrow LifecycleRule, key: Slice<u8>) -> bool =>
+    r.enabled && startsWithBytes(key, r.prefix.view()) && !r.hasSizeAbove && !r.hasSizeBelow && r.tags.length == 0;
+
+/// When a rule removes a version that stopped being the current one at `sinceMillis`: the days added, rounded up to
+/// the next midnight UTC, as `expiresAt`. null: the rule does not expire noncurrent versions.
+fn noncurrentExpiresAt(r: borrow LifecycleRule, sinceMillis: i64) -> i64? {
+    if (r.noncurrentDays == 0) { return null; }
+    let t = sinceMillis + (r.noncurrentDays as i64) * DAY_MILLIS;
+    return ((t + DAY_MILLIS - 1) / DAY_MILLIS) * DAY_MILLIS;
+}
+
 @test
 fn lifecycleRulesRoundTripAndMatch() -> Result<void, TestFailure> {
     var tags = Vector<Vector<u8>>.create();
@@ -205,6 +240,8 @@ fn lifecycleRulesRoundTripAndMatch() -> Result<void, TestFailure> {
         abortDays: 7,
         legacyPrefix: false,
         expiredDeleteMarker: false,
+        noncurrentDays: 0,
+        newerNoncurrent: 0,
     };
     var rules = Vector<LifecycleRule>.create();
     rules.push(rule)!;

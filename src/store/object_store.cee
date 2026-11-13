@@ -180,8 +180,12 @@ struct MaintenanceReport {
 
 /// What one application of the lifecycle rules did.
 struct LifecycleReport {
+    /// Current objects expired: deleted, or, in a bucket with versioning, put under a delete marker.
     objectsExpired: u64;
     uploadsAborted: u64;
+    /// Noncurrent versions removed, and delete markers removed that were their key's only version (ADR-0042).
+    versionsExpired: u64;
+    markersRemoved: u64;
 }
 
 /// A live inline version that compaction copies.
@@ -904,6 +908,92 @@ fn verifyFault(e: StoreError) -> VerifyFault => match (e) {
 
 /// What admission adds for a write's journal record and the extent headers of a small object (ADR-0006).
 const ADMIT_RECORD_BYTES: u64 = 4096;
+
+/// What a bucket's rules can take at all at one time, worked out once a run so that the pass, which looks at every
+/// version of the bucket, spends one comparison on a version no rule can take yet (ADR-0042 §9).
+struct LifecycleCutoffs {
+    /// A current object, or a lone delete marker, written after this (Unix milliseconds) is not due by any rule's
+    /// `Expiration`; -1 when no rule has one.
+    current: i64;
+    /// A version that became noncurrent after this is not due by any rule; -1 when no rule expires them.
+    noncurrent: i64;
+    /// Some rule has `ExpiredObjectDeleteMarker`: a lone marker may go whatever its age.
+    markers: bool;
+}
+
+fn lifecycleCutoffs(rules: Slice<LifecycleRule>, nowMillis: i64) -> LifecycleCutoffs {
+    var cut = LifecycleCutoffs { current: -1, noncurrent: -1, markers: false };
+    for (i in 0..rules.length) {
+        let r = borrow rules[i];
+        if (!r.enabled) { continue; }
+        // Due means the days added to the time, rounded up to midnight, have passed: never before the days have.
+        if (r.expirationDays > 0) { cut.current = cut.current.max(nowMillis - (r.expirationDays as i64) * DAY_MILLIS); }
+        if (r.expirationDate > 0 && nowMillis >= r.expirationDate) { cut.current = 0x7FFFFFFFFFFFFFFF; }
+        if (r.noncurrentDays > 0) {
+            cut.noncurrent = cut.noncurrent.max(nowMillis - (r.noncurrentDays as i64) * DAY_MILLIS);
+        }
+        if (r.expiredDeleteMarker) { cut.markers = true; }
+    }
+    return cut;
+}
+
+/// Whether some rule deletes this version at `nowMillis` (ADR-0042 §3). Current (`noncurrent` false): an object
+/// whose `Expiration`, counted from `sinceMillis` (its modification time), has passed. Noncurrent: a version, delete
+/// markers too, whose `NoncurrentVersionExpiration` has passed since it stopped being current (`sinceMillis`), with
+/// at least the rule's count of `newer` noncurrent versions kept.
+fn lifecycleTakes(
+    rules: Slice<LifecycleRule>,
+    key: Slice<u8>,
+    v: borrow ObjectVersion,
+    noncurrent: bool,
+    newer: u32,
+    sinceMillis: i64,
+    nowMillis: i64,
+) -> bool {
+    let marker = isDeleteMarker(v);
+    for (i in 0..rules.length) {
+        let r = borrow rules[i];
+        // The cheap parts first: the pass looks at every version of the bucket, and nearly none is due.
+        if (!r.enabled || !startsWithBytes(key, r.prefix.view())) { continue; }
+        if (noncurrent && newer < r.newerNoncurrent) { continue; }
+        let at = if (noncurrent) noncurrentExpiresAt(r, sinceMillis) else expiresAt(r, sinceMillis);
+        let due = match (at) {
+            Some(t) => nowMillis >= t,
+            null => false,
+        };
+        if (!due) { continue; }
+        if (marker) {
+            if (ruleTakesMarker(r, key)) { return true; }
+            continue;
+        }
+        // The rest of the filter; the tags are read out of the metadata only for a rule that filters by them.
+        var tags = Vector<u8>.create();
+        if (r.tags.length > 0) {
+            match (metadataValue(v.metadata.view(), TAGS_FIELD.bytes())) {
+                Ok(t) => { tags = t; }
+                Err(_) => {}
+            }
+        }
+        if (ruleMatches(r, key, v.size, tags.view())) { return true; }
+    }
+    return false;
+}
+
+/// Whether some rule removes a delete marker that is its key's only version (ADR-0042 §3): one with
+/// `ExpiredObjectDeleteMarker`, or an `Expiration` that has passed since the marker was written.
+fn lifecycleTakesLoneMarker(rules: Slice<LifecycleRule>, key: Slice<u8>, writtenMillis: i64, nowMillis: i64) -> bool {
+    for (r in rules) {
+        if (!ruleTakesMarker(r, key)) { continue; }
+        if (r.expiredDeleteMarker) { return true; }
+        match (expiresAt(r, writtenMillis)) {
+            Some(t) => {
+                if (nowMillis >= t) { return true; }
+            }
+            null => {}
+        }
+    }
+    return false;
+}
 
 /// The most objects one bucket's lifecycle rules delete in one run (ADR-0020).
 const LIFECYCLE_BATCH: usize = 1000;
@@ -2307,12 +2397,19 @@ struct ObjectStore {
         borrow mut this,
         bucket: StringView,
         targets: Slice<DeleteTarget>,
+    ) -> Result<Vector<DeleteOutcome>, StoreError> => this.deleteManyAt(bucket.bytes(), targets, Clock.unixMillis());
+
+    /// `deleteMany` with the time its records carry: the clock's, or a lifecycle run's.
+    fn deleteManyAt(
+        borrow mut this,
+        bucket: Slice<u8>,
+        targets: Slice<DeleteTarget>,
+        now: i64,
     ) -> Result<Vector<DeleteOutcome>, StoreError> {
         this.commitStaged()?;
         this.checkWritable()?;
-        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        if (!this.state.hasBucket(bucket)?) { return Err(StoreError.NoSuchBucket); }
         var out = Vector<DeleteOutcome>.create();
-        let now = Clock.unixMillis();
         // Before the batch stages anything of its own: what is in a sync now may hold a PUT of one of its keys.
         let unpublished = this.pendingApplies.length > 0 || this.inflightApplies.length > 0;
         for (i in 0..targets.length) {
@@ -2321,7 +2418,7 @@ struct ObjectStore {
                 out.push(DeleteOutcome { valid: false, lsn: null, versionId: null, deleteMarker: false })?;
                 continue;
             }
-            match (this.stageTarget(bucket.bytes(), borrow targets[i], now, unpublished)) {
+            match (this.stageTarget(bucket, borrow targets[i], now, unpublished)) {
                 Ok(o) => { out.push(o)?; }
                 Err(e) => {
                     this.journal.discardPending();
@@ -3396,7 +3493,7 @@ struct ObjectStore {
         var compaction = CompactStats { segmentsRemoved: 0, bytesFreed: 0, relocated: 0, bytesCopied: 0 };
         if (withSteps) { compaction = this.compact(this.config.compactMaxCopyBytes)?; }
         let compacted = Clock.monotonicNanos();
-        var lifecycle = LifecycleReport { objectsExpired: 0, uploadsAborted: 0 };
+        var lifecycle = LifecycleReport { objectsExpired: 0, uploadsAborted: 0, versionsExpired: 0, markersRemoved: 0 };
         let lifecycleEvery = this.config.lifecycleEveryMillis;
         if (lifecycleEvery > 0 && now - this.lifecycleRan >= truncate<i64>(lifecycleEvery)) {
             lifecycle = this.applyLifecycle(now)?;
@@ -3461,10 +3558,12 @@ struct ObjectStore {
     }
 
     /// Applies every bucket's lifecycle rules as of `nowMillis`: deletes the objects a rule has expired (one batch per
-    /// bucket, as DeleteObjects does) and aborts the uploads a rule's AbortIncompleteMultipartUpload has. At most
-    /// LIFECYCLE_BATCH objects per bucket and run, so the store's lock is never held long; the rest wait for the next.
+    /// bucket, as DeleteObjects does) and aborts the uploads a rule's AbortIncompleteMultipartUpload has. In a bucket
+    /// with versioning (ADR-0042) an expired current object gets a delete marker, noncurrent versions are removed
+    /// by their rule, and so is a delete marker left as its key's only version. About LIFECYCLE_BATCH deletes per
+    /// bucket and run, so the store's lock is never held long; the rest wait for the next.
     fn applyLifecycle(borrow mut this, nowMillis: i64) -> Result<LifecycleReport, StoreError> {
-        var report = LifecycleReport { objectsExpired: 0, uploadsAborted: 0 };
+        var report = LifecycleReport { objectsExpired: 0, uploadsAborted: 0, versionsExpired: 0, markersRemoved: 0 };
         var names = Vector<Vector<u8>>.create();
         for (i in 0..this.state.buckets.length()) {
             if (this.state.buckets.valueAt(i).lifecycle.length > 0) {
@@ -3482,49 +3581,74 @@ struct ObjectStore {
                 Ok(r) => r,
                 Err(_) => { return Err(StoreError.DataCorrupt); }
             };
-            // Objects that some rule has expired.
-            var expired = Vector<Vector<u8>>.create();
+            let cut = lifecycleCutoffs(rules.view(), nowMillis);
+            // What the rules delete: a key (its current object) or one version of it, by id (ADR-0042 §3).
+            var targets = Vector<DeleteTarget>.create();
+            var objects: u64 = 0;
+            var versions: u64 = 0;
+            var markers: u64 = 0;
+            // With versioning suspended, the marker over an expired object has the null id and replaces the key's
+            // null version when it is applied (ADR-0041 §2).
+            let suspended = match (this.state.buckets.get(borrow k)) {
+                Some(b) => b.versioning == VERSIONING_SUSPENDED,
+                null => false,
+            };
             // The bucket's keys are one run of the index: from its first key to the next bucket's.
             let start = this.state.keyFor(bucketName, "".bytes())?;
             var cursor = this.state.index.seek(borrow start);
-            // A versioned bucket's objects are not expired until there are noncurrent-version rules (ADR-0041 §9); its
-            // uploads still are.
-            let versioned = match (this.state.buckets.get(borrow k)) {
-                Some(b) => b.versioning != VERSIONING_OFF,
-                null => false,
-            };
-            if (versioned) { cursor = null; }
             while (true) {
                 let i = match (cursor) {
                     Some(c) => c,
                     null => { break; }
                 };
                 cursor = this.state.index.next(i);
-                if (expired.length == LIFECYCLE_BATCH) { break; }
+                if (targets.length >= LIFECYCLE_BATCH) { break; }
                 let key = this.state.index.keyAt(i);
                 if (key.bucket != start.bucket) { break; }
-                let v = this.state.index.valueAt(i);
-                let tags = match (metadataValue(v.metadata.view(), TAGS_FIELD.bytes())) {
-                    Ok(t) => t,
-                    Err(_) => Vector<u8>.create(),
-                };
-                for (r in 0..rules.length) {
-                    if (!ruleMatches(borrow rules[r], key.key.view(), v.size, tags.view())) { continue; }
-                    match (expiresAt(borrow rules[r], v.mtimeMillis)) {
-                        Some(at) => {
-                            if (nowMillis >= at) {
-                                expired.push(copyBytes(key.key.view())?)?;
-                                break;
-                            }
-                        }
-                        null => {}
+                let name = key.key.view();
+                let headSlot = this.state.index.slotAt(i);
+                let head = this.state.index.versionAt(headSlot);
+                var slot = this.state.index.olderOf(headSlot);
+                var nullReplaced = false;
+                if (!isDeleteMarker(head)) {
+                    // The current object: deleted, or put under a delete marker, by a DELETE without a version id.
+                    if (head.mtimeMillis <= cut.current &&
+                        lifecycleTakes(rules.view(), name, head, false, 0, head.mtimeMillis, nowMillis)) {
+                        targets.push(DeleteTarget { key: copyBytes(name)?, versionId: null })?;
+                        objects += 1;
+                        nullReplaced = suspended;
+                    }
+                } else if (slot == NO_VERSION_SLOT) {
+                    // A delete marker that is all its key has.
+                    if ((cut.markers || head.mtimeMillis <= cut.current) &&
+                        lifecycleTakesLoneMarker(rules.view(), name, head.mtimeMillis, nowMillis)) {
+                        targets.push(DeleteTarget { key: copyBytes(name)?, versionId: head.versionId })?;
+                        markers += 1;
                     }
                 }
+                // The noncurrent versions: each became noncurrent when the next newer one was written.
+                var since = head.mtimeMillis;
+                var newer: u32 = 0;
+                while (slot != NO_VERSION_SLOT) {
+                    let v = this.state.index.versionAt(slot);
+                    // Not the null version this run's null marker replaces: a delete of the null id after that
+                    // marker in the batch would remove the marker.
+                    let replaced = nullReplaced && isNullVersionId(v.versionId);
+                    if (!replaced && since <= cut.noncurrent &&
+                        lifecycleTakes(rules.view(), name, v, true, newer, since, nowMillis)) {
+                        targets.push(DeleteTarget { key: copyBytes(name)?, versionId: v.versionId })?;
+                        versions += 1;
+                    }
+                    since = v.mtimeMillis;
+                    newer += 1;
+                    slot = this.state.index.olderOf(slot);
+                }
             }
-            if (expired.length > 0) {
-                let bucketText = StringView.fromUtf8(bucketName) ?? "";
-                let _ = this.deleteObjects(bucketText, expired.view())?;
-                report.objectsExpired += expired.length as u64;
+            if (targets.length > 0) {
+                let _ = this.deleteManyAt(bucketName, targets.view(), nowMillis)?;
+                report.objectsExpired += objects;
+                report.versionsExpired += versions;
+                report.markersRemoved += markers;
             }
             // Uploads that some rule aborts.
             var old = Vector<[u8; 16]>.create();

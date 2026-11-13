@@ -180,12 +180,8 @@ fn parseLifecycle(xml: Slice<u8>) -> Result<Vector<LifecycleRule>, S3Fail> {
         };
         let inner = xml[start..end];
         at = end + 7;
-        // Actions CosmoStore does not have: storage classes and versions.
-        let unsupported = [
-            "<Transition>",
-            "<NoncurrentVersionExpiration>",
-            "<NoncurrentVersionTransition>",
-        ];
+        // Actions CosmoStore does not have: storage classes.
+        let unsupported = ["<Transition>", "<NoncurrentVersionTransition>"];
         for (u in unsupported) {
             if (findBytes(inner, u.bytes(), 0).isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
         }
@@ -203,6 +199,8 @@ fn parseLifecycle(xml: Slice<u8>) -> Result<Vector<LifecycleRule>, S3Fail> {
             abortDays: 0,
             legacyPrefix: false,
             expiredDeleteMarker: false,
+            noncurrentDays: 0,
+            newerNoncurrent: 0,
         };
         let _ = rawElement(inner, "ID", mut rule.id)?;
         if (rule.id.length > 255) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
@@ -227,8 +225,8 @@ fn parseLifecycle(xml: Slice<u8>) -> Result<Vector<LifecycleRule>, S3Fail> {
             Some(e) => {
                 let days = elementText(e, "Days");
                 let date = elementText(e, "Date");
-                // ExpiredObjectDeleteMarker stands alone (S3); here it is kept and does nothing, as no bucket is
-                // versioned.
+                // ExpiredObjectDeleteMarker stands alone (S3): it removes a delete marker that is all its key has
+                // (ADR-0042).
                 match (elementText(e, "ExpiredObjectDeleteMarker")) {
                     Some(t) => {
                         if (days.isSome() || date.isSome()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
@@ -272,7 +270,27 @@ fn parseLifecycle(xml: Slice<u8>) -> Result<Vector<LifecycleRule>, S3Fail> {
             }
             null => {}
         }
-        if (rule.expirationDays == 0 && rule.expirationDate == 0 && rule.abortDays == 0 && !rule.expiredDeleteMarker) {
+        // NoncurrentVersionExpiration (ADR-0042): after NoncurrentDays, keeping NewerNoncurrentVersions (1 to 100).
+        match (blockOf(inner, "NoncurrentVersionExpiration", 0)) {
+            Some(n) => {
+                rule.noncurrentDays = truncate<u32>(
+                    positiveDecimal(elementText(n, "NoncurrentDays") ?? "".bytes())?.min(0xFFFFFFFF),
+                );
+                match (elementText(n, "NewerNoncurrentVersions")) {
+                    Some(t) => {
+                        let keep = positiveDecimal(t)?;
+                        if (keep > 100) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                        rule.newerNoncurrent = truncate<u32>(keep);
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        // S3: a delete marker has no tags to filter by.
+        if (rule.expiredDeleteMarker && rule.tags.length > 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        if (rule.expirationDays == 0 && rule.expirationDate == 0 && rule.abortDays == 0 && !rule.expiredDeleteMarker &&
+            rule.noncurrentDays == 0) {
             return Err(S3Fail.Code(S3Code.MalformedXML)); // a rule needs an action
         }
         rules.push(rule)?;
@@ -350,6 +368,12 @@ async fn getBucketLifecycle(
             body.extend(
                 "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>".bytes(),
             )?;
+        }
+        if (r.noncurrentDays > 0) {
+            body.extend("<NoncurrentVersionExpiration>".bytes())?;
+            xmlDecimal(mut body, "NoncurrentDays", r.noncurrentDays as u64)?;
+            if (r.newerNoncurrent > 0) { xmlDecimal(mut body, "NewerNoncurrentVersions", r.newerNoncurrent as u64)?; }
+            body.extend("</NoncurrentVersionExpiration>".bytes())?;
         }
         if (r.abortDays > 0) {
             body.extend("<AbortIncompleteMultipartUpload>".bytes())?;

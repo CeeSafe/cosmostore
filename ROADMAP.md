@@ -1641,3 +1641,55 @@ Browser form uploads with a SigV4 POST policy.
   `object_versions.all().delete()`); rclone 20, Go 22, JavaScript 28 (client-s3 3.1168.0), Java 25, .NET 22 pass as
   before and do not exercise versioning.
 - **Next:** M5 item 2, lifecycle rules for noncurrent versions and expired delete markers.
+
+### 13 Nov 2026: M5 item 2, lifecycle rules and versions (ADR-0042)
+
+- **Rules did nothing in a bucket with versioning** (ADR-0041 §9): a delete there writes a marker and frees nothing,
+  `NoncurrentVersionExpiration` was NotImplemented and `ExpiredObjectDeleteMarker` was stored and ignored.
+- **A rule has `noncurrentDays` and `newerNoncurrent`** (`src/store/bucket_config.cee`). The rules blob is version 2
+  only when a rule uses them, so every blob written so far is unchanged; both versions load.
+- **One pass per bucket decides per key from its chain** (`applyLifecycle`, `lifecycleTakes`):
+  - the current object past its `Expiration` is deleted as a DELETE without an id does it: gone without versioning,
+    under a delete marker with it;
+  - a noncurrent version, markers too, goes `noncurrentDays` after the next newer version was written, if
+    `newerNoncurrent` newer noncurrent versions stay;
+  - a delete marker that is all its key has goes by `ExpiredObjectDeleteMarker`, or by an `Expiration` once the
+    marker is that old.
+  A marker has no size and no tags, so a rule filtering by either never takes one.
+- **One commit per bucket and run** through `deleteManyAt`, the batch path of DeleteObjects with the run's time on
+  its records. A run acts on the state it finds: the marker in one run, the object under it in a later one, then
+  the marker.
+- **S3:** `NoncurrentVersionExpiration` with `NoncurrentDays` (1 or more) and `NewerNoncurrentVersions` (1 to 100)
+  is parsed and written back; `ExpiredObjectDeleteMarker` with a tag filter is InvalidRequest. Transitions stay
+  NotImplemented.
+- **A bug found on rereading the pass, before it was committed:** with versioning suspended, a key whose current
+  object expired and whose old null version was due too got both deletes in one batch; the second, by the null id,
+  removed the null marker the first had just written, and the object was current again, every run. The pass now
+  leaves the null version to the marker that replaces it (ADR-0042 §7).
+- **Tests (5 new, 166 in all, no leaks):** a bucket with versions through eleven runs of five rule sets, to empty,
+  with recovery and fsck; the suspended case beside the same key in an enabled bucket; the blob's two versions and
+  the marker filter; the cutoffs against the rules at every hour of ten days; the XML. Twenty ways of breaking the
+  change in a copy are each caught (five only after the tests got a case for them: a lone marker's age, the enabled
+  bucket beside the suspended one, and three wrong cutoffs).
+- **Clients:** `tools/s3_smoke.sh` 159 checks, boto3 74, both with the new rules set and read back; the s3-tests
+  subset is 286 with `test_lifecycle_set_noncurrent`, and passes whole (472 in scope, 298 pass).
+- **No fault sweep of its own:** the pass writes no new kind of record. Its deletes are `DeleteVersion` and
+  `DeleteMarker` records staged by `deleteManyAt`, which the versioned sweeps (once, sticky, torn, crash) go through.
+- **The pass's hold of the store, measured** (the first upkeep after a restart, on copies of one store, builds that
+  log every upkeep; the M1 under other sessions' load, so the spread is wide):
+  - **The first version of the new pass was slower** on a bucket without versioning, 400,000 objects of 128 B and
+    one `Expiration` rule that takes nothing yet: 9 to 18 ms (median 13) against 6 to 14 ms (median 10) for
+    `48709f4` and 7 to 13 ms (median 9.5) for `a902b87`, ten restarts each at a load average of 4 to 6. Reading the
+    tags later did not change that.
+  - **With the cutoffs (ADR-0042 §9)** a version no rule can take yet costs one comparison. Ten more restarts each,
+    with the 1-minute load average near 5 and the 5-minute one at 18 to 29: 9 to 37 ms (median 19.5) for the new pass, 9 to 43 ms (median 28.5) for
+    `48709f4`, 14 to 37 ms (median 28) for `a902b87`; the new pass was at or under `48709f4` in 7 rounds of 10.
+    That run was too loaded to say more than that the new pass is no longer the slower one.
+  - **400,000 versions over 200,000 keys** (versioning enabled, one `NoncurrentVersionExpiration` rule): 6 to 13 ms
+    in nine restarts of ten (one at 28 ms), the same before the cutoffs.
+  - **Still one hold, not steps:** at these sizes the pass is at ADR-0029's 10 ms line, as it was before this change.
+    It runs once an hour by default. Putting it in steps, as checkpoints and compaction are, is open.
+- **The p99 gate was not run:** no bucket in it has rules, and the pass does not run for a bucket without them.
+- **Not shown anywhere:** what a run did (`LifecycleReport`) is not in the stats or the log, as before.
+- **Next:** M5 item 3 (bucket policies, an ACL compatibility mode, the public-access block). Object tagging is done
+  (ADR-0017).

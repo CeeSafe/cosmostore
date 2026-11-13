@@ -6,7 +6,7 @@ giving up large-object throughput or crash correctness.
 
 **Status: a single-node alpha.** `cosmostore serve` speaks the S3 API over HTTP/1.1 and TLS, on a crash-tested
 storage engine (journal, large-object extents, checkpoints, compaction, the space reserve and `fsck`). The AWS CLI,
-rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 285 Ceph s3-tests pass against it
+rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 286 Ceph s3-tests pass against it
 ([compatibility](docs/compatibility.md)). Milestones M0 to M4 of the [roadmap](ROADMAP.md) are done; M5, production
 features, is under way: S3 versioning is in (ADR-0041). There is no replication or clustering yet, and no policies or
 ACLs.
@@ -37,7 +37,8 @@ through CeeSafe.Web's `web_tls` ([ADR-0016](docs/adr/0016-listen-address-and-tls
 - **Objects:** PUT, GET, HEAD, DELETE, ranges, conditional requests, CopyObject, DeleteObjects, user metadata, object
   tags, GetObjectAttributes, and checksums (CRC32, CRC32C, CRC64NVME, SHA-256) checked, stored and returned.
 - **Multipart uploads**, including UploadPartCopy, ListParts and ListMultipartUploads; abandoned uploads expire.
-- **Buckets:** create, list, delete, tags and lifecycle rules (expiration, aborting incomplete uploads);
+- **Buckets:** create, list, delete, versioning, tags and lifecycle rules (expiration, noncurrent versions, lone
+  delete markers, aborting incomplete uploads);
   ListObjects v1 and v2; path-style and virtual-host addressing.
 - **Upkeep in the background:** checkpoints and compaction in steps, upload expiry and lifecycle rules.
 - **Performance work** (ADR-0021 to ADR-0038): group commit across requests, reads and small PUTs on the event loop,
@@ -324,15 +325,15 @@ limits.
   targets ([docs/targets.md](docs/targets.md)) on the reference machine.
 
 **Now, M5 (production features):** versioning, delete markers and ListObjectVersions are in (ADR-0041), checked
-with the AWS CLI, boto3 and the Ceph versioning tests. Then lifecycle rules for noncurrent versions, policies,
-encryption and Object Lock.
+with the AWS CLI, boto3 and the Ceph versioning tests, and lifecycle rules expire noncurrent versions and lone delete
+markers (ADR-0042). Then policies, encryption and Object Lock.
 
 **Later:** M6 a Raft-based cluster, and M7 advanced S3 features.
 
 **Known limits:**
 - a single node: no replication or erasure coding yet;
 - no bucket policies, ACLs, CORS, Object Lock or MFA delete, and no SigV2 or session tokens;
-- lifecycle rules expire nothing in a bucket with versioning yet;
+- no lifecycle transitions: there is one storage class;
 - HTTP/1.1 only;
 - Windows is not supported.
 

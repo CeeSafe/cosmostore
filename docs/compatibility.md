@@ -8,14 +8,14 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
 
 | Client | Version | Script | Checks | Result |
 |---|---|---|---|---|
-| AWS CLI v2 | 2.34.13 | `tools/s3_smoke.sh` | 157 | pass |
+| AWS CLI v2 | 2.34.13 | `tools/s3_smoke.sh` | 159 | pass |
 | rclone | 1.73.2 | `tools/sdk/rclone.sh` | 20 | pass |
-| boto3 (botocore with CRT) | 1.42.97 | `tools/sdk/boto3.sh` | 72 | pass |
+| boto3 (botocore with CRT) | 1.42.97 | `tools/sdk/boto3.sh` | 74 | pass |
 | AWS SDK for Go v2 | service/s3 1.114.9 | `tools/sdk/go.sh` | 22 | pass |
 | AWS SDK for JavaScript v3 | client-s3 3.1168.0 | `tools/sdk/js.sh` | 28 | pass |
 | AWS SDK for Java v2 (with aws-crt) | 2.57.11 | `tools/sdk/java.sh` | 25 | pass |
 | AWS SDK for .NET (with CrtIntegration) | AWSSDK.S3 4.0.104.11 | `tools/sdk/dotnet.sh` | 22 | pass |
-| Ceph s3-tests (subset) | commit 5b39871 | `tools/s3tests/run.sh` | 285 | pass |
+| Ceph s3-tests (subset) | commit 5b39871 | `tools/s3tests/run.sh` | 286 | pass |
 
 ### Client settings to know
 
@@ -37,10 +37,12 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
 
 The subset is every in-scope test that passes (`tools/s3tests/subset.txt`). At this commit, 472 tests are left once
 the out-of-scope markers are excluded (the `versioning` and `delete_marker` markers are in scope since ADR-0041).
-297 pass. The subset leaves out every
+298 pass. The subset leaves out every
 `test_post_object*` test: they all sign with SigV2, so they pass or fail on the SigV2 refusal, not on POST object.
-SigV4 POST is tested with boto3 and the JS SDK instead (ADR-0018). That leaves 285 in the subset: the 252 of M3 and
-33 more, all versioning and delete-marker tests (five of them conditional writes on the current version). ADR-0014 accounts for the rest: nearly all test ACLs, object
+SigV4 POST is tested with boto3 and the JS SDK instead (ADR-0018). That leaves 286 in the subset: the 252 of M3 and
+34 more: 33 versioning and delete-marker tests (five of them conditional writes on the current version) and
+`test_lifecycle_set_noncurrent` (ADR-0042). The tests that watch rules expire objects need RGW's debug clock and
+stay out of scope; `src/store/version_tests.cee` checks that with the store's own clock. ADR-0014 accounts for the rest: nearly all test ACLs, object
 lock, CORS or policies. Response checksums and GET `?partNumber` pass since ADR-0015. Of the checksum tests, only
 SHA-1 still fails, along with those that need ACLs or POST object.
 
@@ -61,7 +63,7 @@ SHA-1 still fails, along with those that need ACLs or POST object.
 | Area | Supported | Not yet |
 |---|---|---|
 | Auth | SigV4 headers; presigned URLs, with hoisted `x-amz-*` query headers; aws-chunked, signed and unsigned, with trailers; POST object with a SigV4 policy | SigV2, session tokens |
-| Buckets | Create, Head, Delete, List (with creation dates and pagination), GetBucketLocation, PutBucketVersioning and GetBucketVersioning (`Enabled`, `Suspended`), ListObjectVersions (versions and delete markers, `key-marker` and `version-id-marker`); bucket tags; lifecycle rules (expiration by days or date, filtered by prefix, tags and size; AbortIncompleteMultipartUpload) | MFA delete, policies, ACLs, CORS; lifecycle transitions and noncurrent versions (rules expire nothing in a bucket with versioning) |
+| Buckets | Create, Head, Delete, List (with creation dates and pagination), GetBucketLocation, PutBucketVersioning and GetBucketVersioning (`Enabled`, `Suspended`), ListObjectVersions (versions and delete markers, `key-marker` and `version-id-marker`); bucket tags; lifecycle rules (expiration by days or date, filtered by prefix, tags and size; NoncurrentVersionExpiration with NewerNoncurrentVersions; ExpiredObjectDeleteMarker; AbortIncompleteMultipartUpload) | MFA delete, policies, ACLs, CORS; lifecycle transitions |
 | Objects | Put, Get, Head, Delete; Range; `?partNumber`; If-Match / If-None-Match / If-(Un)Modified-Since; conditional PUT and Complete (`If-None-Match`, `If-Match`); `response-*`; `versionId` on Get, Head, Delete, GetObjectAttributes and the tagging calls, with `x-amz-version-id` and `x-amz-delete-marker` in responses (ADR-0041); GetObjectAttributes | object lock |
 | Integrity | Content-MD5; `x-amz-checksum-{crc32,crc32c,crc64nvme,sha256}` checked and stored, CRC64NVME by default; returned with `x-amz-checksum-mode`; multipart COMPOSITE and FULL_OBJECT | SHA-1 checksums |
 | Metadata | `x-amz-meta-*` (2 KiB), Content-Encoding/-Disposition/-Language, Cache-Control, Expires; object tags (Get/Put/DeleteObjectTagging, `x-amz-tagging`, `x-amz-tagging-directive`, `x-amz-tagging-count`) | |
@@ -71,8 +73,8 @@ SHA-1 still fails, along with those that need ACLs or POST object.
 | Addressing | path-style; virtual-host under a configured domain | |
 | Network | HTTP/1.1 on any address (`[address:]port`, 127.0.0.1 by default); TLS 1.2/1.3 with `--tls-cert`/`--tls-key`, reloaded when the files change | SNI, HTTP/2 |
 
-Anything else gets S3's `NotImplemented` (501) XML error. Design notes: ADR-0008 to ADR-0020 and ADR-0041 in `docs/adr/`.
+Anything else gets S3's `NotImplemented` (501) XML error. Design notes: ADR-0008 to ADR-0020, ADR-0041 and ADR-0042 in `docs/adr/`.
 
 Versioning (ADR-0041) is checked by `tools/s3_smoke.sh` with the AWS CLI (34 checks), `tools/sdk/boto3.sh` (20
-checks) and the s3-tests subset. The rclone, Go, JavaScript, Java and .NET scripts pass as before; they do not
+checks) and the s3-tests subset; the lifecycle rules for versions (ADR-0042) by two checks in each of the first two. The rclone, Go, JavaScript, Java and .NET scripts pass as before; they do not
 exercise versioning.

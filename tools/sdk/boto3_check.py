@@ -243,6 +243,19 @@ check("the key is back", s3.get_object(Bucket=V, Key="k")["Body"].read(), b"vers
 s3.put_bucket_versioning(Bucket=V, VersioningConfiguration={"Status": "Suspended"})
 check("a suspended put has no version id", s3.put_object(Bucket=V, Key="k", Body=b"null").get("VersionId"), None)
 check("the null version", s3.get_object(Bucket=V, Key="k", VersionId="null")["Body"].read(), b"null")
+# Lifecycle rules for versions (ADR-0042) are kept and returned.
+s3.put_bucket_lifecycle_configuration(Bucket=V, LifecycleConfiguration={"Rules": [
+    {"ID": "old", "Filter": {"Prefix": "k"}, "Status": "Enabled",
+     "NoncurrentVersionExpiration": {"NoncurrentDays": 30, "NewerNoncurrentVersions": 2}},
+    {"ID": "markers", "Filter": {"Prefix": ""}, "Status": "Enabled", "Expiration": {"ExpiredObjectDeleteMarker": True}}]})
+rules = s3.get_bucket_lifecycle_configuration(Bucket=V)["Rules"]
+check("lifecycle rules for versions",
+      [(r["ID"], r.get("NoncurrentVersionExpiration"), r.get("Expiration")) for r in rules],
+      [("old", {"NoncurrentDays": 30, "NewerNoncurrentVersions": 2}, None),
+       ("markers", None, {"ExpiredObjectDeleteMarker": True})])
+check("noncurrent days of zero", code_of(lambda: s3.put_bucket_lifecycle_configuration(Bucket=V, LifecycleConfiguration={
+    "Rules": [{"ID": "z", "Filter": {"Prefix": ""}, "Status": "Enabled",
+               "NoncurrentVersionExpiration": {"NoncurrentDays": 0}}]})), "InvalidArgument")
 check("bucket with versions not empty", code_of(lambda: s3.delete_bucket(Bucket=V)), "BucketNotEmpty")
 boto3.resource("s3", endpoint_url=endpoint).Bucket(V).object_versions.all().delete()
 check("no versions left", [k for k in s3.list_object_versions(Bucket=V) if k in ("Versions", "DeleteMarkers")], [])

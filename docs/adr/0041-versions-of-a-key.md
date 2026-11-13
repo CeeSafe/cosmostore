@@ -58,8 +58,8 @@ compatibility matrix was run with them (`docs/compatibility.md`).
    every later checkpoint hold it.
 8. **Reads of the current object skip markers:** HEAD, GET, the conditional PUT's "key exists", and ListObjects
    treat a key whose newest version is a delete marker as absent.
-9. **Lifecycle expiration leaves versioned buckets alone until M5's item 2** gives it noncurrent-version rules: in
-   a bucket that is `Enabled` or `Suspended` it expires nothing. Unversioned buckets are unchanged.
+9. **Lifecycle expiration left versioned buckets alone until M5's item 2** gave it noncurrent-version rules
+   (ADR-0042, which replaces this point): in a bucket that was `Enabled` or `Suspended` it expired nothing.
 
 10. **In the S3 API a version id is 32 hex digits, and `null` for the null id.** Other text is InvalidArgument; an
     id the key does not have is NoSuchVersion on a read and succeeds on a delete, as in S3.

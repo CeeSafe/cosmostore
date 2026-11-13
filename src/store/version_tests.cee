@@ -874,3 +874,297 @@ fn completionRetryFindsItsVersionUnderLaterOnes() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+fn setRules(s: borrow mut ObjectStore, rules: borrow Vector<LifecycleRule>) {
+    var blob = Vector<u8>.create();
+    encodeLifecycle(rules.view(), mut blob)!;
+    s.setBucketConfig("bkt", BUCKET_CONFIG_LIFECYCLE, blob.view())!;
+}
+
+fn noncurrentRule(id: StringView, prefix: StringView, days: u32, keep: u32) -> LifecycleRule {
+    var r = rule(id, prefix, 0);
+    r.noncurrentDays = days;
+    r.newerNoncurrent = keep;
+    return r;
+}
+
+@test
+fn lifecycleRulesForVersionsRoundTrip() -> Result<void, TestFailure> {
+    // Without the new action the blob is version 1, as before; with it, version 2. Both read back.
+    var rules = Vector<LifecycleRule>.create();
+    rules.push(rule("plain", "a/", 3))!;
+    var blob = Vector<u8>.create();
+    encodeLifecycle(rules.view(), mut blob)!;
+    Check.equalU64(1, blob[0] as u64)?;
+    let old = blob.length;
+    rules.push(noncurrentRule("versions", "b/", 5, 2))!;
+    encodeLifecycle(rules.view(), mut blob)!;
+    Check.equalU64(2, blob[0] as u64)?;
+    Check.isTrue(blob.length > old, "the new fields are there")?;
+    let back = decodeLifecycle(blob.view())!;
+    Check.equalU64(2, back.length as u64)?;
+    Check.isTrue(back[0].expirationDays == 3 && back[0].noncurrentDays == 0, "the plain rule")?;
+    Check.isTrue(back[1].noncurrentDays == 5 && back[1].newerNoncurrent == 2, "the versions rule")?;
+    // A cut blob is refused.
+    Check.isTrue(decodeLifecycle(blob.view()[0..blob.length - 1]).isErr(), "a short blob")?;
+    // The expiry: the days after it became noncurrent, at the next midnight UTC.
+    let noon = 20000 * DAY_MILLIS + DAY_MILLIS / 2;
+    match (noncurrentExpiresAt(borrow back[1], noon)) {
+        Some(at) => { Check.isTrue(at == 20006 * DAY_MILLIS, "five days, then midnight")?; }
+        null => { return Check.fail("the rule expires noncurrent versions"); }
+    }
+    Check.isTrue(noncurrentExpiresAt(borrow back[0], noon).isNull(), "the plain rule does not")?;
+    // A delete marker has no size and no tags: a rule that filters by either never takes one.
+    Check.isTrue(ruleTakesMarker(borrow back[1], "b/key".bytes()), "by prefix")?;
+    Check.isTrue(!ruleTakesMarker(borrow back[1], "c/key".bytes()), "another prefix")?;
+    var sized = noncurrentRule("sized", "b/", 1, 0);
+    sized.hasSizeAbove = true;
+    Check.isTrue(!ruleTakesMarker(borrow sized, "b/key".bytes()), "a size filter")?;
+    var tagged = noncurrentRule("tagged", "b/", 1, 0);
+    tagged.tags.push(copyBytes("k=v".bytes())!)!;
+    Check.isTrue(!ruleTakesMarker(borrow tagged, "b/key".bytes()), "a tag filter")?;
+    var off = noncurrentRule("off", "b/", 1, 0);
+    off.enabled = false;
+    Check.isTrue(!ruleTakesMarker(borrow off, "b/key".bytes()), "a disabled rule")?;
+    return Ok();
+}
+
+@test
+fn lifecycleInABucketWithVersions() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("versions-lifecycle");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+    let a1 = putVersion(mut s, "bkt", "a", "one");
+    let a2 = putVersion(mut s, "bkt", "a", "two");
+    let a3 = putVersion(mut s, "bkt", "a", "three");
+    let _ = putVersion(mut s, "bkt", "b", "one");
+    s.deleteObject("bkt", "b")!; // a marker over one object
+    let _ = putVersion(mut s, "bkt", "c", "zero");
+    let c1 = putVersion(mut s, "bkt", "c", "one");
+    let _ = putVersion(mut s, "bkt", "keep/k", "one");
+    let _ = putVersion(mut s, "bkt", "keep/k", "two");
+    s.deleteObject("bkt", "lone")!; // a marker that is all its key has
+    let now = Clock.unixMillis();
+
+    // Noncurrent versions two days old go, the newest noncurrent one of each key kept. Nothing under keep/.
+    var first = Vector<LifecycleRule>.create();
+    first.push(noncurrentRule("old", "a", 2, 1))!;
+    first.push(noncurrentRule("old-b", "b", 2, 1))!;
+    first.push(rule("expire-lone", "lone", 3))!; // an Expiration takes a lone marker once the marker is that old
+    setRules(mut s, borrow first);
+    let early = s.applyLifecycle(now + DAY_MILLIS)!;
+    Check.equalU64(0, early.objectsExpired + early.versionsExpired + early.markersRemoved)?;
+    let third = s.applyLifecycle(now + 4 * DAY_MILLIS)!;
+    Check.equalU64(1, third.versionsExpired)?;
+    Check.equalU64(1, third.markersRemoved)?;
+    Check.equalU64(0, third.objectsExpired)?;
+    Check.equalU64(0, s.versionsOf("bkt", "lone")!.length as u64)?;
+    let a = s.versionsOf("bkt", "a")!;
+    Check.equalU64(2, a.length as u64)?;
+    Check.isTrue(a[0].versionId[..] == a3.versionId[..] && a[1].versionId[..] == a2.versionId[..], "the oldest went")?;
+    Check.isTrue(s.headVersion("bkt", "a", a1.versionId).isErr(), "the first version is gone")?;
+    Check.equalU64(2, s.versionsOf("bkt", "b")!.length as u64)?;
+    Check.equalU64(0, s.applyLifecycle(now + 4 * DAY_MILLIS)!.versionsExpired)?; // nothing more at the same time
+
+    // Keeping none: every noncurrent version goes; b's marker is then all b has, and goes in the next run.
+    var second = Vector<LifecycleRule>.create();
+    second.push(noncurrentRule("old", "a", 2, 0))!;
+    second.push(noncurrentRule("old-b", "b", 2, 0))!;
+    var markers = rule("markers", "b", 0);
+    markers.expiredDeleteMarker = true;
+    second.push(markers)!;
+    setRules(mut s, borrow second);
+    let fourth = s.applyLifecycle(now + 4 * DAY_MILLIS)!;
+    Check.equalU64(2, fourth.versionsExpired)?;
+    Check.equalU64(0, fourth.markersRemoved)?;
+    Check.equalU64(1, s.versionsOf("bkt", "a")!.length as u64)?;
+    Check.equalBytes("three".bytes(), s.getObject("bkt", "a")!.view())?;
+    Check.isTrue(s.currentMarker("bkt", "b")!.isSome(), "b's marker is still there")?;
+    let fifth = s.applyLifecycle(now + 4 * DAY_MILLIS)!;
+    Check.equalU64(1, fifth.markersRemoved)?;
+    Check.equalU64(0, s.versionsOf("bkt", "b")!.length as u64)?;
+
+    // Expiration alone puts current objects under a marker stamped with the run's time, and removes nothing.
+    var thirdRules = Vector<LifecycleRule>.create();
+    thirdRules.push(rule("expire-a", "a", 1))!;
+    thirdRules.push(rule("expire-c", "c", 1))!;
+    setRules(mut s, borrow thirdRules);
+    let at = now + 5 * DAY_MILLIS;
+    let sixth = s.applyLifecycle(at)!;
+    Check.equalU64(2, sixth.objectsExpired)?;
+    Check.equalU64(0, sixth.versionsExpired + sixth.markersRemoved)?;
+    expectNoSuchKey(s.headObject("bkt", "a"))?;
+    let hidden = s.versionsOf("bkt", "a")!;
+    Check.equalU64(2, hidden.length as u64)?;
+    Check.isTrue(hidden[0].deleteMarker && hidden[0].mtimeMillis == at, "a marker of the run's time")?;
+    Check.equalBytes("one".bytes(), s.getObjectVersion("bkt", "c", c1.versionId)!.view())?;
+    // The same rules again: a marker over an object is neither expired nor alone.
+    let again = s.applyLifecycle(at + 30 * DAY_MILLIS)!;
+    Check.equalU64(0, again.objectsExpired + again.versionsExpired + again.markersRemoved)?;
+
+    // A version is noncurrent from when the next newer one was written, not from when the newest was: c's first
+    // version has been so for days, the one under the new marker only since the marker.
+    var cRules = Vector<LifecycleRule>.create();
+    cRules.push(noncurrentRule("old-c", "c", 1, 0))!;
+    setRules(mut s, borrow cRules);
+    let onlyOldest = s.applyLifecycle(at)!;
+    Check.equalU64(1, onlyOldest.versionsExpired)?;
+    let c = s.versionsOf("bkt", "c")!;
+    Check.equalU64(2, c.length as u64)?;
+    Check.isTrue(c[0].deleteMarker && c[1].versionId[..] == c1.versionId[..], "the version under the marker stays")?;
+
+    // With a noncurrent rule too, the objects under the markers go, and then the markers left alone, by the age of
+    // the marker.
+    var fourthRules = Vector<LifecycleRule>.create();
+    var both = rule("both", "", 1);
+    both.noncurrentDays = 1;
+    fourthRules.push(both)!;
+    setRules(mut s, borrow fourthRules);
+    let later = at + 3 * DAY_MILLIS;
+    let seventh = s.applyLifecycle(later)!;
+    // a's and c's objects, and keep/k's first version; keep/k's current one expires under a marker.
+    Check.equalU64(3, seventh.versionsExpired)?;
+    Check.equalU64(1, seventh.objectsExpired)?;
+    Check.equalU64(0, seventh.markersRemoved)?;
+    let eighth = s.applyLifecycle(later)!;
+    Check.equalU64(2, eighth.markersRemoved)?; // a's and c's; keep/k's marker is not alone, nor old
+    Check.equalU64(0, eighth.versionsExpired + eighth.objectsExpired)?;
+    Check.equalU64(0, s.versionsOf("bkt", "a")!.length as u64)?;
+    Check.equalU64(0, s.versionsOf("bkt", "c")!.length as u64)?;
+    Check.equalU64(2, s.versionsOf("bkt", "keep/k")!.length as u64)?;
+    let ninth = s.applyLifecycle(later + 3 * DAY_MILLIS)!;
+    Check.equalU64(1, ninth.versionsExpired)?;
+    let tenth = s.applyLifecycle(later + 6 * DAY_MILLIS)!;
+    Check.equalU64(1, tenth.markersRemoved)?;
+
+    // Nothing is left, here and after recovery, and the bucket can go.
+    Check.isTrue(s.verify()!.problems.length == 0, "fsck is clean")?;
+    let reopened = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(0, reopened.versionsOf("bkt", "a")!.length as u64)?;
+    Check.equalU64(0, reopened.versionsOf("bkt", "keep/k")!.length as u64)?;
+    Check.equalU64(0, reopened.objectCount() as u64)?;
+    s.deleteBucket("bkt")!;
+    return Ok();
+}
+
+@test
+fn lifecycleInASuspendedBucket() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("versions-lifecycle-suspended");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    let _ = putVersion(mut s, "bkt", "k", "null version"); // before versioning: the null id
+    setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+    let x = putVersion(mut s, "bkt", "k", "with an id");
+    let _ = putVersion(mut s, "bkt", "n", "enabled");
+    setVersioning(mut s, "bkt", VERSIONING_SUSPENDED);
+    let _ = putVersion(mut s, "bkt", "n", "suspended"); // the null version, over one with an id
+    // The same two versions of a key in a bucket whose versioning stays enabled.
+    s.createBucket("enabled")!;
+    let _ = putVersion(mut s, "enabled", "k", "null version");
+    setVersioning(mut s, "enabled", VERSIONING_ENABLED);
+    let _ = putVersion(mut s, "enabled", "k", "with an id");
+    let now = Clock.unixMillis();
+    var rules = Vector<LifecycleRule>.create();
+    var both = rule("both", "", 1);
+    both.noncurrentDays = 1;
+    rules.push(both)!;
+    setRules(mut s, borrow rules);
+    var blob = Vector<u8>.create();
+    encodeLifecycle(rules.view(), mut blob)!;
+    s.setBucketConfig("enabled", BUCKET_CONFIG_LIFECYCLE, blob.view())!;
+
+    // k: its current version has an id and expires under a null marker, which replaces the old null version below
+    // it. That version is not also removed by its id: the delete would take the marker just written.
+    // n: its current version is the null one, which the null marker replaces; the version with an id below goes.
+    // In the enabled bucket the marker has an id of its own, and the old null version under it goes by its id.
+    let at = now + 3 * DAY_MILLIS;
+    let first = s.applyLifecycle(at)!;
+    Check.equalU64(3, first.objectsExpired)?;
+    Check.equalU64(2, first.versionsExpired)?;
+    Check.equalU64(0, first.markersRemoved)?;
+    let e = s.versionsOf("enabled", "k")!;
+    Check.equalU64(2, e.length as u64)?;
+    Check.isTrue(e[0].deleteMarker && !isNullVersionId(e[0].versionId), "a marker with an id")?;
+    Check.isTrue(!isNullVersionId(e[1].versionId), "the null version went")?;
+    expectNoSuchKey(s.headObject("bkt", "k"))?;
+    let k = s.versionsOf("bkt", "k")!;
+    Check.equalU64(2, k.length as u64)?;
+    Check.isTrue(k[0].deleteMarker && isNullVersionId(k[0].versionId), "a null marker is the newest")?;
+    Check.isTrue(k[1].versionId[..] == x.versionId[..], "over the version with an id")?;
+    let n = s.versionsOf("bkt", "n")!;
+    Check.equalU64(1, n.length as u64)?;
+    Check.isTrue(n[0].deleteMarker && isNullVersionId(n[0].versionId), "n is a null marker alone")?;
+
+    // Later: the versions under the two k markers, and n's lone marker; then the k markers.
+    let second = s.applyLifecycle(at + 3 * DAY_MILLIS)!;
+    Check.equalU64(2, second.versionsExpired)?;
+    Check.equalU64(1, second.markersRemoved)?;
+    Check.equalU64(0, second.objectsExpired)?;
+    let third = s.applyLifecycle(at + 3 * DAY_MILLIS)!;
+    Check.equalU64(2, third.markersRemoved)?;
+    Check.equalU64(0, s.objectCount() as u64)?;
+    Check.isTrue(s.verify()!.problems.length == 0, "fsck is clean")?;
+    let reopened = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(0, reopened.objectCount() as u64)?;
+    return Ok();
+}
+
+/// The cutoffs only spare the pass work (ADR-0042 §9): whatever a rule takes at a time is inside them, at every
+/// hour of ten days. The version is written an hour before midnight, so a rule is due an hour after its days.
+@test
+fn lifecycleCutoffsNeverHideADueVersion() -> Result<void, TestFailure> {
+    var rules = Vector<LifecycleRule>.create();
+    rules.push(rule("three", "a", 3))!;
+    rules.push(rule("seven", "", 7))!;
+    rules.push(noncurrentRule("two", "a", 2, 0))!;
+    rules.push(noncurrentRule("five", "", 5, 0))!;
+    var dated = rule("dated", "d", 0);
+    let hour: i64 = 3600000;
+    let written = 20000 * DAY_MILLIS + 23 * hour;
+    dated.expirationDate = 20009 * DAY_MILLIS; // after the day rules, so it does not cover for them
+    rules.push(dated)!;
+    var off = rule("off", "", 1);
+    off.enabled = false;
+    off.noncurrentDays = 1;
+    rules.push(off)!;
+    var v = vacantVersion();
+    v.mtimeMillis = written;
+    let keys = ["a/key", "b/key", "d/key"];
+    var dueCurrent: u64 = 0;
+    var dueNoncurrent: u64 = 0;
+    var spared: u64 = 0;
+    var step: i64 = 0;
+    while (step <= 240) {
+        let now = written + step * hour;
+        let cut = lifecycleCutoffs(rules.view(), now);
+        for (k in keys) {
+            if (lifecycleTakes(rules.view(), k.bytes(), borrow v, false, 0, written, now)) {
+                Check.isTrue(written <= cut.current, "a due current object is inside the cutoff")?;
+                dueCurrent += 1;
+            }
+            if (lifecycleTakes(rules.view(), k.bytes(), borrow v, true, 0, written, now)) {
+                Check.isTrue(written <= cut.noncurrent, "a due noncurrent version is inside the cutoff")?;
+                dueNoncurrent += 1;
+            }
+        }
+        if (written > cut.current && written > cut.noncurrent) { spared += 1; }
+        step += 1;
+    }
+    // The sweep crosses the boundaries: for two days nothing is due and the cutoffs say so, later all of it is.
+    Check.equalU64(48, spared)?;
+    Check.isTrue(dueCurrent > 0 && dueNoncurrent > 0, "later versions are due")?;
+    // A disabled rule sets no cutoff, and ExpiredObjectDeleteMarker is told apart.
+    var only = Vector<LifecycleRule>.create();
+    var disabled = rule("off-too", "", 1);
+    disabled.enabled = false;
+    disabled.noncurrentDays = 1;
+    only.push(disabled)!;
+    let none = lifecycleCutoffs(only.view(), written + 100 * DAY_MILLIS);
+    Check.isTrue(none.current < 0 && none.noncurrent < 0 && !none.markers, "a disabled rule takes nothing")?;
+    var marked = rule("markers", "", 0);
+    marked.expiredDeleteMarker = true;
+    only.push(marked)!;
+    Check.isTrue(lifecycleCutoffs(only.view(), written).markers, "a rule for lone markers")?;
+    return Ok();
+}
