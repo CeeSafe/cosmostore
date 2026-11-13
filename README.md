@@ -9,7 +9,8 @@ storage engine (journal, large-object extents, checkpoints, compaction, the spac
 rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 364 Ceph s3-tests pass against it
 ([compatibility](docs/compatibility.md)). Milestones M0 to M4 of the [roadmap](ROADMAP.md) are done; M5, production
 features, is under way: S3 versioning (ADR-0041), bucket policies (ADR-0043), the public-access block (ADR-0044)
-ACLs (ADR-0045) and Object Lock (ADR-0047) are in. There is no replication or clustering yet.
+ACLs (ADR-0045), Object Lock (ADR-0047) and event notifications to webhooks (ADR-0048) are in. There is no
+replication or clustering yet.
 
 CosmoStore's own code is pure CeeSafe, with no C and no `unsafe` blocks. The one C below it is OpenSSL 3, for TLS,
 through CeeSafe.Web's `web_tls` ([ADR-0016](docs/adr/0016-listen-address-and-tls.md)).
@@ -170,7 +171,7 @@ It is developed on macOS (CI runs on macOS 15) and benchmarked on Linux (Debian 
 
 ```text
 cosmostore serve <dir> <[address:]port> <credentials-file> [domain] [--tls-cert <pem> --tls-key <pem>]
-                 [--maintain-seconds <n>] [--upload-expiry-hours <n>]
+                 [--maintain-seconds <n>] [--upload-expiry-hours <n>] [--notify-targets <file>]
 cosmostore fsck  <dir>
 cosmostore bench <dir> <objects> <size-bytes> <batch>
 cosmostore soak  <dir> <seconds> <keys> <capacity-bytes>
@@ -180,7 +181,8 @@ cosmostore soak  <dir> <seconds> <keys> <capacity-bytes>
   `[::]:9000`). The credentials file has one `access-key secret-key` pair per line. With a domain, `<bucket>.<domain>`
   addresses a bucket as well as `/<bucket>/` paths. With `--tls-cert` and `--tls-key` it serves TLS, and reloads the
   files when they change. `--maintain-seconds` (10) sets the upkeep round, and `--upload-expiry-hours` (168; 0 never)
-  when unfinished multipart uploads are aborted.
+  when unfinished multipart uploads are aborted. `--notify-targets` names a file of webhooks, one `<id> <url>` a line,
+  that bucket notification rules may send events to (ADR-0048).
 
   The server raises its open-file limit to the most the system allows at start, and logs it: it holds a descriptor per
   connection and per upload in progress, and macOS starts processes at 256. If it still runs out, requests get 503 and
@@ -331,13 +333,15 @@ limits.
 with the AWS CLI, boto3 and the Ceph versioning tests, and lifecycle rules expire noncurrent versions and lone delete
 markers (ADR-0042). Bucket policies are in (ADR-0043), with the access keys as principals, and so are the
 public-access block and GetBucketPolicyStatus (ADR-0044) and an ACL compatibility mode (ADR-0045). Object Lock and
-legal hold keep versions from being removed (ADR-0047). Encryption is designed and waits for a cipher (ADR-0046).
+legal hold keep versions from being removed (ADR-0047). Event notifications go to webhooks, at least once, from
+an outbox that is the journal itself (ADR-0048). Encryption is designed and waits for a cipher (ADR-0046).
 
 **Later:** M6 a Raft-based cluster, and M7 advanced S3 features.
 
 **Known limits:**
 - a single node: no replication or erasure coding yet;
 - no CORS or MFA delete, and no SigV2 or session tokens;
+- event notifications go to HTTP webhooks only, in order, so one webhook that is down holds the others' events;
 - no server-side encryption yet: it is designed (ADR-0046) and waits for AES-256-GCM in CeeSafe's lib/std; a request
   that asks for it is refused with NotImplemented;
 - one account: every access key may do what no bucket policy denies it, and an ACL can grant only to the owner, to

@@ -1,0 +1,199 @@
+// Event notifications over S3 (ADR-0048): the targets file, the configuration document and the event.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+import web_tls;
+import web_client;
+
+fn testTargets() -> Vector<NotifyTarget> =>
+    parseTargets("hook http://127.0.0.1:9000/events\naudit\thttps://audit.example/s3  # the second\n".bytes())! ??
+        Vector<NotifyTarget>.create();
+
+/// The rules a document gives, as text (`id>target:events:prefix:suffix` for each), or its refusal's code.
+fn rulesAnswer(xml: StringView) -> Vector<u8> {
+    let targets = testTargets();
+    var out = Vector<u8>.create();
+    match (parseNotification(xml.bytes(), targets.view())) {
+        Ok(rules) => {
+            for (i in 0..rules.length) {
+                if (i > 0) { out.push(' ')!; }
+                out.extend(rules[i].id.view())!;
+                out.push('>')!;
+                out.extend(rules[i].target.view())!;
+                out.push(':')!;
+                out.push('0' + rules[i].events / 10)!;
+                out.push('0' + rules[i].events % 10)!;
+                out.push(':')!;
+                out.extend(rules[i].prefix.view())!;
+                out.push(':')!;
+                out.extend(rules[i].suffix.view())!;
+            }
+        }
+        Err(S3Fail.Code(code)) => { out.extend(s3CodeName(code).bytes())!; }
+        Err(_) => { out.extend("failed".bytes())!; }
+    }
+    return out;
+}
+
+@test
+fn notificationTargets() -> Result<void, TestFailure> {
+    let targets = testTargets();
+    Check.equalU64(2, targets.length as u64)?;
+    Check.equalBytes("hook".bytes(), targets[0].id.view())?;
+    Check.equalBytes("http://127.0.0.1:9000/events".bytes(), targets[0].url.view())?;
+    Check.equalBytes("https://audit.example/s3".bytes(), targets[1].url.view())?;
+    Check.equalBytes(
+        "https://audit.example/s3".bytes(),
+        targetUrl(targets.view(), "audit".bytes()) ?? "".bytes(),
+    )?;
+    Check.isTrue(targetUrl(targets.view(), "nowhere".bytes()).isNull(), "a target that is not there")?;
+    Check.equalU64(0, (parseTargets("# none\n\n".bytes())! ?? testTargets()).length as u64)?;
+    let refused = [
+        "hook\n",
+        "hook ftp://example/\n",
+        "bad.id http://example/\n",
+        "- http://example/\n",
+        "hook http://example/ extra\n",
+        "hook http://a/\nhook http://b/\n",
+    ];
+    for (r in refused) { Check.isTrue(parseTargets(r.bytes())!.isNull(), "a file that is not a targets file")?; }
+    Check.equalBytes("hook".bytes(), targetOfArn("arn:cosmostore:sqs::hook:webhook".bytes()) ?? "".bytes())?;
+    let notArns = ["arn:aws:sqs:us-east-1:1:queue", "arn:cosmostore:sqs:::webhook", "hook", "arn:cosmostore:sqs::hook"];
+    for (a in notArns) { Check.isTrue(targetOfArn(a.bytes()).isNull(), "an ARN that names no target")?; }
+    return Ok();
+}
+
+@test
+fn notificationDocument() -> Result<void, TestFailure> {
+    let given =
+        """
+        <NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <QueueConfiguration>
+            <Id>images</Id>
+            <Queue>arn:cosmostore:sqs::hook:webhook</Queue>
+            <Event>s3:ObjectCreated:*</Event>
+            <Filter><S3Key>
+              <FilterRule><Name>prefix</Name><Value>img/</Value></FilterRule>
+              <FilterRule><Name>suffix</Name><Value>.jpg</Value></FilterRule>
+            </S3Key></Filter>
+          </QueueConfiguration>
+          <QueueConfiguration>
+            <Queue> arn:cosmostore:sqs::audit:webhook </Queue>
+            <Event>s3:ObjectRemoved:Delete</Event>
+            <Event>s3:ObjectCreated:Put</Event>
+          </QueueConfiguration>
+        </NotificationConfiguration>
+        """;
+    Check.equalBytes("images>hook:03:img/:.jpg >audit:05::".bytes(), rulesAnswer(given).view())?;
+    Check.equalU64(0, rulesAnswer("<NotificationConfiguration/>").length as u64)?; // no rules: taken off
+    // What Get writes, Put reads back.
+    let targets = testTargets();
+    let rules = match (parseNotification(given.bytes(), targets.view())) {
+        Ok(r) => r,
+        Err(_) => { return Check.fail("the document parses"); }
+    };
+    var xml = Vector<u8>.create();
+    notificationXml(rules.view(), mut xml)!;
+    let text = match (StringView.fromUtf8(xml.view())) {
+        Some(t) => t,
+        null => { return Check.fail("the document is text"); }
+    };
+    Check.equalBytes("images>hook:03:img/:.jpg >audit:05::".bytes(), rulesAnswer(text).view())?;
+    let head = "<NotificationConfiguration><QueueConfiguration>";
+    let tail = "</QueueConfiguration></NotificationConfiguration>";
+    let bodies = [
+        "<Queue>arn:cosmostore:sqs::hook:webhook</Queue><Event>s3:ObjectRemoved:*</Event>",
+        "<Queue>arn:cosmostore:sqs::hook:webhook</Queue><Event>s3:ObjectCreated:CompleteMultipartUpload</Event><Event>s3:ObjectRemoved:DeleteMarkerCreated</Event>",
+        "<Event>s3:ObjectCreated:*</Event>",
+        "<Queue>arn:cosmostore:sqs::hook:webhook</Queue>",
+        "<Queue>arn:cosmostore:sqs::nowhere:webhook</Queue><Event>s3:ObjectCreated:*</Event>",
+        "<Queue>arn:aws:sqs:us-east-1:1:q</Queue><Event>s3:ObjectCreated:*</Event>",
+        "<Queue>arn:cosmostore:sqs::hook:webhook</Queue><Event>s3:ObjectCreated:Copy</Event>",
+        "<Queue>arn:cosmostore:sqs::hook:webhook</Queue><Event>s3:ObjectRestore:Post</Event>",
+        "<Queue>arn:cosmostore:sqs::hook:webhook</Queue><Event>everything</Event>",
+        "<Queue>arn:cosmostore:sqs::hook:webhook</Queue><Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>middle</Name><Value>x</Value></FilterRule></S3Key></Filter>",
+        "<Queue>arn:cosmostore:sqs::hook:webhook</Queue><Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>a</Value></FilterRule><FilterRule><Name>prefix</Name><Value>b</Value></FilterRule></S3Key></Filter>",
+        "<Queue>arn:cosmostore:sqs::hook:webhook</Queue><Event>s3:ObjectCreated:*",
+    ];
+    let answers = [
+        ">hook:12::",
+        ">hook:10::",
+        "MalformedXML",
+        "MalformedXML",
+        "InvalidArgument",
+        "InvalidArgument",
+        "NotImplemented",
+        "NotImplemented",
+        "InvalidArgument",
+        "InvalidArgument",
+        "InvalidArgument",
+        "MalformedXML",
+    ];
+    for (i in 0..bodies.length) {
+        var doc = Vector<u8>.create();
+        doc.extend(head.bytes())!;
+        doc.extend(bodies[i].bytes())!;
+        doc.extend(tail.bytes())!;
+        let t = match (StringView.fromUtf8(doc.view())) {
+            Some(t) => t,
+            null => { return Check.fail("the document is text"); }
+        };
+        Check.equalBytes(answers[i].bytes(), rulesAnswer(t).view())?;
+    }
+    Check.equalBytes("MalformedXML".bytes(), rulesAnswer("<Other/>").view())?;
+    let others = [
+        "<NotificationConfiguration><TopicConfiguration><Topic>arn:aws:sns:us-east-1:1:t</Topic><Event>s3:ObjectCreated:*</Event></TopicConfiguration></NotificationConfiguration>",
+        "<NotificationConfiguration><CloudFunctionConfiguration></CloudFunctionConfiguration></NotificationConfiguration>",
+        "<NotificationConfiguration><EventBridgeConfiguration></EventBridgeConfiguration></NotificationConfiguration>",
+    ];
+    for (o in others) { Check.equalBytes("NotImplemented".bytes(), rulesAnswer(o).view())?; }
+    return Ok();
+}
+
+@test
+fn notificationEventAsJson() -> Result<void, TestFailure> {
+    var e = OutboxEvent {
+        lsn: 0x0102,
+        kind: EVENT_COMPLETE,
+        bucket: copyBytes("bkt".bytes())!,
+        key: copyBytes("img/a b\"c.jpg".bytes())!,
+        versionId: [0u8; 16],
+        size: 1234,
+        md5: [0xABu8; 16],
+        parts: 3,
+        mtimeMillis: 1767225600000,
+        ruleIds: Vector<Vector<u8>>.create(),
+        targets: Vector<Vector<u8>>.create(),
+    };
+    e.ruleIds.push(copyBytes("say \"hi\"\n".bytes())!)!;
+    e.targets.push(copyBytes("hook".bytes())!)!;
+    var json = Vector<u8>.create();
+    eventJson(borrow e, 0, mut json)!;
+    Check.equalBytes(
+        "{\"Records\":[{\"eventVersion\":\"2.1\",\"eventSource\":\"aws:s3\",\"awsRegion\":\"us-east-1\",\"eventTime\":\"2026-01-01T00:00:00.000Z\",\"eventName\":\"ObjectCreated:CompleteMultipartUpload\",\"s3\":{\"s3SchemaVersion\":\"1.0\",\"configurationId\":\"say \\\"hi\\\"\\u000a\",\"bucket\":{\"name\":\"bkt\",\"arn\":\"arn:aws:s3:::bkt\"},\"object\":{\"key\":\"img/a%20b%22c.jpg\",\"size\":1234,\"eTag\":\"abababababababababababababababab-3\",\"sequencer\":\"0000000000000102\"}}}]}".bytes(),
+        json.view(),
+    )?;
+    // A version removed: its id, and no size or ETag.
+    e.kind = EVENT_DELETE;
+    e.versionId = [0x11u8; 16];
+    var removed = Vector<u8>.create();
+    eventJson(borrow e, 0, mut removed)!;
+    Check.isTrue(
+        findBytes(
+            removed.view(),
+            "\"eventName\":\"ObjectRemoved:Delete\"".bytes(),
+            0,
+        ).isSome(),
+        "the event's name",
+    )?;
+    Check.isTrue(
+        findBytes(
+            removed.view(),
+            "\"object\":{\"key\":\"img/a%20b%22c.jpg\",\"versionId\":\"11111111111111111111111111111111\",\"sequencer\"".bytes(),
+            0,
+        ).isSome(),
+        "the version, and nothing of its content",
+    )?;
+    return Ok();
+}

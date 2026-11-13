@@ -396,6 +396,18 @@ for kind in ("Versions", "DeleteMarkers"):
 s3.delete_bucket(Bucket=L)
 check("the lock bucket deleted", code_of(lambda: s3.head_bucket(Bucket=L)), "404")
 
+# Event notifications (ADR-0048): the configuration only; tools/s3_smoke.sh has a webhook to deliver to.
+N = "boto3-notify"
+s3.create_bucket(Bucket=N)
+check("no notification rules", [k for k in s3.get_bucket_notification_configuration(Bucket=N) if k.endswith("Configurations")], [])
+check("a target serve was not given", code_of(lambda: s3.put_bucket_notification_configuration(Bucket=N, NotificationConfiguration={
+    "QueueConfigurations": [{"QueueArn": "arn:cosmostore:sqs::nowhere:webhook", "Events": ["s3:ObjectCreated:*"]}]})), "InvalidArgument")
+check("a topic", code_of(lambda: s3.put_bucket_notification_configuration(Bucket=N, NotificationConfiguration={
+    "TopicConfigurations": [{"TopicArn": "arn:aws:sns:us-east-1:1:t", "Events": ["s3:ObjectCreated:*"]}]})), "NotImplemented")
+s3.put_bucket_notification_configuration(Bucket=N, NotificationConfiguration={})
+check("rules taken off where there were none", s3.get_bucket_notification_configuration(Bucket=N).get("QueueConfigurations"), None)
+s3.delete_bucket(Bucket=N)
+
 check("wrong secret", code_of(lambda: boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
                                                        aws_secret_access_key="wrong").list_buckets()),
       "SignatureDoesNotMatch")

@@ -9,15 +9,19 @@
 // than fall back, because segments it covered may already be gone. Little-endian:
 //
 // Header (64 bytes):
-//   0 u64 magic "CSCKPT01"   8 u16 format (10; 1 to 9 still load)   10 u16 header length (64)   12 u32 flags (0)
+//   0 u64 magic "CSCKPT01"   8 u16 format (11; 1 to 10 still load)   10 u16 header length (64)
+//  12 u32 event count (format 11; 0 before)
 //  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count (versions, in format 6)   48 i64 created ms
 //  56 u32 upload count (format 2; reserved, 0, in format 1)   60 u32 crc32c of bytes 0..60
-// Entries, buckets, then objects, then uploads: u8 kind (1 bucket, 2 object, 3 upload), u32 body length, body.
+// Entries, buckets, then objects, then uploads, then events: u8 kind (1 bucket, 2 object, 3 upload, 4 event), u32
+// body length, body.
 //   bucket: u16+bytes name, i64 created ms, in format 5 u32+bytes tags and u32+bytes lifecycle rules (ADR-0020), and
 //           in format 6 u8 versioning (0 off, 1 enabled, 2 suspended; ADR-0041), and in format 7 u32+bytes the
 //           bucket policy's JSON (ADR-0043), and in format 8 u32+bytes the public-access block (empty, or one byte of
 //           its settings; ADR-0044), and in format 9 u32+bytes the bucket's ACL (empty, or its three characters;
-//           ADR-0045), and in format 10 u32+bytes the object lock configuration (empty for none; ADR-0047)
+//           ADR-0045), and in format 10 u32+bytes the object lock configuration (empty for none; ADR-0047), and in
+//           format 11 u32+bytes the notification rules (ADR-0048)
+//   event:  an undelivered event of the outbox, as `encodeEvent` writes one (ADR-0048)
 //   object: u16+bytes bucket, u16+bytes key, 16 version id, u64 lsn, u64 size, i64 mtime ms,
 //           16 md5, u16+bytes content type, u64 payload segment, u64 payload offset,
 //           u32 payload length, u64 record segment, u32 record length, manifest (u32 count,
@@ -35,10 +39,11 @@ const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 10;
+const CHECKPOINT_FORMAT: u16 = 11;
 const CHECKPOINT_BUCKET: u8 = 1;
 const CHECKPOINT_OBJECT: u8 = 2;
 const CHECKPOINT_UPLOAD: u8 = 3;
+const CHECKPOINT_EVENT: u8 = 4;
 const CHECKPOINT_IO_CHUNK: usize = 1048576;
 /// No single entry is larger: an upload of 10,000 parts of 5 GiB each, every part in 64 MiB extents, needs about
 /// 16 MiB.
@@ -124,12 +129,19 @@ struct CheckpointWriter {
     }
 }
 
-fn encodeCheckpointHeader(lsn: u64, segment: u64, buckets: u64, objects: u64, uploads: u32) -> [u8; 64] {
+fn encodeCheckpointHeader(
+    lsn: u64,
+    segment: u64,
+    buckets: u64,
+    objects: u64,
+    uploads: u32,
+    events: u32,
+) -> [u8; 64] {
     var h = [0u8; 64];
     h.writeLE(0, CHECKPOINT_MAGIC);
     h.writeLE(8, CHECKPOINT_FORMAT);
     h.writeLE(10, truncate<u16>(CHECKPOINT_HEADER_LEN));
-    h.writeLE(12, 0u32);
+    h.writeLE(12, events);
     h.writeLE(16, lsn);
     h.writeLE(24, segment);
     h.writeLE(32, buckets);
@@ -215,6 +227,8 @@ struct CheckpointJob {
     private names: HashMap<u32, Vector<u8>>;
     /// The upload entries at `lsn`, encoded; they follow the objects.
     private uploads: Vector<Vector<u8>>;
+    /// The outbox's undelivered events as of the start, written after the uploads (ADR-0048).
+    private events: Vector<Vector<u8>>;
     private body: Vector<u8>;
     /// A key's version slots, newest first, while its entries are written oldest first.
     private slots: Vector<u32>;
@@ -239,6 +253,7 @@ struct CheckpointJob {
     /// whose segments are all still there.
     fn publish(borrow mut this) -> Result<u64, StoreError> {
         for (i in 0..this.uploads.length) { this.writer.add(CHECKPOINT_UPLOAD, this.uploads[i].view())?; }
+        for (i in 0..this.events.length) { this.writer.add(CHECKPOINT_EVENT, this.events[i].view())?; }
         // A snapshot that gave each key at `lsn` exactly once fills the header's count; anything else is a bug, and
         // such a file must never be published.
         if (this.writer.entries != this.expected) { return Err(StoreError.CheckpointCorrupt); }
@@ -270,12 +285,20 @@ fn beginCheckpointJob(
     let _ = Fs.unlink(tmp.view()); // a leftover of an interrupted attempt
     let file = sio(DurableFile.createNew(tmp.view()))?;
     let objects = state.index.versionCount() as u64;
+    // The events still to be delivered, as of now: at most MAX_OUTBOX_EVENTS.
+    var events = Vector<Vector<u8>>.create();
+    for (i in state.outbox.head..state.outbox.events.length) {
+        var entry = Vector<u8>.create();
+        encodeEvent(borrow state.outbox.events[i], mut entry)?;
+        events.push(entry)?;
+    }
     let header = encodeCheckpointHeader(
         lsn,
         segment,
         state.buckets.length() as u64,
         objects,
         truncate<u32>(state.uploads.length()),
+        truncate<u32>(events.length),
     );
     match (file.writeAt(header[..], 0)) {
         Ok() => {}
@@ -311,6 +334,8 @@ fn beginCheckpointJob(
         body.extend(b.acl.view())?;
         body.pushLE(truncate<u32>(b.objectLock.length))?;
         body.extend(b.objectLock.view())?;
+        body.pushLE(truncate<u32>(b.notification.length))?;
+        body.extend(b.notification.view())?;
         w.add(CHECKPOINT_BUCKET, body.view())?;
     }
     var uploads = Vector<Vector<u8>>.create();
@@ -333,9 +358,10 @@ fn beginCheckpointJob(
         tmp: tmp,
         done: done,
         writer: w,
-        expected: state.buckets.length() as u64 + objects + state.uploads.length() as u64,
+        expected: state.buckets.length() as u64 + objects + state.uploads.length() as u64 + events.length as u64,
         names: names,
         uploads: uploads,
+        events: events,
         body: body,
         slots: Vector<u32>.create(),
         steps: 0,
@@ -612,10 +638,11 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
     let buckets = h.readLE<u64>(32);
     let objects = h.readLE<u64>(40);
     let uploads = if (format >= 2) h.readLE<u32>(56) as u64 else 0;
+    let events = if (format >= 11) h.readLE<u32>(12) as u64 else 0;
     var state = StoreState.create();
     var crc = Crc32c.create();
     var entries: u64 = 0;
-    while (entries < buckets + objects + uploads) {
+    while (entries < buckets + objects + uploads + events) {
         r.ensure(5)?;
         let prefix = r.take(5);
         let kind = prefix[0];
@@ -623,7 +650,8 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
         crc.update(prefix);
         if (length > CHECKPOINT_MAX_ENTRY) { return Err(StoreError.CheckpointCorrupt); }
         let expected = if (entries < buckets) CHECKPOINT_BUCKET else if (entries <
-            buckets + objects) CHECKPOINT_OBJECT else CHECKPOINT_UPLOAD;
+            buckets + objects) CHECKPOINT_OBJECT else if (entries <
+            buckets + objects + uploads) CHECKPOINT_UPLOAD else CHECKPOINT_EVENT;
         if (kind != expected) { return Err(StoreError.CheckpointCorrupt); }
         r.ensure(length)?;
         let body = r.take(length);
@@ -643,6 +671,7 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
                 publicAccess: Vector<u8>.create(),
                 acl: Vector<u8>.create(),
                 objectLock: Vector<u8>.create(),
+                notification: Vector<u8>.create(),
             };
             if (format >= 5) {
                 info.tags = corrupt(readBlob32(body, mut at))?;
@@ -672,12 +701,18 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
                     return Err(StoreError.CheckpointCorrupt);
                 }
             }
+            if (format >= 11) {
+                info.notification = corrupt(readBlob32(body, mut at))?;
+                if (decodeNotification(info.notification.view()).isErr()) { return Err(StoreError.CheckpointCorrupt); }
+            }
             if (at != body.length) { return Err(StoreError.CheckpointCorrupt); }
             if (!state.addBucket(name, info)?) { return Err(StoreError.CheckpointCorrupt); } // a bucket twice
         } else if (kind == CHECKPOINT_OBJECT) {
             decodeObjectEntry(body, mut state, format)?;
-        } else {
+        } else if (kind == CHECKPOINT_UPLOAD) {
             decodeUploadEntry(body, mut state, format)?;
+        } else {
+            state.outbox.events.push(corrupt(decodeEvent(body))?)?;
         }
         entries += 1;
     }

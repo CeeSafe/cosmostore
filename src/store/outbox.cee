@@ -1,0 +1,285 @@
+// The event outbox (ADR-0048). A bucket's notification rules say which of its writes are events and for which
+// targets. The journal is the outbox: a write's record is its event, queued in memory as the record is applied,
+// carried in checkpoints while it is undelivered, and passed over at recovery once the delivery cursor, a small
+// file beside the journal, is past it.
+
+/// A bucket's notification rules (ADR-0048 §1), in the compact form below; empty for none.
+const BUCKET_CONFIG_NOTIFICATION: u8 = 8;
+/// The kinds of event, as bits of a rule's mask: an object written by a PUT, a POST or a copy; one completed from
+/// a multipart upload; a version removed; a delete marker written.
+const EVENT_PUT: u8 = 1;
+const EVENT_COMPLETE: u8 = 2;
+const EVENT_DELETE: u8 = 4;
+const EVENT_MARKER: u8 = 8;
+const EVENT_ALL: u8 = 15;
+const MAX_NOTIFICATION_RULES: usize = 100;
+const MAX_NOTIFICATION_BYTES: usize = 65536;
+/// The most events the outbox holds: past it the oldest is dropped, and counted (ADR-0048 §4).
+const MAX_OUTBOX_EVENTS: usize = 100000;
+const OUTBOX_CURSOR_NAME: StringView = "/outbox.cursor";
+
+/// One rule: events of the kinds in `events`, of keys with the prefix and the suffix, go to `target`.
+struct NotificationRule {
+    id: Vector<u8>;
+    target: Vector<u8>;
+    events: u8;
+    prefix: Vector<u8>;
+    suffix: Vector<u8>;
+}
+
+/// Notification rules v1: u8 version, u16 count, then per rule u16+bytes id, u16+bytes target, u8 events, u16+bytes
+/// prefix, u16+bytes suffix.
+fn encodeNotification(rules: Slice<NotificationRule>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.pushLE(1u8)?;
+    out.pushLE(truncate<u16>(rules.length))?;
+    for (i in 0..rules.length) {
+        pushText16(out, rules[i].id.view())?;
+        pushText16(out, rules[i].target.view())?;
+        out.pushLE(rules[i].events)?;
+        pushText16(out, rules[i].prefix.view())?;
+        pushText16(out, rules[i].suffix.view())?;
+    }
+    return Ok();
+}
+
+fn decodeNotification(blob: Slice<u8>) -> Result<Vector<NotificationRule>, MetaFault> {
+    var rules = Vector<NotificationRule>.create();
+    if (blob.length == 0) { return Ok(rules); }
+    var at: usize = 0;
+    need(blob, at, 3)?;
+    if (blob[0] != 1) { return Err(MetaFault.BadVersion); }
+    let count = blob.readLE<u16>(1) as usize;
+    at = 3;
+    if (count == 0 || count > MAX_NOTIFICATION_RULES) { return Err(MetaFault.TooLong); }
+    for (i in 0..count) {
+        let id = readText16(blob, mut at)?;
+        let target = readText16(blob, mut at)?;
+        need(blob, at, 1)?;
+        let events = blob[at];
+        at += 1;
+        let prefix = readText16(blob, mut at)?;
+        let suffix = readText16(blob, mut at)?;
+        if (target.length == 0 || events == 0 || events > EVENT_ALL) { return Err(MetaFault.TooLong); }
+        rules.push(NotificationRule { id: id, target: target, events: events, prefix: prefix, suffix: suffix })?;
+    }
+    if (at != blob.length) { return Err(MetaFault.TooLong); }
+    return Ok(rules);
+}
+
+/// Whether a rule is for an event of `kind` on `key`.
+fn ruleTakesEvent(r: borrow NotificationRule, kind: u8, key: Slice<u8>) -> bool {
+    if ((r.events & kind) == 0) { return false; }
+    if (!startsWithBytes(key, r.prefix.view())) { return false; }
+    let n = r.suffix.length;
+    return n <= key.length && key[key.length - n..] == r.suffix.view();
+}
+
+/// One event waiting to be delivered: what a record did, and the rules it is for.
+struct OutboxEvent {
+    /// The record's LSN: the event's place in the outbox, and its `sequencer`.
+    lsn: u64;
+    kind: u8;
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    versionId: [u8; 16];
+    size: u64;
+    md5: [u8; 16];
+    /// The parts of a completed multipart upload: its ETag's count.
+    parts: u32;
+    mtimeMillis: i64;
+    /// The rules that take it, each its id and its target, in the rules' order.
+    ruleIds: Vector<Vector<u8>>;
+    targets: Vector<Vector<u8>>;
+}
+
+/// An event as a checkpoint keeps it: u64 lsn, u8 kind, u16+bytes bucket, u16+bytes key, 16 version id, u64 size,
+/// 16 md5, u32 parts, i64 mtime ms, u16 rule count, then per rule u16+bytes id and u16+bytes target.
+fn encodeEvent(e: borrow OutboxEvent, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.pushLE(e.lsn)?;
+    out.pushLE(e.kind)?;
+    pushText16(out, e.bucket.view())?;
+    pushText16(out, e.key.view())?;
+    out.extend(e.versionId[..])?;
+    out.pushLE(e.size)?;
+    out.extend(e.md5[..])?;
+    out.pushLE(e.parts)?;
+    out.pushLE(e.mtimeMillis)?;
+    out.pushLE(truncate<u16>(e.targets.length))?;
+    for (i in 0..e.targets.length) {
+        pushText16(out, e.ruleIds[i].view())?;
+        pushText16(out, e.targets[i].view())?;
+    }
+    return Ok();
+}
+
+fn decodeEvent(bytes: Slice<u8>) -> Result<OutboxEvent, MetaFault> {
+    var at: usize = 0;
+    let lsn = readU64(bytes, mut at)?;
+    need(bytes, at, 1)?;
+    let kind = bytes[at];
+    at += 1;
+    let bucket = readText16(bytes, mut at)?;
+    let key = readText16(bytes, mut at)?;
+    let versionId = readId16(bytes, mut at)?;
+    let size = readU64(bytes, mut at)?;
+    let md5 = readId16(bytes, mut at)?;
+    let parts = readU32(bytes, mut at)?;
+    let mtime = readU64(bytes, mut at)?;
+    need(bytes, at, 2)?;
+    let count = bytes.readLE<u16>(at) as usize;
+    at += 2;
+    var e = OutboxEvent {
+        lsn: lsn,
+        kind: kind,
+        bucket: bucket,
+        key: key,
+        versionId: versionId,
+        size: size,
+        md5: md5,
+        parts: parts,
+        mtimeMillis: truncate<i64>(mtime),
+        ruleIds: Vector<Vector<u8>>.create(),
+        targets: Vector<Vector<u8>>.create(),
+    };
+    if (count == 0 || count > MAX_NOTIFICATION_RULES) { return Err(MetaFault.TooLong); }
+    for (i in 0..count) {
+        e.ruleIds.push(readText16(bytes, mut at)?)?;
+        e.targets.push(readText16(bytes, mut at)?)?;
+    }
+    if (at != bytes.length) { return Err(MetaFault.TooLong); }
+    return Ok(e);
+}
+
+fn cloneEvent(e: borrow OutboxEvent) -> Result<OutboxEvent, AllocError> {
+    var copy = OutboxEvent {
+        lsn: e.lsn,
+        kind: e.kind,
+        bucket: copyBytes(e.bucket.view())?,
+        key: copyBytes(e.key.view())?,
+        versionId: e.versionId,
+        size: e.size,
+        md5: e.md5,
+        parts: e.parts,
+        mtimeMillis: e.mtimeMillis,
+        ruleIds: Vector<Vector<u8>>.create(),
+        targets: Vector<Vector<u8>>.create(),
+    };
+    for (i in 0..e.targets.length) {
+        copy.ruleIds.push(copyBytes(e.ruleIds[i].view())?)?;
+        copy.targets.push(copyBytes(e.targets[i].view())?)?;
+    }
+    return Ok(copy);
+}
+
+/// The events waiting, oldest first, and how far delivery has got.
+struct Outbox {
+    events: Vector<OutboxEvent>;
+    /// The events before this place are delivered, and wait only to be cut off the front.
+    head: usize;
+    /// The LSN of the newest event delivered: recovery passes over records up to it.
+    cursor: u64;
+    /// Buckets with notification rules: while 0, a record's apply looks no further (ADR-0048 §6).
+    buckets: u64;
+    queued: u64;
+    delivered: u64;
+    dropped: u64;
+    /// Deliveries that failed and are tried again.
+    failures: u64;
+
+    fn create() -> Outbox => Outbox {
+        events: Vector<OutboxEvent>.create(),
+        head: 0,
+        cursor: 0,
+        buckets: 0,
+        queued: 0,
+        delivered: 0,
+        dropped: 0,
+        failures: 0,
+    };
+
+    fn pending(borrow this) -> usize => this.events.length - this.head;
+
+    /// Queues an event; past the limit the oldest waiting one is dropped.
+    fn add(borrow mut this, e: OutboxEvent) -> Result<void, AllocError> {
+        if (this.pending() >= MAX_OUTBOX_EVENTS) {
+            this.head += 1;
+            this.dropped += 1;
+        }
+        this.compact();
+        this.events.push(e)?;
+        this.queued += 1;
+        return Ok();
+    }
+
+    /// Cuts the delivered events off the front once they are half of what is held.
+    fn compact(borrow mut this) {
+        if (this.head == 0 || this.head * 2 < this.events.length) { return; }
+        var kept = Vector<OutboxEvent>.create();
+        while (this.events.length > this.head) {
+            match (this.events.pop()) {
+                Some(e) => {
+                    if (kept.push(e).isErr()) { return; }
+                }
+                null => {}
+            }
+        }
+        this.events.clear();
+        while (kept.length > 0) {
+            match (kept.pop()) {
+                Some(e) => {
+                    if (this.events.push(e).isErr()) { return; }
+                }
+                null => {}
+            }
+        }
+        this.head = 0;
+    }
+
+    /// Every event up to `lsn` is delivered: the cursor moves, and they leave the outbox.
+    fn deliveredTo(borrow mut this, lsn: u64) {
+        while (this.head < this.events.length && this.events[this.head].lsn <= lsn) {
+            this.head += 1;
+            this.delivered += 1;
+        }
+        if (lsn > this.cursor) { this.cursor = lsn; }
+        this.compact();
+    }
+}
+
+/// The cursor file: u64 LSN and the CRC32C of those eight bytes. 0 without a file, or with one that does not read:
+/// events are then delivered again, never lost.
+fn readOutboxCursor(dir: StringView) -> Result<u64, AllocError> {
+    var path = String.create();
+    path.append(dir)?;
+    path.append(OUTBOX_CURSOR_NAME)?;
+    let file = match (DurableFile.openRead(path.view())) {
+        Ok(f) => f,
+        Err(_) => { return Ok(0); }
+    };
+    var bytes = [0u8; 12];
+    if (file.readExactAt(mut bytes[..], 0).isErr()) { return Ok(0); }
+    if (bytes[..].readLE<u32>(8) != Crc32c.of(bytes[0..8])) { return Ok(0); }
+    return Ok(bytes[..].readLE<u64>(0));
+}
+
+/// Writes the cursor file: a new file, synced, renamed over the old one, and the directory synced.
+fn writeOutboxCursor(dir: StringView, lsn: u64) -> Result<void, StoreError> {
+    var path = String.create();
+    path.append(dir)?;
+    path.append(OUTBOX_CURSOR_NAME)?;
+    var tmp = String.create();
+    tmp.append(path.view())?;
+    tmp.append(".tmp")?;
+    let _ = Fs.unlink(tmp.view());
+    var bytes = Vector<u8>.create();
+    bytes.pushLE(lsn)?;
+    bytes.pushLE(Crc32c.of(bytes.view()))?;
+    {
+        let file = sio(DurableFile.createNew(tmp.view()))?;
+        sio(file.writeAt(bytes.view(), 0))?;
+        sio(file.syncData())?;
+    }
+    sio(Fs.rename(tmp.view(), path.view()))?;
+    sio(Fs.syncDirectory(dir))?;
+    return Ok();
+}

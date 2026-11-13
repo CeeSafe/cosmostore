@@ -1,0 +1,457 @@
+// Event notifications (ADR-0048): a bucket's notification configuration, the webhook targets `serve` is given, the
+// event as S3 writes one, and the task that delivers the store's outbox to the targets.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+import web_tls;
+import web_client;
+
+/// A webhook: the name rules call it by, and where its events are POSTed.
+struct NotifyTarget {
+    id: Vector<u8>;
+    url: Vector<u8>;
+}
+
+const TARGET_ARN_HEAD: StringView = "arn:cosmostore:sqs::";
+const TARGET_ARN_TAIL: StringView = ":webhook";
+/// Events asked of the store at a time, and the waits of the delivery task: with nothing to deliver, and after a
+/// failure, doubling up to the longest.
+const DELIVERY_BATCH: usize = 64;
+const DELIVERY_IDLE_MS: u64 = 500;
+const DELIVERY_RETRY_MS: u64 = 1000;
+const DELIVERY_RETRY_MOST_MS: u64 = 60000;
+
+// ---- Targets ----
+
+/// The targets of a targets file (`serve --notify-targets`): lines of `<id> <url>`, `#` starting a comment. An id is
+/// 1 to 32 characters of `A-Z a-z 0-9 _ -`; a URL is `http://` or `https://`. Null for a file that is not one.
+fn parseTargets(text: Slice<u8>) -> Result<Vector<NotifyTarget>?, AllocError> {
+    var targets = Vector<NotifyTarget>.create();
+    var at: usize = 0;
+    while (at < text.length) {
+        let end = pieceEnd(text, at, '\n');
+        let line = trimBlank(text[at..pieceEnd(text[0..end], at, '#')]);
+        at = end + 1;
+        if (line.length == 0) { continue; }
+        var space = pieceEnd(line, 0, ' ');
+        let tab = pieceEnd(line, 0, '\t');
+        if (tab < space) { space = tab; }
+        if (space >= line.length) { return Ok(null); }
+        let id = line[0..space];
+        let url = trimBlank(line[space + 1..]);
+        if (!isKeyId(id) || id == "-".bytes()) { return Ok(null); }
+        if (!startsWithBytes(url, "http://".bytes()) && !startsWithBytes(url, "https://".bytes())) { return Ok(null); }
+        if (pieceEnd(url, 0, ' ') < url.length || url.length > 2048) { return Ok(null); }
+        for (i in 0..targets.length) {
+            if (targets[i].id.view() == id) { return Ok(null); }
+        }
+        targets.push(NotifyTarget { id: copyBytes(id)?, url: copyBytes(url)? })?;
+    }
+    return Ok(Some(targets));
+}
+
+fn targetUrl<region a>(targets: Slice<a, NotifyTarget>, id: Slice<u8>) -> Slice<a, u8>? {
+    for (i in 0..targets.length) {
+        if (targets[i].id.view() == id) { return Some(targets[i].url.view()); }
+    }
+    return null;
+}
+
+/// The target a rule's ARN names: `arn:cosmostore:sqs::<id>:webhook`.
+fn targetOfArn(arn: Slice<u8>) -> Slice<u8>? {
+    let head = TARGET_ARN_HEAD.bytes();
+    let tail = TARGET_ARN_TAIL.bytes();
+    if (!startsWithBytes(arn, head) || arn.length <= head.length + tail.length) { return null; }
+    if (arn[arn.length - tail.length..] != tail) { return null; }
+    return Some(arn[head.length..arn.length - tail.length]);
+}
+
+// ---- The configuration ----
+
+/// The kinds of event an `<Event>` names (ADR-0048 §1). A PUT, a POST and a copy write the same record, so the
+/// events that tell them apart cannot be given: NotImplemented.
+fn eventMaskOf(name: Slice<u8>) -> Result<u8, S3Fail> {
+    if (name == "s3:ObjectCreated:*".bytes()) { return Ok(EVENT_PUT | EVENT_COMPLETE); }
+    if (name == "s3:ObjectCreated:Put".bytes()) { return Ok(EVENT_PUT); }
+    if (name == "s3:ObjectCreated:CompleteMultipartUpload".bytes()) { return Ok(EVENT_COMPLETE); }
+    if (name == "s3:ObjectRemoved:*".bytes()) { return Ok(EVENT_DELETE | EVENT_MARKER); }
+    if (name == "s3:ObjectRemoved:Delete".bytes()) { return Ok(EVENT_DELETE); }
+    if (name == "s3:ObjectRemoved:DeleteMarkerCreated".bytes()) { return Ok(EVENT_MARKER); }
+    if (startsWithBytes(name, "s3:".bytes())) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    return Err(S3Fail.Code(S3Code.InvalidArgument));
+}
+
+fn eventName(kind: u8) -> StringView =>
+    if (kind == EVENT_PUT) "ObjectCreated:Put"
+        else if (kind == EVENT_COMPLETE) "ObjectCreated:CompleteMultipartUpload"
+        else if (kind == EVENT_DELETE) "ObjectRemoved:Delete"
+        else "ObjectRemoved:DeleteMarkerCreated";
+
+/// The text between `<name>` and `</name>` from `at` on, and where it ends; null when there is no more.
+fn nextElement<region a>(xml: Slice<a, u8>, name: StringView, at: borrow mut usize) -> Result<Slice<a, u8>?, S3Fail> {
+    var open = Vector<u8>.create();
+    open.push('<')?;
+    open.extend(name.bytes())?;
+    open.push('>')?;
+    var close = Vector<u8>.create();
+    close.extend("</".bytes())?;
+    close.extend(name.bytes())?;
+    close.push('>')?;
+    let start = match (findBytes(xml, open.view(), at)) {
+        Some(s) => s + open.length,
+        null => { return Ok(null); }
+    };
+    let end = match (findBytes(xml, close.view(), start)) {
+        Some(e) => e,
+        null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    };
+    at = end + close.length;
+    return Ok(Some(xml[start..end]));
+}
+
+/// The rules of a `<NotificationConfiguration>`: its queue configurations, each for a target `serve` was given.
+/// Topics, functions and EventBridge are NotImplemented; a queue that is no target is InvalidArgument.
+fn parseNotification(xml: Slice<u8>, targets: Slice<NotifyTarget>) -> Result<Vector<NotificationRule>, S3Fail> {
+    if (findBytes(xml, "<NotificationConfiguration".bytes(), 0).isNull()) {
+        return Err(S3Fail.Code(S3Code.MalformedXML));
+    }
+    let others = ["<TopicConfiguration", "<CloudFunctionConfiguration", "<EventBridgeConfiguration"];
+    for (o in others) {
+        if (findBytes(xml, o.bytes(), 0).isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    }
+    var rules = Vector<NotificationRule>.create();
+    var at: usize = 0;
+    while (true) {
+        let inner = match (nextElement(xml, "QueueConfiguration", mut at)?) {
+            Some(i) => i,
+            null => { break; }
+        };
+        if (rules.length >= MAX_NOTIFICATION_RULES) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        var rule = NotificationRule {
+            id: Vector<u8>.create(),
+            target: Vector<u8>.create(),
+            events: 0,
+            prefix: Vector<u8>.create(),
+            suffix: Vector<u8>.create(),
+        };
+        let _ = rawElement(inner, "Id", mut rule.id)?;
+        let arn = match (elementText(inner, "Queue")) {
+            Some(q) => trimBlank(q),
+            null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        };
+        let target = match (targetOfArn(arn)) {
+            Some(t) => t,
+            null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        };
+        if (targetUrl(targets, target).isNull()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        rule.target.extend(target)?;
+        var eventAt: usize = 0;
+        while (true) {
+            match (nextElement(inner, "Event", mut eventAt)?) {
+                Some(e) => { rule.events |= eventMaskOf(trimBlank(e))?; }
+                null => { break; }
+            }
+        }
+        if (rule.events == 0) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        var filterAt: usize = 0;
+        while (true) {
+            let f = match (nextElement(inner, "FilterRule", mut filterAt)?) {
+                Some(f) => f,
+                null => { break; }
+            };
+            let name = trimBlank(elementText(f, "Name") ?? "".bytes());
+            var value = Vector<u8>.create();
+            let _ = rawElement(f, "Value", mut value)?;
+            if (value.length > MAX_KEY_BYTES) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            if (name == "prefix".bytes() || name == "Prefix".bytes()) {
+                if (rule.prefix.length > 0) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                rule.prefix = value;
+            } else if (name == "suffix".bytes() || name == "Suffix".bytes()) {
+                if (rule.suffix.length > 0) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                rule.suffix = value;
+            } else {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
+        }
+        rules.push(rule)?;
+    }
+    return Ok(rules);
+}
+
+fn notificationXml(rules: Slice<NotificationRule>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    xmlHead(out, "NotificationConfiguration")?;
+    for (i in 0..rules.length) {
+        let r = borrow rules[i];
+        out.extend("<QueueConfiguration>".bytes())?;
+        if (r.id.length > 0) { xmlElement(out, "Id", r.id.view(), false)?; }
+        var arn = Vector<u8>.create();
+        arn.extend(TARGET_ARN_HEAD.bytes())?;
+        arn.extend(r.target.view())?;
+        arn.extend(TARGET_ARN_TAIL.bytes())?;
+        xmlElement(out, "Queue", arn.view(), false)?;
+        if ((r.events & (EVENT_PUT | EVENT_COMPLETE)) == (EVENT_PUT | EVENT_COMPLETE)) {
+            xmlElement(out, "Event", "s3:ObjectCreated:*".bytes(), false)?;
+        } else if ((r.events & EVENT_PUT) != 0) {
+            xmlElement(out, "Event", "s3:ObjectCreated:Put".bytes(), false)?;
+        } else if ((r.events & EVENT_COMPLETE) != 0) {
+            xmlElement(out, "Event", "s3:ObjectCreated:CompleteMultipartUpload".bytes(), false)?;
+        }
+        if ((r.events & (EVENT_DELETE | EVENT_MARKER)) == (EVENT_DELETE | EVENT_MARKER)) {
+            xmlElement(out, "Event", "s3:ObjectRemoved:*".bytes(), false)?;
+        } else if ((r.events & EVENT_DELETE) != 0) {
+            xmlElement(out, "Event", "s3:ObjectRemoved:Delete".bytes(), false)?;
+        } else if ((r.events & EVENT_MARKER) != 0) {
+            xmlElement(out, "Event", "s3:ObjectRemoved:DeleteMarkerCreated".bytes(), false)?;
+        }
+        if (r.prefix.length > 0 || r.suffix.length > 0) {
+            out.extend("<Filter><S3Key>".bytes())?;
+            if (r.prefix.length > 0) {
+                out.extend("<FilterRule><Name>prefix</Name>".bytes())?;
+                xmlElement(out, "Value", r.prefix.view(), false)?;
+                out.extend("</FilterRule>".bytes())?;
+            }
+            if (r.suffix.length > 0) {
+                out.extend("<FilterRule><Name>suffix</Name>".bytes())?;
+                xmlElement(out, "Value", r.suffix.view(), false)?;
+                out.extend("</FilterRule>".bytes())?;
+            }
+            out.extend("</S3Key></Filter>".bytes())?;
+        }
+        out.extend("</QueueConfiguration>".bytes())?;
+    }
+    out.extend("</NotificationConfiguration>".bytes())?;
+    return Ok();
+}
+
+/// GetBucketNotificationConfiguration: an empty document for a bucket without rules, as S3 answers.
+async fn getBucketNotification(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let stored = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_NOTIFICATION)?;
+    let rules = match (decodeNotification(stored.view())) {
+        Ok(r) => r,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    var body = Vector<u8>.create();
+    notificationXml(rules.view(), mut body)?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// PutBucketNotificationConfiguration: the rules replace the bucket's; a document without any takes them off.
+async fn putBucketNotification(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 1048576)?;
+    verifySmallBody(req, xml.view(), true)?;
+    let rules = parseNotification(xml.view(), app.notifyTargets.view())?;
+    var stored = Vector<u8>.create();
+    if (rules.length > 0) { encodeNotification(rules.view(), mut stored)?; }
+    if (stored.length > MAX_NOTIFICATION_BYTES) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_NOTIFICATION, stored.view())?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+// ---- The event ----
+
+/// `text` as the inside of a JSON string.
+fn appendJsonText(out: borrow mut Vector<u8>, text: Slice<u8>) -> Result<void, AllocError> {
+    let digits = "0123456789abcdef".bytes();
+    for (i in 0..text.length) {
+        let c = text[i];
+        if (c == '"' || c == '\\') {
+            out.push('\\')?;
+            out.push(c)?;
+        } else if (c < 0x20) {
+            out.extend("\\u00".bytes())?;
+            out.push(digits[(c >> 4) as usize])?;
+            out.push(digits[(c & 15) as usize])?;
+        } else {
+            out.push(c)?;
+        }
+    }
+    return Ok();
+}
+
+/// The event for its rule `rule`, as S3 writes one (ADR-0048 §5): one record, the key URL-encoded, the record's
+/// LSN as the sequencer.
+fn eventJson(e: borrow OutboxEvent, rule: usize, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.extend(
+        "{\"Records\":[{\"eventVersion\":\"2.1\",\"eventSource\":\"aws:s3\",\"awsRegion\":\"us-east-1\"".bytes(),
+    )?;
+    out.extend(",\"eventTime\":\"".bytes())?;
+    appendIso8601(out, e.mtimeMillis)?;
+    out.extend("\",\"eventName\":\"".bytes())?;
+    out.extend(eventName(e.kind).bytes())?;
+    out.extend("\",\"s3\":{\"s3SchemaVersion\":\"1.0\",\"configurationId\":\"".bytes())?;
+    appendJsonText(out, e.ruleIds[rule].view())?;
+    out.extend("\",\"bucket\":{\"name\":\"".bytes())?;
+    appendJsonText(out, e.bucket.view())?;
+    out.extend("\",\"arn\":\"arn:aws:s3:::".bytes())?;
+    appendJsonText(out, e.bucket.view())?;
+    out.extend("\"},\"object\":{\"key\":\"".bytes())?;
+    appendUriEncoded(out, e.key.view(), true)?;
+    out.push('"')?;
+    if (e.kind == EVENT_PUT || e.kind == EVENT_COMPLETE) {
+        out.extend(",\"size\":".bytes())?;
+        appendDecimal(out, e.size)?;
+        out.extend(",\"eTag\":\"".bytes())?;
+        appendHexBytes(out, e.md5[..])?;
+        if (e.parts > 0) {
+            out.push('-')?;
+            appendDecimal(out, e.parts as u64)?;
+        }
+        out.push('"')?;
+    }
+    if (!isNullVersionId(e.versionId)) {
+        out.extend(",\"versionId\":\"".bytes())?;
+        appendVersionId(out, e.versionId)?;
+        out.push('"')?;
+    }
+    out.extend(",\"sequencer\":\"".bytes())?;
+    var lsn = [0u8; 8];
+    for (i in 0..8) { lsn[i] = truncate<u8>(e.lsn >> truncate<u64>((7 - i) * 8)); }
+    appendHexBytes(out, lsn[..])?;
+    out.extend("\"}}}]}".bytes())?;
+    return Ok();
+}
+
+// ---- Delivery ----
+
+/// The https connector of the delivery client: the system's roots, HTTP/1.1. Null when it cannot be made: https
+/// targets then fail, and are tried again.
+fn deliveryConnector() -> Box<dyn Connector + Send + Share>? {
+    var config = match (TlsConfig.client()) {
+        Ok(c) => c,
+        Err(_) => { return null; }
+    };
+    if (config.trustSystem().isErr()) { return null; }
+    var protocols = [Alpn.Http11, Alpn.None];
+    if (config.setAlpn(protocols[..]).isErr()) { return null; }
+    let tls = match (TlsConnector.create(config)) {
+        Ok(t) => t,
+        Err(_) => { return null; }
+    };
+    return match (Box.create(tls)) {
+        Ok(b) => {
+            let boxed: Box<dyn Connector + Send + Share> = b;
+            Some(boxed)
+        }
+        Err(_) => null,
+    };
+}
+
+/// POSTs one event to one webhook: delivered when the answer is a 2xx.
+async fn postEvent(client: borrow Client, url: Slice<u8>, json: Slice<u8>) -> bool {
+    let text = match (StringView.fromUtf8(url)) {
+        Some(t) => t,
+        null => { return false; }
+    };
+    var request = match (ClientRequest.create(Method.Post, text)) {
+        Ok(r) => r,
+        Err(_) => { return false; }
+    };
+    if (request.header("content-type", "application/json".bytes()).isErr()) { return false; }
+    var body = match (BytesBody.of(json)) {
+        Ok(b) => b,
+        Err(_) => { return false; }
+    };
+    var response = match (await client.send(request, mut body)) {
+        Ok(r) => r,
+        Err(_) => { return false; }
+    };
+    let status = response.status();
+    var answer = Vector<u8>.create();
+    let _ = await response.readToEnd(mut answer, 65536);
+    let _ = await response.finish(client);
+    return status >= 200 && status < 300;
+}
+
+async fn deliveryPause(ms: u64) -> Result<void, NetError> {
+    match (await Timer.sleep(ms)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+/// Delivers the store's outbox to the targets, oldest event first, until it is cancelled (ADR-0048 §4). An event
+/// leaves the outbox once every one of its targets has answered 2xx; one that fails is tried again, after a wait
+/// that doubles up to a minute, and the events behind it wait with it. An event for a target `serve` was not given
+/// is passed over.
+async fn deliverForever(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    targets: borrow Vector<NotifyTarget>,
+) -> Result<ServerReport, NetError> {
+    var options = ClientOptions.defaults();
+    options.totalMs = 60000;
+    options.retry = RetryPolicy.never();
+    let client = match (Client.create(options, deliveryConnector())) {
+        Ok(c) => c,
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    };
+    var wait = DELIVERY_RETRY_MS;
+    // Without targets there is nowhere to deliver to, and no rule can be put: the store is left alone.
+    while (targets.length == 0) { await deliveryPause(DELIVERY_RETRY_MOST_MS)?; }
+    while (true) {
+        var events = Vector<OutboxEvent>.create();
+        {
+            var guard = match (await store.get().lock()) {
+                Ok(g) => g,
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            };
+            let s = guard.data();
+            // Copies out of memory: on the event loop.
+            match (s.pendingEvents(DELIVERY_BATCH)) {
+                Ok(e) => { events = e; }
+                Err(_) => {}
+            }
+        }
+        if (events.length == 0) {
+            await deliveryPause(DELIVERY_IDLE_MS)?;
+            continue;
+        }
+        var delivered: u64 = 0;
+        var failed = false;
+        for (i in 0..events.length) {
+            let e = borrow events[i];
+            for (t in 0..e.targets.length) {
+                let url = match (targetUrl(targets.view(), e.targets[t].view())) {
+                    Some(u) => u,
+                    null => { continue; }
+                };
+                var json = Vector<u8>.create();
+                if (eventJson(e, t, mut json).isErr() || !(await postEvent(borrow client, url, json.view()))) {
+                    failed = true;
+                    break;
+                }
+            }
+            if (failed) { break; }
+            delivered = e.lsn;
+        }
+        if (delivered > 0 || failed) {
+            var guard = match (await store.get().lock()) {
+                Ok(g) => g,
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            };
+            let s = guard.data();
+            // The cursor is written and synced: on a worker thread.
+            let noted = await Async.blocking(() => s.eventsNoted(delivered, failed));
+            if (noted.isErr()) {
+                let _ = await AsyncConsole.writeError("cosmostore: the notification cursor was not written\n");
+            }
+        }
+        if (failed) {
+            await deliveryPause(wait)?;
+            wait = if (wait * 2 > DELIVERY_RETRY_MOST_MS) DELIVERY_RETRY_MOST_MS else wait * 2;
+        } else {
+            wait = DELIVERY_RETRY_MS;
+        }
+    }
+    return Err(NetError.Closed);
+}

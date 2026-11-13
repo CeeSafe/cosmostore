@@ -1859,3 +1859,44 @@ Browser form uploads with a SigV4 POST policy.
   `tools/tls_smoke.sh`, and a fault sweep (the new records go through the commits that were swept).
 - **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
 - **Next:** M5 item 6, notifications through a durable outbox; item 4's rest when G33 is fixed.
+
+### 13 Nov 2026: M5 item 6, event notifications through a durable outbox (ADR-0048)
+
+- **Chosen with the user** (yes, 13 Nov): HTTP webhooks first, a POST of S3's event document.
+- **The journal is the outbox.** A write's record is its event: when a record is applied (PutInline, PutExtent,
+  UploadComplete, DeleteVersion that removes something, DeleteMarker) and its bucket has a rule for it, the event is
+  queued in memory in LSN order. Nothing more is written, so the event is durable in the write's own sync.
+- **What keeps it over a restart:** the journal for records after the newest checkpoint; the checkpoint for older
+  ones (format 11: the waiting events after the uploads, their count in the header's unused word; a bucket's rules
+  in its entry; formats 1 to 10 load); and a cursor file, `outbox.cursor` (the LSN delivered and a CRC), written
+  atomically after each batch delivered, which recovery reads first. No event pins a segment.
+- **Rules** are `BucketConfig` kind 8, read and written as S3's queue configurations; a target is a webhook of
+  the file `serve --notify-targets` names, as `arn:cosmostore:sqs::<id>:webhook`. Created and removed events, with
+  prefix and suffix; `:Post` and `:Copy` are NotImplemented, since a PUT, a POST and a copy write one kind of
+  record.
+- **Delivery** is a third task beside the server and the upkeep, over CeeSafe.Web's `web_client` (a new
+  dependency): oldest first, 64 at a time, each event to each of its targets; a failure waits 1 s doubling to
+  60 s, and the events behind wait with it. At least once. The outbox holds 100,000 events, then drops the oldest
+  and counts it. Five counts in the stats.
+- **Tests (9 new, 203 in all, no leaks):** rules and events encoded and cut at every byte; the outbox through
+  recovery from the journal, the cursor, a checkpoint, and a checkpoint with records after it; versions (a marker
+  written, a version removed); rules taken off; a cursor file missing or damaged; the limit. Over S3, the targets
+  file, the document (12 bodies, what Get writes Put reads) and the event's JSON byte for byte.
+- **A fault sweep of the outbox** (three tests: a fault at every operation of a workload with rules, three writes,
+  a delivery, a checkpoint and a fourth write; once, sticky and torn, and with a crash): after recovery the event of
+  every acknowledged write is waiting unless it was delivered, and a delivery made durable is not sent again. **It
+  found one fault:** `eventsDelivered` dropped the events from memory before it wrote the cursor, so a cursor write
+  that failed, then a checkpoint, left the event out of the checkpoint while the disk still asked for it. The
+  cursor is written first now; if that fails the events stay and are delivered again.
+- **Clients:** `tools/s3_smoke.sh` 288 checks (15 new) with a webhook of its own, `tools/webhook.py`: events
+  arrive, only the rule's keys; with the webhook down an event waits, the server is killed with SIGKILL and
+  started again and it still waits, the webhook comes back and it arrives; fsck passes with the cursor file there.
+  boto3 135 (4 new, the configuration only). The s3-tests subset 364, as before (its SNS tests are out of scope).
+- **Not done:** a queue per target, so one target down does not hold the others; reloading the targets file;
+  an https webhook in a test (the connector verifies against the system's roots; the checks use http).
+- **Not run:** the p99 gate (owed since item 3; applying a record now costs one comparison while no bucket has
+  rules), the rclone, Go, JavaScript, Java and .NET scripts, and `tools/tls_smoke.sh`.
+- **CI:** the smoke script now starts `tools/webhook.py` with `python3`, and uses the port after the server's.
+- **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
+- **Next:** M5 item 7 (CORS, quotas, rate limits, audit log, admin API, credential rotation); item 4's rest when
+  G33 is fixed; the p99 gate for items 3 to 6 on a quiet machine.

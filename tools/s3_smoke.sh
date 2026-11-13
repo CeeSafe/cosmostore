@@ -8,7 +8,7 @@ bin=$(cd "$(dirname "${1:-out/cosmostore}")" && pwd)/$(basename "${1:-out/cosmos
 port=${2:-9311}
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
-trap 'kill "$server" 2>/dev/null; rm -rf "$work"' EXIT
+trap 'kill "$server" "$hook" 2>/dev/null; rm -rf "$work"' EXIT
 
 export AWS_ACCESS_KEY_ID=AKIASMOKETEST0000001
 export AWS_SECRET_ACCESS_KEY=smoke/secret/0123456789abcdefghijkl
@@ -17,9 +17,18 @@ export AWS_EC2_METADATA_DISABLED=true
 export AWS_ENDPOINT_URL="http://127.0.0.1:$port"
 echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > "$work/credentials"
 
-"$bin" serve "$work/store" "$port" "$work/credentials" localhost 2> "$work/server.log" &
-server=$!
-sleep 1
+# A webhook for the event notifications (ADR-0048), and a second target that nothing listens on.
+hookport=$((port + 1))
+: > "$work/hook.out"
+start_hook() { python3 -I "$here/webhook.py" "$hookport" "$work/hook.out" & hook=$!; }
+start_hook
+printf 'hook http://127.0.0.1:%s/events\n# a comment\n' "$hookport" > "$work/targets"
+start_server() {
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" 2>> "$work/server.log" &
+    server=$!
+    sleep 1
+}
+start_server
 
 failed=0
 pass() { echo "ok   $1"; }
@@ -533,14 +542,54 @@ check "SSE-C asked for" "$(code s3api put-object --bucket smoke --key sse.txt --
 check "a read with a key" "$(code s3api get-object --bucket smoke --key sse.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901 got.txt)" NotImplemented
 check "nothing stored" "$(aws s3api list-objects-v2 --bucket smoke --prefix sse.txt --query 'Contents[].Key' --output text)" None
 
+# Event notifications (ADR-0048): the rules, events at a webhook, and none lost while it is down or over a kill.
+events() { wc -l < hook.out | tr -d ' '; }
+wait_events() { n=0; while [ "$(events)" -lt "$1" ] && [ "$n" -lt 150 ]; do sleep 0.1; n=$((n + 1)); done; events; }
+event() { tail -1 hook.out | python3 -c 'import json,sys; r=json.load(sys.stdin)["Records"][0]; o=r["s3"]["object"]; print(r["eventName"], r["s3"]["bucket"]["name"], o["key"], o.get("size"), r["s3"]["configurationId"])'; }
+stat() { aws s3api get-object --bucket _cosmostore --key stats stats.json > /dev/null 2>&1; python3 -c 'import json,sys; print(json.load(open("stats.json"))[sys.argv[1]])' "$1"; }
+rules() { aws s3api put-bucket-notification-configuration --bucket notify --notification-configuration "$1"; }
+aws s3api create-bucket --bucket notify > /dev/null 2>&1
+check "no notification rules" "$(aws s3api get-bucket-notification-configuration --bucket notify --query QueueConfigurations)" null
+check "a target serve was not given" "$(code s3api put-bucket-notification-configuration --bucket notify --notification-configuration '{"QueueConfigurations":[{"QueueArn":"arn:cosmostore:sqs::nowhere:webhook","Events":["s3:ObjectCreated:*"]}]}')" InvalidArgument
+check "a topic" "$(code s3api put-bucket-notification-configuration --bucket notify --notification-configuration '{"TopicConfigurations":[{"TopicArn":"arn:aws:sns:us-east-1:1:t","Events":["s3:ObjectCreated:*"]}]}')" NotImplemented
+check "an event the store cannot tell apart" "$(code s3api put-bucket-notification-configuration --bucket notify --notification-configuration '{"QueueConfigurations":[{"QueueArn":"arn:cosmostore:sqs::hook:webhook","Events":["s3:ObjectCreated:Copy"]}]}')" NotImplemented
+rules '{"QueueConfigurations":[{"Id":"logs","QueueArn":"arn:cosmostore:sqs::hook:webhook","Events":["s3:ObjectCreated:*","s3:ObjectRemoved:*"],"Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"logs/"},{"Name":"suffix","Value":".txt"}]}}}]}' > /dev/null 2>&1 || fail "put-bucket-notification-configuration"
+check "get-bucket-notification-configuration" "$(aws s3api get-bucket-notification-configuration --bucket notify --query 'QueueConfigurations[0].[Id,QueueArn,length(Events),Filter.Key.FilterRules[0].Value,Filter.Key.FilterRules[1].Value]' --output text | tr '\t' ' ')" "logs arn:cosmostore:sqs::hook:webhook 2 logs/ .txt"
+aws s3api put-object --bucket notify --key "logs/a b.txt" --body pub.txt > /dev/null 2>&1
+aws s3api put-object --bucket notify --key logs/a.bin --body pub.txt > /dev/null 2>&1
+aws s3api put-object --bucket notify --key other/a.txt --body pub.txt > /dev/null 2>&1
+check "an event at the webhook" "$(wait_events 1)" 1
+check "the event" "$(event)" "ObjectCreated:Put notify logs/a%20b.txt 12 logs"
+aws s3api delete-object --bucket notify --key "logs/a b.txt" > /dev/null 2>&1
+check "a delete's event" "$(wait_events 2) $(event)" "2 ObjectRemoved:Delete notify logs/a%20b.txt None logs"
+check "only the keys of the rule" "$(sleep 1; events)" 2
+# The webhook goes down: the event waits; the server is killed: it still waits; both come back: it arrives.
+kill "$hook"
+wait "$hook" 2> /dev/null
+aws s3api put-object --bucket notify --key logs/kept.txt --body pub.txt > /dev/null 2>&1
+sleep 2
+check "an event waits while the webhook is down" "$(stat eventsPending) $(events)" "1 2"
+kill -9 "$server"
+wait "$server" 2> /dev/null
+start_server
+check "it waits over a kill" "$(stat eventsPending)" 1
+start_hook
+check "delivered once the webhook is back" "$(wait_events 3) $(event)" "3 ObjectCreated:Put notify logs/kept.txt 12 logs"
+check "nothing waits" "$(sleep 1; stat eventsPending) $(stat eventsDropped)" "0 0"
+rules '{}' > /dev/null 2>&1 || fail "notification rules taken off"
+aws s3api put-object --bucket notify --key logs/after.txt --body pub.txt > /dev/null 2>&1
+check "no rules, no events" "$(sleep 1; events)" 3
+aws s3 rm --recursive s3://notify/ > /dev/null 2>&1
+aws s3api delete-bucket --bucket notify > /dev/null 2>&1 && pass "delete-bucket after notifications" || fail "delete-bucket after notifications"
+
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket smoke > /dev/null 2>&1 && pass "delete-bucket" || fail "delete-bucket"
 aws s3api create-bucket --bucket after > /dev/null 2>&1 # a commit, which reaps what readers held
 check "no extents left" "$(ls store/extents | wc -l | tr -d ' ')" 0
 
-kill "$server"
-wait "$server" 2> /dev/null
+kill "$server" "$hook"
+wait "$server" "$hook" 2> /dev/null
 "$bin" fsck store > fsck.out 2>&1 && pass "fsck" || { fail "fsck"; cat fsck.out; }
 if [ -s server.log ] && grep -q "Internal\|Unavailable" server.log; then fail "server logged errors"; cat server.log; fi
 [ "$failed" = 0 ] && echo "s3 smoke: all passed" || echo "s3 smoke: FAILED"

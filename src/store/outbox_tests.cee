@@ -1,0 +1,305 @@
+// The event outbox (ADR-0048): rules, the events records give as they are applied, and what recovery, a checkpoint
+// and the delivery cursor do to them.
+
+fn notifyRule(
+    id: StringView,
+    target: StringView,
+    events: u8,
+    prefix: StringView,
+    suffix: StringView,
+) -> NotificationRule =>
+    NotificationRule {
+        id: copyBytes(id.bytes())!,
+        target: copyBytes(target.bytes())!,
+        events: events,
+        prefix: copyBytes(prefix.bytes())!,
+        suffix: copyBytes(suffix.bytes())!,
+    };
+
+fn setNotification(s: borrow mut ObjectStore, bucket: StringView, rules: borrow Vector<NotificationRule>) {
+    var blob = Vector<u8>.create();
+    if (rules.length > 0) { encodeNotification(rules.view(), mut blob)!; }
+    s.setBucketConfig(bucket, BUCKET_CONFIG_NOTIFICATION, blob.view())!;
+}
+
+/// The waiting events as text: `kind:key` for each, in order.
+fn waiting(s: borrow ObjectStore) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    let events = s.pendingEvents(1000)!;
+    for (i in 0..events.length) {
+        if (i > 0) { out.push(' ')!; }
+        out.push('0' + events[i].kind)!;
+        out.push(':')!;
+        out.extend(events[i].key.view())!;
+    }
+    return out;
+}
+
+@test
+fn notificationRulesAndEvents() -> Result<void, TestFailure> {
+    var rules = Vector<NotificationRule>.create();
+    rules.push(notifyRule("images", "hook", EVENT_PUT | EVENT_COMPLETE, "img/", ".jpg"))!;
+    rules.push(notifyRule("", "audit", EVENT_ALL, "", ""))!;
+    var blob = Vector<u8>.create();
+    encodeNotification(rules.view(), mut blob)!;
+    let back = match (decodeNotification(blob.view())) {
+        Ok(b) => b,
+        Err(_) => { return Check.fail("the rules read back"); }
+    };
+    Check.equalU64(2, back.length as u64)?;
+    Check.equalBytes("images".bytes(), back[0].id.view())?;
+    Check.equalBytes("hook".bytes(), back[0].target.view())?;
+    Check.isTrue(back[0].events == 3 && back[1].events == EVENT_ALL, "the events")?;
+    Check.equalBytes(".jpg".bytes(), back[0].suffix.view())?;
+    Check.isTrue(ruleTakesEvent(borrow back[0], EVENT_PUT, "img/a.jpg".bytes()), "prefix, suffix and kind")?;
+    Check.isTrue(!ruleTakesEvent(borrow back[0], EVENT_DELETE, "img/a.jpg".bytes()), "another kind")?;
+    Check.isTrue(!ruleTakesEvent(borrow back[0], EVENT_PUT, "img/a.png".bytes()), "another suffix")?;
+    Check.isTrue(!ruleTakesEvent(borrow back[0], EVENT_PUT, "doc/a.jpg".bytes()), "another prefix")?;
+    Check.isTrue(!ruleTakesEvent(borrow back[0], EVENT_PUT, "jpg".bytes()), "a key shorter than the suffix")?;
+    Check.isTrue(ruleTakesEvent(borrow back[1], EVENT_MARKER, "".bytes()), "no filter")?;
+    Check.isTrue(decodeNotification("".bytes()).isOk(), "no rules")?;
+    // Cut anywhere, or with a rule that takes nothing, it is not a set of rules.
+    for (cut in 1..blob.length) { Check.isTrue(decodeNotification(blob.view()[0..cut]).isErr(), "rules cut short")?; }
+    var none = Vector<NotificationRule>.create();
+    none.push(notifyRule("x", "hook", 0, "", ""))!;
+    var bad = Vector<u8>.create();
+    encodeNotification(none.view(), mut bad)!;
+    Check.isTrue(decodeNotification(bad.view()).isErr(), "a rule for no event")?;
+    // An event as a checkpoint keeps it.
+    var e = OutboxEvent {
+        lsn: 77,
+        kind: EVENT_COMPLETE,
+        bucket: copyBytes("bkt".bytes())!,
+        key: copyBytes("img/a.jpg".bytes())!,
+        versionId: [7u8; 16],
+        size: 123456789012,
+        md5: [9u8; 16],
+        parts: 3,
+        mtimeMillis: 1767225600000,
+        ruleIds: Vector<Vector<u8>>.create(),
+        targets: Vector<Vector<u8>>.create(),
+    };
+    e.ruleIds.push(copyBytes("images".bytes())!)!;
+    e.targets.push(copyBytes("hook".bytes())!)!;
+    e.ruleIds.push(copyBytes("".bytes())!)!;
+    e.targets.push(copyBytes("audit".bytes())!)!;
+    var bytes = Vector<u8>.create();
+    encodeEvent(borrow e, mut bytes)!;
+    let again = match (decodeEvent(bytes.view())) {
+        Ok(a) => a,
+        Err(_) => { return Check.fail("the event reads back"); }
+    };
+    Check.isTrue(again.lsn == 77 && again.kind == EVENT_COMPLETE && again.parts == 3, "its numbers")?;
+    Check.isTrue(again.size == 123456789012 && again.mtimeMillis == 1767225600000, "its size and time")?;
+    Check.equalBytes("img/a.jpg".bytes(), again.key.view())?;
+    Check.equalBytes("audit".bytes(), again.targets[1].view())?;
+    for (cut in 0..bytes.length) { Check.isTrue(decodeEvent(bytes.view()[0..cut]).isErr(), "an event cut short")?; }
+    return Ok();
+}
+
+@test
+fn outboxFollowsTheJournal() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("outbox");
+    var firstLsn: u64 = 0;
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        s.createBucket("quiet")!;
+        putText(mut s, "bkt", "logs/early", "before any rule"); // no event: no rules yet
+        var rules = Vector<NotificationRule>.create();
+        rules.push(notifyRule("logs", "hook", EVENT_ALL, "logs/", ""))!;
+        setNotification(mut s, "bkt", borrow rules);
+        putText(mut s, "bkt", "logs/a", "one");
+        putText(mut s, "bkt", "other/b", "not under the prefix");
+        putText(mut s, "quiet", "logs/c", "a bucket without rules");
+        s.deleteObject("bkt", "logs/a")!;
+        s.deleteObject("bkt", "logs/missing")!; // nothing removed: no event
+        putText(mut s, "bkt", "logs/d", "two");
+        Check.equalBytes("1:logs/a 4:logs/a 1:logs/d".bytes(), waiting(borrow s).view())?;
+        let events = s.pendingEvents(2)!;
+        Check.equalU64(2, events.length as u64)?;
+        firstLsn = events[0].lsn;
+        Check.isTrue(events[0].lsn < events[1].lsn, "in the journal's order")?;
+        Check.equalU64(3, events[0].size)?;
+        Check.equalBytes("logs".bytes(), events[0].ruleIds[0].view())?;
+        Check.equalBytes("hook".bytes(), events[0].targets[0].view())?;
+        Check.equalBytes(Md5.of("one".bytes())[..], events[0].md5[..])?;
+        let counts = s.outboxCounts();
+        Check.isTrue(counts[0] == 3 && counts[1] == 3 && counts[2] == 0 && counts[3] == 0, "three waiting")?;
+    }
+    // A crash loses nothing: the journal gives them again.
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.equalBytes("1:logs/a 4:logs/a 1:logs/d".bytes(), waiting(borrow s).view())?;
+        // The first is delivered: the cursor is durable before this returns.
+        s.eventsDelivered(firstLsn)!;
+        Check.equalBytes("4:logs/a 1:logs/d".bytes(), waiting(borrow s).view())?;
+        Check.equalU64(1, s.outboxCounts()[2])?;
+    }
+    for (round in 0..3) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        // From the journal past the cursor; then from a checkpoint; then from one and the records after it.
+        if (round < 2) {
+            Check.equalBytes("4:logs/a 1:logs/d".bytes(), waiting(borrow s).view())?;
+        } else {
+            Check.equalBytes("4:logs/a 1:logs/d 1:logs/e".bytes(), waiting(borrow s).view())?;
+        }
+        if (round == 0) { let _ = s.checkpoint()!; }
+        if (round == 1) { putText(mut s, "bkt", "logs/e", "after the checkpoint"); }
+    }
+    {
+        // Versions: a delete without an id is a marker written; one with an id, a version removed.
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        let last = s.pendingEvents(10)![2].lsn;
+        s.eventsDelivered(last)!;
+        Check.equalU64(0, waiting(borrow s).length as u64)?;
+        setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+        let v = putVersion(mut s, "bkt", "logs/v", "one").versionId;
+        s.deleteObject("bkt", "logs/v")!;
+        let _ = s.deleteVersion("bkt", "logs/v", v)!;
+        Check.equalBytes("1:logs/v 8:logs/v 4:logs/v".bytes(), waiting(borrow s).view())?;
+        // Rules taken off: nothing more is queued; what waits still waits.
+        var none = Vector<NotificationRule>.create();
+        setNotification(mut s, "bkt", borrow none);
+        putText(mut s, "bkt", "logs/z", "no rules any more");
+        Check.equalU64(3, s.outboxCounts()[0])?;
+        // The store keeps only rules that read.
+        match (s.setBucketConfig("bkt", BUCKET_CONFIG_NOTIFICATION, "rules".bytes())) {
+            Err(StoreError.InvalidKey) => {}
+            _ => { return Check.fail("rules that are not rules"); }
+        }
+    }
+    // The cursor file gone, or damaged: the waiting events are delivered again, none is lost.
+    var cursor = String.create();
+    cursor.append(dir.view())!;
+    cursor.append(OUTBOX_CURSOR_NAME)!;
+    Check.isTrue(readOutboxCursor(dir.view())! > 0, "the cursor is on disk")?;
+    Fs.unlink(cursor.view())!;
+    Check.equalU64(0, readOutboxCursor(dir.view())!)?;
+    {
+        let file = DurableFile.createNew(cursor.view())!;
+        file.writeAt("not a cursor".bytes(), 0)!;
+    }
+    Check.equalU64(0, readOutboxCursor(dir.view())!)?;
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.isTrue(s.outboxCounts()[0] >= 3, "delivered again rather than lost")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn outboxDropsTheOldestPastItsLimit() -> Result<void, TestFailure> {
+    var box = Outbox.create();
+    for (i in 0..MAX_OUTBOX_EVENTS + 5) {
+        var e = OutboxEvent {
+            lsn: (i + 1) as u64,
+            kind: EVENT_PUT,
+            bucket: Vector<u8>.create(),
+            key: Vector<u8>.create(),
+            versionId: [0u8; 16],
+            size: 0,
+            md5: [0u8; 16],
+            parts: 0,
+            mtimeMillis: 0,
+            ruleIds: Vector<Vector<u8>>.create(),
+            targets: Vector<Vector<u8>>.create(),
+        };
+        box.add(e)!;
+    }
+    Check.equalU64(MAX_OUTBOX_EVENTS as u64, box.pending() as u64)?;
+    Check.equalU64(5, box.dropped)?;
+    Check.equalU64(6, box.events[box.head].lsn)?; // the five oldest went
+    box.deliveredTo(10);
+    Check.equalU64((MAX_OUTBOX_EVENTS - 5) as u64, box.pending() as u64)?;
+    Check.equalU64(11, box.events[box.head].lsn)?;
+    Check.equalU64(10, box.cursor)?;
+    box.deliveredTo((MAX_OUTBOX_EVENTS + 5) as u64);
+    Check.equalU64(0, box.pending() as u64)?;
+    Check.equalU64(0, box.events.length as u64)?; // cut off the front
+    return Ok();
+}
+
+/// A workload for the fault sweeps: rules, three writes, the first event delivered, a checkpoint, a fourth write.
+/// `acked[i]`: write `i` was acknowledged with the rules in place; `delivered`: the cursor's write returned Ok.
+fn outboxWorkload(dir: StringView, acked: borrow mut [bool; 4], delivered: borrow mut bool) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    if (s.createBucket("bkt").isErr()) { return; }
+    var rules = Vector<NotificationRule>.create();
+    rules.push(notifyRule("all", "hook", EVENT_ALL, "", ""))!;
+    var blob = Vector<u8>.create();
+    encodeNotification(rules.view(), mut blob)!;
+    if (s.setBucketConfig("bkt", BUCKET_CONFIG_NOTIFICATION, blob.view()).isErr()) { return; }
+    let keys = ["e0", "e1", "e2", "e3"];
+    for (i in 0..3) {
+        acked[i] = s.putObject("bkt", keys[i], "text/plain", "event".bytes(), PutCondition.None).isOk();
+    }
+    match (s.pendingEvents(1)) {
+        Ok(events) => {
+            if (events.length == 1 && events[0].key.view() == "e0".bytes()) {
+                delivered = s.eventsDelivered(events[0].lsn).isOk();
+            }
+        }
+        Err(_) => {}
+    }
+    let _ = s.checkpoint();
+    acked[3] = s.putObject("bkt", keys[3], "text/plain", "event".bytes(), PutCondition.None).isOk();
+}
+
+/// A fault at every operation of the workload, then recovery: the event of every acknowledged write is waiting,
+/// unless it was delivered; one whose delivery was made durable is not sent again (ADR-0048 §3).
+fn sweepOutbox(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    var all = [false; 4];
+    var sent = false;
+    Faults.countOperations();
+    outboxWorkload(dir.view(), mut all, mut sent);
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 20 && sent && all[0] && all[1] && all[2] && all[3], "the workload runs clean")?;
+    var cursorsKept: usize = 0;
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        var acked = [false; 4];
+        var delivered = false;
+        armMode(borrow mode, n);
+        outboxWorkload(dir.view(), mut acked, mut delivered);
+        Faults.disarm();
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        let text = waiting(borrow s);
+        let keys = ["1:e0", "1:e1", "1:e2", "1:e3"];
+        for (i in 0..4) {
+            let there = findBytes(text.view(), keys[i].bytes(), 0).isSome();
+            if (i == 0 && delivered) {
+                Check.isTrue(!there, "a delivered event is not sent again")?;
+                cursorsKept += 1;
+            } else if (acked[i] && i > 0) {
+                Check.isTrue(there, "an acknowledged write's event is waiting")?;
+            } else if (acked[i] && !there) {
+                // e0, with its delivery interrupted: the cursor may have reached the disk before the fault.
+                Check.isTrue(readOutboxCursor(dir.view())! > 0, "the first event is gone only if the cursor says so")?;
+            }
+        }
+    }
+    Check.isTrue(cursorsKept > 0, "some faulted runs delivered the first event")?;
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn outboxFaultsOnce() -> Result<void, TestFailure> => sweepOutbox("outbox-fault-once", SweepMode.Once);
+
+@test
+fn outboxFaultsTorn() -> Result<void, TestFailure> => sweepOutbox("outbox-fault-torn", SweepMode.StickyTorn);
+
+@test
+fn outboxFaultsCrash() -> Result<void, TestFailure> => sweepOutbox("outbox-fault-crash", SweepMode.Crash);

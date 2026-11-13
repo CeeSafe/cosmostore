@@ -138,6 +138,8 @@ struct BucketInfo {
     acl: Vector<u8>;
     /// The object lock configuration as it is stored; empty for a bucket without object lock (ADR-0047).
     objectLock: Vector<u8>;
+    /// The notification rules as they are stored; empty for none (ADR-0048).
+    notification: Vector<u8>;
 }
 
 /// Space use of one segment, for compaction (ADR-0005). `liveBytes` counts the records that
@@ -413,6 +415,8 @@ struct StoreState {
     /// The latest completions, oldest first, so a retried Complete gets its first answer (ADR-0014). Rebuilt from
     /// the journal after the newest checkpoint, and never written to one.
     completions: Vector<Completion>;
+    /// The events of applied records still to be delivered (ADR-0048).
+    outbox: Outbox;
 
     fn create() -> StoreState => StoreState {
         index: VersionIndex.create(),
@@ -425,7 +429,56 @@ struct StoreState {
         extentBytes: 0,
         uploads: HashMap<UploadKey, Upload>.create(),
         completions: Vector<Completion>.create(),
+        outbox: Outbox.create(),
     };
+
+    /// Queues the event of a record just applied, if its bucket has a notification rule for it (ADR-0048 §2).
+    /// Nothing while no bucket has rules, and nothing for a record the delivery cursor is past: recovery applies
+    /// those again.
+    fn noteEvent(
+        borrow mut this,
+        kind: u8,
+        bucket: Slice<u8>,
+        key: Slice<u8>,
+        versionId: [u8; 16],
+        size: u64,
+        md5: [u8; 16],
+        parts: u32,
+        mtimeMillis: i64,
+        lsn: u64,
+    ) -> Result<void, StoreError> {
+        if (this.outbox.buckets == 0 || lsn <= this.outbox.cursor) { return Ok(); }
+        let k = BucketKey { name: copyBytes(bucket)? };
+        let blob = match (this.buckets.get(borrow k)) {
+            Some(b) => copyBytes(b.notification.view())?,
+            null => { return Ok(); }
+        };
+        if (blob.length == 0) { return Ok(); }
+        let rules = match (decodeNotification(blob.view())) {
+            Ok(r) => r,
+            Err(_) => { return Ok(); }
+        };
+        var e = OutboxEvent {
+            lsn: lsn,
+            kind: kind,
+            bucket: copyBytes(bucket)?,
+            key: copyBytes(key)?,
+            versionId: versionId,
+            size: size,
+            md5: md5,
+            parts: parts,
+            mtimeMillis: mtimeMillis,
+            ruleIds: Vector<Vector<u8>>.create(),
+            targets: Vector<Vector<u8>>.create(),
+        };
+        for (i in 0..rules.length) {
+            if (!ruleTakesEvent(borrow rules[i], kind, key)) { continue; }
+            e.ruleIds.push(copyBytes(rules[i].id.view())?)?;
+            e.targets.push(copyBytes(rules[i].target.view())?)?;
+        }
+        if (e.targets.length > 0) { this.outbox.add(e)?; }
+        return Ok();
+    }
 
     /// The key's current object: its newest version, unless that is a delete marker (ADR-0041).
     fn current(borrow this, key: borrow IndexKey) -> borrow(this) ObjectVersion? {
@@ -459,6 +512,7 @@ struct StoreState {
             null => {}
         }
         if (this.nextBucket == NO_BUCKET) { return Err(StoreError.InsufficientStorage); } // 4 billion creations
+        if (entry.notification.length > 0) { this.outbox.buckets += 1; }                  // from a checkpoint
         entry.number = this.nextBucket;
         // If the second put fails, the name stays under a number no bucket has, and the next add reuses the number.
         this.bucketNames.put(entry.number, name)?;
@@ -471,7 +525,10 @@ struct StoreState {
     fn removeBucket(borrow mut this, name: Slice<u8>) -> Result<void, StoreError> {
         let k = BucketKey { name: copyBytes(name)? };
         match (this.buckets.remove(borrow k)) {
-            Some(b) => { let _ = this.bucketNames.remove(borrow b.number); }
+            Some(b) => {
+                if (b.notification.length > 0 && this.outbox.buckets > 0) { this.outbox.buckets -= 1; }
+                let _ = this.bucketNames.remove(borrow b.number);
+            }
             null => {}
         }
         return Ok();
@@ -659,6 +716,17 @@ fn applyRecord(
                         Some(old) => {
                             state.retire(borrow old)?;
                             state.bumpObjects(m.bucket.view(), false)?;
+                            state.noteEvent(
+                                EVENT_DELETE,
+                                m.bucket.view(),
+                                m.key.view(),
+                                m.versionId,
+                                0,
+                                [0u8; 16],
+                                0,
+                                m.mtimeMillis,
+                                lsn,
+                            )?;
                         }
                         null => {}
                     }
@@ -681,6 +749,17 @@ fn applyRecord(
                     marker.kind = VersionKind.DeleteMarker;
                     marker.mtimeMillis = m.mtimeMillis;
                     installVersion(state, m.bucket.view(), key, marker)?;
+                    state.noteEvent(
+                        EVENT_MARKER,
+                        m.bucket.view(),
+                        m.key.view(),
+                        m.versionId,
+                        0,
+                        [0u8; 16],
+                        0,
+                        m.mtimeMillis,
+                        lsn,
+                    )?;
                 }
                 null => {}
             }
@@ -706,6 +785,7 @@ fn applyRecord(
                 publicAccess: Vector<u8>.create(),
                 acl: Vector<u8>.create(),
                 objectLock: Vector<u8>.create(),
+                notification: Vector<u8>.create(),
             };
             let _ = state.addBucket(name, info)?;
         }
@@ -718,8 +798,15 @@ fn applyRecord(
             let configKind = m.kind;
             let value = m.value;
             let k = BucketKey { name: m.bucket };
+            // The count of buckets with notification rules follows the rules (ADR-0048 §6).
+            var gained = false;
+            var lost = false;
             match (state.buckets.getMut(borrow k)) {
                 Some(b) => {
+                    if (configKind == BUCKET_CONFIG_NOTIFICATION) {
+                        gained = b.notification.length == 0 && value.length > 0;
+                        lost = b.notification.length > 0 && value.length == 0;
+                    }
                     if (configKind == BUCKET_CONFIG_TAGS) {
                         b.tags = value;
                     } else if (configKind == BUCKET_CONFIG_LIFECYCLE) {
@@ -732,12 +819,16 @@ fn applyRecord(
                         b.acl = value;
                     } else if (configKind == BUCKET_CONFIG_OBJECT_LOCK) {
                         b.objectLock = value;
+                    } else if (configKind == BUCKET_CONFIG_NOTIFICATION) {
+                        b.notification = value;
                     } else {
                         b.versioning = value[0]; // one valid byte: `decodeBucketConfigMeta` checked it
                     }
                 }
                 null => {}
             }
+            if (gained) { state.outbox.buckets += 1; }
+            if (lost && state.outbox.buckets > 0) { state.outbox.buckets -= 1; }
         }
         RecordType.Relocate => {
             let m = match (decodeRelocateMeta(meta)) {
@@ -807,6 +898,17 @@ fn applyPut(
     // in every checkpoint (ADR-0005).
     let live = if (extents.length == 0) totalLen as u64 else 0;
     state.addSegmentBytes(segment, totalLen as u64, live)?;
+    state.noteEvent(
+        if (parts > 0) EVENT_COMPLETE else EVENT_PUT,
+        m.bucket.view(),
+        m.key.view(),
+        m.versionId,
+        m.size,
+        m.md5,
+        parts,
+        m.mtimeMillis,
+        lsn,
+    )?;
     let key = state.indexKey(m.bucket.view(), m.key.view())?;
     let bucket = m.bucket;
     let version = ObjectVersion {
@@ -1175,6 +1277,11 @@ struct ObjectStore {
             }
             for (i in 0..live.length) { state.addSegmentBytes(live[i].id, 0, live[i].size)?; }
         }
+        // The outbox: the checkpoint's events the cursor is not past, then those of the records replayed
+        // (ADR-0048 §3).
+        let delivered = readOutboxCursor(dir)?;
+        state.outbox.deliveredTo(delivered);
+        state.outbox.delivered = 0;
         var failure: StoreError? = null;
         let journal = Journal.openFrom(dir, config.journal, start, (segment, offset, header, bytes) => {
             if (failure.isSome()) { return; }
@@ -1962,6 +2069,45 @@ struct ObjectStore {
         if (this.mustCommitBefore(borrow rec, obj)) { return Ok(null); }
         return Ok(Some(this.stageEncoded(rec, obj)?));
     }
+
+    /// The oldest events still to be delivered, at most `most`, as copies (ADR-0048 §4).
+    fn pendingEvents(borrow this, most: usize) -> Result<Vector<OutboxEvent>, StoreError> {
+        var out = Vector<OutboxEvent>.create();
+        var i = this.state.outbox.head;
+        while (i < this.state.outbox.events.length && out.length < most) {
+            out.push(cloneEvent(borrow this.state.outbox.events[i])?)?;
+            i += 1;
+        }
+        return Ok(out);
+    }
+
+    /// Every event up to `lsn` is delivered: they leave the outbox, and the cursor file says so, durably, before
+    /// this returns. A crash before it delivers them again.
+    fn eventsDelivered(borrow mut this, lsn: u64) -> Result<void, StoreError> {
+        // The cursor first: if it cannot be written the events stay, in memory and in the next checkpoint, and
+        // are delivered again. Dropped first, a checkpoint could leave them out while the disk still asks for them.
+        writeOutboxCursor(this.dir.view(), lsn)?;
+        this.state.outbox.deliveredTo(lsn);
+        return Ok();
+    }
+
+    /// What the delivery task did with a batch: every event up to `lsn` is delivered (0: none), and one delivery
+    /// failed and will be tried again.
+    fn eventsNoted(borrow mut this, lsn: u64, failed: bool) -> Result<void, StoreError> {
+        if (failed) { this.state.outbox.failures += 1; }
+        if (lsn == 0) { return Ok(); }
+        return this.eventsDelivered(lsn);
+    }
+
+    /// The outbox's counts: events waiting, and since the store was opened those queued, delivered and dropped, and
+    /// the deliveries that failed.
+    fn outboxCounts(borrow this) -> [u64; 5] => [
+        this.state.outbox.pending() as u64,
+        this.state.outbox.queued,
+        this.state.outbox.delivered,
+        this.state.outbox.dropped,
+        this.state.outbox.failures,
+    ];
 
     /// A bucket's object lock configuration as it is stored; empty without one, or without the bucket.
     fn lockConfigOf(borrow this, bucket: Slice<u8>) -> Result<Vector<u8>, StoreError> {
@@ -3715,7 +3861,11 @@ struct ObjectStore {
         }
         if (kind == BUCKET_CONFIG_PUBLIC_ACCESS && !isPublicAccessValue(value)) { return Err(StoreError.InvalidKey); }
         if (kind == BUCKET_CONFIG_ACL && !isAclValue(value)) { return Err(StoreError.InvalidKey); }
-        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_OBJECT_LOCK) { return Err(StoreError.InvalidKey); }
+        if (kind == BUCKET_CONFIG_NOTIFICATION &&
+            (value.length > MAX_NOTIFICATION_BYTES || decodeNotification(value).isErr())) {
+            return Err(StoreError.InvalidKey);
+        }
+        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_NOTIFICATION) { return Err(StoreError.InvalidKey); }
         // Object lock needs versioning enabled, keeps it so, and is never taken off a bucket (ADR-0047 §1).
         let locks = this.lockConfigOf(bucket.bytes())?.length > 0;
         if (kind == BUCKET_CONFIG_OBJECT_LOCK) {
@@ -3748,6 +3898,7 @@ struct ObjectStore {
                 if (kind == BUCKET_CONFIG_PUBLIC_ACCESS) { return Ok(copyBytes(b.publicAccess.view())?); }
                 if (kind == BUCKET_CONFIG_ACL) { return Ok(copyBytes(b.acl.view())?); }
                 if (kind == BUCKET_CONFIG_OBJECT_LOCK) { return Ok(copyBytes(b.objectLock.view())?); }
+                if (kind == BUCKET_CONFIG_NOTIFICATION) { return Ok(copyBytes(b.notification.view())?); }
                 Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?)
             }
             null => Err(StoreError.NoSuchBucket),
