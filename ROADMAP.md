@@ -1900,3 +1900,31 @@ Browser form uploads with a SigV4 POST policy.
 - **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
 - **Next:** M5 item 7 (CORS, quotas, rate limits, audit log, admin API, credential rotation); item 4's rest when
   G33 is fixed; the p99 gate for items 3 to 6 on a quiet machine.
+
+### 13 Nov 2026: M5 item 7, first part: CORS (ADR-0049)
+
+- **Chosen with the user** (yes, 13 Nov): CORS first of item 7's parts, then credential rotation.
+- **Rules** are `BucketConfig` kind 9 in a compact form (checkpoint format 12, formats 1 to 11 load): Put-, Get-
+  and DeleteBucketCors; up to 100 rules of origins, methods, headers, exposed headers and an age; patterns with
+  one `*`.
+- **A preflight** (OPTIONS, routed to the S3 handler now; the web server answered it itself before) is answered
+  unsigned: 200 with the rule's fields when a rule allows the origin, the method and every header asked for; 403
+  AccessForbidden otherwise; 400 without the origin or the method.
+- **A request that names an `Origin`** gets the first matching rule's fields on whatever its answer is, an error
+  too. No rule: no fields, and the request is served as before; CORS never refuses a request that is not a
+  preflight.
+- **The cost:** a count of buckets with CORS rules in the app, as for policies; while it is 0 an `Origin` is not
+  looked at. Otherwise such a request reads its bucket's rules, one lock round.
+- **A fault in ADR-0045, found by the Ceph CORS test:** an anonymous GET of a key that is not there was
+  AccessDenied even for a requester who may list the bucket; S3 answers NoSuchKey there. Fixed: with nothing to
+  have an ACL, the request goes on if it may do `s3:ListBucket`, and is refused if not.
+- **Tests (2 new, 205 in all, no leaks):** the document (what Get writes Put reads, 8 refusals, 101 rules), the
+  stored rules cut at every byte, patterns, the first rule for an origin and a method, a preflight's headers.
+- **Clients:** `tools/s3_smoke.sh` 310 checks (22 new: 20 for CORS with curl, 2 for the missing key); boto3 139
+  (4 new); the s3-tests subset 377 (496 in scope, 389 pass; 13 new). The four `*_v2` presigned CORS tests sign
+  with SigV2.
+- **Not run:** the p99 gate (owed since item 3), the rclone, Go, JavaScript, Java and .NET scripts,
+  `tools/tls_smoke.sh`, and a fault sweep (a BucketConfig record through the commits that were swept).
+- **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
+- **Next:** credential rotation (the credentials file reloaded when it changes, as certificates are), then the
+  rest of item 7.

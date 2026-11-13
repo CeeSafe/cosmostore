@@ -1,0 +1,298 @@
+// CORS (ADR-0049): a bucket's rules as S3's XML, the answer to a browser's preflight, and the fields a matching rule
+// adds to the answer of any request that names its origin.
+import web_core;
+import web_http;
+import web_server;
+
+fn corsMethodBit(name: Slice<u8>) -> u8 {
+    if (name == "GET".bytes()) { return CORS_GET; }
+    if (name == "PUT".bytes()) { return CORS_PUT; }
+    if (name == "POST".bytes()) { return CORS_POST; }
+    if (name == "DELETE".bytes()) { return CORS_DELETE; }
+    if (name == "HEAD".bytes()) { return CORS_HEAD; }
+    return 0;
+}
+
+/// Every `<name>` of `xml`, trimmed, into `out`.
+fn corsTexts(xml: Slice<u8>, name: StringView, out: borrow mut Vector<Vector<u8>>) -> Result<void, S3Fail> {
+    var at: usize = 0;
+    while (true) {
+        match (nextElement(xml, name, mut at)?) {
+            Some(t) => { out.push(copyBytes(trimBlank(t))?)?; }
+            null => { break; }
+        }
+    }
+    return Ok();
+}
+
+/// The rules of a `<CORSConfiguration>` (ADR-0049 §1): 1 to 100, each with an origin and a method at least. A
+/// method S3 has no CORS for, or a pattern with two `*`, is InvalidRequest.
+fn parseCors(xml: Slice<u8>) -> Result<Vector<CorsRule>, S3Fail> {
+    if (findBytes(xml, "<CORSConfiguration".bytes(), 0).isNull()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    var rules = Vector<CorsRule>.create();
+    var at: usize = 0;
+    while (true) {
+        let inner = match (nextElement(xml, "CORSRule", mut at)?) {
+            Some(i) => i,
+            null => { break; }
+        };
+        if (rules.length >= MAX_CORS_RULES) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        var rule = CorsRule {
+            id: Vector<u8>.create(),
+            methods: 0,
+            origins: Vector<Vector<u8>>.create(),
+            headers: Vector<Vector<u8>>.create(),
+            expose: Vector<Vector<u8>>.create(),
+            maxAge: -1,
+        };
+        let _ = rawElement(inner, "ID", mut rule.id)?;
+        corsTexts(inner, "AllowedOrigin", mut rule.origins)?;
+        corsTexts(inner, "AllowedHeader", mut rule.headers)?;
+        corsTexts(inner, "ExposeHeader", mut rule.expose)?;
+        var methods = Vector<Vector<u8>>.create();
+        corsTexts(inner, "AllowedMethod", mut methods)?;
+        if (rule.origins.length == 0 || methods.length == 0) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        for (i in 0..methods.length) {
+            let bit = corsMethodBit(methods[i].view());
+            if (bit == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            rule.methods |= bit;
+        }
+        for (i in 0..rule.origins.length) {
+            if (!oneWildcard(rule.origins[i].view())) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        }
+        for (i in 0..rule.headers.length) {
+            if (!oneWildcard(rule.headers[i].view())) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        }
+        match (elementText(inner, "MaxAgeSeconds")) {
+            Some(t) => {
+                rule.maxAge = match (parseDecimal(trimBlank(t))) {
+                    Some(n) => if (n > 2147483647) 2147483647 else truncate<i64>(n),
+                    null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+                };
+            }
+            null => {}
+        }
+        rules.push(rule)?;
+    }
+    if (rules.length == 0) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    return Ok(rules);
+}
+
+fn corsXml(rules: Slice<CorsRule>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let names = ["GET", "PUT", "POST", "DELETE", "HEAD"];
+    let bits = [CORS_GET, CORS_PUT, CORS_POST, CORS_DELETE, CORS_HEAD];
+    xmlHead(out, "CORSConfiguration")?;
+    for (i in 0..rules.length) {
+        let r = borrow rules[i];
+        out.extend("<CORSRule>".bytes())?;
+        if (r.id.length > 0) { xmlElement(out, "ID", r.id.view(), false)?; }
+        for (j in 0..r.origins.length) { xmlElement(out, "AllowedOrigin", r.origins[j].view(), false)?; }
+        for (j in 0..names.length) {
+            if ((r.methods & bits[j]) != 0) { xmlElement(out, "AllowedMethod", names[j].bytes(), false)?; }
+        }
+        for (j in 0..r.headers.length) { xmlElement(out, "AllowedHeader", r.headers[j].view(), false)?; }
+        for (j in 0..r.expose.length) { xmlElement(out, "ExposeHeader", r.expose[j].view(), false)?; }
+        if (r.maxAge >= 0) {
+            var n = Vector<u8>.create();
+            appendDecimal(mut n, truncate<u64>(r.maxAge))?;
+            xmlElement(out, "MaxAgeSeconds", n.view(), false)?;
+        }
+        out.extend("</CORSRule>".bytes())?;
+    }
+    out.extend("</CORSConfiguration>".bytes())?;
+    return Ok();
+}
+
+// ---- Matching ----
+
+/// The place in `rule.origins` of the first pattern `origin` matches.
+fn corsOrigin(rule: borrow CorsRule, origin: Slice<u8>) -> usize? {
+    for (i in 0..rule.origins.length) {
+        if (corsMatch(rule.origins[i].view(), origin, false)) { return Some(i); }
+    }
+    return null;
+}
+
+/// The first rule that allows `method` (a CORS bit) from `origin` (ADR-0049 §2).
+fn corsRuleFor(rules: Slice<CorsRule>, origin: Slice<u8>, method: u8) -> usize? {
+    for (i in 0..rules.length) {
+        if ((rules[i].methods & method) != 0 && corsOrigin(borrow rules[i], origin).isSome()) { return Some(i); }
+    }
+    return null;
+}
+
+/// Whether a rule lets a preflight ask for these headers (`Access-Control-Request-Headers`): each one must match
+/// one of the rule's, without regard to case.
+fn corsAllowsHeaders(rule: borrow CorsRule, requested: Slice<u8>) -> bool {
+    var at: usize = 0;
+    while (at <= requested.length) {
+        let end = pieceEnd(requested, at, ',');
+        let name = trimBlank(requested[at..end]);
+        at = end + 1;
+        if (name.length == 0) { continue; }
+        var allowed = false;
+        for (i in 0..rule.headers.length) {
+            if (corsMatch(rule.headers[i].view(), name, true)) { allowed = true; }
+        }
+        if (!allowed) { return false; }
+    }
+    return true;
+}
+
+/// The fields a matching rule adds to an answer: the origin (`*` when the rule's pattern is `*`), the method, the
+/// headers a script may read, and that the answer varies with the origin.
+fn corsFields(
+    exchange: borrow mut Exchange,
+    rule: borrow CorsRule,
+    origin: Slice<u8>,
+    method: Slice<u8>,
+) -> Result<void, S3Fail> {
+    let any = match (corsOrigin(rule, origin)) {
+        Some(i) => rule.origins[i].view() == "*".bytes(),
+        null => false,
+    };
+    exchange.header("access-control-allow-origin", if (any) "*".bytes() else origin)?;
+    exchange.header("access-control-allow-methods", method)?;
+    if (!any) { exchange.header("access-control-allow-credentials", "true".bytes())?; }
+    if (rule.expose.length > 0) {
+        var list = Vector<u8>.create();
+        for (i in 0..rule.expose.length) {
+            if (i > 0) { list.extend(", ".bytes())?; }
+            list.extend(rule.expose[i].view())?;
+        }
+        exchange.header("access-control-expose-headers", list.view())?;
+    }
+    exchange.header("vary", "Origin, Access-Control-Request-Headers, Access-Control-Request-Method".bytes())?;
+    return Ok();
+}
+
+/// The bucket's rules, for a request that names an origin; none for a bucket without them, or that is not there.
+async fn corsRulesOf(app: borrow S3App, bucket: StringView) -> Result<Vector<CorsRule>, S3Fail> {
+    var stored = Vector<u8>.create();
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        // An index lookup and a copy: on the event loop.
+        match (store.bucketConfig(bucket, BUCKET_CONFIG_CORS)) {
+            Ok(c) => { stored = c; }
+            Err(_) => {}
+        }
+    }
+    return match (decodeCors(stored.view())) {
+        Ok(r) => Ok(r),
+        Err(_) => Ok(Vector<CorsRule>.create()),
+    };
+}
+
+/// Adds the CORS fields to the answer of a request with an `Origin` (ADR-0049 §2), whatever the answer turns out
+/// to be: the first rule that allows the origin and the method. The method is the one the request names in
+/// `Access-Control-Request-Method`, else its own.
+async fn corsAnswer(
+    app: borrow S3App,
+    req: borrow S3Request,
+    origin: Slice<u8>,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let rules = await corsRulesOf(app, req.bucket.view())?;
+    if (rules.length == 0) { return Ok(); }
+    let method = trimBlank(headerOf(req, "access-control-request-method") ?? req.methodText.view());
+    let bit = corsMethodBit(method);
+    if (bit == 0) { return Ok(); }
+    return match (corsRuleFor(rules.view(), origin, bit)) {
+        Some(i) => corsFields(exchange, borrow rules[i], origin, method),
+        null => Ok(),
+    };
+}
+
+/// A preflight (ADR-0049 §3): OPTIONS with an origin and the method to come, not signed. 200 with the rule's
+/// fields when a rule allows the origin, the method and the headers asked for; AccessForbidden when none does;
+/// InvalidRequest without the origin or the method.
+async fn preflight(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let origin = match (headerOf(req, "origin")) {
+        Some(o) => trimBlank(o),
+        null => { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    };
+    let method = match (headerOf(req, "access-control-request-method")) {
+        Some(m) => trimBlank(m),
+        null => { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    };
+    let bit = corsMethodBit(method);
+    if (bit == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    if (req.bucket.length == 0) { return Err(S3Fail.Code(S3Code.AccessForbidden)); }
+    let rules = await corsRulesOf(app, req.bucket.view())?;
+    let asked = headerOf(req, "access-control-request-headers") ?? "".bytes();
+    var found: usize? = null;
+    for (i in 0..rules.length) {
+        if (found.isSome()) { break; }
+        let r = borrow rules[i];
+        if ((r.methods & bit) != 0 && corsOrigin(r, origin).isSome() && corsAllowsHeaders(r, asked)) { found = i; }
+    }
+    let rule = match (found) {
+        Some(i) => borrow rules[i],
+        null => { return Err(S3Fail.Code(S3Code.AccessForbidden)); }
+    };
+    corsFields(exchange, rule, origin, method)?;
+    if (trimBlank(asked).length > 0) { exchange.header("access-control-allow-headers", trimBlank(asked))?; }
+    if (rule.maxAge >= 0) {
+        var age = Vector<u8>.create();
+        appendDecimal(mut age, truncate<u64>(rule.maxAge))?;
+        exchange.header("access-control-max-age", age.view())?;
+    }
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+// ---- The CORS calls ----
+
+/// The count of buckets with CORS rules, made again from the store (ADR-0049 §4), before the response.
+async fn recountCors(app: borrow S3App) -> Result<void, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    app.corsBuckets.store(store.corsBucketCount());
+    return Ok();
+}
+
+async fn getBucketCors(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let stored = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_CORS)?;
+    if (stored.length == 0) { return Err(S3Fail.Code(S3Code.NoSuchCORSConfiguration)); }
+    let rules = match (decodeCors(stored.view())) {
+        Ok(r) => r,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    var body = Vector<u8>.create();
+    corsXml(rules.view(), mut body)?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn putBucketCors(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 1048576)?;
+    verifySmallBody(req, xml.view(), true)?;
+    let rules = parseCors(xml.view())?;
+    var stored = Vector<u8>.create();
+    encodeCors(rules.view(), mut stored)?;
+    if (stored.length > MAX_CORS_BYTES) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_CORS, stored.view())?;
+    await recountCors(app)?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn deleteBucketCors(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_CORS, "".bytes())?;
+    await recountCors(app)?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}

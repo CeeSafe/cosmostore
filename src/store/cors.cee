@@ -1,0 +1,126 @@
+// A bucket's CORS rules (ADR-0049) as the store keeps them. The S3 layer reads and writes them as XML and applies
+// them to requests (`src/s3/cors.cee`).
+
+/// A bucket's CORS rules, in the compact form below; empty for none.
+const BUCKET_CONFIG_CORS: u8 = 9;
+const CORS_GET: u8 = 1;
+const CORS_PUT: u8 = 2;
+const CORS_POST: u8 = 4;
+const CORS_DELETE: u8 = 8;
+const CORS_HEAD: u8 = 16;
+/// S3's limit on the rules of one configuration.
+const MAX_CORS_RULES: usize = 100;
+const MAX_CORS_BYTES: usize = 65536;
+
+/// One rule: requests from an origin that matches one of `origins`, with a method of `methods`, are allowed; a
+/// preflight may ask for the headers that match `headers`. A pattern has at most one `*`.
+struct CorsRule {
+    id: Vector<u8>;
+    methods: u8;
+    origins: Vector<Vector<u8>>;
+    headers: Vector<Vector<u8>>;
+    expose: Vector<Vector<u8>>;
+    /// Seconds a browser may keep a preflight's answer; -1 for none.
+    maxAge: i64;
+}
+
+fn pushTexts16(out: borrow mut Vector<u8>, texts: Slice<Vector<u8>>) -> Result<void, AllocError> {
+    out.pushLE(truncate<u16>(texts.length))?;
+    for (i in 0..texts.length) { pushText16(out, texts[i].view())?; }
+    return Ok();
+}
+
+fn readTexts16(bytes: Slice<u8>, at: borrow mut usize) -> Result<Vector<Vector<u8>>, MetaFault> {
+    var out = Vector<Vector<u8>>.create();
+    need(bytes, at, 2)?;
+    let n = bytes.readLE<u16>(at) as usize;
+    at += 2;
+    for (i in 0..n) { out.push(readText16(bytes, at)?)?; }
+    return Ok(out);
+}
+
+/// CORS rules v1: u8 version, u16 count, then per rule u16+bytes id, u8 methods, i64 max age (-1: none), and three
+/// lists (origins, headers, exposed headers), each u16 count and u16+bytes texts.
+fn encodeCors(rules: Slice<CorsRule>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.pushLE(1u8)?;
+    out.pushLE(truncate<u16>(rules.length))?;
+    for (i in 0..rules.length) {
+        pushText16(out, rules[i].id.view())?;
+        out.pushLE(rules[i].methods)?;
+        out.pushLE(rules[i].maxAge)?;
+        pushTexts16(out, rules[i].origins.view())?;
+        pushTexts16(out, rules[i].headers.view())?;
+        pushTexts16(out, rules[i].expose.view())?;
+    }
+    return Ok();
+}
+
+/// Whether a pattern has at most one `*`.
+fn oneWildcard(pattern: Slice<u8>) -> bool {
+    var stars: usize = 0;
+    for (i in 0..pattern.length) {
+        if (pattern[i] == '*') { stars += 1; }
+    }
+    return stars <= 1;
+}
+
+fn decodeCors(blob: Slice<u8>) -> Result<Vector<CorsRule>, MetaFault> {
+    var rules = Vector<CorsRule>.create();
+    if (blob.length == 0) { return Ok(rules); }
+    var at: usize = 0;
+    need(blob, at, 3)?;
+    if (blob[0] != 1) { return Err(MetaFault.BadVersion); }
+    let count = blob.readLE<u16>(1) as usize;
+    at = 3;
+    if (count == 0 || count > MAX_CORS_RULES) { return Err(MetaFault.TooLong); }
+    for (i in 0..count) {
+        let id = readText16(blob, mut at)?;
+        need(blob, at, 1)?;
+        let methods = blob[at];
+        at += 1;
+        let maxAge = truncate<i64>(readU64(blob, mut at)?);
+        let origins = readTexts16(blob, mut at)?;
+        let headers = readTexts16(blob, mut at)?;
+        let expose = readTexts16(blob, mut at)?;
+        if (methods == 0 || methods > 31 || origins.length == 0 || maxAge < -1) { return Err(MetaFault.TooLong); }
+        for (j in 0..origins.length) {
+            if (!oneWildcard(origins[j].view())) { return Err(MetaFault.TooLong); }
+        }
+        for (j in 0..headers.length) {
+            if (!oneWildcard(headers[j].view())) { return Err(MetaFault.TooLong); }
+        }
+        rules.push(
+            CorsRule { id: id, methods: methods, origins: origins, headers: headers, expose: expose, maxAge: maxAge },
+        )?;
+    }
+    if (at != blob.length) { return Err(MetaFault.TooLong); }
+    return Ok(rules);
+}
+
+/// Whether `text` matches a pattern with at most one `*`; header names without regard to case.
+fn corsMatch(pattern: Slice<u8>, text: Slice<u8>, ignoreCase: bool) -> bool {
+    var star = pattern.length;
+    for (i in 0..pattern.length) {
+        if (pattern[i] == '*') { star = i; }
+    }
+    if (star == pattern.length) { return corsSame(pattern, text, ignoreCase); }
+    let head = pattern[0..star];
+    let tail = pattern[star + 1..];
+    if (text.length < head.length + tail.length) { return false; }
+    return corsSame(head, text[0..head.length], ignoreCase) &&
+        corsSame(tail, text[text.length - tail.length..], ignoreCase);
+}
+
+fn corsSame(a: Slice<u8>, b: Slice<u8>, ignoreCase: bool) -> bool {
+    if (a.length != b.length) { return false; }
+    for (i in 0..a.length) {
+        var x = a[i];
+        var y = b[i];
+        if (ignoreCase) {
+            if (x >= 'A' && x <= 'Z') { x += 32; }
+            if (y >= 'A' && y <= 'Z') { y += 32; }
+        }
+        if (x != y) { return false; }
+    }
+    return true;
+}

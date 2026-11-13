@@ -140,6 +140,8 @@ struct BucketInfo {
     objectLock: Vector<u8>;
     /// The notification rules as they are stored; empty for none (ADR-0048).
     notification: Vector<u8>;
+    /// The CORS rules as they are stored; empty for none (ADR-0049).
+    cors: Vector<u8>;
 }
 
 /// Space use of one segment, for compaction (ADR-0005). `liveBytes` counts the records that
@@ -786,6 +788,7 @@ fn applyRecord(
                 acl: Vector<u8>.create(),
                 objectLock: Vector<u8>.create(),
                 notification: Vector<u8>.create(),
+                cors: Vector<u8>.create(),
             };
             let _ = state.addBucket(name, info)?;
         }
@@ -821,6 +824,8 @@ fn applyRecord(
                         b.objectLock = value;
                     } else if (configKind == BUCKET_CONFIG_NOTIFICATION) {
                         b.notification = value;
+                    } else if (configKind == BUCKET_CONFIG_CORS) {
+                        b.cors = value;
                     } else {
                         b.versioning = value[0]; // one valid byte: `decodeBucketConfigMeta` checked it
                     }
@@ -2068,6 +2073,15 @@ struct ObjectStore {
         };
         if (this.mustCommitBefore(borrow rec, obj)) { return Ok(null); }
         return Ok(Some(this.stageEncoded(rec, obj)?));
+    }
+
+    /// How many buckets have CORS rules (ADR-0049 §4).
+    fn corsBucketCount(borrow this) -> u64 {
+        var n: u64 = 0;
+        for (i in 0..this.state.buckets.length()) {
+            if (this.state.buckets.valueAt(i).cors.length > 0) { n += 1; }
+        }
+        return n;
     }
 
     /// The oldest events still to be delivered, at most `most`, as copies (ADR-0048 §4).
@@ -3865,7 +3879,10 @@ struct ObjectStore {
             (value.length > MAX_NOTIFICATION_BYTES || decodeNotification(value).isErr())) {
             return Err(StoreError.InvalidKey);
         }
-        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_NOTIFICATION) { return Err(StoreError.InvalidKey); }
+        if (kind == BUCKET_CONFIG_CORS && (value.length > MAX_CORS_BYTES || decodeCors(value).isErr())) {
+            return Err(StoreError.InvalidKey);
+        }
+        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_CORS) { return Err(StoreError.InvalidKey); }
         // Object lock needs versioning enabled, keeps it so, and is never taken off a bucket (ADR-0047 §1).
         let locks = this.lockConfigOf(bucket.bytes())?.length > 0;
         if (kind == BUCKET_CONFIG_OBJECT_LOCK) {
@@ -3899,6 +3916,7 @@ struct ObjectStore {
                 if (kind == BUCKET_CONFIG_ACL) { return Ok(copyBytes(b.acl.view())?); }
                 if (kind == BUCKET_CONFIG_OBJECT_LOCK) { return Ok(copyBytes(b.objectLock.view())?); }
                 if (kind == BUCKET_CONFIG_NOTIFICATION) { return Ok(copyBytes(b.notification.view())?); }
+                if (kind == BUCKET_CONFIG_CORS) { return Ok(copyBytes(b.cors.view())?); }
                 Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?)
             }
             null => Err(StoreError.NoSuchBucket),

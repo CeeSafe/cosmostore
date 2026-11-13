@@ -484,6 +484,10 @@ check "a public object under it" "$(code s3api put-object --bucket acl --key e.t
 aws s3api put-object-acl --bucket acl --key b.txt --acl private > /dev/null 2>&1 && pass "a private ACL under it" || fail "a private ACL under it"
 check "anonymous read after private" "$(anon "$AWS_ENDPOINT_URL/acl/b.txt")" 403
 aws s3api delete-public-access-block --bucket acl > /dev/null 2>&1
+aws s3api put-bucket-acl --bucket acl --acl public-read > /dev/null 2>&1
+check "a missing key, for a requester who may list" "$(anon "$AWS_ENDPOINT_URL/acl/missing.txt")" 404
+aws s3api put-bucket-acl --bucket acl --acl private > /dev/null 2>&1
+check "a missing key, for one who may not" "$(anon "$AWS_ENDPOINT_URL/acl/missing.txt")" 403
 aws s3api put-bucket-acl --bucket acl --access-control-policy "{\"Owner\": {\"ID\": \"cosmostore\"}, \"Grants\": [{\"Grantee\": {\"Type\": \"CanonicalUser\", \"ID\": \"cosmostore\"}, \"Permission\": \"FULL_CONTROL\"}, {\"Grantee\": {\"Type\": \"Group\", \"URI\": \"$everyone\"}, \"Permission\": \"READ_ACP\"}]}" > /dev/null 2>&1 || fail "put-bucket-acl with a document"
 check "the document's grants" "$(grants aws s3api get-bucket-acl --bucket acl)" "cosmostore None FULL_CONTROL;None $everyone READ_ACP;"
 check "anonymous ACL read by READ_ACP" "$(anon "$AWS_ENDPOINT_URL/acl?acl")" 200
@@ -541,6 +545,35 @@ check "SSE-S3 asked for" "$(code s3api put-object --bucket smoke --key sse.txt -
 check "SSE-C asked for" "$(code s3api put-object --bucket smoke --key sse.txt --body pub.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901)" NotImplemented
 check "a read with a key" "$(code s3api get-object --bucket smoke --key sse.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901 got.txt)" NotImplemented
 check "nothing stored" "$(aws s3api list-objects-v2 --bucket smoke --prefix sse.txt --query 'Contents[].Key' --output text)" None
+
+# CORS (ADR-0049): the rules, a browser's preflight, and the fields on answers to requests that name an origin.
+cors() { curl -s -o /dev/null -D cors.out "$@"; printf '%s %s %s' "$(sed -n '1s/^HTTP[^ ]* \([0-9]*\).*/\1/p' cors.out)" "$(sed -n 's/^[Aa]ccess-[Cc]ontrol-[Aa]llow-[Oo]rigin: *//p' cors.out | tr -d '\r')" "$(sed -n 's/^[Aa]ccess-[Cc]ontrol-[Aa]llow-[Mm]ethods: *//p' cors.out | tr -d '\r')"; }
+corsfield() { sed -n "s/^$1: *//Ip" cors.out | tr -d '\r'; }
+aws s3api create-bucket --bucket cors --acl public-read > /dev/null 2>&1
+aws s3api put-object --bucket cors --key a.txt --body pub.txt --acl public-read > /dev/null 2>&1
+check "no CORS rules" "$(code s3api get-bucket-cors --bucket cors)" NoSuchCORSConfiguration
+check "a preflight without rules" "$(cors -X OPTIONS -H 'Origin: https://app.example' -H 'Access-Control-Request-Method: GET' "$AWS_ENDPOINT_URL/cors/a.txt")" "403  "
+aws s3api put-bucket-cors --bucket cors --cors-configuration '{"CORSRules":[{"ID":"site","AllowedOrigins":["https://*.example"],"AllowedMethods":["GET","HEAD"],"AllowedHeaders":["x-amz-*","content-type"],"ExposeHeaders":["ETag","x-amz-version-id"],"MaxAgeSeconds":600},{"AllowedOrigins":["*"],"AllowedMethods":["PUT"]}]}' > /dev/null 2>&1 || fail "put-bucket-cors"
+check "get-bucket-cors" "$(aws s3api get-bucket-cors --bucket cors --query 'CORSRules[0].[ID,AllowedOrigins[0],length(AllowedMethods),AllowedHeaders[0],ExposeHeaders[1],MaxAgeSeconds]' --output text | tr '\t' ' ')" "site https://*.example 2 x-amz-* x-amz-version-id 600"
+check "a preflight a rule allows" "$(cors -X OPTIONS -H 'Origin: https://app.example' -H 'Access-Control-Request-Method: GET' -H 'Access-Control-Request-Headers: X-Amz-Date, Content-Type' "$AWS_ENDPOINT_URL/cors/a.txt")" "200 https://app.example GET"
+check "its other fields" "$(corsfield access-control-allow-headers)|$(corsfield access-control-max-age)|$(corsfield access-control-expose-headers)|$(corsfield access-control-allow-credentials)" "X-Amz-Date, Content-Type|600|ETag, x-amz-version-id|true"
+check "a preflight for a header it does not allow" "$(cors -X OPTIONS -H 'Origin: https://app.example' -H 'Access-Control-Request-Method: GET' -H 'Access-Control-Request-Headers: authorization' "$AWS_ENDPOINT_URL/cors/a.txt")" "403  "
+check "a preflight from another origin" "$(cors -X OPTIONS -H 'Origin: https://app.other' -H 'Access-Control-Request-Method: GET' "$AWS_ENDPOINT_URL/cors/a.txt")" "403  "
+check "a preflight by the rule for any origin" "$(cors -X OPTIONS -H 'Origin: https://app.other' -H 'Access-Control-Request-Method: PUT' "$AWS_ENDPOINT_URL/cors/a.txt")" "200 * PUT"
+check "a preflight for a method no rule has" "$(cors -X OPTIONS -H 'Origin: https://app.example' -H 'Access-Control-Request-Method: DELETE' "$AWS_ENDPOINT_URL/cors/a.txt")" "403  "
+check "a preflight without an origin" "$(cors -X OPTIONS -H 'Access-Control-Request-Method: GET' "$AWS_ENDPOINT_URL/cors/a.txt")" "400  "
+check "a preflight without a method" "$(cors -X OPTIONS -H 'Origin: https://app.example' "$AWS_ENDPOINT_URL/cors/a.txt")" "400  "
+check "a read that names its origin" "$(cors -H 'Origin: https://app.example' "$AWS_ENDPOINT_URL/cors/a.txt")" "200 https://app.example GET"
+check "what a script may read of it" "$(corsfield access-control-expose-headers)" "ETag, x-amz-version-id"
+check "a read from another origin" "$(cors -H 'Origin: https://app.other' "$AWS_ENDPOINT_URL/cors/a.txt")" "200  "
+check "a read without an origin" "$(cors "$AWS_ENDPOINT_URL/cors/a.txt")" "200  "
+check "an error that names its origin" "$(cors -H 'Origin: https://app.example' "$AWS_ENDPOINT_URL/cors/missing.txt")" "404 https://app.example GET"
+check "a method the CLI's S3 has no CORS for" "$(code s3api put-bucket-cors --bucket cors --cors-configuration '{"CORSRules":[{"AllowedOrigins":["*"],"AllowedMethods":["PATCH"]}]}')" InvalidRequest
+aws s3api delete-bucket-cors --bucket cors > /dev/null 2>&1 || fail "delete-bucket-cors"
+check "no CORS rules again" "$(code s3api get-bucket-cors --bucket cors)" NoSuchCORSConfiguration
+check "a read after the rules are gone" "$(cors -H 'Origin: https://app.example' "$AWS_ENDPOINT_URL/cors/a.txt")" "200  "
+aws s3 rm --recursive s3://cors/ > /dev/null 2>&1
+aws s3api delete-bucket --bucket cors > /dev/null 2>&1 && pass "delete-bucket after CORS" || fail "delete-bucket after CORS"
 
 # Event notifications (ADR-0048): the rules, events at a webhook, and none lost while it is down or over a kill.
 events() { wc -l < hook.out | tr -d ' '; }

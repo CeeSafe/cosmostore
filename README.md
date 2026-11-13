@@ -6,10 +6,10 @@ giving up large-object throughput or crash correctness.
 
 **Status: a single-node alpha.** `cosmostore serve` speaks the S3 API over HTTP/1.1 and TLS, on a crash-tested
 storage engine (journal, large-object extents, checkpoints, compaction, the space reserve and `fsck`). The AWS CLI,
-rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 364 Ceph s3-tests pass against it
+rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 377 Ceph s3-tests pass against it
 ([compatibility](docs/compatibility.md)). Milestones M0 to M4 of the [roadmap](ROADMAP.md) are done; M5, production
 features, is under way: S3 versioning (ADR-0041), bucket policies (ADR-0043), the public-access block (ADR-0044)
-ACLs (ADR-0045), Object Lock (ADR-0047) and event notifications to webhooks (ADR-0048) are in. There is no
+ACLs (ADR-0045), Object Lock (ADR-0047), event notifications to webhooks (ADR-0048) and CORS (ADR-0049) are in. There is no
 replication or clustering yet.
 
 CosmoStore's own code is pure CeeSafe, with no C and no `unsafe` blocks. The one C below it is OpenSSL 3, for TLS,
@@ -340,7 +340,7 @@ an outbox that is the journal itself (ADR-0048). Encryption is designed and wait
 
 **Known limits:**
 - a single node: no replication or erasure coding yet;
-- no CORS or MFA delete, and no SigV2 or session tokens;
+- no MFA delete, and no SigV2 or session tokens;
 - event notifications go to HTTP webhooks only, in order, so one webhook that is down holds the others' events;
 - no server-side encryption yet: it is designed (ADR-0046) and waits for AES-256-GCM in CeeSafe's lib/std; a request
   that asks for it is refused with NotImplemented;

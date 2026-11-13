@@ -408,6 +408,21 @@ s3.put_bucket_notification_configuration(Bucket=N, NotificationConfiguration={})
 check("rules taken off where there were none", s3.get_bucket_notification_configuration(Bucket=N).get("QueueConfigurations"), None)
 s3.delete_bucket(Bucket=N)
 
+# CORS (ADR-0049): the rules; tools/s3_smoke.sh sends the preflights.
+C = "boto3-cors"
+s3.create_bucket(Bucket=C)
+check("no CORS rules", code_of(lambda: s3.get_bucket_cors(Bucket=C)), "NoSuchCORSConfiguration")
+cors_rules = [{"ID": "site", "AllowedOrigins": ["https://*.example", "http://localhost:3000"], "AllowedMethods": ["GET", "PUT"],
+               "AllowedHeaders": ["*"], "ExposeHeaders": ["ETag"], "MaxAgeSeconds": 300},
+              {"AllowedOrigins": ["*"], "AllowedMethods": ["HEAD"]}]
+s3.put_bucket_cors(Bucket=C, CORSConfiguration={"CORSRules": cors_rules})
+check("get_bucket_cors", s3.get_bucket_cors(Bucket=C)["CORSRules"], cors_rules)
+check("a pattern with two wildcards", code_of(lambda: s3.put_bucket_cors(Bucket=C, CORSConfiguration={"CORSRules": [
+    {"AllowedOrigins": ["https://*.a.*"], "AllowedMethods": ["GET"]}]})), "InvalidRequest")
+s3.delete_bucket_cors(Bucket=C)
+check("the CORS rules deleted", code_of(lambda: s3.get_bucket_cors(Bucket=C)), "NoSuchCORSConfiguration")
+s3.delete_bucket(Bucket=C)
+
 check("wrong secret", code_of(lambda: boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
                                                        aws_secret_access_key="wrong").list_buckets()),
       "SignatureDoesNotMatch")

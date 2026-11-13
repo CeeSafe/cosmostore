@@ -1,0 +1,155 @@
+// CORS (ADR-0049): the document, the stored rules, and which rule a request meets.
+import web_core;
+import web_http;
+import web_server;
+
+fn corsRulesOfXml(xml: StringView) -> Result<Vector<CorsRule>, TestFailure> => match (parseCors(xml.bytes())) {
+    Ok(r) => Ok(r),
+    Err(_) => Err(TestFailure.create("the CORS document parses")),
+};
+
+fn corsRefusal(xml: StringView) -> StringView => match (parseCors(xml.bytes())) {
+    Ok(_) => "ok",
+    Err(S3Fail.Code(code)) => s3CodeName(code),
+    Err(_) => "failed",
+};
+
+@test
+fn corsDocumentAndStoredRules() -> Result<void, TestFailure> {
+    let given =
+        """
+        <CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <CORSRule>
+            <ID>site</ID>
+            <AllowedOrigin>https://*.example.com</AllowedOrigin>
+            <AllowedOrigin>http://localhost:3000</AllowedOrigin>
+            <AllowedMethod>GET</AllowedMethod>
+            <AllowedMethod>HEAD</AllowedMethod>
+            <AllowedHeader>x-amz-*</AllowedHeader>
+            <AllowedHeader>Content-Type</AllowedHeader>
+            <ExposeHeader>ETag</ExposeHeader>
+            <ExposeHeader>x-amz-version-id</ExposeHeader>
+            <MaxAgeSeconds>600</MaxAgeSeconds>
+          </CORSRule>
+          <CORSRule>
+            <AllowedOrigin>*</AllowedOrigin>
+            <AllowedMethod> PUT </AllowedMethod>
+          </CORSRule>
+        </CORSConfiguration>
+        """;
+    let rules = corsRulesOfXml(given)?;
+    Check.equalU64(2, rules.length as u64)?;
+    Check.equalBytes("site".bytes(), rules[0].id.view())?;
+    Check.isTrue(rules[0].methods == (CORS_GET | CORS_HEAD) && rules[1].methods == CORS_PUT, "the methods")?;
+    Check.isTrue(rules[0].maxAge == 600 && rules[1].maxAge == -1, "the ages")?;
+    Check.equalBytes("http://localhost:3000".bytes(), rules[0].origins[1].view())?;
+    Check.equalBytes("x-amz-*".bytes(), rules[0].headers[0].view())?;
+    Check.equalBytes("x-amz-version-id".bytes(), rules[0].expose[1].view())?;
+    // Stored and read back; what Get writes, Put reads.
+    var blob = Vector<u8>.create();
+    encodeCors(rules.view(), mut blob)!;
+    let back = match (decodeCors(blob.view())) {
+        Ok(b) => b,
+        Err(_) => { return Check.fail("the rules read back"); }
+    };
+    var xml = Vector<u8>.create();
+    corsXml(back.view(), mut xml)!;
+    let again = match (parseCors(xml.view())) {
+        Ok(a) => a,
+        Err(_) => { return Check.fail("the written document parses"); }
+    };
+    var second = Vector<u8>.create();
+    encodeCors(again.view(), mut second)!;
+    Check.equalBytes(blob.view(), second.view())?;
+    for (cut in 1..blob.length) { Check.isTrue(decodeCors(blob.view()[0..cut]).isErr(), "rules cut short")?; }
+    Check.isTrue(decodeCors("".bytes()).isOk(), "no rules")?;
+    // Refused.
+    Check.equalBytes("MalformedXML".bytes(), corsRefusal("<Other/>").bytes())?;
+    Check.equalBytes("MalformedXML".bytes(), corsRefusal("<CORSConfiguration></CORSConfiguration>").bytes())?;
+    let head = "<CORSConfiguration><CORSRule>";
+    let tail = "</CORSRule></CORSConfiguration>";
+    let bodies = [
+        "<AllowedMethod>GET</AllowedMethod>",
+        "<AllowedOrigin>*</AllowedOrigin>",
+        "<AllowedOrigin>*</AllowedOrigin><AllowedMethod>PATCH</AllowedMethod>",
+        "<AllowedOrigin>*</AllowedOrigin><AllowedMethod>get</AllowedMethod>",
+        "<AllowedOrigin>http://*.a.*</AllowedOrigin><AllowedMethod>GET</AllowedMethod>",
+        "<AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod><AllowedHeader>*-x-*</AllowedHeader>",
+        "<AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod><MaxAgeSeconds>soon</MaxAgeSeconds>",
+        "<AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET",
+    ];
+    let answers = [
+        "MalformedXML", "MalformedXML", "InvalidRequest", "InvalidRequest", "InvalidRequest",
+        "InvalidRequest", "MalformedXML", "MalformedXML",
+    ];
+    for (i in 0..bodies.length) {
+        var doc = Vector<u8>.create();
+        doc.extend(head.bytes())!;
+        doc.extend(bodies[i].bytes())!;
+        doc.extend(tail.bytes())!;
+        let text = match (StringView.fromUtf8(doc.view())) {
+            Some(t) => t,
+            null => { return Check.fail("the document is text"); }
+        };
+        Check.equalBytes(answers[i].bytes(), corsRefusal(text).bytes())?;
+    }
+    // At most 100 rules.
+    var many = Vector<u8>.create();
+    many.extend("<CORSConfiguration>".bytes())!;
+    for (i in 0..101) {
+        many.extend("<CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule>".bytes())!;
+    }
+    many.extend("</CORSConfiguration>".bytes())!;
+    match (parseCors(many.view())) {
+        Err(S3Fail.Code(S3Code.InvalidRequest)) => {}
+        _ => { return Check.fail("101 rules"); }
+    }
+    return Ok();
+}
+
+@test
+fn corsRulesMeetRequests() -> Result<void, TestFailure> {
+    // Patterns: one `*`, anywhere; origins as they are, header names without regard to case.
+    Check.isTrue(corsMatch("*".bytes(), "anything".bytes(), false), "every origin")?;
+    Check.isTrue(corsMatch("*suffix".bytes(), "foo.suffix".bytes(), false), "a suffix")?;
+    Check.isTrue(!corsMatch("*suffix".bytes(), "foo.suffix.get".bytes(), false), "not past the end")?;
+    Check.isTrue(corsMatch("start*end".bytes(), "startend".bytes(), false), "nothing for the star")?;
+    Check.isTrue(corsMatch("start*end".bytes(), "start12end".bytes(), false), "the middle")?;
+    Check.isTrue(!corsMatch("start*end".bytes(), "0start12end".bytes(), false), "not before the start")?;
+    Check.isTrue(!corsMatch("start*end".bytes(), "starend".bytes(), false), "the two ends do not overlap")?;
+    Check.isTrue(corsMatch("prefix*".bytes(), "prefix".bytes(), false), "a prefix alone")?;
+    Check.isTrue(!corsMatch("prefix*".bytes(), "bla.prefix".bytes(), false), "not in the middle")?;
+    Check.isTrue(!corsMatch("https://a.example".bytes(), "https://A.example".bytes(), false), "an origin's case")?;
+    Check.isTrue(corsMatch("Content-*".bytes(), "content-type".bytes(), true), "a header's case")?;
+    Check.isTrue(corsMatch("x-amz-date".bytes(), "X-Amz-Date".bytes(), true), "a header, exactly")?;
+
+    let rules = corsRulesOfXml(
+        """
+        <CORSConfiguration>
+          <CORSRule><AllowedOrigin>*suffix</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule>
+          <CORSRule><AllowedOrigin>*.put</AllowedOrigin><AllowedMethod>PUT</AllowedMethod>
+            <AllowedHeader>x-amz-*</AllowedHeader><AllowedHeader>content-type</AllowedHeader></CORSRule>
+          <CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>DELETE</AllowedMethod></CORSRule>
+        </CORSConfiguration>
+        """,
+    )?;
+    // The first rule that allows the origin and the method.
+    Check.equalU64(0, (corsRuleFor(rules.view(), "foo.suffix".bytes(), CORS_GET) ?? 9) as u64)?;
+    Check.isTrue(corsRuleFor(rules.view(), "foo.suffix".bytes(), CORS_PUT).isNull(), "the method of another rule")?;
+    Check.equalU64(1, (corsRuleFor(rules.view(), "foo.put".bytes(), CORS_PUT) ?? 9) as u64)?;
+    Check.isTrue(corsRuleFor(rules.view(), "foo.bar".bytes(), CORS_GET).isNull(), "an origin no rule has")?;
+    Check.equalU64(2, (corsRuleFor(rules.view(), "foo.bar".bytes(), CORS_DELETE) ?? 9) as u64)?;
+    Check.isTrue(corsRuleFor(rules.view(), "foo.bar".bytes(), CORS_HEAD).isNull(), "a method no rule has")?;
+    // A preflight's headers: each must be one of the rule's.
+    Check.isTrue(corsAllowsHeaders(borrow rules[1], "X-Amz-Date, Content-Type".bytes()), "both allowed")?;
+    Check.isTrue(corsAllowsHeaders(borrow rules[1], "".bytes()), "none asked for")?;
+    Check.isTrue(corsAllowsHeaders(borrow rules[1], " x-amz-meta-a ,, ".bytes()), "spaces and empty pieces")?;
+    Check.isTrue(!corsAllowsHeaders(borrow rules[1], "x-amz-date, authorization".bytes()), "one that is not")?;
+    Check.isTrue(!corsAllowsHeaders(borrow rules[0], "content-type".bytes()), "a rule that allows none")?;
+    let methods = ["GET", "PUT", "POST", "DELETE", "HEAD"];
+    let bits = [CORS_GET, CORS_PUT, CORS_POST, CORS_DELETE, CORS_HEAD];
+    for (i in 0..methods.length) { Check.equalU64(bits[i] as u64, corsMethodBit(methods[i].bytes()) as u64)?; }
+    Check.equalU64(0, corsMethodBit("OPTIONS".bytes()) as u64)?;
+    Check.equalU64(0, corsMethodBit("get".bytes()) as u64)?;
+    return Ok();
+}

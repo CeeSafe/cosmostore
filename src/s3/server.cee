@@ -55,6 +55,8 @@ struct S3App {
     denyBuckets: AtomicU64;
     /// Whether the server listens with TLS: `aws:SecureTransport` (ADR-0043 §6).
     secure: bool;
+    /// Buckets with CORS rules (ADR-0049 §4): while 0, a request's `Origin` is not looked at.
+    corsBuckets: AtomicU64;
     /// The webhooks notification rules may name (`serve --notify-targets`, ADR-0048).
     notifyTargets: Vector<NotifyTarget>;
 }
@@ -217,6 +219,15 @@ async fn serveS3(
 ) -> Result<void, S3Fail> {
     let req = S3Request.of(request, app.domain.view())?;
     kind = latencyClass(borrow req);
+    // CORS (ADR-0049): a preflight is answered here, unsigned; a request that names its origin gets a matching
+    // rule's fields on whatever its answer is.
+    if (isMethod(req.method, Method.Options)) { return await preflight(app, borrow req, exchange); }
+    if (app.corsBuckets.load() > 0 && req.bucket.length > 0) {
+        match (headerOf(borrow req, "origin")) {
+            Some(origin) => { await corsAnswer(app, borrow req, trimBlank(origin), exchange)?; }
+            null => {}
+        }
+    }
     // A browser form upload is authenticated by its form's policy signature, not its headers (ADR-0018).
     if (isPostObject(borrow req)) { return await postObject(app, borrow req, exchange, peer); }
     let now = Clock.unixMillis() / 1000;
@@ -262,6 +273,23 @@ async fn serveS3(
             if (isMethod(m, Method.Delete)) {
                 await authorize(app, borrow req, borrow who, "s3:DeleteBucketPolicy", bucket, none)?;
                 return await deleteBucketPolicy(app, borrow req, exchange);
+            }
+            return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+        }
+        // A bucket's CORS rules (ADR-0049).
+        if (req.hasParam("cors")) {
+            if (!req.onlyParams("cors")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            if (isMethod(m, Method.Get)) {
+                await authorize(app, borrow req, borrow who, "s3:GetBucketCORS", bucket, none)?;
+                return await getBucketCors(app, borrow req, exchange);
+            }
+            if (isMethod(m, Method.Put)) {
+                await authorize(app, borrow req, borrow who, "s3:PutBucketCORS", bucket, none)?;
+                return await putBucketCors(app, borrow req, auth, exchange);
+            }
+            if (isMethod(m, Method.Delete)) {
+                await authorize(app, borrow req, borrow who, "s3:PutBucketCORS", bucket, none)?;
+                return await deleteBucketCors(app, borrow req, exchange);
             }
             return Err(S3Fail.Code(S3Code.MethodNotAllowed));
         }
@@ -695,6 +723,7 @@ async fn deleteBucket(app: borrow S3App, req: borrow S3Request, exchange: borrow
     }
     // Its policy, if it had one, no longer counts (ADR-0043 §8).
     if (app.policyBuckets.load() > 0) { await recountPolicies(app)?; }
+    if (app.corsBuckets.load() > 0) { await recountCors(app)?; }
     await exchange.send(Status.noContent(), "".bytes())?;
     return Ok();
 }
