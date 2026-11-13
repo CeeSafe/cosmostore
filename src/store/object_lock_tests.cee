@@ -1,0 +1,272 @@
+// Object lock in the store (ADR-0047): the bucket's configuration, the default retention a new version gets, what a
+// locked version refuses, and how its retention may change.
+
+fn lockOfVersion(s: borrow ObjectStore, key: StringView, id: [u8; 16]) -> ObjectLock =>
+    lockOfMetadata(s.headObjectOf("bkt", key, Some(id))!.metadata.view());
+
+fn lockTarget(key: StringView, id: [u8; 16], bypass: bool) -> Vector<DeleteTarget> {
+    var targets = Vector<DeleteTarget>.create();
+    targets.push(DeleteTarget { key: copyBytes(key.bytes())!, versionId: Some(id), bypassGovernance: bypass })!;
+    return targets;
+}
+
+/// Whether a delete of the version by the batch path was refused as locked.
+fn refusedAsLocked(s: borrow mut ObjectStore, key: StringView, id: [u8; 16], bypass: bool) -> bool {
+    let targets = lockTarget(key, id, bypass);
+    return s.deleteMany("bkt", targets.view())![0].locked;
+}
+
+fn isThere(s: borrow ObjectStore, key: StringView, id: [u8; 16]) -> bool => s.headObjectOf("bkt", key, Some(id)).isOk();
+
+@test
+fn objectLockConfigurationOfABucket() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("object-lock-config");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        s.createBucket("plain")!;
+        // Object lock needs versioning enabled.
+        match (s.setBucketConfig("bkt", BUCKET_CONFIG_OBJECT_LOCK, "E".bytes())) {
+            Err(StoreError.InvalidBucketState) => {}
+            _ => { return Check.fail("object lock without versioning"); }
+        }
+        setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+        let refused = [
+            "",
+            "X",
+            "E.",
+            "E.G",
+            "E.G.d",
+            "E.G.d0",
+            "E.X.d1",
+            "E.G.w1",
+            "E.G.d36501",
+            "E.C.y101",
+            "E.G.d1x",
+        ];
+        for (r in refused) {
+            match (s.setBucketConfig("bkt", BUCKET_CONFIG_OBJECT_LOCK, r.bytes())) {
+                Err(StoreError.InvalidKey) => {}
+                _ => { return Check.fail("a configuration that is not one"); }
+            }
+        }
+        s.setBucketConfig("bkt", BUCKET_CONFIG_OBJECT_LOCK, "E".bytes())!;
+        s.setBucketConfig("bkt", BUCKET_CONFIG_OBJECT_LOCK, "E.C.y2".bytes())!;
+        s.setBucketConfig("bkt", BUCKET_CONFIG_OBJECT_LOCK, "E.G.d30".bytes())!;
+        // It keeps versioning enabled, and is never taken off.
+        let suspended = [VERSIONING_SUSPENDED];
+        match (s.setBucketConfig("bkt", BUCKET_CONFIG_VERSIONING, suspended[..])) {
+            Err(StoreError.InvalidBucketState) => {}
+            _ => { return Check.fail("versioning suspended under object lock"); }
+        }
+        match (s.setBucketConfig("bkt", BUCKET_CONFIG_OBJECT_LOCK, "".bytes())) {
+            Err(StoreError.InvalidBucketState) => {}
+            _ => { return Check.fail("object lock taken off"); }
+        }
+        // A bucket without it: no version of it can be locked.
+        putText(mut s, "plain", "k", "x");
+        match (s.setLockOf("plain", "k", null, null, true, false)) {
+            Err(StoreError.ObjectLockOff) => {}
+            _ => { return Check.fail("a legal hold in a bucket without object lock"); }
+        }
+        var meta = Vector<u8>.create();
+        metadataAdd(mut meta, LOCK_FIELD.bytes(), "G0.9999999999999".bytes())!;
+        var w = s.newWriter()!;
+        w.write("locked?".bytes())!;
+        let obj = w.finish()!;
+        match (s.putFinishedWith("plain", "locked", "", meta.view(), "".bytes(), borrow obj, PutCondition.None)) {
+            Err(StoreError.ObjectLockOff) => {}
+            _ => { return Check.fail("a locked object in a bucket without object lock"); }
+        }
+    }
+    // Through recovery from the journal, then from a format 10 checkpoint.
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.equalBytes("E.G.d30".bytes(), s.bucketConfig("bkt", BUCKET_CONFIG_OBJECT_LOCK)!.view())?;
+        Check.equalU64(0, s.bucketConfig("plain", BUCKET_CONFIG_OBJECT_LOCK)!.length as u64)?;
+        if (round == 0) { let _ = s.checkpoint()!; }
+    }
+    let d = decodeLockConfig("E.C.y2".bytes()) ?? LockDefault { mode: LOCK_NONE, days: 0, years: 0 };
+    Check.isTrue(d.mode == LOCK_COMPLIANCE && d.years == 2 && d.days == 0, "two years of compliance")?;
+    Check.equalI64(1000 + 730 * DAY_MILLIS, lockDefaultUntil(d, 1000))?;
+    var back = Vector<u8>.create();
+    encodeLockConfig(d, mut back)!;
+    Check.equalBytes("E.C.y2".bytes(), back.view())?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn lockedVersionsStay() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("object-lock");
+    var a = [0u8; 16];
+    var b = [0u8; 16];
+    var c = [0u8; 16];
+    let hour: i64 = 3600000;
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+        s.setBucketConfig("bkt", BUCKET_CONFIG_OBJECT_LOCK, "E.G.d1".bytes())!;
+        let now = Clock.unixMillis();
+        // A new version gets the bucket's default retention, from now.
+        a = putVersion(mut s, "bkt", "a", "one").versionId;
+        let given = lockOfVersion(borrow s, "a", a);
+        Check.isTrue(given.mode == LOCK_GOVERNANCE && !given.hold, "the default mode")?;
+        Check.isTrue(given.until >= now + DAY_MILLIS && given.until < now + DAY_MILLIS + 60000, "a day from now")?;
+        // It stays: by the batch path, by the single one; a delete without an id writes a marker over it.
+        Check.isTrue(refusedAsLocked(mut s, "a", a, false), "a locked version, by deleteMany")?;
+        match (s.deleteVersion("bkt", "a", a)) {
+            Err(StoreError.ObjectLocked) => {}
+            _ => { return Check.fail("a locked version, by deleteVersion"); }
+        }
+        Check.isTrue(s.deleteDeferred("bkt", "a", Some(a), false)!.locked, "a locked version, by deleteDeferred")?;
+        s.deleteObject("bkt", "a")!;
+        Check.isTrue(isThere(borrow s, "a", a), "the version under the marker")?;
+        // Governance retention gives way to a bypass.
+        Check.isTrue(!refusedAsLocked(mut s, "a", a, true), "governance, bypassed")?;
+        Check.isTrue(!isThere(borrow s, "a", a), "the version is gone")?;
+
+        // A retention changes only as its own allows.
+        b = putVersion(mut s, "bkt", "b", "one").versionId;
+        let shorter = ObjectLock { mode: LOCK_GOVERNANCE, until: now + hour, hold: false };
+        match (s.setLockOf("bkt", "b", Some(b), Some(shorter), null, false)) {
+            Err(StoreError.ObjectLocked) => {}
+            _ => { return Check.fail("governance shortened without a bypass"); }
+        }
+        s.setLockOf("bkt", "b", Some(b), Some(shorter), null, true)!;
+        Check.equalI64(now + hour, lockOfVersion(borrow s, "b", b).until)?;
+        let compliance = ObjectLock { mode: LOCK_COMPLIANCE, until: now + 2 * hour, hold: false };
+        match (s.setLockOf("bkt", "b", Some(b), Some(compliance), null, false)) {
+            Err(StoreError.ObjectLocked) => {}
+            _ => { return Check.fail("governance made compliance without a bypass"); }
+        }
+        s.setLockOf("bkt", "b", Some(b), Some(compliance), null, true)!;
+        let less = ObjectLock { mode: LOCK_COMPLIANCE, until: now + hour, hold: false };
+        let softer = ObjectLock { mode: LOCK_GOVERNANCE, until: now + 3 * hour, hold: false };
+        let changes = [less, softer, noLock()];
+        for (change in changes) {
+            match (s.setLockOf("bkt", "b", Some(b), Some(change), null, true)) {
+                Err(StoreError.ObjectLocked) => {}
+                _ => { return Check.fail("compliance shortened, softened or taken off"); }
+            }
+        }
+        let longer = ObjectLock { mode: LOCK_COMPLIANCE, until: now + 3 * hour, hold: false };
+        s.setLockOf("bkt", "b", Some(b), Some(longer), null, false)!;
+        Check.isTrue(refusedAsLocked(mut s, "b", b, true), "compliance, whatever the bypass")?;
+
+        // A legal hold: on, off, and no bypass.
+        c = putVersion(mut s, "bkt", "c", "one").versionId;
+        s.setLockOf("bkt", "c", Some(c), Some(noLock()), null, true)!; // the default retention taken off
+        Check.isTrue(lockOfVersion(borrow s, "c", c).mode == LOCK_NONE, "no retention")?;
+        s.setLockOf("bkt", "c", null, null, true, false)!; // the current version, by no id
+        Check.isTrue(lockOfVersion(borrow s, "c", c).hold, "the hold")?;
+        Check.isTrue(refusedAsLocked(mut s, "c", c, true), "a legal hold, whatever the bypass")?;
+        let generation = s.headObject("bkt", "c")!.generation;
+        s.setTags("bkt", "c", "k=v".bytes())!; // other fields change beside the lock
+        Check.isTrue(lockOfVersion(borrow s, "c", c).hold, "the hold beside new tags")?;
+        Check.equalU64(generation, s.headObject("bkt", "c")!.generation)?;
+        match (s.setLockOf("bkt", "missing", null, null, true, false)) {
+            Err(StoreError.NoSuchKey) => {}
+            _ => { return Check.fail("a hold on a missing key"); }
+        }
+    }
+    // The locks through recovery from the journal, then from a checkpoint.
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        let kept = lockOfVersion(borrow s, "b", b);
+        Check.isTrue(kept.mode == LOCK_COMPLIANCE && !kept.hold, "compliance after recovery")?;
+        Check.isTrue(lockOfVersion(borrow s, "c", c).hold, "the hold after recovery")?;
+        Check.isTrue(refusedAsLocked(mut s, "b", b, true), "still locked")?;
+        Check.isTrue(refusedAsLocked(mut s, "c", c, true), "still held")?;
+        if (round == 0) { let _ = s.checkpoint()!; }
+    }
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.setLockOf("bkt", "c", Some(c), null, false, false)!;
+    Check.isTrue(!refusedAsLocked(mut s, "c", c, false), "the hold taken off")?;
+    Check.isTrue(!isThere(borrow s, "c", c), "the version is gone")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// Lifecycle rules leave a locked noncurrent version until its retention ends (ADR-0047 §4).
+@test
+fn lifecycleLeavesLockedVersions() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("object-lock-lifecycle");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("bkt")!;
+    setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+    s.setBucketConfig("bkt", BUCKET_CONFIG_OBJECT_LOCK, "E".bytes())!;
+    let now = Clock.unixMillis();
+    let locked = putVersion(mut s, "bkt", "k", "one").versionId;
+    let free = putVersion(mut s, "bkt", "k", "two").versionId;
+    let _ = putVersion(mut s, "bkt", "k", "three");
+    let tenDays = ObjectLock { mode: LOCK_COMPLIANCE, until: now + 10 * DAY_MILLIS, hold: false };
+    s.setLockOf("bkt", "k", Some(locked), Some(tenDays), null, false)!;
+    var rules = Vector<LifecycleRule>.create();
+    rules.push(noncurrentRule("old", "k", 1, 0))!;
+    setRules(mut s, borrow rules);
+    let first = s.applyLifecycle(now + 3 * DAY_MILLIS)!;
+    Check.equalU64(1, first.versionsExpired)?;
+    Check.isTrue(isThere(borrow s, "k", locked), "the locked version stays")?;
+    Check.isTrue(!isThere(borrow s, "k", free), "the other goes")?;
+    // Once its retention has ended, it goes too.
+    let later = s.applyLifecycle(now + 11 * DAY_MILLIS)!;
+    Check.equalU64(1, later.versionsExpired)?;
+    Check.isTrue(!isThere(borrow s, "k", locked), "after its retention")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn objectLockAsText() -> Result<void, TestFailure> {
+    let locks = [
+        ObjectLock { mode: LOCK_GOVERNANCE, until: 1767225600000, hold: false },
+        ObjectLock { mode: LOCK_COMPLIANCE, until: 1, hold: true },
+        ObjectLock { mode: LOCK_NONE, until: 0, hold: true },
+    ];
+    let texts = ["G0.1767225600000", "C1.1", "N1.0"];
+    for (i in 0..locks.length) {
+        var text = Vector<u8>.create();
+        encodeLock(locks[i], mut text)!;
+        Check.equalBytes(texts[i].bytes(), text.view())?;
+        let back = decodeLock(text.view()) ?? noLock();
+        Check.isTrue(back.mode == locks[i].mode && back.until == locks[i].until && back.hold == locks[i].hold, "back")?;
+    }
+    var none = Vector<u8>.create();
+    encodeLock(noLock(), mut none)!;
+    Check.equalU64(0, none.length as u64)?;
+    Check.isTrue(decodeLock("".bytes()).isSome(), "no field is no lock")?;
+    let refused = ["G", "G0", "G0.", "X0.1", "G2.1", "G0.x", "N0.0", "N1.5", "G0-1", "G0.12345678901234567890"];
+    for (r in refused) { Check.isTrue(decodeLock(r.bytes()).isNull(), "not a lock")?; }
+    // What holds, and what may change.
+    let g = ObjectLock { mode: LOCK_GOVERNANCE, until: 100, hold: false };
+    let c = ObjectLock { mode: LOCK_COMPLIANCE, until: 100, hold: false };
+    Check.isTrue(lockHolds(g, 99, false) && !lockHolds(g, 99, true) && !lockHolds(g, 100, false), "governance")?;
+    Check.isTrue(lockHolds(c, 99, true) && !lockHolds(c, 100, false), "compliance")?;
+    Check.isTrue(lockHolds(ObjectLock { mode: LOCK_NONE, until: 0, hold: true }, 1000, true), "a hold")?;
+    Check.isTrue(!lockHolds(noLock(), 0, false), "no lock")?;
+    Check.isTrue(lockChangeAllowed(g, noLock(), 100, false), "an ended retention changes freely")?;
+    Check.isTrue(lockChangeAllowed(c, g, 100, false), "an ended compliance too")?;
+    Check.isTrue(!lockChangeAllowed(g, noLock(), 50, false) && lockChangeAllowed(g, noLock(), 50, true), "bypass")?;
+    let stricter = ObjectLock { mode: LOCK_COMPLIANCE, until: 100, hold: false };
+    Check.isTrue(
+        !lockChangeAllowed(g, stricter, 50, false) && lockChangeAllowed(g, stricter, 50, true),
+        "another mode",
+    )?;
+    let longer = ObjectLock { mode: LOCK_GOVERNANCE, until: 200, hold: false };
+    Check.isTrue(lockChangeAllowed(g, longer, 50, false), "governance made longer")?;
+    // The field is found in a blob without a copy, among others, and not when the blob is cut short.
+    var meta = Vector<u8>.create();
+    metadataAdd(mut meta, "x-amz-meta-a".bytes(), "1".bytes())!;
+    metadataAdd(mut meta, LOCK_FIELD.bytes(), "C1.1".bytes())!;
+    metadataAdd(mut meta, TAGS_FIELD.bytes(), "k=v".bytes())!;
+    Check.isTrue(lockOfMetadata(meta.view()).hold, "the lock among other fields")?;
+    Check.isTrue(metadataFind(meta.view(), "x-amz-meta-b".bytes()).isNull(), "a field that is not there")?;
+    Check.isTrue(metadataFind("".bytes(), LOCK_FIELD.bytes()).isNull(), "no metadata")?;
+    for (cut in 0..meta.length) {
+        let found = metadataFind(meta.view()[0..cut], TAGS_FIELD.bytes());
+        Check.isTrue(found.isNull(), "a blob cut short")?;
+    }
+    return Ok();
+}

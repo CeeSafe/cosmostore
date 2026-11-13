@@ -9,7 +9,7 @@
 // than fall back, because segments it covered may already be gone. Little-endian:
 //
 // Header (64 bytes):
-//   0 u64 magic "CSCKPT01"   8 u16 format (9; 1 to 8 still load)   10 u16 header length (64)   12 u32 flags (0)
+//   0 u64 magic "CSCKPT01"   8 u16 format (10; 1 to 9 still load)   10 u16 header length (64)   12 u32 flags (0)
 //  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count (versions, in format 6)   48 i64 created ms
 //  56 u32 upload count (format 2; reserved, 0, in format 1)   60 u32 crc32c of bytes 0..60
 // Entries, buckets, then objects, then uploads: u8 kind (1 bucket, 2 object, 3 upload), u32 body length, body.
@@ -17,7 +17,7 @@
 //           in format 6 u8 versioning (0 off, 1 enabled, 2 suspended; ADR-0041), and in format 7 u32+bytes the
 //           bucket policy's JSON (ADR-0043), and in format 8 u32+bytes the public-access block (empty, or one byte of
 //           its settings; ADR-0044), and in format 9 u32+bytes the bucket's ACL (empty, or its three characters;
-//           ADR-0045)
+//           ADR-0045), and in format 10 u32+bytes the object lock configuration (empty for none; ADR-0047)
 //   object: u16+bytes bucket, u16+bytes key, 16 version id, u64 lsn, u64 size, i64 mtime ms,
 //           16 md5, u16+bytes content type, u64 payload segment, u64 payload offset,
 //           u32 payload length, u64 record segment, u32 record length, manifest (u32 count,
@@ -35,7 +35,7 @@ const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 9;
+const CHECKPOINT_FORMAT: u16 = 10;
 const CHECKPOINT_BUCKET: u8 = 1;
 const CHECKPOINT_OBJECT: u8 = 2;
 const CHECKPOINT_UPLOAD: u8 = 3;
@@ -309,6 +309,8 @@ fn beginCheckpointJob(
         body.extend(b.publicAccess.view())?;
         body.pushLE(truncate<u32>(b.acl.length))?;
         body.extend(b.acl.view())?;
+        body.pushLE(truncate<u32>(b.objectLock.length))?;
+        body.extend(b.objectLock.view())?;
         w.add(CHECKPOINT_BUCKET, body.view())?;
     }
     var uploads = Vector<Vector<u8>>.create();
@@ -640,6 +642,7 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
                 policy: Vector<u8>.create(),
                 publicAccess: Vector<u8>.create(),
                 acl: Vector<u8>.create(),
+                objectLock: Vector<u8>.create(),
             };
             if (format >= 5) {
                 info.tags = corrupt(readBlob32(body, mut at))?;
@@ -662,6 +665,12 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
             if (format >= 9) {
                 info.acl = corrupt(readBlob32(body, mut at))?;
                 if (!isAclValue(info.acl.view())) { return Err(StoreError.CheckpointCorrupt); }
+            }
+            if (format >= 10) {
+                info.objectLock = corrupt(readBlob32(body, mut at))?;
+                if (info.objectLock.length > 0 && decodeLockConfig(info.objectLock.view()).isNull()) {
+                    return Err(StoreError.CheckpointCorrupt);
+                }
             }
             if (at != body.length) { return Err(StoreError.CheckpointCorrupt); }
             if (!state.addBucket(name, info)?) { return Err(StoreError.CheckpointCorrupt); } // a bucket twice

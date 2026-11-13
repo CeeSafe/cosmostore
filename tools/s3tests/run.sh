@@ -77,11 +77,11 @@ printf '%s\n' "0555b35654ad1656d804 h7GhxuBLTrlhVUyxSPUKUV8r/2EI4ngqJxD7iBdBYLhw
 server=$!
 sleep 1
 
-# Features outside the scope (ADR-0014): auth v2, IAM and user policies, encryption, IAM and STS, lifecycle, object
-# lock, websites, Select, SNS, storage classes, and RGW-only behaviour (tagging is in since ADR-0017, lifecycle
-# configuration since ADR-0020, versioning and delete markers since ADR-0041, bucket policies since ADR-0043;
+# Features outside the scope (ADR-0014): auth v2, IAM and user policies, encryption, IAM and STS, lifecycle,
+# websites, Select, SNS, storage classes, and RGW-only behaviour (tagging is in since ADR-0017, lifecycle
+# configuration since ADR-0020, versioning and delete markers since ADR-0041, bucket policies since ADR-0043, object lock since ADR-0047;
 # lifecycle_expiration needs RGW's debug clock).
-outside="auth_aws2 or bucket_encryption or bucket_logging or bucket_logging_cleanup or cloud_transition or cloud_restore or encryption or fails_on_aws or group or group_policy or iam_account or iam_cross_account or iam_role or iam_tenant or iam_user or lifecycle_expiration or lifecycle_transition or object_lock or object_ownership or role_policy or session_policy or s3control or s3select or s3website or s3website_routing_rules or s3website_redirect_location or sns or sse_s3 or storage_class or test_of_sts or user_policy or webidentity_test or abac_test or appendobject or token_claims_trust_policy_test or token_principal_tag_role_policy_test or token_request_tag_trust_policy_test or token_resource_tags_test or token_role_tags_test or token_tag_keys_test"
+outside="auth_aws2 or bucket_encryption or bucket_logging or bucket_logging_cleanup or cloud_transition or cloud_restore or encryption or fails_on_aws or group or group_policy or iam_account or iam_cross_account or iam_role or iam_tenant or iam_user or lifecycle_expiration or lifecycle_transition or object_ownership or role_policy or session_policy or s3control or s3select or s3website or s3website_routing_rules or s3website_redirect_location or sns or sse_s3 or storage_class or test_of_sts or user_policy or webidentity_test or abac_test or appendobject or token_claims_trust_policy_test or token_principal_tag_role_policy_test or token_request_tag_trust_policy_test or token_resource_tags_test or token_role_tags_test or token_tag_keys_test"
 cd "$tests"
 if [ "${1:-}" = all ]; then
     S3TEST_CONF="$work/s3tests.conf" "$python" -I -m pytest -q -p no:cacheprovider -m "not ($outside)" \

@@ -142,7 +142,13 @@ fn parseDeleteBody(xml: Slice<u8>) -> Result<DeleteRequest, S3Fail> {
             }
             null => {}
         }
-        if (!bad) { request.targets.push(DeleteTarget { key: copyBytes(key.view())?, versionId: versionId })?; }
+        if (!bad) {
+            request.targets.push(DeleteTarget {
+                key: copyBytes(key.view())?,
+                versionId: versionId,
+                bypassGovernance: false,
+            })?;
+        }
         request.badVersion.push(bad)?;
         request.keys.push(key)?;
         if (request.keys.length > MAX_DELETE_KEYS) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
@@ -172,7 +178,17 @@ async fn deleteObjects(
         let action = if (t.versionId.isSome()) "s3:DeleteObjectVersion" else "s3:DeleteObject";
         let ok = gateAllows(app, borrow gate, req, who, action, bucket, t.key.view())?;
         refused.push(!ok)?;
-        if (ok) { allowed.push(DeleteTarget { key: copyBytes(t.key.view())?, versionId: t.versionId })?; }
+        // A version under governance retention goes only for a request that asks to bypass it and may
+        // (ADR-0047 §4).
+        let bypass = ok && t.versionId.isSome() && bypassAsked(req) &&
+            gateAllows(app, borrow gate, req, who, "s3:BypassGovernanceRetention", bucket, t.key.view())?;
+        if (ok) {
+            allowed.push(DeleteTarget {
+                key: copyBytes(t.key.view())?,
+                versionId: t.versionId,
+                bypassGovernance: bypass,
+            })?;
+        }
     }
     let outcomes = await storeDeleteMany(app, bucket, allowed.view())?;
     var body = Vector<u8>.create();
@@ -184,15 +200,18 @@ async fn deleteObjects(
         let key = request.keys[i].view();
         var valid = false;
         var denied = false;
+        var asked: [u8; 16]? = null;
         if (!request.badVersion[i]) {
             denied = refused[target];
+            asked = request.targets[target].versionId;
             target += 1;
         }
         if (!request.badVersion[i] && !denied) {
             let o = borrow outcomes[next];
             let named = allowed[next].versionId.isSome();
             next += 1;
-            valid = o.valid;
+            valid = o.valid && !o.locked;
+            denied = o.locked; // under retention or a legal hold: AccessDenied, and it stays
             if (valid && !request.quiet) {
                 body.extend("<Deleted>".bytes())?;
                 xmlElement(mut body, "Key", key, false)?;
@@ -215,6 +234,15 @@ async fn deleteObjects(
         if (!valid) {
             body.extend("<Error>".bytes())?;
             xmlElement(mut body, "Key", key, false)?;
+            // The version the entry named, as S3 tells it back.
+            match (asked) {
+                Some(v) => {
+                    id.clear();
+                    appendVersionId(mut id, v)?;
+                    xmlElement(mut body, "VersionId", id.view(), false)?;
+                }
+                null => {}
+            }
             let code =
                 if (denied) S3Code.AccessDenied
                     else if (request.badVersion[i]) S3Code.NoSuchVersion

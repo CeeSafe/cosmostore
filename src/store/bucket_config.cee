@@ -18,14 +18,20 @@ const PUBLIC_ACCESS_BLOCK_POLICY: u8 = 4;
 const PUBLIC_ACCESS_RESTRICT_BUCKETS: u8 = 8;
 /// A bucket's ACL (ADR-0045): its three characters, as a version's `ACL_FIELD` holds one; empty for the private one.
 const BUCKET_CONFIG_ACL: u8 = 6;
+/// A bucket's object lock configuration (ADR-0047): `E` for enabled, then for a default retention a dot, its mode
+/// (`G`, `C`), a dot, and its period, `d` or `y` and a number of days or years. Never cleared once it is set.
+const BUCKET_CONFIG_OBJECT_LOCK: u8 = 7;
+/// S3's longest default retention: 100 years, in days.
+const MAX_LOCK_DAYS: u32 = 36500;
+const MAX_LOCK_YEARS: u32 = 100;
 const VERSIONING_OFF: u8 = 0;
 const VERSIONING_ENABLED: u8 = 1;
 const VERSIONING_SUSPENDED: u8 = 2;
 const DAY_MILLIS: i64 = 86400000;
 
 /// BucketConfig meta v1: u8 format version, u16+bytes bucket, u8 kind (1 tags, 2 lifecycle, 3 versioning, 4 policy,
-/// 5 public-access block, 6 ACL), u32+bytes the value (empty: cleared; versioning and the public-access block: one
-/// byte; the ACL: three).
+/// 5 public-access block, 6 ACL, 7 object lock), u32+bytes the value (empty: cleared; versioning and the public-access
+/// block: one byte; the ACL: three).
 fn encodeBucketConfigMeta(
     out: borrow mut Vector<u8>,
     bucket: Slice<u8>,
@@ -66,6 +72,8 @@ fn decodeBucketConfigMeta(bytes: Slice<u8>) -> Result<BucketConfigMeta, MetaFaul
         if (!isPublicAccessValue(value.view())) { return Err(MetaFault.TooLong); }
     } else if (kind == BUCKET_CONFIG_ACL) {
         if (!isAclValue(value.view())) { return Err(MetaFault.TooLong); }
+    } else if (kind == BUCKET_CONFIG_OBJECT_LOCK) {
+        if (decodeLockConfig(value.view()).isNull()) { return Err(MetaFault.TooLong); }
     } else if (kind != BUCKET_CONFIG_TAGS && kind != BUCKET_CONFIG_LIFECYCLE) {
         return Err(MetaFault.TooLong);
     }
@@ -78,6 +86,65 @@ fn isVersioningValue(value: Slice<u8>) -> bool =>
 
 /// Whether `value` is a public-access block as it is stored: empty for none, or one byte of the four settings.
 fn isPublicAccessValue(value: Slice<u8>) -> bool => value.length == 0 || (value.length == 1 && value[0] < 16);
+
+/// A bucket's default retention: none (`LOCK_NONE`), or a mode and a period in days or in years.
+struct LockDefault {
+    mode: u8;
+    days: u32;
+    years: u32;
+}
+
+/// A bucket's object lock configuration as it is stored.
+fn encodeLockConfig(d: LockDefault, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.push('E')?;
+    if (d.mode == LOCK_NONE) { return Ok(); }
+    out.push('.')?;
+    out.push(d.mode)?;
+    out.push('.')?;
+    out.push(if (d.years > 0) 'y' else 'd')?;
+    var digits = [0u8; 10];
+    var n: usize = 0;
+    var v = if (d.years > 0) d.years else d.days;
+    while (true) {
+        digits[n] = '0' + truncate<u8>(v % 10);
+        n += 1;
+        v = v / 10;
+        if (v == 0) { break; }
+    }
+    while (n > 0) {
+        n -= 1;
+        out.push(digits[n])?;
+    }
+    return Ok();
+}
+
+/// A stored object lock configuration's default retention; null for a value that is not one (an empty one too).
+fn decodeLockConfig(value: Slice<u8>) -> LockDefault? {
+    if (value.length == 0 || value[0] != 'E') { return null; }
+    var d = LockDefault { mode: LOCK_NONE, days: 0, years: 0 };
+    if (value.length == 1) { return Some(d); }
+    if (value.length < 6 || value.length > 10 || value[1] != '.' || value[3] != '.') { return null; }
+    if (value[2] != LOCK_GOVERNANCE && value[2] != LOCK_COMPLIANCE) { return null; }
+    if (value[4] != 'd' && value[4] != 'y') { return null; }
+    var n: u32 = 0;
+    for (i in 5..value.length) {
+        if (value[i] < '0' || value[i] > '9') { return null; }
+        n = n * 10 + ((value[i] - '0') as u32);
+    }
+    let most = if (value[4] == 'y') MAX_LOCK_YEARS else MAX_LOCK_DAYS;
+    if (n == 0 || n > most) { return null; }
+    d.mode = value[2];
+    if (value[4] == 'y') {
+        d.years = n;
+    } else {
+        d.days = n;
+    }
+    return Some(d);
+}
+
+/// When a default retention that starts at `now` ends: a year is 365 days, as S3 counts it.
+fn lockDefaultUntil(d: LockDefault, now: i64) -> i64 =>
+    now + ((d.days as i64) + (d.years as i64) * 365) * DAY_MILLIS;
 
 // ---- Lifecycle rules ----
 

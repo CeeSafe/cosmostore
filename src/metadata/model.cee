@@ -309,25 +309,32 @@ fn encodeSetTagsMeta(
     return Ok();
 }
 
-/// The SetTags meta's second format, which sets a version's ACL (ADR-0045).
+/// The SetTags meta's later formats, which set another field of the version in place of its tags: its ACL
+/// (ADR-0045), or its object lock (ADR-0047).
 const SET_ACL_FORMAT: u8 = 2;
+const SET_LOCK_FORMAT: u8 = 3;
 
-/// SetTags meta v2: as v1 with format 2, and the last field is the version's ACL as it is stored (empty: the private
-/// one) in place of its tags.
-fn encodeSetAclMeta(
+/// The metadata field a SetTags record of `format` sets.
+fn setTagsField(format: u8) -> StringView =>
+    if (format == SET_ACL_FORMAT) ACL_FIELD else if (format == SET_LOCK_FORMAT) LOCK_FIELD else TAGS_FIELD;
+
+/// SetTags meta v2 and v3: as v1 with format 2 or 3, and the last field is the version's ACL, or its object lock,
+/// as it is stored (empty: the private ACL; no lock) in place of its tags.
+fn encodeSetFieldMeta(
     out: borrow mut Vector<u8>,
+    format: u8,
     bucket: Slice<u8>,
     key: Slice<u8>,
     versionId: [u8; 16],
     generation: u64,
-    acl: Slice<u8>,
+    value: Slice<u8>,
 ) -> Result<void, AllocError> {
-    out.pushLE(SET_ACL_FORMAT)?;
+    out.pushLE(format)?;
     pushText16(out, bucket)?;
     pushText16(out, key)?;
     out.extend(versionId[..])?;
     out.pushLE(generation)?;
-    pushText16(out, acl)?;
+    pushText16(out, value)?;
     return Ok();
 }
 
@@ -336,17 +343,17 @@ struct SetTagsMeta {
     key: Vector<u8>;
     versionId: [u8; 16];
     generation: u64;
-    /// The tags, or with `acl` the ACL.
+    /// The tags, or the ACL or lock of the later formats.
     tags: Vector<u8>;
-    /// Format 2: the record sets the ACL, not the tags.
-    acl: bool;
+    /// 1: the record sets the tags; SET_ACL_FORMAT, SET_LOCK_FORMAT: that field.
+    format: u8;
 }
 
 fn decodeSetTagsMeta(bytes: Slice<u8>) -> Result<SetTagsMeta, MetaFault> {
     var at: usize = 0;
     need(bytes, at, 1)?;
-    let acl = bytes[at] == SET_ACL_FORMAT;
-    if (acl) {
+    let format = bytes[at];
+    if (format == SET_ACL_FORMAT || format == SET_LOCK_FORMAT) {
         at += 1;
     } else {
         checkVersion(bytes, mut at)?;
@@ -357,15 +364,116 @@ fn decodeSetTagsMeta(bytes: Slice<u8>) -> Result<SetTagsMeta, MetaFault> {
     let generation = readU64(bytes, mut at)?;
     let tags = readText16(bytes, mut at)?;
     if (at != bytes.length) { return Err(MetaFault.TooLong); }
-    if (acl && !isAclValue(tags.view())) { return Err(MetaFault.TooLong); }
+    if (format == SET_ACL_FORMAT && !isAclValue(tags.view())) { return Err(MetaFault.TooLong); }
+    if (format == SET_LOCK_FORMAT && decodeLock(tags.view()).isNull()) { return Err(MetaFault.TooLong); }
     return Ok(SetTagsMeta {
         bucket: bucket,
         key: key,
         versionId: versionId,
         generation: generation,
         tags: tags,
-        acl: acl,
+        format: format,
     });
+}
+
+/// The value of the pair `name` in a metadata blob, without a copy; null if there is none, or the blob is not one.
+fn metadataFind<region a>(blob: Slice<a, u8>, name: Slice<u8>) -> Slice<a, u8>? {
+    if (blob.length < 2) { return null; }
+    let pairs = blob.readLE<u16>(0);
+    var at: usize = 2;
+    for (i in 0..pairs) {
+        if (at + 2 > blob.length) { return null; }
+        let nameLen = blob.readLE<u16>(at) as usize;
+        at += 2;
+        if (at + nameLen + 2 > blob.length) { return null; }
+        let found = blob[at..at + nameLen] == name;
+        at += nameLen;
+        let valueLen = blob.readLE<u16>(at) as usize;
+        at += 2;
+        if (at + valueLen > blob.length) { return null; }
+        if (found) { return Some(blob[at..at + valueLen]); }
+        at += valueLen;
+    }
+    return null;
+}
+
+// ---- Object lock (ADR-0047) ----
+
+/// The stored field that holds a version's object lock: its retention mode (`N` none, `G` governance,
+/// `C` compliance), its legal hold (`0`, `1`), a dot, and the time its retention ends, in ms. No field: no lock.
+const LOCK_FIELD: StringView = "x-amz-object-lock";
+const LOCK_NONE: u8 = 'N';
+const LOCK_GOVERNANCE: u8 = 'G';
+const LOCK_COMPLIANCE: u8 = 'C';
+
+/// A version's retention and legal hold.
+struct ObjectLock {
+    mode: u8;
+    /// When the retention ends, in ms since the epoch; 0 without one.
+    until: i64;
+    hold: bool;
+}
+
+fn noLock() -> ObjectLock => ObjectLock { mode: LOCK_NONE, until: 0, hold: false };
+
+/// A lock as its field holds it; nothing for no retention and no hold.
+fn encodeLock(l: ObjectLock, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (l.mode == LOCK_NONE && !l.hold) { return Ok(); }
+    out.push(l.mode)?;
+    out.push(if (l.hold) '1' else '0')?;
+    out.push('.')?;
+    var digits = [0u8; 20];
+    var n: usize = 0;
+    var v = if (l.mode == LOCK_NONE || l.until < 0) 0 else l.until;
+    while (true) {
+        digits[n] = '0' + truncate<u8>(v % 10);
+        n += 1;
+        v = v / 10;
+        if (v == 0) { break; }
+    }
+    while (n > 0) {
+        n -= 1;
+        out.push(digits[n])?;
+    }
+    return Ok();
+}
+
+/// A stored lock: no lock for an empty field, null for a field that is not one.
+fn decodeLock(text: Slice<u8>) -> ObjectLock? {
+    if (text.length == 0) { return Some(noLock()); }
+    if (text.length < 4 || text.length > 22 || text[2] != '.') { return null; }
+    let mode = text[0];
+    if (mode != LOCK_NONE && mode != LOCK_GOVERNANCE && mode != LOCK_COMPLIANCE) { return null; }
+    if (text[1] != '0' && text[1] != '1') { return null; }
+    var until: i64 = 0;
+    for (i in 3..text.length) {
+        if (text[i] < '0' || text[i] > '9') { return null; }
+        until = until * 10 + ((text[i] - '0') as i64);
+    }
+    if (mode == LOCK_NONE && (until != 0 || text[1] == '0')) { return null; }
+    return Some(ObjectLock { mode: mode, until: until, hold: text[1] == '1' });
+}
+
+/// The lock of a version with this metadata: none without the field, or with one that does not read.
+fn lockOfMetadata(blob: Slice<u8>) -> ObjectLock => match (metadataFind(blob, LOCK_FIELD.bytes())) {
+    Some(text) => decodeLock(text) ?? noLock(),
+    null => noLock(),
+};
+
+/// Whether a lock keeps its version from being removed at `now` (ADR-0047 §4): a legal hold always, compliance
+/// retention until it ends, governance retention until it ends unless the request may bypass it.
+fn lockHolds(l: ObjectLock, now: i64, bypass: bool) -> bool {
+    if (l.hold) { return true; }
+    if (l.mode == LOCK_NONE || l.until <= now) { return false; }
+    return l.mode == LOCK_COMPLIANCE || !bypass;
+}
+
+/// Whether a version's retention may become `next` at `now` (ADR-0047 §3): freely once it has ended; compliance
+/// only longer; governance longer in its own mode, or anything with a bypass.
+fn lockChangeAllowed(old: ObjectLock, next: ObjectLock, now: i64, bypass: bool) -> bool {
+    if (old.mode == LOCK_NONE || old.until <= now) { return true; }
+    if (old.mode == LOCK_COMPLIANCE) { return next.mode == LOCK_COMPLIANCE && next.until >= old.until; }
+    return (next.mode == LOCK_GOVERNANCE && next.until >= old.until) || bypass;
 }
 
 /// The pairs of a metadata blob.

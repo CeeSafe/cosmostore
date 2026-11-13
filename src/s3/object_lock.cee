@@ -1,0 +1,334 @@
+// Object lock (ADR-0047): a bucket's configuration and default retention, a version's retention and legal hold, the
+// fields that give a new object its lock, and the bypass of governance retention. The store keeps a locked version
+// from being removed (`ObjectStore.stageTarget`); this is the S3 face of it.
+import web_core;
+import web_http;
+import web_server;
+
+/// Whether the request asks to bypass governance retention.
+fn bypassAsked(req: borrow S3Request) -> bool => match (headerOf(req, "x-amz-bypass-governance-retention")) {
+    Some(v) => trimBlank(v) == "true".bytes() || trimBlank(v) == "True".bytes(),
+    null => false,
+};
+
+/// Whether the request bypasses governance retention on its object (ADR-0047 §4): it asks to, and may
+/// (`s3:BypassGovernanceRetention`: a key no policy denies it, or an anonymous request a policy allows it).
+async fn governanceBypass(app: borrow S3App, req: borrow S3Request, who: borrow Requester) -> Result<bool, S3Fail> {
+    if (!bypassAsked(req)) { return Ok(false); }
+    let bucket = req.bucket.view();
+    let gate = await policyGate(app, who, bucket)?;
+    return Ok(gateAllows(app, borrow gate, req, who, "s3:BypassGovernanceRetention", bucket, req.key.view().bytes())?);
+}
+
+fn lockModeOf(name: Slice<u8>) -> u8? {
+    if (name == "GOVERNANCE".bytes()) { return LOCK_GOVERNANCE; }
+    if (name == "COMPLIANCE".bytes()) { return LOCK_COMPLIANCE; }
+    return null;
+}
+
+fn lockModeName(mode: u8) -> StringView => if (mode == LOCK_COMPLIANCE) "COMPLIANCE" else "GOVERNANCE";
+
+/// A time as S3 writes one, in ms; null for text that is not one.
+fn lockTime(text: Slice<u8>) -> i64? => match (parseIsoTime(trimBlank(text))) {
+    Some(seconds) => seconds * 1000,
+    null => null,
+};
+
+// ---- A new object's lock ----
+
+/// The lock the request's fields give a new object (ADR-0047 §2): a retention's mode and end, together, and a legal
+/// hold; null without any of them.
+fn lockOfFields(mode: Slice<u8>?, until: Slice<u8>?, hold: Slice<u8>?, now: i64) -> Result<ObjectLock?, S3Fail> {
+    let invalid = S3Fail.Code(S3Code.InvalidArgument);
+    if (mode.isNull() && until.isNull() && hold.isNull()) { return Ok(null); }
+    var lock = noLock();
+    if (mode.isSome() != until.isSome()) { return Err(invalid); }
+    match (mode) {
+        Some(m) => {
+            lock.mode = match (lockModeOf(trimBlank(m))) {
+                Some(v) => v,
+                null => { return Err(invalid); }
+            };
+            lock.until = match (lockTime(until ?? "".bytes())) {
+                Some(t) => t,
+                null => { return Err(invalid); }
+            };
+            if (lock.until <= now) { return Err(invalid); }
+        }
+        null => {}
+    }
+    match (hold) {
+        Some(h) => {
+            if (trimBlank(h) == "ON".bytes()) {
+                lock.hold = true;
+            } else if (trimBlank(h) != "OFF".bytes()) {
+                return Err(invalid);
+            }
+        }
+        null => {}
+    }
+    return Ok(Some(lock));
+}
+
+/// `metadata` with the lock the request's fields give the new object in it (PUT, CopyObject,
+/// CreateMultipartUpload), and without any lock `metadata` had: a copy never has its source's. InvalidRequest in a
+/// bucket without object lock. Without the fields the store gives the bucket's default retention, if it has one.
+async fn withRequestLock(app: borrow S3App, req: borrow S3Request, metadata: Vector<u8>) -> Result<Vector<u8>, S3Fail> {
+    let lock = lockOfFields(
+        headerOf(req, "x-amz-object-lock-mode"),
+        headerOf(req, "x-amz-object-lock-retain-until-date"),
+        headerOf(req, "x-amz-object-lock-legal-hold"),
+        Clock.unixMillis(),
+    )?;
+    var text = Vector<u8>.create();
+    match (lock) {
+        Some(l) => {
+            let config = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_OBJECT_LOCK)?;
+            if (config.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            encodeLock(l, mut text)?;
+        }
+        null => {}
+    }
+    if (text.length == 0 && metadataFind(metadata.view(), LOCK_FIELD.bytes()).isNull()) { return Ok(metadata); }
+    return match (metadataReplace(metadata.view(), LOCK_FIELD.bytes(), text.view())) {
+        Ok(b) => Ok(b),
+        Err(_) => Err(S3Fail.Code(S3Code.InternalError)),
+    };
+}
+
+/// A version's lock as S3's response fields (GET and HEAD).
+fn lockHeaders(exchange: borrow mut Exchange, stored: Slice<u8>) -> Result<void, S3Fail> {
+    let lock = decodeLock(stored) ?? noLock();
+    if (lock.mode != LOCK_NONE) {
+        exchange.header("x-amz-object-lock-mode", lockModeName(lock.mode).bytes())?;
+        var until = Vector<u8>.create();
+        appendIso8601(mut until, lock.until)?;
+        exchange.header("x-amz-object-lock-retain-until-date", until.view())?;
+    }
+    if (lock.hold) { exchange.header("x-amz-object-lock-legal-hold", "ON".bytes())?; }
+    return Ok();
+}
+
+// ---- The bucket's configuration ----
+
+/// A whole number of days or years; null for text that is not a number, 0 or less included.
+fn lockPeriod(text: Slice<u8>) -> u32? {
+    let n = parseDecimal(trimBlank(text)) ?? 0;
+    if (n == 0 || n > 1000000) { return null; }
+    return truncate<u32>(n);
+}
+
+/// The default retention of an `<ObjectLockConfiguration>` (ADR-0047 §1): `Enabled`, and at most one rule with a
+/// mode and days or years, not both.
+fn parseLockConfig(xml: Slice<u8>) -> Result<LockDefault, S3Fail> {
+    let malformed = S3Fail.Code(S3Code.MalformedXML);
+    if (findBytes(xml, "<ObjectLockConfiguration".bytes(), 0).isNull()) { return Err(malformed); }
+    match (elementText(xml, "ObjectLockEnabled")) {
+        Some(e) => {
+            if (trimBlank(e) != "Enabled".bytes()) { return Err(malformed); }
+        }
+        null => { return Err(malformed); }
+    }
+    var d = LockDefault { mode: LOCK_NONE, days: 0, years: 0 };
+    if (findBytes(xml, "<Rule>".bytes(), 0).isNull()) { return Ok(d); }
+    d.mode = match (elementText(xml, "Mode")) {
+        Some(m) => match (lockModeOf(trimBlank(m))) {
+            Some(v) => v,
+            null => { return Err(malformed); }
+        },
+        null => { return Err(malformed); }
+    };
+    let days = elementText(xml, "Days");
+    let years = elementText(xml, "Years");
+    if (days.isSome() == years.isSome()) { return Err(malformed); }
+    let period = match (lockPeriod(days ?? years ?? "".bytes())) {
+        Some(n) => n,
+        null => { return Err(S3Fail.Code(S3Code.InvalidRetentionPeriod)); }
+    };
+    if (days.isSome()) {
+        if (period > MAX_LOCK_DAYS) { return Err(S3Fail.Code(S3Code.InvalidRetentionPeriod)); }
+        d.days = period;
+    } else {
+        if (period > MAX_LOCK_YEARS) { return Err(S3Fail.Code(S3Code.InvalidRetentionPeriod)); }
+        d.years = period;
+    }
+    return Ok(d);
+}
+
+fn lockConfigXml(d: LockDefault, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    xmlHead(out, "ObjectLockConfiguration")?;
+    out.extend("<ObjectLockEnabled>Enabled</ObjectLockEnabled>".bytes())?;
+    if (d.mode != LOCK_NONE) {
+        out.extend("<Rule><DefaultRetention>".bytes())?;
+        xmlElement(out, "Mode", lockModeName(d.mode).bytes(), false)?;
+        var n = Vector<u8>.create();
+        appendDecimal(mut n, (if (d.years > 0) d.years else d.days) as u64)?;
+        xmlElement(out, if (d.years > 0) "Years" else "Days", n.view(), false)?;
+        out.extend("</DefaultRetention></Rule>".bytes())?;
+    }
+    out.extend("</ObjectLockConfiguration>".bytes())?;
+    return Ok();
+}
+
+async fn getObjectLockConfiguration(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let stored = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_OBJECT_LOCK)?;
+    let d = match (decodeLockConfig(stored.view())) {
+        Some(d) => d,
+        null => { return Err(S3Fail.Code(S3Code.ObjectLockConfigurationNotFoundError)); }
+    };
+    var body = Vector<u8>.create();
+    lockConfigXml(d, mut body)?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// PutObjectLockConfiguration: on a bucket whose versioning is enabled (InvalidBucketState otherwise); object lock
+/// is never taken off again.
+async fn putObjectLockConfiguration(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    verifySmallBody(req, xml.view(), true)?;
+    var stored = Vector<u8>.create();
+    encodeLockConfig(parseLockConfig(xml.view())?, mut stored)?;
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_OBJECT_LOCK, stored.view())?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+// ---- A version's retention and legal hold ----
+
+/// The retention of a `<Retention>`: a mode and an end in the future, or neither, which takes the retention off.
+fn parseRetention(xml: Slice<u8>, now: i64) -> Result<ObjectLock, S3Fail> {
+    let malformed = S3Fail.Code(S3Code.MalformedXML);
+    if (findBytes(xml, "<Retention".bytes(), 0).isNull()) { return Err(malformed); }
+    let mode = elementText(xml, "Mode");
+    let until = elementText(xml, "RetainUntilDate");
+    var lock = noLock();
+    if (mode.isNull() && until.isNull()) { return Ok(lock); }
+    lock.mode = match (lockModeOf(trimBlank(mode ?? "".bytes()))) {
+        Some(v) => v,
+        null => { return Err(malformed); }
+    };
+    lock.until = match (lockTime(until ?? "".bytes())) {
+        Some(t) => t,
+        null => { return Err(malformed); }
+    };
+    if (lock.until <= now) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    return Ok(lock);
+}
+
+/// The status of a `<LegalHold>`.
+fn parseLegalHold(xml: Slice<u8>) -> Result<bool, S3Fail> {
+    if (findBytes(xml, "<LegalHold".bytes(), 0).isNull()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    let status = trimBlank(elementText(xml, "Status") ?? "".bytes());
+    if (status == "ON".bytes()) { return Ok(true); }
+    if (status == "OFF".bytes()) { return Ok(false); }
+    return Err(S3Fail.Code(S3Code.MalformedXML));
+}
+
+/// Changes the lock of the request's version in the store, which decides whether its retention may change.
+async fn storeSetLock(
+    app: borrow S3App,
+    req: borrow S3Request,
+    retention: ObjectLock?,
+    hold: bool?,
+    bypass: bool,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let versionId = requestVersion(req)?;
+    let bucket = req.bucket.view();
+    let key = req.key.view();
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        match (await Async.blocking(() => store.setLockOf(bucket, key, versionId, retention, hold, bypass))) {
+            Ok() => {}
+            Err(e) => {
+                deleteMarkerHeaders(store, bucket, key, versionId, exchange)?;
+                return Err(storeFail(e, key.length));
+            }
+        }
+    }
+    match (versionId) {
+        Some(id) => { versionHeader(exchange, "x-amz-version-id", id)?; }
+        null => {}
+    }
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn putObjectRetention(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    bypass: bool,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    verifySmallBody(req, xml.view(), true)?;
+    let retention = parseRetention(xml.view(), Clock.unixMillis())?;
+    return await storeSetLock(app, req, Some(retention), null, bypass, exchange);
+}
+
+async fn putObjectLegalHold(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    verifySmallBody(req, xml.view(), true)?;
+    let hold = parseLegalHold(xml.view())?;
+    return await storeSetLock(app, req, null, Some(hold), false, exchange);
+}
+
+/// The lock of the request's version, in a bucket with object lock: InvalidRequest in one without.
+async fn requestedLock(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<ObjectLock, S3Fail> {
+    let config = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_OBJECT_LOCK)?;
+    if (config.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    let info = await objectInfo(app, req, exchange)?;
+    readVersionHeader(exchange, borrow info)?;
+    return Ok(lockOfMetadata(info.metadata.view()));
+}
+
+async fn getObjectRetention(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let lock = await requestedLock(app, req, exchange)?;
+    if (lock.mode == LOCK_NONE) { return Err(S3Fail.Code(S3Code.NoSuchObjectLockConfiguration)); }
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "Retention")?;
+    xmlElement(mut body, "Mode", lockModeName(lock.mode).bytes(), false)?;
+    var until = Vector<u8>.create();
+    appendIso8601(mut until, lock.until)?;
+    xmlElement(mut body, "RetainUntilDate", until.view(), false)?;
+    body.extend("</Retention>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// GetObjectLegalHold: `OFF` for a version that was never given one.
+async fn getObjectLegalHold(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let lock = await requestedLock(app, req, exchange)?;
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "LegalHold")?;
+    xmlElement(mut body, "Status", if (lock.hold) "ON".bytes() else "OFF".bytes(), false)?;
+    body.extend("</LegalHold>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}

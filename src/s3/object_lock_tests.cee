@@ -1,0 +1,167 @@
+// Object lock over S3 (ADR-0047): the request's fields and the three documents.
+import web_core;
+import web_http;
+import web_server;
+
+fn lockFieldsAnswer(mode: StringView, until: StringView, hold: StringView) -> Vector<u8> {
+    let m: Slice<u8>? = if (mode.length > 0) Some(mode.bytes()) else null;
+    let u: Slice<u8>? = if (until.length > 0) Some(until.bytes()) else null;
+    let h: Slice<u8>? = if (hold.length > 0) Some(hold.bytes()) else null;
+    var out = Vector<u8>.create();
+    // Now is 1 Jan 2026.
+    match (lockOfFields(m, u, h, 1767225600000)) {
+        Ok(Some(l)) => { encodeLock(l, mut out)!; }
+        Ok(null) => { out.extend("none".bytes())!; }
+        Err(S3Fail.Code(code)) => { out.extend(s3CodeName(code).bytes())!; }
+        Err(_) => { out.extend("failed".bytes())!; }
+    }
+    return out;
+}
+
+@test
+fn objectLockRequestFields() -> Result<void, TestFailure> {
+    Check.equalBytes("none".bytes(), lockFieldsAnswer("", "", "").view())?;
+    Check.equalBytes(
+        "G0.1798761600000".bytes(),
+        lockFieldsAnswer("GOVERNANCE", "2027-01-01T00:00:00Z", "").view(),
+    )?;
+    Check.equalBytes(
+        "C1.1798761600000".bytes(),
+        lockFieldsAnswer("COMPLIANCE", "2027-01-01T00:00:00.000Z", "ON").view(),
+    )?;
+    Check.equalBytes("N1.0".bytes(), lockFieldsAnswer("", "", "ON").view())?;
+    Check.equalU64(0, lockFieldsAnswer("", "", "OFF").length as u64)?; // a lock that is none
+    let invalid = "InvalidArgument".bytes();
+    Check.equalBytes(invalid, lockFieldsAnswer("GOVERNANCE", "", "").view())?;
+    Check.equalBytes(invalid, lockFieldsAnswer("", "2027-01-01T00:00:00Z", "").view())?;
+    Check.equalBytes(invalid, lockFieldsAnswer("governance", "2027-01-01T00:00:00Z", "").view())?;
+    Check.equalBytes(invalid, lockFieldsAnswer("GOVERNANCE", "next year", "").view())?;
+    Check.equalBytes(invalid, lockFieldsAnswer("GOVERNANCE", "2025-12-31T23:59:59Z", "").view())?; // in the past
+    Check.equalBytes(invalid, lockFieldsAnswer("", "", "on").view())?;
+    return Ok();
+}
+
+fn lockConfigAnswer(xml: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    match (parseLockConfig(xml.bytes())) {
+        Ok(d) => { encodeLockConfig(d, mut out)!; }
+        Err(S3Fail.Code(code)) => { out.extend(s3CodeName(code).bytes())!; }
+        Err(_) => { out.extend("failed".bytes())!; }
+    }
+    return out;
+}
+
+@test
+fn objectLockDocuments() -> Result<void, TestFailure> {
+    let head = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>";
+    let tail = "</ObjectLockConfiguration>";
+    let rules = [
+        "",
+        "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>30</Days></DefaultRetention></Rule>",
+        "<Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Years>2</Years></DefaultRetention></Rule>",
+        "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days><Years>1</Years></DefaultRetention></Rule>",
+        "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode></DefaultRetention></Rule>",
+        "<Rule><DefaultRetention><Mode>abc</Mode><Days>1</Days></DefaultRetention></Rule>",
+        "<Rule><DefaultRetention><Days>1</Days></DefaultRetention></Rule>",
+        "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>0</Days></DefaultRetention></Rule>",
+        "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>-1</Days></DefaultRetention></Rule>",
+        "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>36501</Days></DefaultRetention></Rule>",
+        "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Years>101</Years></DefaultRetention></Rule>",
+    ];
+    let answers = [
+        "E",
+        "E.G.d30",
+        "E.C.y2",
+        "MalformedXML",
+        "MalformedXML",
+        "MalformedXML",
+        "MalformedXML",
+        "InvalidRetentionPeriod",
+        "InvalidRetentionPeriod",
+        "InvalidRetentionPeriod",
+        "InvalidRetentionPeriod",
+    ];
+    for (i in 0..rules.length) {
+        var doc = Vector<u8>.create();
+        doc.extend(head.bytes())!;
+        doc.extend(rules[i].bytes())!;
+        doc.extend(tail.bytes())!;
+        let text = match (StringView.fromUtf8(doc.view())) {
+            Some(t) => t,
+            null => { return Check.fail("the document is text"); }
+        };
+        Check.equalBytes(answers[i].bytes(), lockConfigAnswer(text).view())?;
+    }
+    Check.equalBytes("MalformedXML".bytes(), lockConfigAnswer("<Other/>").view())?;
+    Check.equalBytes("MalformedXML".bytes(), lockConfigAnswer("<ObjectLockConfiguration/>").view())?;
+    Check.equalBytes(
+        "MalformedXML".bytes(),
+        lockConfigAnswer(
+            "<ObjectLockConfiguration><ObjectLockEnabled>Disabled</ObjectLockEnabled></ObjectLockConfiguration>",
+        ).view(),
+    )?;
+    // What Get writes, Put reads back.
+    let defaults = ["E", "E.G.d30", "E.C.y2"];
+    for (d in defaults) {
+        var xml = Vector<u8>.create();
+        lockConfigXml(decodeLockConfig(d.bytes()) ?? LockDefault { mode: LOCK_NONE, days: 9, years: 9 }, mut xml)!;
+        let text = match (StringView.fromUtf8(xml.view())) {
+            Some(t) => t,
+            null => { return Check.fail("the document is text"); }
+        };
+        Check.equalBytes(d.bytes(), lockConfigAnswer(text).view())?;
+    }
+
+    // A retention, at 1 Jan 2026.
+    let now: i64 = 1767225600000;
+    let given = parseRetention(
+        "<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2027-01-01T00:00:00Z</RetainUntilDate></Retention>".bytes(),
+        now,
+    );
+    match (given) {
+        Ok(l) => { Check.isTrue(l.mode == LOCK_COMPLIANCE && l.until == 1798761600000 && !l.hold, "a retention")?; }
+        Err(_) => { return Check.fail("the retention parses"); }
+    }
+    match (parseRetention("<Retention></Retention>".bytes(), now)) {
+        Ok(l) => { Check.isTrue(l.mode == LOCK_NONE, "an empty one takes it off")?; }
+        Err(_) => { return Check.fail("the empty retention parses"); }
+    }
+    let bad = [
+        "<Other/>",
+        "<Retention><Mode>abc</Mode><RetainUntilDate>2027-01-01T00:00:00Z</RetainUntilDate></Retention>",
+        "<Retention><Mode>GOVERNANCE</Mode></Retention>",
+        "<Retention><RetainUntilDate>2027-01-01T00:00:00Z</RetainUntilDate></Retention>",
+        "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>soon</RetainUntilDate></Retention>",
+    ];
+    for (doc in bad) {
+        match (parseRetention(doc.bytes(), now)) {
+            Err(S3Fail.Code(S3Code.MalformedXML)) => {}
+            _ => { return Check.fail("a retention that is not one"); }
+        }
+    }
+    match (parseRetention(
+        "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2025-01-01T00:00:00Z</RetainUntilDate></Retention>".bytes(),
+        now,
+    )) {
+        Err(S3Fail.Code(S3Code.InvalidArgument)) => {}
+        _ => { return Check.fail("a retention that has ended"); }
+    }
+
+    // A legal hold.
+    match (parseLegalHold("<LegalHold><Status>ON</Status></LegalHold>".bytes())) {
+        Ok(on) => { Check.isTrue(on, "on")?; }
+        Err(_) => { return Check.fail("the hold parses"); }
+    }
+    match (parseLegalHold("<LegalHold><Status> OFF </Status></LegalHold>".bytes())) {
+        Ok(on) => { Check.isTrue(!on, "off")?; }
+        Err(_) => { return Check.fail("the hold parses"); }
+    }
+    let noHold = ["<Other/>", "<LegalHold/>", "<LegalHold><Status>abc</Status></LegalHold>"];
+    for (doc in noHold) {
+        match (parseLegalHold(doc.bytes())) {
+            Err(S3Fail.Code(S3Code.MalformedXML)) => {}
+            _ => { return Check.fail("a hold that is not one"); }
+        }
+    }
+    return Ok();
+}

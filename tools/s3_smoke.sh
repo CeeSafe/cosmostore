@@ -488,6 +488,45 @@ aws s3api delete-bucket --bucket acl-made > /dev/null 2>&1
 aws s3 rm --recursive s3://acl/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket acl > /dev/null 2>&1 && pass "delete-bucket with an ACL" || fail "delete-bucket with an ACL"
 
+# Object lock (ADR-0047): the bucket's configuration, retention and legal hold, what a locked version refuses, bypass.
+aws s3api create-bucket --bucket lock --object-lock-enabled-for-bucket > /dev/null 2>&1 || fail "create-bucket with object lock"
+check "versioning under object lock" "$(aws s3api get-bucket-versioning --bucket lock --query Status --output text)" Enabled
+check "get-object-lock-configuration" "$(aws s3api get-object-lock-configuration --bucket lock --query ObjectLockConfiguration.ObjectLockEnabled --output text)" Enabled
+check "no object lock configuration" "$(code s3api get-object-lock-configuration --bucket smoke)" ObjectLockConfigurationNotFoundError
+check "object lock without versioning" "$(code s3api put-object-lock-configuration --bucket smoke --object-lock-configuration ObjectLockEnabled=Enabled)" InvalidBucketState
+check "versioning suspended under object lock" "$(code s3api put-bucket-versioning --bucket lock --versioning-configuration Status=Suspended)" InvalidBucketState
+check "a lock in a bucket without object lock" "$(code s3api put-object --bucket smoke --key held.txt --body pub.txt --object-lock-legal-hold-status ON)" InvalidRequest
+lv=$(aws s3api put-object --bucket lock --key a.txt --body pub.txt --object-lock-mode GOVERNANCE --object-lock-retain-until-date 2040-01-01T00:00:00Z --query VersionId --output text)
+check "get-object-retention" "$(aws s3api get-object-retention --bucket lock --key a.txt --query '[Retention.Mode,Retention.RetainUntilDate]' --output text | cut -c1-21)" "GOVERNANCE	2040-01-01"
+check "the lock in a head" "$(aws s3api head-object --bucket lock --key a.txt --query ObjectLockMode --output text)" GOVERNANCE
+check "a locked version" "$(code s3api delete-object --bucket lock --key a.txt --version-id "$lv")" AccessDenied
+check "a locked version in delete-objects" "$(aws s3api delete-objects --bucket lock --delete '{"Objects":[{"Key":"a.txt","VersionId":"'"$lv"'"}]}' --query 'Errors[0].Code' --output text)" AccessDenied
+check "a delete marker over it" "$(aws s3api delete-object --bucket lock --key a.txt --query DeleteMarker)" true
+check "the version under the marker" "$(aws s3api get-object --bucket lock --key a.txt --version-id "$lv" got.txt > /dev/null 2>&1 && cat got.txt)" "public bytes"
+check "a retention shortened" "$(code s3api put-object-retention --bucket lock --key a.txt --version-id "$lv" --retention Mode=GOVERNANCE,RetainUntilDate=2030-01-01T00:00:00Z)" AccessDenied
+aws s3api put-object-retention --bucket lock --key a.txt --version-id "$lv" --retention Mode=GOVERNANCE,RetainUntilDate=2030-01-01T00:00:00Z --bypass-governance-retention > /dev/null 2>&1 && pass "shortened with a bypass" || fail "shortened with a bypass"
+check "the retention after it" "$(aws s3api get-object-retention --bucket lock --key a.txt --version-id "$lv" --query Retention.RetainUntilDate --output text | cut -c1-10)" 2030-01-01
+check "a retention in the past" "$(code s3api put-object-retention --bucket lock --key a.txt --version-id "$lv" --retention Mode=GOVERNANCE,RetainUntilDate=2020-01-01T00:00:00Z --bypass-governance-retention)" InvalidArgument
+check "no legal hold yet" "$(aws s3api get-object-legal-hold --bucket lock --key a.txt --version-id "$lv" --query LegalHold.Status --output text)" OFF
+aws s3api put-object-legal-hold --bucket lock --key a.txt --version-id "$lv" --legal-hold Status=ON > /dev/null 2>&1 || fail "put-object-legal-hold"
+check "get-object-legal-hold" "$(aws s3api get-object-legal-hold --bucket lock --key a.txt --version-id "$lv" --query LegalHold.Status --output text)" ON
+check "a held version, with a bypass" "$(code s3api delete-object --bucket lock --key a.txt --version-id "$lv" --bypass-governance-retention)" AccessDenied
+aws s3api put-object-legal-hold --bucket lock --key a.txt --version-id "$lv" --legal-hold Status=OFF > /dev/null 2>&1
+aws s3api delete-object --bucket lock --key a.txt --version-id "$lv" --bypass-governance-retention > /dev/null 2>&1 && pass "governance bypassed" || fail "governance bypassed"
+check "the version is gone" "$(code s3api get-object --bucket lock --key a.txt --version-id "$lv" got.txt)" NoSuchVersion
+aws s3api put-object-lock-configuration --bucket lock --object-lock-configuration 'ObjectLockEnabled=Enabled,Rule={DefaultRetention={Mode=GOVERNANCE,Days=1}}' > /dev/null 2>&1 || fail "put-object-lock-configuration"
+check "the default retention" "$(aws s3api get-object-lock-configuration --bucket lock --query 'ObjectLockConfiguration.Rule.DefaultRetention.[Mode,Days]' --output text | tr '\t' ' ')" "GOVERNANCE 1"
+dv=$(aws s3api put-object --bucket lock --key b.txt --body pub.txt --query VersionId --output text)
+check "a new object's default retention" "$(aws s3api get-object-retention --bucket lock --key b.txt --query Retention.Mode --output text)" GOVERNANCE
+check "the default keeps it" "$(code s3api delete-object --bucket lock --key b.txt --version-id "$dv")" AccessDenied
+check "a period that is none" "$(code s3api put-object-lock-configuration --bucket lock --object-lock-configuration 'ObjectLockEnabled=Enabled,Rule={DefaultRetention={Mode=GOVERNANCE,Days=0}}')" InvalidRetentionPeriod
+for kind in Versions DeleteMarkers; do
+    aws s3api list-object-versions --bucket lock --query "$kind[].[Key,VersionId]" --output text | while read -r key id; do
+        [ "$key" = None ] || aws s3api delete-object --bucket lock --key "$key" --version-id "$id" --bypass-governance-retention > /dev/null 2>&1
+    done
+done
+aws s3api delete-bucket --bucket lock > /dev/null 2>&1 && pass "delete-bucket once nothing is locked" || fail "delete-bucket once nothing is locked"
+
 # Encryption waits for a cipher (ADR-0046 §7): a request that asks for it is refused, not stored in the clear.
 check "SSE-S3 asked for" "$(code s3api put-object --bucket smoke --key sse.txt --body pub.txt --server-side-encryption AES256)" NotImplemented
 check "SSE-C asked for" "$(code s3api put-object --bucket smoke --key sse.txt --body pub.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901)" NotImplemented

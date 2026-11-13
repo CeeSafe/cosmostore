@@ -90,6 +90,13 @@ enum StoreError {
     NoSuchVersion,
     /// The version asked for is a delete marker: it has nothing to read.
     MethodNotAllowed,
+    /// The bucket's state does not allow the change: object lock needs versioning enabled, and keeps it so
+    /// (ADR-0047).
+    InvalidBucketState,
+    /// The version is under retention or a legal hold: it stays, and so does its retention.
+    ObjectLocked,
+    /// The bucket has no object lock configuration: its versions cannot be locked.
+    ObjectLockOff,
 }
 
 fn sio<T>(r: Result<T, IoFailure>) -> Result<T, StoreError> => match (r) {
@@ -129,6 +136,8 @@ struct BucketInfo {
     publicAccess: Vector<u8>;
     /// The bucket's ACL as it is stored; empty for the private one (ADR-0045).
     acl: Vector<u8>;
+    /// The object lock configuration as it is stored; empty for a bucket without object lock (ADR-0047).
+    objectLock: Vector<u8>;
 }
 
 /// Space use of one segment, for compaction (ADR-0005). `liveBytes` counts the records that
@@ -336,6 +345,8 @@ struct VersionPage {
 struct DeleteTarget {
     key: Vector<u8>;
     versionId: [u8; 16]?;
+    /// The request may remove a version under governance retention (ADR-0047 §4).
+    bypassGovernance: bool;
 }
 
 /// What a delete did, or staged (ADR-0041).
@@ -349,6 +360,8 @@ struct DeleteOutcome {
     versionId: [u8; 16]?;
     /// A delete marker was written, or the version removed was one.
     deleteMarker: bool;
+    /// The version named is under retention or a legal hold: nothing was written, and it stays (ADR-0047).
+    locked: bool;
 }
 
 /// One page of a listing: keys and rolled-up common prefixes, both in byte order.
@@ -602,8 +615,8 @@ fn applyRecord(
             let tags = m.tags;
             let generation = m.generation;
             let versionId = m.versionId;
-            // The record's second format sets the version's ACL (ADR-0045).
-            let field = if (m.acl) ACL_FIELD else TAGS_FIELD;
+            // The record's later formats set the version's ACL (ADR-0045) or lock (ADR-0047).
+            let field = setTagsField(m.format);
             match (state.index.findMut(borrow key, versionId)) {
                 Some(v) => {
                     if (v.lsn == generation) {
@@ -692,6 +705,7 @@ fn applyRecord(
                 policy: Vector<u8>.create(),
                 publicAccess: Vector<u8>.create(),
                 acl: Vector<u8>.create(),
+                objectLock: Vector<u8>.create(),
             };
             let _ = state.addBucket(name, info)?;
         }
@@ -716,6 +730,8 @@ fn applyRecord(
                         b.publicAccess = value;
                     } else if (configKind == BUCKET_CONFIG_ACL) {
                         b.acl = value;
+                    } else if (configKind == BUCKET_CONFIG_OBJECT_LOCK) {
+                        b.objectLock = value;
                     } else {
                         b.versioning = value[0]; // one valid byte: `decodeBucketConfigMeta` checked it
                     }
@@ -1607,7 +1623,7 @@ struct ObjectStore {
         key: StringView,
         id: [u8; 16]?,
         tags: Slice<u8>,
-    ) -> Result<void, StoreError> => this.setFieldOf(bucket, key, id, tags, false);
+    ) -> Result<void, StoreError> => this.setFieldOf(bucket, key, id, tags, META_FORMAT_VERSION);
 
     /// Sets the ACL of the current version, or of the version with the id, as `setTagsOf` sets tags: `acl` as it is
     /// stored, empty for the private one (ADR-0045). One SetTags record of the second format.
@@ -1619,7 +1635,7 @@ struct ObjectStore {
         acl: Slice<u8>,
     ) -> Result<void, StoreError> {
         if (!isAclValue(acl)) { return Err(StoreError.InvalidKey); }
-        return this.setFieldOf(bucket, key, id, acl, true);
+        return this.setFieldOf(bucket, key, id, acl, SET_ACL_FORMAT);
     }
 
     fn setFieldOf(
@@ -1628,9 +1644,9 @@ struct ObjectStore {
         key: StringView,
         id: [u8; 16]?,
         tags: Slice<u8>,
-        acl: bool,
+        format: u8,
     ) -> Result<void, StoreError> {
-        let field = if (acl) ACL_FIELD else TAGS_FIELD;
+        let field = setTagsField(format);
         this.commitStaged()?;
         this.checkWritable()?;
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
@@ -1660,8 +1676,8 @@ struct ObjectStore {
             null => { return Err(StoreError.NoSuchKey); }
         }
         this.scratch.clear();
-        if (acl) {
-            encodeSetAclMeta(mut this.scratch, bucket.bytes(), key.bytes(), versionId, generation, tags)?;
+        if (format != META_FORMAT_VERSION) {
+            encodeSetFieldMeta(mut this.scratch, format, bucket.bytes(), key.bytes(), versionId, generation, tags)?;
         } else {
             encodeSetTagsMeta(mut this.scratch, bucket.bytes(), key.bytes(), versionId, generation, tags)?;
         }
@@ -1916,7 +1932,11 @@ struct ObjectStore {
         versionId: [u8; 16],
         obj: borrow FinishedObject,
     ) -> Result<u64, StoreError> {
-        let rec = encodePut(bucket, key, contentType, metadata, extras, versionId, obj)?;
+        let locked = this.lockMetadata(bucket.bytes(), metadata)?;
+        let rec = match (locked) {
+            Some(m) => encodePut(bucket, key, contentType, m.view(), extras, versionId, obj)?,
+            null => encodePut(bucket, key, contentType, metadata, extras, versionId, obj)?,
+        };
         // A full segment rotates at a commit with nothing staged after it (ADR-0022).
         if (this.mustCommitBefore(borrow rec, obj)) { this.commitStaged()?; }
         return this.stageEncoded(rec, obj);
@@ -1934,9 +1954,83 @@ struct ObjectStore {
         versionId: [u8; 16],
         obj: borrow FinishedObject,
     ) -> Result<u64?, StoreError> {
-        let rec = encodePut(bucket, key, contentType, metadata, extras, versionId, obj)?;
+        let locked = this.lockMetadata(bucket.bytes(), metadata)?;
+        let rec = match (locked) {
+            Some(m) => encodePut(bucket, key, contentType, m.view(), extras, versionId, obj)?,
+            null => encodePut(bucket, key, contentType, metadata, extras, versionId, obj)?,
+        };
         if (this.mustCommitBefore(borrow rec, obj)) { return Ok(null); }
         return Ok(Some(this.stageEncoded(rec, obj)?));
+    }
+
+    /// A bucket's object lock configuration as it is stored; empty without one, or without the bucket.
+    fn lockConfigOf(borrow this, bucket: Slice<u8>) -> Result<Vector<u8>, StoreError> {
+        let k = BucketKey { name: copyBytes(bucket)? };
+        return Ok(match (this.state.buckets.get(borrow k)) {
+            Some(b) => copyBytes(b.objectLock.view())?,
+            null => Vector<u8>.create(),
+        });
+    }
+
+    /// The metadata a new version of `bucket` is written with, when it is not `metadata` as given (ADR-0047 §2): a
+    /// version that brings no lock gets the bucket's default retention, from now. ObjectLockOff for a lock in a
+    /// bucket without object lock.
+    fn lockMetadata(borrow this, bucket: Slice<u8>, metadata: Slice<u8>) -> Result<Vector<u8>?, StoreError> {
+        let config = this.lockConfigOf(bucket)?;
+        let given = metadataFind(metadata, LOCK_FIELD.bytes()).isSome();
+        if (config.length == 0) {
+            if (given) { return Err(StoreError.ObjectLockOff); }
+            return Ok(null);
+        }
+        if (given) { return Ok(null); }
+        let d = match (decodeLockConfig(config.view())) {
+            Some(d) => d,
+            null => { return Ok(null); }
+        };
+        if (d.mode == LOCK_NONE) { return Ok(null); }
+        var text = Vector<u8>.create();
+        encodeLock(
+            ObjectLock { mode: d.mode, until: lockDefaultUntil(d, Clock.unixMillis()), hold: false },
+            mut text,
+        )?;
+        return match (metadataReplace(metadata, LOCK_FIELD.bytes(), text.view())) {
+            Ok(m) => Ok(Some(m)),
+            Err(_) => Err(StoreError.DataCorrupt),
+        };
+    }
+
+    /// Changes the lock of the current version, or of the version with the id, in place (ADR-0047 §3): its
+    /// retention, its legal hold, or both. ObjectLockOff in a bucket without object lock; ObjectLocked for a
+    /// retention the version's own does not allow without `bypass`. One SetTags record of the third format.
+    fn setLockOf(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16]?,
+        retention: ObjectLock?,
+        hold: bool?,
+        bypass: bool,
+    ) -> Result<void, StoreError> {
+        this.commitStaged()?;
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        if (this.lockConfigOf(bucket.bytes())?.length == 0) { return Err(StoreError.ObjectLockOff); }
+        let info = this.headObjectOf(bucket, key, id)?;
+        var next = lockOfMetadata(info.metadata.view());
+        match (retention) {
+            Some(r) => {
+                if (!lockChangeAllowed(next, r, Clock.unixMillis(), bypass)) { return Err(StoreError.ObjectLocked); }
+                next.mode = r.mode;
+                next.until = if (r.mode == LOCK_NONE) 0 else r.until;
+            }
+            null => {}
+        }
+        match (hold) {
+            Some(h) => { next.hold = h; }
+            null => {}
+        }
+        var text = Vector<u8>.create();
+        encodeLock(next, mut text)?;
+        return this.setFieldOf(bucket, key, id, text.view(), SET_LOCK_FORMAT);
     }
 
     /// A bucket's versioning state; VERSIONING_OFF for a bucket that is not there.
@@ -2347,8 +2441,14 @@ struct ObjectStore {
         ObjectStore.checkKey(key)?;
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
+        let locks = this.lockConfigOf(bucket.bytes())?.length > 0;
         let kind = match (this.state.index.find(borrow k, versionId)) {
-            Some(v) => v.kind,
+            Some(v) => {
+                if (locks && lockHolds(lockOfMetadata(v.metadata.view()), Clock.unixMillis(), false)) {
+                    return Err(StoreError.ObjectLocked);
+                }
+                v.kind
+            }
             null => { return Ok(null); }
         };
         let _ = this.stageDeleteRecord(
@@ -2385,11 +2485,12 @@ struct ObjectStore {
         bucket: StringView,
         key: StringView,
         versionId: [u8; 16]?,
+        bypass: bool,
     ) -> Result<DeleteOutcome, StoreError> {
         this.checkWritable()?;
         ObjectStore.checkKey(key)?;
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
-        let target = DeleteTarget { key: copyBytes(key.bytes())?, versionId: versionId };
+        let target = DeleteTarget { key: copyBytes(key.bytes())?, versionId: versionId, bypassGovernance: bypass };
         let unpublished = this.pendingApplies.length > 0 || this.inflightApplies.length > 0;
         return this.stageTarget(bucket.bytes(), borrow target, Clock.unixMillis(), unpublished);
     }
@@ -2418,28 +2519,45 @@ struct ObjectStore {
             Some(id) => {
                 var found = false;
                 var marker = false;
+                var locked = false;
+                // A version is locked only in a bucket with object lock: no other pays for the look (ADR-0047 §6).
+                let locks = this.lockConfigOf(bucket)?.length > 0;
                 match (this.state.index.find(borrow k, id)) {
                     Some(v) => {
                         found = true;
                         marker = isDeleteMarker(v);
+                        locked = locks && lockHolds(lockOfMetadata(v.metadata.view()), now, target.bypassGovernance);
                     }
                     null => {}
                 }
                 var lsn: u64? = null;
+                // The version stays. Its id is 16 random bytes that only its published PUT has told: a version
+                // locked by a write still unpublished cannot be named here.
+                if (locked) {
+                    return Ok(
+                        DeleteOutcome { valid: true, lsn: null, versionId: id, deleteMarker: marker, locked: true },
+                    );
+                }
                 if (found || unpublished) {
                     lsn = this.stageDeleteRecord(RecordType.DeleteVersion, bucket, key, id, now)?;
                 }
-                return Ok(DeleteOutcome { valid: true, lsn: lsn, versionId: id, deleteMarker: marker });
+                return Ok(DeleteOutcome { valid: true, lsn: lsn, versionId: id, deleteMarker: marker, locked: false });
             }
             null => {}
         }
         if (versioning == VERSIONING_OFF) {
             var lsn: u64? = null;
             if (unpublished || this.state.current(borrow k).isSome()) { lsn = this.stageDelete(bucket, key, now)?; }
-            return Ok(DeleteOutcome { valid: true, lsn: lsn, versionId: null, deleteMarker: false });
+            return Ok(DeleteOutcome { valid: true, lsn: lsn, versionId: null, deleteMarker: false, locked: false });
         }
         let staged = this.stageDeleteOf(bucket, key, now)?;
-        return Ok(DeleteOutcome { valid: true, lsn: staged.lsn, versionId: staged.versionId, deleteMarker: true });
+        return Ok(DeleteOutcome {
+            valid: true,
+            lsn: staged.lsn,
+            versionId: staged.versionId,
+            deleteMarker: true,
+            locked: false,
+        });
     }
 
     /// `deleteObjects` for entries that may name versions (ADR-0041), telling what each did: one commit for all.
@@ -2465,7 +2583,9 @@ struct ObjectStore {
         for (i in 0..targets.length) {
             let key = targets[i].key.view();
             if (key.length == 0 || key.length > MAX_KEY_BYTES) {
-                out.push(DeleteOutcome { valid: false, lsn: null, versionId: null, deleteMarker: false })?;
+                out.push(
+                    DeleteOutcome { valid: false, lsn: null, versionId: null, deleteMarker: false, locked: false },
+                )?;
                 continue;
             }
             match (this.stageTarget(bucket, borrow targets[i], now, unpublished)) {
@@ -2823,6 +2943,12 @@ struct ObjectStore {
             if (expected.length > 0 && expected != extras.value.view()) { return Err(StoreError.BadDigest); }
             extras.encode(mut extrasBlob)?;
             encodeManifest(mut manifest, extents.view())?;
+            // The lock the upload was created with, or the bucket's default from now (ADR-0047 §2).
+            let lockedMetadata = this.lockMetadata(bucket.bytes(), u.metadata.view())?;
+            let objectMetadata = match (lockedMetadata) {
+                Some(m) => m,
+                null => copyBytes(u.metadata.view())?,
+            };
             encodeUploadCompleteMeta(
                 mut meta,
                 bucket.bytes(),
@@ -2832,7 +2958,7 @@ struct ObjectStore {
                 size,
                 multipartEtag(md5s.view()),
                 u.contentType.view(),
-                u.metadata.view(),
+                objectMetadata.view(),
                 id,
                 truncate<u32>(chosen.length),
                 extrasBlob.view(),
@@ -3589,7 +3715,17 @@ struct ObjectStore {
         }
         if (kind == BUCKET_CONFIG_PUBLIC_ACCESS && !isPublicAccessValue(value)) { return Err(StoreError.InvalidKey); }
         if (kind == BUCKET_CONFIG_ACL && !isAclValue(value)) { return Err(StoreError.InvalidKey); }
-        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_ACL) { return Err(StoreError.InvalidKey); }
+        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_OBJECT_LOCK) { return Err(StoreError.InvalidKey); }
+        // Object lock needs versioning enabled, keeps it so, and is never taken off a bucket (ADR-0047 §1).
+        let locks = this.lockConfigOf(bucket.bytes())?.length > 0;
+        if (kind == BUCKET_CONFIG_OBJECT_LOCK) {
+            if (value.length == 0) { return Err(if (locks) StoreError.InvalidBucketState else StoreError.InvalidKey); }
+            if (decodeLockConfig(value).isNull()) { return Err(StoreError.InvalidKey); }
+            if (this.versioningOf(bucket.bytes())? != VERSIONING_ENABLED) { return Err(StoreError.InvalidBucketState); }
+        }
+        if (kind == BUCKET_CONFIG_VERSIONING && locks && value[0] != VERSIONING_ENABLED) {
+            return Err(StoreError.InvalidBucketState);
+        }
         this.scratch.clear();
         encodeBucketConfigMeta(mut this.scratch, bucket.bytes(), kind, value)?;
         let empty = [0u8; 1];
@@ -3611,6 +3747,7 @@ struct ObjectStore {
                 if (kind == BUCKET_CONFIG_POLICY) { return Ok(copyBytes(b.policy.view())?); }
                 if (kind == BUCKET_CONFIG_PUBLIC_ACCESS) { return Ok(copyBytes(b.publicAccess.view())?); }
                 if (kind == BUCKET_CONFIG_ACL) { return Ok(copyBytes(b.acl.view())?); }
+                if (kind == BUCKET_CONFIG_OBJECT_LOCK) { return Ok(copyBytes(b.objectLock.view())?); }
                 Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?)
             }
             null => Err(StoreError.NoSuchBucket),
@@ -3686,7 +3823,7 @@ struct ObjectStore {
                     // The current object: deleted, or put under a delete marker, by a DELETE without a version id.
                     if (head.mtimeMillis <= cut.current &&
                         lifecycleTakes(rules.view(), name, head, false, 0, head.mtimeMillis, nowMillis)) {
-                        targets.push(DeleteTarget { key: copyBytes(name)?, versionId: null })?;
+                        targets.push(DeleteTarget { key: copyBytes(name)?, versionId: null, bypassGovernance: false })?;
                         objects += 1;
                         nullReplaced = suspended;
                     }
@@ -3694,7 +3831,11 @@ struct ObjectStore {
                     // A delete marker that is all its key has.
                     if ((cut.markers || head.mtimeMillis <= cut.current) &&
                         lifecycleTakesLoneMarker(rules.view(), name, head.mtimeMillis, nowMillis)) {
-                        targets.push(DeleteTarget { key: copyBytes(name)?, versionId: head.versionId })?;
+                        targets.push(DeleteTarget {
+                            key: copyBytes(name)?,
+                            versionId: head.versionId,
+                            bypassGovernance: false,
+                        })?;
                         markers += 1;
                     }
                 }
@@ -3706,9 +3847,15 @@ struct ObjectStore {
                     // Not the null version this run's null marker replaces: a delete of the null id after that
                     // marker in the batch would remove the marker.
                     let replaced = nullReplaced && isNullVersionId(v.versionId);
-                    if (!replaced && since <= cut.noncurrent &&
+                    // A version under retention or a legal hold stays until that ends (ADR-0047 §4).
+                    let held = lockHolds(lockOfMetadata(v.metadata.view()), nowMillis, false);
+                    if (!replaced && !held && since <= cut.noncurrent &&
                         lifecycleTakes(rules.view(), name, v, true, newer, since, nowMillis)) {
-                        targets.push(DeleteTarget { key: copyBytes(name)?, versionId: v.versionId })?;
+                        targets.push(DeleteTarget {
+                            key: copyBytes(name)?,
+                            versionId: v.versionId,
+                            bypassGovernance: false,
+                        })?;
                         versions += 1;
                     }
                     since = v.mtimeMillis;

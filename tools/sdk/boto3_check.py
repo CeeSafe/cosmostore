@@ -352,6 +352,50 @@ check("anonymous list after private", code_of(lambda: anonymous.list_objects_v2(
 boto3.resource("s3", endpoint_url=endpoint).Bucket(A).object_versions.all().delete()
 s3.delete_bucket(Bucket=A)
 
+# Object lock (ADR-0047): retention and legal hold on versions, the default retention, copies and multipart uploads.
+import datetime
+L = "boto3-lock"
+far = datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc)
+s3.create_bucket(Bucket=L, ObjectLockEnabledForBucket=True)
+check("versioning under object lock", s3.get_bucket_versioning(Bucket=L)["Status"], "Enabled")
+check("the lock configuration", s3.get_object_lock_configuration(Bucket=L)["ObjectLockConfiguration"], {"ObjectLockEnabled": "Enabled"})
+kept = s3.put_object(Bucket=L, Key="kept", Body=b"kept", ObjectLockMode="GOVERNANCE", ObjectLockRetainUntilDate=far)["VersionId"]
+head = s3.head_object(Bucket=L, Key="kept")
+check("the lock in a head", (head["ObjectLockMode"], head["ObjectLockRetainUntilDate"]), ("GOVERNANCE", far))
+check("a locked version", code_of(lambda: s3.delete_object(Bucket=L, Key="kept", VersionId=kept)), "AccessDenied")
+check("a retention shortened", code_of(lambda: s3.put_object_retention(Bucket=L, Key="kept", VersionId=kept,
+      Retention={"Mode": "GOVERNANCE", "RetainUntilDate": datetime.datetime(2030, 1, 1, tzinfo=datetime.timezone.utc)})), "AccessDenied")
+longer = datetime.datetime(2041, 1, 1, tzinfo=datetime.timezone.utc)
+s3.put_object_retention(Bucket=L, Key="kept", VersionId=kept, Retention={"Mode": "GOVERNANCE", "RetainUntilDate": longer})
+check("a retention made longer", s3.get_object_retention(Bucket=L, Key="kept", VersionId=kept)["Retention"], {"Mode": "GOVERNANCE", "RetainUntilDate": longer})
+s3.copy_object(Bucket=L, Key="copy", CopySource={"Bucket": L, "Key": "kept"})
+check("a copy has no lock", code_of(lambda: s3.get_object_retention(Bucket=L, Key="copy")), "NoSuchObjectLockConfiguration")
+s3.put_object_legal_hold(Bucket=L, Key="copy", LegalHold={"Status": "ON"})
+check("the hold in a head", s3.head_object(Bucket=L, Key="copy")["ObjectLockLegalHoldStatus"], "ON")
+copy_version = s3.head_object(Bucket=L, Key="copy")["VersionId"]
+check("a held version, with a bypass", code_of(lambda: s3.delete_object(Bucket=L, Key="copy", VersionId=copy_version, BypassGovernanceRetention=True)), "AccessDenied")
+s3.put_object_legal_hold(Bucket=L, Key="copy", LegalHold={"Status": "OFF"})
+check("the hold taken off", s3.get_object_legal_hold(Bucket=L, Key="copy")["LegalHold"]["Status"], "OFF")
+s3.put_object_lock_configuration(Bucket=L, ObjectLockConfiguration={"ObjectLockEnabled": "Enabled",
+    "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Years": 1}}})
+check("the default retention", s3.get_object_lock_configuration(Bucket=L)["ObjectLockConfiguration"]["Rule"]["DefaultRetention"], {"Mode": "GOVERNANCE", "Years": 1})
+upload = s3.create_multipart_upload(Bucket=L, Key="parts")["UploadId"]
+etag = s3.upload_part(Bucket=L, Key="parts", UploadId=upload, PartNumber=1, Body=b"part")["ETag"]
+parts = s3.complete_multipart_upload(Bucket=L, Key="parts", UploadId=upload, MultipartUpload={"Parts": [{"ETag": etag, "PartNumber": 1}]})["VersionId"]
+check("an upload's default retention", s3.get_object_retention(Bucket=L, Key="parts")["Retention"]["Mode"], "GOVERNANCE")
+errors = s3.delete_objects(Bucket=L, Delete={"Objects": [{"Key": "parts", "VersionId": parts}, {"Key": "copy", "VersionId": copy_version}]})
+check("delete_objects, one locked", ([e["Code"] for e in errors.get("Errors", [])], [d["Key"] for d in errors.get("Deleted", [])]), (["AccessDenied"], ["copy"]))
+check("versioning suspended under object lock", code_of(lambda: s3.put_bucket_versioning(Bucket=L, VersioningConfiguration={"Status": "Suspended"})), "InvalidBucketState")
+s3.create_bucket(Bucket=L + "-off")
+check("a lock in a bucket without object lock", code_of(lambda: s3.put_object(Bucket=L + "-off", Key="held", Body=b"x", ObjectLockLegalHoldStatus="ON")), "InvalidRequest")
+check("object lock without versioning", code_of(lambda: s3.put_object_lock_configuration(Bucket=L + "-off", ObjectLockConfiguration={"ObjectLockEnabled": "Enabled"})), "InvalidBucketState")
+s3.delete_bucket(Bucket=L + "-off")
+for kind in ("Versions", "DeleteMarkers"):
+    for v in s3.list_object_versions(Bucket=L).get(kind, []):
+        s3.delete_object(Bucket=L, Key=v["Key"], VersionId=v["VersionId"], BypassGovernanceRetention=True)
+s3.delete_bucket(Bucket=L)
+check("the lock bucket deleted", code_of(lambda: s3.head_bucket(Bucket=L)), "404")
+
 check("wrong secret", code_of(lambda: boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
                                                        aws_secret_access_key="wrong").list_buckets()),
       "SignatureDoesNotMatch")

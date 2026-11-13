@@ -1824,3 +1824,38 @@ Browser form uploads with a SigV4 POST policy.
   encryption, the response fields. All after G33.
 - **Next:** when lib/std has the cipher, the rest of ADR-0046. Meanwhile M5 item 5 (Object Lock and legal hold)
   does not depend on it; and the p99 gate for item 3 is still owed, on a quiet machine.
+
+### 13 Nov 2026: M5 item 5, object lock and legal hold (ADR-0047)
+
+- **Chosen with the user** (yes, 13 Nov, to starting it while G33 holds item 4).
+- **A bucket's configuration** is `BucketConfig` kind 7 (`E`, or `E.G.d30`, `E.C.y2` with a default retention;
+  checkpoint format 10, formats 1 to 9 load). It needs versioning enabled, keeps it enabled and is never taken
+  off: the store refuses, whoever asks (InvalidBucketState).
+- **A version's lock** is the `x-amz-object-lock` field of its metadata (mode, legal hold, the time the retention
+  ends), given by the request's fields or the bucket's default as the store stages the version, and changed in
+  place by a SetTags record of a third format. Compliance only grows; governance grows in its own mode, and
+  changes otherwise only with the bypass.
+- **Enforced where a version's removal is staged** (`stageTarget`, `deleteVersion`): a delete that names a locked
+  version is not staged (AccessDenied; an entry of DeleteObjects, the others going on), a lifecycle rule leaves it
+  until its retention ends, a delete without an id writes a marker over it. Why staging is the place: ADR-0047 §4.
+- **Calls:** Get- and PutObjectLockConfiguration, Get- and PutObjectRetention, Get- and PutObjectLegalHold,
+  `x-amz-bucket-object-lock-enabled` on CreateBucket, the `x-amz-object-lock-*` fields on PutObject, CopyObject
+  and CreateMultipartUpload, `x-amz-bypass-governance-retention` (with `s3:BypassGovernanceRetention`), and the
+  lock in GET and HEAD. Seven policy actions.
+- **Two things the Ceph tests found:** an error entry of DeleteObjects did not name the version it was asked to
+  remove (their cleanup reads it, and one failure had taken 56 later tests with it); and changing a governance
+  retention to compliance needs the bypass, which the first rule let through.
+- **Tests (6 new, 194 in all, no leaks):** in the store, the configuration and its refusals through recovery and
+  a format 10 checkpoint; a locked version by all three delete paths, the bypass, every change of a retention,
+  the hold, recovery; lifecycle leaving a locked noncurrent version until its retention ends; the lock's text
+  form and the field found in a blob cut at every byte. Over S3, the request's fields and the three documents.
+- **Clients:** `tools/s3_smoke.sh` 273 checks (26 new), boto3 131 (17 new: a copy, a multipart upload,
+  DeleteObjects), the s3-tests subset 364 (496 in scope, 376 pass): all 39 `test_object_lock_*` tests. They were
+  in scope all along, since the tests carry no `object_lock` marker; the name is gone from the script's list.
+- **Not done:** the object lock fields of a POST form. Compliance retention is in the unit tests only: a client
+  script that made one could not clean up after itself.
+- **Not run:** the p99 gate (owed since item 3; a PUT now looks up its bucket's lock configuration, one more
+  lookup of the kind versioning already makes), the rclone, Go, JavaScript, Java and .NET scripts,
+  `tools/tls_smoke.sh`, and a fault sweep (the new records go through the commits that were swept).
+- **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
+- **Next:** M5 item 6, notifications through a durable outbox; item 4's rest when G33 is fixed.
