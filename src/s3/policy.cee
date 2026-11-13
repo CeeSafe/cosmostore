@@ -982,8 +982,7 @@ fn isListingAction(action: StringView) -> bool => action == "s3:ListBucket" || a
 enum PolicyGate {
     /// Nothing to read: a key, and no policy has a Deny.
     Open,
-    /// Anonymous, and no bucket has a policy (nothing to read), or this bucket's public policy is restricted by its
-    /// public-access block (ADR-0044 §3).
+    /// Anonymous, and this bucket's public policy is restricted by its public-access block (ADR-0044 §3).
     Closed,
     /// The bucket has no policy, or is not there.
     Absent,
@@ -992,77 +991,119 @@ enum PolicyGate {
     Broken,
 }
 
-/// The bucket's policy, as a request by `who` needs it (ADR-0043 §8).
-async fn policyGate(app: borrow S3App, who: borrow Requester, bucket: StringView) -> Result<PolicyGate, S3Fail> {
-    if (who.key.isSome()) {
-        if (app.denyBuckets.load() == 0) { return Ok(PolicyGate.Open); }
-    } else if (app.policyBuckets.load() == 0) {
-        return Ok(PolicyGate.Closed);
+/// What a request's checks need of its bucket, read once: its policy, and for an anonymous request its ACL.
+struct AccessGate {
+    policy: PolicyGate;
+    /// The bucket's ACL as an anonymous request meets it (ADR-0045 §4): the private one for a key's request, which
+    /// needs none, and under `IgnorePublicAcls`.
+    acl: [u8; 3];
+    /// The bucket's public-access block has `IgnorePublicAcls`: its objects' ACLs open nothing either.
+    ignoreAcls: bool;
+}
+
+/// The bucket's policy and ACL, as a request by `who` needs them (ADR-0043 §8, ADR-0045 §6).
+async fn policyGate(app: borrow S3App, who: borrow Requester, bucket: StringView) -> Result<AccessGate, S3Fail> {
+    var gate = AccessGate { policy: PolicyGate.Absent, acl: privateAcl(), ignoreAcls: false };
+    let anonymous = who.key.isNull();
+    if (!anonymous && app.denyBuckets.load() == 0) {
+        gate.policy = PolicyGate.Open;
+        return Ok(gate);
     }
     var document = Vector<u8>.create();
     var block = Vector<u8>.create();
+    var acl = Vector<u8>.create();
     {
         var guard = await lockStore(app)?;
         let store = guard.data();
         // Index lookups and copies: on the event loop.
         match (store.bucketConfig(bucket, BUCKET_CONFIG_POLICY)) {
             Ok(d) => { document = d; }
-            Err(_) => { return Ok(PolicyGate.Absent); }
+            Err(_) => { return Ok(gate); } // no such bucket
         }
-        if (document.length > 0 && who.key.isNull()) {
+        if (anonymous) {
             match (store.bucketConfig(bucket, BUCKET_CONFIG_PUBLIC_ACCESS)) {
                 Ok(b) => { block = b; }
-                Err(_) => { return Ok(PolicyGate.Absent); }
+                Err(_) => { return Ok(gate); }
+            }
+            match (store.bucketConfig(bucket, BUCKET_CONFIG_ACL)) {
+                Ok(a) => { acl = a; }
+                Err(_) => { return Ok(gate); }
             }
         }
     }
-    if (document.length == 0) { return Ok(PolicyGate.Absent); }
+    gate.ignoreAcls = publicAccessHas(block.view(), PUBLIC_ACCESS_IGNORE_ACLS);
+    if (!gate.ignoreAcls) { gate.acl = aclOf(acl.view()); }
+    if (document.length == 0) { return Ok(gate); }
     let policy = match (parseBucketPolicy(document.view(), bucket.bytes(), app.credentials.view(), false)) {
         Ok(p) => p,
         Err(S3Fail.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
-        Err(_) => { return Ok(PolicyGate.Broken); }
+        Err(_) => {
+            gate.policy = PolicyGate.Broken;
+            return Ok(gate);
+        }
     };
     // RestrictPublicBuckets: a public policy opens nothing to a requester outside the account (ADR-0044 §3).
     if (publicAccessHas(block.view(), PUBLIC_ACCESS_RESTRICT_BUCKETS) && policyIsPublic(borrow policy)) {
-        return Ok(PolicyGate.Closed);
+        gate.policy = PolicyGate.Closed;
+        return Ok(gate);
     }
-    return Ok(PolicyGate.Read(policy));
+    gate.policy = PolicyGate.Read(policy);
+    return Ok(gate);
 }
 
-/// Whether the gate lets `who` do `action` on `bucket` or `bucket/key` (`key` empty: the bucket).
-fn gateAllows(
+/// What the bucket's policy and ACL say of `who` doing `action` on `bucket` or `bucket/key` (`key` empty: the
+/// bucket). Neither: an anonymous request that only the object's own ACL could still let in (ADR-0045 §4).
+fn gateDecision(
     app: borrow S3App,
-    gate: borrow PolicyGate,
+    gate: borrow AccessGate,
     req: borrow S3Request,
     who: borrow Requester,
     action: StringView,
     bucket: StringView,
     key: Slice<u8>,
-) -> Result<bool, AllocError> {
+) -> Result<PolicyDecision, AllocError> {
     let anonymous = who.key.isNull();
-    if (isPolicyAction(action)) { return Ok(!anonymous); }
-    let policy = match (gate) {
-        PolicyGate.Open => { return Ok(true); }
-        PolicyGate.Closed | PolicyGate.Broken => { return Ok(false); }
-        PolicyGate.Absent => { return Ok(!anonymous); }
-        PolicyGate.Read(p) => p,
-    };
-    var resource = copyBytes(bucket.bytes())?;
-    if (key.length > 0) {
-        resource.push('/')?;
-        resource.extend(key)?;
+    if (isPolicyAction(action)) { return Ok(if (anonymous) PolicyDecision.Deny else PolicyDecision.Allow); }
+    match (borrow gate.policy) {
+        PolicyGate.Open => { return Ok(PolicyDecision.Allow); }
+        PolicyGate.Closed | PolicyGate.Broken => { return Ok(PolicyDecision.Deny); }
+        PolicyGate.Absent => {}
+        PolicyGate.Read(policy) => {
+            var resource = copyBytes(bucket.bytes())?;
+            if (key.length > 0) {
+                resource.push('/')?;
+                resource.extend(key)?;
+            }
+            let facts = policyFacts(req, isListingAction(action), app.secure, who.peer)?;
+            let principal = match (who.key) {
+                Some(i) => Some(app.credentials[i].accessKey.view()),
+                null => null,
+            };
+            match (decidePolicy(policy, principal, action, resource.view(), borrow facts)) {
+                PolicyDecision.Deny => { return Ok(PolicyDecision.Deny); }
+                PolicyDecision.Allow => { return Ok(PolicyDecision.Allow); }
+                PolicyDecision.Neither => {}
+            }
+        }
     }
-    let facts = policyFacts(req, isListingAction(action), app.secure, who.peer)?;
-    let principal = match (who.key) {
-        Some(i) => Some(app.credentials[i].accessKey.view()),
-        null => null,
-    };
-    return Ok(match (decidePolicy(policy, principal, action, resource.view(), borrow facts)) {
-        PolicyDecision.Deny => false,
-        PolicyDecision.Allow => true,
-        PolicyDecision.Neither => !anonymous,
-    });
+    // No statement applies: a key may, and an anonymous request may do what the bucket's ACL grants everyone.
+    if (!anonymous || aclGrants(gate.acl[ACL_ALL_USERS], bucketAclNeed(action))) { return Ok(PolicyDecision.Allow); }
+    return Ok(PolicyDecision.Neither);
 }
+
+/// Whether the gate lets `who` do `action` on `bucket` or `bucket/key`, by the bucket's policy and ACL alone.
+fn gateAllows(
+    app: borrow S3App,
+    gate: borrow AccessGate,
+    req: borrow S3Request,
+    who: borrow Requester,
+    action: StringView,
+    bucket: StringView,
+    key: Slice<u8>,
+) -> Result<bool, AllocError> => Ok(match (gateDecision(app, gate, req, who, action, bucket, key)?) {
+    PolicyDecision.Allow => true,
+    _ => false,
+});
 
 /// AccessDenied unless `who` may do `action` on `bucket` or `bucket/key` (ADR-0043 §4).
 async fn authorize(
@@ -1072,11 +1113,33 @@ async fn authorize(
     action: StringView,
     bucket: StringView,
     key: Slice<u8>,
+) -> Result<void, S3Fail> => await authorizeVersion(app, req, who, action, bucket, key, null);
+
+/// `authorize`, for the version `versionId` of the key when the action is on one: an anonymous request that the
+/// bucket's policy and ACL neither let in nor refuse may do what the version's own ACL grants everyone
+/// (ADR-0045 §4).
+async fn authorizeVersion(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    action: StringView,
+    bucket: StringView,
+    key: Slice<u8>,
+    versionId: [u8; 16]?,
 ) -> Result<void, S3Fail> {
     if (who.key.isSome() && (app.denyBuckets.load() == 0 || isPolicyAction(action))) { return Ok(); }
     let gate = await policyGate(app, who, bucket)?;
-    if (!gateAllows(app, borrow gate, req, who, action, bucket, key)?) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
-    return Ok();
+    match (gateDecision(app, borrow gate, req, who, action, bucket, key)?) {
+        PolicyDecision.Allow => { return Ok(); }
+        PolicyDecision.Deny => { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+        PolicyDecision.Neither => {}
+    }
+    let need = objectAclNeed(action);
+    if (need != 0 && key.length > 0 && !gate.ignoreAcls) {
+        let acl = await storeObjectAcl(app, bucket, key, versionId)?;
+        if (aclGrants(acl[ACL_ALL_USERS], need)) { return Ok(); }
+    }
+    return Err(S3Fail.Code(S3Code.AccessDenied));
 }
 
 /// `authorize` for the request's own object, with the action's version form when it names a version.
@@ -1087,8 +1150,9 @@ async fn authorizeObject(
     action: StringView,
     versionAction: StringView,
 ) -> Result<void, S3Fail> {
-    let named = if (req.hasParam("versionId")) versionAction else action;
-    return await authorize(app, req, who, named, req.bucket.view(), req.key.view().bytes());
+    let versionId = requestVersion(req)?;
+    let named = if (versionId.isSome()) versionAction else action;
+    return await authorizeVersion(app, req, who, named, req.bucket.view(), req.key.view().bytes(), versionId);
 }
 
 /// The counts of ADR-0043 §8, made again from the store: buckets with a policy, and those whose policy has a Deny
@@ -1189,6 +1253,14 @@ async fn getBucketPolicyStatus(
             Ok(p) => { isPublic = policyIsPublic(borrow p); }
             Err(S3Fail.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
             Err(_) => {} // a stored policy that does not parse opens nothing (ADR-0043 §9)
+        }
+    }
+    // A public ACL makes the bucket public too, unless the block has it ignored (ADR-0045 §5).
+    if (!isPublic) {
+        let acl = await storeBucketConfig(app, bucket, BUCKET_CONFIG_ACL)?;
+        if (aclIsPublic(aclOf(acl.view()))) {
+            let block = await storeBucketConfig(app, bucket, BUCKET_CONFIG_PUBLIC_ACCESS)?;
+            isPublic = !publicAccessHas(block.view(), PUBLIC_ACCESS_IGNORE_ACLS);
         }
     }
     var body = Vector<u8>.create();

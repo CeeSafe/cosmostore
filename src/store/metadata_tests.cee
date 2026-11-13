@@ -133,3 +133,116 @@ fn tagsChangeInPlace() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+fn aclOfKey(s: borrow ObjectStore, key: StringView) -> Vector<u8> =>
+    metadataValue(s.headObject("bkt", key)!.metadata.view(), ACL_FIELD.bytes())!;
+
+/// A version's ACL (ADR-0045) changes in place as its tags do, by a SetTags record of the second format: the
+/// version, its tags and its other fields stay, through recovery and a checkpoint; an overwrite starts private.
+@test
+fn aclChangesInPlace() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("object-acl");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("bkt")!;
+        var meta = Vector<u8>.create();
+        metadataAdd(mut meta, "x-amz-meta-a".bytes(), "1".bytes())!;
+        metadataAdd(mut meta, ACL_FIELD.bytes(), "PA@".bytes())!; // public-read, as a PUT with x-amz-acl stores it
+        var w = s.newWriter()!;
+        w.write("open".bytes())!;
+        let obj = w.finish()!;
+        let generation = s.putFinishedWith(
+            "bkt",
+            "k",
+            "",
+            meta.view(),
+            "".bytes(),
+            borrow obj,
+            PutCondition.None,
+        )!.generation;
+        Check.equalBytes("PA@".bytes(), aclOfKey(borrow s, "k").view())?;
+        s.setTags("bkt", "k", "team=red".bytes())!;
+        s.setAclOf("bkt", "k", null, "PC@".bytes())!;
+        let info = s.headObject("bkt", "k")!;
+        Check.equalU64(generation, info.generation)?;
+        Check.equalBytes("1".bytes(), metadataValue(info.metadata.view(), "x-amz-meta-a".bytes())!.view())?;
+        Check.equalBytes("team=red".bytes(), tagsOf(borrow s, "k").view())?;
+        Check.equalBytes("PC@".bytes(), aclOfKey(borrow s, "k").view())?;
+        match (s.setAclOf("bkt", "missing", null, "PA@".bytes())) {
+            Err(StoreError.NoSuchKey) => {}
+            _ => { return Check.fail("an ACL on a missing key"); }
+        }
+        match (s.setAclOf("bkt", "k", null, "PA".bytes())) {
+            Err(StoreError.InvalidKey) => {}
+            _ => { return Check.fail("an ACL of two characters"); }
+        }
+        match (s.setAclOf("bkt", "k", null, "P`@".bytes())) {
+            Err(StoreError.InvalidKey) => {}
+            _ => { return Check.fail("a permission there is not"); }
+        }
+        putText(mut s, "bkt", "plain", "x");
+        s.setAclOf("bkt", "plain", null, "PA@".bytes())!;
+        s.setAclOf("bkt", "plain", null, "".bytes())!; // private again
+        Check.equalU64(0, aclOfKey(borrow s, "plain").length as u64)?;
+    }
+    for (round in 0..3) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        if (round < 2) {
+            Check.equalBytes("PC@".bytes(), aclOfKey(borrow s, "k").view())?;
+            Check.equalBytes("team=red".bytes(), tagsOf(borrow s, "k").view())?;
+            Check.equalU64(0, aclOfKey(borrow s, "plain").length as u64)?;
+        } else {
+            Check.equalU64(0, aclOfKey(borrow s, "k").length as u64)?;
+        }
+        if (round == 0) { let _ = s.checkpoint()!; }
+        if (round == 1) { putText(mut s, "bkt", "k", "overwritten"); }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// A bucket's ACL (ADR-0045): through recovery from the journal and from a format 9 checkpoint, made private again,
+/// and gone with its bucket.
+@test
+fn bucketAclSurvivesAndGoesWithTheBucket() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("bucket-acl");
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createBucket("open")!;
+        s.createBucket("shut")!;
+        s.setBucketConfig("open", BUCKET_CONFIG_ACL, "PC@".bytes())!;
+        s.setBucketConfig("shut", BUCKET_CONFIG_ACL, "P@A".bytes())!;
+        match (s.setBucketConfig("shut", BUCKET_CONFIG_ACL, "public".bytes())) {
+            Err(StoreError.InvalidKey) => {}
+            _ => { return Check.fail("an ACL that is not three characters"); }
+        }
+        match (s.setBucketConfig("shut", 7, "x".bytes())) {
+            Err(StoreError.InvalidKey) => {}
+            _ => { return Check.fail("a kind of configuration there is not"); }
+        }
+    }
+    for (round in 0..3) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.equalBytes("PC@".bytes(), s.bucketConfig("open", BUCKET_CONFIG_ACL)!.view())?;
+        let shut = s.bucketConfig("shut", BUCKET_CONFIG_ACL)!;
+        if (round < 2) {
+            Check.equalBytes("P@A".bytes(), shut.view())?;
+        } else {
+            Check.equalU64(0, shut.length as u64)?;
+        }
+        if (round == 0) { let _ = s.checkpoint()!; } // format 9 holds the ACLs
+        if (round == 1) {
+            s.setBucketConfig("shut", BUCKET_CONFIG_ACL, "".bytes())!;
+            let _ = s.checkpoint()!;
+        }
+    }
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.deleteBucket("open")!;
+        s.createBucket("open")!;
+    }
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(0, s.bucketConfig("open", BUCKET_CONFIG_ACL)!.length as u64)?; // a new bucket starts private
+    removeTree(dir.view());
+    return Ok();
+}

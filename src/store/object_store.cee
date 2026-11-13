@@ -127,6 +127,8 @@ struct BucketInfo {
     policy: Vector<u8>;
     /// The public-access block: empty for none, or one byte of the PUBLIC_ACCESS bits (ADR-0044).
     publicAccess: Vector<u8>;
+    /// The bucket's ACL as it is stored; empty for the private one (ADR-0045).
+    acl: Vector<u8>;
 }
 
 /// Space use of one segment, for compaction (ADR-0005). `liveBytes` counts the records that
@@ -600,10 +602,12 @@ fn applyRecord(
             let tags = m.tags;
             let generation = m.generation;
             let versionId = m.versionId;
+            // The record's second format sets the version's ACL (ADR-0045).
+            let field = if (m.acl) ACL_FIELD else TAGS_FIELD;
             match (state.index.findMut(borrow key, versionId)) {
                 Some(v) => {
                     if (v.lsn == generation) {
-                        v.metadata = match (metadataReplace(v.metadata.view(), TAGS_FIELD.bytes(), tags.view())) {
+                        v.metadata = match (metadataReplace(v.metadata.view(), field.bytes(), tags.view())) {
                             Ok(b) => b,
                             Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
                         };
@@ -687,6 +691,7 @@ fn applyRecord(
                 versioning: VERSIONING_OFF,
                 policy: Vector<u8>.create(),
                 publicAccess: Vector<u8>.create(),
+                acl: Vector<u8>.create(),
             };
             let _ = state.addBucket(name, info)?;
         }
@@ -709,6 +714,8 @@ fn applyRecord(
                         b.policy = value;
                     } else if (configKind == BUCKET_CONFIG_PUBLIC_ACCESS) {
                         b.publicAccess = value;
+                    } else if (configKind == BUCKET_CONFIG_ACL) {
+                        b.acl = value;
                     } else {
                         b.versioning = value[0]; // one valid byte: `decodeBucketConfigMeta` checked it
                     }
@@ -1600,7 +1607,30 @@ struct ObjectStore {
         key: StringView,
         id: [u8; 16]?,
         tags: Slice<u8>,
+    ) -> Result<void, StoreError> => this.setFieldOf(bucket, key, id, tags, false);
+
+    /// Sets the ACL of the current version, or of the version with the id, as `setTagsOf` sets tags: `acl` as it is
+    /// stored, empty for the private one (ADR-0045). One SetTags record of the second format.
+    fn setAclOf(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16]?,
+        acl: Slice<u8>,
     ) -> Result<void, StoreError> {
+        if (!isAclValue(acl)) { return Err(StoreError.InvalidKey); }
+        return this.setFieldOf(bucket, key, id, acl, true);
+    }
+
+    fn setFieldOf(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16]?,
+        tags: Slice<u8>,
+        acl: bool,
+    ) -> Result<void, StoreError> {
+        let field = if (acl) ACL_FIELD else TAGS_FIELD;
         this.commitStaged()?;
         this.checkWritable()?;
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
@@ -1621,7 +1651,7 @@ struct ObjectStore {
             Some(v) => {
                 generation = v.lsn;
                 versionId = v.versionId;
-                let next = match (metadataReplace(v.metadata.view(), TAGS_FIELD.bytes(), tags)) {
+                let next = match (metadataReplace(v.metadata.view(), field.bytes(), tags)) {
                     Ok(b) => b,
                     Err(_) => { return Err(StoreError.DataCorrupt); }
                 };
@@ -1630,7 +1660,11 @@ struct ObjectStore {
             null => { return Err(StoreError.NoSuchKey); }
         }
         this.scratch.clear();
-        encodeSetTagsMeta(mut this.scratch, bucket.bytes(), key.bytes(), versionId, generation, tags)?;
+        if (acl) {
+            encodeSetAclMeta(mut this.scratch, bucket.bytes(), key.bytes(), versionId, generation, tags)?;
+        } else {
+            encodeSetTagsMeta(mut this.scratch, bucket.bytes(), key.bytes(), versionId, generation, tags)?;
+        }
         let empty = [0u8; 1];
         this.commitOne(RecordType.SetTags, empty[0..0])?;
         return Ok();
@@ -3554,7 +3588,8 @@ struct ObjectStore {
             return Err(StoreError.MetadataTooLarge);
         }
         if (kind == BUCKET_CONFIG_PUBLIC_ACCESS && !isPublicAccessValue(value)) { return Err(StoreError.InvalidKey); }
-        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_PUBLIC_ACCESS) { return Err(StoreError.InvalidKey); }
+        if (kind == BUCKET_CONFIG_ACL && !isAclValue(value)) { return Err(StoreError.InvalidKey); }
+        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_ACL) { return Err(StoreError.InvalidKey); }
         this.scratch.clear();
         encodeBucketConfigMeta(mut this.scratch, bucket.bytes(), kind, value)?;
         let empty = [0u8; 1];
@@ -3575,6 +3610,7 @@ struct ObjectStore {
                 }
                 if (kind == BUCKET_CONFIG_POLICY) { return Ok(copyBytes(b.policy.view())?); }
                 if (kind == BUCKET_CONFIG_PUBLIC_ACCESS) { return Ok(copyBytes(b.publicAccess.view())?); }
+                if (kind == BUCKET_CONFIG_ACL) { return Ok(copyBytes(b.acl.view())?); }
                 Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?)
             }
             null => Err(StoreError.NoSuchBucket),

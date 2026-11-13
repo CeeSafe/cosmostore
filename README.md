@@ -6,10 +6,10 @@ giving up large-object throughput or crash correctness.
 
 **Status: a single-node alpha.** `cosmostore serve` speaks the S3 API over HTTP/1.1 and TLS, on a crash-tested
 storage engine (journal, large-object extents, checkpoints, compaction, the space reserve and `fsck`). The AWS CLI,
-rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 305 Ceph s3-tests pass against it
+rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 325 Ceph s3-tests pass against it
 ([compatibility](docs/compatibility.md)). Milestones M0 to M4 of the [roadmap](ROADMAP.md) are done; M5, production
-features, is under way: S3 versioning (ADR-0041), bucket policies (ADR-0043) and the public-access block (ADR-0044)
-are in. There is no replication or clustering yet, and no ACLs.
+features, is under way: S3 versioning (ADR-0041), bucket policies (ADR-0043), the public-access block (ADR-0044)
+and ACLs (ADR-0045) are in. There is no replication or clustering yet.
 
 CosmoStore's own code is pure CeeSafe, with no C and no `unsafe` blocks. The one C below it is OpenSSL 3, for TLS,
 through CeeSafe.Web's `web_tls` ([ADR-0016](docs/adr/0016-listen-address-and-tls.md)).
@@ -35,7 +35,8 @@ through CeeSafe.Web's `web_tls` ([ADR-0016](docs/adr/0016-listen-address-and-tls
 - **Auth:** SigV4 headers and presigned URLs, aws-chunked bodies (signed and unsigned, with trailing checksums), and
   POST object with a SigV4 policy. A credentials file holds the access keys; a bucket policy can deny them, and let
   anonymous requests in (ADR-0043); a public-access block refuses a public policy or closes the bucket that has one,
-  and GetBucketPolicyStatus says whether it is public (ADR-0044).
+  and GetBucketPolicyStatus says whether it is public (ADR-0044). ACLs, canned or granted, open buckets and objects
+  to anonymous requests (ADR-0045).
 - **Objects:** PUT, GET, HEAD, DELETE, ranges, conditional requests, CopyObject, DeleteObjects, user metadata, object
   tags, GetObjectAttributes, and checksums (CRC32, CRC32C, CRC64NVME, SHA-256) checked, stored and returned.
 - **Multipart uploads**, including UploadPartCopy, ListParts and ListMultipartUploads; abandoned uploads expire.
@@ -329,15 +330,16 @@ limits.
 **Now, M5 (production features):** versioning, delete markers and ListObjectVersions are in (ADR-0041), checked
 with the AWS CLI, boto3 and the Ceph versioning tests, and lifecycle rules expire noncurrent versions and lone delete
 markers (ADR-0042). Bucket policies are in (ADR-0043), with the access keys as principals, and so are the
-public-access block and GetBucketPolicyStatus (ADR-0044). Then an ACL compatibility mode, encryption and Object Lock.
+public-access block and GetBucketPolicyStatus (ADR-0044) and an ACL compatibility mode (ADR-0045). Then encryption
+and Object Lock.
 
 **Later:** M6 a Raft-based cluster, and M7 advanced S3 features.
 
 **Known limits:**
 - a single node: no replication or erasure coding yet;
-- no ACLs (the public-access block's two ACL settings are stored and do nothing yet), CORS, Object Lock or MFA
-  delete, and no SigV2 or session tokens;
-- one account: every access key may do what no bucket policy denies it;
+- no CORS, Object Lock or MFA delete, and no SigV2 or session tokens;
+- one account: every access key may do what no bucket policy denies it, and an ACL can grant only to the owner, to
+  everyone and to authenticated requesters;
 - no lifecycle transitions: there is one storage class;
 - HTTP/1.1 only;
 - Windows is not supported.

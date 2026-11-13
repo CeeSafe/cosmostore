@@ -1763,3 +1763,37 @@ Browser form uploads with a SigV4 POST policy.
   CeeSafe.Web's pinned commit does not compile with (`AsyncError.Closed` is not matched in `web_core`). This slice
   was checked, tested and built with the 0.41.0 build kept as `out/ceesafec.good3`.
 - **Next:** slice 3, an ACL compatibility mode, which gives the two ACL settings their meaning.
+
+### 13 Nov 2026: M5 item 3, slice 3: an ACL compatibility mode (ADR-0045); item 3 done
+
+- **Chosen with the user** (yes, 13 Nov, to the proposal after slice 2): canned ACLs and grants are stored and
+  enforced, not accepted and ignored.
+- **An ACL is three sets of permissions:** the owner's (`cosmostore`), everyone's and every authenticated
+  requester's, stored as three characters; the private one as nothing. A bucket's is `BucketConfig` kind 6
+  (checkpoint format 9, formats 1 to 8 load). A version's is the `x-amz-acl` field of its metadata, beside its tags,
+  changed in place by a SetTags record of a second format: no new record type, and no new version.
+- **Given three ways:** `x-amz-acl` (the four canned ACLs with a meaning here; the two `bucket-owner` ones are
+  private), the `x-amz-grant-*` fields, and the `<AccessControlPolicy>` document. Another canonical user or group
+  is InvalidArgument, a grantee by email UnresolvableGrantByEmailAddress.
+- **Calls:** Get- and PutBucketAcl, Get- and PutObjectAcl (with `versionId`), and the ACL fields on CreateBucket,
+  PutObject, CopyObject, CreateMultipartUpload and POST object. A copy never has its source's ACL.
+- **What it opens:** an anonymous request the bucket's policy neither refuses nor allows may do what the ACL
+  grants everyone (the table of ADR-0045 §4). A policy's Deny wins. Keys are never refused by an ACL.
+- **The block's ACL settings work:** `BlockPublicAcls` refuses a request that gives a public ACL,
+  `IgnorePublicAcls` makes stored ones open nothing. GetBucketPolicyStatus is `true` for a public bucket ACL too.
+- **The cost, changed for anonymous requests only:** one was refused at once while no bucket had a policy; it now
+  takes the store's lock once for the bucket's policy, block and ACL, and once more for the object's ACL when those
+  decide nothing. A key's request is as before.
+- **Tests (6 new, 184 in all, no leaks):** canned ACLs and the stored form, grant fields, the document (what GetAcl
+  writes PutAcl reads; 13 refused), the permissions of every action; in the store, a version's ACL changed in
+  place through recovery and a checkpoint with its tags kept, and a bucket's through a format 9 checkpoint.
+- **Clients:** `tools/s3_smoke.sh` 243 checks (40 new), boto3 114 (19 new: versions and multipart too), the
+  s3-tests subset 325 (496 in scope, 337 pass; 20 new).
+- **Ceph ACL tests still failing, and why:** the `test_access_bucket_*` matrix and the grant tests use the `alt`
+  user as a second account; `test_bucket_acl_default`, the `*_acl_canned*` tests and others compare the owner's id
+  and display name with their configuration's (a configurable owner would pass them; ADR-0045, rejected for now).
+- **Not run:** the p99 gate (owed since slice 1; this slice adds nothing to a key's request), the rclone, Go,
+  JavaScript, Java and .NET scripts, `tools/tls_smoke.sh`, and a fault sweep: the new record is a SetTags record
+  through the same commit, and the new config kind a BucketConfig record.
+- **The toolchain:** as in slice 2, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
+- **Next:** M5 item 4, SSE-S3 and SSE-C. Before it, on a quiet machine: the p99 gate for item 3.

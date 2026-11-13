@@ -12,6 +12,29 @@ const MAX_USER_METADATA: usize = 2048;
 const MAX_METADATA_BYTES: usize = 16384;
 /// The stored field that holds a version's tags: their URL-encoded `k=v&k2=v2` form, as `x-amz-tagging` sends them.
 const TAGS_FIELD: StringView = "x-amz-tagging";
+/// The stored field that holds a version's ACL (ADR-0045), when it is not the private one: three characters, the
+/// permissions of the owner, of everyone and of every authenticated requester, each `ACL_BASE` and its ACL bits.
+const ACL_FIELD: StringView = "x-amz-acl";
+const ACL_BASE: u8 = 0x40;
+const ACL_READ: u8 = 1;
+const ACL_WRITE: u8 = 2;
+const ACL_READ_ACP: u8 = 4;
+const ACL_WRITE_ACP: u8 = 8;
+const ACL_FULL_CONTROL: u8 = 16;
+/// The places of the three grantees in a stored ACL.
+const ACL_OWNER: usize = 0;
+const ACL_ALL_USERS: usize = 1;
+const ACL_AUTHENTICATED: usize = 2;
+
+/// Whether `value` is an ACL as it is stored: empty for the private one, or its three characters.
+fn isAclValue(value: Slice<u8>) -> bool {
+    if (value.length == 0) { return true; }
+    if (value.length != 3) { return false; }
+    for (i in 0..3) {
+        if (value[i] < ACL_BASE || value[i] >= ACL_BASE + 32) { return false; }
+    }
+    return true;
+}
 
 /// The null version id, used by unversioned buckets.
 fn nullVersionId() -> [u8; 16] => [0u8; 16];
@@ -286,24 +309,63 @@ fn encodeSetTagsMeta(
     return Ok();
 }
 
+/// The SetTags meta's second format, which sets a version's ACL (ADR-0045).
+const SET_ACL_FORMAT: u8 = 2;
+
+/// SetTags meta v2: as v1 with format 2, and the last field is the version's ACL as it is stored (empty: the private
+/// one) in place of its tags.
+fn encodeSetAclMeta(
+    out: borrow mut Vector<u8>,
+    bucket: Slice<u8>,
+    key: Slice<u8>,
+    versionId: [u8; 16],
+    generation: u64,
+    acl: Slice<u8>,
+) -> Result<void, AllocError> {
+    out.pushLE(SET_ACL_FORMAT)?;
+    pushText16(out, bucket)?;
+    pushText16(out, key)?;
+    out.extend(versionId[..])?;
+    out.pushLE(generation)?;
+    pushText16(out, acl)?;
+    return Ok();
+}
+
 struct SetTagsMeta {
     bucket: Vector<u8>;
     key: Vector<u8>;
     versionId: [u8; 16];
     generation: u64;
+    /// The tags, or with `acl` the ACL.
     tags: Vector<u8>;
+    /// Format 2: the record sets the ACL, not the tags.
+    acl: bool;
 }
 
 fn decodeSetTagsMeta(bytes: Slice<u8>) -> Result<SetTagsMeta, MetaFault> {
     var at: usize = 0;
-    checkVersion(bytes, mut at)?;
+    need(bytes, at, 1)?;
+    let acl = bytes[at] == SET_ACL_FORMAT;
+    if (acl) {
+        at += 1;
+    } else {
+        checkVersion(bytes, mut at)?;
+    }
     let bucket = readText16(bytes, mut at)?;
     let key = readText16(bytes, mut at)?;
     let versionId = readId16(bytes, mut at)?;
     let generation = readU64(bytes, mut at)?;
     let tags = readText16(bytes, mut at)?;
     if (at != bytes.length) { return Err(MetaFault.TooLong); }
-    return Ok(SetTagsMeta { bucket: bucket, key: key, versionId: versionId, generation: generation, tags: tags });
+    if (acl && !isAclValue(tags.view())) { return Err(MetaFault.TooLong); }
+    return Ok(SetTagsMeta {
+        bucket: bucket,
+        key: key,
+        versionId: versionId,
+        generation: generation,
+        tags: tags,
+        acl: acl,
+    });
 }
 
 /// The pairs of a metadata blob.

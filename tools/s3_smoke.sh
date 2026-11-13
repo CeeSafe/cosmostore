@@ -426,6 +426,68 @@ aws s3api delete-bucket --bucket pol > /dev/null 2>&1 && fail "delete-bucket und
 aws s3api delete-bucket-policy --bucket pol > /dev/null 2>&1
 aws s3api delete-bucket --bucket pol > /dev/null 2>&1 && pass "delete-bucket after it" || fail "delete-bucket after it"
 
+# ACLs (ADR-0045): canned ACLs, grants and the document; what they open to anonymous requests; the block's ACL settings.
+grants() { "$@" --query 'Grants[].[Grantee.ID,Grantee.URI,Permission]' --output text | tr '\t\n' ' ;'; }
+everyone=http://acs.amazonaws.com/groups/global/AllUsers
+aws s3api create-bucket --bucket acl > /dev/null 2>&1
+aws s3api put-object --bucket acl --key a.txt --body pub.txt > /dev/null 2>&1
+check "a new bucket's ACL" "$(grants aws s3api get-bucket-acl --bucket acl)" "cosmostore None FULL_CONTROL;"
+check "a new object's ACL" "$(grants aws s3api get-object-acl --bucket acl --key a.txt)" "cosmostore None FULL_CONTROL;"
+check "anonymous without an ACL" "$(anon "$AWS_ENDPOINT_URL/acl/a.txt")" 403
+aws s3api put-object-acl --bucket acl --key a.txt --acl public-read > /dev/null 2>&1 || fail "put-object-acl"
+check "get-object-acl" "$(grants aws s3api get-object-acl --bucket acl --key a.txt)" "cosmostore None FULL_CONTROL;None $everyone READ;"
+check "anonymous read by the object's ACL" "$(anon "$AWS_ENDPOINT_URL/acl/a.txt") $(cat anon.out)" "200 public bytes"
+check "the object's headers" "$(curl -s -I "$AWS_ENDPOINT_URL/acl/a.txt" | grep -ci 'x-amz-acl')" 0
+check "anonymous ACL read" "$(anon "$AWS_ENDPOINT_URL/acl/a.txt?acl")" 403
+check "anonymous list without the bucket's ACL" "$(anon "$AWS_ENDPOINT_URL/acl?list-type=2")" 403
+aws s3api put-bucket-acl --bucket acl --acl public-read > /dev/null 2>&1 || fail "put-bucket-acl"
+check "get-bucket-acl" "$(grants aws s3api get-bucket-acl --bucket acl)" "cosmostore None FULL_CONTROL;None $everyone READ;"
+check "anonymous list by the bucket's ACL" "$(anon "$AWS_ENDPOINT_URL/acl?list-type=2")" 200
+check "anonymous put under public-read" "$(anon -X PUT --data-binary @pub.txt "$AWS_ENDPOINT_URL/acl/x.txt")" 403
+check "the status of a public ACL" "$(aws s3api get-bucket-policy-status --bucket acl --query PolicyStatus.IsPublic)" true
+aws s3api put-bucket-acl --bucket acl --grant-full-control id=cosmostore --grant-write "uri=\"$everyone\"" > /dev/null 2>&1 || fail "put-bucket-acl with grants"
+check "the grants" "$(grants aws s3api get-bucket-acl --bucket acl)" "cosmostore None FULL_CONTROL;None $everyone WRITE;"
+check "anonymous put by a WRITE grant" "$(anon -X PUT --data-binary @pub.txt "$AWS_ENDPOINT_URL/acl/x.txt")" 200
+check "anonymous list without READ" "$(anon "$AWS_ENDPOINT_URL/acl?list-type=2")" 403
+check "the anonymous object is private" "$(anon "$AWS_ENDPOINT_URL/acl/x.txt")" 403
+check "anonymous delete by it" "$(anon -X DELETE "$AWS_ENDPOINT_URL/acl/x.txt")" 204
+aws s3api put-object --bucket acl --key b.txt --body pub.txt --acl public-read > /dev/null 2>&1 || fail "put-object with an ACL"
+check "anonymous read of an object put public" "$(anon "$AWS_ENDPOINT_URL/acl/b.txt")" 200
+aws s3api copy-object --bucket acl --key c.txt --copy-source acl/b.txt > /dev/null 2>&1
+check "a copy is private" "$(anon "$AWS_ENDPOINT_URL/acl/c.txt")" 403
+aws s3api copy-object --bucket acl --key d.txt --copy-source acl/b.txt --acl public-read > /dev/null 2>&1
+check "a copy with its own ACL" "$(anon "$AWS_ENDPOINT_URL/acl/d.txt")" 200
+printf '%s' '{"Statement": [{"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::acl/d.txt"}]}' > deny-d.json
+aws s3api put-bucket-policy --bucket acl --policy file://deny-d.json > /dev/null 2>&1
+check "a Deny over the ACL" "$(anon "$AWS_ENDPOINT_URL/acl/d.txt")" 403
+check "the ACL beside the Deny" "$(anon "$AWS_ENDPOINT_URL/acl/b.txt")" 200
+aws s3api delete-bucket-policy --bucket acl > /dev/null 2>&1
+aws s3api put-public-access-block --bucket acl --public-access-block-configuration IgnorePublicAcls=true > /dev/null 2>&1
+check "anonymous read under IgnorePublicAcls" "$(anon "$AWS_ENDPOINT_URL/acl/b.txt")" 403
+check "anonymous put under it" "$(anon -X PUT --data-binary @pub.txt "$AWS_ENDPOINT_URL/acl/y.txt")" 403
+check "the status under it" "$(aws s3api get-bucket-policy-status --bucket acl --query PolicyStatus.IsPublic)" false
+check "the ACL stays" "$(grants aws s3api get-object-acl --bucket acl --key b.txt)" "cosmostore None FULL_CONTROL;None $everyone READ;"
+aws s3api put-public-access-block --bucket acl --public-access-block-configuration BlockPublicAcls=true > /dev/null 2>&1
+check "anonymous read without IgnorePublicAcls" "$(anon "$AWS_ENDPOINT_URL/acl/b.txt")" 200
+check "a public bucket ACL under BlockPublicAcls" "$(code s3api put-bucket-acl --bucket acl --acl public-read)" AccessDenied
+check "a public object ACL under it" "$(code s3api put-object-acl --bucket acl --key a.txt --acl authenticated-read)" AccessDenied
+check "a public object under it" "$(code s3api put-object --bucket acl --key e.txt --body pub.txt --acl public-read)" AccessDenied
+aws s3api put-object-acl --bucket acl --key b.txt --acl private > /dev/null 2>&1 && pass "a private ACL under it" || fail "a private ACL under it"
+check "anonymous read after private" "$(anon "$AWS_ENDPOINT_URL/acl/b.txt")" 403
+aws s3api delete-public-access-block --bucket acl > /dev/null 2>&1
+aws s3api put-bucket-acl --bucket acl --access-control-policy "{\"Owner\": {\"ID\": \"cosmostore\"}, \"Grants\": [{\"Grantee\": {\"Type\": \"CanonicalUser\", \"ID\": \"cosmostore\"}, \"Permission\": \"FULL_CONTROL\"}, {\"Grantee\": {\"Type\": \"Group\", \"URI\": \"$everyone\"}, \"Permission\": \"READ_ACP\"}]}" > /dev/null 2>&1 || fail "put-bucket-acl with a document"
+check "the document's grants" "$(grants aws s3api get-bucket-acl --bucket acl)" "cosmostore None FULL_CONTROL;None $everyone READ_ACP;"
+check "anonymous ACL read by READ_ACP" "$(anon "$AWS_ENDPOINT_URL/acl?acl")" 200
+check "a grantee there is not" "$(code s3api put-bucket-acl --bucket acl --grant-read id=stranger)" InvalidArgument
+check "a grantee by email" "$(code s3api put-bucket-acl --bucket acl --grant-read emailAddress=a@example.com)" UnresolvableGrantByEmailAddress
+check "an owner there is not" "$(code s3api put-bucket-acl --bucket acl --access-control-policy '{"Owner": {"ID": "stranger"}, "Grants": []}')" InvalidArgument
+check "an ACL on a missing key" "$(code s3api put-object-acl --bucket acl --key missing --acl private)" NoSuchKey
+aws s3api create-bucket --bucket acl-made --acl public-read > /dev/null 2>&1
+check "a bucket made public" "$(anon "$AWS_ENDPOINT_URL/acl-made?list-type=2")" 200
+aws s3api delete-bucket --bucket acl-made > /dev/null 2>&1
+aws s3 rm --recursive s3://acl/ > /dev/null 2>&1
+aws s3api delete-bucket --bucket acl > /dev/null 2>&1 && pass "delete-bucket with an ACL" || fail "delete-bucket with an ACL"
+
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket smoke > /dev/null 2>&1 && pass "delete-bucket" || fail "delete-bucket"

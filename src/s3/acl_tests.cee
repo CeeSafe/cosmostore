@@ -1,0 +1,208 @@
+// ACLs (ADR-0045): the three ways to give one, the document, and what one grants.
+import web_core;
+import web_http;
+import web_server;
+
+/// An ACL as text, the three stored characters; the refusal's code when there is none.
+fn aclText(acl: Result<[u8; 3], S3Fail>) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    match (acl) {
+        Ok(a) => {
+            for (i in 0..3) { out.push(ACL_BASE + a[i])!; }
+        }
+        Err(S3Fail.Code(code)) => { out.extend(s3CodeName(code).bytes())!; }
+        Err(_) => { out.extend("failed".bytes())!; }
+    }
+    return out;
+}
+
+@test
+fn aclCannedAndStored() -> Result<void, TestFailure> {
+    Check.equalBytes("P@@".bytes(), aclText(cannedAcl("private".bytes())).view())?;
+    Check.equalBytes("PA@".bytes(), aclText(cannedAcl("public-read".bytes())).view())?;
+    Check.equalBytes("PC@".bytes(), aclText(cannedAcl("public-read-write".bytes())).view())?;
+    Check.equalBytes("P@A".bytes(), aclText(cannedAcl("authenticated-read".bytes())).view())?;
+    Check.equalBytes("P@@".bytes(), aclText(cannedAcl("bucket-owner-full-control".bytes())).view())?;
+    Check.equalBytes("P@@".bytes(), aclText(cannedAcl("bucket-owner-read".bytes())).view())?;
+    Check.equalBytes("NotImplemented".bytes(), aclText(cannedAcl("log-delivery-write".bytes())).view())?;
+    Check.equalBytes("InvalidArgument".bytes(), aclText(cannedAcl("public".bytes())).view())?;
+    // The private ACL is stored as nothing; any other as its three characters, and back.
+    Check.equalU64(0, storedAcl(privateAcl())!.length as u64)?;
+    Check.equalBytes("PA@".bytes(), storedAcl([ACL_FULL_CONTROL, ACL_READ, 0u8])!.view())?;
+    Check.equalBytes("@@@".bytes(), storedAcl([0u8; 3])!.view())?; // no grants at all is not the private one
+    Check.equalBytes("PA@".bytes(), aclText(Ok(aclOf("PA@".bytes()))).view())?;
+    Check.equalBytes("P@@".bytes(), aclText(Ok(aclOf("".bytes()))).view())?;
+    Check.equalBytes("P@@".bytes(), aclText(Ok(aclOf("zzz".bytes()))).view())?; // not an ACL: private
+    Check.isTrue(!aclIsPublic(privateAcl()), "the private ACL")?;
+    Check.isTrue(aclIsPublic([ACL_FULL_CONTROL, ACL_READ, 0u8]), "a grant to everyone")?;
+    Check.isTrue(aclIsPublic([ACL_FULL_CONTROL, 0u8, ACL_READ_ACP]), "a grant to the authenticated")?;
+    return Ok();
+}
+
+fn grantsOf(value: StringView, permission: u8) -> Vector<u8> {
+    var acl = [0u8; 3];
+    return match (grantHeader(value.bytes(), permission, mut acl)) {
+        Ok() => aclText(Ok(acl)),
+        Err(e) => aclText(Err(e)),
+    };
+}
+
+@test
+fn aclGrantHeaders() -> Result<void, TestFailure> {
+    Check.equalBytes(
+        "@A@".bytes(),
+        grantsOf("uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"", ACL_READ).view(),
+    )?;
+    Check.equalBytes(
+        "PPP".bytes(),
+        grantsOf(
+            "id=\"cosmostore\", uri=http://acs.amazonaws.com/groups/global/AllUsers,uri=\"http://acs.amazonaws.com/groups/global/AuthenticatedUsers\"",
+            ACL_FULL_CONTROL,
+        ).view(),
+    )?;
+    Check.equalBytes("@@@".bytes(), grantsOf("", ACL_READ).view())?;
+    Check.equalBytes("InvalidArgument".bytes(), grantsOf("id=\"someone-else\"", ACL_READ).view())?;
+    Check.equalBytes(
+        "InvalidArgument".bytes(),
+        grantsOf("uri=\"http://acs.amazonaws.com/groups/s3/LogDelivery\"", ACL_WRITE).view(),
+    )?;
+    Check.equalBytes(
+        "UnresolvableGrantByEmailAddress".bytes(),
+        grantsOf("emailAddress=\"a@example.com\"", ACL_READ).view(),
+    )?;
+    Check.equalBytes("InvalidArgument".bytes(), grantsOf("AllUsers", ACL_READ).view())?;
+    return Ok();
+}
+
+@test
+fn aclDocument() -> Result<void, TestFailure> {
+    // What GetAcl writes, PutAcl reads back: every permission of every grantee.
+    let all = [ACL_FULL_CONTROL | ACL_READ, ACL_READ | ACL_WRITE | ACL_READ_ACP | ACL_WRITE_ACP, ACL_FULL_CONTROL];
+    var xml = Vector<u8>.create();
+    aclXml(all, mut xml)!;
+    Check.equalBytes(aclText(Ok(all)).view(), aclText(parseAclXml(xml.view())).view())?;
+    var bare = Vector<u8>.create();
+    aclXml(privateAcl(), mut bare)!;
+    Check.equalBytes("P@@".bytes(), aclText(parseAclXml(bare.view())).view())?;
+    Check.isTrue(
+        findBytes(bare.view(), "xsi:type=\"CanonicalUser\"><ID>cosmostore</ID>".bytes(), 0).isSome(),
+        "the owner's grant",
+    )?;
+    // A document as a client writes one.
+    let given =
+        """
+        <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Owner><ID>cosmostore</ID><DisplayName>anything</DisplayName></Owner>
+          <AccessControlList>
+            <Grant>
+              <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
+                <ID> cosmostore </ID>
+              </Grantee>
+              <Permission>FULL_CONTROL</Permission>
+            </Grant>
+            <Grant>
+              <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="Group">
+                <URI>http://acs.amazonaws.com/groups/global/AllUsers</URI>
+              </Grantee>
+              <Permission>
+                READ
+              </Permission>
+            </Grant>
+          </AccessControlList>
+        </AccessControlPolicy>
+        """;
+    Check.equalBytes("PA@".bytes(), aclText(parseAclXml(given.bytes())).view())?;
+    let head = "<AccessControlPolicy><Owner><ID>cosmostore</ID></Owner><AccessControlList>";
+    let tail = "</AccessControlList></AccessControlPolicy>";
+    let grants = [
+        "",
+        "<Grant><Grantee><ID>stranger</ID></Grantee><Permission>READ</Permission></Grant>",
+        "<Grant><Grantee><URI>http://acs.amazonaws.com/groups/s3/LogDelivery</URI></Grantee><Permission>WRITE</Permission></Grant>",
+        "<Grant><Grantee><EmailAddress>a@example.com</EmailAddress></Grantee><Permission>READ</Permission></Grant>",
+        "<Grant><Grantee><ID>cosmostore</ID></Grantee><Permission>EVERYTHING</Permission></Grant>",
+        "<Grant><Grantee><ID>cosmostore</ID></Grantee></Grant>",
+        "<Grant><Grantee></Grantee><Permission>READ</Permission></Grant>",
+        "<Grant><Grantee><ID>cosmostore</ID></Grantee><Permission>READ</Permission>",
+    ];
+    let answers = [
+        "@@@",
+        "InvalidArgument",
+        "InvalidArgument",
+        "UnresolvableGrantByEmailAddress",
+        "MalformedACLError",
+        "MalformedACLError",
+        "MalformedACLError",
+        "MalformedACLError",
+    ];
+    for (i in 0..grants.length) {
+        var doc = Vector<u8>.create();
+        doc.extend(head.bytes())!;
+        doc.extend(grants[i].bytes())!;
+        doc.extend(tail.bytes())!;
+        Check.equalBytes(answers[i].bytes(), aclText(parseAclXml(doc.view())).view())?;
+    }
+    let refused = [
+        "<Other/>",
+        "<AccessControlPolicy><Owner><ID>cosmostore</ID></Owner></AccessControlPolicy>",
+        "<AccessControlPolicy><AccessControlList></AccessControlList></AccessControlPolicy>",
+        "<AccessControlPolicy><AccessControlList></AccessControlList><Owner><ID>cosmostore</ID></Owner></AccessControlPolicy>",
+        "<AccessControlPolicy><Owner></Owner><AccessControlList></AccessControlList></AccessControlPolicy>",
+    ];
+    for (doc in refused) {
+        Check.equalBytes("MalformedACLError".bytes(), aclText(parseAclXml(doc.bytes())).view())?;
+    }
+    Check.equalBytes(
+        "InvalidArgument".bytes(),
+        aclText(parseAclXml(
+            "<AccessControlPolicy><Owner><ID>stranger</ID></Owner><AccessControlList></AccessControlList></AccessControlPolicy>".bytes(),
+        )).view(),
+    )?;
+    // At most 100 grants.
+    var many = Vector<u8>.create();
+    many.extend(head.bytes())!;
+    for (i in 0..101) {
+        many.extend("<Grant><Grantee><ID>cosmostore</ID></Grantee><Permission>READ</Permission></Grant>".bytes())!;
+    }
+    many.extend(tail.bytes())!;
+    Check.equalBytes("MalformedACLError".bytes(), aclText(parseAclXml(many.view())).view())?;
+    return Ok();
+}
+
+/// What an ACL grants (ADR-0045 §4): a bucket's, its listings, writes and its own ACL; an object's, its reads and
+/// its own ACL; full control, all of them; and nothing else.
+@test
+fn aclPermissions() -> Result<void, TestFailure> {
+    let bucket = [
+        "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:PutObject",
+        "s3:DeleteObject", "s3:GetBucketAcl", "s3:PutBucketAcl",
+    ];
+    let needs = [ACL_READ, ACL_READ, ACL_READ, ACL_WRITE, ACL_WRITE, ACL_READ_ACP, ACL_WRITE_ACP];
+    for (i in 0..bucket.length) {
+        Check.equalU64(needs[i] as u64, bucketAclNeed(bucket[i]) as u64)?;
+        Check.equalU64(0, objectAclNeed(bucket[i]) as u64)?;
+    }
+    let object = [
+        "s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectAcl", "s3:GetObjectVersionAcl",
+        "s3:PutObjectAcl", "s3:PutObjectVersionAcl",
+    ];
+    let objectNeeds = [ACL_READ, ACL_READ, ACL_READ_ACP, ACL_READ_ACP, ACL_WRITE_ACP, ACL_WRITE_ACP];
+    for (i in 0..object.length) {
+        Check.equalU64(objectNeeds[i] as u64, objectAclNeed(object[i]) as u64)?;
+        Check.equalU64(0, bucketAclNeed(object[i]) as u64)?;
+    }
+    let neither = [
+        "s3:DeleteObjectVersion", "s3:GetObjectTagging", "s3:PutObjectTagging", "s3:DeleteBucket",
+        "s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:GetBucketVersioning", "s3:AbortMultipartUpload",
+        "s3:GetObjectAttributes", "s3:PutBucketPublicAccessBlock",
+    ];
+    for (a in neither) {
+        Check.equalU64(0, bucketAclNeed(a) as u64)?;
+        Check.equalU64(0, objectAclNeed(a) as u64)?;
+    }
+    Check.isTrue(aclGrants(ACL_READ, ACL_READ), "the permission itself")?;
+    Check.isTrue(!aclGrants(ACL_READ, ACL_WRITE), "another permission")?;
+    Check.isTrue(aclGrants(ACL_FULL_CONTROL, ACL_WRITE_ACP), "full control")?;
+    Check.isTrue(!aclGrants(ACL_FULL_CONTROL, 0), "an action no ACL grants")?;
+    Check.isTrue(!aclGrants(0, ACL_READ), "no permission")?;
+    return Ok();
+}

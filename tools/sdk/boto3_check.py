@@ -309,6 +309,49 @@ check("anonymous after the delete", code_of(lambda: anonymous.get_object(Bucket=
 boto3.resource("s3", endpoint_url=endpoint).Bucket(P).objects.all().delete()
 s3.delete_bucket(Bucket=P)
 
+# ACLs (ADR-0045): canned ACLs and the document, on buckets, objects, versions and multipart uploads.
+A = "boto3-acl"
+everyone = "http://acs.amazonaws.com/groups/global/AllUsers"
+def grants_of(acl):
+    return sorted((g["Grantee"].get("ID") or g["Grantee"].get("URI"), g["Permission"]) for g in acl["Grants"])
+s3.create_bucket(Bucket=A, ACL="public-read")
+check("a bucket made public-read", grants_of(s3.get_bucket_acl(Bucket=A)), [("cosmostore", "FULL_CONTROL"), (everyone, "READ")])
+check("the owner", s3.get_bucket_acl(Bucket=A)["Owner"]["ID"], "cosmostore")
+s3.put_object(Bucket=A, Key="open", Body=b"open", ACL="public-read")
+s3.put_object(Bucket=A, Key="shut", Body=b"shut")
+check("anonymous list by the ACL", sorted(o["Key"] for o in anonymous.list_objects_v2(Bucket=A)["Contents"]), ["open", "shut"])
+check("anonymous read by the ACL", anonymous.get_object(Bucket=A, Key="open")["Body"].read(), b"open")
+check("anonymous read of a private object", code_of(lambda: anonymous.get_object(Bucket=A, Key="shut")), "AccessDenied")
+check("anonymous write under public-read", code_of(lambda: anonymous.put_object(Bucket=A, Key="x", Body=b"x")), "AccessDenied")
+check("no ACL in the headers", [h for h in s3.head_object(Bucket=A, Key="open")["ResponseMetadata"]["HTTPHeaders"] if "acl" in h], [])
+s3.put_object_acl(Bucket=A, Key="open", ACL="private")
+check("anonymous read after private", code_of(lambda: anonymous.get_object(Bucket=A, Key="open")), "AccessDenied")
+policy = s3.get_object_acl(Bucket=A, Key="shut")
+policy = {"Owner": policy["Owner"], "Grants": policy["Grants"] + [{"Grantee": {"Type": "Group", "URI": everyone}, "Permission": "READ"}]}
+s3.put_object_acl(Bucket=A, Key="shut", AccessControlPolicy=policy)
+check("the document's grants", grants_of(s3.get_object_acl(Bucket=A, Key="shut")), [("cosmostore", "FULL_CONTROL"), (everyone, "READ")])
+check("anonymous read by the document", anonymous.get_object(Bucket=A, Key="shut")["Body"].read(), b"shut")
+s3.put_bucket_versioning(Bucket=A, VersioningConfiguration={"Status": "Enabled"})
+v1 = s3.put_object(Bucket=A, Key="ver", Body=b"one", ACL="public-read")["VersionId"]
+v2 = s3.put_object(Bucket=A, Key="ver", Body=b"two")["VersionId"]
+check("anonymous read of a public version", anonymous.get_object(Bucket=A, Key="ver", VersionId=v1)["Body"].read(), b"one")
+check("anonymous read of the private current", code_of(lambda: anonymous.get_object(Bucket=A, Key="ver")), "AccessDenied")
+s3.put_object_acl(Bucket=A, Key="ver", VersionId=v1, ACL="private")
+s3.put_object_acl(Bucket=A, Key="ver", ACL="public-read")
+check("the version made private", code_of(lambda: anonymous.get_object(Bucket=A, Key="ver", VersionId=v1)), "AccessDenied")
+check("the current made public", anonymous.get_object(Bucket=A, Key="ver")["Body"].read(), b"two")
+check("the versions stay", [v["VersionId"] for v in s3.list_object_versions(Bucket=A, Prefix="ver")["Versions"]], [v2, v1])
+upload = s3.create_multipart_upload(Bucket=A, Key="parts", ACL="public-read")["UploadId"]
+etag = s3.upload_part(Bucket=A, Key="parts", UploadId=upload, PartNumber=1, Body=b"part")["ETag"]
+s3.complete_multipart_upload(Bucket=A, Key="parts", UploadId=upload, MultipartUpload={"Parts": [{"ETag": etag, "PartNumber": 1}]})
+check("anonymous read of a public upload", anonymous.get_object(Bucket=A, Key="parts")["Body"].read(), b"part")
+check("a grantee by email", code_of(lambda: s3.put_bucket_acl(Bucket=A, GrantRead="emailAddress=a@example.com")), "UnresolvableGrantByEmailAddress")
+check("a grantee there is not", code_of(lambda: s3.put_bucket_acl(Bucket=A, GrantRead="id=stranger")), "InvalidArgument")
+s3.put_bucket_acl(Bucket=A, ACL="private")
+check("anonymous list after private", code_of(lambda: anonymous.list_objects_v2(Bucket=A)), "AccessDenied")
+boto3.resource("s3", endpoint_url=endpoint).Bucket(A).object_versions.all().delete()
+s3.delete_bucket(Bucket=A)
+
 check("wrong secret", code_of(lambda: boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
                                                        aws_secret_access_key="wrong").list_buckets()),
       "SignatureDoesNotMatch")

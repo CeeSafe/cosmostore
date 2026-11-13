@@ -49,7 +49,8 @@ struct S3App {
     latencies: Latencies;
     /// The store's writers without its lock: an inline-sized PUT starts with no lock round (ADR-0032).
     writers: WriterFactory;
-    /// Buckets with a policy, and those whose policy has a Deny (ADR-0043 §8): while both are 0, no request reads one.
+    /// Buckets with a policy, and those whose policy has a Deny (ADR-0043 §8): while the second is 0, no key's request
+    /// reads one. An anonymous request always reads its bucket's policy and ACL (ADR-0045 §6).
     policyBuckets: AtomicU64;
     denyBuckets: AtomicU64;
     /// Whether the server listens with TLS: `aws:SecureTransport` (ADR-0043 §6).
@@ -259,6 +260,19 @@ async fn serveS3(
             }
             return Err(S3Fail.Code(S3Code.MethodNotAllowed));
         }
+        // A bucket's ACL (ADR-0045).
+        if (req.hasParam("acl")) {
+            if (!req.onlyParams("acl")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            if (isMethod(m, Method.Get)) {
+                await authorize(app, borrow req, borrow who, "s3:GetBucketAcl", bucket, none)?;
+                return await getBucketAcl(app, borrow req, exchange);
+            }
+            if (isMethod(m, Method.Put)) {
+                await authorize(app, borrow req, borrow who, "s3:PutBucketAcl", bucket, none)?;
+                return await putBucketAcl(app, borrow req, auth, exchange);
+            }
+            return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+        }
         // Whether its policy is public, and its public-access block (ADR-0044).
         if (req.hasParam("policyStatus")) {
             if (!req.onlyParams("policyStatus")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
@@ -372,6 +386,19 @@ async fn serveS3(
         return Err(S3Fail.Code(S3Code.MethodNotAllowed));
     }
     if (req.key.length > MAX_KEY_BYTES) { return Err(S3Fail.Code(S3Code.KeyTooLongError)); }
+    // An object's ACL (ADR-0045).
+    if (req.hasParam("acl")) {
+        if (!req.onlyParams("acl,versionId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        if (isMethod(m, Method.Get)) {
+            await authorizeObject(app, borrow req, borrow who, "s3:GetObjectAcl", "s3:GetObjectVersionAcl")?;
+            return await getObjectAcl(app, borrow req, exchange);
+        }
+        if (isMethod(m, Method.Put)) {
+            await authorizeObject(app, borrow req, borrow who, "s3:PutObjectAcl", "s3:PutObjectVersionAcl")?;
+            return await putObjectAcl(app, borrow req, auth, exchange);
+        }
+        return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+    }
     if (req.hasParam("tagging")) {
         if (!req.onlyParams("tagging,versionId")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
         if (isMethod(m, Method.Get)) {
@@ -535,6 +562,8 @@ async fn storeBucketList(app: borrow S3App) -> Result<Vector<BucketEntry>, S3Fai
 }
 
 async fn createBucket(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    // The ACL of the request's fields, checked before the bucket is made (ADR-0045 §3).
+    let acl = storedAcl(requestAcl(req)? ?? privateAcl())?;
     {
         var guard = await lockStore(app)?;
         let store = guard.data();
@@ -544,6 +573,8 @@ async fn createBucket(app: borrow S3App, req: borrow S3Request, exchange: borrow
             Err(e) => { return Err(storeFail(e, 0)); }
         }
     }
+    // A second record: a bucket made without it is private, which opens nothing.
+    if (acl.length > 0) { await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_ACL, acl.view())?; }
     var location = Vector<u8>.create();
     location.push('/')?;
     location.extend(req.bucket.view().bytes())?;

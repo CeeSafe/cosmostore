@@ -1,0 +1,407 @@
+// ACLs (ADR-0045): a bucket's or a version's ACL is the permissions of three grantees, the owner, everyone and every
+// authenticated requester. Canned ACLs, grant headers and the XML document become one; an anonymous request may do
+// what it grants everyone. The ACL calls.
+import web_core;
+import web_http;
+import web_server;
+
+/// The one owner of every bucket and object: its canonical id, which is also its display name.
+const OWNER_ID: StringView = "cosmostore";
+const ALL_USERS_URI: StringView = "http://acs.amazonaws.com/groups/global/AllUsers";
+const AUTHENTICATED_URI: StringView = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
+/// S3's limit on the grants of one ACL.
+const MAX_GRANTS: usize = 100;
+
+/// The ACL of a bucket or object that was given none: the owner has full control.
+fn privateAcl() -> [u8; 3] => [ACL_FULL_CONTROL, 0u8, 0u8];
+
+/// A stored ACL's permissions, by grantee; the private one for an empty value.
+fn aclOf(stored: Slice<u8>) -> [u8; 3] {
+    if (!isAclValue(stored) || stored.length == 0) { return privateAcl(); }
+    return [stored[0] - ACL_BASE, stored[1] - ACL_BASE, stored[2] - ACL_BASE];
+}
+
+/// An ACL as it is stored: empty for the private one.
+fn storedAcl(acl: [u8; 3]) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    if (acl[ACL_OWNER] == ACL_FULL_CONTROL && !aclIsPublic(acl)) { return Ok(out); }
+    for (i in 0..3) { out.push(ACL_BASE + acl[i])?; }
+    return Ok(out);
+}
+
+/// Whether an ACL grants anything to everyone or to every authenticated requester: what S3 calls a public ACL.
+fn aclIsPublic(acl: [u8; 3]) -> bool => acl[ACL_ALL_USERS] != 0 || acl[ACL_AUTHENTICATED] != 0;
+
+/// Whether a grantee's permissions include `need`: full control includes every one.
+fn aclGrants(permissions: u8, need: u8) -> bool => need != 0 && (permissions & (need | ACL_FULL_CONTROL)) != 0;
+
+/// The permission a bucket's ACL must grant for `action` (ADR-0045 §4); 0 for an action no ACL grants.
+fn bucketAclNeed(action: StringView) -> u8 {
+    if (action == "s3:ListBucket" || action == "s3:ListBucketVersions" || action == "s3:ListBucketMultipartUploads") {
+        return ACL_READ;
+    }
+    if (action == "s3:PutObject" || action == "s3:DeleteObject") { return ACL_WRITE; }
+    if (action == "s3:GetBucketAcl") { return ACL_READ_ACP; }
+    if (action == "s3:PutBucketAcl") { return ACL_WRITE_ACP; }
+    return 0;
+}
+
+/// The permission an object's ACL must grant for `action`; 0 for an action no ACL grants.
+fn objectAclNeed(action: StringView) -> u8 {
+    if (action == "s3:GetObject" || action == "s3:GetObjectVersion") { return ACL_READ; }
+    if (action == "s3:GetObjectAcl" || action == "s3:GetObjectVersionAcl") { return ACL_READ_ACP; }
+    if (action == "s3:PutObjectAcl" || action == "s3:PutObjectVersionAcl") { return ACL_WRITE_ACP; }
+    return 0;
+}
+
+// ---- The three ways to give an ACL ----
+
+/// A canned ACL (ADR-0045 §2). With one owner, the two `bucket-owner` ones are the private one.
+fn cannedAcl(name: Slice<u8>) -> Result<[u8; 3], S3Fail> {
+    if (name == "private".bytes() || name == "bucket-owner-read".bytes() ||
+        name == "bucket-owner-full-control".bytes()) {
+        return Ok(privateAcl());
+    }
+    if (name == "public-read".bytes()) { return Ok([ACL_FULL_CONTROL, ACL_READ, 0u8]); }
+    if (name == "public-read-write".bytes()) { return Ok([ACL_FULL_CONTROL, ACL_READ | ACL_WRITE, 0u8]); }
+    if (name == "authenticated-read".bytes()) { return Ok([ACL_FULL_CONTROL, 0u8, ACL_READ]); }
+    if (name == "aws-exec-read".bytes() || name == "log-delivery-write".bytes()) {
+        return Err(S3Fail.Code(S3Code.NotImplemented));
+    }
+    return Err(S3Fail.Code(S3Code.InvalidArgument));
+}
+
+fn permissionOf(name: Slice<u8>) -> u8 {
+    if (name == "FULL_CONTROL".bytes()) { return ACL_FULL_CONTROL; }
+    if (name == "READ".bytes()) { return ACL_READ; }
+    if (name == "WRITE".bytes()) { return ACL_WRITE; }
+    if (name == "READ_ACP".bytes()) { return ACL_READ_ACP; }
+    if (name == "WRITE_ACP".bytes()) { return ACL_WRITE_ACP; }
+    return 0;
+}
+
+/// Spaces, tabs and line ends off both ends.
+fn trimBlank(bytes: Slice<u8>) -> Slice<u8> {
+    var a: usize = 0;
+    var b = bytes.length;
+    while (a < b && (bytes[a] == ' ' || bytes[a] == '\t' || bytes[a] == '\r' || bytes[a] == '\n')) { a += 1; }
+    while (b > a && (bytes[b - 1] == ' ' || bytes[b - 1] == '\t' || bytes[b - 1] == '\r' || bytes[b - 1] == '\n')) {
+        b -= 1;
+    }
+    return bytes[a..b];
+}
+
+/// The place of a group in an ACL, by its URI.
+fn groupOf(uri: Slice<u8>) -> Result<usize, S3Fail> {
+    if (uri == ALL_USERS_URI.bytes()) { return Ok(ACL_ALL_USERS); }
+    if (uri == AUTHENTICATED_URI.bytes()) { return Ok(ACL_AUTHENTICATED); }
+    return Err(S3Fail.Code(S3Code.InvalidArgument)); // the log delivery group, or none S3 has
+}
+
+/// The place of a canonical user: there is one, the owner.
+fn userOf(id: Slice<u8>) -> Result<usize, S3Fail> {
+    if (id == OWNER_ID.bytes()) { return Ok(ACL_OWNER); }
+    return Err(S3Fail.Code(S3Code.InvalidArgument));
+}
+
+/// The grantees of one `x-amz-grant-*` field, `uri="..."`, `id="..."` or `emailAddress="..."`, separated by commas,
+/// each given `permission`.
+fn grantHeader(value: Slice<u8>, permission: u8, acl: borrow mut [u8; 3]) -> Result<void, S3Fail> {
+    var at: usize = 0;
+    while (at <= value.length) {
+        let end = pieceEnd(value, at, ',');
+        let piece = trimBlank(value[at..end]);
+        at = end + 1;
+        if (piece.length == 0) { continue; }
+        let eq = pieceEnd(piece, 0, '=');
+        if (eq >= piece.length) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        let kind = trimBlank(piece[0..eq]);
+        let given = trimBlank(piece[eq + 1..]);
+        let quoted = given.length >= 2 && given[0] == '"' && given[given.length - 1] == '"';
+        let who = if (quoted) given[1..given.length - 1] else given;
+        let place =
+            if (kind == "uri".bytes()) {
+                groupOf(who)?
+            } else if (kind == "id".bytes()) {
+                userOf(who)?
+            } else if (kind == "emailAddress".bytes() || kind == "emailaddress".bytes()) {
+                return Err(S3Fail.Code(S3Code.UnresolvableGrantByEmailAddress));
+            } else {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            };
+        acl[place] |= permission;
+    }
+    return Ok();
+}
+
+/// The ACL a request's fields give: `x-amz-acl`, or the `x-amz-grant-*` fields, not both; null without either.
+fn requestAcl(req: borrow S3Request) -> Result<[u8; 3]?, S3Fail> {
+    let names = [
+        "x-amz-grant-read",
+        "x-amz-grant-write",
+        "x-amz-grant-read-acp",
+        "x-amz-grant-write-acp",
+        "x-amz-grant-full-control",
+    ];
+    let permissions = [ACL_READ, ACL_WRITE, ACL_READ_ACP, ACL_WRITE_ACP, ACL_FULL_CONTROL];
+    var granted = false;
+    var acl = [0u8; 3];
+    for (i in 0..names.length) {
+        match (headerOf(req, names[i])) {
+            Some(v) => {
+                granted = true;
+                grantHeader(v, permissions[i], mut acl)?;
+            }
+            null => {}
+        }
+    }
+    match (headerOf(req, "x-amz-acl")) {
+        Some(name) => {
+            if (granted) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            return Ok(Some(cannedAcl(trimBlank(name))?));
+        }
+        null => {}
+    }
+    if (!granted) { return Ok(null); }
+    return Ok(Some(acl));
+}
+
+/// The ACL of an `<AccessControlPolicy>` (ADR-0045 §2): its owner must be the owner, and its grantees the owner or
+/// the two groups.
+fn parseAclXml(xml: Slice<u8>) -> Result<[u8; 3], S3Fail> {
+    let malformed = S3Code.MalformedACLError;
+    if (findBytes(xml, "<AccessControlPolicy".bytes(), 0).isNull()) { return Err(S3Fail.Code(malformed)); }
+    let list = match (findBytes(xml, "<AccessControlList".bytes(), 0)) {
+        Some(at) => at,
+        null => { return Err(S3Fail.Code(malformed)); }
+    };
+    // The owner is named before the grants.
+    match (findBytes(xml, "<Owner>".bytes(), 0)) {
+        Some(at) => {
+            if (at > list) { return Err(S3Fail.Code(malformed)); }
+            match (elementText(xml[at..list], "ID")) {
+                Some(id) => {
+                    let _ = userOf(trimBlank(id))?;
+                }
+                null => { return Err(S3Fail.Code(malformed)); }
+            }
+        }
+        null => { return Err(S3Fail.Code(malformed)); }
+    }
+    var acl = [0u8; 3];
+    var grants: usize = 0;
+    var at = list;
+    while (true) {
+        let start = match (findBytes(xml, "<Grant>".bytes(), at)) {
+            Some(s) => s + 7,
+            null => { break; }
+        };
+        let end = match (findBytes(xml, "</Grant>".bytes(), start)) {
+            Some(e) => e,
+            null => { return Err(S3Fail.Code(malformed)); }
+        };
+        let inner = xml[start..end];
+        at = end + 8;
+        grants += 1;
+        if (grants > MAX_GRANTS) { return Err(S3Fail.Code(malformed)); }
+        let permission = match (elementText(inner, "Permission")) {
+            Some(p) => permissionOf(trimBlank(p)),
+            null => 0,
+        };
+        if (permission == 0) { return Err(S3Fail.Code(malformed)); }
+        var place: usize = 0;
+        match (elementText(inner, "URI")) {
+            Some(uri) => { place = groupOf(trimBlank(uri))?; }
+            null => {
+                match (elementText(inner, "ID")) {
+                    Some(id) => { place = userOf(trimBlank(id))?; }
+                    null => {
+                        if (elementText(inner, "EmailAddress").isSome()) {
+                            return Err(S3Fail.Code(S3Code.UnresolvableGrantByEmailAddress));
+                        }
+                        return Err(S3Fail.Code(malformed));
+                    }
+                }
+            }
+        }
+        acl[place] |= permission;
+    }
+    return Ok(acl);
+}
+
+/// The `<AccessControlPolicy>` of an ACL: the owner's grants, then everyone's, then every authenticated requester's.
+fn aclXml(acl: [u8; 3], out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let names = ["FULL_CONTROL", "READ", "WRITE", "READ_ACP", "WRITE_ACP"];
+    let bits = [ACL_FULL_CONTROL, ACL_READ, ACL_WRITE, ACL_READ_ACP, ACL_WRITE_ACP];
+    xmlHead(out, "AccessControlPolicy")?;
+    out.extend("<Owner><ID>".bytes())?;
+    out.extend(OWNER_ID.bytes())?;
+    out.extend("</ID><DisplayName>".bytes())?;
+    out.extend(OWNER_ID.bytes())?;
+    out.extend("</DisplayName></Owner><AccessControlList>".bytes())?;
+    for (g in 0..3) {
+        for (p in 0..names.length) {
+            if ((acl[g] & bits[p]) == 0) { continue; }
+            out.extend("<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"".bytes())?;
+            if (g == ACL_OWNER) {
+                out.extend("CanonicalUser\"><ID>".bytes())?;
+                out.extend(OWNER_ID.bytes())?;
+                out.extend("</ID><DisplayName>".bytes())?;
+                out.extend(OWNER_ID.bytes())?;
+                out.extend("</DisplayName>".bytes())?;
+            } else {
+                out.extend("Group\"><URI>".bytes())?;
+                out.extend(if (g == ACL_ALL_USERS) ALL_USERS_URI.bytes() else AUTHENTICATED_URI.bytes())?;
+                out.extend("</URI>".bytes())?;
+            }
+            out.extend("</Grantee><Permission>".bytes())?;
+            out.extend(names[p].bytes())?;
+            out.extend("</Permission></Grant>".bytes())?;
+        }
+    }
+    out.extend("</AccessControlList></AccessControlPolicy>".bytes())?;
+    return Ok();
+}
+
+// ---- With the store ----
+
+/// A version's ACL as an anonymous request meets it: the private one for a key or version that is not there.
+async fn storeObjectAcl(
+    app: borrow S3App,
+    bucket: StringView,
+    key: Slice<u8>,
+    versionId: [u8; 16]?,
+) -> Result<[u8; 3], S3Fail> {
+    let name = match (StringView.fromUtf8(key)) {
+        Some(k) => k,
+        null => { return Ok(privateAcl()); }
+    };
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    // An index lookup, no I/O: on the event loop.
+    return Ok(match (store.headObjectOf(bucket, name, versionId)) {
+        Ok(info) => match (metadataValue(info.metadata.view(), ACL_FIELD.bytes())) {
+            Ok(v) => aclOf(v.view()),
+            Err(_) => privateAcl(),
+        },
+        Err(_) => privateAcl(),
+    });
+}
+
+/// AccessDenied for a public ACL on a bucket whose public-access block has `BlockPublicAcls` (ADR-0045 §5).
+async fn checkPublicAcl(app: borrow S3App, bucket: StringView, acl: [u8; 3]) -> Result<void, S3Fail> {
+    if (!aclIsPublic(acl)) { return Ok(); }
+    let block = await storeBucketConfig(app, bucket, BUCKET_CONFIG_PUBLIC_ACCESS)?;
+    if (publicAccessHas(block.view(), PUBLIC_ACCESS_BLOCK_ACLS)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    return Ok();
+}
+
+/// `metadata` with the ACL the request's fields give the new object in it (PUT, CopyObject, CreateMultipartUpload):
+/// the private one without them, whatever `metadata` had.
+async fn withRequestAcl(app: borrow S3App, req: borrow S3Request, metadata: Vector<u8>) -> Result<Vector<u8>, S3Fail> {
+    let acl = requestAcl(req)? ?? privateAcl();
+    return await withAcl(app, req.bucket.view(), acl, metadata);
+}
+
+/// `metadata` with `acl` in it, once the bucket's public-access block has let it through.
+async fn withAcl(
+    app: borrow S3App,
+    bucket: StringView,
+    acl: [u8; 3],
+    metadata: Vector<u8>,
+) -> Result<Vector<u8>, S3Fail> {
+    await checkPublicAcl(app, bucket, acl)?;
+    let stored = storedAcl(acl)?;
+    if (stored.length == 0 && metadata.length == 0) { return Ok(metadata); }
+    return match (metadataReplace(metadata.view(), ACL_FIELD.bytes(), stored.view())) {
+        Ok(b) => Ok(b),
+        Err(_) => Err(S3Fail.Code(S3Code.InternalError)),
+    };
+}
+
+/// The ACL a Put*Acl request gives: its fields', or its body's.
+async fn aclOfRequest(
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<[u8; 3], S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    verifySmallBody(req, xml.view(), true)?;
+    match (requestAcl(req)?) {
+        Some(acl) => {
+            if (trimBlank(xml.view()).length > 0) { return Err(S3Fail.Code(S3Code.UnexpectedContent)); }
+            return Ok(acl);
+        }
+        null => {}
+    }
+    if (trimBlank(xml.view()).length == 0) { return Err(S3Fail.Code(S3Code.MissingSecurityHeader)); }
+    return parseAclXml(xml.view());
+}
+
+// ---- The ACL calls ----
+
+async fn getBucketAcl(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let stored = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_ACL)?;
+    var body = Vector<u8>.create();
+    aclXml(aclOf(stored.view()), mut body)?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn putBucketAcl(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let acl = await aclOfRequest(req, auth, exchange)?;
+    await checkPublicAcl(app, req.bucket.view(), acl)?;
+    let stored = storedAcl(acl)?;
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_ACL, stored.view())?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn getObjectAcl(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let info = await objectInfo(app, req, exchange)?;
+    readVersionHeader(exchange, borrow info)?;
+    let stored = match (metadataValue(info.metadata.view(), ACL_FIELD.bytes())) {
+        Ok(v) => v,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    var body = Vector<u8>.create();
+    aclXml(aclOf(stored.view()), mut body)?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// PutObjectAcl: the ACL of the current version, or of the one `versionId` names; no new version.
+async fn putObjectAcl(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let acl = await aclOfRequest(req, auth, exchange)?;
+    let versionId = requestVersion(req)?;
+    let bucket = req.bucket.view();
+    let key = req.key.view();
+    await checkPublicAcl(app, bucket, acl)?;
+    let stored = storedAcl(acl)?;
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let value = stored.view();
+        match (await Async.blocking(() => store.setAclOf(bucket, key, versionId, value))) {
+            Ok() => {}
+            Err(e) => {
+                deleteMarkerHeaders(store, bucket, key, versionId, exchange)?;
+                return Err(storeFail(e, key.length));
+            }
+        }
+    }
+    match (versionId) {
+        Some(id) => { versionHeader(exchange, "x-amz-version-id", id)?; }
+        null => {}
+    }
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
