@@ -1,0 +1,224 @@
+// Server-side encryption (ADR-0046): the parts that need no cipher.
+import web_core;
+import web_http;
+import web_server;
+
+@test
+fn sseChunkGeometry() -> Result<void, TestFailure> {
+    Check.equalU64(1, sseChunks(0))?;
+    Check.equalU64(1, sseChunks(1))?;
+    Check.equalU64(1, sseChunks(65536))?;
+    Check.equalU64(2, sseChunks(65537))?;
+    Check.equalU64(16, sseStoredLength(0))?;
+    Check.equalU64(17, sseStoredLength(1))?;
+    Check.equalU64(65552, sseStoredLength(65536))?;
+    Check.equalU64(65537 + 32, sseStoredLength(65537))?;
+    Check.equalU64(5368709120 + 16 * 81920, sseStoredLength(5368709120))?; // 5 GiB
+    // An empty part: its one tag.
+    let none = sseSpan(0, 0, 0);
+    Check.equalU64(1, none.chunks)?;
+    Check.equalU64(0, none.storedFrom)?;
+    Check.equalU64(16, none.storedTo)?;
+    // A whole part of two chunks and a bit.
+    let n: u64 = 2 * 65536 + 100;
+    let whole = sseSpan(n, 0, n);
+    Check.equalU64(0, whole.firstChunk)?;
+    Check.equalU64(3, whole.chunks)?;
+    Check.equalU64(0, whole.storedFrom)?;
+    Check.equalU64(sseStoredLength(n), whole.storedTo)?;
+    Check.equalU64(0, whole.skip)?;
+    // One byte at a chunk's end, and the next: each its own chunk.
+    let last = sseSpan(n, 65535, 65536);
+    Check.equalU64(0, last.firstChunk)?;
+    Check.equalU64(1, last.chunks)?;
+    Check.equalU64(65552, last.storedTo)?;
+    Check.equalU64(65535, last.skip)?;
+    let next = sseSpan(n, 65536, 65537);
+    Check.equalU64(1, next.firstChunk)?;
+    Check.equalU64(1, next.chunks)?;
+    Check.equalU64(65552, next.storedFrom)?;
+    Check.equalU64(2 * 65552, next.storedTo)?;
+    Check.equalU64(0, next.skip)?;
+    // A range across a boundary into the short last chunk.
+    let tail = sseSpan(n, 65536 + 10, n);
+    Check.equalU64(1, tail.firstChunk)?;
+    Check.equalU64(2, tail.chunks)?;
+    Check.equalU64(65552, tail.storedFrom)?;
+    Check.equalU64(2 * 65552 + 100 + 16, tail.storedTo)?;
+    Check.equalU64(10, tail.skip)?;
+    // Every span is whole chunks: its stored bytes are its plaintext's and a tag each.
+    let froms = [0u64, 1u64, 65535u64, 65536u64, 131071u64, 131072u64, 131171u64];
+    for (from in froms) {
+        for (to in froms) {
+            if (to <= from) { continue; }
+            let s = sseSpan(n, from, to);
+            let plainEnd = if ((s.firstChunk + s.chunks) * 65536 < n) (s.firstChunk + s.chunks) * 65536 else n;
+            Check.equalU64(plainEnd - s.firstChunk * 65536 + 16 * s.chunks, s.storedTo - s.storedFrom)?;
+            Check.equalU64(from, s.firstChunk * 65536 + s.skip)?;
+        }
+    }
+    // Nonces: the part and the chunk, little-endian; no two alike.
+    let a = sseNonce(0, 0);
+    let b = sseNonce(1, 0);
+    let c = sseNonce(0, 1);
+    let d = sseNonce(0x01020304, 0x1122334455667788);
+    Check.equalBytes([0u8; 12][..], a[..])?;
+    Check.equalBytes([1u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8][..], b[..])?;
+    Check.equalBytes([0u8, 0u8, 0u8, 0u8, 1u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8][..], c[..])?;
+    Check.equalBytes(
+        [4u8, 3u8, 2u8, 1u8, 0x88u8, 0x77u8, 0x66u8, 0x55u8, 0x44u8, 0x33u8, 0x22u8, 0x11u8][..],
+        d[..],
+    )?;
+    return Ok();
+}
+
+@test
+fn sseEnvelopeAsText() -> Result<void, TestFailure> {
+    var e = SseEnvelope {
+        customer: false,
+        keyId: copyBytes("key-2026_11".bytes())!,
+        nonce: [0u8; 12],
+        wrapped: [0u8; 48],
+    };
+    for (i in 0..12) { e.nonce[i] = truncate<u8>(i * 17); }
+    for (i in 0..48) { e.wrapped[i] = truncate<u8>(255 - i); }
+    var text = Vector<u8>.create();
+    encodeEnvelope(borrow e, mut text)!;
+    Check.equalU64((6 + 11 + 1 + 24 + 1 + 96) as u64, text.length as u64)?;
+    Check.isTrue(startsWithBytes(text.view(), "v1.s3.key-2026_11.00112233".bytes()), "the text")?;
+    let back = match (decodeEnvelope(text.view())!) {
+        Some(b) => b,
+        null => { return Check.fail("the envelope reads back"); }
+    };
+    Check.isTrue(!back.customer, "its mode")?;
+    Check.equalBytes(e.keyId.view(), back.keyId.view())?;
+    Check.equalBytes(e.nonce[..], back.nonce[..])?;
+    Check.equalBytes(e.wrapped[..], back.wrapped[..])?;
+    // SSE-C: no key id.
+    var c = SseEnvelope { customer: true, keyId: copyBytes("-".bytes())!, nonce: [7u8; 12], wrapped: [9u8; 48] };
+    var ctext = Vector<u8>.create();
+    encodeEnvelope(borrow c, mut ctext)!;
+    Check.isTrue(startsWithBytes(ctext.view(), "v1.c.-.0707".bytes()), "a customer's envelope")?;
+    Check.isTrue(decodeEnvelope(ctext.view())!.isSome(), "it reads back")?;
+    // What is not an envelope.
+    let hexNonce = "000102030405060708090a0b";
+    var wrapped = Vector<u8>.create();
+    for (i in 0..96) { wrapped.push('a')!; }
+    let heads = ["v2.s3.k.", "v1.kms.k.", "v1.s3..", "v1.s3.-.", "v1.c.k.", "v1.s3.bad id.", "v1.s3.k.x."];
+    for (h in heads) {
+        var bad = Vector<u8>.create();
+        bad.extend(h.bytes())!;
+        bad.extend(hexNonce.bytes())!;
+        bad.push('.')!;
+        bad.extend(wrapped.view())!;
+        Check.isTrue(decodeEnvelope(bad.view())!.isNull(), "not an envelope")?;
+    }
+    let others = [
+        "", "AES256", "v1.s3.k.000102030405060708090a0b", "v1.s3.k.000102030405060708090a0b.abcd",
+        "v1.s3.k.000102030405060708090a0g.aa", "v1.s3.k.00.aa.bb",
+    ];
+    for (o in others) { Check.isTrue(decodeEnvelope(o.bytes())!.isNull(), "not an envelope")?; }
+    return Ok();
+}
+
+fn keyFileAnswer(text: StringView) -> StringView => match (parseKeyFile(text.bytes())) {
+    Ok(_) => "ok",
+    Err(KeyFileFault.Empty) => "empty",
+    Err(KeyFileFault.BadLine) => "line",
+    Err(KeyFileFault.BadId) => "id",
+    Err(KeyFileFault.BadKey) => "key",
+    Err(KeyFileFault.Duplicate) => "duplicate",
+    Err(KeyFileFault.OutOfMemory) => "memory",
+};
+
+@test
+fn sseKeyFile() -> Result<void, TestFailure> {
+    // 32 bytes of 0, and of 0xFF, in base64.
+    let zeros = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    let ones = "//////////////////////////////////////////8=";
+    var text = Vector<u8>.create();
+    text.extend("# the master keys: the first seals\n\nk2  ".bytes())!;
+    text.extend(ones.bytes())!;
+    text.extend("   # since November\r\nk1\t".bytes())!;
+    text.extend(zeros.bytes())!;
+    text.extend("\n".bytes())!;
+    let keys = match (parseKeyFile(text.view())) {
+        Ok(k) => k,
+        Err(_) => { return Check.fail("the key file parses"); }
+    };
+    Check.equalU64(2, keys.length as u64)?;
+    Check.equalBytes("k2".bytes(), keys[0].id.view())?;
+    Check.equalBytes([0xFFu8; 32][..], keys[0].key[..])?;
+    Check.equalBytes("k1".bytes(), keys[1].id.view())?;
+    Check.equalBytes([0u8; 32][..], keys[1].key[..])?;
+    Check.equalBytes("empty".bytes(), keyFileAnswer("").bytes())?;
+    Check.equalBytes("empty".bytes(), keyFileAnswer("# nothing\n\n").bytes())?;
+    Check.equalBytes("line".bytes(), keyFileAnswer("justanid\n").bytes())?;
+    Check.equalBytes("id".bytes(), keyFileAnswer("bad.id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n").bytes())?;
+    Check.equalBytes("id".bytes(), keyFileAnswer("- AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n").bytes())?;
+    Check.equalBytes(
+        "id".bytes(),
+        keyFileAnswer("abcdefghijklmnopqrstuvwxyz0123456 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n").bytes(),
+    )?;
+    Check.equalBytes("key".bytes(), keyFileAnswer("k AAAAAAAAAAAAAAAAAAAAAA==\n").bytes())?; // 16 bytes
+    Check.equalBytes("key".bytes(), keyFileAnswer("k not-base64\n").bytes())?;
+    Check.equalBytes(
+        "duplicate".bytes(),
+        keyFileAnswer(
+            "k AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nk //////////////////////////////////////////8=\n",
+        ).bytes(),
+    )?;
+    return Ok();
+}
+
+fn sseAnswer(managed: StringView, algorithm: StringView, key: StringView, md5: StringView) -> Vector<u8> {
+    let m: Slice<u8>? = if (managed.length > 0) Some(managed.bytes()) else null;
+    let a: Slice<u8>? = if (algorithm.length > 0) Some(algorithm.bytes()) else null;
+    let k: Slice<u8>? = if (key.length > 0) Some(key.bytes()) else null;
+    let d: Slice<u8>? = if (md5.length > 0) Some(md5.bytes()) else null;
+    let answer = match (sseOfFields(m, a, k, d)) {
+        Ok(SseRequest.None) => "none",
+        Ok(SseRequest.Managed) => "managed",
+        Ok(SseRequest.Customer(given)) => if (given[0] == 0 && given[31] == 0) "customer" else "another key",
+        Err(S3Fail.Code(code)) => s3CodeName(code),
+        Err(_) => "failed",
+    };
+    return copyBytes(answer.bytes())!;
+}
+
+@test
+fn sseRequestFields() -> Result<void, TestFailure> {
+    let zeros = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    // The MD5 of 32 zero bytes, in base64.
+    var digest = Vector<u8>.create();
+    appendBase64(mut digest, Md5.of([0u8; 32][..])[..])!;
+    let md5 = match (StringView.fromUtf8(digest.view())) {
+        Some(t) => t,
+        null => { return Check.fail("the digest is text"); }
+    };
+    Check.equalBytes("none".bytes(), sseAnswer("", "", "", "").view())?;
+    Check.equalBytes("managed".bytes(), sseAnswer("AES256", "", "", "").view())?;
+    Check.equalBytes("NotImplemented".bytes(), sseAnswer("aws:kms", "", "", "").view())?;
+    Check.equalBytes("InvalidArgument".bytes(), sseAnswer("AES128", "", "", "").view())?;
+    Check.equalBytes("customer".bytes(), sseAnswer("", "AES256", zeros, md5).view())?;
+    Check.equalBytes("InvalidArgument".bytes(), sseAnswer("AES256", "AES256", zeros, md5).view())?;
+    Check.equalBytes("InvalidArgument".bytes(), sseAnswer("", "", zeros, md5).view())?;
+    Check.equalBytes("InvalidArgument".bytes(), sseAnswer("", "AES256", "", md5).view())?;
+    Check.equalBytes("InvalidArgument".bytes(), sseAnswer("", "AES256", zeros, "").view())?;
+    Check.equalBytes("InvalidArgument".bytes(), sseAnswer("", "AES128", zeros, md5).view())?;
+    Check.equalBytes("InvalidArgument".bytes(), sseAnswer("", "AES256", "AAAAAAAAAAAAAAAAAAAAAA==", md5).view())?;
+    Check.equalBytes(
+        "InvalidArgument".bytes(),
+        sseAnswer("", "AES256", "//////////////////////////////////////////8=", md5).view(),
+    )?;
+    Check.isTrue(isSseField("x-amz-server-side-encryption".bytes()), "the SSE-S3 field")?;
+    Check.isTrue(isSseField("x-amz-server-side-encryption-customer-key".bytes()), "a customer field")?;
+    Check.isTrue(isSseField("x-amz-server-side-encryption-aws-kms-key-id".bytes()), "a KMS field")?;
+    Check.isTrue(
+        isSseField("x-amz-copy-source-server-side-encryption-customer-key".bytes()),
+        "a copy source's field",
+    )?;
+    Check.isTrue(!isSseField("x-amz-meta-server-side-encryption".bytes()), "user metadata")?;
+    Check.isTrue(!isSseField("x-amz-acl".bytes()), "another field")?;
+    return Ok();
+}

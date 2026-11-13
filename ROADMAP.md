@@ -1797,3 +1797,30 @@ Browser form uploads with a SigV4 POST policy.
   through the same commit, and the new config kind a BucketConfig record.
 - **The toolchain:** as in slice 2, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
 - **Next:** M5 item 4, SSE-S3 and SSE-C. Before it, on a quiet machine: the p99 gate for item 3.
+
+### 13 Nov 2026: M5 item 4, server-side encryption: the design, and what needs no cipher (ADR-0046, G33)
+
+- **Blocked on a cipher.** lib/std has SHA-256, HMAC and the system's random source, and no cipher; CosmoStore
+  calls no C. Asked where the cipher should come from, the user chose AES-256-GCM in lib/std over one in
+  CosmoStore's own code (13 Nov). Logged as G33 in `CEESAFE_GAPS.md`, with the API CosmoStore would call.
+- **The master key, chosen with the user** (yes, 13 Nov, to the proposal after slice 3 of item 3): a key file named
+  when `serve` starts, wrapping a data key per object.
+- **The design (ADR-0046, proposed):** encryption is above the store, which carries ciphertext as any bytes. An
+  object is sealed in 64 KiB chunks under its own data key, the nonce the part number and the chunk's index, so a
+  range opens only the chunks it touches and CompleteMultipartUpload still joins manifests without rewriting. The
+  envelope (the data key sealed under a master key, or under the request's for SSE-C) is a field of the version's
+  metadata, beside its tags and ACL. The record flag ADR-0001 reserved cannot carry it: `Journal.stage` writes
+  flags 0, Relocate restages, and checkpoints keep no flags.
+- **Built, since it needs no cipher** (`src/s3/sse.cee`): the chunk arithmetic (stored length, the chunks and
+  stored bytes of a range, nonces), the envelope's text form, the key file's parser, and the request's fields
+  (SSE-S3's, and SSE-C's key with its MD5 checked). None of it is reached by a request yet.
+- **A fix on the way:** a request with an `x-amz-server-side-encryption*` field (a copy source's and a POST form's
+  too) was ignored and its object stored in the clear under a 200. It is NotImplemented now (ADR-0046 §7).
+- **Tests (4 new, 188 in all, no leaks):** the geometry (every span is whole chunks; boundaries; an empty part),
+  the envelope read back and 13 texts that are not one, the key file (order, comments, 8 refusals), the fields.
+- **Clients:** `tools/s3_smoke.sh` 247 checks (4 new: both kinds refused, a read with a key refused, nothing
+  stored); boto3 114 and the s3-tests subset 325, as before: nothing in them sends the fields.
+- **Not built:** `serve --sse-key-file`, sealing and opening, the reader over stored offsets, bucket default
+  encryption, the response fields. All after G33.
+- **Next:** when lib/std has the cipher, the rest of ADR-0046. Meanwhile M5 item 5 (Object Lock and legal hold)
+  does not depend on it; and the p99 gate for item 3 is still owed, on a quiet machine.

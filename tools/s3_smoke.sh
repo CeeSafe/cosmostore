@@ -488,6 +488,12 @@ aws s3api delete-bucket --bucket acl-made > /dev/null 2>&1
 aws s3 rm --recursive s3://acl/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket acl > /dev/null 2>&1 && pass "delete-bucket with an ACL" || fail "delete-bucket with an ACL"
 
+# Encryption waits for a cipher (ADR-0046 §7): a request that asks for it is refused, not stored in the clear.
+check "SSE-S3 asked for" "$(code s3api put-object --bucket smoke --key sse.txt --body pub.txt --server-side-encryption AES256)" NotImplemented
+check "SSE-C asked for" "$(code s3api put-object --bucket smoke --key sse.txt --body pub.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901)" NotImplemented
+check "a read with a key" "$(code s3api get-object --bucket smoke --key sse.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901 got.txt)" NotImplemented
+check "nothing stored" "$(aws s3api list-objects-v2 --bucket smoke --prefix sse.txt --query 'Contents[].Key' --output text)" None
+
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket smoke > /dev/null 2>&1 && pass "delete-bucket" || fail "delete-bucket"

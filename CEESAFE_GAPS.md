@@ -41,6 +41,7 @@ boilerplate; **P2** ergonomics.
 | G30 | P2 | runtime/async | Waking a task always writes a byte to the executor's wake pipe, even from the executor's own thread: every `AsyncMutex` unlock with a waiter is a `write` system call |
 | G31 | P2 | lib/std/checksums | `Crc32c` is software only (slicing-by-8, 1.5 GB/s on an M1): no way to use the CPU's CRC32C instructions (ARMv8 `crc32c`, x86 SSE4.2), 4.7 times faster in one chain. **Fixed in CeeSafe 0.30.0** (ADR 0089: the instruction where the CPU has it, asked at run time; `Crc32c.of` 1,652 to 8,147 MB/s on the M1). CosmoStore builds with 0.30.0 since 11 Nov 2026 |
 | G32 | P2 | std/process | No way to read or raise the open-file limit (`getrlimit`/`setrlimit` `RLIMIT_NOFILE`): a server cannot lift its soft limit (256 on macOS) to the hard one at start, as servers usually do **Fixed in CeeSafe 0.41.0** (ADR 0104: `ProcessLimits.openFiles`, `raiseOpenFiles`, `IoError.TooManyOpenFiles`); `serve` raises its limit at start since 13 Nov 2026 |
+| G33 | P1 | lib/std/crypto | No authenticated cipher (AES-256-GCM): S3 server-side encryption (ADR-0046) has nothing to seal an object's bytes with, and CosmoStore calls no C. Wanted on the CPU's AES and carry-less multiply instructions, with a constant-time fallback. SSE stays NotImplemented until then |
 
 ## Status (2026-11-06)
 
@@ -446,6 +447,41 @@ disk without a platform's errno number.
 `ProcessLimits.openFiles()` reads the soft and hard limits, `raiseOpenFiles(to)` raises the soft one (clamped on Apple
 systems to `kern.maxfilesperproc`), and `IoError.TooManyOpenFiles` names `EMFILE` and `ENFILE`. `cosmostore serve`
 raises its limit at start and logs it; `IoFailure` maps the new variant to `EMFILE`, so ADR-0039's 503 holds.
+
+### G33: no authenticated cipher (P1)
+
+**Evidence.** `lib/std/checksums.cee` has `Crc32c`, `Crc64Nvme`, `Md5`, `Sha256` and `HmacSha256`, and
+`lib/std/host.cee` has `Random.fill` from the system's cryptographic source. Nothing in lib/core or lib/std
+encrypts: no AES, no GCM, no ChaCha20-Poly1305, and no key derivation beyond HMAC. CeeSafe.Web's `web_tls` reaches
+OpenSSL for TLS records only and exports no cipher. CosmoStore's M5 item 4 is S3 server-side encryption (SSE-S3 and
+SSE-C, ADR-0046), which S3 defines as AES-256: an object's bytes sealed under a data key, the data key sealed under
+a master key or the request's. CosmoStore calls no C and has no `unsafe`, so it cannot reach OpenSSL itself.
+
+**Why it matters.** Encryption at rest is a line item of every production object store, and the cipher is the one
+part of it an application should not write. A table-based AES in safe code leaks its key through cache timing; a
+table-free one (bitsliced) is constant-time but runs at tens of MB/s, a fraction of what the journal and extents
+carry (ADR-0034: 1 MiB GETs at over 1 GB/s); and GHASH without a carry-less multiply is slower still. Every CPU
+CosmoStore targets has the instructions (AES-NI and PCLMULQDQ on x86-64, the AES and PMULL extensions on ARMv8),
+which is how G31 ended for CRC32C. The owner chose this path over a cipher in CosmoStore's own code (13 Nov 2026).
+
+**Repro.** There is nothing to call: `ceesafe_api` finds no `Aes`, `Gcm`, `ChaCha` or `Aead` in lib/core or
+lib/std. A program that needs to seal a buffer under a key has to carry its own cipher.
+
+**Suggested.** In lib/std, an AES-256-GCM that uses the CPU's instructions where the target has them and a
+constant-time software path elsewhere, with one API:
+- `Aes256Gcm.create(key: Slice<u8>) -> Aes256Gcm?` (null unless the key is 32 bytes), holding the expanded key and
+  the GHASH key, wiped when it is dropped;
+- `seal(borrow this, nonce: [u8; 12], associated: Slice<u8>, data: SliceMut<u8>) -> [u8; 16]`, in place, returning
+  the tag;
+- `open(borrow this, nonce: [u8; 12], associated: Slice<u8>, data: SliceMut<u8>, tag: [u8; 16]) -> bool`, in
+  place, comparing the tag in constant time and leaving `data` unreadable (zeroed) when it is false.
+Both without effects, so async code may call them, and checked against the NIST GCM vectors and Wycheproof's.
+CosmoStore would seal 64 KiB chunks, so throughput on buffers of that size is what counts; anything near the
+CRC32C rate (GB/s) keeps encryption off the profile. Two smaller things it would use beside it: a constant-time
+`Bytes.equal` (CosmoStore has its own `sameSignature` for SigV4), and a way to wipe a `Vector<u8>` that held a key.
+
+**In the meantime.** SSE requests stay NotImplemented. ADR-0046 fixes the formats and builds what does not need the
+cipher (the key file, the request's fields, the stored envelope), so the cipher is one call away when it lands.
 
 ## Not gaps (checked)
 

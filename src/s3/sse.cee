@@ -1,0 +1,257 @@
+// Server-side encryption (ADR-0046): what needs no cipher. The chunks an object is sealed in and where they are
+// stored, the envelope kept with a version, the key file, and the request's fields. Sealing and opening wait for
+// AES-256-GCM in lib/std (CEESAFE_GAPS.md, G33); until then a request that asks for encryption is NotImplemented.
+import web_core;
+import web_http;
+import web_server;
+
+/// The metadata field that holds a version's envelope (ADR-0046 §3).
+const SSE_FIELD: StringView = "x-amz-server-side-encryption";
+/// The plaintext bytes of one sealed chunk, and its tag's.
+const SSE_CHUNK: u64 = 65536;
+const SSE_TAG: u64 = 16;
+const SSE_KEY_BYTES: usize = 32;
+const SSE_NONCE_BYTES: usize = 12;
+/// A data key sealed: its 32 bytes and the tag.
+const SSE_WRAPPED_BYTES: usize = 48;
+const MAX_KEY_ID: usize = 32;
+
+// ---- Chunks (ADR-0046 §2) ----
+
+/// The chunks of a part of `n` plaintext bytes: an empty one is one empty chunk.
+fn sseChunks(n: u64) -> u64 => if (n == 0) 1 else (n + SSE_CHUNK - 1) / SSE_CHUNK;
+
+/// The bytes a part of `n` plaintext bytes is stored in: itself and a tag per chunk.
+fn sseStoredLength(n: u64) -> u64 => n + SSE_TAG * sseChunks(n);
+
+/// A chunk's nonce: the part number (0 for an object that is not multipart) and the chunk's index in the part.
+fn sseNonce(part: u32, chunk: u64) -> [u8; 12] {
+    var nonce = [0u8; 12];
+    for (i in 0..4) { nonce[i] = truncate<u8>(part >> truncate<u32>(i * 8)); }
+    for (i in 0..8) { nonce[4 + i] = truncate<u8>(chunk >> truncate<u64>(i * 8)); }
+    return nonce;
+}
+
+/// The stored bytes to read for a range of a part's plaintext.
+struct SseSpan {
+    /// The first chunk to open, and how many.
+    firstChunk: u64;
+    chunks: u64;
+    /// The stored bytes of those chunks, from the part's start.
+    storedFrom: u64;
+    storedTo: u64;
+    /// The plaintext bytes of the first chunk before the range.
+    skip: u64;
+}
+
+/// The chunks that hold plaintext `from..to` of a part of `n` bytes (`from < to <= n`, or the whole of an empty
+/// part): each is read and opened whole.
+fn sseSpan(n: u64, from: u64, to: u64) -> SseSpan {
+    let stride = SSE_CHUNK + SSE_TAG;
+    if (n == 0 || to <= from) {
+        return SseSpan { firstChunk: 0, chunks: 1, storedFrom: 0, storedTo: if (n == 0) SSE_TAG else 0, skip: 0 };
+    }
+    let first = from / SSE_CHUNK;
+    let last = (to - 1) / SSE_CHUNK;
+    let stored = sseStoredLength(n);
+    let end = (last + 1) * stride;
+    return SseSpan {
+        firstChunk: first,
+        chunks: last - first + 1,
+        storedFrom: first * stride,
+        storedTo: if (end < stored) end else stored,
+        skip: from - first * SSE_CHUNK,
+    };
+}
+
+// ---- The envelope (ADR-0046 §3) ----
+
+/// What a version keeps to be opened again: the data key, sealed under a master key or the request's.
+struct SseEnvelope {
+    /// SSE-C: the data key is sealed under the request's key, and `keyId` is `-`.
+    customer: bool;
+    keyId: Vector<u8>;
+    nonce: [u8; 12];
+    wrapped: [u8; 48];
+}
+
+fn isKeyId(id: Slice<u8>) -> bool {
+    if (id.length == 0 || id.length > MAX_KEY_ID) { return false; }
+    for (i in 0..id.length) {
+        let c = id[i];
+        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) { return false; }
+    }
+    return true;
+}
+
+/// The envelope as the field holds it: `v1.<mode>.<key id>.<nonce>.<wrapped data key>`, the last two in hex.
+fn encodeEnvelope(e: borrow SseEnvelope, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.extend(if (e.customer) "v1.c.".bytes() else "v1.s3.".bytes())?;
+    out.extend(e.keyId.view())?;
+    out.push('.')?;
+    appendHexBytes(out, e.nonce[..])?;
+    out.push('.')?;
+    appendHexBytes(out, e.wrapped[..])?;
+    return Ok();
+}
+
+/// `text` as hex into `out`, whose length it must fill exactly.
+fn hexInto(text: Slice<u8>, out: SliceMut<u8>) -> bool {
+    if (text.length != out.length * 2) { return false; }
+    for (i in 0..out.length) {
+        let hi = hexValue(text[i * 2]);
+        let lo = hexValue(text[i * 2 + 1]);
+        if (hi.isNull() || lo.isNull()) { return false; }
+        out[i] = ((hi ?? 0) << 4) | (lo ?? 0);
+    }
+    return true;
+}
+
+/// A stored envelope; null for a field that is not one.
+fn decodeEnvelope(text: Slice<u8>) -> Result<SseEnvelope?, AllocError> {
+    var pieces = [0usize; 6];
+    var count: usize = 1;
+    for (i in 0..text.length) {
+        if (text[i] != '.') { continue; }
+        if (count == 5) { return Ok(null); }
+        pieces[count] = i + 1;
+        count += 1;
+    }
+    if (count != 5) { return Ok(null); }
+    pieces[5] = text.length + 1;
+    if (text[pieces[0]..pieces[1] - 1] != "v1".bytes()) { return Ok(null); }
+    let mode = text[pieces[1]..pieces[2] - 1];
+    let customer = mode == "c".bytes();
+    if (!customer && mode != "s3".bytes()) { return Ok(null); }
+    let id = text[pieces[2]..pieces[3] - 1];
+    if (!isKeyId(id) || customer != (id == "-".bytes())) { return Ok(null); }
+    var e = SseEnvelope { customer: customer, keyId: copyBytes(id)?, nonce: [0u8; 12], wrapped: [0u8; 48] };
+    if (!hexInto(text[pieces[3]..pieces[4] - 1], mut e.nonce[..])) { return Ok(null); }
+    if (!hexInto(text[pieces[4]..pieces[5] - 1], mut e.wrapped[..])) { return Ok(null); }
+    return Ok(Some(e));
+}
+
+// ---- The key file (ADR-0046 §4) ----
+
+struct MasterKey {
+    id: Vector<u8>;
+    key: [u8; 32];
+}
+
+enum KeyFileFault {
+    /// No key at all.
+    Empty,
+    /// A line that is not `<key id> <base64 of 32 bytes>`.
+    BadLine,
+    BadId,
+    BadKey,
+    /// Two keys with one id.
+    Duplicate,
+    OutOfMemory,
+}
+
+fn keyFileOom(e: AllocError) -> KeyFileFault => KeyFileFault.OutOfMemory;
+
+/// The master keys of a key file: the first seals new objects, every one opens what was sealed under it.
+fn parseKeyFile(text: Slice<u8>) -> Result<Vector<MasterKey>, KeyFileFault> {
+    var keys = Vector<MasterKey>.create();
+    var at: usize = 0;
+    while (at < text.length) {
+        let end = pieceEnd(text, at, '\n');
+        let line = trimBlank(text[at..pieceEnd(text[0..end], at, '#')]);
+        at = end + 1;
+        if (line.length == 0) { continue; }
+        var space = pieceEnd(line, 0, ' ');
+        let tab = pieceEnd(line, 0, '\t');
+        if (tab < space) { space = tab; }
+        if (space >= line.length) { return Err(KeyFileFault.BadLine); }
+        let id = line[0..space];
+        let encoded = trimBlank(line[space + 1..]);
+        if (!isKeyId(id) || id == "-".bytes()) { return Err(KeyFileFault.BadId); }
+        for (i in 0..keys.length) {
+            if (keys[i].id.view() == id) { return Err(KeyFileFault.Duplicate); }
+        }
+        var raw = Vector<u8>.create();
+        let decoded = match (decodeBase64(encoded, mut raw)) {
+            Ok(d) => d,
+            Err(e) => { return Err(keyFileOom(e)); }
+        };
+        if (!decoded || raw.length != SSE_KEY_BYTES) { return Err(KeyFileFault.BadKey); }
+        var key = MasterKey {
+            id: match (copyBytes(id)) {
+                Ok(c) => c,
+                Err(e) => { return Err(keyFileOom(e)); }
+            },
+            key: [0u8; 32],
+        };
+        for (i in 0..SSE_KEY_BYTES) { key.key[i] = raw[i]; }
+        match (keys.push(key)) {
+            Ok() => {}
+            Err(e) => { return Err(keyFileOom(e)); }
+        }
+    }
+    if (keys.length == 0) { return Err(KeyFileFault.Empty); }
+    return Ok(keys);
+}
+
+// ---- The request's fields (ADR-0046 §5, §6) ----
+
+/// What a request asks for a new object, or brings to read one.
+enum SseRequest {
+    None,
+    /// SSE-S3: `x-amz-server-side-encryption: AES256`.
+    Managed,
+    /// SSE-C: the request's key.
+    Customer([u8; 32]),
+}
+
+/// The encryption a request's fields ask for: the SSE-S3 field, or the three customer fields (the algorithm, the
+/// key in base64 and its MD5 in base64), not both.
+fn sseOfFields(
+    managed: Slice<u8>?,
+    algorithm: Slice<u8>?,
+    key: Slice<u8>?,
+    keyMd5: Slice<u8>?,
+) -> Result<SseRequest, S3Fail> {
+    let invalid = S3Fail.Code(S3Code.InvalidArgument);
+    let customer = algorithm.isSome() || key.isSome() || keyMd5.isSome();
+    match (managed) {
+        Some(m) => {
+            if (customer) { return Err(invalid); }
+            if (trimBlank(m) == "AES256".bytes()) { return Ok(SseRequest.Managed); }
+            if (trimBlank(m) == "aws:kms".bytes() || trimBlank(m) == "aws:kms:dsse".bytes()) {
+                return Err(S3Fail.Code(S3Code.NotImplemented));
+            }
+            return Err(invalid);
+        }
+        null => {}
+    }
+    if (!customer) { return Ok(SseRequest.None); }
+    if (trimBlank(algorithm ?? "".bytes()) != "AES256".bytes()) { return Err(invalid); }
+    var raw = Vector<u8>.create();
+    if (!decodeBase64(trimBlank(key ?? "".bytes()), mut raw)? || raw.length != SSE_KEY_BYTES) { return Err(invalid); }
+    var digest = Vector<u8>.create();
+    if (!decodeBase64(trimBlank(keyMd5 ?? "".bytes()), mut digest)? || digest.length != 16) { return Err(invalid); }
+    let ok = sameSignature(digest.view(), Md5.of(raw.view())[..]);
+    var out = [0u8; 32];
+    for (i in 0..SSE_KEY_BYTES) {
+        out[i] = raw[i];
+        raw[i] = 0; // the key is not left behind in a freed buffer
+    }
+    if (!ok) { return Err(invalid); }
+    return Ok(SseRequest.Customer(out));
+}
+
+/// Whether a field's name is one of the encryption fields, a copy source's included.
+fn isSseField(name: Slice<u8>) -> bool =>
+    startsWithBytes(name, SSE_FIELD.bytes()) ||
+        startsWithBytes(name, "x-amz-copy-source-server-side-encryption".bytes());
+
+/// Whether a request asks for encryption or brings a key (ADR-0046 §7): NotImplemented until there is a cipher.
+fn asksEncryption(req: borrow S3Request) -> bool {
+    for (i in 0..req.headers.length) {
+        if (isSseField(req.headers[i].name.view())) { return true; }
+    }
+    return false;
+}

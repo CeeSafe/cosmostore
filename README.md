@@ -338,6 +338,8 @@ and Object Lock.
 **Known limits:**
 - a single node: no replication or erasure coding yet;
 - no CORS, Object Lock or MFA delete, and no SigV2 or session tokens;
+- no server-side encryption yet: it is designed (ADR-0046) and waits for AES-256-GCM in CeeSafe's lib/std; a request
+  that asks for it is refused with NotImplemented;
 - one account: every access key may do what no bucket policy denies it, and an ACL can grant only to the owner, to
   everyone and to authenticated requesters;
 - no lifecycle transitions: there is one storage class;
