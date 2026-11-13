@@ -178,7 +178,8 @@ cosmostore soak  <dir> <seconds> <keys> <capacity-bytes>
 ```
 
 - **`serve`** serves the store in `<dir>` over the S3 API, on 127.0.0.1 unless an address is given (`0.0.0.0:9000`,
-  `[::]:9000`). The credentials file has one `access-key secret-key` pair per line. With a domain, `<bucket>.<domain>`
+  `[::]:9000`). The credentials file has one `access-key secret-key` pair per line, and is read again when it
+  changes, within an upkeep round: a key is added, rotated or revoked without a restart (ADR-0050). With a domain, `<bucket>.<domain>`
   addresses a bucket as well as `/<bucket>/` paths. With `--tls-cert` and `--tls-key` it serves TLS, and reloads the
   files when they change. `--maintain-seconds` (10) sets the upkeep round, and `--upload-expiry-hours` (168; 0 never)
   when unfinished multipart uploads are aborted. `--notify-targets` names a file of webhooks, one `<id> <url>` a line,

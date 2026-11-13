@@ -62,6 +62,82 @@ fn readSmallFileInto(path: StringView, out: borrow mut Vector<u8>) -> Result<voi
 }
 
 /// Reads the credentials file.
+/// The credentials file and when it was last seen modified, with the sets its reloads go into (ADR-0050).
+struct Rotation {
+    sets: Arc<CredentialSets>;
+    path: String;
+    modified: i64;
+    /// The modification time of a file that did not read: it is tried again each round, and reported once.
+    failed: i64;
+}
+
+enum RotationOutcome {
+    Unchanged,
+    /// The keys now accepted, and those revoked.
+    Reloaded(u64, u64),
+    Failed(String),
+}
+
+/// Reads the credentials file again if its modification time changed, and makes its keys the current set. A file
+/// that does not read, or has no key, changes nothing: the keys in use stay.
+fn checkCredentials(r: borrow mut Rotation) -> RotationOutcome {
+    let modified = match (Fs.modifiedMillis(r.path.view())) {
+        Ok(m) => m,
+        Err(_) => r.modified,
+    };
+    if (modified == r.modified) { return RotationOutcome.Unchanged; }
+    let fresh = match (readCredentials(r.path.view())) {
+        Ok(f) => f,
+        Err(message) => {
+            // A file caught half written reads on a later round; one that stays unreadable is reported once.
+            if (modified == r.failed) { return RotationOutcome.Unchanged; }
+            r.failed = modified;
+            return RotationOutcome.Failed(message);
+        }
+    };
+    r.modified = modified; // seen: a file that is the same keys, or a set that cannot be taken, is not read again
+    let old = r.sets.get().view();
+    let next = match (nextCredentials(old, fresh.view())) {
+        Ok(n) => n,
+        Err(_) => { return RotationOutcome.Failed(textOf("out of memory")); }
+    };
+    if (sameCredentials(old, next.view())) { return RotationOutcome.Unchanged; }
+    var live: u64 = 0;
+    var revoked: u64 = 0;
+    for (i in 0..next.length) {
+        if (next[i].revoked) {
+            revoked += 1;
+        } else {
+            live += 1;
+        }
+    }
+    if (!r.sets.get().replace(next)) {
+        return RotationOutcome.Failed(textOf("the credentials were reloaded too many times; restart to reload"));
+    }
+    return RotationOutcome.Reloaded(live, revoked);
+}
+
+async fn reloadCredentialsIfChanged(r: borrow mut Rotation) {
+    let outcome = await Async.blocking(() => checkCredentials(r));
+    match (outcome) {
+        RotationOutcome.Unchanged => {}
+        RotationOutcome.Reloaded(live, revoked) => {
+            var line = String.create();
+            let _ = line.append("cosmostore: credentials reloaded: ");
+            let _ = line.appendNumber(live);
+            let _ = line.append(" keys accepted, ");
+            let _ = line.appendNumber(revoked);
+            let _ = line.append(" revoked\n");
+            let _ = await AsyncConsole.writeError(line.view());
+        }
+        RotationOutcome.Failed(message) => {
+            let _ = await AsyncConsole.writeError("cosmostore: credentials reload failed, keeping the keys in use: ");
+            let _ = await AsyncConsole.writeError(message.view());
+            let _ = await AsyncConsole.writeError("\n");
+        }
+    }
+}
+
 /// The targets file of `--notify-targets`; none without the option. A file that does not read stops `serve`.
 fn readTargets(path: StringView, given: bool) -> Vector<NotifyTarget> {
     if (!given) { return Vector<NotifyTarget>.create(); }
@@ -193,6 +269,7 @@ async fn servePlain(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     everyMs: u64,
     targets: borrow Vector<NotifyTarget>,
+    rotation: borrow mut Rotation,
 ) -> Result<ServerReport, NetError> {
     let listener = listenOn(address)?;
     let drain = Drain.create()?;
@@ -200,7 +277,7 @@ async fn servePlain(
     await notice(address, false);
     let raced = await Async.race(
         async move () => await server.run(listener, borrow plain, ConnectionLimits.defaults(), drain),
-        async () => await maintainAndDeliver(store, everyMs, targets),
+        async () => await maintainAndDeliver(store, everyMs, targets, rotation),
     );
     return Ok(raced?.value);
 }
@@ -210,9 +287,10 @@ async fn maintainAndDeliver(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     everyMs: u64,
     targets: borrow Vector<NotifyTarget>,
+    rotation: borrow mut Rotation,
 ) -> Result<ServerReport, NetError> {
     let raced = await Async.race(
-        async () => await maintainForever(store, everyMs),
+        async () => await maintainForever(store, everyMs, rotation),
         async () => await deliverForever(store, targets),
     );
     return Ok(raced?.value);
@@ -225,9 +303,10 @@ async fn maintainReloadAndDeliver(
     config: borrow TlsConfig,
     watch: borrow mut CertWatch,
     targets: borrow Vector<NotifyTarget>,
+    rotation: borrow mut Rotation,
 ) -> Result<ServerReport, NetError> {
     let raced = await Async.race(
-        async () => await maintainAndReload(store, everyMs, config, watch),
+        async () => await maintainAndReload(store, everyMs, config, watch, rotation),
         async () => await deliverForever(store, targets),
     );
     return Ok(raced?.value);
@@ -242,6 +321,7 @@ async fn serveTls(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     everyMs: u64,
     targets: borrow Vector<NotifyTarget>,
+    rotation: borrow mut Rotation,
 ) -> Result<ServerReport, NetError> {
     let listener = listenOn(address)?;
     let drain = Drain.create()?;
@@ -249,7 +329,7 @@ async fn serveTls(
     let config = acceptor.configuration();
     let raced = await Async.race(
         async move () => await server.run(listener, acceptor, ConnectionLimits.defaults(), drain),
-        async () => await maintainReloadAndDeliver(store, everyMs, config, watch, targets),
+        async () => await maintainReloadAndDeliver(store, everyMs, config, watch, targets, rotation),
     );
     return Ok(raced?.value);
 }
@@ -278,13 +358,18 @@ fn certWatch(certPath: StringView, keyPath: StringView) -> CertWatch => CertWatc
 /// The store's upkeep, forever, every `everyMs`: checkpoints when due, compaction, reaping, and expiring old uploads
 /// (`ObjectStore.maintain`). It holds the store's lock while it runs, so requests wait for it. A failure is logged and
 /// tried again next time; the loop ends only when it is cancelled.
-async fn maintainForever(store: borrow Arc<AsyncMutex<ObjectStore>>, everyMs: u64) -> Result<ServerReport, NetError> {
+async fn maintainForever(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    everyMs: u64,
+    rotation: borrow mut Rotation,
+) -> Result<ServerReport, NetError> {
     while (true) {
         match (await Timer.sleep(everyMs)) {
             Ok() => {}
             Err(e) => { return Err(NetErrors.fromAsync(e)); }
         }
         await upkeep(store);
+        await reloadCredentialsIfChanged(rotation);
     }
     return Err(NetError.Closed);
 }
@@ -295,6 +380,7 @@ async fn maintainAndReload(
     everyMs: u64,
     config: borrow TlsConfig,
     watch: borrow mut CertWatch,
+    rotation: borrow mut Rotation,
 ) -> Result<ServerReport, NetError> {
     while (true) {
         match (await Timer.sleep(everyMs)) {
@@ -303,6 +389,7 @@ async fn maintainAndReload(
         }
         await upkeep(store);
         await reloadIfChanged(config, watch);
+        await reloadCredentialsIfChanged(rotation);
     }
     return Err(NetError.Closed);
 }
@@ -742,9 +829,26 @@ fn serve() -> i32 {
         Some(a) => a,
         null => { usage(); }
     };
-    let credentials = match (readCredentials(credentialsPath)) {
+    let firstCredentials = match (readCredentials(credentialsPath)) {
         Ok(c) => c,
         Err(message) => { die(message.view()); }
+    };
+    // The sets a reload of the file goes into (ADR-0050): one owner for the requests, one for the upkeep.
+    let credentials = match (CredentialSets.create(firstCredentials)) {
+        Ok(sets) => match (Arc<CredentialSets>.create(sets)) {
+            Ok(a) => a,
+            Err(_) => { die("out of memory"); }
+        },
+        Err(_) => { die("out of memory"); }
+    };
+    var rotation = Rotation {
+        sets: credentials.clone(),
+        path: textOf(credentialsPath),
+        modified: match (Fs.modifiedMillis(credentialsPath)) {
+            Ok(m) => m,
+            Err(_) => 0,
+        },
+        failed: 0,
     };
     // The webhooks of event notifications (ADR-0048): once for the requests, once for the delivery task.
     let notifyTargets = readTargets(Process.argument(targetsAt) ?? "", targetsAt != 0);
@@ -767,7 +871,7 @@ fn serve() -> i32 {
     };
     // The policy counts of ADR-0043 §8, before the first request.
     let policies = match (store.bucketPolicies()) {
-        Ok(p) => countPolicies(borrow p, credentials.view()),
+        Ok(p) => countPolicies(borrow p, credentials.get().view()),
         Err(_) => { die("out of memory"); }
     };
     let corsBuckets = store.corsBucketCount();
@@ -845,9 +949,12 @@ fn serve() -> i32 {
                 borrow maintenance,
                 everyMs,
                 borrow deliveryTargets,
+                mut rotation,
             ))
         }
-        null => { Async.run(servePlain(server, address, borrow maintenance, everyMs, borrow deliveryTargets)) }
+        null => {
+            Async.run(servePlain(server, address, borrow maintenance, everyMs, borrow deliveryTargets, mut rotation))
+        }
     };
     match (result) {
         Ok(_) => { return 0; }

@@ -24,7 +24,7 @@ start_hook() { python3 -I "$here/webhook.py" "$hookport" "$work/hook.out" & hook
 start_hook
 printf 'hook http://127.0.0.1:%s/events\n# a comment\n' "$hookport" > "$work/targets"
 start_server() {
-    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" 2>> "$work/server.log" &
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 2>> "$work/server.log" &
     server=$!
     sleep 1
 }
@@ -614,6 +614,25 @@ aws s3api put-object --bucket notify --key logs/after.txt --body pub.txt > /dev/
 check "no rules, no events" "$(sleep 1; events)" 3
 aws s3 rm --recursive s3://notify/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket notify > /dev/null 2>&1 && pass "delete-bucket after notifications" || fail "delete-bucket after notifications"
+
+# Credential rotation (ADR-0050): the credentials file is read again when it changes, within an upkeep round (2 s).
+second() { ( export AWS_ACCESS_KEY_ID=AKIASMOKETEST0000002; export AWS_SECRET_ACCESS_KEY="$1"; shift; "$@" ); }
+check "a key the file does not have" "$(second second/secret/one code s3api list-buckets)" InvalidAccessKeyId
+echo "AKIASMOKETEST0000002 second/secret/one" >> credentials
+sleep 4
+check "a key added to the file" "$(second second/secret/one aws s3api list-buckets --query 'length(Buckets)')" 1
+printf '%s\n' "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" "AKIASMOKETEST0000002 second/secret/two" > credentials
+sleep 4
+check "its old secret" "$(second second/secret/one code s3api list-buckets)" SignatureDoesNotMatch
+check "its new secret" "$(second second/secret/two aws s3api list-buckets --query 'length(Buckets)')" 1
+: > credentials
+sleep 4
+check "a file without keys changes nothing" "$(aws s3api list-buckets --query 'length(Buckets)') $(second second/secret/two aws s3api list-buckets --query 'length(Buckets)')" "1 1"
+echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > credentials
+sleep 4
+check "a key taken out of the file" "$(second second/secret/two code s3api list-buckets)" InvalidAccessKeyId
+check "the first key through it all" "$(aws s3api list-buckets --query 'length(Buckets)')" 1
+check "the reloads in the log" "$(grep -c 'credentials reloaded' server.log) $(grep -c 'credentials reload failed' server.log)" "3 1"
 
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1

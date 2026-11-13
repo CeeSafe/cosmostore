@@ -1928,3 +1928,30 @@ Browser form uploads with a SigV4 POST policy.
 - **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
 - **Next:** credential rotation (the credentials file reloaded when it changes, as certificates are), then the
   rest of item 7.
+
+### 14 Nov 2026: M5 item 7, second part: credential rotation (ADR-0050)
+
+- **Chosen with the user** (yes, 13 Nov): after CORS.
+- **The upkeep reloads the credentials file** when its modification time changes, as it reloads certificates: a
+  key is added, rotated or revoked within one round, with no restart. A file that does not read or has no key
+  changes nothing, is reported once and tried again each round.
+- **A key keeps its place.** A reload builds the next set from the current one: kept keys in place with the
+  file's secret, keys the file dropped in place and revoked, new keys after. A request remembers its key by its
+  place (a policy's decision uses it), so a place must mean one key across a reload.
+- **No lock on the request path.** lib/std has no reader-writer lock and no atomic swap of an owner, and a
+  blocking `Mutex` is not for async code. The sets live in 4,096 `OnceLock` cells made at start; a reload writes
+  the next cell and stores its number; a request reads the number and the cell. After 4,095 reloads a reload is
+  refused and reported.
+- **Tests (2 new, 207 in all, no leaks):** the set after a reload (a secret changed, a key gone, a key new, a
+  revoked key back, a key twice in the file), and the cells: a set read before a reload stays as it was, and the
+  last cell refuses the next.
+- **Clients:** `tools/s3_smoke.sh` 318 checks (8 new): a key added to the file works, its old secret fails and
+  its new one works after a change, an empty file changes nothing, a key taken out is InvalidAccessKeyId, and the
+  log has three reloads and one failure. The script's server now runs its upkeep every 2 s
+  (`--maintain-seconds 2`) so the reloads are seen; the other 310 checks pass with it. boto3 139 and the s3-tests
+  subset 377, as before.
+- **Not run:** the p99 gate (owed since item 3; a request now reads its credentials through an `Arc`, an atomic
+  and a cell where it read a vector), the rclone, Go, JavaScript, Java and .NET scripts and `tools/tls_smoke.sh`.
+- **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
+- **Next:** the rest of item 7 (quotas, rate limits, an audit log, an admin API and CLI); item 4's rest when G33
+  is fixed; the p99 gate for items 3 to 7 on a quiet machine.

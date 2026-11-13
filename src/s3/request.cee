@@ -8,6 +8,95 @@ struct Credential {
     secret: Vector<u8>;
     /// Its last signing key (ADR-0035).
     signing: SigningKeyCache;
+    /// The credentials file no longer has the key (ADR-0050): nothing it signs is accepted. Its place stays, so a
+    /// key's place is the same in every set.
+    revoked: bool;
+}
+
+/// The most credential sets a server takes in its life: the first, and a reload for each of the others.
+const MAX_CREDENTIAL_SETS: usize = 4096;
+
+/// The credentials, and the sets that replaced them as the file changed (ADR-0050). A request reads the current
+/// set without a lock: each set is written once, into a cell made at start, and `current` then names it. A key's
+/// place is the same in every set, so a place taken from one set means the same key in the next.
+struct CredentialSets {
+    sets: Vector<OnceLock<Vector<Credential>>>;
+    current: AtomicU64;
+    none: Vector<Credential>;
+
+    fn create(first: Vector<Credential>) -> Result<CredentialSets, AllocError> {
+        var sets = Vector<OnceLock<Vector<Credential>>>.create();
+        sets.reserve(MAX_CREDENTIAL_SETS)?;
+        for (i in 0..MAX_CREDENTIAL_SETS) { sets.push(OnceLock<Vector<Credential>>.create())?; }
+        let _ = sets[0].set(first);
+        return Ok(CredentialSets { sets: sets, current: AtomicU64.create(0), none: Vector<Credential>.create() });
+    }
+
+    /// The current set.
+    fn view(borrow this) -> Slice<Credential> {
+        let at = this.current.load() as usize;
+        return match (this.sets[at].get()) {
+            Some(set) => set.view(),
+            null => this.none.view(),
+        };
+    }
+
+    /// Makes `next` the current set; false when every cell is used, and the set stays as it was. One task calls
+    /// this, the upkeep.
+    fn replace(borrow this, next: Vector<Credential>) -> bool {
+        let at = this.current.load() as usize + 1;
+        if (at >= this.sets.length) { return false; }
+        if (this.sets[at].set(next).isErr()) { return false; }
+        this.current.store(at as u64);
+        return true;
+    }
+}
+
+/// The set that follows `old` when the file holds `fresh` (ADR-0050 §2): every key of `old` in its place, with
+/// the file's secret, or revoked if the file no longer has it; then the file's new keys, in its order.
+fn nextCredentials(old: Slice<Credential>, fresh: Slice<Credential>) -> Result<Vector<Credential>, AllocError> {
+    var out = Vector<Credential>.create();
+    for (i in 0..old.length) {
+        var c = Credential {
+            accessKey: copyBytes(old[i].accessKey.view())?,
+            secret: Vector<u8>.create(),
+            signing: SigningKeyCache.create(),
+            revoked: true,
+        };
+        for (j in 0..fresh.length) {
+            if (c.revoked && fresh[j].accessKey.view() == old[i].accessKey.view()) {
+                c.secret.extend(fresh[j].secret.view())?;
+                c.revoked = false;
+            }
+        }
+        out.push(c)?;
+    }
+    for (j in 0..fresh.length) {
+        var known = false;
+        for (i in 0..out.length) {
+            if (out[i].accessKey.view() == fresh[j].accessKey.view()) { known = true; }
+        }
+        if (known) { continue; }
+        out.push(Credential {
+            accessKey: copyBytes(fresh[j].accessKey.view())?,
+            secret: copyBytes(fresh[j].secret.view())?,
+            signing: SigningKeyCache.create(),
+            revoked: false,
+        })?;
+    }
+    return Ok(out);
+}
+
+/// Whether two sets hold the same keys, secrets and revocations in the same places.
+fn sameCredentials(a: Slice<Credential>, b: Slice<Credential>) -> bool {
+    if (a.length != b.length) { return false; }
+    for (i in 0..a.length) {
+        if (a[i].revoked != b[i].revoked || a[i].accessKey.view() != b[i].accessKey.view() ||
+            !sameSignature(a[i].secret.view(), b[i].secret.view())) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /// Parses a credentials file: one `access-key secret-key` pair per line; `#` starts a comment.
@@ -28,6 +117,7 @@ fn parseCredentials(text: Slice<u8>) -> Result<Vector<Credential>, AllocError> {
             accessKey: Vector<u8>.create(),
             secret: Vector<u8>.create(),
             signing: SigningKeyCache.create(),
+            revoked: false,
         };
         c.accessKey.extend(trimmed[0..space])?;
         c.secret.extend(trimSpaces(trimmed[space + 1..]))?;
@@ -330,7 +420,9 @@ struct S3Request {
         if (auth.service.view() != "s3".bytes()) { return Err(S3Code.AuthorizationHeaderMalformed); }
         var found: usize? = null;
         for (i in 0..credentials.length) {
-            if (sameSignature(credentials[i].accessKey.view(), auth.accessKey.view())) { found = Some(i); }
+            if (!credentials[i].revoked && sameSignature(credentials[i].accessKey.view(), auth.accessKey.view())) {
+                found = Some(i);
+            }
         }
         let credential = match (found) {
             Some(i) => borrow credentials[i],

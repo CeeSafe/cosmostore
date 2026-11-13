@@ -137,7 +137,7 @@ fn policyScalars<region a>(r: borrow mut JsonReader<a>, out: borrow mut Vector<V
 /// Whether `key` is one of the configured access keys.
 fn configuredKey(credentials: Slice<Credential>, key: Slice<u8>) -> bool {
     for (i in 0..credentials.length) {
-        if (credentials[i].accessKey.view() == key) { return true; }
+        if (!credentials[i].revoked && credentials[i].accessKey.view() == key) { return true; }
     }
     return false;
 }
@@ -1034,7 +1034,7 @@ async fn policyGate(app: borrow S3App, who: borrow Requester, bucket: StringView
     gate.ignoreAcls = publicAccessHas(block.view(), PUBLIC_ACCESS_IGNORE_ACLS);
     if (!gate.ignoreAcls) { gate.acl = aclOf(acl.view()); }
     if (document.length == 0) { return Ok(gate); }
-    let policy = match (parseBucketPolicy(document.view(), bucket.bytes(), app.credentials.view(), false)) {
+    let policy = match (parseBucketPolicy(document.view(), bucket.bytes(), app.credentials.get().view(), false)) {
         Ok(p) => p,
         Err(S3Fail.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
         Err(_) => {
@@ -1075,8 +1075,10 @@ fn gateDecision(
                 resource.extend(key)?;
             }
             let facts = policyFacts(req, isListingAction(action), app.secure, who.peer)?;
+            // A key's place is the same in every set of credentials (ADR-0050).
+            let credentials = app.credentials.get().view();
             let principal = match (who.key) {
-                Some(i) => Some(app.credentials[i].accessKey.view()),
+                Some(i) => if (i < credentials.length) Some(credentials[i].accessKey.view()) else null,
                 null => null,
             };
             match (decidePolicy(policy, principal, action, resource.view(), borrow facts)) {
@@ -1198,7 +1200,7 @@ async fn recountPolicies(app: borrow S3App) -> Result<void, S3Fail> {
             Err(e) => { return Err(storeFail(e, 0)); }
         };
     }
-    let counts = countPolicies(borrow all, app.credentials.view());
+    let counts = countPolicies(borrow all, app.credentials.get().view());
     app.policyBuckets.store(counts.policies);
     app.denyBuckets.store(counts.denies);
     return Ok();
@@ -1226,7 +1228,7 @@ async fn putBucketPolicy(
 ) -> Result<void, S3Fail> {
     let json = await readSmallBody(auth, exchange, MAX_POLICY_BYTES + 1)?;
     verifySmallBody(req, json.view(), true)?;
-    let policy = parseBucketPolicy(json.view(), req.bucket.view().bytes(), app.credentials.view(), true)?;
+    let policy = parseBucketPolicy(json.view(), req.bucket.view().bytes(), app.credentials.get().view(), true)?;
     // BlockPublicPolicy: a public policy is not taken (ADR-0044 §3).
     if (policyIsPublic(borrow policy)) {
         let block = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_PUBLIC_ACCESS)?;
@@ -1261,7 +1263,7 @@ async fn getBucketPolicyStatus(
     let document = await storeBucketConfig(app, bucket, BUCKET_CONFIG_POLICY)?;
     var isPublic = false;
     if (document.length > 0) {
-        match (parseBucketPolicy(document.view(), bucket.bytes(), app.credentials.view(), false)) {
+        match (parseBucketPolicy(document.view(), bucket.bytes(), app.credentials.get().view(), false)) {
             Ok(p) => { isPublic = policyIsPublic(borrow p); }
             Err(S3Fail.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
             Err(_) => {} // a stored policy that does not parse opens nothing (ADR-0043 §9)
