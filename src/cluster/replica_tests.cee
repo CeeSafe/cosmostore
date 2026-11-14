@@ -6,11 +6,16 @@
 
 const CLUSTER_KEYS: usize = 5;
 
-fn replicaConfig(id: u32, seed: u64) -> ReplicaConfig {
+fn replicaConfig(id: u32, seed: u64, upkeep: bool) -> ReplicaConfig {
     var voters = Vector<u32>.create();
     for (v in 1..4) { voters.push(truncate<u32>(v))!; }
     var store = storeConfig();
     store.journal = JournalConfig { segmentTargetBytes: 2048, maxBatchBytes: 65536, shardId: 0, raftLog: true };
+    if (upkeep) {
+        // Checkpoints and compaction often: a follower cut off for a while falls behind the leader's checkpoint.
+        store.journal.segmentTargetBytes = 1024;
+        store.checkpointEveryBytes = 1024;
+    }
     return ReplicaConfig {
         id: id,
         voters: voters,
@@ -25,6 +30,10 @@ fn replicaConfig(id: u32, seed: u64) -> ReplicaConfig {
 struct Cluster {
     replicas: Vector<ShardReplica>;
     net: Vector<RaftMessage>;
+    /// Replicas cut off from the others: what they send and what is sent to them is lost.
+    cut: [bool; 3];
+    /// Every replica runs its upkeep (checkpoints, compaction) each round.
+    upkeep: bool;
 }
 
 fn replicaDir(root: StringView, id: u32) -> String {
@@ -34,15 +43,17 @@ fn replicaDir(root: StringView, id: u32) -> String {
     return d;
 }
 
-fn clusterOpen(root: StringView, seed: u64) -> Result<Cluster, StoreError> {
+fn clusterOpen(root: StringView, seed: u64) -> Result<Cluster, StoreError> => clusterOpenWith(root, seed, false);
+
+fn clusterOpenWith(root: StringView, seed: u64, upkeep: bool) -> Result<Cluster, StoreError> {
     var replicas = Vector<ShardReplica>.create();
     for (i in 1..4) {
         let id = truncate<u32>(i);
         let dir = replicaDir(root, id);
         sio(Fs.ensureDirectory(dir.view()))?;
-        replicas.push(ShardReplica.open(dir.view(), replicaConfig(id, seed))?)?;
+        replicas.push(ShardReplica.open(dir.view(), replicaConfig(id, seed, upkeep))?)?;
     }
-    return Ok(Cluster { replicas: replicas, net: Vector<RaftMessage>.create() });
+    return Ok(Cluster { replicas: replicas, net: Vector<RaftMessage>.create(), cut: [false; 3], upkeep: upkeep });
 }
 
 /// One round: every message sent so far is delivered, in order, and then every replica ticks.
@@ -55,12 +66,17 @@ fn clusterStep(c: borrow mut Cluster) -> Result<void, StoreError> {
             null => { break; }
         };
         let at = (m.to - 1) as usize;
+        if (c.cut[at] || c.cut[(m.from - 1) as usize]) { continue; }
         c.replicas[at].step(m)?;
         c.replicas[at].drain(mut c.net)?;
     }
     for (i in 0..c.replicas.length) {
         c.replicas[i].tick()?;
         c.replicas[i].drain(mut c.net)?;
+        if (c.upkeep) {
+            c.replicas[i].maintain()?;
+            c.replicas[i].drain(mut c.net)?;
+        }
     }
     return Ok();
 }
@@ -281,3 +297,197 @@ fn replicasFaultsTorn() -> Result<void, TestFailure> => sweepCluster("cluster-to
 
 @test
 fn replicasFaultsCrash() -> Result<void, TestFailure> => sweepCluster("cluster-crash", SweepMode.Crash);
+
+/// A follower cut off while the leader writes (overwriting the same keys, so segments empty out), checkpoints and
+/// compacts; then it rejoins, behind the leader's checkpoint, and must catch up from a snapshot. Stops at the first
+/// error, as a power cut would.
+/// Returns each replica's checkpoint index when it stopped: published checkpoints and installed snapshots are
+/// durable, so none may come back lower after a crash.
+fn snapshotWorkload(root: StringView, seed: u64, model: borrow mut ClusterModel) -> [u64; 3] {
+    var c = match (clusterOpenWith(root, seed, true)) {
+        Ok(c) => c,
+        Err(_) => { return [0u64; 3]; }
+    };
+    let _ = runSnapshotWorkload(mut c, model);
+    var floors = [0u64; 3];
+    for (i in 0..3) { floors[i] = c.replicas[i].store.checkpointIndex(); }
+    return floors;
+}
+
+fn runSnapshotWorkload(c: borrow mut Cluster, model: borrow mut ClusterModel) -> Result<void, StoreError> {
+    for (op in 0usize..31usize) {
+        let at = match (awaitLeader(c)?) {
+            Some(i) => i,
+            null => { return Ok(); }
+        };
+        if (op == 1) { c.cut[(at + 1) % 3] = true; }
+        let before = c.replicas[at].beginWrite()?;
+        let k = op % CLUSTER_KEYS;
+        let value = 1000 + (op as u64);
+        model.hasPending = true;
+        if (op == 0) {
+            model.bucketPending = true;
+            c.replicas[at].store.createBucket("bkt")?;
+        } else {
+            model.pendingKey = k;
+            model.pendingValue = value;
+            var data = Vector<u8>.create();
+            data.pushLE(value)?;
+            data.resize(200, 7)?; // larger records fill segments sooner
+            data.viewMut().writeLE(0, value);
+            let _ = c.replicas[at].store.putObject("bkt", clusterKey(k), "text/plain", data.view(), PutCondition.None)?;
+        }
+        let index = c.replicas[at].finishWrite(before)? ?? before;
+        var rounds = 0;
+        while (!c.replicas[at].isApplied(index)) {
+            if (rounds > 300) { return Ok(); }
+            clusterStep(c)?;
+            rounds += 1;
+        }
+        if (op == 0) { model.bucket = true; } else { model.values[k] = model.pendingValue; }
+        model.hasPending = false;
+        model.bucketPending = false;
+        model.acked += 1;
+    }
+    // The follower rejoins and catches up.
+    c.cut = [false; 3];
+    for (round in 0..300) {
+        var behind = false;
+        let last = c.replicas[0].store.appliedIndex().max(c.replicas[1].store.appliedIndex()).max(
+            c.replicas[2].store.appliedIndex(),
+        );
+        for (i in 0..3) {
+            if (c.replicas[i].store.appliedIndex() < last) { behind = true; }
+        }
+        if (!behind) { return Ok(); }
+        clusterStep(c)?;
+    }
+    return Ok();
+}
+
+/// A value's first 8 bytes; the snapshot workload pads its values to 200 bytes.
+fn heldValuePadded(r: borrow ShardReplica, k: usize) -> Result<u64, TestFailure> {
+    match (r.store.getObject("bkt", clusterKey(k))) {
+        Ok(data) => {
+            if (data.length < 8) { return Err(TestFailure.create("a value of the wrong length")); }
+            return Ok(data.readLE<u64>(0));
+        }
+        Err(StoreError.NoSuchKey) => { return Ok(0); }
+        Err(StoreError.NoSuchBucket) => { return Ok(0); }
+        Err(_) => { return Err(TestFailure.create("a read failed")); }
+    }
+}
+
+/// `checkCluster` for the snapshot workload: reopened with upkeep, they elect, catch up (a snapshot where one is
+/// needed), agree, and hold every acknowledged write.
+fn checkSnapshotCluster(
+    root: StringView,
+    seed: u64,
+    model: borrow ClusterModel,
+    floors: [u64; 3],
+) -> Result<void, TestFailure> {
+    var c = match (clusterOpenWith(root, seed + 1, true)) {
+        Ok(c) => c,
+        Err(_) => { return Err(TestFailure.create("a replica did not open after the fault")); }
+    };
+    for (i in 0..3) {
+        Check.isTrue(
+            c.replicas[i].store.checkpointIndex() >= floors[i],
+            "a replica came back without a checkpoint or snapshot it had made durable",
+        )?;
+    }
+    let at = match (awaitLeader(mut c)) {
+        Ok(Some(i)) => i,
+        _ => { return Err(TestFailure.create("no leader after the fault")); }
+    };
+    let target = c.replicas[at].store.lastEntry();
+    for (round in 0..400) {
+        if (c.replicas[0].isApplied(target) && c.replicas[1].isApplied(target) && c.replicas[2].isApplied(target)) {
+            break;
+        }
+        match (clusterStep(mut c)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("a replica failed while catching up")); }
+        }
+    }
+    for (i in 0..3) { Check.isTrue(c.replicas[i].isApplied(target), "a replica did not catch up")?; }
+    let bucket = c.replicas[0].store.bucketExists("bkt")!;
+    Check.isTrue(bucket || !model.bucket, "an acknowledged bucket was lost")?;
+    for (k in 0..CLUSTER_KEYS) {
+        let held = heldValuePadded(borrow c.replicas[0], k)?;
+        for (i in 1..3) { Check.equalU64(held, heldValuePadded(borrow c.replicas[i], k)?)?; }
+        let ok = held == model.values[k] || (model.hasPending && model.pendingKey == k && held == model.pendingValue);
+        Check.isTrue(ok, "a replica holds neither the acknowledged value nor the one being written")?;
+    }
+    return Ok();
+}
+
+/// The clean snapshot workload, and what it did: snapshots installed, segments compacted away, bytes relocated. Its
+/// replicas are closed when it returns.
+fn snapshotRun(root: StringView, model: borrow mut ClusterModel) -> Result<[u64; 3], TestFailure> {
+    var c = match (clusterOpenWith(root, 5, true)) {
+        Ok(c) => c,
+        Err(_) => { return Err(TestFailure.create("the replicas did not open")); }
+    };
+    if (runSnapshotWorkload(mut c, model).isErr()) { return Err(TestFailure.create("the workload failed")); }
+    var done = [0u64; 3];
+    for (i in 0..3) {
+        done[0] += c.replicas[i].snapshotsInstalled;
+        done[1] += c.replicas[i].store.counters().segmentsCompacted;
+        done[2] += c.replicas[i].store.counters().compactionBytesCopied;
+    }
+    return Ok(done);
+}
+
+@test
+fn replicasCatchUpFromASnapshot() -> Result<void, TestFailure> {
+    let root = scratchDirectory("cluster-snapshot");
+    var model = emptyModel();
+    let done = snapshotRun(root.view(), mut model)?;
+    Check.equalU64(31, model.acked)?;
+    Check.isTrue(done[0] >= 1, "the follower caught up from a snapshot")?;
+    Check.isTrue(done[1] >= 3, "segments were compacted away")?;
+    Check.isTrue(done[2] > 0, "the leader relocated live payloads")?;
+    checkSnapshotCluster(root.view(), 5, borrow model, [0u64; 3])?;
+    removeTree(root.view());
+    return Ok();
+}
+
+fn sweepSnapshots(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let root = scratchDirectory(name);
+    Faults.countOperations();
+    var clean = emptyModel();
+    let _ = snapshotWorkload(root.view(), 5, mut clean);
+    Faults.disarm();
+    Check.equalU64(31, clean.acked)?;
+    let points = Faults.seen();
+    // Every third operation, so the sweep stays within a few minutes; the cluster sweeps above cover each one.
+    var n = 1u64;
+    while (n <= points) {
+        removeTree(root.view());
+        Fs.ensureDirectory(root.view())!;
+        armMode(borrow mode, n);
+        var model = emptyModel();
+        let floors = snapshotWorkload(root.view(), 5, mut model);
+        Faults.disarm();
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(root.view())!;
+        }
+        checkSnapshotCluster(root.view(), 5, borrow model, floors)?;
+        n += 3;
+    }
+    removeTree(root.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn snapshotsFaultsOnce() -> Result<void, TestFailure> => sweepSnapshots("snapshot-once", SweepMode.Once);
+
+@test
+fn snapshotsFaultsTorn() -> Result<void, TestFailure> => sweepSnapshots("snapshot-torn", SweepMode.StickyTorn);
+
+@test
+fn snapshotsFaultsCrash() -> Result<void, TestFailure> => sweepSnapshots("snapshot-crash", SweepMode.Crash);

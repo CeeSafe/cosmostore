@@ -1,0 +1,92 @@
+// Installing a leader's snapshot (ADR-0058 §9): its files, written into a fresh store directory of the replica's next
+// generation, each synced, then the directory; the generation file then switches to it, and only then is the old
+// directory removed. A crash before the switch leaves the old store (and the new directory, removed at the next open);
+// after it, the new one. No rename: the crash model (ADR-0004) judges appends, syncs and directory entries.
+
+/// Writes `bundle`'s files into `dir` (which must be empty), durably. Refuses a bundle that is not for `index` and
+/// `term`, a file that fails its CRC, and any name but a segment's or a checkpoint's.
+fn writeSnapshotBundle(dir: StringView, bundle: Slice<u8>, index: u64, term: u64) -> Result<void, StoreError> {
+    if (bundle.length < 28 || bundle.readLE<u64>(0) != SNAPSHOT_MAGIC) { return Err(StoreError.CheckpointCorrupt); }
+    if (bundle.readLE<u64>(8) != index || bundle.readLE<u64>(16) != term) { return Err(StoreError.CheckpointCorrupt); }
+    let count = bundle.readLE<u32>(24);
+    var at = 28usize;
+    var n = 0u32;
+    while (n < count) {
+        if (at + 2 > bundle.length) { return Err(StoreError.CheckpointCorrupt); }
+        let nameLength = bundle.readLE<u16>(at) as usize;
+        at += 2;
+        if (at + nameLength + 12 > bundle.length) { return Err(StoreError.CheckpointCorrupt); }
+        let name = match (StringView.fromUtf8(bundle[at..at + nameLength])) {
+            Some(v) => v,
+            null => { return Err(StoreError.CheckpointCorrupt); }
+        };
+        at += nameLength;
+        let isSegment = name.length == 23 && name.startsWith("seg-") && name.endsWith(".cj");
+        let isCheckpoint = name.length == 24 && name.startsWith("ckpt-") && name.endsWith(".ck");
+        if (!isSegment && !isCheckpoint) { return Err(StoreError.CheckpointCorrupt); }
+        let length = match (checkedTruncate<usize>(bundle.readLE<u64>(at))) {
+            Some(l) => l,
+            null => { return Err(StoreError.CheckpointCorrupt); }
+        };
+        let crc = bundle.readLE<u32>(at + 8);
+        at += 12;
+        if (at + length > bundle.length) { return Err(StoreError.CheckpointCorrupt); }
+        let bytes = bundle[at..at + length];
+        if (Crc32c.of(bytes) != crc) { return Err(StoreError.CheckpointCorrupt); }
+        at += length;
+        var path = String.create();
+        path.append(dir)?;
+        path.append("/")?;
+        path.append(name)?;
+        let file = sio(DurableFile.createNew(path.view()))?;
+        sio(file.writeAt(bytes, 0))?;
+        sio(file.syncData())?;
+        n += 1;
+    }
+    if (at != bundle.length) { return Err(StoreError.CheckpointCorrupt); }
+    sio(Fs.syncDirectory(dir))?;
+    return Ok();
+}
+
+/// Removes a store directory and what is in it (its files and its extents directory), then makes that durable.
+fn removeStoreDirectory(dir: StringView) -> Result<void, StoreError> {
+    let names = match (Directory.list(dir)) {
+        Ok(n) => n,
+        Err(IoError.NotFound) => { return Ok(); }
+        Err(_) => { return Err(StoreError.Io(IoFailure { op: IoOp.Open, errno: 0 })); }
+    };
+    for (i in 0..names.length) {
+        var path = String.create();
+        path.append(dir)?;
+        path.append("/")?;
+        path.append(names[i].view())?;
+        if (names[i].view() == "extents") {
+            let inner = match (Directory.list(path.view())) {
+                Ok(n) => n,
+                Err(_) => { return Err(StoreError.Io(IoFailure { op: IoOp.Open, errno: 0 })); }
+            };
+            for (k in 0..inner.length) {
+                var file = String.create();
+                file.append(path.view())?;
+                file.append("/")?;
+                file.append(inner[k].view())?;
+                sio(Fs.unlink(file.view()))?;
+            }
+            sio(Fs.removeDirectory(path.view()))?;
+        } else {
+            sio(Fs.unlink(path.view()))?;
+        }
+    }
+    sio(Fs.removeDirectory(dir))?;
+    sio(Fs.syncDirectory(Fs.parentOf(dir)))?;
+    return Ok();
+}
+
+/// `<dir>/store-<16 hex>`: a replica's store directory of generation `generation`.
+fn storeDirectory(dir: StringView, generation: u64) -> Result<String, AllocError> {
+    var s = String.create();
+    s.append(dir)?;
+    s.append("/store-")?;
+    appendHex16Text(mut s, generation)?;
+    return Ok(s);
+}

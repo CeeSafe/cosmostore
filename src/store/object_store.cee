@@ -1203,6 +1203,51 @@ const LIFECYCLE_BATCH: usize = 1000;
 /// Abandoned extents queued between reaps; more are left to the orphan sweep at open.
 const ABANDONED_CAPACITY: usize = 4096;
 
+/// A snapshot bundle (ADR-0058 §9): u64 magic "CSSNAP01", u64 index, u64 term, u32 file count, then per file u16 name
+/// length, the name, u64 length, u32 CRC32C of the bytes, the bytes.
+const SNAPSHOT_MAGIC: u64 = 0x313050414E535343; // "CSSNAP01" in file order
+
+/// Appends the first `length` bytes of the file at `path` to a bundle, as `name`.
+fn appendBundleFile(
+    bundle: borrow mut Vector<u8>,
+    name: StringView,
+    path: StringView,
+    length: u64,
+) -> Result<void, StoreError> {
+    let file = sio(DurableFile.openRead(path))?;
+    let n = match (checkedTruncate<usize>(length)) {
+        Some(n) => n,
+        null => { return Err(StoreError.EntityTooLarge); }
+    };
+    var bytes = Vector<u8>.create();
+    bytes.resize(n, 0)?;
+    sio(file.readExactAt(mut bytes.viewMut(), 0))?;
+    bundle.pushLE(truncate<u16>(name.length))?;
+    bundle.extend(name.bytes())?;
+    bundle.pushLE(length)?;
+    bundle.pushLE(Crc32c.of(bytes.view()))?;
+    bundle.extend(bytes.view())?;
+    return Ok();
+}
+
+/// `seg-<16 hex>.cj`, a segment's file name.
+fn segmentName(id: u64) -> Result<String, StoreError> {
+    var s = String.create();
+    s.append("seg-")?;
+    appendHex16(mut s, id)?;
+    s.append(".cj")?;
+    return Ok(s);
+}
+
+/// `ckpt-<16 hex>.ck`, a checkpoint's file name.
+fn checkpointName(lsn: u64) -> Result<String, StoreError> {
+    var s = String.create();
+    s.append("ckpt-")?;
+    appendHex16Text(mut s, lsn)?;
+    s.append(".ck")?;
+    return Ok(s);
+}
+
 /// `ObjectStore.stageRecord` on the journal alone, so the meta may be another of the store's fields.
 fn stageIn(
     journal: borrow mut Journal,
@@ -1326,6 +1371,9 @@ struct ObjectStore {
     private term: u64;
     /// The terms of the entries recovery found after the checkpoint, unapplied, for the replica's Raft core.
     private recoveredTerms: Vector<u64>;
+    /// The term of the last applied entry, and of the newest checkpoint's (a Raft log; 0 on a single node).
+    private appliedTerm: u64;
+    private checkpointTerm: u64;
 
     /// Opens the store in `dir`: loads the newest checkpoint, if any, then replays the journal
     /// records after it.
@@ -1335,9 +1383,11 @@ struct ObjectStore {
         let complete = listCheckpoints(dir, false)?;
         var state = StoreState.create();
         var start = JournalStart.beginning();
+        var startTerm = 0u64;
         if (complete.length > 0) {
             let loaded = readCheckpoint(dir, complete[complete.length - 1])?;
             start = JournalStart { segment: loaded.segment, lsn: loaded.lsn };
+            startTerm = loaded.term;
             state = loaded.state;
             // The checkpointed versions' inline records are live in the segments they cover.
             var live = Vector<SegmentFile>.create();
@@ -1456,6 +1506,8 @@ struct ObjectStore {
             raft: raft,
             term: 0,
             recoveredTerms: recoveredTerms,
+            appliedTerm: startTerm,
+            checkpointTerm: startTerm,
             counts: StoreCounters {
                 payloadBytes: 0,
                 journalBytesWritten: 0,
@@ -1863,6 +1915,7 @@ struct ObjectStore {
                 manifest,
             )?;
             this.publishedNext = lsn + 1;
+            this.appliedTerm = h.term;
             lsn += 1;
         }
         this.journal.markCommitted(to);
@@ -3891,10 +3944,27 @@ struct ObjectStore {
         if (this.state.index.snapshotActive()) { this.state.index.endSnapshot(); }
         this.commitStaged()?;
         this.checkWritable()?;
+        if (this.raft) {
+            // A Raft log's checkpoint is of the applied state; entries after it may follow in the same segment, which
+            // recovery starts in and skips up to it (ADR-0058 §3).
+            let applied = this.appliedIndex();
+            if (applied == this.checkpointLsn) { return Ok(null); }
+            let segment = this.segmentAfter(applied)?;
+            return Ok(
+                beginCheckpointJob(
+                    this.dir.view(),
+                    applied,
+                    this.appliedTerm,
+                    segment,
+                    this.sinceCheckpoint,
+                    mut this.state,
+                )?,
+            );
+        }
         let segment = this.journal.sealActive()?;
         let lsn = this.journal.upcomingLsn() - 1;
         if (lsn == this.checkpointLsn) { return Ok(null); }
-        return Ok(beginCheckpointJob(this.dir.view(), lsn, segment, this.sinceCheckpoint, mut this.state)?);
+        return Ok(beginCheckpointJob(this.dir.view(), lsn, 0, segment, this.sinceCheckpoint, mut this.state)?);
     }
 
     /// Encodes the job's next `max` index entries (memory only). Returns whether it has all of them. On an error the
@@ -3919,6 +3989,7 @@ struct ObjectStore {
         this.counts.checkpoints += 1;
         this.checkpointLsn = job.lsn;
         this.checkpointSegment = job.segment;
+        this.checkpointTerm = job.term;
         // What was committed during the job is not in the checkpoint.
         this.sinceCheckpoint =
             if (this.sinceCheckpoint > job.sinceBefore) this.sinceCheckpoint - job.sinceBefore else 0;
@@ -3936,6 +4007,9 @@ struct ObjectStore {
     /// and once those are durable the segments are removed. Copies at most `maxCopyBytes` of
     /// live data, but always removes segments with nothing live.
     fn compact(borrow mut this, maxCopyBytes: u64) -> Result<CompactStats, StoreError> {
+        // A cluster shard's follower copies nothing: its leader's Relocate entries do (ADR-0058 §2). It removes what
+        // its checkpoint covers and holds nothing live.
+        if (this.raft && this.term == 0) { return this.removeDeadSegments(); }
         // The steps of ADR-0029 in a row, holding the store throughout; the server releases it between them.
         var job = match (this.beginCompaction(maxCopyBytes)?) {
             Some(j) => j,
@@ -4086,6 +4160,79 @@ struct ObjectStore {
         let _ = this.upkeepHeld(started);
         return Ok(stats);
     }
+
+    /// Removes the segments the checkpoint covers that hold nothing live, unless a reader pins one.
+    fn removeDeadSegments(borrow mut this) -> Result<CompactStats, StoreError> {
+        var stats = CompactStats { segmentsRemoved: 0, bytesFreed: 0, relocated: 0, bytesCopied: 0 };
+        var dead = Vector<u64>.create();
+        for (i in 0..this.state.segments.length()) {
+            let id: u64 = this.state.segments.keyAt(i);
+            if (id < this.checkpointSegment && this.state.segments.valueAt(i).liveBytes == 0) { dead.push(id)?; }
+        }
+        for (k in 0..dead.length) {
+            let id = dead[k];
+            if (this.segmentPins.isPinned(id)) { continue; }
+            let usage = this.segmentUsage(id);
+            this.journal.removeSegment(id)?;
+            let _ = this.state.segments.remove(borrow id);
+            stats.segmentsRemoved += 1;
+            this.counts.segmentsCompacted += 1;
+            stats.bytesFreed += usage.totalBytes;
+        }
+        if (stats.segmentsRemoved > 0) { this.journal.syncDirectory()?; }
+        return Ok(stats);
+    }
+
+    /// The segment that holds entry `lsn + 1`, or the active one when it is not written yet: where a checkpoint at
+    /// `lsn` has recovery start (ADR-0058 §3).
+    fn segmentAfter(borrow this, lsn: u64) -> Result<u64, StoreError> {
+        if (lsn + 1 > this.journal.lastLsn()) { return Ok(this.journal.activeSegment()); }
+        return Ok(this.journal.entryAt(lsn + 1)?.segment);
+    }
+
+    /// This replica's newest checkpoint as a snapshot for a follower (ADR-0058 §9): the checkpoint file, every
+    /// segment before the one recovery starts in, and that one up to the checkpoint's last entry, byte for byte, so
+    /// every locator in the checkpoint holds on the follower too. Only inline payloads: a cluster shard has no extents
+    /// until item 5.
+    fn snapshotBundle(borrow this) -> Result<Vector<u8>, StoreError> {
+        let index = this.checkpointLsn;
+        if (index == 0) { return Err(StoreError.CheckpointCorrupt); }
+        var bundle = Vector<u8>.create();
+        bundle.pushLE(SNAPSHOT_MAGIC)?;
+        bundle.pushLE(index)?;
+        bundle.pushLE(this.checkpointTerm)?;
+        let countAt = bundle.length;
+        bundle.pushLE(0u32)?;
+        var count = 0u32;
+        let checkpoint = checkpointPath(this.dir.view(), index, false)?;
+        let size = sio(DurableFile.openRead(checkpoint.view()))?.size();
+        appendBundleFile(mut bundle, checkpointName(index)?.view(), checkpoint.view(), sio(size)?)?;
+        count += 1;
+        let start = this.checkpointSegment;
+        let ids = listSegmentIds(this.dir.view())?;
+        for (k in 0..ids.length) {
+            let id = ids[k];
+            if (id > start) { continue; }
+            var length = this.journal.durableEnd(id)?;
+            if (id == start && index + 1 <= this.journal.lastLsn()) {
+                let next = this.journal.entryAt(index + 1)?;
+                if (next.segment == start) { length = next.offset; }
+            }
+            let path = this.journal.segmentFile(id)?;
+            let name = segmentName(id)?;
+            appendBundleFile(mut bundle, name.view(), path.view(), length)?;
+            count += 1;
+        }
+        bundle.viewMut().writeLE(countAt, count);
+        return Ok(bundle);
+    }
+
+    /// The newest checkpoint: its index, the term of its entry, and the segment recovery starts in.
+    fn checkpointIndex(borrow this) -> u64 => this.checkpointLsn;
+
+    fn checkpointEntryTerm(borrow this) -> u64 => this.checkpointTerm;
+
+    fn checkpointStart(borrow this) -> u64 => this.checkpointSegment;
 
     /// The verified record that holds an inline version's payload.
     fn readLiveRecord(borrow this, v: borrow ObjectVersion) -> Result<Vector<u8>, StoreError> {

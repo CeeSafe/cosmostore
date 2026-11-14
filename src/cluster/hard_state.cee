@@ -8,6 +8,8 @@
 // index is a lower bound, and a leader tells the rest.
 //
 // Record (little-endian): u32 magic "CRST", u32 vote, u64 sequence, u64 term, u32 reserved (0), u32 CRC32C of 0..28.
+//
+// The same files under another stem keep a replica's store generation (ADR-0058 §9): `term` is the generation.
 
 const HARD_STATE_MAGIC: u32 = 0x54535243; // "CRST" in file order
 const HARD_STATE_RECORD: usize = 32;
@@ -25,6 +27,7 @@ struct HardStateScan {
 struct HardStateFile {
     private file: DurableFile;
     private dir: String;
+    private stem: String;
     /// Which file is in use (0 or 1), and its valid length.
     private which: u64;
     private size: u64;
@@ -33,13 +36,16 @@ struct HardStateFile {
     vote: u32;
 
     /// Opens `dir`'s hard state, or makes an empty one (term 0, no vote), durably.
-    fn open(dir: StringView) -> Result<HardStateFile, IoFailure> {
-        let first = scanHardState(dir, 0)?;
-        let second = scanHardState(dir, 1)?;
+    fn open(dir: StringView) -> Result<HardStateFile, IoFailure> => HardStateFile.openNamed(dir, "raft-state");
+
+    /// The same, in files `<stem>.0` and `<stem>.1`.
+    fn openNamed(dir: StringView, stem: StringView) -> Result<HardStateFile, IoFailure> {
+        let first = scanHardState(dir, stem, 0)?;
+        let second = scanHardState(dir, stem, 1)?;
         var which = 0u64;
         if (second.found && (!first.found || second.sequence > first.sequence)) { which = 1; }
         let chosen = if (which == 0) first else second;
-        let path = hardStatePath(dir, which)?;
+        let path = hardStatePath(dir, stem, which)?;
         let file = match (DurableFile.openReadWrite(path.view())) {
             Ok(f) => f,
             Err(e) => {
@@ -56,10 +62,12 @@ struct HardStateFile {
             file.syncData()?;
         }
         var d = String.create();
-        if (d.append(dir).isErr()) { return Err(IoFailure { op: IoOp.Open, errno: 0 }); }
+        var named = String.create();
+        if (d.append(dir).isErr() || named.append(stem).isErr()) { return Err(IoFailure { op: IoOp.Open, errno: 0 }); }
         return Ok(HardStateFile {
             file: file,
             dir: d,
+            stem: named,
             which: which,
             size: chosen.end,
             sequence: chosen.sequence,
@@ -76,7 +84,7 @@ struct HardStateFile {
         if (this.size + HARD_STATE_RECORD as u64 > HARD_STATE_SWITCH_AT) {
             // The other file, afresh: what it held is older than anything in this one.
             let other = 1 - this.which;
-            let path = hardStatePath(this.dir.view(), other)?;
+            let path = hardStatePath(this.dir.view(), this.stem.view(), other)?;
             match (Fs.unlink(path.view())) {
                 Ok() => {}
                 Err(e) => {
@@ -103,9 +111,9 @@ struct HardStateFile {
 }
 
 /// Reads file `which`'s records up to the first invalid one. A missing file holds nothing.
-fn scanHardState(dir: StringView, which: u64) -> Result<HardStateScan, IoFailure> {
+fn scanHardState(dir: StringView, stem: StringView, which: u64) -> Result<HardStateScan, IoFailure> {
     var scan = HardStateScan { found: false, sequence: 0, term: 0, vote: 0, end: 0 };
-    let path = hardStatePath(dir, which)?;
+    let path = hardStatePath(dir, stem, which)?;
     let file = match (DurableFile.openRead(path.view())) {
         Ok(f) => f,
         Err(e) => {
@@ -140,9 +148,10 @@ fn hardStateRecord(sequence: u64, term: u64, vote: u32) -> [u8; 32] {
     return record;
 }
 
-fn hardStatePath(dir: StringView, which: u64) -> Result<String, IoFailure> {
+fn hardStatePath(dir: StringView, stem: StringView, which: u64) -> Result<String, IoFailure> {
     var path = String.create();
-    let ok = path.append(dir).isOk() && path.append(if (which == 0) "/raft-state.0" else "/raft-state.1").isOk();
+    let ok = path.append(dir).isOk() && path.append("/").isOk() && path.append(stem).isOk() &&
+        path.append(if (which == 0) ".0" else ".1").isOk();
     if (!ok) { return Err(IoFailure { op: IoOp.Open, errno: 0 }); }
     return Ok(path);
 }

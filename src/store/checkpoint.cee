@@ -13,6 +13,9 @@
 //  12 u32 event count (format 11; 0 before)
 //  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count (versions, in format 6)   48 i64 created ms
 //  56 u32 upload count (format 2; reserved, 0, in format 1)   60 u32 crc32c of bytes 0..60
+// In format 15 (ADR-0058) 16 more header bytes follow: u64 the term of the entry at `lsn` (a cluster shard's Raft log;
+// 0 on a single node), u32 reserved (0), u32 crc32c of those 12. A Raft log's checkpoint does not seal: `segment` is
+// the one holding entry lsn + 1, and recovery skips its records up to `lsn`.
 // Entries, buckets, then objects, then uploads, then events: u8 kind (1 bucket, 2 object, 3 upload, 4 event), u32
 // body length, body.
 //   bucket: u16+bytes name, i64 created ms, in format 5 u32+bytes tags and u32+bytes lifecycle rules (ADR-0020), and
@@ -41,7 +44,9 @@ const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 14;
+const CHECKPOINT_FORMAT: u16 = 15;
+/// The header's extension in format 15: the term (ADR-0058).
+const CHECKPOINT_EXTENSION_LEN: usize = 16;
 const CHECKPOINT_BUCKET: u8 = 1;
 const CHECKPOINT_OBJECT: u8 = 2;
 const CHECKPOINT_UPLOAD: u8 = 3;
@@ -142,7 +147,7 @@ fn encodeCheckpointHeader(
     var h = [0u8; 64];
     h.writeLE(0, CHECKPOINT_MAGIC);
     h.writeLE(8, CHECKPOINT_FORMAT);
-    h.writeLE(10, truncate<u16>(CHECKPOINT_HEADER_LEN));
+    h.writeLE(10, truncate<u16>(CHECKPOINT_HEADER_LEN + CHECKPOINT_EXTENSION_LEN));
     h.writeLE(12, events);
     h.writeLE(16, lsn);
     h.writeLE(24, segment);
@@ -215,6 +220,8 @@ fn encodeUploadEntry(out: borrow mut Vector<u8>, id: [u8; 16], u: borrow Upload)
 /// `publish`).
 struct CheckpointJob {
     lsn: u64;
+    /// The term of the entry at `lsn` (format 15).
+    term: u64;
     /// The first segment the checkpoint does not cover: replay starts there.
     segment: u64;
     /// The journal bytes committed between the previous checkpoint and `lsn`.
@@ -278,6 +285,7 @@ struct CheckpointJob {
 fn beginCheckpointJob(
     dir: StringView,
     lsn: u64,
+    term: u64,
     segment: u64,
     sinceBefore: u64,
     state: borrow mut StoreState,
@@ -302,7 +310,19 @@ fn beginCheckpointJob(
         truncate<u32>(state.uploads.length()),
         truncate<u32>(events.length),
     );
+    var extension = [0u8; 16];
+    extension.writeLE(0, term);
+    extension.writeLE(8, 0u32);
+    let extensionCrc = Crc32c.of(extension[0..12]);
+    extension.writeLE(12, extensionCrc);
     match (file.writeAt(header[..], 0)) {
+        Ok() => {}
+        Err(e) => {
+            let _ = Fs.unlink(tmp.view());
+            return Err(StoreError.Io(e));
+        }
+    }
+    match (file.writeAt(extension[..], CHECKPOINT_HEADER_LEN as u64)) {
         Ok() => {}
         Err(e) => {
             let _ = Fs.unlink(tmp.view());
@@ -311,7 +331,7 @@ fn beginCheckpointJob(
     }
     var w = CheckpointWriter {
         file: file,
-        offset: CHECKPOINT_HEADER_LEN as u64,
+        offset: (CHECKPOINT_HEADER_LEN + CHECKPOINT_EXTENSION_LEN) as u64,
         buffer: Vector<u8>.create(),
         crc: Crc32c.create(),
         entries: 0,
@@ -360,6 +380,7 @@ fn beginCheckpointJob(
     dirCopy.append(dir)?;
     return Ok(CheckpointJob {
         lsn: lsn,
+        term: term,
         segment: segment,
         sinceBefore: sinceBefore,
         dir: dirCopy,
@@ -431,6 +452,8 @@ fn checkpointStepOf(
 /// A loaded checkpoint: where replay starts, and the state to replay onto.
 struct LoadedCheckpoint {
     lsn: u64;
+    /// The term of the entry at `lsn` (format 15; 0 before, and on a single node).
+    term: u64;
     segment: u64;
     state: StoreState;
 }
@@ -647,6 +670,13 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
     let objects = h.readLE<u64>(40);
     let uploads = if (format >= 2) h.readLE<u32>(56) as u64 else 0;
     let events = if (format >= 11) h.readLE<u32>(12) as u64 else 0;
+    var term = 0u64;
+    if (format >= 15) {
+        r.ensure(CHECKPOINT_EXTENSION_LEN)?;
+        let x = r.take(CHECKPOINT_EXTENSION_LEN);
+        if (x.readLE<u32>(12) != Crc32c.of(x[0..12])) { return Err(StoreError.CheckpointCorrupt); }
+        term = x.readLE<u64>(0);
+    }
     var state = StoreState.create();
     var crc = Crc32c.create();
     var entries: u64 = 0;
@@ -748,5 +778,5 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
         return Err(StoreError.CheckpointCorrupt);
     }
     if (!r.atEnd()) { return Err(StoreError.CheckpointCorrupt); }
-    return Ok(LoadedCheckpoint { lsn: lsn, segment: segment, state: state });
+    return Ok(LoadedCheckpoint { lsn: lsn, term: term, segment: segment, state: state });
 }

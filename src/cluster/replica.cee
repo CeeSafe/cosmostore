@@ -4,6 +4,14 @@
 // `beginWrite`, then the store's own calls (which stage and persist entries of its term without applying them), then
 // `finishWrite`, which proposes them; the write is acknowledged once the leader has applied it (`isApplied`). The
 // next write waits for that, so its checks see every earlier one (ADR-0058 §8; pipelining is later work).
+//
+// Slice d: each replica checkpoints its applied state on its own, and its core then forgets the entries the
+// checkpoint holds; the leader compacts by proposing Relocate entries, and a follower removes the segments its
+// checkpoint covers that hold nothing live (`maintain`). A follower behind the leader's checkpoint gets a snapshot: the
+// leader's checkpoint and segments, which it installs as its store's next generation (`snapshot.cee`).
+//
+// The replica's directory: `raft-state.*` (term and vote), `store-generation.*` (which store directory is current),
+// and `store-<16 hex>` (the store of that generation).
 
 struct ReplicaConfig {
     id: u32;
@@ -20,6 +28,11 @@ struct ShardReplica {
     core: RaftCore;
     store: ObjectStore;
     private hard: HardStateFile;
+    private generation: HardStateFile;
+    private dir: String;
+    private storeConfig: StoreConfig;
+    /// Snapshots installed, for tests and stats.
+    snapshotsInstalled: u64;
     /// Reads a quorum has confirmed: serve each once the store has applied its index.
     reads: Vector<RaftReadState>;
 
@@ -28,14 +41,16 @@ struct ShardReplica {
     fn open(dir: StringView, config: ReplicaConfig) -> Result<ShardReplica, StoreError> {
         var storeConfig = config.store;
         storeConfig.journal.raftLog = true;
-        var store = ObjectStore.open(dir, storeConfig)?;
         let hard = sio(HardStateFile.open(dir))?;
+        let generation = sio(HardStateFile.openNamed(dir, "store-generation"))?;
+        let current = storeDirectory(dir, generation.term)?;
+        removeOtherStores(dir, current.view())?;
+        sio(Fs.ensureDirectory(current.view()))?;
+        var store = ObjectStore.open(current.view(), storeConfig)?;
         let terms = store.takeRecoveredTerms();
-        let applied = store.appliedIndex();
-        if (applied != 0) {
-            // A checkpoint: its term comes with slice d (snapshots).
-            return Err(StoreError.NotReplicated);
-        }
+        // The core starts at the store's checkpoint, which holds every entry up to it.
+        let snapIndex = store.checkpointIndex();
+        let snapTerm = store.checkpointEntryTerm();
         let core = RaftCore.restore(
             RaftConfig {
                 id: config.id,
@@ -46,17 +61,60 @@ struct ShardReplica {
                 seed: config.seed,
             },
             RaftHardState { term: hard.term, vote: hard.vote, commit: 0 },
-            0,
-            0,
+            snapIndex,
+            snapTerm,
             terms,
         )?;
+        var d = String.create();
+        d.append(dir)?;
         return Ok(ShardReplica {
             id: config.id,
             core: core,
             store: store,
             hard: hard,
+            generation: generation,
+            dir: d,
+            storeConfig: storeConfig,
+            snapshotsInstalled: 0,
             reads: Vector<RaftReadState>.create(),
         });
+    }
+
+    /// Upkeep: a checkpoint when one is due, after which the core forgets what it holds; then compaction, the
+    /// leader's as a write of Relocate entries (when no write is in flight), a follower's removing dead segments.
+    fn maintain(borrow mut this) -> Result<void, StoreError> {
+        if (this.store.checkpointDue() && this.store.checkpoint()?) {
+            this.core.compact(this.store.checkpointIndex());
+        }
+        if (this.core.isLeader()) {
+            match (this.beginWrite()) {
+                Ok(before) => {
+                    let _ = this.store.compact(this.store.compactionBudget())?;
+                    let _ = this.finishWrite(before)?;
+                }
+                Err(_) => {}
+            }
+        } else {
+            let _ = this.store.compact(0)?;
+        }
+        return Ok();
+    }
+
+    /// Installs a leader's snapshot as the store's next generation (snapshot.cee).
+    fn installSnapshot(borrow mut this, s: borrow RaftSnapshot) -> Result<void, StoreError> {
+        let next = this.generation.term + 1;
+        let target = storeDirectory(this.dir.view(), next)?;
+        removeStoreDirectory(target.view())?; // a leftover of an install that crashed before its switch
+        sio(Fs.ensureDirectory(target.view()))?;
+        writeSnapshotBundle(target.view(), s.data.view(), s.index, s.term)?;
+        sio(this.generation.save(next, 0))?;
+        let old = storeDirectory(this.dir.view(), next - 1)?;
+        this.store = ObjectStore.open(target.view(), this.storeConfig)?;
+        let _ = this.store.takeRecoveredTerms();
+        if (this.store.appliedIndex() != s.index) { return Err(StoreError.CheckpointCorrupt); }
+        removeStoreDirectory(old.view())?;
+        this.snapshotsInstalled += 1;
+        return Ok();
     }
 
     fn isLeader(borrow this) -> bool => this.core.isLeader();
@@ -109,7 +167,11 @@ struct ShardReplica {
     fn drain(borrow mut this, out: borrow mut Vector<RaftMessage>) -> Result<void, StoreError> {
         while (this.core.hasReady()) {
             var ready = this.core.ready()?;
-            if (ready.snapshot.isSome()) { return Err(StoreError.NotReplicated); } // slice d
+            // 0. A snapshot replaces the store; the core already starts after it.
+            match (replace(mut ready.snapshot, null)) {
+                Some(s) => { this.installSnapshot(borrow s)?; }
+                null => {}
+            }
             // 1. Entries: the leader's own are in the journal already; a follower's are the leader's records. One
             // whose index the journal has with another term starts a suffix to cut off.
             if (ready.entries.length > 0) {
@@ -149,6 +211,13 @@ struct ShardReplica {
                     Some(m) => m,
                     null => { break; }
                 };
+                if (m.kind == RAFT_SNAPSHOT) {
+                    // The core compacts only to the store's checkpoints, so the snapshot it names is the newest.
+                    if (m.index != this.store.checkpointIndex()) {
+                        panic("replica: a snapshot that is not the checkpoint");
+                    }
+                    m.data = this.store.snapshotBundle()?;
+                }
                 if (m.kind == RAFT_APPEND) {
                     var i = m.index + 1;
                     while (i <= m.index + m.count) {
@@ -171,6 +240,25 @@ struct ShardReplica {
         }
         return Ok();
     }
+}
+
+/// Removes the store directories of `dir` other than `current`: the old generation of a snapshot install that crashed
+/// after its switch, or the new one of one that crashed before it.
+fn removeOtherStores(dir: StringView, current: StringView) -> Result<void, StoreError> {
+    let names = match (Directory.list(dir)) {
+        Ok(n) => n,
+        Err(_) => { return Ok(); }
+    };
+    for (i in 0..names.length) {
+        let name = names[i].view();
+        if (!(name.length == 22 && name.startsWith("store-"))) { continue; }
+        var path = String.create();
+        path.append(dir)?;
+        path.append("/")?;
+        path.append(name)?;
+        if (path.view() != current) { removeStoreDirectory(path.view())?; }
+    }
+    return Ok();
 }
 
 fn reverseMessages(v: borrow mut Vector<RaftMessage>) {

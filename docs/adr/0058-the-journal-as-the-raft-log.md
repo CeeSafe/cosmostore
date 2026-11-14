@@ -37,7 +37,9 @@
 3. **A checkpoint need not seal.** A checkpoint at applied index L records the segment that holds entry L + 1 (or the
    active segment when there is none), and recovery scans from that segment, skipping records up to L. Single-node
    checkpoints keep sealing as before; their files are read the same way. Only segments wholly at or below L may be
-   compacted away.
+   compacted away. A checkpoint records the term of entry L too, which a replica's core needs to start from it:
+   checkpoint format 15 adds 16 header bytes (the term and a CRC32C of them); formats 1 to 14 still load, with term 0.
+   Each replica checkpoints on its own; its core then forgets the entries the checkpoint holds.
 4. **A segment is sealed only when its last entry is committed.** Rotation waits for the commit index
    (`Journal.markCommitted`), so every uncommitted entry is in the active segment, and cutting off a suffix touches one
    file: `Journal.truncateAfter(lsn)` cuts the active segment at the end of entry `lsn`, syncs it, and staging resumes
@@ -67,10 +69,14 @@
    versioning) is checked by the leader when it stages the record, against its applied state together with its
    proposed but uncommitted records, as group commit does now with its pending batch (ADR-0022). Upkeep that writes
    (lifecycle, upload expiry, compaction, notifications' outbox cursor) runs on the leader only.
-9. **Snapshots** are a leader's checkpoint plus the inline payloads it names. A follower installs one into a fresh
-   directory: the payloads go into segments below the checkpoint's segment, which are never scanned and so need no
-   Raft index, then the checkpoint file, then the switch, a rename of the directory with a directory sync. A crash
-   leaves the old store or the new one.
+9. **Snapshots** are a leader's checkpoint and its journal as files: the checkpoint file, every segment before the
+   one recovery starts in, and that one up to the checkpoint's last entry, byte for byte (`snapshotBundle`), so every
+   locator in the checkpoint holds on the follower without being rewritten. Dead bytes travel too, at most what
+   compaction leaves (half a segment's worth by default). A follower writes them into a fresh store directory of its
+   next generation (`<dir>/store-<generation>`), each file synced, then the directory; a second pair of append-only
+   files like the hard state's (`store-generation.*`) then switches to it, and only then is the old directory removed.
+   A crash before the switch leaves the old store, after it the new one; either way the other directory is removed at
+   the next open. No rename, as for the hard state (§5). Built in slice d (`src/cluster/snapshot.cee`).
 10. **Extents wait for item 5.** Until extents replicate, a cluster shard refuses what would write one (large PUTs,
     multipart parts) with NotImplemented; everything that lives in records works.
 

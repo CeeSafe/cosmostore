@@ -2331,3 +2331,30 @@ Browser form uploads with a SigV4 POST policy.
   commit the journal itself rather than the store's pending batch, which skipped it.
 - **Not yet:** checkpoints, the leader's compaction and snapshots (slice d; ADR-0058's slice table now says so), a
   checkpointed replica refuses to open until then; extents (item 5); the peer network (item 3).
+
+### 15 Nov 2026: M6 item 2, slice d: checkpoints, the leader's compaction, snapshots (ADR-0058); item 2 done
+
+- **Asked by the owner** (14 Nov, "push it and go ahead with slice d").
+- **Checkpoints in a Raft log:** of the applied state, at index L; recovery starts in the segment holding entry L + 1
+  and skips up to L, so nothing is sealed. Checkpoint format 15 adds the term of entry L (16 header bytes with their
+  CRC32C); formats 1 to 14 still load, with term 0. Each replica checkpoints on its own, and its core then forgets the
+  entries the checkpoint holds.
+- **Compaction:** the leader's `Relocate` copies are a write like any other, proposed and applied on every replica; a
+  follower removes the segments its checkpoint covers that hold nothing live (`ShardReplica.maintain`).
+- **Snapshots** (`src/cluster/snapshot.cee`): a follower behind the leader's checkpoint gets the checkpoint file,
+  the segments before the one recovery starts in, and that one up to entry L, byte for byte, so every locator holds.
+  It writes them into its next store generation (`store-<16 hex>`), syncs them and the directory, switches with an
+  append-only generation file (no rename), then removes the old directory; the next open removes whichever is stale.
+  `Fs.removeDirectory` is new, a fault point like the rest.
+- **Tests:** a follower cut off while the leader writes 31 times (200-byte values over five keys), checkpoints every
+  KiB and compacts, then rejoins: it installs a snapshot, segments are compacted away and payloads relocated, and all
+  three agree. Sweeps of every third I/O operation, once, torn and crash: after each they reopen, catch up, agree and
+  hold every acknowledged write, and no replica comes back with a lower checkpoint than it had made durable.
+- **Mutants:** without the syncs of a snapshot's files, the crash sweep fails (once it checked that a replica keeps
+  the checkpoints and snapshots it made durable; before, a follower that lost its snapshot simply got another, which
+  hid the loss). Without the directory sync after them it does not: opening the new store syncs the same directory
+  when it makes its extents directory, so only a crash between the switch and the open would show it; the code keeps
+  the sync. Starting recovery in the active segment instead of the one holding L + 1 changes nothing here, since the
+  journal seals only at applied entries; the code keeps the general rule.
+- **M6 item 2 is done:** the journal is the Raft log, under every fault sweep, for everything that lives in records.
+  **Next:** item 3, the cluster file, the peer port and signed messages, so three `serve` processes replicate.
