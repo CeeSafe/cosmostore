@@ -2232,3 +2232,26 @@ Browser form uploads with a SigV4 POST policy.
   tests that sign with SigV2 or do not trust the test certificate, and `test_sse_kms_no_key`, which expects
   `aws:kms` without a key id to be refused (RGW); AWS uses its default key, and so does CosmoStore.
 - **M5 item 4 is done.** Left of it: a KMS service behind ADR-0055's keys, if one is wanted.
+
+### 14 Nov 2026: the p99 gate on a quiet machine, for the 0.41.0 move and for M5
+
+- **Why:** CI's gate failed on 12 Nov for the 0.41.0 move (run 43321032635: large writes at concurrency 32, p99
+  1.31, ops/s 0.76), and nobody had looked; M5's own changes had not been through a gate together.
+- **Where:** binfadel (the user's Linux host, given 14 Nov when the Mac mini was off the network): Xeon E-2236,
+  server on CPUs 2,3, generator on 4,5,10,11; each commit with its own pins (`docs/benchmarks/2026-11-14-binfadel-gates.md`).
+- **The 0.41.0 move** (`b8a794e` → `48709f4`): passed; large writes at concurrency 32 0.98 (p99) and 1.02 (ops/s).
+  CI's failure was the shared runner's noise.
+- **M5** (`48709f4` → `67947c6`, with ceesafec 0.45.0 and CeeSafe.Web `9592f2d`): passed; p99 0.99 to 1.04 but large
+  GETs at concurrency 32 (1.12, within its noise of 1.15); ops/s 0.92 to 1.03, every group within its noise. The
+  matrix asks for no encryption: SSE's own cost is not measured here.
+- **CI on 0.45.0:** the run on `ec5cac2` (the CeeSafe.Web pin) passed `check`; its `perf` job could not build its
+  base, `9e08dc6`, whose pins (0.45.0 with `c799f14`) do not compile. Bases from `ec5cac2` on build: run
+  43615465567 (`ec5cac2` → `442dde8`, SSE-KMS) passed both `check` and `perf`.
+
+### 14 Nov 2026: M5 closed
+
+- **Exit met:** a beta that can be run in production on a single node with operational runbooks. Items 1 to 7 are
+  built (ADRs 0041 to 0055); `docs/runbooks.md` covers them, encryption keys included; CI is green on 0.45.0; the
+  p99 gate passes for all of M5 on a quiet machine (above).
+- **Left by choice:** a KMS service behind ADR-0055's keys; G34 (`HmacSha256` does not wipe its key) for CeeSafe.
+- **Next:** M6, the distributed cluster, when the owner says so.
