@@ -73,6 +73,21 @@ Replace the certificate and key files in place (both, with the same names). The 
 and logs `TLS certificate reloaded`; if they do not load it keeps the old ones and says so (ADR-0019). New
 connections get the new certificate; open ones are not closed.
 
+## Encryption keys
+
+- **The key file** (`serve --sse-key-file <file>`, ADR-0046 §4) has one `<key id> <base64 of 32 bytes>` per line;
+  `#` starts a comment. Make a key with `head -c 32 /dev/urandom | base64`. Key ids are 1 to 32 of
+  `A-Z a-z 0-9 _ -`. The file is read once, at start; a file that does not parse stops `serve`. Without the option,
+  a request for SSE-S3 is refused with `InvalidRequest`.
+- **Keep it off the data's volume**, readable only by the server's user, and backed up apart from the data:
+  whoever has both reads everything, and losing a key loses every object sealed under it.
+- **Rotate:** put a new line first and keep the old ones, then restart. New objects are sealed under the first
+  key; every key in the file opens what it sealed. An object stays under its key until it is written again.
+- **An object whose key is not in the file** cannot be read: `InternalError`, and stderr says
+  `an object is sealed under a master key that is not in the key file: <id>`. Put the key back and restart.
+- `fsck` checks a sealed object's length and its extents' CRCs without the keys; its MD5 is the plaintext's, which
+  only a GET checks, and every GET checks each chunk it reads.
+
 ## Space
 
 - **The store refuses a write that would take the volume into its reserve** (256 MiB) with `InsufficientStorage`
@@ -218,8 +233,10 @@ There is no backup command and no replication yet (M6).
 
 ## Not yet
 
-- **Encryption at rest** (SSE-S3, SSE-C) is designed (ADR-0046) and waits for a cipher in CeeSafe. A request
-  that asks for it is refused with `NotImplemented`, never stored in the clear. Until then, encrypt the volume.
+- **Encryption at rest** is SSE-S3 on PutObject, GetObject and HeadObject (ADR-0046), with `serve --sse-key-file`.
+  Multipart uploads, copies of a sealed object, POST forms, a bucket's default and SSE-C are not served yet: a
+  request that asks for them is refused with `NotImplemented`, never stored in the clear. Keys, metadata, sizes and
+  the ETag (the plaintext's MD5) are not encrypted; for those, encrypt the volume too.
 - One node: no replication, no failover.
 - No call to force a credentials reload or an upkeep round (both come within a round), nor to change an option
   without a restart.

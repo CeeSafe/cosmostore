@@ -1,0 +1,36 @@
+// How a sealed object's bytes are laid out (ADR-0046 §2): what the store needs of server-side encryption. The store
+// carries ciphertext as it carries any bytes and never opens it; it only has to know how much of it there is, to read
+// it and to verify it. Sealing and opening are the S3 layer's (`src/s3/sse.cee`).
+
+/// The metadata field that holds a sealed version's envelope (ADR-0046 §3).
+const SSE_FIELD: StringView = "x-amz-server-side-encryption";
+/// The plaintext bytes of one sealed chunk, and its tag's.
+const SSE_CHUNK: u64 = 65536;
+const SSE_TAG: u64 = 16;
+
+/// The chunks of a part of `n` plaintext bytes: an empty one is one empty chunk.
+fn sseChunks(n: u64) -> u64 => if (n == 0) 1 else (n + SSE_CHUNK - 1) / SSE_CHUNK;
+
+/// The bytes a part of `n` plaintext bytes is stored in: itself and a tag per chunk.
+fn sseStoredLength(n: u64) -> u64 => n + SSE_TAG * sseChunks(n);
+
+/// Whether a version's bytes are sealed: its metadata holds an envelope.
+fn isSealed(v: borrow ObjectVersion) -> bool => metadataFind(v.metadata.view(), SSE_FIELD.bytes()).isSome();
+
+/// The bytes a version's body is stored in: its payload's, or its extents'. For a version in the clear it is its size.
+fn storedLengthOf(v: borrow ObjectVersion) -> u64 {
+    if (v.extents.length == 0) { return v.payload.length as u64; }
+    var total: u64 = 0;
+    for (i in 0..v.extents.length) { total += v.extents[i].length; }
+    return total;
+}
+
+/// The bytes a sealed version must be stored in: each part's chunks, from the part sizes of its extras (ADR-0015),
+/// or, for one PUT, the chunks of its size. Null when a multipart version keeps no part sizes.
+fn sealedLengthOf(v: borrow ObjectVersion, partSizes: Slice<u64>) -> u64? {
+    if (v.parts == 0) { return sseStoredLength(v.size); }
+    if (partSizes.length == 0) { return null; }
+    var total: u64 = 0;
+    for (i in 0..partSizes.length) { total += sseStoredLength(partSizes[i]); }
+    return total;
+}

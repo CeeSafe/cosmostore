@@ -302,6 +302,8 @@ struct ReceivedBody {
 
 /// Streams the body into `writer` without the store's lock, a step at a time: decoded if aws-chunked, hashed, and
 /// written on a worker thread. Every check runs before the caller commits, and a refused body's extents are removed.
+/// With a sealer (ADR-0046 §2) the body is hashed as it arrives and written sealed; the finished object's size and
+/// MD5 are then the plaintext's, as S3 answers them, and its stored bytes are longer.
 async fn receiveBody(
     app: borrow S3App,
     auth: Authenticated,
@@ -309,8 +311,14 @@ async fn receiveBody(
     writer: ObjectWriter,
     exchange: borrow mut Exchange,
     storedAlgorithm: ChecksumAlgorithm,
+    sealer: SseSealer?,
 ) -> Result<ReceivedBody, S3Fail> {
     var w = writer;
+    var seal = sealer;
+    var plainMd5 = Md5.create();
+    var sealed = Vector<u8>.create();
+    // A sealed object that stays inline is sealed on the event loop, as its bytes are kept there (ADR-0031).
+    let sealInline = app.writers.keepsInline(sseStoredLength(spec.size));
     // A second checksum only when the one to store is not the client's.
     let separate = !sameAlgorithm(storedAlgorithm, spec.checksumKind);
     var storedSum = RunningChecksum.create(if (separate) storedAlgorithm else ChecksumAlgorithm.None);
@@ -343,6 +351,35 @@ async fn receiveBody(
         received += data.length as u64;
         if (received > size) { return Err(S3Fail.Code(S3Code.IncompleteBody)); }
         if (data.length == 0) { continue; }
+        match (seal.asBorrowMut()) {
+            Some(s) => {
+                if (sealInline) {
+                    sealInto(mut sha, mut checksum, mut storedSum, mut plainMd5, s, mut sealed, hashing, data)?;
+                    if (!w.fitsInline(sealed.length)) { return Err(S3Fail.Code(S3Code.InternalError)); }
+                    w.writeInline(sealed.view())?;
+                    continue;
+                }
+                let step = await Async.blocking(
+                    () => sealStep(
+                        mut w,
+                        mut sha,
+                        mut checksum,
+                        mut storedSum,
+                        mut plainMd5,
+                        s,
+                        mut sealed,
+                        hashing,
+                        data,
+                    ),
+                );
+                match (step) {
+                    Ok() => {}
+                    Err(e) => { return Err(storeFail(e, 0)); }
+                }
+                continue;
+            }
+            null => {}
+        }
         if (w.fitsInline(data.length)) {
             // Bytes that stay in memory need no worker thread (ADR-0031).
             if (hashing) { sha.update(data); }
@@ -362,10 +399,30 @@ async fn receiveBody(
     }
     giveBodyBuffer(app, buf);
     if (received != size || (chunked && !decoder.isDone())) { return Err(S3Fail.Code(S3Code.IncompleteBody)); }
-    let finished = match (w.finishInline()) {
+    match (seal.asBorrowMut()) {
+        Some(s) => {
+            // The last chunk: the part's end, or the one empty chunk of an empty object.
+            sealed.clear();
+            s.finish(mut sealed)?;
+            if (w.fitsInline(sealed.length)) {
+                w.writeInline(sealed.view())?;
+            } else {
+                match (await Async.blocking(() => writeSealed(mut w, sealed.view()))) {
+                    Ok() => {}
+                    Err(e) => { return Err(storeFail(e, 0)); }
+                }
+            }
+        }
+        null => {}
+    }
+    var finished = match (w.finishInline()) {
         Some(f) => f,
         null => await finishSpilled(mut w)?,
     };
+    if (seal.isSome()) {
+        finished.size = received;
+        finished.md5 = plainMd5.finish();
+    }
 
     var refusal: S3Code? = null;
     match (expectedSha) {
@@ -469,14 +526,29 @@ async fn putObject(
     contentTypeOf(req, mut contentType)?;
     // Refused before the body is read; the ACL of the request's fields goes with the metadata (ADR-0045 §3).
     let tagged = await withRequestAcl(app, req, withRequestTags(req, metadataOf(req)?)?)?;
-    let metadata = await withRequestLock(app, req, tagged)?;
-    let writer = await startPutObject(app, req.bucket.view(), spec.size)?;
+    var metadata = await withRequestLock(app, req, tagged)?;
+    // SSE-S3 (ADR-0046 §5): a data key for the object, whose envelope goes with its metadata.
+    var sealer: SseSealer? = null;
+    match (sseRequestOf(req)?) {
+        SseRequest.None => {}
+        SseRequest.Managed => {
+            var seal = newManagedSeal(app.sseKeys.view())?;
+            metadataAdd(mut metadata, SSE_FIELD.bytes(), seal.field.view())?;
+            sealer = SseSealer.create(borrow seal.dataKey, 0, spec.size);
+            for (i in 0..32) { seal.dataKey[i] = 0; }
+            if (sealer.isNull()) { return Err(S3Fail.Code(S3Code.InternalError)); }
+        }
+        SseRequest.Customer(_) => { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    }
+    let sealing = sealer.isSome();
+    let storedSize = if (sealing) sseStoredLength(spec.size) else spec.size;
+    let writer = await startPutObject(app, req.bucket.view(), storedSize)?;
     // Every object gets a checksum: the client's, else CRC64NVME, as S3 does (ADR-0015).
     let storeAs = match (spec.checksumKind) {
         ChecksumAlgorithm.None => ChecksumAlgorithm.Crc64Nvme,
         _ => spec.checksumKind,
     };
-    let body = await receiveBody(app, auth, mut spec, writer, exchange, storeAs)?;
+    let body = await receiveBody(app, auth, mut spec, writer, exchange, storeAs, sealer)?;
     var extras = Vector<u8>.create();
     singlePartExtras(body.storedAlgorithm, body.stored.view(), mut extras)?;
     let outcome = await commitPut(
@@ -491,6 +563,7 @@ async fn putObject(
         ifMatch.view(),
     )?;
     writtenVersionHeader(exchange, borrow outcome)?;
+    if (sealing) { exchange.header(SSE_FIELD, "AES256".bytes())?; }
     return await sendStored(exchange, borrow outcome.md5, 0, borrow body);
 }
 
@@ -579,6 +652,51 @@ fn writeStep(
     checksum.update(data);
     stored.update(data);
     return writer.write(data);
+}
+
+/// A step of a sealed PUT body, in memory (ADR-0046 §2): the plaintext hashed, and the chunks it completes into
+/// `sealed`.
+fn sealInto(
+    sha: borrow mut Sha256,
+    checksum: borrow mut RunningChecksum,
+    stored: borrow mut RunningChecksum,
+    md5: borrow mut Md5,
+    sealer: borrow mut SseSealer,
+    sealed: borrow mut Vector<u8>,
+    hashing: bool,
+    data: Slice<u8>,
+) -> Result<void, AllocError> {
+    if (hashing) { sha.update(data); }
+    checksum.update(data);
+    stored.update(data);
+    md5.update(data);
+    sealed.clear();
+    return sealer.feed(data, sealed);
+}
+
+/// `sealInto` and the write of what it sealed, on a worker thread.
+fn sealStep(
+    writer: borrow mut ObjectWriter,
+    sha: borrow mut Sha256,
+    checksum: borrow mut RunningChecksum,
+    stored: borrow mut RunningChecksum,
+    md5: borrow mut Md5,
+    sealer: borrow mut SseSealer,
+    sealed: borrow mut Vector<u8>,
+    hashing: bool,
+    data: Slice<u8>,
+) -> Result<void, StoreError> {
+    sealInto(sha, checksum, stored, md5, sealer, sealed, hashing, data)?;
+    return writeSealed(writer, sealed.view());
+}
+
+/// Sealed bytes into the writer, on a worker thread: they may spill into extents.
+fn writeSealed(writer: borrow mut ObjectWriter, sealed: Slice<u8>) -> Result<void, StoreError> {
+    if (sealed.length == 0) { return Ok(); }
+    return match (writer.write(sealed)) {
+        Ok() => Ok(),
+        Err(f) => Err(StoreError.Io(f)),
+    };
 }
 
 fn appendChecksumName(out: borrow mut Vector<u8>, kind: ChecksumAlgorithm) -> Result<void, AllocError> {
@@ -920,7 +1038,15 @@ async fn openGet(
             }
         };
         if (withBody && !p.notModified && p.end > p.start) {
-            prepared = match (store.prepareReaderOf(req.bucket.view(), req.key.view(), versionId, p.start, p.end)) {
+            // A sealed object's range is read as the whole chunks that hold it (ADR-0046 §2).
+            var from = p.start;
+            var to = p.end;
+            if (metadataFind(p.info.metadata.view(), SSE_FIELD.bytes()).isSome()) {
+                let span = sseSpan(p.info.size, p.start, p.end);
+                from = span.storedFrom;
+                to = span.storedTo;
+            }
+            prepared = match (store.prepareReaderOf(req.bucket.view(), req.key.view(), versionId, from, to)) {
                 Ok(r) => r,
                 Err(e) => { return Err(storeFail(e, req.key.length)); }
             };
@@ -950,6 +1076,24 @@ async fn openGet(
 async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
     let withBody = !isMethod(req.method, Method.Head);
     var plan = await openGet(app, req, withBody, exchange)?;
+    // A sealed object's data key, before any of the answer is given (ADR-0046 §2, §4).
+    var opener: SseOpener? = null;
+    var skip: u64 = 0;
+    if (plan.reader.isSome()) {
+        var field = Vector<u8>.create();
+        match (metadataFind(plan.info.metadata.view(), SSE_FIELD.bytes())) {
+            Some(f) => { field.extend(f)?; }
+            null => {}
+        }
+        if (field.length > 0) {
+            var dataKey = await sealedDataKey(app, field.view())?;
+            let span = sseSpan(plan.info.size, plan.start, plan.end);
+            skip = span.skip;
+            opener = SseOpener.create(borrow dataKey, 0, plan.info.size, span.firstChunk);
+            for (i in 0..32) { dataKey[i] = 0; }
+            if (opener.isNull()) { return Err(S3Fail.Code(S3Code.InternalError)); }
+        }
+    }
     readVersionHeader(exchange, borrow plan.info)?;
     var field = Vector<u8>.create();
     appendEtag(mut field, borrow plan.info.md5, plan.info.parts)?;
@@ -1015,6 +1159,11 @@ async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
                 }
                 // Nor is the ACL: GetObjectAcl returns it (ADR-0045).
                 if (name == ACL_FIELD.bytes()) { continue; }
+                // Nor the envelope: S3's field for the mode (ADR-0046 §3).
+                if (name == SSE_FIELD.bytes()) {
+                    exchange.header(SSE_FIELD, "AES256".bytes())?;
+                    continue;
+                }
                 // The lock is S3's three fields (ADR-0047).
                 if (name == LOCK_FIELD.bytes()) {
                     lockHeaders(exchange, pairs[i].value.view())?;
@@ -1047,6 +1196,17 @@ async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
         exchange.setStatus(Status.ok());
     }
     exchange.setContentLength(plan.end - plan.start);
+    match (opener.asBorrowMut()) {
+        Some(o) => {
+            match (plan.reader.asBorrowMut()) {
+                Some(reader) => { await sendOpened(app, exchange, reader, o, skip, plan.end - plan.start)?; }
+                null => {}
+            }
+            await exchange.finish()?;
+            return Ok();
+        }
+        null => {}
+    }
     match (plan.reader.asBorrowMut()) {
         Some(reader) => {
             // An inline object is already in memory: sent as it is, without a worker thread per read.

@@ -1,4 +1,4 @@
-// Server-side encryption (ADR-0046): the parts that need no cipher.
+// Server-side encryption (ADR-0046): chunks, sealing and opening, the envelope, the key file, the request's fields.
 import web_core;
 import web_http;
 import web_server;
@@ -220,5 +220,299 @@ fn sseRequestFields() -> Result<void, TestFailure> {
     )?;
     Check.isTrue(!isSseField("x-amz-meta-server-side-encryption".bytes()), "user metadata")?;
     Check.isTrue(!isSseField("x-amz-acl".bytes()), "another field")?;
+    return Ok();
+}
+
+/// Byte k of a test text.
+fn sseText(n: usize, seed: usize) -> Vector<u8> {
+    var v = Vector<u8>.create();
+    for (k in 0..n) { v.push(truncate<u8>(k * 31 + seed + (k >> 9)))!; }
+    return v;
+}
+
+fn sseTestKey() -> [u8; 32] {
+    var key = [0u8; 32];
+    for (i in 0..32) { key[i] = truncate<u8>(i); }
+    return key;
+}
+
+/// A part sealed, fed `step` bytes at a time.
+fn sseSealed(key: borrow [u8; 32], part: u32, text: Slice<u8>, step: usize) -> Vector<u8> {
+    var sealer = match (SseSealer.create(key, part, text.length as u64)) {
+        Some(s) => s,
+        null => { panic("no cipher for the key"); }
+    };
+    var stored = Vector<u8>.create();
+    var at: usize = 0;
+    while (at < text.length) {
+        let end = if (text.length - at < step) text.length else at + step;
+        sealer.feed(text[at..end], mut stored)!;
+        at = end;
+    }
+    sealer.finish(mut stored)!;
+    return stored;
+}
+
+/// Stored chunks opened from chunk `first`, fed `step` bytes at a time: the plaintext, or null when one is refused
+/// or the bytes end inside a chunk.
+fn sseOpened(
+    key: borrow [u8; 32],
+    part: u32,
+    size: u64,
+    first: u64,
+    stored: Slice<u8>,
+    step: usize,
+) -> Vector<u8>? {
+    var opener = match (SseOpener.create(key, part, size, first)) {
+        Some(o) => o,
+        null => { panic("no cipher for the key"); }
+    };
+    var plain = Vector<u8>.create();
+    var at: usize = 0;
+    while (at < stored.length) {
+        let end = if (stored.length - at < step) stored.length else at + step;
+        if (!opener.feed(stored[at..end], mut plain)!) { return null; }
+        at = end;
+    }
+    if (!opener.isWhole()) { return null; }
+    return plain;
+}
+
+@test
+fn sseSealsAndOpens() -> Result<void, TestFailure> {
+    let key = sseTestKey();
+    // What another implementation gives (Python's cryptography) for "abc" as the one chunk of part 0.
+    let abc = sseSealed(borrow key, 0, "abc".bytes(), 100);
+    var hex = Vector<u8>.create();
+    appendHexBytes(mut hex, abc.view())!;
+    Check.equalBytes("6fded6d0933d8de78af52db2d132390290077c".bytes(), hex.view())?;
+    let sizes = [0usize, 1, 65535, 65536, 65537, 200000];
+    for (i in 0..sizes.length) {
+        let n = sizes[i];
+        let text = sseText(n, i);
+        let stored = sseSealed(borrow key, 3, text.view(), 7001);
+        Check.equalU64(sseStoredLength(n as u64), stored.length as u64)?;
+        match (sseOpened(borrow key, 3, n as u64, 0, stored.view(), 5000)) {
+            Some(plain) => { Check.equalBytes(text.view(), plain.view())?; }
+            null => { return Check.fail("a sealed part did not open"); }
+        }
+        // Under another part number, or another key, nothing opens.
+        Check.isTrue(sseOpened(borrow key, 4, n as u64, 0, stored.view(), 5000).isNull(), "refused")?;
+        var other = key;
+        other[31] = other[31] ^ 1;
+        Check.isTrue(sseOpened(borrow other, 3, n as u64, 0, stored.view(), 5000).isNull(), "refused")?;
+    }
+    return Ok();
+}
+
+@test
+fn sseOpensRangesAndRefusesChanges() -> Result<void, TestFailure> {
+    let key = sseTestKey();
+    let n: usize = 200000;
+    let text = sseText(n, 9);
+    let stored = sseSealed(borrow key, 0, text.view(), 65536);
+    // A range across a chunk's end: its two chunks are read whole and opened.
+    let from: usize = 65530;
+    let to: usize = 65545;
+    let span = sseSpan(n as u64, from as u64, to as u64);
+    let piece = stored.view()[span.storedFrom as usize..span.storedTo as usize];
+    match (sseOpened(borrow key, 0, n as u64, span.firstChunk, piece, 4096)) {
+        Some(plain) => {
+            let skip = span.skip as usize;
+            Check.equalBytes(text.view()[from..to], plain.view()[skip..skip + (to - from)])?;
+        }
+        null => { return Check.fail("a range did not open"); }
+    }
+    // The last chunk alone.
+    let tail = sseSpan(n as u64, (n - 1) as u64, n as u64);
+    let last = stored.view()[tail.storedFrom as usize..tail.storedTo as usize];
+    Check.isTrue(sseOpened(borrow key, 0, n as u64, tail.firstChunk, last, 4096).isSome(), "opens")?;
+    // A changed byte, in a text or in a tag.
+    var changed = Vector<u8>.create();
+    changed.extend(stored.view())!;
+    changed[70000] = changed[70000] ^ 1;
+    Check.isTrue(sseOpened(borrow key, 0, n as u64, 0, changed.view(), 4096).isNull(), "refused")?;
+    changed[70000] = changed[70000] ^ 1;
+    changed[65536 + 3] = changed[65536 + 3] ^ 0x80;
+    Check.isTrue(sseOpened(borrow key, 0, n as u64, 0, changed.view(), 4096).isNull(), "refused")?;
+    // Chunks in another order: the second where the first was.
+    let stride: usize = 65552;
+    Check.isTrue(sseOpened(borrow key, 0, n as u64, 0, stored.view()[stride..2 * stride], 4096).isNull(), "refused")?;
+    // Cut short: inside a chunk, and after a whole chunk (the object would end at a chunk that is not its last).
+    Check.isTrue(sseOpened(borrow key, 0, n as u64, 0, stored.view()[0..stride + 10], 4096).isNull(), "refused")?;
+    Check.isTrue(sseOpened(borrow key, 0, 2 * 65536, 0, stored.view()[0..2 * stride], 4096).isNull(), "refused")?;
+    // Bytes after the last chunk.
+    var longer = Vector<u8>.create();
+    longer.extend(stored.view())!;
+    longer.push(0)!;
+    Check.isTrue(sseOpened(borrow key, 0, n as u64, 0, longer.view(), 4096).isNull(), "refused")?;
+    return Ok();
+}
+
+@test
+fn sseWrapsDataKeys() -> Result<void, TestFailure> {
+    let master = sseTestKey();
+    var dataKey = [0u8; 32];
+    for (i in 0..32) { dataKey[i] = truncate<u8>(100 + i); }
+    var nonce = [0u8; 12];
+    for (i in 0..12) { nonce[i] = truncate<u8>(i); }
+    let wrapped = match (wrapDataKey(borrow master, false, borrow dataKey, nonce)) {
+        Some(w) => w,
+        null => { return Check.fail("no cipher for the master key"); }
+    };
+    // What another implementation gives.
+    var hex = Vector<u8>.create();
+    appendHexBytes(mut hex, wrapped[..])!;
+    Check.equalBytes(
+        "2367b07cad8ca870e12cf9e4c1980a1ef7a3f14388022507441a9bfa9de88231f2b64d8bc19091e1ffbd90adf361693a".bytes(),
+        hex.view(),
+    )?;
+    var e = SseEnvelope { customer: false, keyId: copyBytes("k1".bytes())!, nonce: nonce, wrapped: wrapped };
+    match (unwrapDataKey(borrow master, borrow e)) {
+        Some(k) => { Check.equalBytes(dataKey[..], k[..])?; }
+        null => { return Check.fail("the data key did not open"); }
+    }
+    // Another master key, another mode, a changed envelope: no key.
+    var other = master;
+    other[0] = other[0] ^ 1;
+    Check.isTrue(unwrapDataKey(borrow other, borrow e).isNull(), "no key")?;
+    e.customer = true;
+    Check.isTrue(unwrapDataKey(borrow master, borrow e).isNull(), "no key")?;
+    e.customer = false;
+    e.wrapped[5] = e.wrapped[5] ^ 1;
+    Check.isTrue(unwrapDataKey(borrow master, borrow e).isNull(), "no key")?;
+    return Ok();
+}
+
+fn sseKeyOf(id: StringView, fill: u8) -> MasterKey {
+    var key = MasterKey { id: copyBytes(id.bytes())!, key: [0u8; 32] };
+    for (i in 0..32) { key.key[i] = fill + truncate<u8>(i); }
+    return key;
+}
+
+fn sseKeyFaultIs(answer: Result<[u8; 32], SseKeyFault>, expected: SseKeyFault) -> bool => match (answer) {
+    Ok(_) => false,
+    Err(SseKeyFault.Broken) => match (expected) {
+        SseKeyFault.Broken => true,
+        _ => false,
+    },
+    Err(SseKeyFault.Customer) => match (expected) {
+        SseKeyFault.Customer => true,
+        _ => false,
+    },
+    Err(SseKeyFault.UnknownKey) => match (expected) {
+        SseKeyFault.UnknownKey => true,
+        _ => false,
+    },
+};
+
+@test
+fn sseManagedKeysRotate() -> Result<void, TestFailure> {
+    var keys = Vector<MasterKey>.create();
+    Check.isTrue(newManagedSeal(keys.view()).isErr(), "no key file: refused")?;
+    keys.push(sseKeyOf("k1", 1))!;
+    let seal = match (newManagedSeal(keys.view())) {
+        Ok(s) => s,
+        Err(_) => { return Check.fail("no seal"); }
+    };
+    Check.isTrue(startsWithBytes(seal.field.view(), "v1.s3.k1.".bytes()), "the envelope names the first key")?;
+    match (managedDataKey(keys.view(), seal.field.view())) {
+        Ok(k) => { Check.equalBytes(seal.dataKey[..], k[..])?; }
+        Err(_) => { return Check.fail("the data key did not open"); }
+    }
+    // Two objects get two data keys.
+    let second = match (newManagedSeal(keys.view())) {
+        Ok(s) => s,
+        Err(_) => { return Check.fail("no seal"); }
+    };
+    Check.isTrue(second.dataKey[..] != seal.dataKey[..], "a data key per object")?;
+    // Rotated: a new first key seals, the old one still opens what it sealed.
+    var rotated = Vector<MasterKey>.create();
+    rotated.push(sseKeyOf("k2", 50))!;
+    rotated.push(sseKeyOf("k1", 1))!;
+    match (managedDataKey(rotated.view(), seal.field.view())) {
+        Ok(k) => { Check.equalBytes(seal.dataKey[..], k[..])?; }
+        Err(_) => { return Check.fail("the old key did not open its object"); }
+    }
+    let after = match (newManagedSeal(rotated.view())) {
+        Ok(s) => s,
+        Err(_) => { return Check.fail("no seal"); }
+    };
+    Check.isTrue(startsWithBytes(after.field.view(), "v1.s3.k2.".bytes()), "the new key seals")?;
+    // The old key gone: the id is unknown. Another key under the id: the envelope does not open.
+    var gone = Vector<MasterKey>.create();
+    gone.push(sseKeyOf("k2", 50))!;
+    Check.isTrue(sseKeyFaultIs(managedDataKey(gone.view(), seal.field.view()), SseKeyFault.UnknownKey), "unknown")?;
+    var swapped = Vector<MasterKey>.create();
+    swapped.push(sseKeyOf("k1", 7))!;
+    Check.isTrue(sseKeyFaultIs(managedDataKey(swapped.view(), seal.field.view()), SseKeyFault.Broken), "broken")?;
+    Check.isTrue(sseKeyFaultIs(managedDataKey(keys.view(), "v1.s3.k1.00".bytes()), SseKeyFault.Broken), "broken")?;
+    // An SSE-C envelope needs the request's key.
+    var c = SseEnvelope { customer: true, keyId: copyBytes("-".bytes())!, nonce: [0u8; 12], wrapped: [0u8; 48] };
+    var field = Vector<u8>.create();
+    encodeEnvelope(borrow c, mut field)!;
+    Check.isTrue(sseKeyFaultIs(managedDataKey(keys.view(), field.view()), SseKeyFault.Customer), "customer")?;
+    return Ok();
+}
+
+/// A sealed object put into the store as the S3 layer puts one: its chunks stored, its plaintext's size and MD5.
+fn putSealed(s: borrow mut ObjectStore, key: StringView, text: Slice<u8>, stored: Slice<u8>) {
+    var obj = s.writeAll(stored)!;
+    obj.size = text.length as u64;
+    obj.md5 = Md5.of(text);
+    var e = SseEnvelope { customer: false, keyId: copyBytes("k1".bytes())!, nonce: [0u8; 12], wrapped: [0u8; 48] };
+    var field = Vector<u8>.create();
+    encodeEnvelope(borrow e, mut field)!;
+    var metadata = Vector<u8>.create();
+    metadataAdd(mut metadata, SSE_FIELD.bytes(), field.view())!;
+    let _ = s.putFinishedWith("bkt", key, "", metadata.view(), "".bytes(), borrow obj, PutCondition.None)!;
+}
+
+@test
+fn sseSealedVersionsAreReadAndVerifiedAsStored() -> Result<void, TestFailure> {
+    let key = sseTestKey();
+    let dir = scratchDirectory("sse-sealed");
+    let small = sseText(500, 1);
+    let large = sseText(200000, 2);
+    {
+        var s = ObjectStore.open(dir.view(), spaceConfig(0, 0))!;
+        s.createBucket("bkt")!;
+        putSealed(mut s, "inline", small.view(), sseSealed(borrow key, 0, small.view(), 4096).view());
+        putSealed(mut s, "extents", large.view(), sseSealed(borrow key, 0, large.view(), 65536).view());
+        putSealed(mut s, "empty", "".bytes(), sseSealed(borrow key, 0, "".bytes(), 1).view());
+        s.checkpoint()!;
+    }
+    var s = ObjectStore.open(dir.view(), spaceConfig(0, 0))!;
+    let report = s.verify()!;
+    Check.equalU64(3, report.objects)?;
+    Check.equalU64(sseStoredLength(500) + sseStoredLength(200000) + sseStoredLength(0), report.bytes)?;
+    Check.equalU64(0, report.problems.length as u64)?;
+    // A read is of what is stored, past the size the version answers with, and it opens.
+    let whole = s.getObject("bkt", "extents")!;
+    Check.equalU64(sseStoredLength(200000), whole.length as u64)?;
+    match (sseOpened(borrow key, 0, 200000, 0, whole.view(), 65536)) {
+        Some(plain) => { Check.equalBytes(large.view(), plain.view())?; }
+        null => { return Check.fail("the stored object did not open"); }
+    }
+    let span = sseSpan(200000, 131070, 131075);
+    let piece = s.getObjectRange("bkt", "extents", span.storedFrom, span.storedTo)!;
+    match (sseOpened(borrow key, 0, 200000, span.firstChunk, piece.view(), 4096)) {
+        Some(plain) => {
+            let skip = span.skip as usize;
+            Check.equalBytes(large.view()[131070..131075], plain.view()[skip..skip + 5])?;
+        }
+        null => { return Check.fail("a range did not open"); }
+    }
+    // A version that claims to be sealed but whose bytes are not its chunks' length is a mismatch.
+    putSealed(mut s, "short", small.view(), small.view());
+    let after = s.verify()!;
+    Check.equalU64(1, after.problems.length as u64)?;
+    Check.equalBytes("short".bytes(), after.problems[0].key.view())?;
+    let mismatch = match (after.problems[0].fault) {
+        VerifyFault.Mismatch => true,
+        _ => false,
+    };
+    Check.isTrue(mismatch, "a mismatch")?;
+    removeTree(dir.view());
     return Ok();
 }

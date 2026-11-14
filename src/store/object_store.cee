@@ -1586,8 +1586,18 @@ struct ObjectStore {
                 report.bytes += size;
                 if (fault.isNull()) {
                     let digest = md5.finish();
-                    // A multipart object's MD5 is its ETag's, not its bytes' (ADR-0009): its extents' CRCs cover it.
-                    if (size != v.size || (v.parts == 0 && digest[..] != v.md5[..])) {
+                    if (isSealed(v)) {
+                        // Sealed bytes (ADR-0046): the MD5 is the plaintext's, which only a key opens; their length
+                        // is their chunks', and the extents' CRCs and each chunk's tag cover them.
+                        let partSizes = match (decodeExtras(v.extras.view())) {
+                            Ok(e) => e.partSizes,
+                            Err(_) => Vector<u64>.create(),
+                        };
+                        let expected = sealedLengthOf(v, partSizes.view());
+                        if (expected.isNull() || size != (expected ?? 0)) { fault = VerifyFault.Mismatch; }
+                    } else if (size != v.size || (v.parts == 0 && digest[..] != v.md5[..])) {
+                        // A multipart object's MD5 is its ETag's, not its bytes' (ADR-0009): its extents' CRCs cover
+                        // it.
                         fault = VerifyFault.Mismatch;
                     }
                 }
@@ -2541,7 +2551,8 @@ struct ObjectStore {
         return readRemaining(mut reader);
     }
 
-    /// A reader of the current version's bytes `[from, to)`, clamped to the object's size.
+    /// A reader of the current version's stored bytes `[from, to)`, clamped to their length: the object's size, or
+    /// its chunks' for a sealed one (ADR-0046 §2).
     fn openReader(
         borrow mut this,
         bucket: StringView,
@@ -2599,7 +2610,9 @@ struct ObjectStore {
                 null => { return Err(StoreError.NoSuchKey); }
             },
         };
-        let end = if (to > v.size) v.size else to;
+        // Offsets of what is stored, which for a sealed version is longer than its size (ADR-0046 §2).
+        let stored = storedLengthOf(v);
+        let end = if (to > stored) stored else to;
         let start = if (from > end) end else from;
         if (v.extents.length != 0) {
             var refs = Vector<ExtentRef>.create();
@@ -2653,7 +2666,8 @@ struct ObjectStore {
         from: u64,
         to: u64,
     ) -> Result<ObjectReader, StoreError> {
-        let end = if (to > v.size) v.size else to;
+        let stored = storedLengthOf(v);
+        let end = if (to > stored) stored else to;
         let start = if (from > end) end else from;
         if (v.extents.length == 0) {
             // The whole record is read and verified, so a GET never serves rotted bytes:

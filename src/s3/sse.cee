@@ -1,15 +1,12 @@
-// Server-side encryption (ADR-0046): what needs no cipher. The chunks an object is sealed in and where they are
-// stored, the envelope kept with a version, the key file, and the request's fields. Sealing and opening wait for
-// AES-256-GCM in lib/std (CEESAFE_GAPS.md, G33); until then a request that asks for encryption is NotImplemented.
+// Server-side encryption (ADR-0046): the chunks an object is sealed in and where they are stored, sealing and opening
+// them with lib/std's AES-256-GCM (ceesafec 0.45.0; CEESAFE_GAPS.md, G33), the envelope kept with a version, the key
+// file, and the request's fields. SSE-S3 is served on PutObject, GetObject and HeadObject (`objects.cee`); any other
+// request that asks for encryption is NotImplemented (`sseServedFor`).
 import web_core;
 import web_http;
 import web_server;
 
-/// The metadata field that holds a version's envelope (ADR-0046 §3).
-const SSE_FIELD: StringView = "x-amz-server-side-encryption";
-/// The plaintext bytes of one sealed chunk, and its tag's.
-const SSE_CHUNK: u64 = 65536;
-const SSE_TAG: u64 = 16;
+// SSE_FIELD, SSE_CHUNK, SSE_TAG, sseChunks and sseStoredLength are the store's (`src/store/sealed.cee`).
 const SSE_KEY_BYTES: usize = 32;
 const SSE_NONCE_BYTES: usize = 12;
 /// A data key sealed: its 32 bytes and the tag.
@@ -17,12 +14,6 @@ const SSE_WRAPPED_BYTES: usize = 48;
 const MAX_KEY_ID: usize = 32;
 
 // ---- Chunks (ADR-0046 §2) ----
-
-/// The chunks of a part of `n` plaintext bytes: an empty one is one empty chunk.
-fn sseChunks(n: u64) -> u64 => if (n == 0) 1 else (n + SSE_CHUNK - 1) / SSE_CHUNK;
-
-/// The bytes a part of `n` plaintext bytes is stored in: itself and a tag per chunk.
-fn sseStoredLength(n: u64) -> u64 => n + SSE_TAG * sseChunks(n);
 
 /// A chunk's nonce: the part number (0 for an object that is not multipart) and the chunk's index in the part.
 fn sseNonce(part: u32, chunk: u64) -> [u8; 12] {
@@ -62,6 +53,157 @@ fn sseSpan(n: u64, from: u64, to: u64) -> SseSpan {
         storedTo: if (end < stored) end else stored,
         skip: from - first * SSE_CHUNK,
     };
+}
+
+// ---- Sealing (ADR-0046 §2) ----
+
+/// A chunk's associated data: 1 for the last chunk of its part, else 0.
+fn sseFlag(last: bool) -> [u8; 1] => [if (last) 1u8 else 0u8];
+
+/// A cipher for a 32-byte key (the length is the type's, so there is one).
+fn sseCipher(key: borrow [u8; 32]) -> Aes256Gcm? => Aes256Gcm.create(key[..]);
+
+/// Seals a part's plaintext as it arrives: every 64 KiB a chunk, its ciphertext and tag, is given out.
+struct SseSealer {
+    cipher: Aes256Gcm;
+    part: u32;
+    /// The part's chunks, and the next one's index.
+    chunks: u64;
+    chunk: u64;
+    /// The plaintext of the chunk being filled.
+    pending: Vector<u8>;
+
+    /// A sealer for a part of `size` plaintext bytes under `key`; null if the cipher refuses the key.
+    fn create(key: borrow [u8; 32], part: u32, size: u64) -> SseSealer? => match (sseCipher(key)) {
+        Some(c) => Some(
+            SseSealer { cipher: c, part: part, chunks: sseChunks(size), chunk: 0, pending: Vector<u8>.create() },
+        ),
+        null => null,
+    };
+
+    fn emit(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        let flag = sseFlag(this.chunk + 1 >= this.chunks);
+        let tag = this.cipher.seal(sseNonce(this.part, this.chunk), flag[..], this.pending.viewMut());
+        out.extend(this.pending.view())?;
+        out.extend(tag[..])?;
+        this.pending.clear();
+        this.chunk += 1;
+        return Ok();
+    }
+
+    /// Takes plaintext and appends to `out` every chunk it completes.
+    fn feed(borrow mut this, data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        var at: usize = 0;
+        while (at < data.length) {
+            let room = SSE_CHUNK as usize - this.pending.length;
+            let take = if (data.length - at < room) data.length - at else room;
+            this.pending.extend(data[at..at + take])?;
+            at += take;
+            if (this.pending.length == SSE_CHUNK as usize) { this.emit(out)?; }
+        }
+        return Ok();
+    }
+
+    /// The part's end: its last chunk, if it was not a full one (an empty part's one empty chunk too).
+    fn finish(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        if (this.chunk < this.chunks) { this.emit(out)?; }
+        return Ok();
+    }
+}
+
+/// Opens a part's stored chunks as they are read, from chunk `first` on.
+struct SseOpener {
+    cipher: Aes256Gcm;
+    part: u32;
+    /// The part's plaintext bytes, its chunks, and the next one's index.
+    size: u64;
+    chunks: u64;
+    chunk: u64;
+    /// The stored bytes of the chunk being read.
+    pending: Vector<u8>;
+
+    fn create(key: borrow [u8; 32], part: u32, size: u64, first: u64) -> SseOpener? => match (sseCipher(key)) {
+        Some(c) => Some(
+            SseOpener {
+                cipher: c,
+                part: part,
+                size: size,
+                chunks: sseChunks(size),
+                chunk: first,
+                pending: Vector<u8>.create(),
+            },
+        ),
+        null => null,
+    };
+
+    /// The stored bytes of the next chunk: its plaintext's and the tag's.
+    fn nextStored(borrow this) -> usize {
+        let before = this.chunk * SSE_CHUNK;
+        let left = if (this.size > before) this.size - before else 0;
+        return (if (left < SSE_CHUNK) left else SSE_CHUNK) as usize + SSE_TAG as usize;
+    }
+
+    /// Takes stored bytes and appends to `out` the plaintext of every chunk they complete. False when a chunk does
+    /// not open (it was changed, moved or cut short) or there are bytes after the part's last chunk: nothing of it
+    /// is given out.
+    fn feed(borrow mut this, stored: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+        var at: usize = 0;
+        while (at < stored.length) {
+            if (this.chunk >= this.chunks) { return Ok(false); }
+            let whole = this.nextStored();
+            let room = whole - this.pending.length;
+            let take = if (stored.length - at < room) stored.length - at else room;
+            this.pending.extend(stored[at..at + take])?;
+            at += take;
+            if (this.pending.length < whole) { break; }
+            let plain = whole - SSE_TAG as usize;
+            var tag = [0u8; 16];
+            for (i in 0..16) { tag[i] = this.pending[plain + i]; }
+            let flag = sseFlag(this.chunk + 1 >= this.chunks);
+            let nonce = sseNonce(this.part, this.chunk);
+            if (!this.cipher.open(nonce, flag[..], mut this.pending.viewMut()[0..plain], tag)) { return Ok(false); }
+            out.extend(this.pending.view()[0..plain])?;
+            this.pending.clear();
+            this.chunk += 1;
+        }
+        return Ok(true);
+    }
+
+    /// Whether every stored byte given was a whole chunk's: a read that ends inside one was cut short.
+    fn isWhole(borrow this) -> bool => this.pending.length == 0;
+}
+
+/// The associated data of a wrapped data key: its mode (ADR-0046 §3).
+fn sseModeText(customer: bool) -> StringView => if (customer) "c" else "s3";
+
+/// A data key sealed under `master` (a master key, or the request's key for SSE-C) with `nonce`, which must be
+/// random: the envelope's last two fields.
+fn wrapDataKey(master: borrow [u8; 32], customer: bool, dataKey: borrow [u8; 32], nonce: [u8; 12]) -> [u8; 48]? {
+    let cipher = match (sseCipher(master)) {
+        Some(c) => c,
+        null => { return null; }
+    };
+    var sealed = [0u8; 32];
+    for (i in 0..32) { sealed[i] = dataKey[i]; }
+    let tag = cipher.seal(nonce, sseModeText(customer).bytes(), mut sealed[..]);
+    var wrapped = [0u8; 48];
+    for (i in 0..32) { wrapped[i] = sealed[i]; }
+    for (i in 0..16) { wrapped[32 + i] = tag[i]; }
+    return wrapped;
+}
+
+/// The data key of an envelope, opened under `master`; null when it is not the key that sealed it.
+fn unwrapDataKey(master: borrow [u8; 32], e: borrow SseEnvelope) -> [u8; 32]? {
+    let cipher = match (sseCipher(master)) {
+        Some(c) => c,
+        null => { return null; }
+    };
+    var key = [0u8; 32];
+    var tag = [0u8; 16];
+    for (i in 0..32) { key[i] = e.wrapped[i]; }
+    for (i in 0..16) { tag[i] = e.wrapped[32 + i]; }
+    if (!cipher.open(e.nonce, sseModeText(e.customer).bytes(), mut key[..], tag)) { return null; }
+    return key;
 }
 
 // ---- The envelope (ADR-0046 §3) ----
@@ -248,10 +390,172 @@ fn isSseField(name: Slice<u8>) -> bool =>
     startsWithBytes(name, SSE_FIELD.bytes()) ||
         startsWithBytes(name, "x-amz-copy-source-server-side-encryption".bytes());
 
-/// Whether a request asks for encryption or brings a key (ADR-0046 §7): NotImplemented until there is a cipher.
+/// Whether a request asks for encryption or brings a key (ADR-0046 §7).
 fn asksEncryption(req: borrow S3Request) -> bool {
     for (i in 0..req.headers.length) {
         if (isSseField(req.headers[i].name.view())) { return true; }
     }
     return false;
+}
+
+/// Whether the request's encryption fields are served: SSE-S3's field alone, on a PutObject (a PUT of a key with no
+/// query and no copy source). Every other request that asks for encryption is NotImplemented until multipart
+/// uploads, copies, POST and SSE-C are served, so nothing asked to be sealed is stored in the clear.
+fn sseServedFor(req: borrow S3Request) -> bool {
+    if (!isMethod(req.method, Method.Put) || req.key.length == 0 || !req.onlyParams("")) { return false; }
+    if (headerOf(req, "x-amz-copy-source").isSome()) { return false; }
+    for (i in 0..req.headers.length) {
+        let name = req.headers[i].name.view();
+        if (isSseField(name) && name != SSE_FIELD.bytes()) { return false; }
+    }
+    return true;
+}
+
+/// The encryption a request's fields ask for.
+fn sseRequestOf(req: borrow S3Request) -> Result<SseRequest, S3Fail> =>
+    sseOfFields(
+        headerOf(req, SSE_FIELD),
+        headerOf(req, "x-amz-server-side-encryption-customer-algorithm"),
+        headerOf(req, "x-amz-server-side-encryption-customer-key"),
+        headerOf(req, "x-amz-server-side-encryption-customer-key-md5"),
+    );
+
+// ---- Sealing a new object, opening a stored one (ADR-0046 §2 to §5) ----
+
+/// A new object's data key, and its envelope as the metadata field holds it.
+struct NewSeal {
+    dataKey: [u8; 32];
+    field: Vector<u8>;
+}
+
+/// SSE-S3 for a new object: a random data key, wrapped under the first master key with a random nonce.
+fn newManagedSeal(keys: Slice<MasterKey>) -> Result<NewSeal, S3Fail> {
+    let failed = S3Fail.Code(S3Code.InternalError);
+    if (keys.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); } // `serve` has no key file
+    var dataKey = [0u8; 32];
+    var nonce = [0u8; 12];
+    if (Random.fill(mut dataKey[..]).isErr() || Random.fill(mut nonce[..]).isErr()) { return Err(failed); }
+    let wrapped = match (wrapDataKey(borrow keys[0].key, false, borrow dataKey, nonce)) {
+        Some(w) => w,
+        null => { return Err(failed); }
+    };
+    let e = SseEnvelope { customer: false, keyId: copyBytes(keys[0].id.view())?, nonce: nonce, wrapped: wrapped };
+    var field = Vector<u8>.create();
+    encodeEnvelope(borrow e, mut field)?;
+    return Ok(NewSeal { dataKey: dataKey, field: field });
+}
+
+/// Why a stored envelope does not give its data key.
+enum SseKeyFault {
+    /// The field is not an envelope, or the key it names does not open it: InternalError.
+    Broken,
+    /// SSE-C: the request must bring the key, which is not served yet.
+    Customer,
+    /// No key of the key file has the id: InternalError, and a line in the log.
+    UnknownKey,
+}
+
+/// The data key of a stored SSE-S3 envelope, opened with the master key its id names.
+fn managedDataKey(keys: Slice<MasterKey>, field: Slice<u8>) -> Result<[u8; 32], SseKeyFault> {
+    let e = match (decodeEnvelope(field)) {
+        Ok(Some(e)) => e,
+        _ => { return Err(SseKeyFault.Broken); }
+    };
+    if (e.customer) { return Err(SseKeyFault.Customer); }
+    for (i in 0..keys.length) {
+        if (keys[i].id.view() == e.keyId.view()) {
+            return match (unwrapDataKey(borrow keys[i].key, borrow e)) {
+                Some(k) => Ok(k),
+                null => Err(SseKeyFault.Broken),
+            };
+        }
+    }
+    return Err(SseKeyFault.UnknownKey);
+}
+
+/// `managedDataKey` as a request's answer, with the log line ADR-0046 §4 asks for when no key has the id.
+async fn sealedDataKey(app: borrow S3App, field: Slice<u8>) -> Result<[u8; 32], S3Fail> {
+    return match (managedDataKey(app.sseKeys.view(), field)) {
+        Ok(k) => Ok(k),
+        Err(SseKeyFault.Customer) => Err(S3Fail.Code(S3Code.NotImplemented)),
+        Err(SseKeyFault.UnknownKey) => {
+            var line = Vector<u8>.create();
+            line.extend("cosmostore: an object is sealed under a master key that is not in the key file: ".bytes())?;
+            match (decodeEnvelope(field)) {
+                Ok(Some(e)) => { line.extend(e.keyId.view())?; }
+                _ => {}
+            }
+            line.push('\n')?;
+            let _ = await AsyncConsole.writeError(StringView.fromUtf8(line.view()) ?? "");
+            Err(S3Fail.Code(S3Code.InternalError))
+        }
+        Err(SseKeyFault.Broken) => Err(S3Fail.Code(S3Code.InternalError)),
+    };
+}
+
+/// One read of a sealed body, on a worker thread: stored bytes from `reader` into `buf`, and the plaintext of the
+/// chunks they complete appended to `plain`. Ok(0) at the end; DataCorrupt when a chunk does not open.
+fn readOpened(
+    reader: borrow mut ObjectReader,
+    opener: borrow mut SseOpener,
+    buf: SliceMut<u8>,
+    plain: borrow mut Vector<u8>,
+) -> Result<usize, StoreError> {
+    let n = reader.read(buf)?;
+    if (n == 0) {
+        if (!opener.isWhole()) { return Err(StoreError.DataCorrupt); } // cut short inside a chunk
+        return Ok(0);
+    }
+    if (!opener.feed(buf[0..n], plain)?) { return Err(StoreError.DataCorrupt); }
+    return Ok(n);
+}
+
+/// Sends `length` plaintext bytes of a sealed body, from `skip` bytes into the first chunk the reader holds
+/// (ADR-0046 §2): every chunk is opened whole before any of it is sent.
+async fn sendOpened(
+    app: borrow S3App,
+    exchange: borrow mut Exchange,
+    reader: borrow mut ObjectReader,
+    opener: borrow mut SseOpener,
+    skip: u64,
+    length: u64,
+) -> Result<void, S3Fail> {
+    var plain = Vector<u8>.create();
+    var skipping = skip;
+    var left = length;
+    match (reader.takeInline()) {
+        Some(bytes) => {
+            // An inline object is at most a few chunks, already in memory: opened without a worker thread.
+            if (!opener.feed(bytes.view(), mut plain)? || !opener.isWhole()) {
+                return Err(storeFail(StoreError.DataCorrupt, 0));
+            }
+            let from = if (skipping > plain.length as u64) plain.length else skipping as usize;
+            let to = if (length < (plain.length - from) as u64) from + length as usize else plain.length;
+            await exchange.write(plain.view()[from..to])?;
+            return Ok();
+        }
+        null => {}
+    }
+    var buf = takeBodyBuffer(app, length + SSE_CHUNK + SSE_TAG)?;
+    while (left > 0) {
+        plain.clear();
+        let chunk = buf.viewMut();
+        let got = await Async.blocking(() => readOpened(reader, opener, chunk, mut plain));
+        let n = match (got) {
+            Ok(n) => n,
+            Err(e) => { return Err(storeFail(e, 0)); }
+        };
+        if (n == 0) { break; } // shorter than planned: the response's length tells the client
+        var from: usize = 0;
+        if (skipping > 0) {
+            from = if (skipping > plain.length as u64) plain.length else skipping as usize;
+            skipping -= from as u64;
+        }
+        let have = (plain.length - from) as u64;
+        let take = if (have > left) left else have;
+        if (take > 0) { await exchange.write(plain.view()[from..from + take as usize])?; }
+        left -= take;
+    }
+    giveBodyBuffer(app, buf);
+    return Ok();
 }

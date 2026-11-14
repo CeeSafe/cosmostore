@@ -23,8 +23,10 @@ hookport=$((port + 1))
 start_hook() { python3 -I "$here/webhook.py" "$hookport" "$work/hook.out" & hook=$!; }
 start_hook
 printf 'hook http://127.0.0.1:%s/events\n# a comment\n' "$hookport" > "$work/targets"
+# The master keys of SSE-S3 (ADR-0046 §4): the first seals, the second only opens.
+printf '# master keys\nk2 %s\nk1 %s\n' "$(head -c 32 /dev/urandom | base64)" "$(head -c 32 /dev/urandom | base64)" > "$work/sse.keys"
 start_server() {
-    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" 2>> "$work/server.log" &
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" 2>> "$work/server.log" &
     server=$!
     sleep 1
 }
@@ -540,8 +542,30 @@ for kind in Versions DeleteMarkers; do
 done
 aws s3api delete-bucket --bucket lock > /dev/null 2>&1 && pass "delete-bucket once nothing is locked" || fail "delete-bucket once nothing is locked"
 
-# Encryption waits for a cipher (ADR-0046 §7): a request that asks for it is refused, not stored in the clear.
-check "SSE-S3 asked for" "$(code s3api put-object --bucket smoke --key sse.txt --body pub.txt --server-side-encryption AES256)" NotImplemented
+# SSE-S3 on PutObject, GetObject and HeadObject (ADR-0046): sealed in 64 KiB chunks, opened whole, ranges too.
+printf 'a sealed line of cosmostore\n' > sse.txt
+check "SSE-S3 put" "$(aws s3api put-object --bucket smoke --key sse/small.txt --body sse.txt --server-side-encryption AES256 --query '[ServerSideEncryption,ETag]' --output text | tr '\t' ' ')" "AES256 \"$(md5 -q sse.txt 2>/dev/null || md5sum sse.txt | cut -d' ' -f1)\""
+check "SSE-S3 head" "$(aws s3api head-object --bucket smoke --key sse/small.txt --query '[ServerSideEncryption,ContentLength]' --output text | tr '\t' ' ')" "AES256 $(wc -c < sse.txt | tr -d ' ')"
+aws s3api get-object --bucket smoke --key sse/small.txt got.txt > /dev/null 2>&1
+cmp -s got.txt sse.txt && pass "SSE-S3 get, inline" || fail "SSE-S3 get, inline"
+head -c 300001 /dev/urandom > sse.bin
+check "SSE-S3 put, in extents" "$(aws s3api put-object --bucket smoke --key sse/big.bin --body sse.bin --server-side-encryption AES256 --query ServerSideEncryption --output text)" AES256
+aws s3api get-object --bucket smoke --key sse/big.bin got.bin > /dev/null 2>&1
+cmp -s got.bin sse.bin && pass "SSE-S3 get, extents" || fail "SSE-S3 get, extents"
+aws s3api get-object --bucket smoke --key sse/big.bin --range bytes=65530-131080 got.bin > /dev/null 2>&1
+dd if=sse.bin of=want.bin bs=1 skip=65530 count=65551 2> /dev/null
+cmp -s got.bin want.bin && pass "SSE-S3 range across chunks" || fail "SSE-S3 range across chunks"
+aws s3api get-object --bucket smoke --key sse/big.bin --range bytes=-5 got.bin > /dev/null 2>&1
+tail -c 5 sse.bin > want.bin
+cmp -s got.bin want.bin && pass "SSE-S3 range at the end" || fail "SSE-S3 range at the end"
+: > empty.bin
+aws s3api put-object --bucket smoke --key sse/empty --body empty.bin --server-side-encryption AES256 > /dev/null 2>&1 || fail "SSE-S3 put, empty"
+check "SSE-S3 empty" "$(aws s3api head-object --bucket smoke --key sse/empty --query ContentLength --output text)" 0
+check "no plaintext on disk" "$(grep -rl 'a sealed line of cosmostore' "$work/store" | wc -l | tr -d ' ')" 0
+check "SSE-S3 copy source" "$(code s3api copy-object --bucket smoke --key sse/copy --copy-source smoke/sse/small.txt)" NotImplemented
+check "SSE-S3 multipart" "$(code s3api create-multipart-upload --bucket smoke --key sse/mp --server-side-encryption AES256)" NotImplemented
+check "SSE-KMS" "$(code s3api put-object --bucket smoke --key sse/kms --body sse.txt --server-side-encryption aws:kms)" NotImplemented
+# SSE-C waits (ADR-0046 §7): a request that asks for it is refused, not stored in the clear.
 check "SSE-C asked for" "$(code s3api put-object --bucket smoke --key sse.txt --body pub.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901)" NotImplemented
 check "a read with a key" "$(code s3api get-object --bucket smoke --key sse.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901 got.txt)" NotImplemented
 check "nothing stored" "$(aws s3api list-objects-v2 --bucket smoke --prefix sse.txt --query 'Contents[].Key' --output text)" None

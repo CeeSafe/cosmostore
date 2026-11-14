@@ -41,7 +41,7 @@ boilerplate; **P2** ergonomics.
 | G30 | P2 | runtime/async | Waking a task always writes a byte to the executor's wake pipe, even from the executor's own thread: every `AsyncMutex` unlock with a waiter is a `write` system call |
 | G31 | P2 | lib/std/checksums | `Crc32c` is software only (slicing-by-8, 1.5 GB/s on an M1): no way to use the CPU's CRC32C instructions (ARMv8 `crc32c`, x86 SSE4.2), 4.7 times faster in one chain. **Fixed in CeeSafe 0.30.0** (ADR 0089: the instruction where the CPU has it, asked at run time; `Crc32c.of` 1,652 to 8,147 MB/s on the M1). CosmoStore builds with 0.30.0 since 11 Nov 2026 |
 | G32 | P2 | std/process | No way to read or raise the open-file limit (`getrlimit`/`setrlimit` `RLIMIT_NOFILE`): a server cannot lift its soft limit (256 on macOS) to the hard one at start, as servers usually do **Fixed in CeeSafe 0.41.0** (ADR 0104: `ProcessLimits.openFiles`, `raiseOpenFiles`, `IoError.TooManyOpenFiles`); `serve` raises its limit at start since 13 Nov 2026 |
-| G33 | P1 | lib/std/crypto | No authenticated cipher (AES-256-GCM): S3 server-side encryption (ADR-0046) has nothing to seal an object's bytes with, and CosmoStore calls no C. Wanted on the CPU's AES and carry-less multiply instructions, with a constant-time fallback. SSE stays NotImplemented until then |
+| G33 | P1 | lib/std/crypto | No authenticated cipher (AES-256-GCM): S3 server-side encryption (ADR-0046) has nothing to seal an object's bytes with, and CosmoStore calls no C. Wanted on the CPU's AES and carry-less multiply instructions, with a constant-time fallback **Fixed in CeeSafe 0.45.0** (ADR 0135: `Aes256Gcm`, `ConstantTime.equal`); SSE-S3 on PutObject, GetObject and HeadObject since 14 Nov 2026 |
 
 ## Status (2026-11-06)
 
@@ -482,6 +482,14 @@ CRC32C rate (GB/s) keeps encryption off the profile. Two smaller things it would
 
 **In the meantime.** SSE requests stay NotImplemented. ADR-0046 fixes the formats and builds what does not need the
 cipher (the key file, the request's fields, the stored envelope), so the cipher is one call away when it lands.
+
+**Fixed in CeeSafe 0.45.0** (2026-11-14, ADR 0135, accepted by the owner as recommended). lib/std's
+`Aes256Gcm.create(key)`, `seal(nonce, associated, data) -> [u8; 16]` and `open(nonce, associated, data, tag) -> bool`,
+as suggested, with the key wiped on drop, and `ConstantTime.equal`. It runs on AES-NI and PCLMULQDQ on x86-64 and on
+the AES and PMULL extensions on ARMv8 (about 3.1 GB/s on an M1, 2.6 GB/s on the Mac mini's i7-8700B, 1.4 GB/s on a
+Ryzen under gcc), chosen by a CPU probe at run time, and on a constant-time CeeSafe path elsewhere (about 16 MB/s).
+CosmoStore's `src/s3/sse.cee` seals and opens 64 KiB chunks with it; its tests check a sealed chunk and a wrapped
+data key against Python's `cryptography`.
 
 ## Not gaps (checked)
 

@@ -2113,3 +2113,30 @@ Browser form uploads with a SigV4 POST policy.
   on the crash model (ADR-0004), not on a test of a snapshot.
 - **M5's exit:** every item but 4 is built; the runbooks exist; a beta without encryption at rest. Item 4 waits
   for G33.
+
+### 14 Nov 2026: M5 item 4 begun, SSE-S3 on PutObject, GetObject and HeadObject (ADR-0046)
+
+- **G33 fixed** in ceesafec 0.45.0 (CeeSafe ADR 0135, `Aes256Gcm`), released from this session; `ceesafe.toml`,
+  CI and the docs now require 0.45.0.
+- **Chosen with the user** (yes, 14 Nov): a multipart part's nonce is to take the part's index (1 to N), not its
+  number; ADR-0046 §2 now lists what that leaves open (parts are sealed before their index is known, and a part
+  uploaded twice under one number must not reuse a nonce), to settle before multipart is sealed.
+- **Built:** `serve --sse-key-file` (read once, wiped, a bad file stops `serve`); PutObject with
+  `x-amz-server-side-encryption: AES256` seals the body in 64 KiB chunks under a random data key wrapped by the
+  first master key (on the event loop for an inline object, else on the worker thread with the write); GetObject
+  reads the whole chunks under a range and opens each before any byte of it is sent; HEAD and GET answer `AES256`
+  in place of the envelope. The store reads stored offsets (a sealed version is longer than its size), and `fsck`
+  checks a sealed version's length against its chunks instead of an MD5 it cannot compute without the key.
+- **Refused, not stored in the clear:** SSE-C, SSE-KMS, multipart and POST with encryption, and a copy whose source
+  is sealed (its ciphertext would otherwise be copied as the object): NotImplemented. SSE-S3 without a key file is
+  InvalidRequest.
+- **Tests (221 passed, 0 failed, no leaks):** `sseManagedKeysRotate` (a data key per object, rotation, an unknown id, a wrong key, an SSE-C
+  envelope) and `sseSealedVersionsAreReadAndVerifiedAsStored` (inline, extents and empty; a range opened from the
+  store; a sealed version of the wrong length is a mismatch), beside the three sealing tests.
+- **Clients:** `tools/s3_smoke.sh` 369 checks, all passed (13 new: put, head, get inline and from extents, a range
+  across chunks and at the end, an empty object, no plaintext in the store's files, and the refusals); its `fsck`
+  passes with the sealed objects in the store.
+- **Not done:** multipart, copies, POST, bucket default encryption (Put-/Get-/DeleteBucketEncryption) and SSE-C;
+  a chunk that fails to open in the middle of a GET ends the response short (the status was sent), as a corrupt
+  extent does, and is not tested end to end.
+- **The toolchain:** `~/dev/CeeSafe-wt-0135/out/ceesafec`, the 0.45.0 build of the release branch.
