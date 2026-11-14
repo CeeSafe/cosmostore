@@ -2032,3 +2032,17 @@ Browser form uploads with a SigV4 POST policy.
   count), the rclone, Go, JavaScript, Java and .NET scripts and `tools/tls_smoke.sh`.
 - **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
 - **Next:** the rest of item 7 (rate limits, an admin API and CLI); item 4's rest when G33 is fixed.
+
+### 14 Nov 2026: the p99 gate again, after the audit log and quotas (ADR-0030), on the Intel Mac mini
+
+- Base `94fe87e` (before bucket policies), head `c40a7e6` (bucket quotas): M5 items 3 to 7 as far as they are
+  built. Chosen with the user (yes, 14 Nov). The default matrix, 3 rounds, both builds made there with ceesafec
+  0.41.0, as in the run of earlier today.
+- **Passed, every group, in one run:** p99 1.00 to 1.01, ops/s 0.99 to 1.05, noise 1.00 to 1.19; the load between
+  1.0 and 2.6 in all its 163 samples, no burst.
+- **What it covers that the earlier run did not:** the audit log's hook in the handler (the log itself off), the
+  credentials read through their sets, the count of a bucket's bytes as versions are installed and removed, and
+  the quota lookup at admission.
+- **Not shown,** as before: the M1's ms and ops/s, requests with policies, ACLs, CORS rules, notification rules, a
+  quota or the audit log in use, and anonymous requests.
+- Results: `~/cosmo-ref/run-gate-m5d` on the mini.
