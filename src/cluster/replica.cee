@@ -1,0 +1,185 @@
+// A cluster shard's replica (ADR-0058, M6 item 2 slice c): the store over a Raft log, the Raft core, and the hard
+// state file. It is the core's host: it persists entries in the journal, saves the term and vote, attaches entries
+// to appends from the journal, and applies committed entries to the store. A leader takes one write at a time:
+// `beginWrite`, then the store's own calls (which stage and persist entries of its term without applying them), then
+// `finishWrite`, which proposes them; the write is acknowledged once the leader has applied it (`isApplied`). The
+// next write waits for that, so its checks see every earlier one (ADR-0058 §8; pipelining is later work).
+
+struct ReplicaConfig {
+    id: u32;
+    voters: Vector<u32>;
+    electionTicks: u32;
+    heartbeatTicks: u32;
+    maxAppendEntries: usize;
+    seed: u64;
+    store: StoreConfig;
+}
+
+struct ShardReplica {
+    id: u32;
+    core: RaftCore;
+    store: ObjectStore;
+    private hard: HardStateFile;
+    /// Reads a quorum has confirmed: serve each once the store has applied its index.
+    reads: Vector<RaftReadState>;
+
+    /// Opens the replica in `dir`: the store (its journal a Raft log), the hard state, and a core holding the terms
+    /// of the entries recovery found unapplied.
+    fn open(dir: StringView, config: ReplicaConfig) -> Result<ShardReplica, StoreError> {
+        var storeConfig = config.store;
+        storeConfig.journal.raftLog = true;
+        var store = ObjectStore.open(dir, storeConfig)?;
+        let hard = sio(HardStateFile.open(dir))?;
+        let terms = store.takeRecoveredTerms();
+        let applied = store.appliedIndex();
+        if (applied != 0) {
+            // A checkpoint: its term comes with slice d (snapshots).
+            return Err(StoreError.NotReplicated);
+        }
+        let core = RaftCore.restore(
+            RaftConfig {
+                id: config.id,
+                voters: config.voters,
+                electionTicks: config.electionTicks,
+                heartbeatTicks: config.heartbeatTicks,
+                maxAppendEntries: config.maxAppendEntries,
+                seed: config.seed,
+            },
+            RaftHardState { term: hard.term, vote: hard.vote, commit: 0 },
+            0,
+            0,
+            terms,
+        )?;
+        return Ok(ShardReplica {
+            id: config.id,
+            core: core,
+            store: store,
+            hard: hard,
+            reads: Vector<RaftReadState>.create(),
+        });
+    }
+
+    fn isLeader(borrow this) -> bool => this.core.isLeader();
+
+    /// Before a write: the index of the last entry, or NotLeader when this replica does not lead or an earlier write
+    /// is not applied yet.
+    fn beginWrite(borrow this) -> Result<u64, StoreError> {
+        if (!this.core.isLeader()) { return Err(StoreError.NotLeader); }
+        let last = this.store.lastEntry();
+        if (last != this.core.lastIndex() || this.store.appliedIndex() != last) { return Err(StoreError.NotLeader); }
+        return Ok(last);
+    }
+
+    /// After a write: proposes the entries it staged and persisted; the last one's index, which the write is
+    /// acknowledged at. Null when it staged nothing.
+    fn finishWrite(borrow mut this, before: u64) -> Result<u64?, StoreError> {
+        // Some of the store's calls stage without committing (group commit's deferred writes): persist them first.
+        this.store.persistEntries()?;
+        let last = this.store.lastEntry();
+        var index = before + 1;
+        while (index <= last) {
+            // The entry is in the journal already: the core keeps its term, the host its data.
+            match (this.core.propose(Vector<u8>.create())?) {
+                Some(i) => {
+                    if (i != index) { panic("replica: the core and the journal disagree on an index"); }
+                }
+                null => { return Err(StoreError.NotLeader); }
+            }
+            index += 1;
+        }
+        if (last == before) { return Ok(null); }
+        return Ok(Some(last));
+    }
+
+    /// Whether the entry at `index` is applied here: on the leader, that a write is acknowledged.
+    fn isApplied(borrow this, index: u64) -> bool => this.store.appliedIndex() >= index;
+
+    /// A message from another replica of the shard.
+    fn step(borrow mut this, m: RaftMessage) -> Result<void, StoreError> {
+        this.core.step(m)?;
+        return Ok();
+    }
+
+    fn tick(borrow mut this) -> Result<void, StoreError> {
+        this.core.tick()?;
+        return Ok();
+    }
+
+    /// Does what the core asks (raft.cee's contract), and puts the messages to send in `out`.
+    fn drain(borrow mut this, out: borrow mut Vector<RaftMessage>) -> Result<void, StoreError> {
+        while (this.core.hasReady()) {
+            var ready = this.core.ready()?;
+            if (ready.snapshot.isSome()) { return Err(StoreError.NotReplicated); } // slice d
+            // 1. Entries: the leader's own are in the journal already; a follower's are the leader's records. One
+            // whose index the journal has with another term starts a suffix to cut off.
+            if (ready.entries.length > 0) {
+                var entries = replace(mut ready.entries, Vector<RaftEntry>.create());
+                reverseEntries(mut entries);
+                var staged = false;
+                while (true) {
+                    let e = match (entries.pop()) {
+                        Some(e) => e,
+                        null => { break; }
+                    };
+                    if (e.index <= this.store.lastEntry()) {
+                        if (this.store.entryTerm(e.index)? == e.term) { continue; }
+                        this.store.truncateEntries(e.index - 1)?;
+                    }
+                    if (e.data.length == 0) {
+                        this.store.appendNoop(e.term)?;
+                    } else {
+                        this.store.appendEntry(e.data.view())?;
+                    }
+                    staged = true;
+                }
+                if (staged) { this.store.persistEntries()?; }
+            }
+            // 2. The term and vote, synced before anything that depends on them is sent.
+            match (replace(mut ready.hardState, null)) {
+                Some(h) => {
+                    if (h.term != this.hard.term || h.vote != this.hard.vote) { sio(this.hard.save(h.term, h.vote))?; }
+                }
+                null => {}
+            }
+            // 3. Messages, appends with their entries read from the journal.
+            var messages = replace(mut ready.messages, Vector<RaftMessage>.create());
+            reverseMessages(mut messages);
+            while (true) {
+                var m = match (messages.pop()) {
+                    Some(m) => m,
+                    null => { break; }
+                };
+                if (m.kind == RAFT_APPEND) {
+                    var i = m.index + 1;
+                    while (i <= m.index + m.count) {
+                        let data = this.store.entryBytes(i)?;
+                        let term = this.store.entryTerm(i)?;
+                        m.entries.push(RaftEntry { term: term, index: i, data: data })?;
+                        i += 1;
+                    }
+                    m.count = 0;
+                }
+                out.push(m)?;
+            }
+            // 4. Committed entries, applied from the journal.
+            if (ready.applyFrom <= ready.applyTo) { this.store.applyEntries(ready.applyFrom, ready.applyTo)?; }
+            for (k in 0..ready.reads.length) {
+                this.reads.push(RaftReadState { id: ready.reads[k].id, index: ready.reads[k].index })?;
+            }
+            this.core.advance();
+            this.store.setLeaderTerm(if (this.core.isLeader()) this.core.term else 0);
+        }
+        return Ok();
+    }
+}
+
+fn reverseMessages(v: borrow mut Vector<RaftMessage>) {
+    if (v.length < 2) { return; }
+    var i = 0usize;
+    var j = v.length - 1;
+    while (i < j) {
+        v.swap(i, j);
+        i += 1;
+        j -= 1;
+    }
+}

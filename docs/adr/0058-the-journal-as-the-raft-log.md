@@ -80,8 +80,8 @@
 |---|---|---|
 | a | the core keeps terms only (§7); the simulation's host keeps the log | ADR-0057's simulation and mutants pass unchanged in what they check |
 | b | the journal: the Raft-log flag, `truncateAfter`, rotation at a committed entry, checkpoints without sealing, the hard state file (§1, §3–§6) | the journal's fault sweeps pass with truncation and the new start |
-| c | the replicated store: a shard replica over the store and the core; leader-only staging and upkeep; replicated `Relocate` (§2, §8) | three replicas in one process, over an in-memory network, agree after the crash model's sweeps |
-| d | snapshots (§9) | a replica that fell behind a compaction catches up from a snapshot under the sweeps |
+| c | the replicated store: a shard replica over the store and the core; the leader takes one write at a time, stages and persists its entries, proposes them, and every replica applies committed entries from its journal (§1, §6–§8) | three replicas in one process, over an in-memory network, agree after the crash model's sweeps |
+| d | checkpoints in a Raft log (§3, with the checkpoint's term), the leader's compaction as replicated `Relocate` records (§2), and snapshots (§9), which need each other: a follower behind a compacted log needs a snapshot | a replica that fell behind a compaction catches up from a snapshot under the sweeps |
 
 ## Consequences
 

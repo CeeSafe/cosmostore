@@ -59,6 +59,10 @@ enum StoreError {
     /// A journal record whose meta does not decode: (segment, offset).
     BadMeta(u64, u64),
     @from OutOfMemory(AllocError),
+    /// A cluster shard's replica that does not lead is asked to write (ADR-0058).
+    NotLeader,
+    /// What a cluster shard cannot replicate yet: extents (ADR-0058 §10, until M6 item 5).
+    NotReplicated,
     InvalidBucketName,
     InvalidKey,
     NoSuchBucket,
@@ -1199,6 +1203,21 @@ const LIFECYCLE_BATCH: usize = 1000;
 /// Abandoned extents queued between reaps; more are left to the orphan sweep at open.
 const ABANDONED_CAPACITY: usize = 4096;
 
+/// `ObjectStore.stageRecord` on the journal alone, so the meta may be another of the store's fields.
+fn stageIn(
+    journal: borrow mut Journal,
+    raft: bool,
+    term: u64,
+    kind: RecordType,
+    meta: Slice<u8>,
+    payload: Slice<u8>,
+) -> Result<RecordPosition, StoreError> {
+    if (!raft) { return Ok(journal.stage(kind, meta, payload)?); }
+    if (carriesManifest(kind)) { return Err(StoreError.NotReplicated); }
+    if (term == 0) { return Err(StoreError.NotLeader); }
+    return Ok(journal.stageEntry(kind, term, meta, payload)?);
+}
+
 /// Applies a durable batch's records to the state, in order.
 fn applyBatch(
     state: borrow mut StoreState,
@@ -1301,6 +1320,12 @@ struct ObjectStore {
     private volumeTotal: u64;
     private volumeAvailable: u64;
     private usedAtMeasure: u64;
+    /// A cluster shard's replica (ADR-0058): records are Raft entries, staged in `term` when this replica leads,
+    /// persisted when committed to the journal, and applied only when Raft commits them (`applyEntries`).
+    private raft: bool;
+    private term: u64;
+    /// The terms of the entries recovery found after the checkpoint, unapplied, for the replica's Raft core.
+    private recoveredTerms: Vector<u64>;
 
     /// Opens the store in `dir`: loads the newest checkpoint, if any, then replays the journal
     /// records after it.
@@ -1340,8 +1365,18 @@ struct ObjectStore {
         state.outbox.deliveredTo(delivered);
         state.outbox.delivered = 0;
         var failure: StoreError? = null;
+        let raft = config.journal.raftLog;
+        var recoveredTerms = Vector<u64>.create();
         let journal = Journal.openFrom(dir, config.journal, start, (segment, offset, header, bytes) => {
             if (failure.isSome()) { return; }
+            if (raft) {
+                // A Raft log's entries after the checkpoint may yet be cut off: applied when Raft commits them.
+                match (recoveredTerms.push(header.term)) {
+                    Ok() => {}
+                    Err(e) => { failure = StoreError.OutOfMemory(e); }
+                }
+                return;
+            }
             let metaEnd = RECORD_HEADER_LEN + header.metaLen as usize;
             let payloadEnd = metaEnd + header.payloadLen as usize;
             let manifest = if (carriesManifest(header.kind)) bytes[metaEnd..payloadEnd] else bytes[0..0];
@@ -1364,6 +1399,8 @@ struct ObjectStore {
             Some(e) => { return Err(e); }
             null => {}
         }
+        let skipped = journal.skippedSegments();
+        for (i in 0..skipped.length) { state.addSegmentBytes(skipped[i].id, skipped[i].size, 0)?; }
         let unscanned = journal.unscannedSegments();
         for (i in 0..unscanned.length) {
             // Records only, as the live store counts a segment: its header is not part of it.
@@ -1392,7 +1429,7 @@ struct ObjectStore {
         extentDir.append(dir)?;
         extentDir.append("/extents")?;
         sio(Fs.ensureDirectory(extentDir.view()))?;
-        let publishedNext = journal.upcomingLsn();
+        let publishedNext = if (raft) start.lsn + 1 else journal.upcomingLsn();
         var store = ObjectStore {
             journal: journal,
             state: state,
@@ -1416,6 +1453,9 @@ struct ObjectStore {
             volumeTotal: 0,
             volumeAvailable: 0,
             usedAtMeasure: 0,
+            raft: raft,
+            term: 0,
+            recoveredTerms: recoveredTerms,
             counts: StoreCounters {
                 payloadBytes: 0,
                 journalBytesWritten: 0,
@@ -1706,8 +1746,9 @@ struct ObjectStore {
     /// Stages one record, commits it durably, and applies it. Any staged batch commits with it.
     fn commitOne(borrow mut this, kind: RecordType, payload: Slice<u8>) -> Result<u64, StoreError> {
         this.commitStaged()?;
-        let pos = this.journal.stage(kind, this.scratch.view(), payload)?;
+        let pos = stageIn(mut this.journal, this.raft, this.term, kind, this.scratch.view(), payload)?;
         this.journal.commit()?;
+        if (this.raft) { return Ok(pos.lsn); } // applied when Raft commits it
         let total = truncate<u32>(recordLength(this.scratch.length, payload.length));
         this.sinceCheckpoint += total as u64;
         this.counts.journalBytesWritten += total as u64;
@@ -1725,6 +1766,108 @@ struct ObjectStore {
         this.publishedNext = pos.lsn + 1;
         this.reapExtents();
         return Ok(pos.lsn);
+    }
+
+    /// Stages a record: a single node's, or in a cluster shard an entry of this replica's term as leader (ADR-0058).
+    /// A cluster shard writes no extents until they replicate (ADR-0058 §10, M6 item 5).
+    fn stageRecord(
+        borrow mut this,
+        kind: RecordType,
+        meta: Slice<u8>,
+        payload: Slice<u8>,
+    ) -> Result<RecordPosition, StoreError> =>
+        stageIn(mut this.journal, this.raft, this.term, kind, meta, payload);
+
+    // --- A cluster shard's replica (ADR-0058, M6 item 2 slice c) ---
+
+    /// Whether this store is a cluster shard's replica.
+    fn isReplica(borrow this) -> bool => this.raft;
+
+    /// The term this replica stages entries in while it leads; 0 while it does not (writes are then NotLeader).
+    fn setLeaderTerm(borrow mut this, term: u64) { this.term = term; }
+
+    /// The terms of the unapplied entries recovery found, once: for the replica's Raft core.
+    fn takeRecoveredTerms(borrow mut this) -> Vector<u64> => replace(mut this.recoveredTerms, Vector<u64>.create());
+
+    /// The index the store's state is at: every entry up to it is applied.
+    fn appliedIndex(borrow this) -> u64 => this.publishedNext - 1;
+
+    /// The last entry in the journal, and its term.
+    fn lastEntry(borrow this) -> u64 => this.journal.lastLsn();
+
+    fn lastEntryTerm(borrow this) -> u64 => this.journal.lastEntryTerm();
+
+    /// The term of written entry `lsn`.
+    fn entryTerm(borrow this, lsn: u64) -> Result<u64, StoreError> => Ok(this.journal.entryAt(lsn)?.header.term);
+
+    /// Written entry `lsn`, its whole record: what a leader sends.
+    fn entryBytes(borrow this, lsn: u64) -> Result<Vector<u8>, StoreError> => Ok(this.journal.entryBytes(lsn)?);
+
+    /// A follower stages an entry as its leader encoded it; `persistEntries` makes it durable.
+    fn appendEntry(borrow mut this, record: Slice<u8>) -> Result<void, StoreError> {
+        this.checkWritable()?;
+        let _ = this.journal.appendEncoded(record)?;
+        return Ok();
+    }
+
+    /// A new leader's first entry, which changes nothing, staged; `persistEntries` makes it durable.
+    fn appendNoop(borrow mut this, term: u64) -> Result<void, StoreError> {
+        this.checkWritable()?;
+        let empty = Vector<u8>.create();
+        let _ = this.journal.stageEntry(RecordType.Noop, term, empty.view(), empty.view())?;
+        return Ok();
+    }
+
+    /// Makes the staged entries durable, without applying them.
+    fn persistEntries(borrow mut this) -> Result<void, StoreError> {
+        this.checkWritable()?;
+        // The journal's own commit: entries staged by the replica (a follower's, a new leader's first) are not in
+        // the store's pending applies, which a Raft log does not use.
+        this.pendingApplies.clear();
+        this.inflightApplies.clear();
+        this.journal.commit()?;
+        return Ok();
+    }
+
+    /// Cuts the entries after `lsn` off, durably: a suffix the leader does not have.
+    fn truncateEntries(borrow mut this, lsn: u64) -> Result<void, StoreError> {
+        this.checkWritable()?;
+        return Ok(this.journal.truncateAfter(lsn)?);
+    }
+
+    /// Applies the committed entries `from` to `to`, in order, from the journal: the same records on every replica,
+    /// so the same state.
+    fn applyEntries(borrow mut this, from: u64, to: u64) -> Result<void, StoreError> {
+        var lsn = from;
+        while (lsn <= to) {
+            if (lsn != this.publishedNext) {
+                return Err(StoreError.Journal(JournalError.OutOfOrder(this.publishedNext)));
+            }
+            let at = this.journal.entryAt(lsn)?;
+            let record = this.journal.readRecord(at.segment, at.offset, at.header.totalLen)?;
+            let h = borrow at.header;
+            let metaEnd = RECORD_HEADER_LEN + h.metaLen as usize;
+            let payloadEnd = metaEnd + h.payloadLen as usize;
+            let manifest = if (carriesManifest(h.kind)) record[metaEnd..payloadEnd] else record[0..0];
+            this.sinceCheckpoint += h.totalLen as u64;
+            this.counts.journalBytesWritten += h.totalLen as u64;
+            applyRecord(
+                mut this.state,
+                h.kind,
+                lsn,
+                at.segment,
+                at.offset,
+                h.totalLen,
+                record[RECORD_HEADER_LEN..metaEnd],
+                h.payloadLen,
+                manifest,
+            )?;
+            this.publishedNext = lsn + 1;
+            lsn += 1;
+        }
+        this.journal.markCommitted(to);
+        this.reapExtents();
+        return Ok();
     }
 
     /// Every mutation starts here. After a journal failure the in-memory state may lag what is
@@ -2375,7 +2518,7 @@ struct ObjectStore {
             ObjectBody.Inline(data) => data.view(),
             ObjectBody.Extents(_) => rec.manifest.view(),
         };
-        let pos = this.journal.stage(rec.kind, rec.meta.view(), payload)?;
+        let pos = this.stageRecord(rec.kind, rec.meta.view(), payload)?;
         let total = truncate<u32>(recordLength(rec.meta.length, payload.length));
         let payloadLen = truncate<u32>(payload.length);
         match (borrow obj.body) {
@@ -2410,6 +2553,12 @@ struct ObjectStore {
             }
         }
         let n = this.inflightApplies.length + this.pendingApplies.length;
+        if (this.raft) {
+            // Persisted; applied when Raft commits them, from the journal.
+            this.inflightApplies.clear();
+            this.pendingApplies.clear();
+            return Ok(n);
+        }
         applyBatch(mut this.state, borrow this.inflightApplies, mut this.sinceCheckpoint, mut this.counts)?;
         applyBatch(mut this.state, borrow this.pendingApplies, mut this.sinceCheckpoint, mut this.counts)?;
         this.inflightApplies.clear();
@@ -2448,6 +2597,10 @@ struct ObjectStore {
                 this.inflightApplies.clear();
                 return Err(StoreError.Journal(e));
             }
+        }
+        if (this.raft) {
+            this.inflightApplies.clear();
+            return Ok();
         }
         applyBatch(mut this.state, borrow this.inflightApplies, mut this.sinceCheckpoint, mut this.counts)?;
         this.inflightApplies.clear();
@@ -2973,7 +3126,7 @@ struct ObjectStore {
         let empty = [0u8; 1];
         if (this.journal.wouldOverflow(meta.length, 0) || this.journal.needsRotation()) { this.commitStaged()?; }
         this.pendingApplies.reserve(1)?;
-        let pos = this.journal.stage(kind, meta.view(), empty[0..0])?;
+        let pos = this.stageRecord(kind, meta.view(), empty[0..0])?;
         this.pendingApplies.push(PendingApply {
             kind: kind,
             lsn: pos.lsn,
@@ -3955,7 +4108,7 @@ struct ObjectStore {
             this.commitStaged()?;
         }
         this.pendingApplies.reserve(1)?;
-        let pos = this.journal.stage(RecordType.Relocate, meta.view(), payload)?;
+        let pos = this.stageRecord(RecordType.Relocate, meta.view(), payload)?;
         this.pendingApplies.push(PendingApply {
             kind: RecordType.Relocate,
             lsn: pos.lsn,

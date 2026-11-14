@@ -2307,3 +2307,27 @@ Browser form uploads with a SigV4 POST policy.
 - **Known limit:** the crash model treats a truncation as durable at once, so it cannot catch a missing sync after
   one; the code syncs, and recovery refuses a term that goes down along the log.
 - **Next:** slice c, the replicated store: three replicas in one process over an in-memory network, under the sweeps.
+
+### 14 Nov 2026: M6 item 2, slice c: the replicated store (ADR-0058)
+
+- **Asked by the owner** (14 Nov, "Go ahead continue to slice c").
+- **The store's Raft mode** (`StoreConfig.journal.raftLog`): records are staged as entries of the leader's term
+  (`stageIn`; NotLeader without one; NotReplicated for what writes extents, until item 5), persisted by the store's
+  own commits and not applied; `applyEntries(from, to)` applies committed entries from the journal, the same records
+  on every replica; recovery keeps the unapplied entries' terms for the core. `persistEntries`, `appendEntry`,
+  `appendNoop`, `truncateEntries`, `entryBytes` and `entryTerm` serve the replica. A `Noop` record (type 15) is a new
+  leader's first entry. Single-node stores do not change.
+- **The replica** (`src/cluster/replica.cee`): the core's host over the store and the hard state. It persists
+  entries (skipping the leader's own, already in the journal; cutting a conflicting suffix), saves term and vote before
+  sending, attaches entries to appends from the journal, applies committed ranges. A leader takes one write at a time
+  (`beginWrite`, the store's own calls, `finishWrite`); it is acknowledged once applied, so the next write's checks
+  see it. Pipelining is later work.
+- **Tests** (`src/cluster/replica_tests.cee`): three replicas in one process over an in-memory network; a bucket and
+  twelve puts and deletes, each acknowledged when the leader applied it; then reopened from disk, they must elect,
+  apply the same index, agree on every key, hold every acknowledged write (a write in flight may land or not) and take
+  another. Fault sweeps over every I/O operation of the three, once, sticky, torn, and with a power cut of all three
+  (the crash model): all pass, in 100 s. Without the hard state saves, all four sweeps fail.
+- **Found on the way:** a new leader's `Noop` is staged by the replica, not by a store write, so `persistEntries` must
+  commit the journal itself rather than the store's pending batch, which skipped it.
+- **Not yet:** checkpoints, the leader's compaction and snapshots (slice d; ADR-0058's slice table now says so), a
+  checkpointed replica refuses to open until then; extents (item 5); the peer network (item 3).
