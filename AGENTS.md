@@ -77,8 +77,8 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
 - All file and directory I/O goes through `DurableFile`/`Fs` (`src/storage/io/durable.cee`), so the fault
   injector and crash model of ADR-0004 cover it. A durability change needs a fault sweep.
 - **Toolchain: ceesafec 0.45.0 or later**, which `ceesafe.toml` requires (`ceesafec = ">=0.45.0"`, CeeSafe ADR 0076):
-  an older compiler stops at that line. CeeSafe.Web's pinned commit (CI's `CEESAFE_WEB_REF`) needs 0.27 (its route
-  handlers are `Send + Share`, CeeSafe ADR 0084); 0.30.0 adds `Crc32c` on the CPU's instruction (ADR 0089, G31);
+  an older compiler stops at that line. CeeSafe.Web's pinned commit (CI's `CEESAFE_WEB_REF`, `9592f2d`) needs 0.44
+  (`AsyncError.Closed`, CeeSafe ADR 0128; 0.27 made its route handlers `Send + Share`, ADR 0084); 0.30.0 adds `Crc32c` on the CPU's instruction (ADR 0089, G31);
   0.36.0 runs `Async.blocking` on a pool of reused threads (ADR 0094, G28); 0.38.0 resizes into zeroed memory, removes
   more bounds checks and inlines the allocator's fast path (ADRs 0099 to 0101); 0.41.0 lets `serve` raise its open-file
   limit (`ProcessLimits`, `IoError.TooManyOpenFiles`; ADR 0104, G32); 0.45.0 has `Aes256Gcm` for server-side
