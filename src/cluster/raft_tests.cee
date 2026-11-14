@@ -1,0 +1,801 @@
+// The Raft core under a seeded simulation (ADR-0057 §4): replicas that crash and lose what they had not persisted,
+// a network that drops, duplicates, delays, reorders and partitions, clients that propose and read. A checker
+// watches every step for Raft's safety properties; a run ends healed, and then must make progress.
+
+/// One replica's disk: what survives its crash.
+struct SimDisk {
+    term: u64;
+    vote: u32;
+    commit: u64;
+    snapIndex: u64;
+    snapTerm: u64;
+    /// The state machine at the snapshot.
+    snapState: Vector<u64>;
+    log: Vector<RaftEntry>;
+}
+
+struct SimNode {
+    id: u32;
+    up: bool;
+    /// Ticks until a crashed replica comes back.
+    downFor: u32;
+    /// Ticks it is paused for (a stopped process, a stalled VM): it neither ticks nor takes messages, which wait.
+    pausedFor: u32;
+    core: RaftCore;
+    disk: SimDisk;
+    /// The state machine: the value of each entry applied, from index 1 on (0 for a leader's empty entry).
+    state: Vector<u64>;
+    /// The partition it is in; messages cross only within one.
+    side: u32;
+}
+
+struct SimFlight {
+    at: u64;
+    message: RaftMessage;
+}
+
+/// A read asked of a leader, and the least index that it must reflect: the highest index any replica had applied
+/// when it was asked (every applied entry is committed, so a linearizable read sees it).
+struct SimRead {
+    id: u64;
+    node: u32;
+    least: u64;
+}
+
+struct SimFaults {
+    /// Out of 1000, per message or per tick.
+    loss: u64;
+    duplicate: u64;
+    crash: u64;
+    partition: u64;
+    /// The most ticks a message waits; out of 1000, the messages that wait up to `lateDelay` instead (so a stale
+    /// message arrives after newer ones have been answered).
+    delay: u64;
+    late: u64;
+    lateDelay: u64;
+    /// Out of 1000 per tick: a replica pauses.
+    pause: u64;
+}
+
+struct Sim {
+    rng: SplitMix;
+    now: u64;
+    nodes: Vector<SimNode>;
+    flights: Vector<SimFlight>;
+    faults: SimFaults;
+    /// The value applied at each index by any replica: every other replica must apply the same (state machine
+    /// safety); a value applied once is never lost (durability of what is committed).
+    chosen: Vector<u64>;
+    /// The term of each leader seen: one leader a term.
+    leaderTerms: Vector<u64>;
+    leaderIds: Vector<u32>;
+    nextValue: u64;
+    nextRead: u64;
+    reads: Vector<SimRead>;
+    readsServed: u64;
+    snapshotsSent: u64;
+    snapshotsInstalled: u64;
+    crashes: u64;
+}
+
+fn simConfig(id: u32, count: u32, seed: u64) -> RaftConfig {
+    var voters = Vector<u32>.create();
+    var v = 1u32;
+    while (v <= count) {
+        voters.push(v)!;
+        v = v + 1;
+    }
+    return RaftConfig {
+        id: id,
+        voters: voters,
+        electionTicks: 10,
+        heartbeatTicks: 2,
+        maxAppendEntries: 3,
+        seed: seed,
+    };
+}
+
+fn simEmptyDisk() -> SimDisk {
+    return SimDisk {
+        term: 0,
+        vote: 0,
+        commit: 0,
+        snapIndex: 0,
+        snapTerm: 0,
+        snapState: Vector<u64>.create(),
+        log: Vector<RaftEntry>.create(),
+    };
+}
+
+fn simValueOf(data: Slice<u8>) -> u64 {
+    if (data.length < 8) { return 0; }
+    return data.readLE<u64>(0);
+}
+
+fn simEncodeState(state: Slice<u64>) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    for (i in 0..state.length) { out.pushLE(state[i])!; }
+    return out;
+}
+
+fn simDecodeState(data: Slice<u8>) -> Vector<u64> {
+    var out = Vector<u64>.create();
+    var at = 0usize;
+    while (at + 8 <= data.length) {
+        out.push(data.readLE<u64>(at))!;
+        at = at + 8;
+    }
+    return out;
+}
+
+fn simCopyEntries(from: Slice<RaftEntry>) -> Vector<RaftEntry> {
+    var out = Vector<RaftEntry>.create();
+    for (i in 0..from.length) { out.push(from[i].copy()!)!; }
+    return out;
+}
+
+fn simCopyValues(from: Slice<u64>) -> Vector<u64> {
+    var out = Vector<u64>.create();
+    for (i in 0..from.length) { out.push(from[i])!; }
+    return out;
+}
+
+fn simCreate(count: u32, seed: u64, faults: SimFaults) -> Sim {
+    var nodes = Vector<SimNode>.create();
+    var id = 1u32;
+    while (id <= count) {
+        nodes.push(SimNode {
+            id: id,
+            up: true,
+            downFor: 0,
+            pausedFor: 0,
+            core: RaftCore.create(simConfig(id, count, seed))!,
+            disk: simEmptyDisk(),
+            state: Vector<u64>.create(),
+            side: 0,
+        })!;
+        id = id + 1;
+    }
+    return Sim {
+        rng: SplitMix { state: seed.wrappingMul(7919).wrappingAdd(17) },
+        now: 0,
+        nodes: nodes,
+        flights: Vector<SimFlight>.create(),
+        faults: faults,
+        chosen: Vector<u64>.create(),
+        leaderTerms: Vector<u64>.create(),
+        leaderIds: Vector<u32>.create(),
+        nextValue: 1000,
+        nextRead: 1,
+        reads: Vector<SimRead>.create(),
+        readsServed: 0,
+        snapshotsSent: 0,
+        snapshotsInstalled: 0,
+        crashes: 0,
+    };
+}
+
+/// Every replica's applied value at `index` (1-based) must be the one first applied there.
+fn simCheckApplied(sim: borrow mut Sim, index: u64, value: u64) -> Result<void, TestFailure> {
+    let i = (index - 1) as usize;
+    if (i < sim.chosen.length) {
+        if (sim.chosen[i] != value) { return Check.fail("two replicas applied different entries at one index"); }
+        return Ok();
+    }
+    if (i != sim.chosen.length) { return Check.fail("an entry applied with a gap before it"); }
+    sim.chosen.push(value)!;
+    return Ok();
+}
+
+fn simHighest(sim: borrow Sim) -> u64 => sim.chosen.length as u64;
+
+/// Does all a replica's ready asks, as a host must (the contract in raft.cee), and checks what it applies.
+fn simDrain(sim: borrow mut Sim, at: usize) -> Result<void, TestFailure> {
+    while (sim.nodes[at].core.hasReady()) {
+        var ready = sim.nodes[at].core.ready()!;
+        // 1. The snapshot replaces the state machine and the log.
+        match (replace(mut ready.snapshot, null)) {
+            Some(s) => {
+                let state = simDecodeState(s.data.view());
+                if ((state.length as u64) != s.index) { return Check.fail("a snapshot's state is not its length"); }
+                for (k in 0..state.length) { simCheckApplied(sim, (k as u64) + 1, state[k])?; }
+                sim.nodes[at].disk.snapIndex = s.index;
+                sim.nodes[at].disk.snapTerm = s.term;
+                sim.nodes[at].disk.snapState = simCopyValues(state.view());
+                sim.nodes[at].disk.log.clear();
+                sim.nodes[at].state = state;
+                sim.snapshotsInstalled = sim.snapshotsInstalled + 1;
+            }
+            null => {}
+        }
+        // 2. Entries replace the persisted log from the first one's index on; then the hard state.
+        if (ready.entries.length > 0) {
+            let first = ready.entries[0].index;
+            let base = sim.nodes[at].disk.snapIndex;
+            if (first <= base) { return Check.fail("an entry to persist at or below the snapshot"); }
+            let keep = (first - base - 1) as usize;
+            if (keep > sim.nodes[at].disk.log.length) { return Check.fail("entries to persist leave a gap"); }
+            sim.nodes[at].disk.log.truncate(keep);
+            var entries = replace(mut ready.entries, Vector<RaftEntry>.create());
+            reverseEntries(mut entries);
+            while (true) {
+                match (entries.pop()) {
+                    Some(e) => { sim.nodes[at].disk.log.push(e)!; }
+                    null => { break; }
+                }
+            }
+        }
+        match (replace(mut ready.hardState, null)) {
+            Some(h) => {
+                if (h.term < sim.nodes[at].disk.term) { return Check.fail("a term went back"); }
+                if (h.term == sim.nodes[at].disk.term && sim.nodes[at].disk.vote != 0 &&
+                    h.vote != sim.nodes[at].disk.vote) {
+                    return Check.fail("a vote changed within a term");
+                }
+                sim.nodes[at].disk.term = h.term;
+                sim.nodes[at].disk.vote = h.vote;
+                sim.nodes[at].disk.commit = h.commit;
+            }
+            null => {}
+        }
+        // A crash here loses the messages, never what was persisted.
+        if (sim.rng.below(1000) < sim.faults.crash) {
+            simCrash(sim, at);
+            return Ok();
+        }
+        // 3. The messages go out; a snapshot carries the sender's snapshot state.
+        var messages = replace(mut ready.messages, Vector<RaftMessage>.create());
+        reverseMessages(mut messages);
+        while (true) {
+            var m = match (messages.pop()) {
+                Some(m) => m,
+                null => { break; }
+            };
+            if (m.kind == RAFT_SNAPSHOT) {
+                if (sim.nodes[at].disk.snapIndex != m.index) { return Check.fail("a snapshot that is not the disk's"); }
+                m.data = simEncodeState(sim.nodes[at].disk.snapState.view());
+                sim.snapshotsSent = sim.snapshotsSent + 1;
+            }
+            simSend(sim, m);
+        }
+        // 4. Committed entries are applied in order.
+        for (k in 0..ready.committed.length) {
+            let e = borrow ready.committed[k];
+            let expected = (sim.nodes[at].state.length as u64) + 1;
+            if (e.index != expected) { return Check.fail("an entry applied out of order"); }
+            let value = simValueOf(e.data.view());
+            simCheckApplied(sim, e.index, value)?;
+            sim.nodes[at].state.push(value)!;
+        }
+        // Reads: the index must cover every entry applied anywhere before the read was asked.
+        for (k in 0..ready.reads.length) {
+            let r = borrow ready.reads[k];
+            var found = false;
+            var n = 0usize;
+            while (n < sim.reads.length) {
+                if (sim.reads[n].id == r.id) {
+                    if (r.index < sim.reads[n].least) { return Check.fail("a stale read"); }
+                    let _ = sim.reads.swapRemove(n);
+                    found = true;
+                    break;
+                }
+                n = n + 1;
+            }
+            if (!found) { return Check.fail("a read released twice, or never asked"); }
+            sim.readsServed = sim.readsServed + 1;
+        }
+        sim.nodes[at].core.advance();
+        // Election safety: one leader a term.
+        if (sim.nodes[at].core.isLeader()) {
+            let term = sim.nodes[at].core.term;
+            let id = sim.nodes[at].id;
+            var seen = false;
+            for (k in 0..sim.leaderTerms.length) {
+                if (sim.leaderTerms[k] == term) {
+                    if (sim.leaderIds[k] != id) { return Check.fail("two leaders in one term"); }
+                    seen = true;
+                }
+            }
+            if (!seen) {
+                sim.leaderTerms.push(term)!;
+                sim.leaderIds.push(id)!;
+            }
+        }
+        // Now and then the host snapshots and compacts.
+        let applied = sim.nodes[at].state.length as u64;
+        if (applied >= sim.nodes[at].disk.snapIndex + 12) {
+            let index = applied - 4;
+            let term = sim.nodes[at].core.termAt(index) ?? 0;
+            sim.nodes[at].core.compact(index);
+            let base = sim.nodes[at].disk.snapIndex;
+            let dropped = (index - base) as usize;
+            var log = replace(mut sim.nodes[at].disk.log, Vector<RaftEntry>.create());
+            reverseEntries(mut log);
+            var kept = Vector<RaftEntry>.create();
+            var k = 0usize;
+            while (true) {
+                match (log.pop()) {
+                    Some(e) => {
+                        if (k >= dropped) { kept.push(e)!; }
+                        k = k + 1;
+                    }
+                    null => { break; }
+                }
+            }
+            sim.nodes[at].disk.log = kept;
+            sim.nodes[at].disk.snapIndex = index;
+            sim.nodes[at].disk.snapTerm = term;
+            sim.nodes[at].disk.snapState = simCopyValues(sim.nodes[at].state[0..(index as usize)]);
+        }
+    }
+    return Ok();
+}
+
+fn reverseMessages(v: borrow mut Vector<RaftMessage>) {
+    if (v.length < 2) { return; }
+    var i = 0usize;
+    var j = v.length - 1;
+    while (i < j) {
+        v.swap(i, j);
+        i = i + 1;
+        j = j - 1;
+    }
+}
+
+fn simDelay(sim: borrow mut Sim) -> u64 {
+    let most = if (sim.rng.below(1000) < sim.faults.late) sim.faults.lateDelay else sim.faults.delay;
+    return sim.now + 1 + sim.rng.below(most + 1);
+}
+
+fn simSend(sim: borrow mut Sim, m: RaftMessage) {
+    if (sim.rng.below(1000) < sim.faults.loss) { return; }
+    if (sim.rng.below(1000) < sim.faults.duplicate) {
+        let again = m.copy()!;
+        let at = simDelay(sim);
+        sim.flights.push(SimFlight { at: at, message: again })!;
+    }
+    let at = simDelay(sim);
+    sim.flights.push(SimFlight { at: at, message: m })!;
+}
+
+/// A crash: what was not persisted is gone, and the replica is down for a while.
+fn simCrash(sim: borrow mut Sim, at: usize) {
+    sim.nodes[at].up = false;
+    sim.nodes[at].downFor = 5 + truncate<u32>(sim.rng.below(30));
+    sim.crashes = sim.crashes + 1;
+}
+
+/// A replica back from a crash, from its disk alone.
+fn simRestart(sim: borrow mut Sim, at: usize, count: u32, seed: u64) {
+    let id = sim.nodes[at].id;
+    let hard = RaftHardState {
+        term: sim.nodes[at].disk.term,
+        vote: sim.nodes[at].disk.vote,
+        commit: sim.nodes[at].disk.commit,
+    };
+    let entries = simCopyEntries(sim.nodes[at].disk.log.view());
+    let core = RaftCore.restore(
+        simConfig(id, count, seed + sim.now),
+        hard,
+        sim.nodes[at].disk.snapIndex,
+        sim.nodes[at].disk.snapTerm,
+        entries,
+    )!;
+    sim.nodes[at].core = core;
+    sim.nodes[at].state = simCopyValues(sim.nodes[at].disk.snapState.view());
+    sim.nodes[at].up = true;
+}
+
+fn simIndexOf(sim: borrow Sim, id: u32) -> usize? {
+    for (i in 0..sim.nodes.length) {
+        if (sim.nodes[i].id == id) { return Some(i); }
+    }
+    return null;
+}
+
+/// One tick: crashes and restarts, partitions, deliveries, clients, and every replica's clock.
+fn simStep(sim: borrow mut Sim, count: u32, seed: u64, faulty: bool) -> Result<void, TestFailure> {
+    sim.now = sim.now + 1;
+    if (faulty && sim.rng.below(1000) < sim.faults.partition) {
+        // A new partition: everyone together again, one replica alone (the leader, when there is one, half the
+        // time), or each replica on one of two sides.
+        let kind = sim.rng.below(4);
+        var alone = sim.rng.below(sim.nodes.length as u64) as usize;
+        if (sim.rng.below(2) == 0) {
+            for (i in 0..sim.nodes.length) {
+                if (sim.nodes[i].up && sim.nodes[i].core.isLeader()) { alone = i; }
+            }
+        }
+        for (i in 0..sim.nodes.length) {
+            sim.nodes[i].side = if (kind == 0) 0 else if (kind == 1) truncate<u32>(
+                sim.rng.below(2),
+            ) else if (i == alone) 1 else 0;
+        }
+    }
+    if (faulty && sim.rng.below(1000) < sim.faults.pause) {
+        let p = sim.rng.below(sim.nodes.length as u64) as usize;
+        sim.nodes[p].pausedFor = 5 + truncate<u32>(sim.rng.below(40));
+    }
+    for (i in 0..sim.nodes.length) {
+        if (!sim.nodes[i].up) {
+            if (sim.nodes[i].downFor > 0) {
+                sim.nodes[i].downFor = sim.nodes[i].downFor - 1;
+            }
+            if (sim.nodes[i].downFor == 0 && (!faulty || sim.rng.below(4) == 0)) { simRestart(sim, i, count, seed); }
+        }
+    }
+    // Deliveries due now, in a random order.
+    var due = Vector<RaftMessage>.create();
+    var k = 0usize;
+    while (k < sim.flights.length) {
+        let held = match (simIndexOf(sim, sim.flights[k].message.to)) {
+            Some(t) => sim.nodes[t].pausedFor > 0,
+            null => false,
+        };
+        if (sim.flights[k].at <= sim.now && !held) {
+            let f = sim.flights.swapRemove(k);
+            due.push(f.message)!;
+        } else {
+            k = k + 1;
+        }
+    }
+    while (due.length > 0) {
+        let pick = sim.rng.below(due.length as u64) as usize;
+        let m = due.swapRemove(pick);
+        let to = match (simIndexOf(sim, m.to)) {
+            Some(i) => i,
+            null => { continue; }
+        };
+        let from = match (simIndexOf(sim, m.from)) {
+            Some(i) => i,
+            null => { continue; }
+        };
+        if (!sim.nodes[to].up || sim.nodes[to].side != sim.nodes[from].side) { continue; }
+        sim.nodes[to].core.step(m)!;
+        simDrain(sim, to)?;
+    }
+    // Clients: a proposal or a read at whichever replica believes it leads.
+    for (i in 0..sim.nodes.length) {
+        if (!sim.nodes[i].up || sim.nodes[i].pausedFor > 0 || !sim.nodes[i].core.isLeader()) { continue; }
+        if (sim.rng.below(3) == 0) {
+            var data = Vector<u8>.create();
+            data.pushLE(sim.nextValue)!;
+            sim.nextValue = sim.nextValue + 1;
+            let _ = sim.nodes[i].core.propose(data)!;
+            simDrain(sim, i)?;
+        }
+        if (!sim.nodes[i].up || !sim.nodes[i].core.isLeader()) { continue; }
+        if (sim.rng.below(5) == 0) {
+            let id = sim.nextRead;
+            let least = simHighest(sim);
+            if (sim.nodes[i].core.readIndex(id)!) {
+                sim.nextRead = sim.nextRead + 1;
+                sim.reads.push(SimRead { id: id, node: sim.nodes[i].id, least: least })!;
+                simDrain(sim, i)?;
+            }
+        }
+    }
+    for (i in 0..sim.nodes.length) {
+        if (!sim.nodes[i].up) { continue; }
+        if (sim.nodes[i].pausedFor > 0) {
+            sim.nodes[i].pausedFor = sim.nodes[i].pausedFor - 1;
+            continue;
+        }
+        if (faulty && sim.rng.below(1000) < sim.faults.crash) {
+            simCrash(sim, i);
+            continue;
+        }
+        sim.nodes[i].core.tick()!;
+        simDrain(sim, i)?;
+    }
+    return Ok();
+}
+
+/// A whole run: `ticks` of faults, then healed (everyone up, one side, nothing lost), and then it must elect a
+/// leader, commit a last value and bring every replica to the same state.
+fn simRun(count: u32, seed: u64, ticks: u64, faults: SimFaults) -> Result<Sim, TestFailure> {
+    var sim = simCreate(count, seed, faults);
+    while (sim.now < ticks) { simStep(mut sim, count, seed, true)?; }
+    sim.faults.loss = 0;
+    sim.faults.duplicate = 0;
+    sim.faults.crash = 0;
+    sim.faults.partition = 0;
+    sim.faults.pause = 0;
+    for (i in 0..sim.nodes.length) {
+        sim.nodes[i].side = 0;
+        sim.nodes[i].downFor = 0;
+        sim.nodes[i].pausedFor = 0;
+    }
+    let healedAt = sim.now;
+    var lastValue = 0u64;
+    var committedLast = false;
+    while (sim.now < healedAt + 400) {
+        simStep(mut sim, count, seed, false)?;
+        if (lastValue == 0) {
+            for (i in 0..sim.nodes.length) {
+                if (sim.nodes[i].up && sim.nodes[i].core.isLeader()) {
+                    lastValue = 1;
+                }
+            }
+        }
+        if (lastValue != 0 && !committedLast) {
+            // The clients go on proposing; once every replica applied the same states, the run is done.
+            var same = true;
+            let len = sim.nodes[0].state.length;
+            for (i in 0..sim.nodes.length) {
+                if (!sim.nodes[i].up || sim.nodes[i].state.length != len) { same = false; }
+            }
+            if (same && len > 0 && (len as u64) == simHighest(sim)) { committedLast = true; }
+        }
+    }
+    if (lastValue == 0) { return Err(TestFailure.create("no leader after the faults healed")); }
+    // Stop the clients and let it settle: every replica holds what was ever applied anywhere.
+    let settledAt = sim.now;
+    while (sim.now < settledAt + 100) {
+        sim.now = sim.now + 1;
+        var due = Vector<RaftMessage>.create();
+        var k = 0usize;
+        while (k < sim.flights.length) {
+            if (sim.flights[k].at <= sim.now) {
+                let f = sim.flights.swapRemove(k);
+                due.push(f.message)!;
+            } else {
+                k = k + 1;
+            }
+        }
+        while (due.length > 0) {
+            let m = due.swapRemove(0);
+            match (simIndexOf(sim, m.to)) {
+                Some(to) => {
+                    if (sim.nodes[to].up) {
+                        sim.nodes[to].core.step(m)!;
+                        simDrain(mut sim, to)?;
+                    }
+                }
+                null => {}
+            }
+        }
+        for (i in 0..sim.nodes.length) {
+            if (sim.nodes[i].up) {
+                sim.nodes[i].core.tick()!;
+                simDrain(mut sim, i)?;
+            }
+        }
+    }
+    let total = simHighest(sim);
+    if (total == 0) { return Err(TestFailure.create("nothing was ever committed")); }
+    for (i in 0..sim.nodes.length) {
+        if (!sim.nodes[i].up) { return Err(TestFailure.create("a replica still down after healing")); }
+        if ((sim.nodes[i].state.length as u64) != total) {
+            return Err(TestFailure.create("a replica behind after settling"));
+        }
+    }
+    return Ok(sim);
+}
+
+fn simQuiet() -> SimFaults =>
+    SimFaults { loss: 0, duplicate: 0, crash: 0, partition: 0, delay: 0, late: 0, lateDelay: 0, pause: 0 };
+
+fn simHarsh() -> SimFaults =>
+    SimFaults { loss: 100, duplicate: 50, crash: 4, partition: 30, delay: 4, late: 50, lateDelay: 30, pause: 10 };
+
+@test
+fn raftOneReplicaLeadsAlone() -> Result<void, TestFailure> {
+    var sim = simCreate(1, 1, simQuiet());
+    for (i in 0..30) { simStep(mut sim, 1, 1, false)?; }
+    Check.isTrue(sim.nodes[0].core.isLeader(), "a single replica elects itself")?;
+    Check.isTrue(simHighest(sim) > 3, "and commits on its own")?;
+    Check.isTrue(sim.readsServed > 0, "and serves reads")?;
+    return Ok();
+}
+
+@test
+fn raftThreeReplicasWithoutFaults() -> Result<void, TestFailure> {
+    let sim = simRun(3, 7, 300, simQuiet())?;
+    Check.equalU64(1, sim.leaderTerms.length as u64)?; // one election, kept
+    Check.isTrue(sim.readsServed > 10, "reads confirmed by a quorum")?;
+    Check.isTrue(sim.snapshotsInstalled == 0, "no snapshot needed")?;
+    return Ok();
+}
+
+@test
+fn raftThreeReplicasUnderFaults() -> Result<void, TestFailure> {
+    var elections = 0u64;
+    var snapshots = 0u64;
+    var crashes = 0u64;
+    var reads = 0u64;
+    var seed = 1u64;
+    while (seed <= 300) {
+        let sim = simRun(3, seed, 1500, simHarsh())?;
+        elections = elections + (sim.leaderTerms.length as u64);
+        snapshots = snapshots + sim.snapshotsInstalled;
+        crashes = crashes + sim.crashes;
+        reads = reads + sim.readsServed;
+        seed = seed + 1;
+    }
+    // The faults did happen: the run is not checking a quiet cluster.
+    Check.isTrue(elections > 600, "leaders were deposed and elected")?;
+    Check.isTrue(snapshots > 30, "followers caught up from snapshots")?;
+    Check.isTrue(crashes > 300, "replicas crashed")?;
+    Check.isTrue(reads > 1000, "reads were served")?;
+    return Ok();
+}
+
+@test
+fn raftFiveReplicasUnderFaults() -> Result<void, TestFailure> {
+    var seed = 1000u64;
+    while (seed < 1100) {
+        let _ = simRun(5, seed, 1500, simHarsh())?;
+        seed = seed + 1;
+    }
+    return Ok();
+}
+
+@test
+fn raftAConflictingSuffixIsReplaced() -> Result<void, TestFailure> {
+    // A follower holding entries of a deposed leader's term that no quorum took: the new leader's log replaces
+    // them, and the commit index never covers them.
+    var core = RaftCore.create(simConfig(2, 3, 5))!;
+    var append = core.message(RAFT_APPEND, 2);
+    append.from = 1;
+    append.term = 1;
+    for (i in 1..4) {
+        var data = Vector<u8>.create();
+        data.pushLE(truncate<u64>(i))!;
+        append.entries.push(RaftEntry { term: 1, index: truncate<u64>(i), data: data })!;
+    }
+    append.commit = 1;
+    core.step(append)!;
+    let first = core.ready()!;
+    Check.equalU64(3, first.entries.length as u64)?;
+    Check.equalU64(1, first.committed.length as u64)?;
+    core.advance();
+    // Leader 3 of term 2 has entry 1 of term 1, then its own entry 2 of term 2.
+    var next = core.message(RAFT_APPEND, 2);
+    next.from = 3;
+    next.term = 2;
+    next.index = 1;
+    next.logTerm = 1;
+    next.commit = 2;
+    var data = Vector<u8>.create();
+    data.pushLE(99u64)!;
+    next.entries.push(RaftEntry { term: 2, index: 2, data: data })!;
+    core.step(next)!;
+    let second = core.ready()!;
+    Check.equalU64(1, second.entries.length as u64)?; // persist from 2 on: the old 2 and 3 are gone
+    Check.equalU64(2, second.entries[0].index)?;
+    Check.equalU64(2, core.lastIndex())?;
+    Check.equalU64(1, second.committed.length as u64)?;
+    Check.equalU64(99, simValueOf(second.committed[0].data.view()))?;
+    Check.equalU64(1, second.messages.length as u64)?; // one reply
+    Check.isTrue(second.messages[0].granted, "the append is taken")?;
+    return Ok();
+}
+
+@test
+fn raftAStaleLeaderIsRefused() -> Result<void, TestFailure> {
+    var core = RaftCore.create(simConfig(2, 3, 5))!;
+    var vote = core.message(RAFT_VOTE, 2);
+    vote.from = 3;
+    vote.term = 5;
+    core.step(vote)!;
+    let r = core.ready()!;
+    Check.isTrue(r.messages[0].granted, "a vote for an up-to-date candidate")?;
+    Check.equalU64(5, (r.hardState ?? RaftHardState { term: 0, vote: 0, commit: 0 }).term)?;
+    core.advance();
+    // An append of term 4 is refused, in term 5, so its leader steps down.
+    var old = core.message(RAFT_APPEND, 2);
+    old.from = 1;
+    old.term = 4;
+    core.step(old)!;
+    let r2 = core.ready()!;
+    Check.isFalse(r2.messages[0].granted, "refused")?;
+    Check.equalU64(5, r2.messages[0].term)?;
+    core.advance();
+    // A second candidate in term 5 does not get the vote it gave.
+    var other = core.message(RAFT_VOTE, 2);
+    other.from = 1;
+    other.term = 5;
+    core.step(other)!;
+    let r3 = core.ready()!;
+    Check.isFalse(r3.messages[0].granted, "one vote a term")?;
+    return Ok();
+}
+
+/// Hands every ready to nowhere: what a test that plays the other replicas itself needs between its steps.
+fn simDiscard(core: borrow mut RaftCore) -> Result<RaftReady, TestFailure> {
+    let r = core.ready()!;
+    core.advance();
+    return Ok(r);
+}
+
+fn simReply(kind: u8, from: u32, term: u64) -> RaftMessage {
+    return RaftMessage {
+        kind: kind,
+        from: from,
+        to: 1,
+        term: term,
+        index: 0,
+        logTerm: 0,
+        commit: 0,
+        granted: true,
+        round: 0,
+        entries: Vector<RaftEntry>.create(),
+        data: Vector<u8>.create(),
+    };
+}
+
+@test
+fn raftAStaleSnapshotKeepsTheLog() -> Result<void, TestFailure> {
+    // A follower that took entries 1 to 5 and then gets a snapshot to 3, sent before them and delayed: it has entry
+    // 3, so it keeps 4 and 5, which the leader may have counted towards a commit.
+    var core = RaftCore.create(simConfig(2, 3, 5))!;
+    var append = core.message(RAFT_APPEND, 2);
+    append.from = 1;
+    append.term = 1;
+    for (i in 1..6) {
+        var data = Vector<u8>.create();
+        data.pushLE(truncate<u64>(i))!;
+        append.entries.push(RaftEntry { term: 1, index: truncate<u64>(i), data: data })!;
+    }
+    append.commit = 2;
+    core.step(append)!;
+    let _ = simDiscard(mut core)?;
+    var snapshot = core.message(RAFT_SNAPSHOT, 2);
+    snapshot.from = 1;
+    snapshot.term = 1;
+    snapshot.index = 3;
+    snapshot.logTerm = 1;
+    core.step(snapshot)!;
+    let r = simDiscard(mut core)?;
+    Check.isTrue(r.snapshot.isNull(), "nothing to install")?;
+    Check.equalU64(5, core.lastIndex())?;
+    Check.equalU64(3, core.commit)?;
+    Check.isTrue(r.messages[0].granted, "the snapshot is answered")?;
+    return Ok();
+}
+
+@test
+fn raftReadsWaitForAQuorum() -> Result<void, TestFailure> {
+    // A leader of five: a read is released when two others have answered a round sent after it, not one.
+    var core = RaftCore.create(simConfig(1, 5, 9))!;
+    var ticks = 0;
+    while (core.role != RAFT_PRE_CANDIDATE && ticks < 40) {
+        core.tick()!;
+        let _ = simDiscard(mut core)?;
+        ticks = ticks + 1;
+    }
+    Check.isTrue(core.role == RAFT_PRE_CANDIDATE, "it campaigns")?;
+    core.step(simReply(RAFT_PRE_VOTE_REPLY, 2, 1))!;
+    core.step(simReply(RAFT_PRE_VOTE_REPLY, 3, 1))!;
+    let _ = simDiscard(mut core)?;
+    core.step(simReply(RAFT_VOTE_REPLY, 2, 1))!;
+    core.step(simReply(RAFT_VOTE_REPLY, 3, 1))!;
+    let _ = simDiscard(mut core)?;
+    Check.isTrue(core.isLeader(), "elected")?;
+    for (p in 2..4) {
+        var ack = simReply(RAFT_APPEND_REPLY, truncate<u32>(p), 1);
+        ack.index = 1;
+        core.step(ack)!;
+    }
+    let _ = simDiscard(mut core)?;
+    Check.equalU64(1, core.commit)?;
+    Check.isTrue(core.readIndex(42)!, "a read taken")?;
+    let round = core.round;
+    let first = simDiscard(mut core)?;
+    Check.equalU64(0, first.reads.length as u64)?;
+    var one = simReply(RAFT_APPEND_REPLY, 4, 1);
+    one.index = 1;
+    one.round = round;
+    core.step(one)!;
+    Check.equalU64(0, simDiscard(mut core)?.reads.length as u64)?; // the leader and one other: two of five
+    var two = simReply(RAFT_APPEND_REPLY, 5, 1);
+    two.index = 1;
+    two.round = round;
+    core.step(two)!;
+    let released = simDiscard(mut core)?;
+    Check.equalU64(1, released.reads.length as u64)?;
+    Check.equalU64(42, released.reads[0].id)?;
+    Check.equalU64(1, released.reads[0].index)?;
+    return Ok();
+}

@@ -1,0 +1,811 @@
+// The Raft core (ADR-0057, M6 item 1): a deterministic state machine without I/O. Messages, ticks, proposals and
+// reads go in; a `RaftReady` comes out, holding what to persist, what to send and what to apply. The journal, the
+// network and the clock are the host's (ADR-0056 §2), so the same code runs under the seeded simulation of
+// `raft_tests.cee` and, from item 3 on, in `serve`.
+//
+// The host's contract, in order, for each `ready()`:
+//   1. persist the snapshot, if there is one (the state machine and the log up to its index are replaced by it);
+//   2. persist the entries (the log from `entries[0].index` on is replaced by them) and then the hard state;
+//   3. send the messages;
+//   4. apply the committed entries, in order;
+//   5. call `advance()`, and only then hand the core anything more.
+// Node ids start at 1; 0 is no node.
+
+const RAFT_FOLLOWER: u8 = 0;
+const RAFT_PRE_CANDIDATE: u8 = 1;
+const RAFT_CANDIDATE: u8 = 2;
+const RAFT_LEADER: u8 = 3;
+
+const RAFT_PRE_VOTE: u8 = 1;
+const RAFT_PRE_VOTE_REPLY: u8 = 2;
+const RAFT_VOTE: u8 = 3;
+const RAFT_VOTE_REPLY: u8 = 4;
+const RAFT_APPEND: u8 = 5;
+const RAFT_APPEND_REPLY: u8 = 6;
+const RAFT_SNAPSHOT: u8 = 7;
+
+const RAFT_NO_NODE: u32 = 0;
+
+/// One entry of the log. A new leader's first entry has no data (Raft §5.4.2: it commits the entries of earlier
+/// terms, and lets reads begin).
+struct RaftEntry {
+    term: u64;
+    index: u64;
+    data: Vector<u8>;
+
+    fn copy(borrow this) -> Result<RaftEntry, AllocError> {
+        return Ok(RaftEntry { term: this.term, index: this.index, data: this.data.clone()? });
+    }
+}
+
+/// A message between two replicas. Which fields mean what depends on `kind`:
+/// - pre-vote and vote: `term` is the term campaigned in, `index` and `logTerm` the candidate's last entry;
+/// - their replies: `granted`; a pre-vote granted answers in the term it was asked in, any other reply in the
+///   sender's term;
+/// - append: `index` and `logTerm` are the entry before `entries`, `commit` the leader's commit index, `round` its
+///   read round (ReadIndex), echoed by the reply;
+/// - append reply: `granted` for success, `index` the follower's match on success and its hint on refusal (the
+///   entry the leader should try next is `index + 1`);
+/// - snapshot: `index` and `logTerm` are the snapshot's last entry, `data` the state the host attaches.
+struct RaftMessage {
+    kind: u8;
+    from: u32;
+    to: u32;
+    term: u64;
+    index: u64;
+    logTerm: u64;
+    commit: u64;
+    granted: bool;
+    round: u64;
+    entries: Vector<RaftEntry>;
+    data: Vector<u8>;
+
+    fn copy(borrow this) -> Result<RaftMessage, AllocError> {
+        var entries = Vector<RaftEntry>.create();
+        entries.reserve(this.entries.length)?;
+        for (i in 0..this.entries.length) { entries.push(this.entries[i].copy()?)?; }
+        return Ok(RaftMessage {
+            kind: this.kind,
+            from: this.from,
+            to: this.to,
+            term: this.term,
+            index: this.index,
+            logTerm: this.logTerm,
+            commit: this.commit,
+            granted: this.granted,
+            round: this.round,
+            entries: entries,
+            data: this.data.clone()?,
+        });
+    }
+}
+
+/// What a replica must keep across a crash, synced before it sends anything that depends on it: its term, whom it
+/// voted for in it, and a commit index (which may lag; a committed entry never changes, so recovery may apply up
+/// to it).
+struct RaftHardState {
+    term: u64;
+    vote: u32;
+    commit: u64;
+}
+
+/// A read that may be served once the state machine has applied `index` (ReadIndex, Raft §6.4).
+struct RaftReadState {
+    id: u64;
+    index: u64;
+}
+
+/// A snapshot a leader sent, to be installed in place of the state machine and of the log up to `index`.
+struct RaftSnapshot {
+    index: u64;
+    term: u64;
+    data: Vector<u8>;
+}
+
+/// What the core asks of its host after a step: see the contract at the top of this file.
+struct RaftReady {
+    hardState: RaftHardState?;
+    snapshot: RaftSnapshot?;
+    entries: Vector<RaftEntry>;
+    messages: Vector<RaftMessage>;
+    committed: Vector<RaftEntry>;
+    reads: Vector<RaftReadState>;
+}
+
+/// The settings of one replica.
+struct RaftConfig {
+    id: u32;
+    /// Every voter of the group, this one included.
+    voters: Vector<u32>;
+    /// Ticks without a leader before a replica campaigns; each campaign waits a random time between this and twice
+    /// it.
+    electionTicks: u32;
+    /// Ticks between a leader's heartbeats; well below `electionTicks`.
+    heartbeatTicks: u32;
+    /// The most entries in one append.
+    maxAppendEntries: usize;
+    /// The seed of the election timer's randomness.
+    seed: u64;
+}
+
+/// The leader's view of one other voter.
+struct RaftPeer {
+    id: u32;
+    /// The next entry to send, and the last one known to match the leader's.
+    next: u64;
+    matched: u64;
+    /// An append or snapshot is out and not answered: the next is sent on its reply or the next heartbeat.
+    inflight: bool;
+    /// Heard from since the last quorum check (Raft §6.2).
+    recent: bool;
+    /// Granted this campaign's vote (or pre-vote), refused it.
+    granted: bool;
+    refused: bool;
+    /// The last read round it has answered.
+    round: u64;
+}
+
+/// A read waiting for a quorum to confirm the leader.
+struct RaftPendingRead {
+    id: u64;
+    index: u64;
+    round: u64;
+}
+
+/// SplitMix64: a small generator whose sequence the seed fixes, so a simulation is reproduced from its seed.
+struct SplitMix {
+    state: u64;
+
+    fn next(borrow mut this) -> u64 {
+        this.state = this.state.wrappingAdd(0x9E3779B97F4A7C15);
+        var z = this.state;
+        z = (z ^ (z >> 30)).wrappingMul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrappingMul(0x94D049BB133111EB);
+        return z ^ (z >> 31);
+    }
+
+    /// A number below `n` (n > 0).
+    fn below(borrow mut this, n: u64) -> u64 => this.next() % n;
+}
+
+struct RaftCore {
+    id: u32;
+    voters: Vector<u32>;
+    electionTicks: u32;
+    heartbeatTicks: u32;
+    maxAppendEntries: usize;
+    rng: SplitMix;
+
+    role: u8;
+    term: u64;
+    vote: u32;
+    leader: u32;
+
+    /// The log: entries after `snapIndex`, whose term was `snapTerm`.
+    snapIndex: u64;
+    snapTerm: u64;
+    log: Vector<RaftEntry>;
+    /// The first entry the host has not persisted (0: none).
+    unstableFrom: u64;
+    /// The last entry the host has persisted.
+    stable: u64;
+    commit: u64;
+    applied: u64;
+
+    elapsed: u32;
+    timeout: u32;
+    heartbeatElapsed: u32;
+
+    peers: Vector<RaftPeer>;
+    round: u64;
+    pendingReads: Vector<RaftPendingRead>;
+    readyReads: Vector<RaftReadState>;
+    outbox: Vector<RaftMessage>;
+    snapshot: RaftSnapshot?;
+    /// The hard state last handed to the host.
+    savedTerm: u64;
+    savedVote: u32;
+    savedCommit: u64;
+
+    /// A replica with an empty log, as a group begins.
+    fn create(config: RaftConfig) -> Result<RaftCore, AllocError> {
+        let hard = RaftHardState { term: 0, vote: RAFT_NO_NODE, commit: 0 };
+        return RaftCore.restore(config, hard, 0, 0, Vector<RaftEntry>.create());
+    }
+
+    /// A replica as its host persisted it: the hard state, the snapshot's last entry (the state machine is at it),
+    /// and the entries after it.
+    fn restore(
+        config: RaftConfig,
+        hard: RaftHardState,
+        snapIndex: u64,
+        snapTerm: u64,
+        entries: Vector<RaftEntry>,
+    ) -> Result<RaftCore, AllocError> {
+        var peers = Vector<RaftPeer>.create();
+        for (i in 0..config.voters.length) {
+            let v = config.voters[i];
+            if (v != config.id) {
+                peers.push(RaftPeer {
+                    id: v,
+                    next: 1,
+                    matched: 0,
+                    inflight: false,
+                    recent: false,
+                    granted: false,
+                    refused: false,
+                    round: 0,
+                })?;
+            }
+        }
+        let last = snapIndex + (entries.length as u64);
+        let commit = if (hard.commit < snapIndex) snapIndex else if (hard.commit > last) last else hard.commit;
+        var core = RaftCore {
+            id: config.id,
+            voters: config.voters,
+            electionTicks: config.electionTicks,
+            heartbeatTicks: config.heartbeatTicks,
+            maxAppendEntries: config.maxAppendEntries,
+            rng: SplitMix { state: config.seed ^ (config.id as u64) },
+            role: RAFT_FOLLOWER,
+            term: hard.term,
+            vote: hard.vote,
+            leader: RAFT_NO_NODE,
+            snapIndex: snapIndex,
+            snapTerm: snapTerm,
+            log: entries,
+            unstableFrom: 0,
+            stable: last,
+            commit: commit,
+            applied: snapIndex,
+            elapsed: 0,
+            timeout: 0,
+            heartbeatElapsed: 0,
+            peers: peers,
+            round: 0,
+            pendingReads: Vector<RaftPendingRead>.create(),
+            readyReads: Vector<RaftReadState>.create(),
+            outbox: Vector<RaftMessage>.create(),
+            snapshot: null,
+            savedTerm: hard.term,
+            savedVote: hard.vote,
+            savedCommit: hard.commit,
+        };
+        core.resetTimeout();
+        return Ok(core);
+    }
+
+    fn isLeader(borrow this) -> bool => this.role == RAFT_LEADER;
+
+    fn lastIndex(borrow this) -> u64 => this.snapIndex + (this.log.length as u64);
+
+    /// The term of entry `i`; null when it is before the snapshot or after the log.
+    fn termAt(borrow this, i: u64) -> u64? {
+        if (i == this.snapIndex) { return Some(this.snapTerm); }
+        if (i < this.snapIndex || i > this.lastIndex()) { return null; }
+        return Some(this.log[(i - this.snapIndex - 1) as usize].term);
+    }
+
+    fn lastTerm(borrow this) -> u64 => this.termAt(this.lastIndex()) ?? 0;
+
+    fn quorum(borrow this) -> usize => this.voters.length / 2 + 1;
+
+    fn resetTimeout(borrow mut this) {
+        let e = this.electionTicks as u64;
+        this.timeout = truncate<u32>(e + this.rng.below(if (e == 0) 1 else e));
+        this.elapsed = 0;
+    }
+
+    fn message(borrow this, kind: u8, to: u32) -> RaftMessage {
+        return RaftMessage {
+            kind: kind,
+            from: this.id,
+            to: to,
+            term: this.term,
+            index: 0,
+            logTerm: 0,
+            commit: 0,
+            granted: false,
+            round: 0,
+            entries: Vector<RaftEntry>.create(),
+            data: Vector<u8>.create(),
+        };
+    }
+
+    fn send(borrow mut this, m: RaftMessage) -> Result<void, AllocError> => this.outbox.push(m);
+
+    // --- Roles ---
+
+    fn becomeFollower(borrow mut this, term: u64, leader: u32) {
+        if (term > this.term) {
+            this.term = term;
+            this.vote = RAFT_NO_NODE;
+        }
+        this.role = RAFT_FOLLOWER;
+        this.leader = leader;
+        this.pendingReads.clear();
+        this.resetTimeout();
+    }
+
+    /// Raft §9.6: a replica first asks whether it could win, without raising its term, so a replica cut off from
+    /// the others does not depose a working leader when it comes back.
+    fn campaign(borrow mut this, pre: bool) -> Result<void, AllocError> {
+        this.role = if (pre) RAFT_PRE_CANDIDATE else RAFT_CANDIDATE;
+        this.leader = RAFT_NO_NODE;
+        this.pendingReads.clear();
+        this.resetTimeout();
+        if (!pre) {
+            this.term = this.term + 1;
+            this.vote = this.id;
+        }
+        for (i in 0..this.peers.length) {
+            this.peers[i].granted = false;
+            this.peers[i].refused = false;
+        }
+        if (this.quorum() == 1) {
+            if (pre) { return this.campaign(false); }
+            return this.becomeLeader();
+        }
+        let kind = if (pre) RAFT_PRE_VOTE else RAFT_VOTE;
+        let term = if (pre) this.term + 1 else this.term;
+        let lastIndex = this.lastIndex();
+        let lastTerm = this.lastTerm();
+        for (i in 0..this.peers.length) {
+            var m = this.message(kind, this.peers[i].id);
+            m.term = term;
+            m.index = lastIndex;
+            m.logTerm = lastTerm;
+            this.send(m)?;
+        }
+        return Ok();
+    }
+
+    fn becomeLeader(borrow mut this) -> Result<void, AllocError> {
+        this.role = RAFT_LEADER;
+        this.leader = this.id;
+        this.elapsed = 0;
+        this.heartbeatElapsed = 0;
+        this.pendingReads.clear();
+        let next = this.lastIndex() + 1;
+        for (i in 0..this.peers.length) {
+            this.peers[i].next = next;
+            this.peers[i].matched = 0;
+            this.peers[i].inflight = false;
+            this.peers[i].recent = true;
+        }
+        this.appendOwn(Vector<u8>.create())?;
+        return this.broadcast();
+    }
+
+    fn appendOwn(borrow mut this, data: Vector<u8>) -> Result<u64, AllocError> {
+        let index = this.lastIndex() + 1;
+        this.log.push(RaftEntry { term: this.term, index: index, data: data })?;
+        this.markUnstable(index);
+        if (this.quorum() == 1) { this.maybeCommit(); }
+        return Ok(index);
+    }
+
+    fn markUnstable(borrow mut this, from: u64) {
+        if (this.unstableFrom == 0 || from < this.unstableFrom) { this.unstableFrom = from; }
+        if (this.stable >= from) { this.stable = from - 1; }
+    }
+
+    // --- Inputs ---
+
+    /// One tick of the host's clock.
+    fn tick(borrow mut this) -> Result<void, AllocError> {
+        if (this.role != RAFT_LEADER) {
+            this.elapsed = this.elapsed + 1;
+            if (this.elapsed >= this.timeout) { return this.campaign(true); }
+            return Ok();
+        }
+        this.heartbeatElapsed = this.heartbeatElapsed + 1;
+        this.elapsed = this.elapsed + 1;
+        if (this.elapsed >= this.electionTicks) {
+            this.elapsed = 0;
+            // Raft §6.2: a leader that has not heard from a quorum in an election timeout steps down, and stops
+            // taking requests it cannot commit (reads are kept safe by their quorum round, not by this).
+            var heard = 1usize;
+            for (i in 0..this.peers.length) {
+                if (this.peers[i].recent) { heard = heard + 1; }
+                this.peers[i].recent = false;
+            }
+            if (heard < this.quorum()) {
+                this.becomeFollower(this.term, RAFT_NO_NODE);
+                return Ok();
+            }
+        }
+        if (this.heartbeatElapsed >= this.heartbeatTicks) {
+            this.heartbeatElapsed = 0;
+            return this.broadcast();
+        }
+        return Ok();
+    }
+
+    /// Appends `data` to the log, when this replica is the leader: the entry's index, or null (the host sends the
+    /// request to `leader`, or waits for one).
+    fn propose(borrow mut this, data: Vector<u8>) -> Result<u64?, AllocError> {
+        if (this.role != RAFT_LEADER) { return Ok(null); }
+        let index = this.appendOwn(data)?;
+        for (i in 0..this.peers.length) {
+            if (!this.peers[i].inflight) { this.sendAppend(i)?; }
+        }
+        return Ok(Some(index));
+    }
+
+    /// Asks for a linearizable read: true when the leader takes it (a `RaftReadState` of `id` comes in a later
+    /// ready), false when this replica is not a leader that may serve reads yet.
+    fn readIndex(borrow mut this, id: u64) -> Result<bool, AllocError> {
+        if (this.role != RAFT_LEADER) { return Ok(false); }
+        // Its commit index covers every entry committed before it was leader only once an entry of its own term is
+        // committed (Raft §6.4).
+        if ((this.termAt(this.commit) ?? 0) != this.term) { return Ok(false); }
+        if (this.quorum() == 1) {
+            this.readyReads.push(RaftReadState { id: id, index: this.commit })?;
+            return Ok(true);
+        }
+        this.round = this.round + 1;
+        this.pendingReads.push(RaftPendingRead { id: id, index: this.commit, round: this.round })?;
+        this.broadcast()?;
+        return Ok(true);
+    }
+
+    /// A message from another replica.
+    fn step(borrow mut this, m: RaftMessage) -> Result<void, AllocError> {
+        if (m.to != this.id) { return Ok(); }
+        let asksForVote = m.kind == RAFT_PRE_VOTE || m.kind == RAFT_VOTE;
+        if (m.term > this.term) {
+            // A replica that hears from its leader does not help depose it (Raft §4.2.3).
+            if (asksForVote && this.leader != RAFT_NO_NODE && this.elapsed < this.electionTicks) { return Ok(); }
+            let ownPreVote = m.kind == RAFT_PRE_VOTE_REPLY && m.granted;
+            if (m.kind != RAFT_PRE_VOTE && !ownPreVote) {
+                let leader = if (m.kind == RAFT_APPEND || m.kind == RAFT_SNAPSHOT) m.from else RAFT_NO_NODE;
+                this.becomeFollower(m.term, leader);
+            }
+        } else if (m.term < this.term) {
+            // A deposed leader learns the term from the refusal; a stale candidate from the pre-vote refusal.
+            if (m.kind == RAFT_APPEND || m.kind == RAFT_SNAPSHOT) {
+                var reply = this.message(RAFT_APPEND_REPLY, m.from);
+                reply.index = this.lastIndex();
+                this.send(reply)?;
+            } else if (m.kind == RAFT_PRE_VOTE) {
+                this.send(this.message(RAFT_PRE_VOTE_REPLY, m.from))?;
+            }
+            return Ok();
+        }
+
+        if (m.kind == RAFT_PRE_VOTE) {
+            let grant = m.term > this.term && this.isUpToDate(m.index, m.logTerm);
+            var reply = this.message(RAFT_PRE_VOTE_REPLY, m.from);
+            if (grant) { reply.term = m.term; }
+            reply.granted = grant;
+            return this.send(reply);
+        }
+        if (m.kind == RAFT_VOTE) {
+            let grant = (this.vote == RAFT_NO_NODE || this.vote == m.from) && this.leader == RAFT_NO_NODE &&
+                this.isUpToDate(m.index, m.logTerm);
+            if (grant) {
+                this.vote = m.from;
+                this.elapsed = 0;
+            }
+            var reply = this.message(RAFT_VOTE_REPLY, m.from);
+            reply.granted = grant;
+            return this.send(reply);
+        }
+        if (m.kind == RAFT_PRE_VOTE_REPLY) {
+            // A grant answers in the term asked; a refusal in the refuser's, which may be ours.
+            if (this.role == RAFT_PRE_CANDIDATE && (m.term == this.term + 1 || (!m.granted && m.term == this.term))) {
+                return this.countVote(m.from, m.granted, true);
+            }
+            return Ok();
+        }
+        if (m.kind == RAFT_VOTE_REPLY) {
+            if (this.role == RAFT_CANDIDATE) { return this.countVote(m.from, m.granted, false); }
+            return Ok();
+        }
+        if (m.kind == RAFT_APPEND) {
+            if (this.role != RAFT_FOLLOWER) { this.becomeFollower(m.term, m.from); }
+            this.leader = m.from;
+            this.elapsed = 0;
+            return this.handleAppend(m);
+        }
+        if (m.kind == RAFT_SNAPSHOT) {
+            if (this.role != RAFT_FOLLOWER) { this.becomeFollower(m.term, m.from); }
+            this.leader = m.from;
+            this.elapsed = 0;
+            return this.handleSnapshot(m);
+        }
+        if (m.kind == RAFT_APPEND_REPLY) {
+            if (this.role == RAFT_LEADER) { return this.handleAppendReply(m); }
+            return Ok();
+        }
+        return Ok();
+    }
+
+    fn isUpToDate(borrow this, index: u64, term: u64) -> bool {
+        let ours = this.lastTerm();
+        return term > ours || (term == ours && index >= this.lastIndex());
+    }
+
+    fn peerAt(borrow this, id: u32) -> usize? {
+        for (i in 0..this.peers.length) {
+            if (this.peers[i].id == id) { return Some(i); }
+        }
+        return null;
+    }
+
+    fn countVote(borrow mut this, from: u32, granted: bool, pre: bool) -> Result<void, AllocError> {
+        let at = match (this.peerAt(from)) {
+            Some(i) => i,
+            null => { return Ok(); }
+        };
+        this.peers[at].granted = granted;
+        this.peers[at].refused = !granted;
+        var yes = 1usize;
+        var no = 0usize;
+        for (i in 0..this.peers.length) {
+            if (this.peers[i].granted) { yes = yes + 1; }
+            if (this.peers[i].refused) { no = no + 1; }
+        }
+        if (yes >= this.quorum()) {
+            if (pre) { return this.campaign(false); }
+            return this.becomeLeader();
+        }
+        if (no >= this.quorum()) { this.becomeFollower(this.term, RAFT_NO_NODE); }
+        return Ok();
+    }
+
+    // --- Replication ---
+
+    fn broadcast(borrow mut this) -> Result<void, AllocError> {
+        for (i in 0..this.peers.length) { this.sendAppend(i)?; }
+        return Ok();
+    }
+
+    /// Sends peer `at` what it lacks from its `next` entry on, or the snapshot when that entry is compacted away.
+    fn sendAppend(borrow mut this, at: usize) -> Result<void, AllocError> {
+        let to = this.peers[at].id;
+        let next = this.peers[at].next;
+        this.peers[at].inflight = true;
+        if (next <= this.snapIndex) {
+            var m = this.message(RAFT_SNAPSHOT, to);
+            m.index = this.snapIndex;
+            m.logTerm = this.snapTerm;
+            return this.send(m);
+        }
+        var m = this.message(RAFT_APPEND, to);
+        m.index = next - 1;
+        m.logTerm = this.termAt(next - 1) ?? 0;
+        m.commit = this.commit;
+        m.round = this.round;
+        var i = next;
+        let last = this.lastIndex();
+        while (i <= last && m.entries.length < this.maxAppendEntries) {
+            m.entries.push(this.log[(i - this.snapIndex - 1) as usize].copy()?)?;
+            i = i + 1;
+        }
+        return this.send(m);
+    }
+
+    fn handleAppend(borrow mut this, m: RaftMessage) -> Result<void, AllocError> {
+        var reply = this.message(RAFT_APPEND_REPLY, m.from);
+        reply.round = m.round;
+        if (m.index < this.commit) {
+            // Everything to the commit index is the leader's already; it learns where to go on from.
+            reply.granted = true;
+            reply.index = this.commit;
+            return this.send(reply);
+        }
+        let ours = this.termAt(m.index);
+        if (ours.isNull() || (ours ?? 0) != m.logTerm) {
+            reply.index = this.refusalHint(m.index);
+            return this.send(reply);
+        }
+        let last = m.index + (m.entries.length as u64);
+        let leaderCommit = m.commit;
+        var entries = m.entries;
+        reverseEntries(mut entries);
+        while (true) {
+            let e = match (entries.pop()) {
+                Some(e) => e,
+                null => { break; }
+            };
+            if (e.index <= this.lastIndex()) {
+                if ((this.termAt(e.index) ?? 0) == e.term) { continue; }
+                // A conflicting suffix is never committed: the leader has every committed entry.
+                if (this.applied >= e.index) { panic("raft: a conflict below the applied index"); }
+                this.log.truncate((e.index - this.snapIndex - 1) as usize);
+            }
+            let index = e.index;
+            this.log.push(e)?;
+            this.markUnstable(index);
+        }
+        let commit = if (leaderCommit < last) leaderCommit else last;
+        if (commit > this.commit) { this.commit = commit; }
+        reply.granted = true;
+        reply.index = last;
+        return this.send(reply);
+    }
+
+    /// Where the leader should look next after a refusal at `index`: our last entry when we lack `index`, else the
+    /// entry before the first of the conflicting term (never below the commit index, which matches).
+    fn refusalHint(borrow this, index: u64) -> u64 {
+        let last = this.lastIndex();
+        if (index > last) { return last; }
+        let conflict = this.termAt(index) ?? 0;
+        var i = index - 1;
+        while (i > this.commit && (this.termAt(i) ?? 0) == conflict) { i = i - 1; }
+        return i;
+    }
+
+    fn handleSnapshot(borrow mut this, m: RaftMessage) -> Result<void, AllocError> {
+        var reply = this.message(RAFT_APPEND_REPLY, m.from);
+        reply.granted = true;
+        if (m.index <= this.commit) {
+            reply.index = this.commit;
+            return this.send(reply);
+        }
+        if ((this.termAt(m.index) ?? 0) == m.logTerm && this.termAt(m.index).isSome()) {
+            // We have its last entry: the log after it stays, and the entries up to it are applied as usual.
+            this.commit = m.index;
+            reply.index = m.index;
+            return this.send(reply);
+        }
+        // Everything we hold disagrees with it or is older: the snapshot replaces it all.
+        this.log.clear();
+        this.snapIndex = m.index;
+        this.snapTerm = m.logTerm;
+        this.commit = m.index;
+        this.applied = m.index;
+        this.stable = m.index;
+        this.unstableFrom = 0;
+        this.snapshot = Some(RaftSnapshot { index: m.index, term: m.logTerm, data: m.data });
+        reply.index = m.index;
+        return this.send(reply);
+    }
+
+    fn handleAppendReply(borrow mut this, m: RaftMessage) -> Result<void, AllocError> {
+        let at = match (this.peerAt(m.from)) {
+            Some(i) => i,
+            null => { return Ok(); }
+        };
+        this.peers[at].recent = true;
+        if (m.round > this.peers[at].round) {
+            this.peers[at].round = m.round;
+            this.releaseReads()?;
+        }
+        if (m.granted) {
+            if (m.index > this.peers[at].matched) {
+                this.peers[at].matched = m.index;
+                this.peers[at].next = m.index + 1;
+                this.maybeCommit();
+            }
+            this.peers[at].inflight = false;
+            if (this.peers[at].next <= this.lastIndex()) { this.sendAppend(at)?; }
+            return Ok();
+        }
+        let floor = this.peers[at].matched + 1;
+        var next = m.index + 1;
+        if (next >= this.peers[at].next) { next = this.peers[at].next - 1; }
+        if (next < floor) { next = floor; }
+        this.peers[at].next = next;
+        this.peers[at].inflight = false;
+        return this.sendAppend(at);
+    }
+
+    /// Commits the highest entry a quorum holds, if it is of this term (Raft §5.4.2). The leader counts only what
+    /// its host has persisted.
+    fn maybeCommit(borrow mut this) {
+        var matched = Vector<u64>.create();
+        if (matched.reserve(this.voters.length).isErr()) { return; }
+        if (matched.push(this.stable).isErr()) { return; }
+        for (i in 0..this.peers.length) {
+            if (matched.push(this.peers[i].matched).isErr()) { return; }
+        }
+        // The quorum-th largest: sort descending, a few voters, so insertion.
+        for (i in 1..matched.length) {
+            var j = i;
+            while (j > 0 && matched[j - 1] < matched[j]) {
+                matched.swap(j - 1, j);
+                j = j - 1;
+            }
+        }
+        let n = matched[this.quorum() - 1];
+        if (n > this.commit && (this.termAt(n) ?? 0) == this.term) { this.commit = n; }
+    }
+
+    fn releaseReads(borrow mut this) -> Result<void, AllocError> {
+        while (this.pendingReads.length > 0) {
+            let round = this.pendingReads[0].round;
+            var acks = 1usize;
+            for (i in 0..this.peers.length) {
+                if (this.peers[i].round >= round) { acks = acks + 1; }
+            }
+            if (acks < this.quorum()) { return Ok(); }
+            let read = this.pendingReads.remove(0);
+            this.readyReads.push(RaftReadState { id: read.id, index: read.index })?;
+        }
+        return Ok();
+    }
+
+    // --- Output ---
+
+    /// What to persist, send and apply now (see the contract at the top of this file).
+    fn ready(borrow mut this) -> Result<RaftReady, AllocError> {
+        var entries = Vector<RaftEntry>.create();
+        if (this.unstableFrom != 0) {
+            var i = this.unstableFrom;
+            let last = this.lastIndex();
+            while (i <= last) {
+                entries.push(this.log[(i - this.snapIndex - 1) as usize].copy()?)?;
+                i = i + 1;
+            }
+        }
+        let last = this.lastIndex();
+        let durableCommit = if (this.commit < last) this.commit else last;
+        var hardState: RaftHardState? = null;
+        if (this.term != this.savedTerm || this.vote != this.savedVote || durableCommit != this.savedCommit) {
+            hardState = Some(RaftHardState { term: this.term, vote: this.vote, commit: durableCommit });
+        }
+        var committed = Vector<RaftEntry>.create();
+        var i = this.applied + 1;
+        while (i <= durableCommit) {
+            committed.push(this.log[(i - this.snapIndex - 1) as usize].copy()?)?;
+            i = i + 1;
+        }
+        return Ok(RaftReady {
+            hardState: hardState,
+            snapshot: replace(mut this.snapshot, null),
+            entries: entries,
+            messages: replace(mut this.outbox, Vector<RaftMessage>.create()),
+            committed: committed,
+            reads: replace(mut this.readyReads, Vector<RaftReadState>.create()),
+        });
+    }
+
+    /// The host has done all a ready asked.
+    fn advance(borrow mut this) {
+        let last = this.lastIndex();
+        this.stable = last;
+        this.unstableFrom = 0;
+        let durableCommit = if (this.commit < last) this.commit else last;
+        if (durableCommit > this.applied) { this.applied = durableCommit; }
+        this.savedTerm = this.term;
+        this.savedVote = this.vote;
+        this.savedCommit = durableCommit;
+        if (this.role == RAFT_LEADER) { this.maybeCommit(); }
+    }
+
+    /// Whether a ready would ask anything.
+    fn hasReady(borrow this) -> bool {
+        let last = this.lastIndex();
+        let durableCommit = if (this.commit < last) this.commit else last;
+        return this.unstableFrom != 0 || this.outbox.length > 0 || this.readyReads.length > 0 ||
+            this.snapshot.isSome() || durableCommit > this.applied || this.term != this.savedTerm ||
+            this.vote != this.savedVote || durableCommit != this.savedCommit;
+    }
+
+    /// Forgets the entries up to `index`, which the host's snapshot now holds (index ≤ the applied index).
+    fn compact(borrow mut this, index: u64) {
+        if (index <= this.snapIndex || index > this.applied) { return; }
+        let term = this.termAt(index) ?? 0;
+        let dropped = (index - this.snapIndex) as usize;
+        let kept = this.log.length - dropped;
+        // The kept entries move to the front, the dropped ones to the back, which is cut off.
+        for (i in 0..kept) { this.log.swap(i, i + dropped); }
+        this.log.truncate(kept);
+        this.snapIndex = index;
+        this.snapTerm = term;
+    }
+}
+
+fn reverseEntries(v: borrow mut Vector<RaftEntry>) {
+    if (v.length < 2) { return; }
+    var i = 0usize;
+    var j = v.length - 1;
+    while (i < j) {
+        v.swap(i, j);
+        i = i + 1;
+        j = j - 1;
+    }
+}

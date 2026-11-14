@@ -2255,3 +2255,27 @@ Browser form uploads with a SigV4 POST policy.
   p99 gate passes for all of M5 on a quiet machine (above).
 - **Left by choice:** a KMS service behind ADR-0055's keys; G34 (`HmacSha256` does not wipe its key) for CeeSafe.
 - **Next:** M6, the distributed cluster, when the owner says so.
+
+### 14 Nov 2026: M6 begun; item 1, the Raft core and its simulation (ADR-0056, ADR-0057)
+
+- **Asked by the owner** (14 Nov, "Go ahead with M6").
+- **The plan** (ADR-0056, accepted by the owner as recommended, 14 Nov): a Raft group per shard with the journal as its log; shards by bucket (a hash of
+  the name over a shard count fixed at creation, 16 by default), so a listing is one leader's; any node takes S3
+  requests and forwards to the leader; linearizable reads by ReadIndex, no leases; extents synced on a majority before
+  `PutExtent`; peers over HTTP/1.1 on a port of their own, signed with a cluster secret; nine items, each with its own
+  ADR, simulation first. The cluster ADR that ROADMAP issue #6 asked for in M0 was never written: this is it.
+- **Item 1** (ADR-0057, accepted as recommended, built): `src/cluster/raft.cee`, a Raft core without I/O (pre-vote, leader
+  stickiness, check-quorum, commit only in the leader's term, ReadIndex, refusal hints, snapshots; static voters),
+  driven by its host through `ready()` and `advance()`.
+- **The simulation** (`src/cluster/raft_tests.cee`): 300 seeds of 3 replicas and 100 of 5, 1500 ticks each, under
+  message loss, duplicates, delays up to 30 ticks, partitions (the leader alone, two sides), crashes that lose all but
+  the disk, pauses, and snapshots; then healed, it must elect, converge and hold everything ever applied. The checker:
+  one leader a term, one entry an index across replicas and snapshots, in-order application, terms and votes never
+  going back on disk, no stale read. Plus directed tests of a conflicting suffix, a stale leader, a stale snapshot and
+  a read's quorum.
+- **Mutants** (`tools/raft_mutants.sh`, eight): the first simulation killed 2 of 9. It needed late messages, the leader
+  partitioned alone and smaller appends to kill Raft's Figure 8 (an earlier term's entry committed by counting), a
+  vote without the up-to-date check and a follower's commit past what was sent; pauses to kill reads released
+  without confirmation (with clocks all running, check-quorum hid it); and directed tests for a read confirmed by one
+  peer of five and a snapshot that drops a log it matches. Two of the nine were no faults under the host's contract
+  (ADR-0057 §5).
