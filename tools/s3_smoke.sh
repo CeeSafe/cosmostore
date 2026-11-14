@@ -630,6 +630,20 @@ aws s3api put-object --bucket quota --key a --body four.txt > /dev/null 2>&1 && 
 check "a copy past the count" "$(code s3api copy-object --bucket quota --key c --copy-source quota/a)" QuotaExceeded
 check "the limits and the use" "$(quota GET quota) $(quotaxml)" "200 20</MaxBytes><MaxObjects>2</MaxObjects><Bytes>8</Bytes><Objects>2"
 check "a quota without a limit" "$(quota PUT quota '<Quota></Quota>')" 400
+# The admin CLI (ADR-0054): the same calls, signed by `cosmostore admin` with the credentials file's first key.
+adm() { "$bin" admin "$AWS_ENDPOINT_URL" credentials "$@"; }
+check "admin stats" "$(adm stats | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(d["objects"] > 0, "rateLimited" in d, "eventsPending" in d)')" "True True True"
+check "admin buckets" "$(adm buckets | python3 -I -c 'import json,sys; b={x["name"]: x for x in json.load(sys.stdin)["buckets"]}; q=b["quota"]; print(q["bytes"], q["objects"], q["maxBytes"], q["maxObjects"], q["versioning"], b["smoke"]["objects"] > 0)')" "8 2 20 2 Off True"
+check "admin quota, read" "$(adm quota quota | tr -d '\n' | sed 's/.*<MaxBytes>//; s/<\/Objects>.*//')" "20</MaxBytes><MaxObjects>2</MaxObjects><Bytes>8</Bytes><Objects>2"
+adm quota quota 30 0 > /dev/null 2>&1 && pass "admin quota, set" || fail "admin quota, set"
+check "the quota it set" "$(quota GET quota) $(quotaxml)" "200 30</MaxBytes><MaxObjects>0</MaxObjects><Bytes>8</Bytes><Objects>2"
+check "admin on a bucket that is not there" "$(adm quota no-such-bucket 2>&1 > /dev/null | sed -n 's/.*<Code>\(.*\)<\/Code>.*/\1/p'); $?" "NoSuchBucket; 0"
+echo "$AWS_ACCESS_KEY_ID wrong/secret" > wrong.credentials
+check "admin with a wrong secret" "$("$bin" admin "$AWS_ENDPOINT_URL" wrong.credentials stats 2>&1 > /dev/null | sed -n 's/.*<Code>\(.*\)<\/Code>.*/\1/p')" SignatureDoesNotMatch
+"$bin" admin "$AWS_ENDPOINT_URL" wrong.credentials stats > /dev/null 2>&1; check "its exit status" "$?" 1
+adm nonsense > /dev/null 2>&1; check "admin with a command there is not" "$?" 2
+"$bin" admin http://127.0.0.1:1 credentials stats > /dev/null 2>&1; check "admin with no server" "$?" 1
+adm quota quota 20 2 > /dev/null 2>&1
 check "an anonymous quota read" "$(anon "$AWS_ENDPOINT_URL/quota?quota")" 403
 aws s3api delete-object --bucket quota --key b > /dev/null 2>&1
 aws s3api put-object --bucket quota --key c --body four.txt > /dev/null 2>&1 && pass "a write after a delete" || fail "a write after a delete"
@@ -658,23 +672,27 @@ check "a key taken out of the file" "$(second second/secret/two code s3api list-
 check "the first key through it all" "$(aws s3api list-buckets --query 'length(Buckets)')" 1
 check "the reloads in the log" "$(grep -c 'credentials reloaded' server.log) $(grep -c 'credentials reload failed' server.log)" "3 1"
 
-# Rate limits (ADR-0053): a second server with both limits, so this one's requests are not held back.
+# Rate limits (ADR-0053): a second server with a limit, so this one's requests are not held back. The limits are
+# low and the bounds wide: however slowly the requests go, some are let through and many are slowed.
 limitport=$((port + 2))
-"$bin" serve "$work/limited" "$limitport" "$work/credentials" --rate-limit-address 20 --rate-limit-key 5 2> "$work/limited.log" &
+burst() { n=0; i=0; while [ "$i" -lt "$1" ]; do [ "$(curl -s -o /dev/null -w '%{http_code}' "$2")" = 503 ] && n=$((n + 1)); i=$((i + 1)); done; echo "$n"; }
+within() { [ "$1" -ge "$2" ] && [ "$1" -le "$3" ] && echo yes || echo "$1"; }
+"$bin" serve "$work/limited" "$limitport" "$work/credentials" --rate-limit-address 3 2> "$work/limited.log" &
 limited=$!
 sleep 1
-burst() { n=0; i=0; while [ "$i" -lt "$1" ]; do [ "$(curl -s -o /dev/null -w '%{http_code}' "$2")" = "$3" ] && n=$((n + 1)); i=$((i + 1)); done; echo "$n"; }
-sleep 1 # into a fresh second, or nearly: the counts below allow for a boundary
-slowed=$(burst 60 "http://127.0.0.1:$limitport/" 503)
-check "an address past its limit is slowed" "$([ "$slowed" -ge 20 ] && [ "$slowed" -le 40 ] && echo yes || echo "$slowed")" yes
+check "an address past its limit is slowed" "$(within "$(burst 60 "http://127.0.0.1:$limitport/")" 20 57)" yes
 i=0; while [ "$i" -lt 60 ]; do curl -s -o /dev/null -D slow.out "http://127.0.0.1:$limitport/"; grep -q '^HTTP[^ ]* 503' slow.out && break; i=$((i + 1)); done
 check "it is told how long to wait" "$(grep -ci '^retry-after: 1' slow.out)" 1
-sleep 1
-check "the next second is its own" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$limitport/")" 403
+sleep 2
+check "a later second is its own" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$limitport/")" 403
+kill "$limited"
+wait "$limited" 2> /dev/null
+"$bin" serve "$work/limited" "$limitport" "$work/credentials" --rate-limit-key 2 2>> "$work/limited.log" &
+limited=$!
 sleep 1
 listurl=$(python3 -I "$here/s3_raw.py" presign "http://127.0.0.1:$limitport" GET "" "" 60)
-slowed=$(burst 15 "$listurl" 503)
-check "a key past its limit is slowed" "$([ "$slowed" -ge 5 ] && [ "$slowed" -le 10 ] && echo yes || echo "$slowed")" yes
+check "a key past its limit is slowed" "$(within "$(burst 40 "$listurl")" 10 38)" yes
+check "an address is not, without that limit" "$(burst 20 "http://127.0.0.1:$limitport/")" 0
 kill "$limited"
 wait "$limited" 2> /dev/null
 

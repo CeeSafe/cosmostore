@@ -1,0 +1,308 @@
+// The admin API and CLI (ADR-0054). The API is the `_cosmostore` endpoint's calls beside the stats, for a signed
+// key; the CLI, `cosmostore admin`, is a small SigV4 client for them and for a bucket's quota.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+import web_tls;
+import web_client;
+
+// ---- The server's side ----
+
+/// GET /_cosmostore/buckets: every bucket with what it holds and what is set on it, as JSON.
+async fn serveBuckets(app: borrow S3App, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    var all = Vector<BucketSummary>.create();
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        // The buckets' entries, no object: memory only.
+        all = match (store.bucketSummaries()) {
+            Ok(a) => a,
+            Err(e) => { return Err(storeFail(e, 0)); }
+        };
+    }
+    var body = Vector<u8>.create();
+    body.extend("{\"buckets\": [".bytes())?;
+    for (i in 0..all.length) {
+        let b = borrow all[i];
+        body.extend(if (i > 0) ",\n  {".bytes() else "\n  {".bytes())?;
+        body.extend("\"name\": \"".bytes())?;
+        appendJsonText(mut body, b.name.view())?;
+        body.extend("\", \"created\": \"".bytes())?;
+        appendIso8601(mut body, b.createdMillis)?;
+        body.extend("\", ".bytes())?;
+        jsonField(mut body, "objects", b.objects, false)?;
+        jsonField(mut body, "bytes", b.bytes, false)?;
+        jsonField(mut body, "maxBytes", b.maxBytes, false)?;
+        jsonField(mut body, "maxObjects", b.maxObjects, false)?;
+        body.extend("\"versioning\": \"".bytes())?;
+        body.extend(
+            if (b.versioning == VERSIONING_ENABLED) "Enabled".bytes()
+                else if (b.versioning == VERSIONING_SUSPENDED) "Suspended".bytes()
+                else "Off".bytes(),
+        )?;
+        body.push('"')?;
+        let names = ["policy", "acl", "publicAccessBlock", "objectLock", "lifecycle", "notification", "cors"];
+        for (f in 0..names.length) {
+            body.extend(", \"".bytes())?;
+            body.extend(names[f].bytes())?;
+            body.extend(if ((b.set & (1u32 << truncate<u32>(f))) != 0) "\": true".bytes() else "\": false".bytes())?;
+        }
+        body.push('}')?;
+    }
+    body.extend("\n]}\n".bytes())?;
+    exchange.header("content-type", "application/json".bytes())?;
+    await exchange.send(Status.ok(), body.view())?;
+    return Ok();
+}
+
+// ---- The CLI ----
+
+/// What a request of the CLI came to.
+enum AdminFault {
+    /// The endpoint is not `http://host[:port]` or `https://host[:port]`.
+    BadEndpoint,
+    /// The request could not be sent, or its answer read.
+    Unreachable,
+    OutOfMemory,
+}
+
+fn adminOom(e: AllocError) -> AdminFault => AdminFault.OutOfMemory;
+
+/// The host and port of an endpoint, as its `Host` field has them.
+fn endpointAuthority(endpoint: Slice<u8>) -> Slice<u8>? {
+    let start: usize =
+        if (startsWithBytes(endpoint, "http://".bytes())) 7
+            else if (startsWithBytes(endpoint, "https://".bytes())) 8
+            else 0;
+    if (start == 0) { return null; }
+    let end = pieceEnd(endpoint, start, '/');
+    if (end == start || (end < endpoint.length && end + 1 != endpoint.length)) { return null; }
+    return Some(endpoint[start..end]);
+}
+
+/// `YYYYMMDDTHHMMSSZ` of a time, SigV4's `x-amz-date`.
+fn appendAmzDate(out: borrow mut Vector<u8>, millis: i64) -> Result<void, AllocError> {
+    var iso = Vector<u8>.create();
+    appendIso8601(mut iso, millis)?; // 2026-11-14T01:02:03.456Z
+    out.extend(iso.view()[0..4])?;
+    out.extend(iso.view()[5..7])?;
+    out.extend(iso.view()[8..13])?;
+    out.extend(iso.view()[14..16])?;
+    out.extend(iso.view()[17..19])?;
+    out.push('Z')?;
+    return Ok();
+}
+
+/// The `Authorization` of a request signed with SigV4 for the headers `host`, `x-amz-content-sha256` and
+/// `x-amz-date` (ADR-0008 §5), as the server checks one.
+fn adminAuthorization(
+    access: Slice<u8>,
+    secret: Slice<u8>,
+    method: Slice<u8>,
+    path: Slice<u8>,
+    query: Slice<u8>,
+    host: Slice<u8>,
+    amzDate: Slice<u8>,
+    payloadHash: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let signed = "host;x-amz-content-sha256;x-amz-date";
+    var headers = Vector<HeaderPair>.create();
+    headers.push(HeaderPair { name: copyBytes("host".bytes())?, value: copyBytes(host)? })?;
+    headers.push(HeaderPair { name: copyBytes("x-amz-content-sha256".bytes())?, value: copyBytes(payloadHash)? })?;
+    headers.push(HeaderPair { name: copyBytes("x-amz-date".bytes())?, value: copyBytes(amzDate)? })?;
+    var canonical = Vector<u8>.create();
+    let _ = canonicalRequest(method, path, query, headers.view(), signed.bytes(), payloadHash, mut canonical)?;
+    var scope = Vector<u8>.create();
+    scope.extend(amzDate[0..8])?;
+    scope.extend("/us-east-1/s3/aws4_request".bytes())?;
+    let key = signingKey(secret, amzDate[0..8], "us-east-1".bytes(), "s3".bytes())?;
+    var signature = Vector<u8>.create();
+    seedSignature(borrow key, amzDate, scope.view(), canonical.view(), mut signature)?;
+    out.extend("AWS4-HMAC-SHA256 Credential=".bytes())?;
+    out.extend(access)?;
+    out.push('/')?;
+    out.extend(scope.view())?;
+    out.extend(", SignedHeaders=".bytes())?;
+    out.extend(signed.bytes())?;
+    out.extend(", Signature=".bytes())?;
+    out.extend(signature.view())?;
+    return Ok();
+}
+
+/// Sends one signed request to the server and returns its status, with its body in `answer`.
+async fn adminSend(
+    endpoint: StringView,
+    credential: borrow Credential,
+    method: Method,
+    path: StringView,
+    query: StringView,
+    body: Slice<u8>,
+    answer: borrow mut Vector<u8>,
+) -> Result<u16, AdminFault> {
+    let host = match (endpointAuthority(endpoint.bytes())) {
+        Some(h) => h,
+        null => { return Err(AdminFault.BadEndpoint); }
+    };
+    var url = String.create();
+    let slashed = endpoint.length > 0 && endpoint.bytes()[endpoint.length - 1] == '/';
+    let base = if (slashed) endpoint[0..endpoint.length - 1] else endpoint;
+    if (url.append(base).isErr() || url.append(path).isErr()) { return Err(AdminFault.OutOfMemory); }
+    if (query.length > 0 && (url.append("?").isErr() || url.append(query).isErr())) {
+        return Err(AdminFault.OutOfMemory);
+    }
+    var amzDate = Vector<u8>.create();
+    var payloadHash = Vector<u8>.create();
+    var authorization = Vector<u8>.create();
+    let digest = Sha256.of(body);
+    let prepared = appendAmzDate(mut amzDate, Clock.unixMillis()).isOk() &&
+        appendHexBytes(mut payloadHash, digest[..]).isOk() &&
+        adminAuthorization(
+            credential.accessKey.view(),
+            credential.secret.view(),
+            Methods.text(method).bytes(),
+            path.bytes(),
+            query.bytes(),
+            host,
+            amzDate.view(),
+            payloadHash.view(),
+            mut authorization,
+        ).isOk();
+    if (!prepared) { return Err(AdminFault.OutOfMemory); }
+    var options = ClientOptions.defaults();
+    options.totalMs = 60000;
+    options.retry = RetryPolicy.never();
+    let client = match (Client.create(options, deliveryConnector())) {
+        Ok(c) => c,
+        Err(_) => { return Err(AdminFault.OutOfMemory); }
+    };
+    var request = match (ClientRequest.create(method, url.view())) {
+        Ok(r) => r,
+        Err(_) => { return Err(AdminFault.BadEndpoint); }
+    };
+    let fields = request.header("x-amz-date", amzDate.view()).isOk() &&
+        request.header("x-amz-content-sha256", payloadHash.view()).isOk() &&
+        request.header("authorization", authorization.view()).isOk();
+    if (!fields) { return Err(AdminFault.OutOfMemory); }
+    var content = match (BytesBody.of(body)) {
+        Ok(b) => b,
+        Err(_) => { return Err(AdminFault.OutOfMemory); }
+    };
+    var none = NoBody {};
+    let sent = if (body.length > 0) await client.send(request, mut content) else await client.send(request, mut none);
+    var response = match (sent) {
+        Ok(r) => r,
+        Err(_) => { return Err(AdminFault.Unreachable); }
+    };
+    let status = response.status();
+    if ((await response.readToEnd(answer, 16777216)).isErr()) { return Err(AdminFault.Unreachable); }
+    let _ = await response.finish(client);
+    await client.shutdown();
+    return Ok(status);
+}
+
+/// What `cosmostore admin` was asked: the request to send.
+struct AdminCall {
+    method: Method;
+    path: String;
+    query: String;
+    body: Vector<u8>;
+}
+
+/// The request of a command and its arguments (ADR-0054 §2); null for a command there is not.
+fn adminCall(command: StringView, a: StringView, b: StringView, c: StringView) -> Result<AdminCall?, AllocError> {
+    var call = AdminCall {
+        method: Method.Get,
+        path: String.create(),
+        query: String.create(),
+        body: Vector<u8>.create(),
+    };
+    if (command == "stats" || command == "buckets") {
+        if (a.length > 0) { return Ok(null); }
+        call.path.append("/_cosmostore/")?;
+        call.path.append(command)?;
+        return Ok(Some(call));
+    }
+    if (command != "quota" || a.length == 0 || !isValidBucketName(a.bytes())) { return Ok(null); }
+    call.path.append("/")?;
+    call.path.append(a)?;
+    call.query.append("quota=")?;
+    if (b.length == 0) { return Ok(Some(call)); }
+    if (b == "off") {
+        if (c.length > 0) { return Ok(null); }
+        call.method = Method.Delete;
+        return Ok(Some(call));
+    }
+    // The most bytes and the most objects, 0 for no limit of that kind.
+    if (parseDecimal(b.bytes()).isNull() || parseDecimal(c.bytes()).isNull()) { return Ok(null); }
+    call.method = Method.Put;
+    call.body.extend("<Quota><MaxBytes>".bytes())?;
+    call.body.extend(b.bytes())?;
+    call.body.extend("</MaxBytes><MaxObjects>".bytes())?;
+    call.body.extend(c.bytes())?;
+    call.body.extend("</MaxObjects></Quota>".bytes())?;
+    return Ok(Some(call));
+}
+
+/// `cosmostore admin <endpoint> <credentials-file> <command> [arguments]`: sends the command's request, signed
+/// with the file's first key, and prints the answer. Returns the exit status: 0 for a 2xx, 1 for any other answer
+/// (its body on stderr), 2 for a command there is not.
+fn admin() -> i32 {
+    let endpoint = Process.argument(2) ?? "";
+    let credentialsPath = Process.argument(3) ?? "";
+    let command = Process.argument(4) ?? "";
+    if (endpoint.length == 0 || credentialsPath.length == 0 || command.length == 0) { return 2; }
+    let call = match (adminCall(
+        command,
+        Process.argument(5) ?? "",
+        Process.argument(6) ?? "",
+        Process.argument(7) ?? "",
+    )) {
+        Ok(Some(c)) => c,
+        Ok(null) => { return 2; }
+        Err(_) => {
+            Console.writeErrorLine("out of memory");
+            return 1;
+        }
+    };
+    let credentials = match (readCredentials(credentialsPath)) {
+        Ok(c) => c,
+        Err(message) => {
+            Console.writeErrorLine(message.view());
+            return 1;
+        }
+    };
+    var answer = Vector<u8>.create();
+    let sent = Async.run(adminSend(
+        endpoint,
+        borrow credentials[0],
+        call.method,
+        call.path.view(),
+        call.query.view(),
+        call.body.view(),
+        mut answer,
+    ));
+    let status = match (sent) {
+        Ok(s) => s,
+        Err(AdminFault.BadEndpoint) => {
+            Console.writeErrorLine("the endpoint is http://host[:port] or https://host[:port]");
+            return 1;
+        }
+        Err(AdminFault.Unreachable) => {
+            Console.writeErrorLine("the server could not be reached");
+            return 1;
+        }
+        Err(AdminFault.OutOfMemory) => {
+            Console.writeErrorLine("out of memory");
+            return 1;
+        }
+    };
+    let text = StringView.fromUtf8(answer.view()) ?? "";
+    if (status >= 200 && status < 300) {
+        if (text.length > 0) { Console.write(text); }
+        return 0;
+    }
+    Console.writeErrorLine(text);
+    return 1;
+}

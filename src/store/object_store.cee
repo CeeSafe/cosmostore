@@ -205,6 +205,20 @@ struct MaintenanceReport {
     totalMicros: u64;
 }
 
+/// One bucket, for the admin API (ADR-0054): what it holds, its quota (0: no limit), its versioning, and which
+/// configurations it has, as bits in the order policy, ACL, public-access block, object lock, lifecycle rules,
+/// notification rules, CORS rules.
+struct BucketSummary {
+    name: Vector<u8>;
+    createdMillis: i64;
+    objects: u64;
+    bytes: u64;
+    maxBytes: u64;
+    maxObjects: u64;
+    versioning: u8;
+    set: u32;
+}
+
 /// The buckets that have a policy, and their policies' JSON (ADR-0043).
 struct BucketPolicies {
     names: Vector<Vector<u8>>;
@@ -2147,6 +2161,38 @@ struct ObjectStore {
             Some(b) => Ok([b.bytes, b.objects]),
             null => Err(StoreError.NoSuchBucket),
         };
+    }
+
+    /// Every bucket, in the order of their names, with what it holds and what is set on it (ADR-0054).
+    fn bucketSummaries(borrow this) -> Result<Vector<BucketSummary>, StoreError> {
+        var out = Vector<BucketSummary>.create();
+        let names = this.listBuckets()?;
+        for (i in 0..names.length) {
+            let k = BucketKey { name: copyBytes(names[i].view())? };
+            let b = match (this.state.buckets.get(borrow k)) {
+                Some(b) => b,
+                null => { continue; }
+            };
+            var set: u32 = 0;
+            let fields = [
+                b.policy.length, b.acl.length, b.publicAccess.length, b.objectLock.length, b.lifecycle.length,
+                b.notification.length, b.cors.length,
+            ];
+            for (f in 0..fields.length) {
+                if (fields[f] > 0) { set |= 1u32 << truncate<u32>(f); }
+            }
+            out.push(BucketSummary {
+                name: copyBytes(names[i].view())?,
+                createdMillis: b.createdMillis,
+                objects: b.objects,
+                bytes: b.bytes,
+                maxBytes: if (b.quota.length == 16) b.quota.view().readLE<u64>(0) else 0,
+                maxObjects: if (b.quota.length == 16) b.quota.view().readLE<u64>(8) else 0,
+                versioning: b.versioning,
+                set: set,
+            })?;
+        }
+        return Ok(out);
     }
 
     /// How many buckets have CORS rules (ADR-0049 §4).

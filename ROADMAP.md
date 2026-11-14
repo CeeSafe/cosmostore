@@ -2067,3 +2067,32 @@ Browser form uploads with a SigV4 POST policy.
   JavaScript, Java and .NET scripts and `tools/tls_smoke.sh`.
 - **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
 - **Next:** the last part of item 7, an admin API and CLI; item 4's rest when G33 is fixed.
+
+### 14 Nov 2026: M5 item 7, last part: an admin API and CLI (ADR-0054); item 7 done
+
+- **Chosen with the user** (yes, 14 Nov): start small, the stats and a few signed calls.
+- **`GET /_cosmostore/buckets`** beside the stats, for a signed key: every bucket with the versions and bytes it
+  holds, its quota, its versioning and which configurations it has. The buckets' entries only; no object is read.
+- **`cosmostore admin <endpoint> <credentials-file> stats | buckets | quota <bucket> [<max-bytes> <max-objects> |
+  off]`:** one request signed with the file's first key, the answer on stdout; exit 0 for a 2xx, 1 otherwise
+  (the answer on stderr), 2 for a command there is not. It signs with the server's own `canonicalRequest`,
+  `signingKey` and `seedSignature`, and sends with CeeSafe.Web's client; https is verified against the system's
+  roots. It is a client like any other: no access to the store's directory, and under the policies, rate limits
+  and audit log as every request.
+- **Tests (2 new, 216 in all, no leaks):** the request of each command and 7 that are none; an endpoint's host,
+  the `x-amz-date` of a time, the `Authorization` header's shape, the same request signing the same and a query
+  signing otherwise.
+- **Clients:** `tools/s3_smoke.sh` 358 checks (11 new): the CLI's stats and buckets read as JSON, a quota read,
+  set and seen by the raw call, a bucket that is not there, a wrong secret (SignatureDoesNotMatch, exit 1), a
+  command there is not (exit 2), no server (exit 1). boto3 139 and the s3-tests subset 377, as before.
+- **The rate-limit checks of ADR-0053 were made over** in the same script: the first ones assumed 60 requests in
+  about a second, and failed once on a slower run (16 slowed where 20 to 40 were expected). They now use a limit
+  of 3 a second for an address and 2 for a key, on a server each, with bounds that hold however slowly the
+  requests go; and check that an address is not slowed without its limit.
+- **Not done:** forcing a credentials reload or an upkeep round, the outbox beyond its counts, changing the
+  server's options while it runs.
+- **Not run:** the rclone, Go, JavaScript, Java and .NET scripts, `tools/tls_smoke.sh`, and the CLI against an
+  https endpoint.
+- **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
+- **M5 now:** items 1 to 3 and 5 to 7 are built; item 4 (SSE-S3, SSE-C) is designed (ADR-0046) and waits for
+  AES-256-GCM in lib/std (G33). **Next:** G33 in the CeeSafe repo, then item 4; and M5's exit, the runbooks.

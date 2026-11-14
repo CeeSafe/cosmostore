@@ -175,6 +175,7 @@ cosmostore serve <dir> <[address:]port> <credentials-file> [domain] [--tls-cert 
                  [--maintain-seconds <n>] [--upload-expiry-hours <n>] [--notify-targets <file>] [--audit-log <file>]
                  [--rate-limit-address <requests-a-second>] [--rate-limit-key <requests-a-second>]
 cosmostore fsck  <dir>
+cosmostore admin <endpoint> <credentials-file> stats | buckets | quota <bucket> [<max-bytes> <max-objects> | off]
 cosmostore bench <dir> <objects> <size-bytes> <batch>
 cosmostore soak  <dir> <seconds> <keys> <capacity-bytes>
 ```
@@ -211,6 +212,9 @@ cosmostore soak  <dir> <seconds> <keys> <capacity-bytes>
   out/cosmostore bench /tmp/cs-large 8 134217728 1       # 8 x 128 MiB
   ```
 
+- **`admin`** asks a running server, signing with the first key of a credentials file: `stats` (the stats as JSON),
+  `buckets` (every bucket with what it holds, its quota and what is set on it), and `quota <bucket>` to read, set
+  or take off a bucket's quota (ADR-0052, ADR-0054). It needs no access to the store's directory.
 - **`fsck`** opens the store and verifies every live object (see [Space safety and fsck](#space-safety-and-fsck-adr-0006)).
   It exits with status 1 if anything is wrong.
 

@@ -1,0 +1,107 @@
+// The admin CLI (ADR-0054): the request of a command, and the pieces of its signature.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+import web_tls;
+import web_client;
+
+/// A command's request as text: `METHOD path?query body`, or `none`.
+fn callText(command: StringView, a: StringView, b: StringView, c: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    match (adminCall(command, a, b, c)!) {
+        Some(call) => {
+            out.extend(Methods.text(call.method).bytes())!;
+            out.push(' ')!;
+            out.extend(call.path.view().bytes())!;
+            if (call.query.view().length > 0) {
+                out.push('?')!;
+                out.extend(call.query.view().bytes())!;
+            }
+            if (call.body.length > 0) {
+                out.push(' ')!;
+                out.extend(call.body.view())!;
+            }
+        }
+        null => { out.extend("none".bytes())!; }
+    }
+    return out;
+}
+
+@test
+fn adminCommands() -> Result<void, TestFailure> {
+    Check.equalBytes("GET /_cosmostore/stats".bytes(), callText("stats", "", "", "").view())?;
+    Check.equalBytes("GET /_cosmostore/buckets".bytes(), callText("buckets", "", "", "").view())?;
+    Check.equalBytes("GET /photos?quota=".bytes(), callText("quota", "photos", "", "").view())?;
+    Check.equalBytes(
+        "PUT /photos?quota= <Quota><MaxBytes>1073741824</MaxBytes><MaxObjects>0</MaxObjects></Quota>".bytes(),
+        callText("quota", "photos", "1073741824", "0").view(),
+    )?;
+    Check.equalBytes("DELETE /photos?quota=".bytes(), callText("quota", "photos", "off", "").view())?;
+    let none = "none".bytes();
+    Check.equalBytes(none, callText("stat", "", "", "").view())?;
+    Check.equalBytes(none, callText("stats", "extra", "", "").view())?;
+    Check.equalBytes(none, callText("quota", "", "", "").view())?;
+    Check.equalBytes(none, callText("quota", "Not_A_Bucket", "", "").view())?;
+    Check.equalBytes(none, callText("quota", "photos", "100", "").view())?; // both limits, or neither
+    Check.equalBytes(none, callText("quota", "photos", "1GiB", "0").view())?;
+    Check.equalBytes(none, callText("quota", "photos", "off", "0").view())?;
+    return Ok();
+}
+
+@test
+fn adminSignature() -> Result<void, TestFailure> {
+    Check.equalBytes("127.0.0.1:9000".bytes(), endpointAuthority("http://127.0.0.1:9000".bytes()) ?? "".bytes())?;
+    Check.equalBytes("s3.example.com".bytes(), endpointAuthority("https://s3.example.com/".bytes()) ?? "".bytes())?;
+    let bad = ["127.0.0.1:9000", "ftp://host", "http://", "http://host/path", ""];
+    for (b in bad) { Check.isTrue(endpointAuthority(b.bytes()).isNull(), "not an endpoint")?; }
+    var date = Vector<u8>.create();
+    appendAmzDate(mut date, 1767225600123)!;
+    Check.equalBytes("20260101T000000Z".bytes(), date.view())?;
+    // The signature is what the server computes for the same request: AWS's own example of a GET (the canonical
+    // request and the signing are the server's, ADR-0008; here the header is put together around them).
+    var auth = Vector<u8>.create();
+    adminAuthorization(
+        "AKIAIOSFODNN7EXAMPLE".bytes(),
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".bytes(),
+        "GET".bytes(),
+        "/test.txt".bytes(),
+        "".bytes(),
+        "examplebucket.s3.amazonaws.com".bytes(),
+        "20130524T000000Z".bytes(),
+        EMPTY_SHA256.bytes(),
+        mut auth,
+    )!;
+    let head =
+        "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=";
+    Check.isTrue(startsWithBytes(auth.view(), head.bytes()), "the header's shape")?;
+    Check.equalU64((head.length + 64) as u64, auth.length as u64)?; // and a signature of 64 hex digits
+    // The same request signs the same; another secret, path or query signs otherwise.
+    var again = Vector<u8>.create();
+    adminAuthorization(
+        "AKIAIOSFODNN7EXAMPLE".bytes(),
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".bytes(),
+        "GET".bytes(),
+        "/test.txt".bytes(),
+        "".bytes(),
+        "examplebucket.s3.amazonaws.com".bytes(),
+        "20130524T000000Z".bytes(),
+        EMPTY_SHA256.bytes(),
+        mut again,
+    )!;
+    Check.equalBytes(auth.view(), again.view())?;
+    var other = Vector<u8>.create();
+    adminAuthorization(
+        "AKIAIOSFODNN7EXAMPLE".bytes(),
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".bytes(),
+        "GET".bytes(),
+        "/test.txt".bytes(),
+        "quota=".bytes(),
+        "examplebucket.s3.amazonaws.com".bytes(),
+        "20130524T000000Z".bytes(),
+        EMPTY_SHA256.bytes(),
+        mut other,
+    )!;
+    Check.isTrue(auth.view() != other.view(), "the query is signed")?;
+    return Ok();
+}

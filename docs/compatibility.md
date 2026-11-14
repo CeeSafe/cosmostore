@@ -8,7 +8,7 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
 
 | Client | Version | Script | Checks | Result |
 |---|---|---|---|---|
-| AWS CLI v2 | 2.34.13 | `tools/s3_smoke.sh` | 347 | pass |
+| AWS CLI v2 | 2.34.13 | `tools/s3_smoke.sh` | 358 | pass |
 | rclone | 1.73.2 | `tools/sdk/rclone.sh` | 20 | pass |
 | boto3 (botocore with CRT) | 1.42.97 | `tools/sdk/boto3.sh` | 139 | pass |
 | AWS SDK for Go v2 | service/s3 1.114.9 | `tools/sdk/go.sh` | 22 | pass |
@@ -79,7 +79,7 @@ SHA-1 still fails, along with those that need a second account or POST object.
 | Addressing | path-style; virtual-host under a configured domain | |
 | Network | HTTP/1.1 on any address (`[address:]port`, 127.0.0.1 by default); TLS 1.2/1.3 with `--tls-cert`/`--tls-key`, reloaded when the files change | SNI, HTTP/2 |
 
-Anything else gets S3's `NotImplemented` (501) XML error. Design notes: ADR-0008 to ADR-0020 and ADR-0041 to ADR-0053 in `docs/adr/`.
+Anything else gets S3's `NotImplemented` (501) XML error. Design notes: ADR-0008 to ADR-0020 and ADR-0041 to ADR-0054 in `docs/adr/`.
 
 Versioning (ADR-0041) is checked by `tools/s3_smoke.sh` with the AWS CLI (34 checks), `tools/sdk/boto3.sh` (20
 checks) and the s3-tests subset; the lifecycle rules for versions (ADR-0042) by two checks in each of the first two. Bucket policies (ADR-0043) are
