@@ -1,0 +1,787 @@
+// S3 on a cluster (ADR-0060, M6 item 4 slice b). Each shard's store has an S3 server of its own inside the node, on a
+// loopback port: the whole S3 layer, unchanged. The node's S3 port is the front: it finds a request's shard from its
+// bucket and sends the request to the shard's leader, itself or another node (`POST /s3` on that node's peer port).
+// The leader takes writes one at a time per shard; it holds a write's response until the entries the write staged are
+// committed and applied, and answers a read only after a ReadIndex round and the apply it names.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+import web_client;
+
+/// How long the front waits for a leader, a read round, or a commit before it answers 503.
+const FRONT_WAIT_MS: u64 = 2000;
+const FRONT_COMMIT_MS: u64 = 5000;
+const FRONT_POLL_MS: u64 = 1;
+/// The largest request or response body the front holds: inline objects only, until item 5.
+const FRONT_MAX_BODY: usize = 67108864;
+
+/// A request or a response, as bytes: what goes to a shard's S3 server, or between nodes.
+struct RawMessage {
+    /// A request's method and target; a response's status.
+    method: Vector<u8>;
+    target: Vector<u8>;
+    status: u16;
+    names: Vector<Vector<u8>>;
+    values: Vector<Vector<u8>>;
+    body: Vector<u8>;
+
+    fn empty() -> RawMessage => RawMessage {
+        method: Vector<u8>.create(),
+        target: Vector<u8>.create(),
+        status: 0,
+        names: Vector<Vector<u8>>.create(),
+        values: Vector<Vector<u8>>.create(),
+        body: Vector<u8>.create(),
+    };
+
+    fn addHeader(borrow mut this, name: Slice<u8>, value: Slice<u8>) -> Result<void, AllocError> {
+        var n = Vector<u8>.create();
+        for (b in name) { n.push(lowerAscii(b))?; }
+        var v = Vector<u8>.create();
+        v.extend(value)?;
+        this.names.push(n)?;
+        this.values.push(v)?;
+        return Ok();
+    }
+}
+
+fn pushBytes32(out: borrow mut Vector<u8>, b: Slice<u8>) -> Result<void, AllocError> {
+    out.pushLE(truncate<u32>(b.length))?;
+    out.extend(b)?;
+    return Ok();
+}
+
+/// u16 status, then u32 + bytes of the method and of the target, u32 header count with u32 + bytes of each name and
+/// value, u32 + bytes of the body.
+fn encodeRaw(out: borrow mut Vector<u8>, m: borrow RawMessage) -> Result<void, AllocError> {
+    out.pushLE(m.status)?;
+    pushBytes32(out, m.method.view())?;
+    pushBytes32(out, m.target.view())?;
+    out.pushLE(truncate<u32>(m.names.length))?;
+    for (i in 0..m.names.length) {
+        pushBytes32(out, m.names[i].view())?;
+        pushBytes32(out, m.values[i].view())?;
+    }
+    pushBytes32(out, m.body.view())?;
+    return Ok();
+}
+
+fn decodeRaw(bytes: Slice<u8>) -> Result<RawMessage, WireFault> {
+    var r = WireReader { at: 0 };
+    var m = RawMessage.empty();
+    m.status = r.u16Of(bytes)?;
+    m.method = r.bytesOf(bytes)?;
+    m.target = r.bytesOf(bytes)?;
+    let count = r.u32Of(bytes)?;
+    if (count > 1024) { return Err(WireFault.TooMany); }
+    var i = 0u32;
+    while (i < count) {
+        let n = r.bytesOf(bytes)?;
+        let v = r.bytesOf(bytes)?;
+        if (m.names.push(n).isErr() || m.values.push(v).isErr()) { return Err(WireFault.OutOfMemory); }
+        i += 1;
+    }
+    m.body = r.bytesOf(bytes)?;
+    if (r.at != bytes.length) { return Err(WireFault.Long); }
+    return Ok(m);
+}
+
+/// The bucket a path names: its first segment (path-style addressing); empty for `/`.
+fn bucketOfTarget(target: Slice<u8>) -> Slice<u8> {
+    var end = target.length;
+    for (i in 0..target.length) {
+        if (target[i] == 0x3F) { // '?'
+            end = i;
+            break;
+        }
+    }
+    let path = target[0..end];
+    if (path.length < 2 || path[0] != 0x2F) { return target[0..0]; }
+    var stop = path.length;
+    for (i in 1..path.length) {
+        if (path[i] == 0x2F) {
+            stop = i;
+            break;
+        }
+    }
+    return path[1..stop];
+}
+
+/// A bucket's shard (ADR-0060 §3): the first 8 bytes of SHA-256(cluster name ‖ bucket), modulo the shard count.
+fn shardOfBucket(file: borrow ClusterFile, bucket: Slice<u8>) -> u32 {
+    var h = Sha256.create();
+    h.update(file.name[..]);
+    h.update(bucket);
+    let d = h.finish();
+    return truncate<u32>(d[..].readBE<u64>(0) % (file.shards as u64));
+}
+
+/// What a shard's S3 server needs that the node gives it: its store, the node's credentials.
+fn clusterS3App(
+    store: Arc<AsyncMutex<ObjectStore>>,
+    writers: WriterFactory,
+    credentials: Arc<CredentialSets>,
+) -> Result<S3App, AllocError> {
+    var barriers = Vector<AsyncMutex<u8>>.create();
+    for (i in 0..BARRIERS) { barriers.push(AsyncMutex<u8>.create(0)?)?; }
+    return Ok(S3App {
+        store: store,
+        credentials: credentials,
+        requests: AtomicU64.create(0),
+        domain: Vector<u8>.create(),
+        commitTurn: AsyncMutex<u8>.create(0)?,
+        published: AtomicU64.create(0),
+        syncing: AtomicBool.create(false),
+        syncingBatch: AtomicU64.create(0),
+        syncingLast: AtomicU64.create(0),
+        barriers: barriers,
+        leading: AtomicBool.create(false),
+        leadingBatch: AtomicU64.create(0),
+        writers: writers,
+        latencies: Latencies.create()?,
+        bodyBuffers: Channel<Vector<u8>>.create(BODY_BUFFERS)?,
+        // "Some", for good: another leader's writes reach this store without passing here (ADR-0060).
+        policyBuckets: AtomicU64.create(1),
+        denyBuckets: AtomicU64.create(1),
+        secure: false,
+        notifyTargets: Vector<NotifyTarget>.create(),
+        sseKeys: Vector<MasterKey>.create(),
+        kmsKeys: Vector<MasterKey>.create(),
+        corsBuckets: AtomicU64.create(1),
+        encryptedBuckets: AtomicU64.create(1),
+        audit: null,
+        rates: RateLimiter.create(0, 0)?,
+        cluster: true,
+    });
+}
+
+async fn frontPause(ms: u64) -> bool {
+    return (await Timer.sleep(ms)).isOk();
+}
+
+fn frontClient() -> Client? {
+    var options = ClientOptions.defaults();
+    options.totalMs = 30000;
+    options.retry = RetryPolicy.never();
+    return match (Client.create(options, null)) {
+        Ok(c) => Some(c),
+        Err(_) => null,
+    };
+}
+
+/// Sends `raw` to `url` (a shard's S3 server, or a node's peer port with `signed` headers), and reads the response
+/// whole. The client's own `host` goes with it: its signature covers it.
+async fn exchangeRaw(
+    shared: borrow NodeShared,
+    url: StringView,
+    raw: borrow RawMessage,
+    signedPath: StringView?,
+    body: Slice<u8>,
+) -> Result<RawMessage, NodeFault> {
+    let client = match (frontClient()) {
+        Some(c) => c,
+        null => { return Err(NodeFault.OutOfMemory); }
+    };
+    let method = match (signedPath) {
+        Some(_) => Method.Post,
+        null => Methods.parse(raw.method.view()),
+    };
+    // A shard's S3 server is asked for the request's own path and query; a node's peer port for its fixed path.
+    var full = textOf(url);
+    if (signedPath.isNull()) {
+        let target = StringView.fromUtf8(raw.target.view()) ?? "/";
+        if (full.append(target).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    var request = match (ClientRequest.create(method, full.view())) {
+        Ok(r) => r,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    match (signedPath) {
+        Some(path) => {
+            if (!signRequest(mut request, borrow shared.file, shared.secret.view(), shared.id, "POST", path, body)) {
+                return Err(NodeFault.OutOfMemory);
+            }
+        }
+        null => {
+            for (i in 0..raw.names.length) {
+                let n = raw.names[i].view();
+                if (Ascii.equalsIgnoringCase(n, "host")) {
+                    if (request.setAuthority(raw.values[i].view()).isErr()) { return Err(NodeFault.Net); }
+                    continue;
+                }
+                let hop = Ascii.equalsIgnoringCase(n, "content-length") ||
+                    Ascii.equalsIgnoringCase(n, "transfer-encoding") || Ascii.equalsIgnoringCase(n, "connection") ||
+                    Ascii.equalsIgnoringCase(n, "expect") || Ascii.equalsIgnoringCase(n, "keep-alive");
+                if (hop) { continue; }
+                let name = StringView.fromUtf8(n) ?? "";
+                if (request.header(name, raw.values[i].view()).isErr()) { return Err(NodeFault.Net); }
+            }
+        }
+    }
+    var content = match (BytesBody.of(body)) {
+        Ok(b) => b,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    var response = match (await client.send(request, mut content)) {
+        Ok(r) => r,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    var out = RawMessage.empty();
+    out.status = response.status();
+    var fields = HeaderBlock.create();
+    if (response.fields(mut fields).isErr()) { return Err(NodeFault.Net); }
+    for (i in 0..fields.count()) {
+        if (out.addHeader(fields.name(i), fields.value(i)).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    if ((await response.readToEnd(mut out.body, FRONT_MAX_BODY)).isErr()) { return Err(NodeFault.Net); }
+    let _ = await response.finish(borrow client);
+    await client.shutdown();
+    return Ok(out);
+}
+
+fn statusOnly(status: u16) -> RawMessage {
+    var m = RawMessage.empty();
+    m.status = status;
+    return m;
+}
+
+/// The slot of `shard` on this node, if it holds one.
+fn slotOf(shared: borrow NodeShared, shard: u32) -> usize? {
+    for (i in 0..shared.slots.length) {
+        if (shared.slots[i].shard == shard) { return Some(i); }
+    }
+    return null;
+}
+
+/// Whether this node's replica of the slot leads, and the leader it knows of (0: none).
+async fn leaderOf(slot: borrow ShardSlot) -> Result<u32, NodeFault> {
+    var guard = match (await slot.replica.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    return Ok(guard.data().core.leader);
+}
+
+/// The replica's state that a leader's request waits on: its role and term, its last and applied entries.
+struct LeaderView {
+    leads: bool;
+    term: u64;
+    last: u64;
+    applied: u64;
+    coreLast: u64;
+}
+
+async fn viewOf(slot: borrow ShardSlot) -> Result<LeaderView, NodeFault> {
+    var guard = match (await slot.replica.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let r = guard.data();
+    var storeGuard = match (await slot.store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let st = storeGuard.data();
+    return Ok(LeaderView {
+        leads: r.core.isLeader(),
+        term: r.core.term,
+        last: st.lastEntry(),
+        applied: st.appliedIndex(),
+        coreLast: r.core.lastIndex(),
+    });
+}
+
+/// Proposes what the shard's S3 server staged and persisted since `before`; the last index and the term, or null if
+/// it staged nothing (or this replica stopped leading: its entries will be cut off).
+async fn proposeStaged(shared: borrow NodeShared, slot: borrow ShardSlot) -> Result<LeaderView?, NodeFault> {
+    var guard = match (await slot.replica.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let r = guard.data();
+    var storeGuard = match (await slot.store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let st = storeGuard.data();
+    if (!r.core.isLeader()) { return Ok(null); }
+    let before = r.core.lastIndex();
+    let term = r.core.term;
+    let proposed = await Async.blocking(() => proposeAndDrain(r, st, before));
+    let out = match (proposed) {
+        Ok(o) => o,
+        Err(e) => {
+            await noteFailure(slot, e);
+            return Ok(null);
+        }
+    };
+    let last = st.lastEntry();
+    await enqueue(shared, slot.shard, out.messages)?;
+    if (!out.any) { return Ok(null); }
+    return Ok(Some(LeaderView { leads: true, term: term, last: last, applied: st.appliedIndex(), coreLast: last }));
+}
+
+struct Proposed {
+    any: bool;
+    messages: Vector<RaftMessage>;
+}
+
+fn proposeAndDrain(
+    r: borrow mut ShardReplica,
+    st: borrow mut ObjectStore,
+    before: u64,
+) -> Result<Proposed, StoreError> {
+    let last = r.finishWrite(st, before)?;
+    var out = Vector<RaftMessage>.create();
+    r.drain(st, mut out)?;
+    return Ok(Proposed { any: last.isSome(), messages: out });
+}
+
+/// A write on the leader (ADR-0060 §5): behind the shard's gate, after everything earlier is applied; its response
+/// held until its entries are committed and applied in the term they were proposed in.
+async fn leadWrite(shared: borrow NodeShared, at: usize, raw: borrow RawMessage) -> Result<RawMessage, NodeFault> {
+    let slot = borrow shared.slots[at];
+    var gate = match (await slot.gate.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let _held = gate.data();
+    var waited = 0u64;
+    while (true) {
+        let v = await viewOf(slot)?;
+        if (!v.leads) { return Ok(statusOnly(421)); }
+        if (v.applied == v.last && v.coreLast == v.last) { break; }
+        if (waited >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(statusOnly(503)); }
+        waited += FRONT_POLL_MS;
+    }
+    let response = await exchangeRaw(shared, slot.s3url.view(), raw, null, raw.body.view())?;
+    let proposed = match (await proposeStaged(shared, slot)?) {
+        Some(p) => p,
+        null => {
+            // Nothing staged (a refusal, a delete of nothing): the answer stands; or no longer the leader, and what it
+            // staged is cut off by the next one: 503, the outcome unknown to the client.
+            let v = await viewOf(slot)?;
+            if (v.leads) { return Ok(response); }
+            return Ok(statusOnly(503));
+        }
+    };
+    waited = 0;
+    while (true) {
+        let v = await viewOf(slot)?;
+        if (v.applied >= proposed.last) {
+            // Applied: the entry at the index is committed; its term says it is this write's.
+            if ((await entryTermOf(slot, proposed.last))? == proposed.term) { return Ok(response); }
+            return Ok(statusOnly(503));
+        }
+        if (!v.leads || v.term != proposed.term) { return Ok(statusOnly(503)); }
+        if (waited >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(statusOnly(503)); }
+        waited += FRONT_POLL_MS;
+    }
+    return Ok(statusOnly(503));
+}
+
+async fn entryTermOf(slot: borrow ShardSlot, index: u64) -> Result<u64, NodeFault> {
+    var storeGuard = match (await slot.store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let st = storeGuard.data();
+    // A read of the journal: on a worker.
+    let term = await Async.blocking(() => st.entryTerm(index));
+    return Ok(term.ok() ?? 0);
+}
+
+/// A read on the leader (ADR-0060 §6): a ReadIndex round, the apply it names, then the shard's S3 server.
+async fn leadRead(shared: borrow NodeShared, at: usize, raw: borrow RawMessage) -> Result<RawMessage, NodeFault> {
+    let slot = borrow shared.slots[at];
+    let id = shared.readIds.fetchAdd(1) + 1;
+    var waited = 0u64;
+    // Asked of the core until it takes it: a new leader takes reads once its first entry is committed.
+    while (true) {
+        var guard = match (await slot.replica.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let r = guard.data();
+        if (!r.core.isLeader()) { return Ok(statusOnly(421)); }
+        let taken = match (r.core.readIndex(id)) {
+            Ok(t) => t,
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        };
+        if (taken) {
+            var storeGuard = match (await slot.store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let st = storeGuard.data();
+            let drained = await Async.blocking(() => drainOf(r, st));
+            match (drained) {
+                Ok(out) => { await enqueue(shared, slot.shard, out)?; }
+                Err(e) => {
+                    await noteFailure(slot, e);
+                    return Ok(statusOnly(503));
+                }
+            }
+            break;
+        }
+        if (waited >= FRONT_WAIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(statusOnly(503)); }
+        waited += FRONT_POLL_MS;
+    }
+    // The round's answer, and the index it names.
+    var index = 0u64;
+    waited = 0;
+    while (true) {
+        {
+            var guard = match (await slot.replica.lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let r = guard.data();
+            var k = 0usize;
+            var found = false;
+            while (k < r.reads.length) {
+                if (r.reads[k].id == id) {
+                    index = r.reads[k].index;
+                    let _ = r.reads.swapRemove(k);
+                    found = true;
+                    break;
+                }
+                k += 1;
+            }
+            if (found) { break; }
+            if (!r.core.isLeader()) { return Ok(statusOnly(421)); }
+        }
+        if (waited >= FRONT_WAIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(statusOnly(503)); }
+        waited += FRONT_POLL_MS;
+    }
+    waited = 0;
+    while (true) {
+        let v = await viewOf(slot)?;
+        if (v.applied >= index) { break; }
+        if (waited >= FRONT_WAIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(statusOnly(503)); }
+        waited += FRONT_POLL_MS;
+    }
+    return await exchangeRaw(shared, slot.s3url.view(), raw, null, raw.body.view());
+}
+
+/// Methods are case-sensitive tokens (RFC 9110 §9.1): a write is PUT, POST or DELETE exactly.
+fn isWriteMethod(method: Slice<u8>) -> bool => match (Methods.parse(method)) {
+    Method.Put => true,
+    Method.Post => true,
+    Method.Delete => true,
+    _ => false,
+};
+
+/// A request for `shard` on this node as its leader; 421 when it is not.
+async fn leadRequest(shared: borrow NodeShared, shard: u32, raw: borrow RawMessage) -> Result<RawMessage, NodeFault> {
+    let at = match (slotOf(shared, shard)) {
+        Some(i) => i,
+        null => { return Ok(statusOnly(421)); }
+    };
+    if (shared.slots[at].failed.load() != 0) { return Ok(statusOnly(503)); }
+    if (isWriteMethod(raw.method.view())) { return await leadWrite(shared, at, raw); }
+    return await leadRead(shared, at, raw);
+}
+
+/// Sends a request for `shard` to its leader: this node, or the node it last heard of, or each node the shard is
+/// placed on in turn; tries again while there is no leader, for up to FRONT_WAIT_MS.
+async fn routeRequest(shared: borrow NodeShared, shard: u32, raw: borrow RawMessage) -> Result<RawMessage, NodeFault> {
+    var waited = 0u64;
+    var body = Vector<u8>.create();
+    if (body.pushLE(shard).isErr() || encodeRaw(mut body, raw).isErr()) { return Err(NodeFault.OutOfMemory); }
+    let placed = match (shared.file.placement(shard)) {
+        Ok(p) => p,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    var turn = 0usize;
+    while (true) {
+        var target = 0u32;
+        match (slotOf(shared, shard)) {
+            Some(at) => {
+                let leader = await leaderOf(borrow shared.slots[at])?;
+                if (leader == shared.id) {
+                    let answer = await leadRequest(shared, shard, raw)?;
+                    if (answer.status != 421) { return Ok(answer); }
+                } else if (leader != 0) {
+                    target = leader;
+                }
+            }
+            null => {
+                // Not a shard of this node: ask its nodes in turn.
+                target = placed[turn % placed.length];
+                turn += 1;
+            }
+        }
+        if (target != 0) {
+            match (shared.file.node(target)) {
+                Some(n) => {
+                    var url = textOf("http://");
+                    if (appendPeerAddress(mut url, n.peer).isErr() || url.append("/s3").isErr()) {
+                        return Err(NodeFault.OutOfMemory);
+                    }
+                    let empty = RawMessage.empty();
+                    match (await exchangeRaw(shared, url.view(), borrow empty, Some("/s3"), body.view())) {
+                        Ok(reply) => {
+                            if (reply.status == 200) {
+                                match (decodeRaw(reply.body.view())) {
+                                    Ok(answer) => { return Ok(answer); }
+                                    Err(_) => { return Ok(statusOnly(502)); }
+                                }
+                            }
+                            // 421: not the leader any more; anything else, try again too.
+                        }
+                        Err(_) => {}
+                    }
+                }
+                null => {}
+            }
+        }
+        if (waited >= FRONT_WAIT_MS || !(await frontPause(20))) { return Ok(statusOnly(503)); }
+        waited += 20;
+    }
+    return Ok(statusOnly(503));
+}
+
+/// ListBuckets on a cluster (ADR-0060 §7): every shard's answer, each a linearizable read, the `<Bucket>` entries
+/// merged by name into the first answer's frame.
+async fn listAllBuckets(shared: borrow NodeShared, raw: borrow RawMessage) -> Result<RawMessage, NodeFault> {
+    var first: RawMessage? = null;
+    var entries = Vector<Vector<u8>>.create();
+    var names = Vector<Vector<u8>>.create();
+    var shard = 0u32;
+    while (shard < shared.file.shards) {
+        let answer = await routeRequest(shared, shard, raw)?;
+        if (answer.status != 200) { return Ok(answer); }
+        // Each `<Bucket>…</Bucket>`, by its name.
+        let b = answer.body.view();
+        var at = 0usize;
+        while (true) {
+            let open = match (indexOfFrom(b, "<Bucket>".bytes(), at)) {
+                Some(i) => i,
+                null => { break; }
+            };
+            let close = match (indexOfFrom(b, "</Bucket>".bytes(), open)) {
+                Some(i) => i + 9,
+                null => { break; }
+            };
+            let entry = b[open..close];
+            let name = match (indexOfFrom(entry, "<Name>".bytes(), 0)) {
+                Some(n) => match (indexOfFrom(entry, "</Name>".bytes(), n)) {
+                    Some(e) => entry[n + 6..e],
+                    null => entry[0..0],
+                },
+                null => entry[0..0],
+            };
+            var e = Vector<u8>.create();
+            var nm = Vector<u8>.create();
+            if (e.extend(entry).isErr() || nm.extend(name).isErr()) { return Err(NodeFault.OutOfMemory); }
+            // Insertion by name.
+            var k = names.length;
+            while (k > 0 && compareBytes(names[k - 1].view(), nm.view()) > 0) { k -= 1; }
+            if (entries.insert(k, e).isErr() || names.insert(k, nm).isErr()) { return Err(NodeFault.OutOfMemory); }
+            at = close;
+        }
+        if (first.isNull()) { first = Some(answer); }
+        shard += 1;
+    }
+    var out = match (first) {
+        Some(f) => f,
+        null => { return Ok(statusOnly(503)); }
+    };
+    // The frame: everything up to `<Buckets>` and from `</Buckets>`, the merged entries between.
+    let b = out.body.view();
+    let start = match (indexOfFrom(b, "<Buckets>".bytes(), 0)) {
+        Some(i) => i + 9,
+        null => { return Ok(out); }
+    };
+    let end = match (indexOfFrom(b, "</Buckets>".bytes(), start)) {
+        Some(i) => i,
+        null => { return Ok(out); }
+    };
+    var merged = Vector<u8>.create();
+    let built = merged.extend(b[0..start]).isOk();
+    if (!built) { return Err(NodeFault.OutOfMemory); }
+    for (i in 0..entries.length) {
+        if (merged.extend(entries[i].view()).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    if (merged.extend(b[end..b.length]).isErr()) { return Err(NodeFault.OutOfMemory); }
+    out.body = merged;
+    return Ok(out);
+}
+
+fn indexOfFrom(hay: Slice<u8>, needle: Slice<u8>, from: usize) -> usize? {
+    if (needle.length == 0 || hay.length < needle.length) { return null; }
+    var i = from;
+    while (i + needle.length <= hay.length) {
+        var same = true;
+        for (k in 0..needle.length) {
+            if (hay[i + k] != needle[k]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) { return Some(i); }
+        i += 1;
+    }
+    return null;
+}
+
+// --- The front's handler ---
+
+struct FrontApp {
+    shared: Arc<NodeShared>;
+}
+
+struct FrontHandler {}
+
+/// An S3 error answer the front makes itself (no leader, no such operation on a cluster).
+fn frontError(code: StringView, status: u16) -> RawMessage {
+    var m = statusOnly(status);
+    var xml = Vector<u8>.create();
+    let _ = xml.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>".bytes());
+    let _ = xml.extend(code.bytes());
+    let _ = xml.extend("</Code><Message>".bytes());
+    let _ = xml.extend(code.bytes());
+    let _ = xml.extend("</Message></Error>".bytes());
+    let _ = m.addHeader("content-type".bytes(), "application/xml".bytes());
+    m.body = xml;
+    return m;
+}
+
+impl Handler<FrontApp> for FrontHandler {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<FrontApp>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let shared = ctx.state().shared.get();
+        var raw = RawMessage.empty();
+        let target = request.path();
+        let copied = raw.method.extend(request.methodToken()).isOk() && raw.target.extend(target.bytes()).isOk();
+        if (!copied) { return Err(HandlerError.Internal); }
+        match (request.query()) {
+            Some(q) => {
+                if (raw.target.push(0x3F).isErr() || raw.target.extend(q.bytes()).isErr()) {
+                    return Err(HandlerError.Internal);
+                }
+            }
+            null => {}
+        }
+        let fields = request.headers();
+        for (i in 0..fields.count()) {
+            if (raw.addHeader(fields.nameBytes(i), fields.value(i)).isErr()) { return Err(HandlerError.Internal); }
+        }
+        var buf = Vector<u8>.create();
+        if (buf.resize(65536, 0).isErr()) { return Err(HandlerError.Internal); }
+        while (true) {
+            let n = await exchange.read(mut buf.viewMut()[..])?;
+            if (n == 0) { break; }
+            if (raw.body.length + n > FRONT_MAX_BODY) {
+                return await relay(exchange, frontError("EntityTooLarge", 400), false);
+            }
+            if (raw.body.extend(buf.view()[0..n]).isErr()) { return Err(HandlerError.Internal); }
+        }
+        let bucket = bucketOfTarget(raw.target.view());
+        let head = Methods.parse(raw.method.view()) == Method.Head;
+        // A copy reads its source from its own shard's store: a source in another shard's bucket is not there.
+        for (i in 0..raw.names.length) {
+            if (!Ascii.equalsIgnoringCase(raw.names[i].view(), "x-amz-copy-source")) { continue; }
+            let source = copySourceBucket(raw.values[i].view());
+            if (source.length > 0 && shardOfBucket(
+                borrow shared.file,
+                source,
+            ) != shardOfBucket(borrow shared.file, bucket)) {
+                return await relay(exchange, frontError("NotImplemented", 501), false);
+            }
+        }
+        let answered = if (bucket.length == 0) {
+            if (Methods.parse(raw.method.view()) == Method.Get) await listAllBuckets(shared, borrow raw) else Ok(
+                frontError("NotImplemented", 501),
+            )
+        } else await routeRequest(shared, shardOfBucket(borrow shared.file, bucket), borrow raw);
+        let answer = match (answered) {
+            Ok(a) => a,
+            Err(_) => frontError("InternalError", 500),
+        };
+        let shown = if (answer.status == 503 && answer.body.length == 0) frontError(
+            "ServiceUnavailable",
+            503,
+        ) else if (answer.status == 421) frontError(
+            "ServiceUnavailable",
+            503,
+        ) else answer;
+        return await relay(exchange, shown, head);
+    }
+}
+
+/// Sends a response as a shard's S3 server gave it: its status, its headers but the framing ones, its body. A HEAD's
+/// answer keeps its Content-Length, the length GET would send, with no content.
+async fn relay(exchange: borrow mut Exchange, m: RawMessage, head: bool) -> Result<void, HandlerError> {
+    var declared: u64? = null;
+    for (i in 0..m.names.length) {
+        if (Ascii.equalsIgnoringCase(m.names[i].view(), "content-length")) {
+            declared = (StringView.fromUtf8(m.values[i].view()) ?? "").parseInt<u64>();
+        }
+    }
+    for (i in 0..m.names.length) {
+        let n = m.names[i].view();
+        let framing = Ascii.equalsIgnoringCase(
+            n,
+            "content-length",
+        ) || Ascii.equalsIgnoringCase(n, "transfer-encoding") ||
+            Ascii.equalsIgnoringCase(n, "connection") || Ascii.equalsIgnoringCase(n, "keep-alive") ||
+            Ascii.equalsIgnoringCase(n, "date") || Ascii.equalsIgnoringCase(n, "server");
+        if (framing) { continue; }
+        let name = StringView.fromUtf8(n) ?? "";
+        exchange.header(name, m.values[i].view())?;
+    }
+    if (head && m.body.length == 0) {
+        match (declared) {
+            Some(n) => {
+                exchange.setStatus(statusOf(m.status));
+                exchange.setContentLength(n);
+                return await exchange.write("".bytes());
+            }
+            null => {}
+        }
+    }
+    return await exchange.send(statusOf(m.status), m.body.view());
+}
+
+/// The bucket an `x-amz-copy-source` names: `bucket/key` or `/bucket/key`, the bucket before the first `/`.
+fn copySourceBucket(source: Slice<u8>) -> Slice<u8> {
+    let from: usize = if (source.length > 0 && source[0] == 0x2F) 1 else 0;
+    var stop = source.length;
+    for (i in from..source.length) {
+        if (source[i] == 0x2F) {
+            stop = i;
+            break;
+        }
+    }
+    return source[from..stop];
+}
+
+fn frontHandler() -> Result<Box<dyn Handler<FrontApp> + Send + Share>, RouteError> {
+    match (Box.create(FrontHandler {})) {
+        Ok(h) => {
+            let d: Box<dyn Handler<FrontApp> + Send + Share> = h;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+fn frontServer(app: FrontApp) -> Result<Server<FrontApp>, RouteError> {
+    var limits = Limits.defaults();
+    limits.maxBodyBytes = FRONT_MAX_BODY as u64;
+    var server = Server<FrontApp>.create(app, limits)?;
+    server.router().get("/*path", frontHandler()?)?;
+    server.router().put("/*path", frontHandler()?)?;
+    server.router().post("/*path", frontHandler()?)?;
+    server.router().delete("/*path", frontHandler()?)?;
+    server.router().add(Method.Head, "/*path", frontHandler()?)?;
+    server.router().add(Method.Options, "/*path", frontHandler()?)?;
+    return Ok(server);
+}

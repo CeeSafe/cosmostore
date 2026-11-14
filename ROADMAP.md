@@ -2383,3 +2383,27 @@ Browser form uploads with a SigV4 POST policy.
   script's own, expecting a new entry on shards whose leader had not been killed.
 - **Runbooks:** "A cluster (preview, M6)": the file, the secret, starting and watching nodes, the plain peer port.
 - **Next:** item 4, routing, forwarding and ReadIndex, so S3 works against any node of a cluster.
+
+### 15 Nov 2026: M6 item 4: S3 on a cluster (ADR-0060)
+
+- **Asked by the owner** (15 Nov, "Yes. Go ahead", after item 3). **ADR-0060** (accepted by the owner as recommended, 15 Nov): each shard's store gets
+  an S3 server of its own inside the node, on loopback, the whole S3 layer unchanged; the node's S3 port is a front
+  that routes a request by its bucket's shard to the leader, itself or another node (`POST /s3` on the peer port,
+  signed); the leader takes writes one at a time per shard and holds each response until its entries are committed
+  and applied in their term, and answers reads after a ReadIndex round; ListBuckets merges every shard's.
+- **Slice a:** the store left the replica (`ShardReplica.open` returns both; every method takes the store), so a node
+  keeps it behind the lock its S3 server takes. ADR-0058's sweeps and snapshot tests pass as before.
+- **Slice b:** `src/cluster/front.cee` (the shards' S3 apps, routing, the write gate and commit wait, ReadIndex
+  reads, forwarding, the ListBuckets merge, HEAD relays); `cosmostore node --listen <port> --credentials <file>`;
+  in a Raft log group commit's published mark is durable, not applied; a cluster's S3 servers keep the bucket counts at
+  "some" and read policies, CORS and encryption every time (they cannot be recounted after an apply they never see).
+- **`tools/cluster_s3_smoke.sh`** (25 checks): buckets made through two nodes; ListBuckets merged and the same through
+  all three; a PUT through one node read through another; If-None-Match through a third node seeing it; versioning,
+  versions written through two nodes, tags, a copy within a bucket, a batch delete; a copy between two shards' buckets
+  refused; the leader of a bucket's shard killed, writes and reads going on through the others with every
+  acknowledged write there; the node restarted and serving what was written while it was down. Passed three runs.
+- **Found on the way:** `Ascii.equalsIgnoringCase(a, lower)` wants its second argument lower case: with `"PUT"`
+  every write was taken for a read and never proposed, though acknowledged. The status showed it: no shard's log had
+  grown. Methods are compared as parsed `Method`s now.
+- **Not yet:** large objects and multipart (item 5), copies across shards, TLS and the other `serve` options on a
+  node's S3 port, pipelined writes. **Next:** item 5, extent replication.

@@ -246,15 +246,17 @@ There is no backup command and no replication yet (M6).
 
 ## A cluster (preview, M6)
 
-A cluster of nodes replicates each shard over Raft (ADR-0056 to ADR-0059). It does not serve S3 yet (M6 item 4):
-what runs today is the replication itself.
+A cluster of nodes replicates each shard over Raft (ADR-0056 to ADR-0060) and serves S3 through any node, except
+large objects (M6 item 5): a cluster takes objects up to the inline limit, and refuses multipart uploads.
 
 - **The cluster file** is the same on every node: `cluster` (16 hex digits), `shards`, `replicas`, `secret-file`,
   and a `node <id> peer=<address:port> domain=<rack>` line per node (ADR-0059 §1). Make the secret with
   `head -c 32 /dev/urandom | base64 > cluster.key`, copy it to every node, and keep it as secret as the access
   keys: whoever holds it can speak for a node.
-- **Start a node** with `cosmostore node <dir> --cluster-file <file> --node <id>`; its shards' replicas are under
-  `<dir>/shard-<2 hex>`. A node that is down is caught up when it comes back, from its peers' logs or, if it fell
+- **Start a node** with `cosmostore node <dir> --cluster-file <file> --node <id> --listen <[address:]port>
+  --credentials <file>` (without the last two, it replicates and serves no S3); its shards' replicas are under
+  `<dir>/shard-<2 hex>`. Point clients at any node's S3 port: a request goes to its bucket's leader, and a write is
+  answered once a majority holds it. A node that is down is caught up when it comes back, from its peers' logs or, if it fell
   behind a checkpoint, from a snapshot; it deposes no working leader.
 - **Watch it** with `cosmostore cluster-status --cluster-file <file> --node <id>`: a line per replica (shard, role,
   term, leader, last entry, commit, applied). Each shard should have one leader, and the nodes the same applied
@@ -270,7 +272,8 @@ what runs today is the replication itself.
   `--kms-key-file`, and a bucket's default (ADR-0046, ADR-0055). There is no KMS service behind SSE-KMS: its keys
   are a file. An encryption context and `aws:kms:dsse` are refused with `NotImplemented`, never ignored. Keys, metadata, sizes and an
   SSE-S3 object's ETag (its plaintext's MD5) are not encrypted; for those, encrypt the volume too.
-- A cluster replicates but does not serve S3 yet (M6 item 4), nor large objects (item 5); membership is the cluster
-  file's (item 6).
+- A cluster serves no large objects or multipart uploads yet (M6 item 5), copies no object between buckets of two
+  shards (NotImplemented), has no TLS, rate limits, audit log, notifications or encryption keys on its S3 port, and
+  takes one write at a time per shard; membership is the cluster file's (item 6).
 - No call to force a credentials reload or an upkeep round (both come within a round), nor to change an option
   without a restart.

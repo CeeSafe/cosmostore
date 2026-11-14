@@ -12,6 +12,9 @@
 //
 // The replica's directory: `raft-state.*` (term and vote), `store-generation.*` (which store directory is current),
 // and `store-<16 hex>` (the store of that generation).
+//
+// The store is not the replica's (ADR-0060 §1): it is passed to everything that uses it, so a node can keep it behind
+// the lock its shard's S3 server takes. A node locks the replica, then the store, never the other way round.
 
 struct ReplicaConfig {
     id: u32;
@@ -23,10 +26,15 @@ struct ReplicaConfig {
     store: StoreConfig;
 }
 
+/// A replica just opened, and its store.
+struct OpenedReplica {
+    replica: ShardReplica;
+    store: ObjectStore;
+}
+
 struct ShardReplica {
     id: u32;
     core: RaftCore;
-    store: ObjectStore;
     private hard: HardStateFile;
     private generation: HardStateFile;
     private dir: String;
@@ -38,7 +46,7 @@ struct ShardReplica {
 
     /// Opens the replica in `dir`: the store (its journal a Raft log), the hard state, and a core holding the terms
     /// of the entries recovery found unapplied.
-    fn open(dir: StringView, config: ReplicaConfig) -> Result<ShardReplica, StoreError> {
+    fn open(dir: StringView, config: ReplicaConfig) -> Result<OpenedReplica, StoreError> {
         var storeConfig = config.store;
         storeConfig.journal.raftLog = true;
         let hard = sio(HardStateFile.open(dir))?;
@@ -67,41 +75,43 @@ struct ShardReplica {
         )?;
         var d = String.create();
         d.append(dir)?;
-        return Ok(ShardReplica {
+        let replica = ShardReplica {
             id: config.id,
             core: core,
-            store: store,
             hard: hard,
             generation: generation,
             dir: d,
             storeConfig: storeConfig,
             snapshotsInstalled: 0,
             reads: Vector<RaftReadState>.create(),
-        });
+        };
+        return Ok(OpenedReplica { replica: replica, store: store });
     }
 
     /// Upkeep: a checkpoint when one is due, after which the core forgets what it holds; then compaction, the
     /// leader's as a write of Relocate entries (when no write is in flight), a follower's removing dead segments.
-    fn maintain(borrow mut this) -> Result<void, StoreError> {
-        if (this.store.checkpointDue() && this.store.checkpoint()?) {
-            this.core.compact(this.store.checkpointIndex());
-        }
+    fn maintain(borrow mut this, store: borrow mut ObjectStore) -> Result<void, StoreError> {
+        if (store.checkpointDue() && store.checkpoint()?) { this.core.compact(store.checkpointIndex()); }
         if (this.core.isLeader()) {
-            match (this.beginWrite()) {
+            match (this.beginWrite(store)) {
                 Ok(before) => {
-                    let _ = this.store.compact(this.store.compactionBudget())?;
-                    let _ = this.finishWrite(before)?;
+                    let _ = store.compact(store.compactionBudget())?;
+                    let _ = this.finishWrite(store, before)?;
                 }
                 Err(_) => {}
             }
         } else {
-            let _ = this.store.compact(0)?;
+            let _ = store.compact(0)?;
         }
         return Ok();
     }
 
     /// Installs a leader's snapshot as the store's next generation (snapshot.cee).
-    fn installSnapshot(borrow mut this, s: borrow RaftSnapshot) -> Result<void, StoreError> {
+    fn installSnapshot(
+        borrow mut this,
+        store: borrow mut ObjectStore,
+        s: borrow RaftSnapshot,
+    ) -> Result<void, StoreError> {
         let next = this.generation.term + 1;
         let target = storeDirectory(this.dir.view(), next)?;
         removeStoreDirectory(target.view())?; // a leftover of an install that crashed before its switch
@@ -109,9 +119,10 @@ struct ShardReplica {
         writeSnapshotBundle(target.view(), s.data.view(), s.index, s.term)?;
         sio(this.generation.save(next, 0))?;
         let old = storeDirectory(this.dir.view(), next - 1)?;
-        this.store = ObjectStore.open(target.view(), this.storeConfig)?;
-        let _ = this.store.takeRecoveredTerms();
-        if (this.store.appliedIndex() != s.index) { return Err(StoreError.CheckpointCorrupt); }
+        var installed = ObjectStore.open(target.view(), this.storeConfig)?;
+        let _ = installed.takeRecoveredTerms();
+        if (installed.appliedIndex() != s.index) { return Err(StoreError.CheckpointCorrupt); }
+        *store = installed;
         removeStoreDirectory(old.view())?;
         this.snapshotsInstalled += 1;
         return Ok();
@@ -121,19 +132,19 @@ struct ShardReplica {
 
     /// Before a write: the index of the last entry, or NotLeader when this replica does not lead or an earlier write
     /// is not applied yet.
-    fn beginWrite(borrow this) -> Result<u64, StoreError> {
+    fn beginWrite(borrow this, store: borrow ObjectStore) -> Result<u64, StoreError> {
         if (!this.core.isLeader()) { return Err(StoreError.NotLeader); }
-        let last = this.store.lastEntry();
-        if (last != this.core.lastIndex() || this.store.appliedIndex() != last) { return Err(StoreError.NotLeader); }
+        let last = store.lastEntry();
+        if (last != this.core.lastIndex() || store.appliedIndex() != last) { return Err(StoreError.NotLeader); }
         return Ok(last);
     }
 
     /// After a write: proposes the entries it staged and persisted; the last one's index, which the write is
     /// acknowledged at. Null when it staged nothing.
-    fn finishWrite(borrow mut this, before: u64) -> Result<u64?, StoreError> {
+    fn finishWrite(borrow mut this, store: borrow mut ObjectStore, before: u64) -> Result<u64?, StoreError> {
         // Some of the store's calls stage without committing (group commit's deferred writes): persist them first.
-        this.store.persistEntries()?;
-        let last = this.store.lastEntry();
+        store.persistEntries()?;
+        let last = store.lastEntry();
         var index = before + 1;
         while (index <= last) {
             // The entry is in the journal already: the core keeps its term, the host its data.
@@ -150,8 +161,6 @@ struct ShardReplica {
     }
 
     /// Whether the entry at `index` is applied here: on the leader, that a write is acknowledged.
-    fn isApplied(borrow this, index: u64) -> bool => this.store.appliedIndex() >= index;
-
     /// A message from another replica of the shard.
     fn step(borrow mut this, m: RaftMessage) -> Result<void, StoreError> {
         this.core.step(m)?;
@@ -164,12 +173,16 @@ struct ShardReplica {
     }
 
     /// Does what the core asks (raft.cee's contract), and puts the messages to send in `out`.
-    fn drain(borrow mut this, out: borrow mut Vector<RaftMessage>) -> Result<void, StoreError> {
+    fn drain(
+        borrow mut this,
+        store: borrow mut ObjectStore,
+        out: borrow mut Vector<RaftMessage>,
+    ) -> Result<void, StoreError> {
         while (this.core.hasReady()) {
             var ready = this.core.ready()?;
             // 0. A snapshot replaces the store; the core already starts after it.
             match (replace(mut ready.snapshot, null)) {
-                Some(s) => { this.installSnapshot(borrow s)?; }
+                Some(s) => { this.installSnapshot(store, borrow s)?; }
                 null => {}
             }
             // 1. Entries: the leader's own are in the journal already; a follower's are the leader's records. One
@@ -183,18 +196,18 @@ struct ShardReplica {
                         Some(e) => e,
                         null => { break; }
                     };
-                    if (e.index <= this.store.lastEntry()) {
-                        if (this.store.entryTerm(e.index)? == e.term) { continue; }
-                        this.store.truncateEntries(e.index - 1)?;
+                    if (e.index <= store.lastEntry()) {
+                        if (store.entryTerm(e.index)? == e.term) { continue; }
+                        store.truncateEntries(e.index - 1)?;
                     }
                     if (e.data.length == 0) {
-                        this.store.appendNoop(e.term)?;
+                        store.appendNoop(e.term)?;
                     } else {
-                        this.store.appendEntry(e.data.view())?;
+                        store.appendEntry(e.data.view())?;
                     }
                     staged = true;
                 }
-                if (staged) { this.store.persistEntries()?; }
+                if (staged) { store.persistEntries()?; }
             }
             // 2. The term and vote, synced before anything that depends on them is sent.
             match (replace(mut ready.hardState, null)) {
@@ -213,16 +226,16 @@ struct ShardReplica {
                 };
                 if (m.kind == RAFT_SNAPSHOT) {
                     // The core compacts only to the store's checkpoints, so the snapshot it names is the newest.
-                    if (m.index != this.store.checkpointIndex()) {
+                    if (m.index != store.checkpointIndex()) {
                         panic("replica: a snapshot that is not the checkpoint");
                     }
-                    m.data = this.store.snapshotBundle()?;
+                    m.data = store.snapshotBundle()?;
                 }
                 if (m.kind == RAFT_APPEND) {
                     var i = m.index + 1;
                     while (i <= m.index + m.count) {
-                        let data = this.store.entryBytes(i)?;
-                        let term = this.store.entryTerm(i)?;
+                        let data = store.entryBytes(i)?;
+                        let term = store.entryTerm(i)?;
                         m.entries.push(RaftEntry { term: term, index: i, data: data })?;
                         i += 1;
                     }
@@ -231,12 +244,12 @@ struct ShardReplica {
                 out.push(m)?;
             }
             // 4. Committed entries, applied from the journal.
-            if (ready.applyFrom <= ready.applyTo) { this.store.applyEntries(ready.applyFrom, ready.applyTo)?; }
+            if (ready.applyFrom <= ready.applyTo) { store.applyEntries(ready.applyFrom, ready.applyTo)?; }
             for (k in 0..ready.reads.length) {
                 this.reads.push(RaftReadState { id: ready.reads[k].id, index: ready.reads[k].index })?;
             }
             this.core.advance();
-            this.store.setLeaderTerm(if (this.core.isLeader()) this.core.term else 0);
+            store.setLeaderTerm(if (this.core.isLeader()) this.core.term else 0);
         }
         return Ok();
     }

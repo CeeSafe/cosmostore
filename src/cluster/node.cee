@@ -22,8 +22,14 @@ const NODE_MAX_BODY: u64 = 1073741824;
 struct ShardSlot {
     shard: u32;
     replica: AsyncMutex<ShardReplica>;
+    /// The replica's store, behind the lock its S3 server takes too (ADR-0060 §1): locked after the replica's.
+    store: Arc<AsyncMutex<ObjectStore>>;
     /// Set once the replica's journal failed: it is left alone until the node restarts (fail-stop, ADR-0001).
     failed: AtomicU64;
+    /// The shard's S3 server on loopback (ADR-0060 §2), empty without S3; and the gate a leader's writes pass one at
+    /// a time (§5).
+    s3url: String;
+    gate: AsyncMutex<u8>;
 }
 
 struct PeerLink {
@@ -43,6 +49,8 @@ struct NodeShared {
     refused: AtomicU64;
     unsent: AtomicU64;
     ticks: AtomicU64;
+    /// The ids of ReadIndex reads (ADR-0060 §6).
+    readIds: AtomicU64;
 }
 
 struct NodeApp {
@@ -75,9 +83,28 @@ fn replicaConfigOf(id: u32, voters: Vector<u32>, shard: u32) -> ReplicaConfig {
 }
 
 /// Opens the replicas of the shards placed on node `id`, under `<dir>/shard-<2 hex>`, and the peer links.
-fn openNode(dir: StringView, file: ClusterFile, secret: Vector<u8>, id: u32) -> Result<NodeShared, String> {
+/// A shard's S3 server, bound to its loopback port, to run beside the node (ADR-0060 §2).
+struct InternalS3 {
+    server: Server<S3App>;
+    listener: Listener;
+}
+
+/// A node opened: what its tasks share, and its shards' S3 servers (none without S3).
+struct NodeParts {
+    shared: NodeShared;
+    internals: Vector<InternalS3>;
+}
+
+fn openNode(
+    dir: StringView,
+    file: ClusterFile,
+    secret: Vector<u8>,
+    id: u32,
+    credentials: Arc<CredentialSets>?,
+) -> Result<NodeParts, String> {
     if (file.node(id).isNull()) { return Err(textOf("this node is not in the cluster file")); }
     var slots = Vector<ShardSlot>.create();
+    var internals = Vector<InternalS3>.create();
     let shards = match (file.shardsOf(id)) {
         Ok(s) => s,
         Err(_) => { return Err(textOf("out of memory")); }
@@ -95,17 +122,67 @@ fn openNode(dir: StringView, file: ClusterFile, secret: Vector<u8>, id: u32) -> 
             Ok() => {}
             Err(_) => { return Err(textOf("a shard's directory cannot be made")); }
         }
-        let replica = match (ShardReplica.open(path.view(), replicaConfigOf(id, voters, shard))) {
+        let opened = match (ShardReplica.open(path.view(), replicaConfigOf(id, voters, shard))) {
             Ok(r) => r,
             Err(e) => { return Err(storeErrorLine(e)); }
         };
-        let locked = match (AsyncMutex<ShardReplica>.create(replica)) {
+        let writers = match (opened.store.writerFactory()) {
+            Ok(w) => w,
+            Err(_) => { return Err(textOf("out of memory")); }
+        };
+        let locked = match (AsyncMutex<ShardReplica>.create(opened.replica)) {
             Ok(l) => l,
             Err(_) => { return Err(textOf("out of memory")); }
         };
-        if (slots.push(ShardSlot { shard: shard, replica: locked, failed: AtomicU64.create(0) }).isErr()) {
-            return Err(textOf("out of memory"));
+        let storeLocked = match (AsyncMutex<ObjectStore>.create(opened.store)) {
+            Ok(l) => l,
+            Err(_) => { return Err(textOf("out of memory")); }
+        };
+        let store = match (Arc<AsyncMutex<ObjectStore>>.create(storeLocked)) {
+            Ok(a) => a,
+            Err(_) => { return Err(textOf("out of memory")); }
+        };
+        // Its S3 server on a loopback port the system picks.
+        var s3url = String.create();
+        match (borrow credentials) {
+            Some(c) => {
+                let app = match (clusterS3App(store.clone(), writers, c.clone())) {
+                    Ok(a) => a,
+                    Err(_) => { return Err(textOf("out of memory")); }
+                };
+                let server = match (s3Server(app)) {
+                    Ok(s) => s,
+                    Err(_) => { return Err(textOf("cannot build the routes")); }
+                };
+                let listener = match (listenOn(SocketAddress.V4([127u8, 0, 0, 1], 0))) {
+                    Ok(l) => l,
+                    Err(_) => { return Err(textOf("a shard's S3 server cannot listen on loopback")); }
+                };
+                let bound = match (listener.localAddress()) {
+                    Ok(a) => a,
+                    Err(_) => { return Err(textOf("a shard's S3 server has no address")); }
+                };
+                let urlMade = s3url.append("http://").isOk() && appendPeerAddress(mut s3url, bound).isOk();
+                if (!urlMade) { return Err(textOf("out of memory")); }
+                if (internals.push(InternalS3 { server: server, listener: listener }).isErr()) {
+                    return Err(textOf("out of memory"));
+                }
+            }
+            null => {}
         }
+        let gate = match (AsyncMutex<u8>.create(0)) {
+            Ok(g) => g,
+            Err(_) => { return Err(textOf("out of memory")); }
+        };
+        let slot = ShardSlot {
+            shard: shard,
+            replica: locked,
+            store: store,
+            failed: AtomicU64.create(0),
+            s3url: s3url,
+            gate: gate,
+        };
+        if (slots.push(slot).isErr()) { return Err(textOf("out of memory")); }
     }
     var peers = Vector<PeerLink>.create();
     for (i in 0..file.nodes.length) {
@@ -129,7 +206,7 @@ fn openNode(dir: StringView, file: ClusterFile, secret: Vector<u8>, id: u32) -> 
         Ok(n) => n,
         Err(_) => { return Err(textOf("out of memory")); }
     };
-    return Ok(NodeShared {
+    let shared = NodeShared {
         file: file,
         secret: secret,
         id: id,
@@ -139,7 +216,9 @@ fn openNode(dir: StringView, file: ClusterFile, secret: Vector<u8>, id: u32) -> 
         refused: AtomicU64.create(0),
         unsent: AtomicU64.create(0),
         ticks: AtomicU64.create(0),
-    });
+        readIds: AtomicU64.create(0),
+    };
+    return Ok(NodeParts { shared: shared, internals: internals });
 }
 
 fn appendHex2(s: borrow mut String, v: u32) -> Result<void, AllocError> {
@@ -194,19 +273,23 @@ fn appendHexGroup(out: borrow mut Vector<u8>, v: u32) -> Result<void, AllocError
 
 // --- The replicas' work ---
 
-fn drainOf(r: borrow mut ShardReplica) -> Result<Vector<RaftMessage>, StoreError> {
+fn drainOf(r: borrow mut ShardReplica, store: borrow mut ObjectStore) -> Result<Vector<RaftMessage>, StoreError> {
     var out = Vector<RaftMessage>.create();
-    r.drain(mut out)?;
+    r.drain(store, mut out)?;
     return Ok(out);
 }
 
-fn tickOf(r: borrow mut ShardReplica, maintain: bool) -> Result<Vector<RaftMessage>, StoreError> {
+fn tickOf(
+    r: borrow mut ShardReplica,
+    store: borrow mut ObjectStore,
+    maintain: bool,
+) -> Result<Vector<RaftMessage>, StoreError> {
     r.tick()?;
     var out = Vector<RaftMessage>.create();
-    r.drain(mut out)?;
+    r.drain(store, mut out)?;
     if (maintain) {
-        r.maintain()?;
-        r.drain(mut out)?;
+        r.maintain(store)?;
+        r.drain(store, mut out)?;
     }
     return Ok(out);
 }
@@ -261,7 +344,12 @@ async fn deliver(shared: borrow NodeShared, sm: ShardMessage) -> Result<void, No
                 return Ok();
             }
         }
-        let drained = await Async.blocking(() => drainOf(r));
+        var storeGuard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = storeGuard.data();
+        let drained = await Async.blocking(() => drainOf(r, st));
         match (drained) {
             Ok(out) => { return await enqueue(shared, slot.shard, out); }
             Err(e) => { await noteFailure(slot, e); }
@@ -288,7 +376,12 @@ async fn tickForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
                 Err(_) => { return Err(NodeFault.Net); }
             };
             let r = guard.data();
-            let ticked = await Async.blocking(() => tickOf(r, maintain));
+            var storeGuard = match (await slot.store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let st = storeGuard.data();
+            let ticked = await Async.blocking(() => tickOf(r, st, maintain));
             match (ticked) {
                 Ok(out) => { await enqueue(shared, slot.shard, out)?; }
                 Err(e) => { await noteFailure(slot, e); }
@@ -434,6 +527,11 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
             Err(_) => { return Err(NodeFault.Net); }
         };
         let r = guard.data();
+        var storeGuard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = storeGuard.data();
         let role = if (slot.failed.load() != 0) "failed" else match (r.core.role) {
             RAFT_LEADER => "leader",
             RAFT_CANDIDATE => "candidate",
@@ -445,7 +543,7 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
             out.push(0x20).isOk() && appendDecimal(mut out, r.core.leader as u64).isOk() && out.push(0x20).isOk() &&
             appendDecimal(mut out, r.core.lastIndex()).isOk() && out.push(0x20).isOk() &&
             appendDecimal(mut out, r.core.commit).isOk() && out.push(0x20).isOk() &&
-            appendDecimal(mut out, r.store.appliedIndex()).isOk() && out.push(0x0A).isOk();
+            appendDecimal(mut out, st.appliedIndex()).isOk() && out.push(0x0A).isOk();
         if (!line) { return Err(NodeFault.OutOfMemory); }
     }
     return Ok(out);
@@ -462,7 +560,9 @@ impl Handler<NodeApp> for PeerHandler {
         let path = request.path();
         let isRaft = request.method() == Method.Post && path == "/raft";
         let isStatus = request.method() == Method.Get && path == "/cluster/status";
-        if (!isRaft && !isStatus) { return await exchange.send(Status.notFound(), "".bytes()); }
+        // A client's S3 request forwarded by another node to this one as the shard's leader (ADR-0060 §4).
+        let isS3 = request.method() == Method.Post && path == "/s3";
+        if (!isRaft && !isStatus && !isS3) { return await exchange.send(Status.notFound(), "".bytes()); }
         // The body, whole: a batch is decoded only once its signature holds.
         var body = Vector<u8>.create();
         var buf = Vector<u8>.create();
@@ -480,7 +580,7 @@ impl Handler<NodeApp> for PeerHandler {
             nonce: headerCopy(request, "x-cosmo-nonce"),
             signature: headerCopy(request, "x-cosmo-signature"),
         };
-        let method = if (isRaft) "POST" else "GET";
+        let method = if (isStatus) "GET" else "POST";
         var checked: Result<u32, PeerRefusal> = Err(PeerRefusal.Malformed);
         {
             var guard = match (await shared.nonces.lock()) {
@@ -510,6 +610,22 @@ impl Handler<NodeApp> for PeerHandler {
                 Err(_) => { return Err(HandlerError.Internal); }
             };
             return await exchange.send(Status.ok(), text.view());
+        }
+        if (isS3) {
+            if (body.length < 4) { return await exchange.send(Status.badRequest(), "".bytes()); }
+            let shard = body.view().readLE<u32>(0);
+            let raw = match (decodeRaw(body.view()[4..body.length])) {
+                Ok(r) => r,
+                Err(_) => { return await exchange.send(Status.badRequest(), "".bytes()); }
+            };
+            let answer = match (await leadRequest(shared, shard, borrow raw)) {
+                Ok(a) => a,
+                Err(_) => { return Err(HandlerError.Internal); }
+            };
+            if (answer.status == 421) { return await exchange.send(statusOf(421), "".bytes()); }
+            var encoded = Vector<u8>.create();
+            if (encodeRaw(mut encoded, borrow answer).isErr()) { return Err(HandlerError.Internal); }
+            return await exchange.send(Status.ok(), encoded.view());
         }
         var batch = match (decodeBatch(body.view())) {
             Ok(b) => b,
@@ -556,7 +672,17 @@ async fn runNode(
     shared: borrow Arc<NodeShared>,
     server: Server<NodeApp>,
     address: SocketAddress,
+    internals: Vector<InternalS3>,
+    front: Server<FrontApp>?,
+    frontAddress: SocketAddress,
 ) -> Result<void, NodeFault> {
+    let frontListener = match (front) {
+        Some(_) => match (listenOn(frontAddress)) {
+            Ok(l) => Some(l),
+            Err(_) => { return Err(NodeFault.Net); }
+        },
+        null => null,
+    };
     let listener = match (listenOn(address)) {
         Ok(l) => l,
         Err(_) => { return Err(NodeFault.Net); }
@@ -571,9 +697,13 @@ async fn runNode(
     var number = Vector<u8>.create();
     let _ = appendDecimal(mut number, node.id as u64);
     let _ = line.append(StringView.fromUtf8(number.view()) ?? "");
-    let _ = line.append(" of the cluster, its peer port open\n");
+    let _ = line.append(
+        if (frontListener.isSome()) " of the cluster, its peer and S3 ports open\n"
+            else " of the cluster, its peer port open\n",
+    );
     let _ = await AsyncConsole.write(line.view());
     let peers = node.peers.length;
+    var servers = internals;
     let scoped = await Async.scope(NodeFault.OutOfMemory, (s) => {
         s.spawn(async move () => {
             match (await server.run(listener, borrow plain, ConnectionLimits.defaults(), drain)) {
@@ -581,6 +711,45 @@ async fn runNode(
                 Err(_) => { return Err(NodeFault.Net); }
             }
         });
+        // The shards' S3 servers, and the front.
+        while (true) {
+            let inner = match (servers.pop()) {
+                Some(i) => i,
+                null => { break; }
+            };
+            s.spawn(async move () => {
+                let d = match (Drain.create()) {
+                    Ok(d) => d,
+                    Err(_) => { return Err(NodeFault.OutOfMemory); }
+                };
+                let p = PlainAcceptor {};
+                match (await inner.server.run(inner.listener, borrow p, ConnectionLimits.defaults(), d)) {
+                    Ok(_) => { return Err(NodeFault.Net); }
+                    Err(_) => { return Err(NodeFault.Net); }
+                }
+            });
+        }
+        match (front) {
+            Some(f) => {
+                match (frontListener) {
+                    Some(fl) => {
+                        s.spawn(async move () => {
+                            let d = match (Drain.create()) {
+                                Ok(d) => d,
+                                Err(_) => { return Err(NodeFault.OutOfMemory); }
+                            };
+                            let p = PlainAcceptor {};
+                            match (await f.run(fl, borrow p, ConnectionLimits.defaults(), d)) {
+                                Ok(_) => { return Err(NodeFault.Net); }
+                                Err(_) => { return Err(NodeFault.Net); }
+                            }
+                        });
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
         s.spawn(async () => await tickForever(node));
         for (i in 0..peers) {
             let at = i;
@@ -613,14 +782,46 @@ fn nodeCommand() -> i32 {
             return 1;
         }
     };
-    let shared = match (openNode(dir, loaded.file, loaded.secret, id)) {
+    // S3 on the node (ADR-0060): `--listen` and `--credentials`, both or neither.
+    if (args.listen.isSome() != args.credentials.isSome()) { return 2; }
+    var credentials: Arc<CredentialSets>? = null;
+    var frontAddress = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    match (borrow args.credentials) {
+        Some(path) => {
+            let first = match (readCredentials(path.view())) {
+                Ok(c) => c,
+                Err(message) => {
+                    Console.writeErrorLine(message.view());
+                    return 1;
+                }
+            };
+            credentials = match (CredentialSets.create(first)) {
+                Ok(sets) => match (Arc<CredentialSets>.create(sets)) {
+                    Ok(a) => Some(a),
+                    Err(_) => { return 1; }
+                },
+                Err(_) => { return 1; }
+            };
+            let listenText = match (borrow args.listen) {
+                Some(l) => l.view(),
+                null => "",
+            };
+            frontAddress = match (listenAddress(listenText)) {
+                Some(a) => a,
+                null => { return 2; }
+            };
+        }
+        null => {}
+    }
+    let parts = match (openNode(dir, loaded.file, loaded.secret, id, credentials)) {
         Ok(s) => s,
         Err(message) => {
             Console.writeErrorLine(message.view());
             return 1;
         }
     };
-    let arc = match (Arc<NodeShared>.create(shared)) {
+    let withS3 = parts.internals.length > 0;
+    let arc = match (Arc<NodeShared>.create(parts.shared)) {
         Ok(a) => a,
         Err(_) => { return 1; }
     };
@@ -638,8 +839,19 @@ fn nodeCommand() -> i32 {
         Ok(h) => server.router().get("/cluster/status", h).isOk(),
         Err(_) => false,
     };
-    if (!routed) { return 1; }
-    match (Async.run(runNode(borrow arc, server, address))) {
+    let routedS3 = match (peerHandler()) {
+        Ok(h) => server.router().post("/s3", h).isOk(),
+        Err(_) => false,
+    };
+    if (!routed || !routedS3) { return 1; }
+    var front: Server<FrontApp>? = null;
+    if (withS3) {
+        front = match (frontServer(FrontApp { shared: arc.clone() })) {
+            Ok(f) => Some(f),
+            Err(_) => { return 1; }
+        };
+    }
+    match (Async.run(runNode(borrow arc, server, address, parts.internals, front, frontAddress))) {
         Ok(_) => { return 1; }
         Err(_) => { return 1; }
     }
@@ -649,11 +861,16 @@ fn nodeCommand() -> i32 {
 struct ClusterArguments {
     file: String;
     node: u32;
+    /// S3 on the node (ADR-0060): where its front listens, and the credentials file.
+    listen: String?;
+    credentials: String?;
 }
 
 fn clusterArguments(from: usize) -> ClusterArguments? {
     var file: String? = null;
     var node: u32? = null;
+    var listen: String? = null;
+    var credentials: String? = null;
     var at = from;
     while (true) {
         let option = match (Process.argument(at)) {
@@ -667,6 +884,10 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
         } else if (option == "--node") {
             node = value.parseInt<u32>();
             if (node.isNull()) { return null; }
+        } else if (option == "--listen") {
+            listen = Some(textOf(value));
+        } else if (option == "--credentials") {
+            credentials = Some(textOf(value));
         } else {
             return null;
         }
@@ -674,7 +895,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     }
     return match (file) {
         Some(f) => match (node) {
-            Some(n) => Some(ClusterArguments { file: f, node: n }),
+            Some(n) => Some(ClusterArguments { file: f, node: n, listen: listen, credentials: credentials }),
             null => null,
         },
         null => null,

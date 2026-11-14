@@ -6,6 +6,35 @@
 
 const CLUSTER_KEYS: usize = 5;
 
+/// A replica and its store, side by side, as a test holds them (a node keeps the store behind a lock, ADR-0060 §1).
+struct TestReplica {
+    replica: ShardReplica;
+    store: ObjectStore;
+
+    fn open(dir: StringView, config: ReplicaConfig) -> Result<TestReplica, StoreError> {
+        let o = ShardReplica.open(dir, config)?;
+        return Ok(TestReplica { replica: o.replica, store: o.store });
+    }
+
+    fn isLeader(borrow this) -> bool => this.replica.isLeader();
+
+    fn beginWrite(borrow this) -> Result<u64, StoreError> => this.replica.beginWrite(borrow this.store);
+
+    fn finishWrite(borrow mut this, before: u64) -> Result<u64?, StoreError> =>
+        this.replica.finishWrite(mut this.store, before);
+
+    fn isApplied(borrow this, index: u64) -> bool => this.store.appliedIndex() >= index;
+
+    fn step(borrow mut this, m: RaftMessage) -> Result<void, StoreError> => this.replica.step(m);
+
+    fn tick(borrow mut this) -> Result<void, StoreError> => this.replica.tick();
+
+    fn drain(borrow mut this, out: borrow mut Vector<RaftMessage>) -> Result<void, StoreError> =>
+        this.replica.drain(mut this.store, out);
+
+    fn maintain(borrow mut this) -> Result<void, StoreError> => this.replica.maintain(mut this.store);
+}
+
 fn replicaConfig(id: u32, seed: u64, upkeep: bool) -> ReplicaConfig {
     var voters = Vector<u32>.create();
     for (v in 1..4) { voters.push(truncate<u32>(v))!; }
@@ -28,7 +57,7 @@ fn replicaConfig(id: u32, seed: u64, upkeep: bool) -> ReplicaConfig {
 }
 
 struct Cluster {
-    replicas: Vector<ShardReplica>;
+    replicas: Vector<TestReplica>;
     net: Vector<RaftMessage>;
     /// Replicas cut off from the others: what they send and what is sent to them is lost.
     cut: [bool; 3];
@@ -46,12 +75,12 @@ fn replicaDir(root: StringView, id: u32) -> String {
 fn clusterOpen(root: StringView, seed: u64) -> Result<Cluster, StoreError> => clusterOpenWith(root, seed, false);
 
 fn clusterOpenWith(root: StringView, seed: u64, upkeep: bool) -> Result<Cluster, StoreError> {
-    var replicas = Vector<ShardReplica>.create();
+    var replicas = Vector<TestReplica>.create();
     for (i in 1..4) {
         let id = truncate<u32>(i);
         let dir = replicaDir(root, id);
         sio(Fs.ensureDirectory(dir.view()))?;
-        replicas.push(ShardReplica.open(dir.view(), replicaConfig(id, seed, upkeep))?)?;
+        replicas.push(TestReplica.open(dir.view(), replicaConfig(id, seed, upkeep))?)?;
     }
     return Ok(Cluster { replicas: replicas, net: Vector<RaftMessage>.create(), cut: [false; 3], upkeep: upkeep });
 }
@@ -184,7 +213,7 @@ fn emptyModel() -> ClusterModel => ClusterModel {
 };
 
 /// The value a replica holds for key `k`: 0 when absent.
-fn heldValue(r: borrow ShardReplica, k: usize) -> Result<u64, TestFailure> {
+fn heldValue(r: borrow TestReplica, k: usize) -> Result<u64, TestFailure> {
     match (r.store.getObject("bkt", clusterKey(k))) {
         Ok(data) => {
             if (data.length != 8) { return Err(TestFailure.create("a value of the wrong length")); }
@@ -366,7 +395,7 @@ fn runSnapshotWorkload(c: borrow mut Cluster, model: borrow mut ClusterModel) ->
 }
 
 /// A value's first 8 bytes; the snapshot workload pads its values to 200 bytes.
-fn heldValuePadded(r: borrow ShardReplica, k: usize) -> Result<u64, TestFailure> {
+fn heldValuePadded(r: borrow TestReplica, k: usize) -> Result<u64, TestFailure> {
     match (r.store.getObject("bkt", clusterKey(k))) {
         Ok(data) => {
             if (data.length < 8) { return Err(TestFailure.create("a value of the wrong length")); }
@@ -432,7 +461,7 @@ fn snapshotRun(root: StringView, model: borrow mut ClusterModel) -> Result<[u64;
     if (runSnapshotWorkload(mut c, model).isErr()) { return Err(TestFailure.create("the workload failed")); }
     var done = [0u64; 3];
     for (i in 0..3) {
-        done[0] += c.replicas[i].snapshotsInstalled;
+        done[0] += c.replicas[i].replica.snapshotsInstalled;
         done[1] += c.replicas[i].store.counters().segmentsCompacted;
         done[2] += c.replicas[i].store.counters().compactionBytesCopied;
     }

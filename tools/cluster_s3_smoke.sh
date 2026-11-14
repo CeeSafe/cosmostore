@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# S3 on a three-node cluster (ADR-0060, M6 item 4): every call through one node and its effect seen through the
+# others; a conditional write that sees the write before it, through another node; versioning, tags, copies, a
+# batch delete; ListBuckets merged across shards, the same from every node; then the leader of a bucket's shard
+# killed, and the run going on through the other nodes, every acknowledged write still there.
+# Large objects (extents) are item 5's and are not tried.
+#
+#   tools/cluster_s3_smoke.sh                ports 19500 and up
+#   COSMO_PORT_BASE=29500 tools/cluster_s3_smoke.sh
+set -u
+cd "$(dirname "$0")/.."
+BIN="$(pwd)/${COSMOSTORE:-out/cosmostore}"
+BASE="${COSMO_PORT_BASE:-19500}"
+WORK=$(mktemp -d)
+PIDS=()
+passed=0
+failed=0
+
+cleanup() {
+    for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+    wait 2>/dev/null
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+cd "$WORK"
+
+pass() { echo "ok   $1"; passed=$((passed + 1)); }
+fail() { echo "FAIL $1"; failed=$((failed + 1)); }
+check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1: expected [$3], got [$2]"; fi; }
+pause() { perl -e "select(undef, undef, undef, $1)"; }
+
+export AWS_ACCESS_KEY_ID=AKIACLUSTERSMOKE0001 AWS_SECRET_ACCESS_KEY=clustersmokesecret0123456789 AWS_DEFAULT_REGION=us-east-1
+export AWS_MAX_ATTEMPTS=6 AWS_RETRY_MODE=standard
+echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > credentials
+head -c 32 /dev/urandom | base64 > cluster.key
+cat > cluster.conf <<EOF
+cluster 00c1a55e5e0c1a55
+shards 8
+replicas 3
+secret-file $WORK/cluster.key
+node 1 peer=127.0.0.1:$((BASE + 1)) domain=a
+node 2 peer=127.0.0.1:$((BASE + 2)) domain=b
+node 3 peer=127.0.0.1:$((BASE + 3)) domain=c
+EOF
+
+start() {
+    mkdir -p "d$1"
+    "$BIN" node "$WORK/d$1" --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials >> "log$1" 2>&1 &
+    PIDS[$1]=$!
+}
+# The AWS CLI against node n's S3 port.
+on() { local n="$1"; shift; aws --no-cli-pager --endpoint-url "http://127.0.0.1:$((BASE + 10 + n))" "$@"; }
+code() { local n="$1"; shift; on "$n" "$@" 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9]*\)).*/\1/p' | head -1; }
+status() { "$BIN" cluster-status --cluster-file cluster.conf --node "$1" 2>/dev/null | tail -n +2; }
+
+for n in 1 2 3; do start "$n"; done
+# Every shard has a leader.
+for i in $(seq 1 100); do
+    leaders=$(status 1 | awk '$4 != 0' | wc -l | tr -d ' ')
+    [ "$leaders" = "8" ] && break
+    pause 0.2
+done
+check "every shard has a leader" "$leaders" "8"
+
+printf 'small object one' > one.txt
+printf 'small object two' > two.txt
+check "CreateBucket through node 1" "$(on 1 s3api create-bucket --bucket alpha --query Location --output text 2>&1)" "/alpha"
+check "CreateBucket through node 2" "$(on 2 s3api create-bucket --bucket beta --query Location --output text 2>&1)" "/beta"
+check "CreateBucket again through node 3" "$(code 3 s3api create-bucket --bucket alpha)" "BucketAlreadyOwnedByYou"
+for n in 1 2 3; do
+    check "ListBuckets through node $n, merged across shards" "$(on "$n" s3api list-buckets --query 'Buckets[].Name' --output text 2>&1)" "alpha	beta"
+done
+
+etag=$(on 2 s3api put-object --bucket alpha --key k/one --body one.txt --query ETag --output text 2>&1)
+check "PutObject through node 2" "$etag" "\"$(md5 -q one.txt 2>/dev/null || md5sum one.txt | cut -d' ' -f1)\""
+check "GetObject through node 3 sees it" "$(on 3 s3api get-object --bucket alpha --key k/one got.txt --query ETag --output text 2>&1 && cat got.txt)" "$etag
+small object one"
+check "HeadObject through node 1" "$(on 1 s3api head-object --bucket alpha --key k/one --query ContentLength --output text 2>&1)" "16"
+check "If-None-Match * through node 1 sees the write through node 2" "$(code 1 s3api put-object --bucket alpha --key k/one --body two.txt --if-none-match '*')" "PreconditionFailed"
+check "If-None-Match * on a new key" "$(on 3 s3api put-object --bucket alpha --key k/two --body two.txt --if-none-match '*' --query ETag --output text 2>&1 | wc -c | tr -d ' ')" "35"
+check "ListObjectsV2 through node 2" "$(on 2 s3api list-objects-v2 --bucket alpha --query 'Contents[].Key' --output text 2>&1)" "k/one	k/two"
+
+on 1 s3api put-bucket-versioning --bucket beta --versioning-configuration Status=Enabled > /dev/null 2>&1
+check "versioning through node 1, seen through node 3" "$(on 3 s3api get-bucket-versioning --bucket beta --query Status --output text 2>&1)" "Enabled"
+on 2 s3api put-object --bucket beta --key v --body one.txt > /dev/null 2>&1
+on 3 s3api put-object --bucket beta --key v --body two.txt > /dev/null 2>&1
+check "two versions, written through two nodes" "$(on 1 s3api list-object-versions --bucket beta --query 'length(Versions)' --output text 2>&1)" "2"
+on 2 s3api put-object-tagging --bucket alpha --key k/one --tagging 'TagSet=[{Key=colour,Value=green}]' > /dev/null 2>&1
+check "tags through node 2, read through node 1" "$(on 1 s3api get-object-tagging --bucket alpha --key k/one --query 'TagSet[0].Value' --output text 2>&1)" "green"
+on 3 s3api copy-object --bucket alpha --key k/copied --copy-source alpha/k/two > /dev/null 2>&1
+check "CopyObject within a bucket" "$(on 2 s3api get-object --bucket alpha --key k/copied got2.txt > /dev/null 2>&1 && cat got2.txt)" "small object two"
+check "CopyObject between buckets of two shards: not yet" "$(code 1 s3api copy-object --bucket beta --key copied --copy-source alpha/k/two)" "NotImplemented"
+check "DeleteObjects through node 1" "$(on 1 s3api delete-objects --bucket alpha --delete 'Objects=[{Key=k/two},{Key=k/copied}]' --query 'length(Deleted)' --output text 2>&1)" "2"
+check "the delete seen through node 3" "$(code 3 s3api head-object --bucket alpha --key k/two)" "404"
+
+# The leader of alpha's shard goes down; the others go on.
+# Find alpha's shard by asking every node's status for the shard that has applied the most entries.
+alphaShard=$(status 1 | sort -k7 -n -r | head -1 | awk '{ print $1 }')
+leader=$(status 1 | awk -v s="$alphaShard" '$1 == s { print $4 }')
+kill -9 "${PIDS[$leader]}" 2>/dev/null
+wait "${PIDS[$leader]}" 2>/dev/null
+PIDS[$leader]=""
+other=$(( leader % 3 + 1 ))
+third=$(( other % 3 + 1 ))
+check "node $leader killed: a write through node $other goes on" "$(on "$other" s3api put-object --bucket alpha --key k/three --body two.txt --query ETag --output text 2>&1 | wc -c | tr -d ' ')" "35"
+check "every acknowledged write is there, through node $third" "$(on "$third" s3api list-objects-v2 --bucket alpha --query 'Contents[].Key' --output text 2>&1)" "k/one	k/three"
+check "and its tags" "$(on "$third" s3api get-object-tagging --bucket alpha --key k/one --query 'TagSet[0].Value' --output text 2>&1)" "green"
+check "ListBuckets with a node down" "$(on "$other" s3api list-buckets --query 'Buckets[].Name' --output text 2>&1)" "alpha	beta"
+
+# It comes back and serves too.
+start "$leader"
+for i in $(seq 1 50); do
+    got=$(on "$leader" s3api head-object --bucket alpha --key k/three --query ContentLength --output text 2>/dev/null)
+    [ "$got" = "16" ] && break
+    pause 0.2
+done
+check "node $leader back: it serves the write made while it was down" "$got" "16"
+
+echo "cluster s3 smoke: $passed passed, $failed failed"
+[ "$failed" -eq 0 ]
