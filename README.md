@@ -7,7 +7,7 @@ giving up large-object throughput or crash correctness.
 **Status: a single-node alpha.** `cosmostore serve` speaks the S3 API over HTTP/1.1 and TLS, on a crash-tested
 storage engine (journal, large-object extents, checkpoints, compaction, the space reserve and `fsck`). The AWS CLI,
 rclone, the boto3, Go, JavaScript, Java and .NET SDKs and a subset of 377 Ceph s3-tests pass against it
-([compatibility](docs/compatibility.md)). Milestones M0 to M4 of the [roadmap](ROADMAP.md) are done; M5, production
+([compatibility](docs/compatibility.md)); [runbooks](docs/runbooks.md) say how to operate it. Milestones M0 to M4 of the [roadmap](ROADMAP.md) are done; M5, production
 features, is under way: S3 versioning (ADR-0041), bucket policies (ADR-0043), the public-access block (ADR-0044)
 ACLs (ADR-0045), Object Lock (ADR-0047), event notifications to webhooks (ADR-0048), CORS (ADR-0049) and bucket
 quotas (ADR-0052) are in. There is no

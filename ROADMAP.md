@@ -2096,3 +2096,20 @@ Browser form uploads with a SigV4 POST policy.
 - **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
 - **M5 now:** items 1 to 3 and 5 to 7 are built; item 4 (SSE-S3, SSE-C) is designed (ADR-0046) and waits for
   AES-256-GCM in lib/std (G33). **Next:** G33 in the CeeSafe repo, then item 4; and M5's exit, the runbooks.
+
+### 14 Nov 2026: runbooks for a single node (`docs/runbooks.md`)
+
+- **Chosen with the user** (yes, 14 Nov): M5's exit asks for operational runbooks; written from what is built.
+- **What is in them:** starting and stopping, what to watch in the stats and on stderr, access keys (add,
+  rotate, revoke), certificates, space and quotas, who can read a bucket and how to close one, Object Lock,
+  event notifications (a webhook down, events dropped), the audit log (questions to ask it, rotation), rate
+  limits, CORS, integrity (fsck, a failed journal), upgrades and going back, backup, and what is not there yet.
+- **Checked against the code as they were written:** which error a full store, a failed journal and a corrupt
+  read give; that a snapshot or a stopped copy is the only backup; that a block closes public policies and ACLs
+  but not a policy for fixed addresses; what deleting `outbox.cursor` does. Two first drafts overstated
+  (anonymous access under a full block; the cursor) and were corrected.
+- **Not exercised as written:** the procedures are those of the smoke script and the unit tests, but the
+  runbook's own command lines were not run end to end against a TLS server, and backup by volume snapshot rests
+  on the crash model (ADR-0004), not on a test of a snapshot.
+- **M5's exit:** every item but 4 is built; the runbooks exist; a beta without encryption at rest. Item 4 waits
+  for G33.
