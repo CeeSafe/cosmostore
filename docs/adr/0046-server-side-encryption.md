@@ -5,11 +5,15 @@
 then a request that asks for encryption is NotImplemented.
 
 **14 Nov 2026:** G33 is fixed in ceesafec 0.45.0 (CeeSafe ADR 0135). Built: `serve --sse-key-file`, SSE-S3 on
-PutObject, GetObject and HeadObject (ranges and `?partNumber=1` too), the reader over stored offsets, and `fsck` of
-sealed versions. A multipart part's nonce is to take the part's index among the completed object's parts (1 to N),
-not the number the client gave it (chosen with the user): a completed version keeps its parts' sizes but not their
-numbers, and the index needs no format change; §2 lists what that leaves open for multipart. Still NotImplemented: multipart uploads, copies of or into a
-sealed object, POST forms, bucket default encryption and SSE-C (§5 to §7).
+PutObject, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, GetObject and HeadObject (ranges and
+`?partNumber` too), the reader over stored offsets, and `fsck` of sealed versions. Still NotImplemented: copies of
+or into a sealed object, POST forms, bucket default encryption and SSE-C (§5 to §7).
+
+**Multipart, revised 14 Nov 2026** (chosen with the user, over the part's index first chosen the same day): each
+upload of a part is sealed under a key of its own, derived from the object's data key and a random salt that the
+part's stored bytes start with (§2). The part's index could not be used: a part is sealed when it is uploaded,
+before its place among the completed parts is known, and a part uploaded twice under one number would have reused
+nonces under one key. No format changes.
 
 ## Context
 
@@ -42,23 +46,25 @@ sealed object, POST forms, bucket default encryption and SSE-C (§5 to §7).
    (`Random.fill`) made for the object and used for nothing else.
    - A chunk is its ciphertext and its 16-byte tag. An object of `n` bytes has `max(1, ceil(n / 65536))` chunks:
      an empty object is one empty chunk, so its tag is there to check.
-   - A chunk's nonce is 12 bytes: the part's index (u32: 0 for an object that is not multipart, else its place
-     among the completed object's parts, 1 to N) and the chunk's index in the part (u64), little-endian. The data
-     key is one object's, so no nonce repeats under a key.
+   - A chunk's nonce is 12 bytes: 4 zero bytes and the chunk's index in its part (u64), little-endian. The data
+     key is one object's, and a multipart part's key is one upload of that part's, so no nonce repeats under a key.
    - A chunk's associated data is one byte: 1 for the last chunk of its part, else 0. Chunks cannot be reordered
      (the nonce), dropped from the end (the last flag) or cut short (the tag).
    - **Stored length:** `n + 16 * chunks`. Plaintext offset `p` of a part is in chunk `p / 65536`, which starts at
      stored offset `(p / 65536) * 65552` of the part. A range reads the chunks it touches whole and opens each:
      a range read is checked as a whole read is, which the extent CRC does not do for a partial read (ADR-0003).
-   - **Multipart:** CreateMultipartUpload makes the data key; every part is sealed under it, so Complete joins
-     the manifests as now. Two things are open, to settle before multipart is built:
-     - A part is sealed when it is uploaded, before its index among the completed parts is known (a client may
-       complete parts 1, 3 and 7). Either Complete refuses numbers that are not 1 to N, the parts are sealed again
-       at Complete, or the part numbers are kept in the extras after all.
-     - A part uploaded twice under one number would be sealed twice under one data key and one nonce, which GCM
-       must never do (it gives away the GHASH key). Each upload of a part needs nonces of its own, such as a random
-       prefix kept with the part, or a key of its own derived from the data key. The parts' plaintext sizes (`extras`,
-     ADR-0015) give each part's stored offset.
+   - **Multipart:** CreateMultipartUpload makes the data key, and its envelope goes with the upload's metadata to
+     the completed object. Each UploadPart draws a random 16-byte salt and seals the part under
+     HMAC-SHA256(data key, `cosmostore sse part v1` and the salt); the part's stored bytes are the salt and then
+     its chunks, so a part is `16 + n + 16 * chunks` bytes. A part uploaded again under its number gets another
+     salt and so another key. Complete joins the manifests as now, and the parts' plaintext sizes (`extras`,
+     ADR-0015) give each part's stored offset. A range reads, under one reader, the chunks it touches and the
+     salts of the parts after its first; when it starts after its first part's first chunk, that part's salt is
+     read apart (16 bytes).
+   - Nothing ties a part to its place: whoever can write the disk can swap two parts with their salts, as they can
+     move a sealed object and its envelope (Consequences). A part changed, cut short or under another salt does not
+     open.
+   - The parts are admitted at their plaintext size, 16 bytes in 64 KiB below what they store.
    - **Reading the stored bytes** needs the store to give a range of what is stored rather than of the size it
      reports: a reader over stored offsets beside `prepareReaderOf`.
 3. **The envelope is a field of the version's metadata,** `x-amz-server-side-encryption`, as text:

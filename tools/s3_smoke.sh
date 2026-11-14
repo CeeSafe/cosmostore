@@ -563,7 +563,36 @@ aws s3api put-object --bucket smoke --key sse/empty --body empty.bin --server-si
 check "SSE-S3 empty" "$(aws s3api head-object --bucket smoke --key sse/empty --query ContentLength --output text)" 0
 check "no plaintext on disk" "$(grep -rl 'a sealed line of cosmostore' "$work/store" | wc -l | tr -d ' ')" 0
 check "SSE-S3 copy source" "$(code s3api copy-object --bucket smoke --key sse/copy --copy-source smoke/sse/small.txt)" NotImplemented
-check "SSE-S3 multipart" "$(code s3api create-multipart-upload --bucket smoke --key sse/mp --server-side-encryption AES256)" NotImplemented
+# SSE-S3 multipart: parts numbered 1 and 3, part 3 uploaded twice; each part under a key of its own (ADR-0046 §2).
+head -c 5242880 /dev/urandom > p1.bin
+head -c 70001 /dev/urandom > p3.bin
+head -c 1000 /dev/urandom > p3old.bin
+created=$(aws s3api create-multipart-upload --bucket smoke --key sse/mp --server-side-encryption AES256 --query '[UploadId,ServerSideEncryption]' --output text)
+mpid=$(printf '%s' "$created" | cut -f1)
+check "SSE-S3 create-multipart-upload" "$(printf '%s' "$created" | cut -f2)" AES256
+check "SSE-S3 upload-part" "$(aws s3api upload-part --bucket smoke --key sse/mp --upload-id "$mpid" --part-number 1 --body p1.bin --query ServerSideEncryption --output text)" AES256
+aws s3api upload-part --bucket smoke --key sse/mp --upload-id "$mpid" --part-number 3 --body p3old.bin > /dev/null 2>&1 || fail "SSE-S3 upload-part 3"
+aws s3api upload-part --bucket smoke --key sse/mp --upload-id "$mpid" --part-number 3 --body p3.bin > /dev/null 2>&1 || fail "SSE-S3 upload-part 3 again"
+check "a copy into a sealed upload" "$(code s3api upload-part-copy --bucket smoke --key sse/mp --upload-id "$mpid" --part-number 2 --copy-source smoke/a/small.txt)" NotImplemented
+mpetag() { aws s3api list-parts --bucket smoke --key sse/mp --upload-id "$mpid" --query "Parts[?PartNumber==\`$1\`].ETag" --output text; }
+mpparts=$(printf '{"Parts":[{"PartNumber":1,"ETag":%s},{"PartNumber":3,"ETag":%s}]}' "$(mpetag 1)" "$(mpetag 3)")
+check "SSE-S3 complete" "$(aws s3api complete-multipart-upload --bucket smoke --key sse/mp --upload-id "$mpid" --multipart-upload "$mpparts" --query ServerSideEncryption --output text)" AES256
+cat p1.bin p3.bin > mp.bin
+aws s3api get-object --bucket smoke --key sse/mp got.bin > /dev/null 2>&1
+cmp -s got.bin mp.bin && pass "SSE-S3 multipart get" || fail "SSE-S3 multipart get"
+aws s3api get-object --bucket smoke --key sse/mp --range bytes=5242870-5242899 got.bin > /dev/null 2>&1
+dd if=mp.bin of=want.bin bs=1 skip=5242870 count=30 2> /dev/null
+cmp -s got.bin want.bin && pass "SSE-S3 range across parts" || fail "SSE-S3 range across parts"
+aws s3api get-object --bucket smoke --key sse/mp --range bytes=$((5242880 + 65540))-$((5242880 + 65549)) got.bin > /dev/null 2>&1
+dd if=mp.bin of=want.bin bs=1 skip=$((5242880 + 65540)) count=10 2> /dev/null
+cmp -s got.bin want.bin && pass "SSE-S3 range inside a part, after its first chunk" || fail "SSE-S3 range inside a part, after its first chunk"
+aws s3api get-object --bucket smoke --key sse/mp --part-number 2 got.bin > /dev/null 2>&1
+cmp -s got.bin p3.bin && pass "SSE-S3 partNumber" || fail "SSE-S3 partNumber"
+check "SSE-S3 multipart head" "$(aws s3api head-object --bucket smoke --key sse/mp --query '[ServerSideEncryption,ContentLength]' --output text | tr '\t' ' ')" "AES256 5312881"
+head -c 20000000 /dev/urandom > cp.bin
+aws s3 cp cp.bin s3://smoke/sse/cp.bin --sse AES256 > /dev/null 2>&1 || fail "SSE-S3 s3 cp, multipart"
+aws s3 cp s3://smoke/sse/cp.bin got.bin > /dev/null 2>&1
+cmp -s got.bin cp.bin && pass "SSE-S3 s3 cp, multipart, back" || fail "SSE-S3 s3 cp, multipart, back"
 check "SSE-KMS" "$(code s3api put-object --bucket smoke --key sse/kms --body sse.txt --server-side-encryption aws:kms)" NotImplemented
 # SSE-C waits (ADR-0046 §7): a request that asks for it is refused, not stored in the clear.
 check "SSE-C asked for" "$(code s3api put-object --bucket smoke --key sse.txt --body pub.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901)" NotImplemented

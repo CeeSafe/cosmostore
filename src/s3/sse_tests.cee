@@ -516,3 +516,133 @@ fn sseSealedVersionsAreReadAndVerifiedAsStored() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// A multipart object sealed as UploadPart seals one: each part under the key of its salt, after the salt.
+fn sseSealedParts(dataKey: borrow [u8; 32], text: Slice<u8>, sizes: Slice<u64>) -> Vector<u8> {
+    var stored = Vector<u8>.create();
+    var at: usize = 0;
+    for (i in 0..sizes.length) {
+        var salt = [0u8; 16];
+        for (k in 0..16) { salt[k] = truncate<u8>(i * 16 + k + 1); }
+        var sealer = match (SseSealer.createPart(dataKey, salt, sizes[i])!) {
+            Some(s) => s,
+            null => { panic("no cipher"); }
+        };
+        if (sealer.storedLength() != SSE_PART_HEADER + sseStoredLength(sizes[i])) { panic("a part's stored length"); }
+        let end = at + sizes[i] as usize;
+        sealer.feed(text[at..end], mut stored)!;
+        sealer.finish(mut stored)!;
+        at = end;
+    }
+    return stored;
+}
+
+/// Plaintext `from..to` read from a sealed multipart object as GET reads it: the planned stored range, and the first
+/// part's header apart when the range starts after it.
+fn sseReadRange(
+    dataKey: borrow [u8; 32],
+    stored: Slice<u8>,
+    sizes: Slice<u64>,
+    size: u64,
+    from: u64,
+    to: u64,
+) -> Vector<u8>? {
+    let r = sseRange(size, sizes, from, to);
+    let salt = match (r.headerAt) {
+        Some(h) => stored[h as usize..(h + SSE_PART_HEADER) as usize],
+        null => "".bytes(),
+    };
+    var stream = match (SseStream.multipart(dataKey, sizes[r.part..], r.chunk, salt)!) {
+        Some(s) => s,
+        null => { return null; }
+    };
+    var plain = Vector<u8>.create();
+    let piece = stored[r.storedFrom as usize..r.storedTo as usize];
+    var at: usize = 0;
+    while (at < piece.length) {
+        let end = if (piece.length - at < 3000) piece.length else at + 3000;
+        if (!stream.feed(piece[at..end], mut plain)!) { return null; }
+        at = end;
+    }
+    if (!stream.isWhole()) { return null; }
+    let skip = r.skip as usize;
+    var out = Vector<u8>.create();
+    out.extend(plain.view()[skip..skip + (to - from) as usize])!;
+    return out;
+}
+
+@test
+fn sseMultipartPartsOpenInAnyRange() -> Result<void, TestFailure> {
+    let dataKey = sseTestKey();
+    let sizes = [70000u64, 100, 131077, 1];
+    var size: u64 = 0;
+    for (i in 0..sizes.length) { size += sizes[i]; }
+    let text = sseText(size as usize, 5);
+    let stored = sseSealedParts(borrow dataKey, text.view(), sizes[..]);
+    var storedSize: u64 = 0;
+    for (i in 0..sizes.length) { storedSize += SSE_PART_HEADER + sseStoredLength(sizes[i]); }
+    Check.equalU64(storedSize, stored.length as u64)?;
+    // Whole; inside one part, at its start and after its first chunk; across parts; the last byte.
+    let ranges = [
+        0u64, size,
+        0, 1,
+        69999, 70001,
+        70000, 70100,
+        70050, 70150,
+        70100, 70100 + 65536 + 3,
+        70100 + 65540, 70100 + 65550,
+        70100 + 131076, size,
+        65530, size - 1,
+        size - 1, size,
+    ];
+    var k: usize = 0;
+    while (k < ranges.length) {
+        let from = ranges[k];
+        let to = ranges[k + 1];
+        k += 2;
+        match (sseReadRange(borrow dataKey, stored.view(), sizes[..], size, from, to)) {
+            Some(plain) => { Check.equalBytes(text.view()[from as usize..to as usize], plain.view())?; }
+            null => { return Check.fail("a range of a sealed multipart object did not open"); }
+        }
+    }
+    // A changed salt, a changed chunk, two parts swapped: nothing opens.
+    var changed = Vector<u8>.create();
+    changed.extend(stored.view())!;
+    let second = (SSE_PART_HEADER + sseStoredLength(70000)) as usize;
+    changed[second + 3] = changed[second + 3] ^ 1;
+    Check.isTrue(sseReadRange(borrow dataKey, changed.view(), sizes[..], size, 0, size).isNull(), "a salt")?;
+    changed[second + 3] = changed[second + 3] ^ 1;
+    changed[second + 20] = changed[second + 20] ^ 1;
+    Check.isTrue(sseReadRange(borrow dataKey, changed.view(), sizes[..], size, 70000, 70100).isNull(), "a chunk")?;
+    let same = [100u64, 100];
+    let twice = sseSealedParts(borrow dataKey, text.view()[0..200], same[..]);
+    var swapped = Vector<u8>.create();
+    let part = (SSE_PART_HEADER + sseStoredLength(100)) as usize;
+    swapped.extend(twice.view()[part..2 * part])!;
+    swapped.extend(twice.view()[0..part])!;
+    match (sseReadRange(borrow dataKey, swapped.view(), same[..], 200, 0, 200)) {
+        Some(plain) => { Check.isTrue(plain.view() != text.view()[0..200], "swapped parts read swapped")?; }
+        null => {}
+    }
+    // One part uploaded twice: two salts, two keys, two ciphertexts of one text.
+    var a = match (SseSealer.createPart(borrow dataKey, [1u8; 16], 100)!) {
+        Some(s) => s,
+        null => { return Check.fail("no cipher"); }
+    };
+    var b = match (SseSealer.createPart(borrow dataKey, [2u8; 16], 100)!) {
+        Some(s) => s,
+        null => { return Check.fail("no cipher"); }
+    };
+    var sa = Vector<u8>.create();
+    var sb = Vector<u8>.create();
+    a.feed(text.view()[0..100], mut sa)!;
+    a.finish(mut sa)!;
+    b.feed(text.view()[0..100], mut sb)!;
+    b.finish(mut sb)!;
+    Check.isTrue(sa.view()[16..] != sb.view()[16..], "a key per upload of a part")?;
+    // Under the wrong data key nothing opens.
+    var other = dataKey;
+    other[0] = other[0] ^ 1;
+    Check.isTrue(sseReadRange(borrow other, stored.view(), sizes[..], size, 0, size).isNull(), "another key")?;
+    return Ok();
+}

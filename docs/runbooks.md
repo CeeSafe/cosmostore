@@ -233,8 +233,8 @@ There is no backup command and no replication yet (M6).
 
 ## Not yet
 
-- **Encryption at rest** is SSE-S3 on PutObject, GetObject and HeadObject (ADR-0046), with `serve --sse-key-file`.
-  Multipart uploads, copies of a sealed object, POST forms, a bucket's default and SSE-C are not served yet: a
+- **Encryption at rest** is SSE-S3 on PutObject, multipart uploads, GetObject and HeadObject (ADR-0046), with
+  `serve --sse-key-file`. Copies of or into a sealed object, POST forms, a bucket's default and SSE-C are not served yet: a
   request that asks for them is refused with `NotImplemented`, never stored in the clear. Keys, metadata, sizes and
   the ETag (the plaintext's MD5) are not encrypted; for those, encrypt the volume too.
 - One node: no replication, no failover.

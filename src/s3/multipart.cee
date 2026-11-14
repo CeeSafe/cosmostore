@@ -81,7 +81,18 @@ async fn createMultipartUpload(
     var contentType = String.create();
     contentTypeOf(req, mut contentType)?;
     let tagged = await withRequestAcl(app, req, withRequestTags(req, metadataOf(req)?)?)?;
-    let metadata = await withRequestLock(app, req, tagged)?;
+    var metadata = await withRequestLock(app, req, tagged)?;
+    // SSE-S3 (ADR-0046 §2): the object's data key is made now; every part is sealed under a key of its own from it.
+    var sealing = false;
+    match (sseRequestOf(req)?) {
+        SseRequest.None => {}
+        SseRequest.Managed => {
+            let seal = newManagedSeal(app.sseKeys.view())?;
+            metadataAdd(mut metadata, SSE_FIELD.bytes(), seal.field.view())?;
+            sealing = true;
+        }
+        SseRequest.Customer(_) => { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    }
     let checksum = uploadChecksumOf(req)?;
     let bucket = req.bucket.view();
     let key = req.key.view();
@@ -91,6 +102,7 @@ async fn createMultipartUpload(
         exchange.header("x-amz-checksum-algorithm", checksumNameUpper(checksum.algorithm).bytes())?;
         exchange.header("x-amz-checksum-type", checksumTypeName(checksum.kind).bytes())?;
     }
+    if (sealing) { exchange.header(SSE_FIELD, "AES256".bytes())?; }
     var body = Vector<u8>.create();
     xmlHead(mut body, "InitiateMultipartUploadResult")?;
     xmlElement(mut body, "Bucket", bucket.bytes(), false)?;
@@ -197,7 +209,20 @@ async fn uploadPart(
             if (!fine) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
         }
     }
-    let body = await receiveBody(app, auth, mut spec, start.writer, exchange, start.algorithm, null)?;
+    // A sealed upload's part: under the key of a random salt of its own, which its stored bytes start with (ADR-0046
+    // §2). The part is admitted at its plaintext size, 16 bytes in 64 KiB short of what it stores.
+    var sealer: SseSealer? = null;
+    if (start.envelope.length > 0) {
+        var dataKey = await sealedDataKey(app, start.envelope.view())?;
+        var salt = [0u8; 16];
+        if (Random.fill(mut salt[..]).isErr()) { return Err(S3Fail.Code(S3Code.InternalError)); }
+        sealer = SseSealer.createPart(borrow dataKey, salt, spec.size)?;
+        for (i in 0..32) { dataKey[i] = 0; }
+        if (sealer.isNull()) { return Err(S3Fail.Code(S3Code.InternalError)); }
+    }
+    let sealing = sealer.isSome();
+    let body = await receiveBody(app, auth, mut spec, start.writer, exchange, start.algorithm, sealer)?;
+    if (sealing) { exchange.header(SSE_FIELD, "AES256".bytes())?; }
     let md5 = await commitPart(
         app,
         req.bucket.view(),
@@ -214,6 +239,8 @@ async fn uploadPart(
 struct PartStart {
     writer: ObjectWriter;
     algorithm: ChecksumAlgorithm;
+    /// The upload's sealed envelope (ADR-0046), empty for an upload in the clear.
+    envelope: Vector<u8>;
 }
 
 /// Under the lock: the upload exists, the part's declared size is admitted, and a part writer for it.
@@ -228,7 +255,7 @@ async fn startPart(
     var guard = await lockStore(app)?;
     let store = guard.data();
     return match (await Async.blocking(() => beginPart(store, bucket, key, id, number, size))) {
-        Ok(w) => Ok(PartStart { writer: w, algorithm: store.uploadAlgorithm(id) }),
+        Ok(w) => Ok(PartStart { writer: w, algorithm: store.uploadAlgorithm(id), envelope: store.uploadEnvelope(id)? }),
         Err(e) => Err(storeFail(e, key.length)),
     };
 }
@@ -417,8 +444,20 @@ async fn completeMultipartUpload(
     let expected = expectedObjectChecksum(req)?;
     let bucket = req.bucket.view();
     let key = req.key.view();
-    let outcome = await storeComplete(app, bucket, key, id, chosen.view(), condition, etags.view(), expected.view())?;
+    var sealed = false;
+    let outcome = await storeComplete(
+        app,
+        bucket,
+        key,
+        id,
+        chosen.view(),
+        condition,
+        etags.view(),
+        expected.view(),
+        mut sealed,
+    )?;
     writtenVersionHeader(exchange, borrow outcome)?;
+    if (sealed) { exchange.header(SSE_FIELD, "AES256".bytes())?; }
     var body = Vector<u8>.create();
     xmlHead(mut body, "CompleteMultipartUploadResult")?;
     var location = Vector<u8>.create();
@@ -497,9 +536,12 @@ async fn storeComplete(
     condition: PutIf,
     etags: Slice<u8>,
     expected: Slice<u8>,
+    sealed: borrow mut bool,
 ) -> Result<PutOutcome, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
+    // Whether the object is sealed (ADR-0046), for the answer: the upload is gone once completed.
+    sealed = store.uploadEnvelope(id)?.length > 0;
     return match (await Async.blocking(
         () => completeWith(store, bucket, key, id, parts, condition, etags, expected),
     )) {

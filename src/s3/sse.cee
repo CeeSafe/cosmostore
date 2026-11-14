@@ -1,6 +1,6 @@
 // Server-side encryption (ADR-0046): the chunks an object is sealed in and where they are stored, sealing and opening
 // them with lib/std's AES-256-GCM (ceesafec 0.45.0; CEESAFE_GAPS.md, G33), the envelope kept with a version, the key
-// file, and the request's fields. SSE-S3 is served on PutObject, GetObject and HeadObject (`objects.cee`); any other
+// file, and the request's fields. SSE-S3 is served on PutObject, multipart uploads, GetObject and HeadObject; any other
 // request that asks for encryption is NotImplemented (`sseServedFor`).
 import web_core;
 import web_http;
@@ -63,23 +63,74 @@ fn sseFlag(last: bool) -> [u8; 1] => [if (last) 1u8 else 0u8];
 /// A cipher for a 32-byte key (the length is the type's, so there is one).
 fn sseCipher(key: borrow [u8; 32]) -> Aes256Gcm? => Aes256Gcm.create(key[..]);
 
-/// Seals a part's plaintext as it arrives: every 64 KiB a chunk, its ciphertext and tag, is given out.
+/// The key a multipart part is sealed under: HMAC-SHA256 of its salt under the object's data key. Each upload of a
+/// part has a random salt of its own, so a part uploaded again under its number is sealed under another key, and no
+/// nonce repeats under a key (ADR-0046 §2).
+fn ssePartKey(dataKey: borrow [u8; 32], salt: Slice<u8>) -> [u8; 32] {
+    var mac = HmacSha256.create(dataKey[..]);
+    mac.update("cosmostore sse part v1".bytes());
+    mac.update(salt);
+    return mac.finish();
+}
+
+/// Seals a part's plaintext as it arrives: every 64 KiB a chunk, its ciphertext and tag, is given out, after the
+/// part's header (a multipart part's salt) if it has one.
 struct SseSealer {
     cipher: Aes256Gcm;
     part: u32;
-    /// The part's chunks, and the next one's index.
+    /// The part's plaintext bytes and chunks, and the next chunk's index.
+    size: u64;
     chunks: u64;
     chunk: u64;
     /// The plaintext of the chunk being filled.
     pending: Vector<u8>;
+    /// Bytes given out before the first chunk: a multipart part's salt; empty once given, or for one PUT.
+    header: Vector<u8>;
+    headerLength: u64;
 
     /// A sealer for a part of `size` plaintext bytes under `key`; null if the cipher refuses the key.
     fn create(key: borrow [u8; 32], part: u32, size: u64) -> SseSealer? => match (sseCipher(key)) {
         Some(c) => Some(
-            SseSealer { cipher: c, part: part, chunks: sseChunks(size), chunk: 0, pending: Vector<u8>.create() },
+            SseSealer {
+                cipher: c,
+                part: part,
+                size: size,
+                chunks: sseChunks(size),
+                chunk: 0,
+                pending: Vector<u8>.create(),
+                header: Vector<u8>.create(),
+                headerLength: 0,
+            },
         ),
         null => null,
     };
+
+    /// A sealer for a multipart part of `size` plaintext bytes: under the part key of `salt`, which it gives out
+    /// first (ADR-0046 §2).
+    fn createPart(dataKey: borrow [u8; 32], salt: [u8; 16], size: u64) -> Result<SseSealer?, AllocError> {
+        var partKey = ssePartKey(dataKey, salt[..]);
+        var made = SseSealer.create(borrow partKey, 0, size);
+        for (i in 0..32) { partKey[i] = 0; }
+        match (made.asBorrowMut()) {
+            Some(s) => {
+                s.header.extend(salt[..])?;
+                s.headerLength = SSE_PART_HEADER;
+            }
+            null => {}
+        }
+        return Ok(made);
+    }
+
+    /// The bytes the part is stored in: its header and its chunks.
+    fn storedLength(borrow this) -> u64 => this.headerLength + sseStoredLength(this.size);
+
+    fn emitHeader(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        if (this.header.length > 0) {
+            out.extend(this.header.view())?;
+            this.header.clear();
+        }
+        return Ok();
+    }
 
     fn emit(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
         let flag = sseFlag(this.chunk + 1 >= this.chunks);
@@ -93,6 +144,7 @@ struct SseSealer {
 
     /// Takes plaintext and appends to `out` every chunk it completes.
     fn feed(borrow mut this, data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        this.emitHeader(out)?;
         var at: usize = 0;
         while (at < data.length) {
             let room = SSE_CHUNK as usize - this.pending.length;
@@ -106,6 +158,7 @@ struct SseSealer {
 
     /// The part's end: its last chunk, if it was not a full one (an empty part's one empty chunk too).
     fn finish(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        this.emitHeader(out)?;
         if (this.chunk < this.chunks) { this.emit(out)?; }
         return Ok();
     }
@@ -171,6 +224,194 @@ struct SseOpener {
 
     /// Whether every stored byte given was a whole chunk's: a read that ends inside one was cut short.
     fn isWhole(borrow this) -> bool => this.pending.length == 0;
+}
+
+/// The stored bytes to read for a range of a sealed object's plaintext, one PUT's or a multipart object's.
+struct SseRange {
+    storedFrom: u64;
+    storedTo: u64;
+    /// The part the range starts in (its index in the parts; 0 for one PUT), the chunk of that part it starts in,
+    /// and that chunk's plaintext bytes before the range.
+    part: usize;
+    chunk: u64;
+    skip: u64;
+    /// A multipart object whose range starts after its first part's header: where that header is stored, to be read
+    /// apart. Null when the stored range starts with a header, or for one PUT.
+    headerAt: u64?;
+}
+
+/// The stored range for plaintext `from..to` (`from < to <= size`) of a sealed object: one PUT's chunks, or, with
+/// `partSizes`, a multipart object's parts, each its header and its chunks (ADR-0046 §2).
+fn sseRange(size: u64, partSizes: Slice<u64>, from: u64, to: u64) -> SseRange {
+    if (partSizes.length == 0) {
+        let s = sseSpan(size, from, to);
+        return SseRange {
+            storedFrom: s.storedFrom,
+            storedTo: s.storedTo,
+            part: 0,
+            chunk: s.firstChunk,
+            skip: s.skip,
+            headerAt: null,
+        };
+    }
+    // The first part the range touches, and where its plaintext and its stored bytes start.
+    var i: usize = 0;
+    var plainAt: u64 = 0;
+    var storedAt: u64 = 0;
+    while (i + 1 < partSizes.length && from >= plainAt + partSizes[i]) {
+        plainAt += partSizes[i];
+        storedAt += SSE_PART_HEADER + sseStoredLength(partSizes[i]);
+        i += 1;
+    }
+    let firstTo = if (to < plainAt + partSizes[i]) to else plainAt + partSizes[i];
+    let first = sseSpan(partSizes[i], from - plainAt, firstTo - plainAt);
+    var r = SseRange {
+        storedFrom: storedAt,
+        storedTo: storedAt + SSE_PART_HEADER + first.storedTo,
+        part: i,
+        chunk: first.firstChunk,
+        skip: first.skip,
+        headerAt: null,
+    };
+    if (first.firstChunk > 0) {
+        r.storedFrom = storedAt + SSE_PART_HEADER + first.storedFrom;
+        r.headerAt = storedAt;
+    }
+    // The last part it touches.
+    var j = i;
+    while (j + 1 < partSizes.length && to > plainAt + partSizes[j]) {
+        plainAt += partSizes[j];
+        storedAt += SSE_PART_HEADER + sseStoredLength(partSizes[j]);
+        j += 1;
+    }
+    if (j > i) { r.storedTo = storedAt + SSE_PART_HEADER + sseSpan(partSizes[j], 0, to - plainAt).storedTo; }
+    return r;
+}
+
+/// Opens a sealed object's stored bytes as they are read: one PUT's chunks, or a multipart object's parts, each a
+/// header (its salt, which gives the part's key) and its chunks.
+struct SseStream {
+    dataKey: [u8; 32];
+    /// Multipart: the plaintext sizes of the parts, from the first one read; empty for one PUT.
+    sizes: Vector<u64>;
+    part: usize;
+    /// The current part's opener; null while its header is read.
+    opener: SseOpener?;
+    /// Multipart: the stored bytes of the current part's chunks not yet read.
+    left: u64;
+    header: Vector<u8>;
+
+    /// One PUT's chunks from chunk `first`.
+    fn single(dataKey: borrow [u8; 32], size: u64, first: u64) -> SseStream? {
+        let opener = SseOpener.create(dataKey, 0, size, first);
+        if (opener.isNull()) { return null; }
+        return SseStream {
+            dataKey: [0u8; 32],
+            sizes: Vector<u64>.create(),
+            part: 0,
+            opener: opener,
+            left: 0,
+            header: Vector<u8>.create(),
+        };
+    }
+
+    /// A multipart object's parts of `sizes`, from chunk `first` of the first one. When `first` is not 0 the stored
+    /// bytes start after that part's header, whose salt is given.
+    fn multipart(
+        dataKey: borrow [u8; 32],
+        sizes: Slice<u64>,
+        first: u64,
+        salt: Slice<u8>,
+    ) -> Result<SseStream?, AllocError> {
+        var s = SseStream {
+            dataKey: [0u8; 32],
+            sizes: Vector<u64>.create(),
+            part: 0,
+            opener: null,
+            left: 0,
+            header: Vector<u8>.create(),
+        };
+        for (i in 0..32) { s.dataKey[i] = dataKey[i]; }
+        s.sizes.extend(sizes)?;
+        if (first > 0) {
+            if (salt.length != SSE_PART_HEADER as usize || sizes.length == 0) { return Ok(null); }
+            if (!s.startPart(salt, first)) { return Ok(null); }
+        }
+        return Ok(Some(s));
+    }
+
+    /// The current part's opener, from chunk `first`, under the key of its salt.
+    fn startPart(borrow mut this, salt: Slice<u8>, first: u64) -> bool {
+        var partKey = ssePartKey(borrow this.dataKey, salt);
+        let size = this.sizes[this.part];
+        this.opener = SseOpener.create(borrow partKey, 0, size, first);
+        for (i in 0..32) { partKey[i] = 0; }
+        let skipped = first * (SSE_CHUNK + SSE_TAG);
+        let stored = sseStoredLength(size);
+        this.left = if (skipped < stored) stored - skipped else 0;
+        return this.opener.isSome();
+    }
+
+    /// Takes stored bytes and appends to `out` the plaintext of every chunk they complete; false when one does not
+    /// open, or the bytes go on past the last part.
+    fn feed(borrow mut this, stored: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+        if (this.sizes.length == 0) {
+            return match (this.opener.asBorrowMut()) {
+                Some(o) => o.feed(stored, out),
+                null => Ok(false),
+            };
+        }
+        var at: usize = 0;
+        while (at < stored.length) {
+            if (this.part >= this.sizes.length) { return Ok(false); }
+            if (this.opener.isNull()) {
+                let want = SSE_PART_HEADER as usize - this.header.length;
+                let take = if (stored.length - at < want) stored.length - at else want;
+                this.header.extend(stored[at..at + take])?;
+                at += take;
+                if (this.header.length == SSE_PART_HEADER as usize) {
+                    var salt = [0u8; 16];
+                    for (i in 0..16) { salt[i] = this.header[i]; }
+                    this.header.clear();
+                    if (!this.startPart(salt[..], 0)) { return Ok(false); }
+                }
+                continue;
+            }
+            let have = (stored.length - at) as u64;
+            let take = if (have < this.left) have else this.left;
+            let piece = stored[at..at + take as usize];
+            let opened = match (this.opener.asBorrowMut()) {
+                Some(o) => o.feed(piece, out)?,
+                null => false,
+            };
+            if (!opened) { return Ok(false); }
+            at += take as usize;
+            this.left -= take;
+            if (this.left == 0) {
+                let whole = match (this.opener.asBorrow()) {
+                    Some(o) => o.isWhole(),
+                    null => false,
+                };
+                if (!whole) { return Ok(false); }
+                this.opener = null;
+                this.part += 1;
+            }
+        }
+        return Ok(true);
+    }
+
+    /// Whether the bytes read end at a chunk's end: a read that ends inside a chunk or a header was cut short.
+    fn isWhole(borrow this) -> bool {
+        if (this.header.length > 0) { return false; }
+        return match (this.opener.asBorrow()) {
+            Some(o) => o.isWhole(),
+            null => true,
+        };
+    }
+
+    drop {
+        for (i in 0..32) { this.dataKey[i] = 0; }
+    }
 }
 
 /// The associated data of a wrapped data key: its mode (ADR-0046 §3).
@@ -399,10 +640,13 @@ fn asksEncryption(req: borrow S3Request) -> bool {
 }
 
 /// Whether the request's encryption fields are served: SSE-S3's field alone, on a PutObject (a PUT of a key with no
-/// query and no copy source). Every other request that asks for encryption is NotImplemented until multipart
-/// uploads, copies, POST and SSE-C are served, so nothing asked to be sealed is stored in the clear.
+/// query and no copy source) or a CreateMultipartUpload. Every other request that asks for encryption is
+/// NotImplemented until copies, POST and SSE-C are served, so nothing asked to be sealed is stored in the clear.
 fn sseServedFor(req: borrow S3Request) -> bool {
-    if (!isMethod(req.method, Method.Put) || req.key.length == 0 || !req.onlyParams("")) { return false; }
+    if (req.key.length == 0) { return false; }
+    let put = isMethod(req.method, Method.Put) && req.onlyParams("");
+    let create = isMethod(req.method, Method.Post) && req.hasParam("uploads") && req.onlyParams("uploads");
+    if (!put && !create) { return false; }
     if (headerOf(req, "x-amz-copy-source").isSome()) { return false; }
     for (i in 0..req.headers.length) {
         let name = req.headers[i].name.view();
@@ -497,7 +741,7 @@ async fn sealedDataKey(app: borrow S3App, field: Slice<u8>) -> Result<[u8; 32], 
 /// chunks they complete appended to `plain`. Ok(0) at the end; DataCorrupt when a chunk does not open.
 fn readOpened(
     reader: borrow mut ObjectReader,
-    opener: borrow mut SseOpener,
+    opener: borrow mut SseStream,
     buf: SliceMut<u8>,
     plain: borrow mut Vector<u8>,
 ) -> Result<usize, StoreError> {
@@ -516,7 +760,7 @@ async fn sendOpened(
     app: borrow S3App,
     exchange: borrow mut Exchange,
     reader: borrow mut ObjectReader,
-    opener: borrow mut SseOpener,
+    opener: borrow mut SseStream,
     skip: u64,
     length: u64,
 ) -> Result<void, S3Fail> {

@@ -2140,3 +2140,27 @@ Browser form uploads with a SigV4 POST policy.
   a chunk that fails to open in the middle of a GET ends the response short (the status was sent), as a corrupt
   extent does, and is not tested end to end.
 - **The toolchain:** `~/dev/CeeSafe-wt-0135/out/ceesafec`, the 0.45.0 build of the release branch.
+
+### 14 Nov 2026: M5 item 4, SSE-S3 for multipart uploads (ADR-0046 §2)
+
+- **Chosen with the user** (yes, 14 Nov, "go with your multipart nonce design"), over the part's index chosen
+  earlier the same day, which could not work: a part is sealed before its place among the completed parts is
+  known, and a part uploaded twice under one number would have reused nonces under one key.
+- **The design:** CreateMultipartUpload makes the data key and keeps its envelope in the upload's metadata. Each
+  UploadPart draws a random 16-byte salt, seals the part under HMAC-SHA256 of the salt under the data key, and
+  stores the salt before the part's chunks. A part uploaded again gets another key. No format changes: the salts
+  are in the stored bytes, the part sizes already in the extras. This refines the design proposed earlier (a
+  random value kept with the part, and the part numbers kept), which would have changed three formats.
+- **Reads:** a range is planned across the parts (`sseRange`) and read under one reader, opened by `SseStream`,
+  which takes each part's salt as it comes; a range that starts after its first part's first chunk reads that
+  part's salt apart. `?partNumber=N` works. `fsck` counts each part's header and chunks.
+- **Refused:** UploadPartCopy into a sealed upload (NotImplemented), as a copy from a sealed source already is.
+- **Tests:** `sseMultipartPartsOpenInAnyRange` (parts of 70000, 100, 131077 and 1 bytes; ten ranges: whole, in a
+  part, across parts, after a part's first chunk, the last byte; a changed salt or chunk, a wrong data key; a part
+  uploaded twice seals differently). `tools/s3_smoke.sh` 378 checks, all passed (9 new: parts 1 and 3 with part 3
+  uploaded twice, a copy into the upload refused, the object whole, a range across parts, a range inside a part
+  after its first chunk, `--part-number`, HEAD, and `aws s3 cp --sse AES256` of 20 MB both ways); `fsck` passes
+  with them stored.
+- **Known:** nothing ties a part to its place, so whoever can write the disk can swap two parts with their salts,
+  as ADR-0046 already accepts for moving a sealed object; the parts are admitted at their plaintext size.
+- **Next:** SSE-C, copies (open and seal again), POST, and bucket default encryption.

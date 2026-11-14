@@ -318,7 +318,11 @@ async fn receiveBody(
     var plainMd5 = Md5.create();
     var sealed = Vector<u8>.create();
     // A sealed object that stays inline is sealed on the event loop, as its bytes are kept there (ADR-0031).
-    let sealInline = app.writers.keepsInline(sseStoredLength(spec.size));
+    // (A part's writer keeps nothing in memory.)
+    let sealInline = match (seal.asBorrow()) {
+        Some(s) => w.fitsInline(truncate<usize>(s.storedLength())),
+        null => false,
+    };
     // A second checksum only when the one to store is not the client's.
     let separate = !sameAlgorithm(storedAlgorithm, spec.checksumKind);
     var storedSum = RunningChecksum.create(if (separate) storedAlgorithm else ChecksumAlgorithm.None);
@@ -837,6 +841,10 @@ struct GetPlan {
     /// `?partNumber=N` of a multipart object: N (0 otherwise), for x-amz-mp-parts-count and the part's checksum.
     partNumber: u32;
     extras: ObjectExtras;
+    /// A sealed object (ADR-0046 §2): the stored range read, and the salt of its first part when that range starts
+    /// after the part's header.
+    sse: SseRange?;
+    salt: Vector<u8>;
 }
 
 /// `Range: bytes=a-b | a- | -n` against `size`: the half-open range, null for no (or an unreadable) range, or
@@ -954,6 +962,8 @@ fn planGet(store: borrow ObjectStore, req: borrow S3Request, versionId: [u8; 16]
                 notModified: true,
                 partNumber: 0,
                 extras: ObjectExtras.none(),
+                sse: null,
+                salt: Vector<u8>.create(),
             });
         }
         Err(code) => { return Err(S3Fail.Code(code)); }
@@ -1012,6 +1022,8 @@ fn planGet(store: borrow ObjectStore, req: borrow S3Request, versionId: [u8; 16]
         notModified: false,
         partNumber: partNumber,
         extras: extras,
+        sse: null,
+        salt: Vector<u8>.create(),
     });
 }
 
@@ -1025,11 +1037,12 @@ async fn openGet(
     // The plan and the reader's pins are index work, on the event loop under the lock (ADR-0023). Only an inline
     // record's read does I/O: on a worker thread, after the lock is released, while its segment is pinned (ADR-0024).
     var prepared: PreparedReader? = null;
+    var header: PreparedReader? = null;
     var planned: GetPlan? = null;
     {
         var guard = await lockStore(app)?;
         let store = guard.data();
-        let p = match (planGet(store, req, versionId)) {
+        var p = match (planGet(store, req, versionId)) {
             Ok(p) => p,
             Err(f) => {
                 // A delete marker in the way names itself in the error's response (ADR-0041).
@@ -1038,13 +1051,29 @@ async fn openGet(
             }
         };
         if (withBody && !p.notModified && p.end > p.start) {
-            // A sealed object's range is read as the whole chunks that hold it (ADR-0046 §2).
+            // A sealed object's range is read as the whole chunks that hold it, and a multipart one's parts with their
+            // headers (ADR-0046 §2).
             var from = p.start;
             var to = p.end;
             if (metadataFind(p.info.metadata.view(), SSE_FIELD.bytes()).isSome()) {
-                let span = sseSpan(p.info.size, p.start, p.end);
-                from = span.storedFrom;
-                to = span.storedTo;
+                if (p.info.parts > 0 && p.extras.partSizes.length == 0) {
+                    return Err(S3Fail.Code(S3Code.InternalError));
+                }
+                let r = sseRange(p.info.size, p.extras.partSizes.view(), p.start, p.end);
+                from = r.storedFrom;
+                to = r.storedTo;
+                match (r.headerAt) {
+                    Some(at) => {
+                        let bucket = req.bucket.view();
+                        let key = req.key.view();
+                        header = match (store.prepareReaderOf(bucket, key, versionId, at, at + SSE_PART_HEADER)) {
+                            Ok(h) => h,
+                            Err(e) => { return Err(storeFail(e, req.key.length)); }
+                        };
+                    }
+                    null => {}
+                }
+                p.sse = r;
             }
             prepared = match (store.prepareReaderOf(req.bucket.view(), req.key.view(), versionId, from, to)) {
                 Ok(r) => r,
@@ -1070,29 +1099,63 @@ async fn openGet(
         }
         null => {}
     }
+    // The salt of the first part, when the range starts inside it: its header, read apart.
+    match (header.asBorrowMut()) {
+        Some(h) => {
+            match (await Async.blocking(() => readHeader(h))) {
+                Ok(salt) => { plan.salt = salt; }
+                Err(e) => { return Err(storeFail(e, req.key.length)); }
+            }
+        }
+        null => {}
+    }
     return Ok(plan);
+}
+
+/// A part's header, on a worker thread.
+fn readHeader(prepared: borrow mut PreparedReader) -> Result<Vector<u8>, StoreError> {
+    var reader = prepared.open()?;
+    return readRemaining(mut reader);
 }
 
 async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
     let withBody = !isMethod(req.method, Method.Head);
     var plan = await openGet(app, req, withBody, exchange)?;
     // A sealed object's data key, before any of the answer is given (ADR-0046 §2, §4).
-    var opener: SseOpener? = null;
+    var opener: SseStream? = null;
     var skip: u64 = 0;
-    if (plan.reader.isSome()) {
-        var field = Vector<u8>.create();
-        match (metadataFind(plan.info.metadata.view(), SSE_FIELD.bytes())) {
-            Some(f) => { field.extend(f)?; }
-            null => {}
+    var sealedRange: SseRange? = null;
+    match (plan.sse.asBorrow()) {
+        Some(r) => {
+            sealedRange = SseRange {
+                storedFrom: r.storedFrom,
+                storedTo: r.storedTo,
+                part: r.part,
+                chunk: r.chunk,
+                skip: r.skip,
+                headerAt: r.headerAt,
+            };
         }
-        if (field.length > 0) {
+        null => {}
+    }
+    match (sealedRange) {
+        Some(r) => {
+            var field = Vector<u8>.create();
+            match (metadataFind(plan.info.metadata.view(), SSE_FIELD.bytes())) {
+                Some(f) => { field.extend(f)?; }
+                null => {}
+            }
             var dataKey = await sealedDataKey(app, field.view())?;
-            let span = sseSpan(plan.info.size, plan.start, plan.end);
-            skip = span.skip;
-            opener = SseOpener.create(borrow dataKey, 0, plan.info.size, span.firstChunk);
+            skip = r.skip;
+            opener = if (plan.info.parts == 0) {
+                SseStream.single(borrow dataKey, plan.info.size, r.chunk)
+            } else {
+                SseStream.multipart(borrow dataKey, plan.extras.partSizes.view()[r.part..], r.chunk, plan.salt.view())?
+            };
             for (i in 0..32) { dataKey[i] = 0; }
             if (opener.isNull()) { return Err(S3Fail.Code(S3Code.InternalError)); }
         }
+        null => {}
     }
     readVersionHeader(exchange, borrow plan.info)?;
     var field = Vector<u8>.create();
