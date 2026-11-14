@@ -2407,3 +2407,20 @@ Browser form uploads with a SigV4 POST policy.
   grown. Methods are compared as parsed `Method`s now.
 - **Not yet:** large objects and multipart (item 5), copies across shards, TLS and the other `serve` options on a
   node's S3 port, pipelined writes. **Next:** item 5, extent replication.
+
+### 15 Nov 2026: M6 item 5: extents on a cluster (ADR-0061)
+
+- **Asked by the owner** (15 Nov, "Go ahead and start", after item 4). **ADR-0061** (accepted by the owner as recommended, 15 Nov): a record that names
+  extents is proposed only once a majority holds them, the leader's front pushing them to every follower at once
+  (`POST /extent`) after the shard's S3 server answered and cutting the write's entries off when no majority comes; a
+  replica that lacks an extent its versions or uploads name fetches it every two seconds (`POST /extent-fetch`),
+  checked against its manifest; no orphan sweep at open in a Raft log (the unapplied entries' extents would go), an
+  upkeep sweep instead that spares the unapplied tail and files under ten minutes old.
+- **Found before it bit:** the orphan sweep at open would have removed the extents of every committed-but-unapplied
+  entry on a restart. The new test fails if it comes back.
+- **Tests:** `raftStoreKeepsAndRepairsExtents`; `tools/cluster_s3_smoke.sh` now 33 checks: with a follower of the
+  bucket's shard down, a 20 MB PUT and a 40 MB multipart upload through the two live nodes, read back through each
+  (by ranges for the multipart one); the follower restarted fetches the six extents it missed; after the leader's
+  loss both objects read whole. Passed three runs.
+- **Not yet:** streaming past 64 MiB a request; copies between two shards' buckets. **Next:** item 6, group 0,
+  membership changes, placement and rebalance.

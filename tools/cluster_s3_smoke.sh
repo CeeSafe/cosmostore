@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# S3 on a three-node cluster (ADR-0060, M6 item 4): every call through one node and its effect seen through the
+# S3 on a three-node cluster (ADR-0060, ADR-0061, M6 items 4 and 5): every call through one node and its effect seen through the
 # others; a conditional write that sees the write before it, through another node; versioning, tags, copies, a
 # batch delete; ListBuckets merged across shards, the same from every node; then the leader of a bucket's shard
 # killed, and the run going on through the other nodes, every acknowledged write still there.
-# Large objects (extents) are item 5's and are not tried.
+# Large objects (extents, ADR-0061): a 20 MB PUT and a 40 MB multipart upload through two nodes, read through a third;
+# every node ends with every extent; they survive the leader's loss.
 #
 #   tools/cluster_s3_smoke.sh                ports 19500 and up
 #   COSMO_PORT_BASE=29500 tools/cluster_s3_smoke.sh
@@ -93,6 +94,37 @@ check "CopyObject between buckets of two shards: not yet" "$(code 1 s3api copy-o
 check "DeleteObjects through node 1" "$(on 1 s3api delete-objects --bucket alpha --delete 'Objects=[{Key=k/two},{Key=k/copied}]' --query 'length(Deleted)' --output text 2>&1)" "2"
 check "the delete seen through node 3" "$(code 3 s3api head-object --bucket alpha --key k/two)" "404"
 
+# Large objects: extents pushed to a majority before their records are proposed (ADR-0061). A follower of alpha's shard
+# is down while they are written, so it must fetch them when it comes back.
+md5of() { md5 -q "$1" 2>/dev/null || md5sum "$1" | cut -d' ' -f1; }
+aShard=$(status 1 | sort -k7 -n -r | head -1 | awk '{ print $1 }')
+aLeader=$(status 1 | awk -v s="$aShard" '$1 == s { print $4 }')
+down=$(( aLeader % 3 + 1 ))
+up=$(( down % 3 + 1 ))
+[ "$up" = "$aLeader" ] || up="$aLeader"
+kill -9 "${PIDS[$down]}" 2>/dev/null
+wait "${PIDS[$down]}" 2>/dev/null
+PIDS[$down]=""
+live=()
+for n in 1 2 3; do [ "$n" != "$down" ] && live+=("$n"); done
+head -c 20000000 /dev/urandom > big.bin
+head -c 41943040 /dev/urandom > huge.bin
+check "node $down down: a 20 MB PUT through node ${live[0]}" "$(on "${live[0]}" s3api put-object --bucket alpha --key big --body big.bin --query ETag --output text 2>&1)" "\"$(md5of big.bin)\""
+on "${live[1]}" s3 cp huge.bin s3://alpha/huge > /dev/null 2>&1
+check "a 40 MB multipart upload through node ${live[1]}" "$(on "${live[0]}" s3api head-object --bucket alpha --key huge --query ContentLength --output text 2>&1)" "41943040"
+on "${live[1]}" s3api get-object --bucket alpha --key big big.got > /dev/null 2>&1
+check "the 20 MB object read through node ${live[1]}" "$(md5of big.got)" "$(md5of big.bin)"
+on "${live[0]}" s3 cp s3://alpha/huge huge.got > /dev/null 2>&1
+check "the multipart object read through node ${live[0]}, by ranges" "$(md5of huge.got)" "$(md5of huge.bin)"
+extents() { find "d$1" -name 'ext-*.ce' | wc -l | tr -d ' '; }
+check "the extents are on the two live nodes" "$([ "$(extents "${live[0]}")" -ge 6 ] && [ "$(extents "${live[0]}")" = "$(extents "${live[1]}")" ] && echo yes)" "yes"
+start "$down"
+for i in $(seq 1 75); do
+    [ "$(extents "$down")" = "$(extents "${live[0]}")" ] && break
+    pause 0.2
+done
+check "node $down back: it fetched the extents it missed" "$(extents "$down")" "$(extents "${live[0]}")"
+
 # The leader of alpha's shard goes down; the others go on.
 # Find alpha's shard by asking every node's status for the shard that has applied the most entries.
 alphaShard=$(status 1 | sort -k7 -n -r | head -1 | awk '{ print $1 }')
@@ -103,9 +135,17 @@ PIDS[$leader]=""
 other=$(( leader % 3 + 1 ))
 third=$(( other % 3 + 1 ))
 check "node $leader killed: a write through node $other goes on" "$(on "$other" s3api put-object --bucket alpha --key k/three --body two.txt --query ETag --output text 2>&1 | wc -c | tr -d ' ')" "35"
-check "every acknowledged write is there, through node $third" "$(on "$third" s3api list-objects-v2 --bucket alpha --query 'Contents[].Key' --output text 2>&1)" "k/one	k/three"
+check "every acknowledged write is there, through node $third" "$(on "$third" s3api list-objects-v2 --bucket alpha --query 'Contents[].Key' --output text 2>&1)" "big	huge	k/one	k/three"
 check "and its tags" "$(on "$third" s3api get-object-tagging --bucket alpha --key k/one --query 'TagSet[0].Value' --output text 2>&1)" "green"
 check "ListBuckets with a node down" "$(on "$other" s3api list-buckets --query 'Buckets[].Name' --output text 2>&1)" "alpha	beta"
+rm -f big.got huge.got
+for i in $(seq 1 25); do
+    on "$third" s3api get-object --bucket alpha --key big big.got > /dev/null 2>&1 && [ "$(md5of big.got)" = "$(md5of big.bin)" ] && break
+    pause 0.4
+done
+check "the 20 MB object survives the leader's loss" "$(md5of big.got)" "$(md5of big.bin)"
+on "$other" s3 cp s3://alpha/huge huge.got > /dev/null 2>&1
+check "and the multipart one" "$(md5of huge.got)" "$(md5of huge.bin)"
 
 # It comes back and serves too.
 start "$leader"

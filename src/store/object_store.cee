@@ -1258,7 +1258,7 @@ fn stageIn(
     payload: Slice<u8>,
 ) -> Result<RecordPosition, StoreError> {
     if (!raft) { return Ok(journal.stage(kind, meta, payload)?); }
-    if (carriesManifest(kind)) { return Err(StoreError.NotReplicated); }
+    // A record that names extents is proposed only once a majority holds them (ADR-0061 §1): the node's front sees to it.
     if (term == 0) { return Err(StoreError.NotLeader); }
     return Ok(journal.stageEntry(kind, term, meta, payload)?);
 }
@@ -1524,7 +1524,9 @@ struct ObjectStore {
         // Every extent not referenced by a live version is garbage: superseded or deleted
         // versions, and uploads that never committed (ADR-0003).
         store.state.deadExtents.clear();
-        store.sweepOrphanExtents()?;
+        // Not in a Raft log: the entries after the checkpoint are not applied yet, and their extents would look like
+        // orphans (ADR-0061 §4). Upkeep sweeps there, carefully.
+        if (!store.raft) { store.sweepOrphanExtents()?; }
         store.measureVolume();
         return Ok(store);
     }
@@ -1570,6 +1572,177 @@ struct ObjectStore {
             removeExtent(this.extentDir.view(), id);
         }
         return Ok(orphans.length);
+    }
+
+    // --- Extents on a cluster (ADR-0061) ---
+
+    /// The extents the entries `from` to `to` name: the new extents of PutExtent and UploadPart records (an
+    /// UploadComplete's are its parts', pushed with them). What a leader pushes before it proposes them.
+    fn extentsOfEntries(borrow this, from: u64, to: u64) -> Result<Vector<u64>, StoreError> {
+        var out = Vector<u64>.create();
+        var lsn = from;
+        while (lsn <= to) {
+            let at = this.journal.entryAt(lsn)?;
+            let h = borrow at.header;
+            let fresh = match (h.kind) {
+                RecordType.PutExtent => true,
+                RecordType.UploadPart => true,
+                _ => false,
+            };
+            if (fresh) {
+                let record = this.journal.readRecord(at.segment, at.offset, h.totalLen)?;
+                let metaEnd = RECORD_HEADER_LEN + h.metaLen as usize;
+                let payloadEnd = metaEnd + h.payloadLen as usize;
+                let refs = match (decodeManifest(record[metaEnd..payloadEnd])) {
+                    Ok(r) => r,
+                    Err(_) => { return Err(StoreError.BadMeta(at.segment, at.offset)); }
+                };
+                for (k in 0..refs.length) { out.push(refs[k].id)?; }
+            }
+            lsn += 1;
+        }
+        return Ok(out);
+    }
+
+    /// Where the store's extent files are.
+    fn extentDirectory(borrow this) -> StringView => this.extentDir.view();
+
+    /// Extent `id`'s file, whole: what a leader pushes, or a replica sends one that lacks it.
+    fn extentFileBytes(borrow this, id: u64) -> Result<Vector<u8>, StoreError> {
+        let path = extentPath(this.extentDir.view(), id)?;
+        let file = sio(DurableFile.openRead(path.view()))?;
+        let size = sio(file.size())?;
+        let n = match (checkedTruncate<usize>(size)) {
+            Some(n) => n,
+            null => { return Err(StoreError.EntityTooLarge); }
+        };
+        var out = Vector<u8>.create();
+        out.resize(n, 0)?;
+        sio(file.readExactAt(mut out.viewMut(), 0))?;
+        return Ok(out);
+    }
+
+    /// Installs extent `id` as another replica sent it (ADR-0061 §2): its header checked, written in place of one of
+    /// the same id, synced, and the directory synced.
+    fn installExtent(borrow mut this, id: u64, bytes: Slice<u8>) -> Result<void, StoreError> {
+        if ((bytes.length as u64) < EXTENT_HEADER_LEN) { return Err(StoreError.DataCorrupt); }
+        let header = bytes[0..64];
+        if (header.readLE<u64>(0) != EXTENT_MAGIC || header.readLE<u64>(8) != id ||
+            header.readLE<u32>(60) != Crc32c.of(header[0..60])) {
+            return Err(StoreError.DataCorrupt);
+        }
+        let path = extentPath(this.extentDir.view(), id)?;
+        match (Fs.unlink(path.view())) {
+            Ok() => {}
+            Err(e) => {
+                if (!e.isNotFound()) { return Err(StoreError.Io(e)); }
+            }
+        }
+        let file = sio(DurableFile.createNew(path.view()))?;
+        sio(file.writeAt(bytes, 0))?;
+        sio(file.syncData())?;
+        sio(Fs.syncDirectory(this.extentDir.view()))?;
+        return Ok();
+    }
+
+    /// The extents this store's versions and uploads name that it does not have, with their lengths and CRCs: what a
+    /// replica fetches (ADR-0061 §3).
+    fn missingExtents(borrow this, most: usize) -> Result<Vector<ExtentRef>, StoreError> {
+        let names = match (Directory.list(this.extentDir.view())) {
+            Ok(n) => n,
+            Err(_) => { return Err(StoreError.Io(IoFailure { op: IoOp.Open, errno: 0 })); }
+        };
+        var present = HashMap<u64, bool>.create();
+        for (i in 0..names.length) {
+            match (extentIdFromName(names[i].view())) {
+                Some(id) => { let _ = present.put(id, true)?; }
+                null => {}
+            }
+        }
+        var missing = Vector<ExtentRef>.create();
+        var seen = HashMap<u64, bool>.create();
+        var cursor = this.state.index.first();
+        while (missing.length < most) {
+            let i = match (cursor) {
+                Some(c) => c,
+                null => { break; }
+            };
+            cursor = this.state.index.next(i);
+            var slot = this.state.index.slotAt(i);
+            while (slot != NO_VERSION_SLOT) {
+                let v = this.state.index.versionAt(slot);
+                for (k in 0..v.extents.length) {
+                    let e = borrow v.extents[k];
+                    if (!present.contains(borrow e.id) && !seen.contains(borrow e.id)) {
+                        let _ = seen.put(e.id, true)?;
+                        missing.push(ExtentRef { id: e.id, length: e.length, crc: e.crc })?;
+                    }
+                }
+                slot = this.state.index.olderOf(slot);
+            }
+        }
+        for (i in 0..this.state.uploads.length()) {
+            let u = this.state.uploads.valueAt(i);
+            for (p in 0..u.parts.length) {
+                for (e in u.parts[p].extents.view()) {
+                    if (missing.length >= most) { break; }
+                    if (!present.contains(borrow e.id) && !seen.contains(borrow e.id)) {
+                        let _ = seen.put(e.id, true)?;
+                        missing.push(ExtentRef { id: e.id, length: e.length, crc: e.crc })?;
+                    }
+                }
+            }
+        }
+        return Ok(missing);
+    }
+
+    /// A Raft log's orphan sweep (ADR-0061 §4): an extent no version or upload names, no entry after the applied
+    /// index names, and whose file is older than ten minutes.
+    fn sweepRaftOrphans(borrow mut this, now: i64) -> Result<usize, StoreError> {
+        let orphans = this.orphanExtents()?;
+        if (orphans.length == 0) { return Ok(0); }
+        let tail = this.extentsOfTail()?;
+        var removed = 0usize;
+        for (id in orphans.view()) {
+            var pending = false;
+            for (t in tail.view()) {
+                if (t == id) { pending = true; }
+            }
+            if (pending) { continue; }
+            let path = extentPath(this.extentDir.view(), id)?;
+            let modified = match (Fs.modifiedMillis(path.view())) {
+                Ok(m) => m,
+                Err(_) => { continue; }
+            };
+            if (modified > now - 600000) { continue; }
+            removeExtent(this.extentDir.view(), id);
+            removed += 1;
+        }
+        return Ok(removed);
+    }
+
+    /// Every extent the unapplied entries name, an UploadComplete's included.
+    fn extentsOfTail(borrow this) -> Result<Vector<u64>, StoreError> {
+        var out = Vector<u64>.create();
+        var lsn = this.appliedIndex() + 1;
+        let last = this.journal.durableLsn();
+        while (lsn <= last) {
+            let at = this.journal.entryAt(lsn)?;
+            let h = borrow at.header;
+            if (carriesManifest(h.kind)) {
+                let record = this.journal.readRecord(at.segment, at.offset, h.totalLen)?;
+                let metaEnd = RECORD_HEADER_LEN + h.metaLen as usize;
+                let payloadEnd = metaEnd + h.payloadLen as usize;
+                match (decodeManifest(record[metaEnd..payloadEnd])) {
+                    Ok(refs) => {
+                        for (k in 0..refs.length) { out.push(refs[k].id)?; }
+                    }
+                    Err(_) => {}
+                }
+            }
+            lsn += 1;
+        }
+        return Ok(out);
     }
 
     /// The extent files that no live version references.

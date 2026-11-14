@@ -1,0 +1,80 @@
+// Extents in a cluster shard's store (ADR-0061): the extents of entries not yet applied survive an open and the
+// orphan sweep; an extent named but absent is listed, with its length and CRC, and installed from another replica's
+// bytes; a file that is not the extent it claims is refused.
+
+fn raftStoreConfig() -> StoreConfig {
+    var c = storeConfig();
+    c.journal = JournalConfig { segmentTargetBytes: 1048576, maxBatchBytes: 65536, shardId: 0, raftLog: true };
+    return c;
+}
+
+fn extentFileCount(dir: StringView) -> u64 {
+    var path = String.create();
+    path.append(dir)!;
+    path.append("/extents")!;
+    var n = 0u64;
+    match (Directory.list(path.view())) {
+        Ok(names) => {
+            for (name in names) {
+                if (name.view().startsWith("ext-")) { n += 1; }
+            }
+        }
+        Err(_) => {}
+    }
+    return n;
+}
+
+@test
+fn raftStoreKeepsAndRepairsExtents() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("raft-extents");
+    var big = Vector<u8>.create();
+    for (i in 0..300000) { big.push(truncate<u8>(i * 7))!; }
+    {
+        var store = ObjectStore.open(dir.view(), raftStoreConfig())!;
+        store.setLeaderTerm(1);
+        store.appendNoop(1)!;
+        store.persistEntries()!;
+        store.applyEntries(1, 1)!;
+        store.createBucket("bkt")!;
+        store.applyEntries(2, 2)!;
+        // A large object: its extents written and synced, its record staged and persisted, not applied.
+        let _ = store.putObject("bkt", "big", "application/octet-stream", big.view(), PutCondition.None)!;
+        store.persistEntries()!;
+        Check.equalU64(3, store.lastEntry())?;
+        Check.equalU64(2, store.appliedIndex())?;
+        Check.isTrue(extentFileCount(dir.view()) >= 1, "the object is in extents")?;
+        let named = store.extentsOfEntries(3, 3)!;
+        Check.isTrue(named.length >= 1, "its record names them")?;
+    }
+    let files = extentFileCount(dir.view());
+    var store = ObjectStore.open(dir.view(), raftStoreConfig())!;
+    // Reopened: the entry is unapplied, so no version names the extents; they are kept all the same.
+    Check.equalU64(files, extentFileCount(dir.view()))?;
+    let _ = store.sweepRaftOrphans(Clock.unixMillis() + 3600000)!;
+    Check.equalU64(files, extentFileCount(dir.view()))?;
+    let terms = store.takeRecoveredTerms();
+    Check.equalU64(3, terms.length as u64)?;
+    store.applyEntries(1, 3)!;
+    Check.equalBytes(big.view(), store.getObject("bkt", "big")!.view())?;
+    Check.equalU64(0, store.missingExtents(16)!.length as u64)?;
+    // An extent lost on this replica: listed with its manifest's length and CRC, and installed from another's bytes.
+    let ids = store.extentsOfEntries(3, 3)!;
+    let id = ids[0];
+    let bytes = store.extentFileBytes(id)!;
+    removeExtent(store.extentDirectory(), id);
+    let missing = store.missingExtents(16)!;
+    Check.equalU64(1, missing.length as u64)?;
+    Check.equalU64(id, missing[0].id)?;
+    Check.equalU64(missing[0].length + EXTENT_HEADER_LEN, bytes.length as u64)?;
+    Check.equalU64(missing[0].crc as u64, Crc32c.of(bytes.view()[64..bytes.length]) as u64)?;
+    // Not the extent it claims to be: refused.
+    Check.isTrue(store.installExtent(id ^ 1, bytes.view()).isErr(), "another id")?;
+    var torn = bytes.clone()!;
+    torn[20] = torn[20] ^ 0xFF;
+    Check.isTrue(store.installExtent(id, torn.view()).isErr(), "a damaged header")?;
+    store.installExtent(id, bytes.view())!;
+    Check.equalU64(0, store.missingExtents(16)!.length as u64)?;
+    Check.equalBytes(big.view(), store.getObject("bkt", "big")!.view())?;
+    removeTree(dir.view());
+    return Ok();
+}

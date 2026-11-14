@@ -356,6 +356,11 @@ async fn leadWrite(shared: borrow NodeShared, at: usize, raw: borrow RawMessage)
         waited += FRONT_POLL_MS;
     }
     let response = await exchangeRaw(shared, slot.s3url.view(), raw, null, raw.body.view())?;
+    // The extents the write staged, on a majority before its entries are proposed (ADR-0061 §1).
+    if (!(await pushExtents(shared, slot)?)) {
+        await abandonStaged(slot);
+        return Ok(statusOnly(503));
+    }
     let proposed = match (await proposeStaged(shared, slot)?) {
         Some(p) => p,
         null => {
@@ -379,6 +384,182 @@ async fn leadWrite(shared: borrow NodeShared, at: usize, raw: borrow RawMessage)
         waited += FRONT_POLL_MS;
     }
     return Ok(statusOnly(503));
+}
+
+/// The extents the entries after the core's last name, persisted first: what a write staged.
+fn stagedExtents(st: borrow mut ObjectStore, after: u64) -> Result<Vector<u64>, StoreError> {
+    st.persistEntries()?;
+    let last = st.lastEntry();
+    if (last <= after) { return Ok(Vector<u64>.create()); }
+    return st.extentsOfEntries(after + 1, last);
+}
+
+/// Sends the extents a write staged to every other replica of the shard at once; whether a majority, this one
+/// counting, holds them all (ADR-0061 §1, §2).
+async fn pushExtents(shared: borrow NodeShared, slot: borrow ShardSlot) -> Result<bool, NodeFault> {
+    var files = Vector<Vector<u8>>.create();
+    var ids = Vector<u64>.create();
+    {
+        var guard = match (await slot.replica.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let after = guard.data().core.lastIndex();
+        var storeGuard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = storeGuard.data();
+        ids = match (await Async.blocking(() => stagedExtents(st, after))) {
+            Ok(i) => i,
+            Err(_) => { return Ok(false); }
+        };
+        for (k in 0..ids.length) {
+            let id = ids[k];
+            match (await Async.blocking(() => st.extentFileBytes(id))) {
+                Ok(b) => {
+                    if (files.push(b).isErr()) { return Err(NodeFault.OutOfMemory); }
+                }
+                Err(_) => { return Ok(false); }
+            }
+        }
+    }
+    if (ids.length == 0) { return Ok(true); }
+    let placed = match (shared.file.placement(slot.shard)) {
+        Ok(p) => p,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    let held = AtomicU64.create(1); // this replica's
+    let heldRef = borrow held;
+    let shard = slot.shard;
+    let fileView = borrow files;
+    let idView = borrow ids;
+    let _ = await Async.scope(NodeFault.OutOfMemory, (s) => {
+        for (p in 0..placed.length) {
+            let peer = placed[p];
+            if (peer == shared.id) { continue; }
+            s.spawn(async move () => {
+                if (await pushAll(shared, peer, shard, idView, fileView)) { let _ = heldRef.fetchAdd(1); }
+                return Ok();
+            });
+        }
+    });
+    return Ok(held.load() >= (placed.length as u64) / 2 + 1);
+}
+
+/// Pushes every extent to node `peer`; whether it took them all.
+async fn pushAll(
+    shared: borrow NodeShared,
+    peer: u32,
+    shard: u32,
+    ids: borrow Vector<u64>,
+    files: borrow Vector<Vector<u8>>,
+) -> bool {
+    let url = match (peerUrl(shared, peer, "/extent")) {
+        Some(u) => u,
+        null => { return false; }
+    };
+    for (k in 0..ids.length) {
+        var body = Vector<u8>.create();
+        let built = body.pushLE(shard).isOk() && body.pushLE(ids[k]).isOk() && body.extend(files[k].view()).isOk();
+        if (!built) { return false; }
+        let empty = RawMessage.empty();
+        match (await exchangeRaw(shared, url.view(), borrow empty, Some("/extent"), body.view())) {
+            Ok(reply) => {
+                if (reply.status != 204) { return false; }
+            }
+            Err(_) => { return false; }
+        }
+    }
+    return true;
+}
+
+/// `http://<peer's address><path>`.
+fn peerUrl(shared: borrow NodeShared, node: u32, path: StringView) -> String? {
+    return match (shared.file.node(node)) {
+        Some(n) => {
+            var url = textOf("http://");
+            if (appendPeerAddress(mut url, n.peer).isErr() || url.append(path).isErr()) { null } else { Some(url) }
+        }
+        null => null,
+    };
+}
+
+/// Cuts off the entries a write staged but could not get its extents to a majority for: uncommitted, this leader's.
+async fn abandonStaged(slot: borrow ShardSlot) {
+    var guard = match (await slot.replica.lock()) {
+        Ok(g) => g,
+        Err(_) => { return; }
+    };
+    let after = guard.data().core.lastIndex();
+    var storeGuard = match (await slot.store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return; }
+    };
+    let st = storeGuard.data();
+    match (await Async.blocking(() => st.truncateEntries(after))) {
+        Ok() => {}
+        Err(e) => { await noteFailure(slot, e); }
+    }
+}
+
+/// Every two seconds, the extents each replica's versions and uploads name that it lacks, fetched from the shard's
+/// other replicas and checked against their manifests (ADR-0061 §3).
+async fn fetchForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
+    while (true) {
+        if (!(await frontPause(2000))) { return Err(NodeFault.Net); }
+        for (i in 0..shared.slots.length) {
+            let slot = borrow shared.slots[i];
+            if (slot.failed.load() != 0) { continue; }
+            var missing = Vector<ExtentRef>.create();
+            {
+                var storeGuard = match (await slot.store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NodeFault.Net); }
+                };
+                let st = storeGuard.data();
+                missing = match (await Async.blocking(() => st.missingExtents(64))) {
+                    Ok(m) => m,
+                    Err(_) => { continue; }
+                };
+            }
+            for (k in 0..missing.length) { await fetchExtent(shared, slot, borrow missing[k]); }
+        }
+    }
+    return Ok();
+}
+
+async fn fetchExtent(shared: borrow NodeShared, slot: borrow ShardSlot, want: borrow ExtentRef) {
+    let placed = match (shared.file.placement(slot.shard)) {
+        Ok(p) => p,
+        Err(_) => { return; }
+    };
+    for (p in 0..placed.length) {
+        if (placed[p] == shared.id) { continue; }
+        let url = match (peerUrl(shared, placed[p], "/extent-fetch")) {
+            Some(u) => u,
+            null => { continue; }
+        };
+        var body = Vector<u8>.create();
+        if (body.pushLE(slot.shard).isErr() || body.pushLE(want.id).isErr()) { return; }
+        let empty = RawMessage.empty();
+        let reply = match (await exchangeRaw(shared, url.view(), borrow empty, Some("/extent-fetch"), body.view())) {
+            Ok(r) => r,
+            Err(_) => { continue; }
+        };
+        if (reply.status != 200) { continue; }
+        // The manifest's length and CRC32C, over the bytes after the header.
+        let b = reply.body.view();
+        if ((b.length as u64) != EXTENT_HEADER_LEN + want.length) { continue; }
+        if (Crc32c.of(b[EXTENT_HEADER_LEN as usize..b.length]) != want.crc) { continue; }
+        var storeGuard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return; }
+        };
+        let st = storeGuard.data();
+        let id = want.id;
+        if ((await Async.blocking(() => st.installExtent(id, b))).isOk()) { return; }
+    }
 }
 
 async fn entryTermOf(slot: borrow ShardSlot, index: u64) -> Result<u64, NodeFault> {

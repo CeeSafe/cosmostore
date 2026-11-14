@@ -562,7 +562,12 @@ impl Handler<NodeApp> for PeerHandler {
         let isStatus = request.method() == Method.Get && path == "/cluster/status";
         // A client's S3 request forwarded by another node to this one as the shard's leader (ADR-0060 §4).
         let isS3 = request.method() == Method.Post && path == "/s3";
-        if (!isRaft && !isStatus && !isS3) { return await exchange.send(Status.notFound(), "".bytes()); }
+        // An extent pushed by a leader, or asked for by a replica that lacks it (ADR-0061 §2, §3).
+        let isExtent = request.method() == Method.Post && path == "/extent";
+        let isFetch = request.method() == Method.Post && path == "/extent-fetch";
+        if (!isRaft && !isStatus && !isS3 && !isExtent && !isFetch) {
+            return await exchange.send(Status.notFound(), "".bytes());
+        }
         // The body, whole: a batch is decoded only once its signature holds.
         var body = Vector<u8>.create();
         var buf = Vector<u8>.create();
@@ -610,6 +615,31 @@ impl Handler<NodeApp> for PeerHandler {
                 Err(_) => { return Err(HandlerError.Internal); }
             };
             return await exchange.send(Status.ok(), text.view());
+        }
+        if (isExtent || isFetch) {
+            if (body.length < 12) { return await exchange.send(Status.badRequest(), "".bytes()); }
+            let shard = body.view().readLE<u32>(0);
+            let id = body.view().readLE<u64>(4);
+            let at = match (slotOf(shared, shard)) {
+                Some(i) => i,
+                null => { return await exchange.send(Status.notFound(), "".bytes()); }
+            };
+            var storeGuard = match (await shared.slots[at].store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(HandlerError.Internal); }
+            };
+            let st = storeGuard.data();
+            if (isExtent) {
+                let file = body.view()[12..body.length];
+                return match (await Async.blocking(() => st.installExtent(id, file))) {
+                    Ok() => await exchange.send(Status.noContent(), "".bytes()),
+                    Err(_) => await exchange.send(statusOf(500), "".bytes()),
+                };
+            }
+            return match (await Async.blocking(() => st.extentFileBytes(id))) {
+                Ok(bytes) => await exchange.send(Status.ok(), bytes.view()),
+                Err(_) => await exchange.send(Status.notFound(), "".bytes()),
+            };
         }
         if (isS3) {
             if (body.length < 4) { return await exchange.send(Status.badRequest(), "".bytes()); }
@@ -751,6 +781,7 @@ async fn runNode(
             null => {}
         }
         s.spawn(async () => await tickForever(node));
+        s.spawn(async () => await fetchForever(node));
         for (i in 0..peers) {
             let at = i;
             s.spawn(async move () => await sendForever(node, at));
@@ -841,6 +872,12 @@ fn nodeCommand() -> i32 {
     };
     let routedS3 = match (peerHandler()) {
         Ok(h) => server.router().post("/s3", h).isOk(),
+        Err(_) => false,
+    } && match (peerHandler()) {
+        Ok(h) => server.router().post("/extent", h).isOk(),
+        Err(_) => false,
+    } && match (peerHandler()) {
+        Ok(h) => server.router().post("/extent-fetch", h).isOk(),
         Err(_) => false,
     };
     if (!routed || !routedS3) { return 1; }

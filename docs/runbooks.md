@@ -246,8 +246,10 @@ There is no backup command and no replication yet (M6).
 
 ## A cluster (preview, M6)
 
-A cluster of nodes replicates each shard over Raft (ADR-0056 to ADR-0060) and serves S3 through any node, except
-large objects (M6 item 5): a cluster takes objects up to the inline limit, and refuses multipart uploads.
+A cluster of nodes replicates each shard over Raft (ADR-0056 to ADR-0061) and serves S3 through any node. A large
+object's extents are on a majority of its shard's replicas before its write is answered; a replica that missed some
+(down, or behind a snapshot) fetches them within seconds. One request moves at most 64 MiB: a PUT of up to 64 MiB,
+any object by multipart upload, and any object by ranged GETs (the AWS CLI's way); a whole GET past 64 MiB fails.
 
 - **The cluster file** is the same on every node: `cluster` (16 hex digits), `shards`, `replicas`, `secret-file`,
   and a `node <id> peer=<address:port> domain=<rack>` line per node (ADR-0059 §1). Make the secret with
@@ -272,8 +274,8 @@ large objects (M6 item 5): a cluster takes objects up to the inline limit, and r
   `--kms-key-file`, and a bucket's default (ADR-0046, ADR-0055). There is no KMS service behind SSE-KMS: its keys
   are a file. An encryption context and `aws:kms:dsse` are refused with `NotImplemented`, never ignored. Keys, metadata, sizes and an
   SSE-S3 object's ETag (its plaintext's MD5) are not encrypted; for those, encrypt the volume too.
-- A cluster serves no large objects or multipart uploads yet (M6 item 5), copies no object between buckets of two
-  shards (NotImplemented), has no TLS, rate limits, audit log, notifications or encryption keys on its S3 port, and
+- A cluster streams no request or answer past 64 MiB, copies no object between buckets of two shards
+  (NotImplemented), has no TLS, rate limits, audit log, notifications or encryption keys on its S3 port, and
   takes one write at a time per shard; membership is the cluster file's (item 6).
 - No call to force a credentials reload or an upkeep round (both come within a round), nor to change an option
   without a restart.
