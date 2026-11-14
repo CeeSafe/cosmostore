@@ -2208,7 +2208,7 @@ Browser form uploads with a SigV4 POST policy.
 
 - **Asked by the user** (14 Nov, "Continue to those remaining": SSE-KMS, the policy condition keys, the SSE-C key
   copies, ADR-0046's status).
-- **SSE-KMS** (ADR-0055, proposed): `serve --kms-key-file`, named keys in the key file's format, apart from SSE-S3's
+- **SSE-KMS** (ADR-0055, accepted by the owner as recommended, 14 Nov): `serve --kms-key-file`, named keys in the key file's format, apart from SSE-S3's
   master keys. `aws:kms` with a key id (or an ARN ending in it), else the file's first key; envelope mode `kms`;
   answers name the key; the ETag is a digest of the plaintext's MD5 under the data key. On PutObject, POST,
   CopyObject (both ways), CreateMultipartUpload, UploadPart, UploadPartCopy and Complete; a bucket default of

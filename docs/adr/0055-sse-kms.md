@@ -1,8 +1,8 @@
 # ADR-0055: SSE-KMS with a local KMS key file
 
-**Status:** proposed for M5 (item 4, its last part), 14 Nov 2026, and built (`src/s3/sse.cee`, `src/s3/serve.cee`,
-`src/s3/policy.cee`, `src/store/bucket_config.cee`), asked for by the owner as the remainder of ADR-0046
-("Continue to those remaining").
+**Status:** accepted for M5 (item 4, its last part), 14 Nov 2026, as recommended (the owner: "I accept ADRs as
+recommended"), and built (`src/s3/sse.cee`, `src/s3/serve.cee`, `src/s3/policy.cee`, `src/store/bucket_config.cee`),
+asked for by the owner as the remainder of ADR-0046 ("Continue to those remaining").
 
 ## Context
 
