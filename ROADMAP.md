@@ -2046,3 +2046,24 @@ Browser form uploads with a SigV4 POST policy.
 - **Not shown,** as before: the M1's ms and ops/s, requests with policies, ACLs, CORS rules, notification rules, a
   quota or the audit log in use, and anonymous requests.
 - Results: `~/cosmo-ref/run-gate-m5d` on the mini.
+
+### 14 Nov 2026: M5 item 7, fifth part: rate limits (ADR-0053)
+
+- **Chosen with the user** (yes, 14 Nov): a limit per key and per address, answered with 503 SlowDown.
+- **`serve --rate-limit-address <n>` and `--rate-limit-key <n>`:** the most requests a second from one address
+  (counted before the request is parsed; an IPv6 address by its first 64 bits) and by one access key (once its
+  signature has checked). Past either: SlowDown with `Retry-After: 1`, counted in the stats (`rateLimited`).
+- **Windows of a second in atomics:** two tables of 4,096 slots (a count, its second, whose it is), found by the
+  address's hash or the key's place in the credentials; no lock and no allocation. A client may send its limit at
+  the end of one second and again at the start of the next; two holders that meet in a slot are slowed together,
+  never let through together.
+- **Tests (2 new, 214 in all, no leaks):** the window (the limit, the next second, a slot shared, a slot taken
+  over), what an address is counted as (its port ignored, an IPv6 /64), and the limiter with and without limits.
+- **Clients:** `tools/s3_smoke.sh` 347 checks (4 new) against a second server started with both limits, so the
+  script's own requests are not held back: of 60 quick anonymous requests 20 to 40 are slowed at 20 a second, a
+  slowed one carries `Retry-After`, the next second is its own, and of 15 by one key 5 to 10 are slowed at 5 a
+  second. boto3 139 and the s3-tests subset 377, as before.
+- **Not run:** the p99 gate with a limit on (off, the request path has two more comparisons), the rclone, Go,
+  JavaScript, Java and .NET scripts and `tools/tls_smoke.sh`.
+- **The toolchain:** as before, the 0.41.0 build `out/ceesafec.good3` of the CeeSafe checkout.
+- **Next:** the last part of item 7, an admin API and CLI; item 4's rest when G33 is fixed.

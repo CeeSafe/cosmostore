@@ -57,6 +57,8 @@ struct S3App {
     denyBuckets: AtomicU64;
     /// Whether the server listens with TLS: `aws:SecureTransport` (ADR-0043 §6).
     secure: bool;
+    /// The request rate limits (`serve --rate-limit-address`, `--rate-limit-key`, ADR-0053).
+    rates: RateLimiter;
     /// The audit log's queue (`serve --audit-log`, ADR-0051); null without one.
     audit: AuditLog?;
     /// Buckets with CORS rules (ADR-0049 §4): while 0, a request's `Origin` is not looked at.
@@ -255,6 +257,9 @@ async fn serveS3(
     facts: borrow mut AuditFacts,
 ) -> Result<void, S3Fail> {
     facts.requester.push('-')?;
+    // The address's rate limit first (ADR-0053): before anything is parsed or a signature is checked.
+    let second = truncate<u64>(Clock.unixMillis() / 1000);
+    if (!app.rates.admitAddress(peer, second)) { return Err(slowDown(exchange)); }
     let req = S3Request.of(request, app.domain.view())?;
     kind = latencyClass(borrow req);
     // CORS (ADR-0049): a preflight is answered here, unsigned; a request that names its origin gets a matching
@@ -277,6 +282,13 @@ async fn serveS3(
     // Encryption waits for a cipher (ADR-0046 §7): refused, not ignored, so nothing asked to be sealed is stored
     // in the clear.
     if (asksEncryption(borrow req)) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    // The key's rate limit, once it is known whose request it is (ADR-0053).
+    match (auth.key) {
+        Some(place) => {
+            if (!app.rates.admitKey(place, second)) { return Err(slowDown(exchange)); }
+        }
+        null => {}
+    }
     let who = Requester { key: auth.key, peer: peer };
     // Who the request is, for its line in the audit log (ADR-0051).
     if (app.audit.isSome()) {

@@ -8,7 +8,7 @@ bin=$(cd "$(dirname "${1:-out/cosmostore}")" && pwd)/$(basename "${1:-out/cosmos
 port=${2:-9311}
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
-trap 'kill "$server" "$hook" 2>/dev/null; rm -rf "$work"' EXIT
+trap 'kill "$server" "$hook" "${limited:-}" 2>/dev/null; rm -rf "$work"' EXIT
 
 export AWS_ACCESS_KEY_ID=AKIASMOKETEST0000001
 export AWS_SECRET_ACCESS_KEY=smoke/secret/0123456789abcdefghijkl
@@ -657,6 +657,26 @@ sleep 4
 check "a key taken out of the file" "$(second second/secret/two code s3api list-buckets)" InvalidAccessKeyId
 check "the first key through it all" "$(aws s3api list-buckets --query 'length(Buckets)')" 1
 check "the reloads in the log" "$(grep -c 'credentials reloaded' server.log) $(grep -c 'credentials reload failed' server.log)" "3 1"
+
+# Rate limits (ADR-0053): a second server with both limits, so this one's requests are not held back.
+limitport=$((port + 2))
+"$bin" serve "$work/limited" "$limitport" "$work/credentials" --rate-limit-address 20 --rate-limit-key 5 2> "$work/limited.log" &
+limited=$!
+sleep 1
+burst() { n=0; i=0; while [ "$i" -lt "$1" ]; do [ "$(curl -s -o /dev/null -w '%{http_code}' "$2")" = "$3" ] && n=$((n + 1)); i=$((i + 1)); done; echo "$n"; }
+sleep 1 # into a fresh second, or nearly: the counts below allow for a boundary
+slowed=$(burst 60 "http://127.0.0.1:$limitport/" 503)
+check "an address past its limit is slowed" "$([ "$slowed" -ge 20 ] && [ "$slowed" -le 40 ] && echo yes || echo "$slowed")" yes
+i=0; while [ "$i" -lt 60 ]; do curl -s -o /dev/null -D slow.out "http://127.0.0.1:$limitport/"; grep -q '^HTTP[^ ]* 503' slow.out && break; i=$((i + 1)); done
+check "it is told how long to wait" "$(grep -ci '^retry-after: 1' slow.out)" 1
+sleep 1
+check "the next second is its own" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$limitport/")" 403
+sleep 1
+listurl=$(python3 -I "$here/s3_raw.py" presign "http://127.0.0.1:$limitport" GET "" "" 60)
+slowed=$(burst 15 "$listurl" 503)
+check "a key past its limit is slowed" "$([ "$slowed" -ge 5 ] && [ "$slowed" -le 10 ] && echo yes || echo "$slowed")" yes
+kill "$limited"
+wait "$limited" 2> /dev/null
 
 # The audit log (ADR-0051): a line of JSON for every request so far, written within a moment of its response.
 audit() { python3 -I -c 'import json,sys

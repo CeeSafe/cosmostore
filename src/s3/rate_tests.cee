@@ -1,0 +1,63 @@
+// Rate limits (ADR-0053): the count of a second, whose it is, and the limiter.
+import web_core;
+import web_http;
+import web_server;
+
+@test
+fn rateWindowsOfASecond() -> Result<void, TestFailure> {
+    let slot = RateSlot { tag: AtomicU64.create(0), window: AtomicU64.create(0), count: AtomicU64.create(0) };
+    // Three a second: the fourth is refused, and the next second begins again.
+    for (i in 0..3) { Check.isTrue(rateAdmit(borrow slot, 7, 100, 3), "within the limit")?; }
+    Check.isTrue(!rateAdmit(borrow slot, 7, 100, 3), "the fourth")?;
+    Check.isTrue(!rateAdmit(borrow slot, 7, 100, 3), "and the fifth")?;
+    Check.isTrue(rateAdmit(borrow slot, 7, 101, 3), "the next second")?;
+    // Another holder in the same slot and second shares the count; once the second is over the slot is its own.
+    Check.isTrue(rateAdmit(borrow slot, 9, 101, 3), "a second holder, counted with the first")?;
+    Check.isTrue(rateAdmit(borrow slot, 9, 101, 3), "the third of the second")?;
+    Check.isTrue(!rateAdmit(borrow slot, 7, 101, 3), "both are past it")?;
+    Check.isTrue(rateAdmit(borrow slot, 9, 105, 3), "a later second")?;
+    Check.equalU64(9, slot.tag.load())?;
+    return Ok();
+}
+
+@test
+fn rateTagsAndTheLimiter() -> Result<void, TestFailure> {
+    let a = SocketAddress.V4([10u8, 0, 0, 1], 1000);
+    let aAgain = SocketAddress.V4([10u8, 0, 0, 1], 2000);
+    let b = SocketAddress.V4([10u8, 0, 0, 2], 1000);
+    Check.equalU64(rateTagOf(a), rateTagOf(aAgain))?; // an address, whatever its port
+    Check.isTrue(rateTagOf(a) != rateTagOf(b), "another address")?;
+    Check.equalU64(0, rateTagOf(null))?;
+    // IPv6: the first 64 bits.
+    var one = [0u8; 16];
+    one[0] = 0x20;
+    one[1] = 0x01;
+    one[15] = 1;
+    var sameNet = one;
+    sameNet[15] = 2;
+    sameNet[9] = 0xFF;
+    var otherNet = one;
+    otherNet[7] = 1;
+    Check.equalU64(rateTagOf(SocketAddress.V6(one, 1, 0)), rateTagOf(SocketAddress.V6(sameNet, 2, 0)))?;
+    Check.isTrue(
+        rateTagOf(SocketAddress.V6(one, 1, 0)) != rateTagOf(SocketAddress.V6(otherNet, 1, 0)),
+        "another /64",
+    )?;
+
+    let limiter = RateLimiter.create(2, 3)!;
+    Check.isTrue(limiter.admitAddress(a, 50) && limiter.admitAddress(aAgain, 50), "two from an address")?;
+    Check.isTrue(!limiter.admitAddress(a, 50), "the third")?;
+    Check.isTrue(limiter.admitAddress(b, 50), "another address has its own count")?;
+    Check.isTrue(limiter.admitAddress(null, 50), "no address, no limit")?;
+    Check.isTrue(limiter.admitAddress(a, 51), "the next second")?;
+    for (i in 0..3) { Check.isTrue(limiter.admitKey(0, 50), "a key within its limit")?; }
+    Check.isTrue(!limiter.admitKey(0, 50), "past it")?;
+    Check.isTrue(limiter.admitKey(1, 50), "another key")?;
+    Check.equalU64(2, limiter.limited.load())?;
+    // Without limits nothing is counted, and nothing is refused.
+    let open = RateLimiter.create(0, 0)!;
+    for (i in 0..1000) { Check.isTrue(open.admitAddress(a, 50) && open.admitKey(0, 50), "no limit")?; }
+    Check.equalU64(0, open.limited.load())?;
+    Check.equalU64(0, open.addresses.length as u64)?;
+    return Ok();
+}

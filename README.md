@@ -173,6 +173,7 @@ It is developed on macOS (CI runs on macOS 15) and benchmarked on Linux (Debian 
 ```text
 cosmostore serve <dir> <[address:]port> <credentials-file> [domain] [--tls-cert <pem> --tls-key <pem>]
                  [--maintain-seconds <n>] [--upload-expiry-hours <n>] [--notify-targets <file>] [--audit-log <file>]
+                 [--rate-limit-address <requests-a-second>] [--rate-limit-key <requests-a-second>]
 cosmostore fsck  <dir>
 cosmostore bench <dir> <objects> <size-bytes> <batch>
 cosmostore soak  <dir> <seconds> <keys> <capacity-bytes>
@@ -185,7 +186,9 @@ cosmostore soak  <dir> <seconds> <keys> <capacity-bytes>
   files when they change. `--maintain-seconds` (10) sets the upkeep round, and `--upload-expiry-hours` (168; 0 never)
   when unfinished multipart uploads are aborted. `--notify-targets` names a file of webhooks, one `<id> <url>` a line,
   that bucket notification rules may send events to (ADR-0048). `--audit-log` names a file that gets a line of JSON
-  for every request: who, from where, what and with what result (ADR-0051).
+  for every request: who, from where, what and with what result (ADR-0051). `--rate-limit-address` and
+  `--rate-limit-key` set the most requests a second from one address and by one access key; past them a request is
+  503 SlowDown (ADR-0053).
 
   The server raises its open-file limit to the most the system allows at start, and logs it: it holds a descriptor per
   connection and per upload in progress, and macOS starts processes at 256. If it still runs out, requests get 503 and

@@ -1,0 +1,116 @@
+// Rate limits (ADR-0053): the most requests a second from one address, and from one access key. Counted in atomics,
+// in windows of a second, without a lock; past a limit a request is SlowDown (503).
+import web_core;
+import web_http;
+import web_server;
+
+/// The slots of each table: an address's is chosen by its hash, a key's by its place in the credentials.
+const RATE_SLOTS: usize = 4096;
+const MAX_RATE_LIMIT: u64 = 1000000;
+
+/// One holder's count in the current second.
+struct RateSlot {
+    /// Whose count it is: an address's hash, or a key's place.
+    tag: AtomicU64;
+    /// The second the count is of.
+    window: AtomicU64;
+    count: AtomicU64;
+}
+
+/// Counts a request of `tag` in `second` and says whether it is within `limit` (ADR-0053 §2). A slot whose second
+/// is over belongs to whoever comes next. Two holders that meet in one slot in one second share its count: they
+/// are limited together, never let through together.
+fn rateAdmit(slot: borrow RateSlot, tag: u64, second: u64, limit: u64) -> bool {
+    if (slot.window.load() != second) {
+        slot.tag.store(tag);
+        slot.count.store(0);
+        slot.window.store(second);
+    }
+    return slot.count.fetchAdd(1) + 1 <= limit;
+}
+
+/// What an address is counted as: an IPv4 address whole, an IPv6 address by its first 64 bits, the part a network
+/// gives one customer. 0 for no address.
+fn rateTagOf(peer: SocketAddress?) -> u64 {
+    match (peer) {
+        Some(SocketAddress.V4(a, _)) => {
+            var bytes = [4u8, 0u8, 0u8, 0u8, 0u8];
+            for (i in 0..4) { bytes[i + 1] = a[i]; }
+            return Crc64Nvme.of(bytes[..]) | 1;
+        }
+        Some(SocketAddress.V6(a, _, _)) => {
+            var bytes = [6u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+            for (i in 0..8) { bytes[i + 1] = a[i]; }
+            return Crc64Nvme.of(bytes[..]) | 1;
+        }
+        null => { return 0; }
+    }
+}
+
+/// The limits `serve` was given, and the counts.
+struct RateLimiter {
+    /// Requests a second from one address, and signed by one key; 0 for no limit.
+    perAddress: u64;
+    perKey: u64;
+    addresses: Vector<RateSlot>;
+    keys: Vector<RateSlot>;
+    /// Requests refused, by either limit.
+    limited: AtomicU64;
+
+    fn create(perAddress: u64, perKey: u64) -> Result<RateLimiter, AllocError> {
+        var addresses = Vector<RateSlot>.create();
+        var keys = Vector<RateSlot>.create();
+        // The tables only when there is a limit to count for.
+        if (perAddress > 0) {
+            addresses.reserve(RATE_SLOTS)?;
+            for (i in 0..RATE_SLOTS) {
+                addresses.push(RateSlot {
+                    tag: AtomicU64.create(0),
+                    window: AtomicU64.create(0),
+                    count: AtomicU64.create(0),
+                })?;
+            }
+        }
+        if (perKey > 0) {
+            keys.reserve(RATE_SLOTS)?;
+            for (i in 0..RATE_SLOTS) {
+                keys.push(
+                    RateSlot { tag: AtomicU64.create(0), window: AtomicU64.create(0), count: AtomicU64.create(0) },
+                )?;
+            }
+        }
+        return Ok(RateLimiter {
+            perAddress: perAddress,
+            perKey: perKey,
+            addresses: addresses,
+            keys: keys,
+            limited: AtomicU64.create(0),
+        });
+    }
+
+    /// Whether a request from `peer` in `second` is within the address limit; it is counted either way.
+    fn admitAddress(borrow this, peer: SocketAddress?, second: u64) -> bool {
+        if (this.perAddress == 0) { return true; }
+        let tag = rateTagOf(peer);
+        if (tag == 0) { return true; }
+        let slot = borrow this.addresses[(tag % (RATE_SLOTS as u64)) as usize];
+        if (rateAdmit(slot, tag, second, this.perAddress)) { return true; }
+        let _ = this.limited.fetchAdd(1);
+        return false;
+    }
+
+    /// Whether a request signed by the key at `place` in `second` is within the key limit.
+    fn admitKey(borrow this, place: usize, second: u64) -> bool {
+        if (this.perKey == 0) { return true; }
+        let slot = borrow this.keys[place % RATE_SLOTS];
+        if (rateAdmit(slot, place as u64, second, this.perKey)) { return true; }
+        let _ = this.limited.fetchAdd(1);
+        return false;
+    }
+}
+
+/// SlowDown, with the second to wait in `Retry-After`.
+fn slowDown(exchange: borrow mut Exchange) -> S3Fail {
+    let _ = exchange.header("retry-after", "1".bytes());
+    return S3Fail.Code(S3Code.SlowDown);
+}
