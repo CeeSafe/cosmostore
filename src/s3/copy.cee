@@ -93,6 +93,13 @@ struct CopyPlan {
     size: u64;
     /// The checksum the copy gets (ADR-0015).
     algorithm: ChecksumAlgorithm;
+    /// A sealed source (ADR-0046 §3): its envelope, the stored range read, and its first part's salt when that range
+    /// starts after the part's header.
+    sourceEnvelope: Vector<u8>;
+    sse: SseRange?;
+    salt: Vector<u8>;
+    /// UploadPartCopy into a sealed upload: the upload's envelope; empty otherwise.
+    uploadEnvelope: Vector<u8>;
 }
 
 /// A finished copy and its checksum, raw.
@@ -119,12 +126,6 @@ fn planCopy(
         Ok() => {}
         Err(code) => { return Err(S3Fail.Code(code)); }
     }
-    // A sealed source is opened and sealed again, or stored in the clear (ADR-0046 §3); until copies do that, its
-    // ciphertext is not copied as if it were the object.
-    if (metadataFind(
-        info.metadata.view(),
-        SSE_FIELD.bytes(),
-    ).isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
     var start: u64 = 0;
     var end = info.size;
     match (target) {
@@ -148,11 +149,9 @@ fn planCopy(
     if (size > MAX_PUT_BYTES) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
     let bucket = req.bucket.view();
     let key = req.key.view();
-    // Nor is a copy put in the clear into a sealed upload, whose object would then not open (ADR-0046 §2).
+    var uploadEnvelope = Vector<u8>.create();
     match (target) {
-        CopyTarget.Part(_) => {
-            if (store.uploadEnvelope(uploadId)?.length > 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-        }
+        CopyTarget.Part(_) => { uploadEnvelope = store.uploadEnvelope(uploadId)?; }
         CopyTarget.Object => {}
     }
     let made = match (target) {
@@ -163,9 +162,50 @@ fn planCopy(
         Ok(w) => w,
         Err(e) => { return Err(storeFail(e, key.length)); }
     };
+    let extras = match (decodeExtras(info.extras.view())) {
+        Ok(e) => e,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    // A sealed source is read as the whole chunks under its range, and opened (ADR-0046 §2, §3).
+    var sourceEnvelope = Vector<u8>.create();
+    match (metadataFind(info.metadata.view(), SSE_FIELD.bytes())) {
+        Some(f) => { sourceEnvelope.extend(f)?; }
+        null => {}
+    }
+    var sse: SseRange? = null;
+    var salt = Vector<u8>.create();
     var reader: ObjectReader? = null;
     if (size > 0) {
-        var prepared = match (store.prepareReaderOf(src.bucket.view(), src.key.view(), src.versionId, start, end)) {
+        var from = start;
+        var to = end;
+        if (sourceEnvelope.length > 0) {
+            if (info.parts > 0 && extras.partSizes.length == 0) { return Err(S3Fail.Code(S3Code.InternalError)); }
+            let r = sseRange(info.size, extras.partSizes.view(), start, end);
+            from = r.storedFrom;
+            to = r.storedTo;
+            match (r.headerAt) {
+                Some(at) => {
+                    // This runs on a worker thread: the first part's salt is read here.
+                    var header = match (store.prepareReaderOf(
+                        src.bucket.view(),
+                        src.key.view(),
+                        src.versionId,
+                        at,
+                        at + SSE_PART_HEADER,
+                    )) {
+                        Ok(p) => p,
+                        Err(e) => { return Err(storeFail(e, src.key.length)); }
+                    };
+                    salt = match (readHeader(mut header)) {
+                        Ok(b) => b,
+                        Err(e) => { return Err(storeFail(e, src.key.length)); }
+                    };
+                }
+                null => {}
+            }
+            sse = r;
+        }
+        var prepared = match (store.prepareReaderOf(src.bucket.view(), src.key.view(), src.versionId, from, to)) {
             Ok(p) => p,
             Err(e) => { return Err(storeFail(e, src.key.length)); }
         };
@@ -188,22 +228,27 @@ fn planCopy(
                     };
                 }
                 null => {
-                    match (decodeExtras(info.extras.view())) {
-                        Ok(e) => {
-                            match (e.algorithm) {
-                                ChecksumAlgorithm.None => {}
-                                _ => {
-                                    if (e.partSizes.length == 0) { algorithm = e.algorithm; }
-                                }
-                            }
+                    match (extras.algorithm) {
+                        ChecksumAlgorithm.None => {}
+                        _ => {
+                            if (extras.partSizes.length == 0) { algorithm = extras.algorithm; }
                         }
-                        Err(_) => {}
                     }
                 }
             }
         }
     }
-    return Ok(CopyPlan { source: info, reader: reader, writer: writer, size: size, algorithm: algorithm });
+    return Ok(CopyPlan {
+        source: info,
+        reader: reader,
+        writer: writer,
+        size: size,
+        algorithm: algorithm,
+        sourceEnvelope: sourceEnvelope,
+        sse: sse,
+        salt: salt,
+        uploadEnvelope: uploadEnvelope,
+    });
 }
 
 async fn openCopy(
@@ -218,49 +263,164 @@ async fn openCopy(
     return await Async.blocking(() => planCopy(store, req, src, target, uploadId));
 }
 
-/// One step of a copy, on a worker thread: read from the source, write to the destination; 0 at the end.
+/// How a copy's bytes pass from its source to its destination (ADR-0046 §3): opened when the source is sealed,
+/// sealed when the destination is, and hashed as plaintext between.
+struct CopyPipe {
+    opener: SseStream?;
+    sealer: SseSealer?;
+    /// Plaintext bytes of the first chunk opened that are before the range, and the plaintext still to give.
+    skip: u64;
+    left: u64;
+    plain: Vector<u8>;
+    sealed: Vector<u8>;
+    md5: Md5;
+}
+
+/// The source's opener for a copy: its data key from the master keys or the copy source's SSE-C key; null for a
+/// source in the clear, which takes no key.
+async fn sourceOpener(
+    app: borrow S3App,
+    req: borrow S3Request,
+    plan: borrow CopyPlan,
+) -> Result<SseStream?, S3Fail> {
+    let key = sseCustomerKeyOf(req, true)?;
+    if (plan.sourceEnvelope.length == 0) {
+        if (key.isSome()) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        return Ok(null);
+    }
+    var dataKey = await sealedDataKey(app, plan.sourceEnvelope.view(), key)?;
+    var opener: SseStream? = null;
+    match (plan.sse.asBorrow()) {
+        Some(r) => {
+            opener = if (plan.source.parts == 0) {
+                SseStream.single(borrow dataKey, plan.source.size, r.chunk)
+            } else {
+                let sizes = match (decodeExtras(plan.source.extras.view())) {
+                    Ok(e) => e.partSizes,
+                    Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+                };
+                SseStream.multipart(borrow dataKey, sizes.view()[r.part..], r.chunk, plan.salt.view())?
+            };
+            if (opener.isNull()) { return Err(S3Fail.Code(S3Code.InternalError)); }
+        }
+        null => {}
+    }
+    for (i in 0..32) { dataKey[i] = 0; }
+    return Ok(opener);
+}
+
+/// One step of a copy, on a worker thread: read from the source, opened if it is sealed, written to the destination,
+/// sealed if it is; 0 at the end.
 fn copyStep(
     reader: borrow mut ObjectReader,
     writer: borrow mut ObjectWriter,
     sum: borrow mut RunningChecksum,
+    pipe: borrow mut CopyPipe,
     buf: SliceMut<u8>,
 ) -> Result<usize, StoreError> {
     let n = reader.read(buf)?;
-    if (n > 0) {
-        sum.update(buf[0..n]);
-        sio(writer.write(buf[0..n]))?;
+    let opening = pipe.opener.isSome();
+    if (n == 0) {
+        let whole = match (pipe.opener.asBorrow()) {
+            Some(o) => o.isWhole(),
+            null => true,
+        };
+        if (!whole) { return Err(StoreError.DataCorrupt); }
+        return Ok(0);
+    }
+    pipe.plain.clear();
+    if (opening) {
+        let opened = match (pipe.opener.asBorrowMut()) {
+            Some(o) => o.feed(buf[0..n], mut pipe.plain)?,
+            null => false,
+        };
+        if (!opened) { return Err(StoreError.DataCorrupt); }
+        let from = if (pipe.skip > pipe.plain.length as u64) pipe.plain.length else pipe.skip as usize;
+        pipe.skip -= from as u64;
+        let have = (pipe.plain.length - from) as u64;
+        let take = if (have > pipe.left) pipe.left else have;
+        let piece = copyBytes(pipe.plain.view()[from..from + take as usize])?;
+        pipe.plain = piece;
+    } else {
+        pipe.plain.extend(buf[0..n])?;
+    }
+    let length = pipe.plain.length as u64;
+    pipe.left -= if (length > pipe.left) pipe.left else length;
+    sum.update(pipe.plain.view());
+    pipe.md5.update(pipe.plain.view());
+    match (pipe.sealer.asBorrowMut()) {
+        Some(s) => {
+            pipe.sealed.clear();
+            s.feed(pipe.plain.view(), mut pipe.sealed)?;
+            sio(writer.write(pipe.sealed.view()))?;
+        }
+        null => { sio(writer.write(pipe.plain.view()))?; }
     }
     return Ok(n);
 }
 
-/// Streams the planned bytes into the writer and finishes it. The reader (and its pins) goes when this returns.
-async fn runCopy(plan: CopyPlan) -> Result<CopyResult, S3Fail> {
+/// The destination's last chunk, on a worker thread, and the writer finished.
+fn finishCopy(writer: borrow mut ObjectWriter, pipe: borrow mut CopyPipe) -> Result<FinishedObject, StoreError> {
+    match (pipe.sealer.asBorrowMut()) {
+        Some(s) => {
+            pipe.sealed.clear();
+            s.finish(mut pipe.sealed)?;
+            sio(writer.write(pipe.sealed.view()))?;
+        }
+        null => {}
+    }
+    return sio(writer.finish());
+}
+
+/// Streams the planned bytes into the writer, through `opener` and `sealer`, and finishes it. The reader (and its
+/// pins) goes when this returns. The copy's size and MD5 are its plaintext's, except an SSE-C destination's ETag,
+/// which is the MD5 of what is stored (ADR-0046 §6).
+async fn runCopy(plan: CopyPlan, opener: SseStream?, sealer: SseSealer?) -> Result<CopyResult, S3Fail> {
     var p = plan;
     var writer = p.writer;
     var sum = RunningChecksum.create(p.algorithm);
+    let sealing = sealer.isSome();
+    var pipe = CopyPipe {
+        opener: opener,
+        sealer: sealer,
+        skip: match (p.sse.asBorrow()) {
+            Some(r) => r.skip,
+            null => 0,
+        },
+        left: p.size,
+        plain: Vector<u8>.create(),
+        sealed: Vector<u8>.create(),
+        md5: Md5.create(),
+    };
     match (p.reader.asBorrowMut()) {
         Some(reader) => {
             var buf = Vector<u8>.create();
-            buf.resize(bodyStep(p.size), 0)?;
-            var copied: u64 = 0;
+            buf.resize(bodyStep(p.size + SSE_CHUNK), 0)?;
             while (true) {
                 let chunk = buf.viewMut();
-                let step = await Async.blocking(() => copyStep(reader, mut writer, mut sum, chunk));
+                let step = await Async.blocking(() => copyStep(reader, mut writer, mut sum, mut pipe, chunk));
                 let n = match (step) {
                     Ok(n) => n,
                     Err(e) => { return Err(storeFail(e, 0)); }
                 };
                 if (n == 0) { break; }
-                copied += n as u64;
             }
-            if (copied != p.size) { return Err(S3Fail.Code(S3Code.InternalError)); }
+            if (pipe.left != 0) { return Err(S3Fail.Code(S3Code.InternalError)); }
         }
         null => {}
     }
-    let finished = match (await Async.blocking(() => writer.finish())) {
+    var finished = match (await Async.blocking(() => finishCopy(mut writer, mut pipe))) {
         Ok(f) => f,
-        Err(f) => { return Err(storeFail(StoreError.Io(f), 0)); }
+        Err(e) => { return Err(storeFail(e, 0)); }
     };
+    if (sealing) {
+        finished.size = p.size;
+        let md5 = pipe.md5.finish();
+        match (pipe.sealer.asBorrow()) {
+            Some(s) => { finished.md5 = sealedEtag(s, md5); }
+            null => {}
+        }
+    }
     var checksum = Vector<u8>.create();
     sum.finishInto(mut checksum)?;
     return Ok(CopyResult { finished: finished, algorithm: p.algorithm, checksum: checksum });
@@ -319,11 +479,20 @@ async fn copyObject(
         }
         null => false,
     };
-    if (!replace && src.bucket.view() == req.bucket.view() && src.key.view() == req.key.view()) {
+    // The destination's encryption: the request's, else the bucket's default (ADR-0046 §3). A copy onto itself may
+    // change only that, which is how an object is sealed again under the newest master key.
+    let fields = sseRequestOf(req)?;
+    let resealing = match (fields) {
+        SseRequest.None => false,
+        _ => true,
+    };
+    if (!replace && !resealing && src.bucket.view() == req.bucket.view() && src.key.view() == req.key.view()) {
         return Err(S3Fail.Code(S3Code.InvalidRequest)); // a copy onto itself must change something
     }
     await authorizeSource(app, req, who, borrow src)?;
     let plan = await openCopy(app, req, borrow src, CopyTarget.Object, [0u8; 16])?;
+    let opener = await sourceOpener(app, req, borrow plan)?;
+    let asked = if (resealing) fields else await bucketDefaultSse(app, req.bucket.view())?;
     // The source's version, when its bucket has versioning (ADR-0041).
     if (plan.source.versioned) { versionHeader(exchange, "x-amz-copy-source-version-id", plan.source.versionId)?; }
     var contentType = String.create();
@@ -364,7 +533,21 @@ async fn copyObject(
     metadata = await withRequestAcl(app, req, metadata)?;
     // Nor its lock: the request's, or the bucket's default (ADR-0047 §2).
     metadata = await withRequestLock(app, req, metadata)?;
-    let copied = await runCopy(plan)?;
+    // Nor its envelope: sealed again as asked, or in the clear (ADR-0046 §3).
+    metadata = match (metadataReplace(metadata.view(), SSE_FIELD.bytes(), "".bytes())) {
+        Ok(b) => b,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    var sealer: SseSealer? = null;
+    match (newSeal(app.sseKeys.view(), borrow asked)?) {
+        Some(seal) => {
+            metadataAdd(mut metadata, SSE_FIELD.bytes(), seal.field.view())?;
+            sealer = Some(sealerOf(borrow seal, plan.size, customerKeyOf(borrow asked))?);
+        }
+        null => {}
+    }
+    let sealing = sealer.isSome();
+    let copied = await runCopy(plan, opener, sealer)?;
     var extras = Vector<u8>.create();
     singlePartExtras(copied.algorithm, copied.checksum.view(), mut extras)?;
     let outcome = await commitPut(
@@ -379,6 +562,7 @@ async fn copyObject(
         etags.view(),
     )?;
     writtenVersionHeader(exchange, borrow outcome)?;
+    if (sealing) { sseAnswerFields(exchange, customerKeyOf(borrow asked))?; }
     return await sendCopyResult(exchange, "CopyObjectResult", borrow outcome.md5, outcome.extras.view());
 }
 
@@ -394,7 +578,29 @@ async fn uploadPartCopy(
     await authorizeSource(app, req, who, borrow src)?;
     let plan = await openCopy(app, req, borrow src, CopyTarget.Part(number), id)?;
     if (plan.source.versioned) { versionHeader(exchange, "x-amz-copy-source-version-id", plan.source.versionId)?; }
-    let copied = await runCopy(plan)?;
+    let opener = await sourceOpener(app, req, borrow plan)?;
+    // Into a sealed upload, the part is sealed as UploadPart seals one: under the key of a salt of its own
+    // (ADR-0046 §2); an SSE-C upload's key comes with the request.
+    let customer = sseCustomerKeyOf(req, false)?;
+    var sealer: SseSealer? = null;
+    if (plan.uploadEnvelope.length > 0) {
+        var dataKey = await sealedDataKey(app, plan.uploadEnvelope.view(), customer)?;
+        var salt = [0u8; 16];
+        if (Random.fill(mut salt[..]).isErr()) { return Err(S3Fail.Code(S3Code.InternalError)); }
+        sealer = SseSealer.createPart(borrow dataKey, salt, plan.size)?;
+        for (i in 0..32) { dataKey[i] = 0; }
+        match (sealer.asBorrowMut()) {
+            Some(s) => {
+                if (isCustomerEnvelope(plan.uploadEnvelope.view())) { s.etagKey = customer; }
+            }
+            null => { return Err(S3Fail.Code(S3Code.InternalError)); }
+        }
+    } else if (customer.isSome()) {
+        return Err(S3Fail.Code(S3Code.InvalidRequest));
+    }
+    let sealing = sealer.isSome();
+    let copied = await runCopy(plan, opener, sealer)?;
+    if (sealing) { sseAnswerFields(exchange, customer)?; }
     let md5 = await commitPart(
         app,
         req.bucket.view(),

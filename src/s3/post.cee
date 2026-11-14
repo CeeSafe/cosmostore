@@ -442,14 +442,43 @@ fn isPostObject(req: borrow S3Request) -> bool {
     return equalsIgnoreCase(trimSpaces(ct[0..semi]), "multipart/form-data".bytes());
 }
 
-/// One step of a POST file, on a worker thread: written, and checksummed for its stored CRC64NVME.
+/// One step of a POST file, on a worker thread: checksummed for its stored CRC64NVME, sealed if the object is
+/// (ADR-0046), and written.
 fn postStep(
     writer: borrow mut ObjectWriter,
     sum: borrow mut RunningChecksum,
+    md5: borrow mut Md5,
+    sealer: borrow mut (SseSealer?),
+    sealed: borrow mut Vector<u8>,
     data: Slice<u8>,
-) -> Result<void, IoFailure> {
+) -> Result<void, StoreError> {
     sum.update(data);
-    return writer.write(data);
+    return match (sealer.asBorrowMut()) {
+        Some(s) => {
+            md5.update(data);
+            sealed.clear();
+            s.feed(data, sealed)?;
+            sio(writer.write(sealed.view()))
+        }
+        null => sio(writer.write(data)),
+    };
+}
+
+/// A POST file's end, on a worker thread: a sealed file's last chunk, and the writer finished.
+fn postFinish(
+    writer: borrow mut ObjectWriter,
+    sealer: borrow mut (SseSealer?),
+    sealed: borrow mut Vector<u8>,
+) -> Result<FinishedObject, StoreError> {
+    match (sealer.asBorrowMut()) {
+        Some(s) => {
+            sealed.clear();
+            s.finish(sealed)?;
+            sio(writer.write(sealed.view()))?;
+        }
+        null => {}
+    }
+    return sio(writer.finish());
 }
 
 async fn postObject(
@@ -531,10 +560,26 @@ async fn postObject(
     var minSize: u64 = 0;
     var maxSize: u64 = MAX_PUT_BYTES;
     let ranged = lengthRange(borrow policy, mut minSize, mut maxSize);
-    // A form that asks for encryption is refused until there is a cipher (ADR-0046 §7).
+    // Encryption (ADR-0046 §5, §6): the form's SSE-S3 or SSE-C fields, else the bucket's default; SSE-C only over
+    // TLS. Any other encryption field (SSE-KMS's) is refused, not ignored.
     for (i in 0..fields.length) {
-        if (isSseField(fields[i].name.view())) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        let name = fields[i].name.view();
+        if (isSseField(name) && name != SSE_FIELD.bytes() && !startsWithBytes(name, SSE_CUSTOMER.bytes())) {
+            return Err(S3Fail.Code(S3Code.NotImplemented));
+        }
     }
+    let fromForm = sseOfFields(
+        fieldOf(borrow fields, "x-amz-server-side-encryption"),
+        fieldOf(borrow fields, "x-amz-server-side-encryption-customer-algorithm"),
+        fieldOf(borrow fields, "x-amz-server-side-encryption-customer-key"),
+        fieldOf(borrow fields, "x-amz-server-side-encryption-customer-key-md5"),
+    )?;
+    let asked = match (fromForm) {
+        SseRequest.None => await bucketDefaultSse(app, req.bucket.view())?,
+        _ => fromForm,
+    };
+    let customer = customerKeyOf(borrow asked);
+    if (customer.isSome() && !app.secure) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
     // What the object gets: its type, stored fields and tags.
     var contentType = String.create();
     appendUtf8(mut contentType, fieldOf(borrow fields, "content-type") ?? "binary/octet-stream".bytes())?;
@@ -563,6 +608,18 @@ async fn postObject(
         null => {}
     }
     if (metadata.length > MAX_METADATA_BYTES) { return Err(S3Fail.Code(S3Code.MetadataTooLarge)); }
+    var sealer: SseSealer? = null;
+    match (newSeal(app.sseKeys.view(), borrow asked)?) {
+        Some(seal) => {
+            metadataAdd(mut metadata, SSE_FIELD.bytes(), seal.field.view())?;
+            // The file's size is not known: the sealer does not need it.
+            sealer = Some(sealerOf(borrow seal, 0, customer)?);
+        }
+        null => {}
+    }
+    let sealing = sealer.isSome();
+    var plainMd5 = Md5.create();
+    var sealed = Vector<u8>.create();
     let bucket = req.bucket.view();
     let keyText = match (StringView.fromUtf8(key.view())) {
         Some(v) => v,
@@ -587,10 +644,12 @@ async fn postObject(
                     return Err(S3Fail.Code(if (ranged) S3Code.EntityTooLarge else S3Code.EntityTooLarge));
                 }
                 let chunk = data.view();
-                let wrote = await Async.blocking(() => postStep(mut writer, mut sum, chunk));
+                let wrote = await Async.blocking(
+                    () => postStep(mut writer, mut sum, mut plainMd5, mut sealer, mut sealed, chunk),
+                );
                 match (wrote) {
                     Ok() => {}
-                    Err(f) => { return Err(storeFail(StoreError.Io(f), 0)); }
+                    Err(e) => { return Err(storeFail(e, 0)); }
                 }
             }
             FormEvent.FileEnd => { ended = true; }
@@ -610,10 +669,18 @@ async fn postObject(
             _ => {}
         }
     }
-    let finished = match (await Async.blocking(() => writer.finish())) {
+    var finished = match (await Async.blocking(() => postFinish(mut writer, mut sealer, mut sealed))) {
         Ok(f) => f,
-        Err(f) => { return Err(storeFail(StoreError.Io(f), 0)); }
+        Err(e) => { return Err(storeFail(e, 0)); }
     };
+    // A sealed file's size and ETag are its plaintext's, but SSE-C's ETag is the MD5 of what is stored (ADR-0046 §6).
+    match (sealer.asBorrow()) {
+        Some(s) => {
+            finished.size = size;
+            finished.md5 = sealedEtag(s, plainMd5.finish());
+        }
+        null => {}
+    }
     if (size < minSize) {
         await discardPut(app, borrow finished)?;
         return Err(S3Fail.Code(S3Code.EntityTooSmall));
@@ -633,6 +700,7 @@ async fn postObject(
         PutIf.None,
         "".bytes(),
     )?;
+    if (sealing) { sseAnswerFields(exchange, customer)?; }
     return await sendPostResult(exchange, borrow fields, bucket, keyText, borrow outcome);
 }
 

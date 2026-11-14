@@ -646,3 +646,86 @@ fn sseMultipartPartsOpenInAnyRange() -> Result<void, TestFailure> {
     Check.isTrue(sseReadRange(borrow other, stored.view(), sizes[..], size, 0, size).isNull(), "another key")?;
     return Ok();
 }
+
+@test
+fn sseCustomerEnvelopesNeedTheirKey() -> Result<void, TestFailure> {
+    var key = [0u8; 32];
+    for (i in 0..32) { key[i] = truncate<u8>(200 - i); }
+    let keys = Vector<MasterKey>.create();
+    let asked = SseRequest.Customer(key);
+    let seal = match (newSeal(keys.view(), borrow asked)) {
+        Ok(Some(s)) => s,
+        _ => { return Check.fail("no SSE-C seal"); }
+    };
+    Check.isTrue(seal.customer, "SSE-C")?;
+    Check.isTrue(isCustomerEnvelope(seal.field.view()), "an SSE-C envelope")?;
+    Check.isTrue(startsWithBytes(seal.field.view(), "v1.c.-.".bytes()), "no key id")?;
+    let e = match (decodeEnvelope(seal.field.view())!) {
+        Some(e) => e,
+        null => { return Check.fail("the envelope does not decode"); }
+    };
+    match (unwrapDataKey(borrow key, borrow e)) {
+        Some(k) => { Check.equalBytes(seal.dataKey[..], k[..])?; }
+        null => { return Check.fail("the request's key does not open it"); }
+    }
+    var other = key;
+    other[3] = other[3] ^ 1;
+    Check.isTrue(unwrapDataKey(borrow other, borrow e).isNull(), "another key")?;
+    // The master keys do not open it, and SSE-S3 without a key file is refused.
+    Check.isTrue(sseKeyFaultIs(managedDataKey(keys.view(), seal.field.view()), SseKeyFault.Customer), "SSE-C")?;
+    let managedAsked = SseRequest.Managed;
+    let none = SseRequest.None;
+    Check.isTrue(newSeal(keys.view(), borrow managedAsked).isErr(), "no key file")?;
+    Check.isTrue(newSeal(keys.view(), borrow none)!.isNull(), "nothing asked")?;
+    // Its ETag is a digest of the plaintext's MD5 under the key: not the MD5, the same for the same bytes, another
+    // under another key.
+    let sealer = sealerOf(borrow seal, 10, Some(key))!;
+    let md5 = Md5.of("ten bytes!".bytes());
+    let etag = sealedEtag(borrow sealer, md5);
+    Check.isTrue(etag[..] != md5[..], "not the MD5")?;
+    Check.equalBytes(etag[..], sseCustomerEtag(borrow key, borrow md5)[..])?;
+    Check.isTrue(sseCustomerEtag(borrow other, borrow md5)[..] != etag[..], "another key")?;
+    let managed = sealerOf(borrow seal, 10, null)!;
+    Check.equalBytes(md5[..], sealedEtag(borrow managed, md5)[..])?;
+    return Ok();
+}
+
+@test
+fn sseSealsWithoutKnowingTheSize() -> Result<void, TestFailure> {
+    // A POST form's file has no size in advance: a sealer told 0 seals as one told the size.
+    let key = sseTestKey();
+    let sizes = [0usize, 1, 65536, 131072, 131073];
+    for (i in 0..sizes.length) {
+        let text = sseText(sizes[i], i);
+        let known = sseSealed(borrow key, 0, text.view(), 5000);
+        var sealer = match (SseSealer.create(borrow key, 0, 0)) {
+            Some(s) => s,
+            null => { return Check.fail("no cipher"); }
+        };
+        var stored = Vector<u8>.create();
+        var at: usize = 0;
+        while (at < text.length) {
+            let end = if (text.length - at < 65536) text.length else at + 65536;
+            sealer.feed(text.view()[at..end], mut stored)!;
+            at = end;
+        }
+        sealer.finish(mut stored)!;
+        Check.equalBytes(known.view(), stored.view())?;
+    }
+    return Ok();
+}
+
+@test
+fn sseBucketEncryptionXml() -> Result<void, TestFailure> {
+    let aes =
+        "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
+    Check.isTrue(parseBucketEncryption(aes.bytes()).isOk(), "AES256")?;
+    let kms =
+        "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
+    Check.isTrue(parseBucketEncryption(kms.bytes()).isErr(), "aws:kms")?;
+    Check.isTrue(parseBucketEncryption("<ServerSideEncryptionConfiguration/>".bytes()).isErr(), "no rule")?;
+    let other =
+        "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>DES</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
+    Check.isTrue(parseBucketEncryption(other.bytes()).isErr(), "DES")?;
+    return Ok();
+}

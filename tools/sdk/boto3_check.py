@@ -188,6 +188,26 @@ check("POST with an expired policy", status, 403)
 wrong_key = dict(post["fields"]); wrong_key["key"] = "elsewhere/${filename}"
 status, _, _ = post_form(post["url"], wrong_key, "w.txt", b"x")
 check("POST key outside the policy", status, 403)
+# Encryption on a POST (ADR-0046 §5): the form's field, then a bucket's default; a file over one 64 KiB chunk.
+sealed = s3.generate_presigned_post(B, "post/sealed", Fields={"x-amz-server-side-encryption": "AES256"},
+                                    Conditions=[{"x-amz-server-side-encryption": "AES256"}], ExpiresIn=60)
+body = bytes(range(256)) * 600
+status, _, headers = post_form(sealed["url"], sealed["fields"], "s.bin", body)
+check("POST sealed", (status, headers.get("x-amz-server-side-encryption")), (204, "AES256"))
+got = s3.get_object(Bucket=B, Key="post/sealed")
+check("POST sealed reads", (got["Body"].read() == body, got["ServerSideEncryption"]), (True, "AES256"))
+kms = s3.generate_presigned_post(B, "post/kms", Fields={"x-amz-server-side-encryption": "aws:kms"},
+                                 Conditions=[{"x-amz-server-side-encryption": "aws:kms"}], ExpiresIn=60)
+status, text, _ = post_form(kms["url"], kms["fields"], "k.bin", b"x")
+check("POST SSE-KMS", (status, "NotImplemented" in text), (501, True))
+s3.put_bucket_encryption(Bucket=B, ServerSideEncryptionConfiguration={
+    "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]})
+plain = s3.generate_presigned_post(B, "post/default", ExpiresIn=60)
+status, _, _ = post_form(plain["url"], plain["fields"], "d.bin", b"sealed by the bucket")
+check("POST under a default", (status, s3.head_object(Bucket=B, Key="post/default")["ServerSideEncryption"]), (204, "AES256"))
+check("POST under a default reads", s3.get_object(Bucket=B, Key="post/default")["Body"].read(), b"sealed by the bucket")
+s3.delete_bucket_encryption(Bucket=B)
+check("no default after delete", code_of(lambda: s3.get_bucket_encryption(Bucket=B)), "ServerSideEncryptionConfigurationNotFoundError")
 
 # Batch delete, then everything.
 r = s3.delete_objects(Bucket=B, Delete={"Objects": [{"Key": "l/%02d" % i} for i in range(25)] + [{"Key": "missing"}]})

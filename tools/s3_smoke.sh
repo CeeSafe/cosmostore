@@ -562,7 +562,17 @@ cmp -s got.bin want.bin && pass "SSE-S3 range at the end" || fail "SSE-S3 range 
 aws s3api put-object --bucket smoke --key sse/empty --body empty.bin --server-side-encryption AES256 > /dev/null 2>&1 || fail "SSE-S3 put, empty"
 check "SSE-S3 empty" "$(aws s3api head-object --bucket smoke --key sse/empty --query ContentLength --output text)" 0
 check "no plaintext on disk" "$(grep -rl 'a sealed line of cosmostore' "$work/store" | wc -l | tr -d ' ')" 0
-check "SSE-S3 copy source" "$(code s3api copy-object --bucket smoke --key sse/copy --copy-source smoke/sse/small.txt)" NotImplemented
+# Copies (ADR-0046 §3): a sealed source opened, the copy stored as the request asks; never the source's envelope.
+aws s3api copy-object --bucket smoke --key sse/copy --copy-source smoke/sse/small.txt > /dev/null 2>&1 || fail "copy of a sealed object"
+check "a copy of a sealed object, in the clear" "$(aws s3api head-object --bucket smoke --key sse/copy --query ServerSideEncryption --output text)" None
+aws s3api get-object --bucket smoke --key sse/copy got.txt > /dev/null 2>&1
+cmp -s got.txt sse.txt && pass "the copy reads as its source" || fail "the copy reads as its source"
+check "a copy sealed" "$(aws s3api copy-object --bucket smoke --key sse/copy2 --copy-source smoke/a/small.txt --server-side-encryption AES256 --query ServerSideEncryption --output text)" AES256
+aws s3api get-object --bucket smoke --key sse/copy2 got.txt > /dev/null 2>&1
+cmp -s got.txt small.txt && pass "a sealed copy reads" || fail "a sealed copy reads"
+check "sealed again onto itself" "$(aws s3api copy-object --bucket smoke --key sse/big.bin --copy-source smoke/sse/big.bin --server-side-encryption AES256 --query ServerSideEncryption --output text)" AES256
+aws s3api get-object --bucket smoke --key sse/big.bin got.bin > /dev/null 2>&1
+cmp -s got.bin sse.bin && pass "sealed again, the same bytes" || fail "sealed again, the same bytes"
 # SSE-S3 multipart: parts numbered 1 and 3, part 3 uploaded twice; each part under a key of its own (ADR-0046 §2).
 head -c 5242880 /dev/urandom > p1.bin
 head -c 70001 /dev/urandom > p3.bin
@@ -573,7 +583,8 @@ check "SSE-S3 create-multipart-upload" "$(printf '%s' "$created" | cut -f2)" AES
 check "SSE-S3 upload-part" "$(aws s3api upload-part --bucket smoke --key sse/mp --upload-id "$mpid" --part-number 1 --body p1.bin --query ServerSideEncryption --output text)" AES256
 aws s3api upload-part --bucket smoke --key sse/mp --upload-id "$mpid" --part-number 3 --body p3old.bin > /dev/null 2>&1 || fail "SSE-S3 upload-part 3"
 aws s3api upload-part --bucket smoke --key sse/mp --upload-id "$mpid" --part-number 3 --body p3.bin > /dev/null 2>&1 || fail "SSE-S3 upload-part 3 again"
-check "a copy into a sealed upload" "$(code s3api upload-part-copy --bucket smoke --key sse/mp --upload-id "$mpid" --part-number 2 --copy-source smoke/a/small.txt)" NotImplemented
+aws s3api upload-part-copy --bucket smoke --key sse/mp --upload-id "$mpid" --part-number 2 --copy-source smoke/a/small.txt > /dev/null 2>&1 \
+    && pass "a copy into a sealed upload" || fail "a copy into a sealed upload"
 mpetag() { aws s3api list-parts --bucket smoke --key sse/mp --upload-id "$mpid" --query "Parts[?PartNumber==\`$1\`].ETag" --output text; }
 mpparts=$(printf '{"Parts":[{"PartNumber":1,"ETag":%s},{"PartNumber":3,"ETag":%s}]}' "$(mpetag 1)" "$(mpetag 3)")
 check "SSE-S3 complete" "$(aws s3api complete-multipart-upload --bucket smoke --key sse/mp --upload-id "$mpid" --multipart-upload "$mpparts" --query ServerSideEncryption --output text)" AES256
@@ -593,10 +604,43 @@ head -c 20000000 /dev/urandom > cp.bin
 aws s3 cp cp.bin s3://smoke/sse/cp.bin --sse AES256 > /dev/null 2>&1 || fail "SSE-S3 s3 cp, multipart"
 aws s3 cp s3://smoke/sse/cp.bin got.bin > /dev/null 2>&1
 cmp -s got.bin cp.bin && pass "SSE-S3 s3 cp, multipart, back" || fail "SSE-S3 s3 cp, multipart, back"
+# A sealed multipart object copied: whole, and by parts whose ranges start inside its parts and cross them.
+aws s3api copy-object --bucket smoke --key sse/mpcopy --copy-source smoke/sse/mp > /dev/null 2>&1 || fail "copy of a sealed multipart object"
+aws s3api get-object --bucket smoke --key sse/mpcopy got.bin > /dev/null 2>&1
+cmp -s got.bin mp.bin && pass "a sealed multipart object copied" || fail "a sealed multipart object copied"
+cpid=$(aws s3api create-multipart-upload --bucket smoke --key sse/parts --server-side-encryption AES256 --query UploadId --output text)
+aws s3api upload-part-copy --bucket smoke --key sse/parts --upload-id "$cpid" --part-number 1 --copy-source smoke/sse/mp --copy-source-range bytes=70000-5312879 > /dev/null 2>&1 || fail "upload-part-copy across a sealed object's parts"
+aws s3api upload-part-copy --bucket smoke --key sse/parts --upload-id "$cpid" --part-number 2 --copy-source smoke/sse/mp --copy-source-range bytes=5242890-5312880 > /dev/null 2>&1 || fail "upload-part-copy inside a sealed part"
+cpetag() { aws s3api list-parts --bucket smoke --key sse/parts --upload-id "$cpid" --query "Parts[?PartNumber==\`$1\`].ETag" --output text; }
+cpparts=$(printf '{"Parts":[{"PartNumber":1,"ETag":%s},{"PartNumber":2,"ETag":%s}]}' "$(cpetag 1)" "$(cpetag 2)")
+aws s3api complete-multipart-upload --bucket smoke --key sse/parts --upload-id "$cpid" --multipart-upload "$cpparts" > /dev/null 2>&1 || fail "complete the copied parts"
+tail -c +70001 mp.bin | head -c 5242880 > want.bin
+dd if=mp.bin bs=1 skip=5242890 2> /dev/null >> want.bin
+aws s3api get-object --bucket smoke --key sse/parts got.bin > /dev/null 2>&1
+cmp -s got.bin want.bin && pass "parts copied from a sealed object" || fail "parts copied from a sealed object"
+# A bucket's default encryption (ADR-0046 §5).
+aws s3api create-bucket --bucket enc > /dev/null 2>&1
+check "no default encryption" "$(code s3api get-bucket-encryption --bucket enc)" ServerSideEncryptionConfigurationNotFoundError
+aws s3api put-bucket-encryption --bucket enc --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' > /dev/null 2>&1 || fail "put-bucket-encryption"
+check "get-bucket-encryption" "$(aws s3api get-bucket-encryption --bucket enc --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' --output text)" AES256
+check "a default of SSE-KMS" "$(code s3api put-bucket-encryption --bucket enc --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}')" NotImplemented
+printf 'sealed by default in cosmostore\n' > dflt.txt
+check "sealed by the default" "$(aws s3api put-object --bucket enc --key d.txt --body dflt.txt --query ServerSideEncryption --output text)" AES256
+aws s3api get-object --bucket enc --key d.txt got.txt > /dev/null 2>&1
+cmp -s got.txt dflt.txt && pass "read under the default" || fail "read under the default"
+check "a copy into it sealed by the default" "$(aws s3api copy-object --bucket enc --key c.txt --copy-source smoke/a/small.txt --query ServerSideEncryption --output text)" AES256
+encid=$(aws s3api create-multipart-upload --bucket enc --key m --query '[UploadId,ServerSideEncryption]' --output text)
+check "an upload into it sealed by the default" "$(printf '%s' "$encid" | cut -f2)" AES256
+aws s3api abort-multipart-upload --bucket enc --key m --upload-id "$(printf '%s' "$encid" | cut -f1)" > /dev/null 2>&1
+check "the default's plaintext not on disk" "$(grep -rl 'sealed by default in cosmostore' "$work/store" | wc -l | tr -d ' ')" 0
+aws s3api delete-bucket-encryption --bucket enc > /dev/null 2>&1 || fail "delete-bucket-encryption"
+check "no default after delete" "$(aws s3api put-object --bucket enc --key e.txt --body dflt.txt --query ServerSideEncryption --output text)" None
+aws s3 rm --recursive s3://enc/ > /dev/null 2>&1
+aws s3api delete-bucket --bucket enc > /dev/null 2>&1 || fail "delete the bucket with a default"
 check "SSE-KMS" "$(code s3api put-object --bucket smoke --key sse/kms --body sse.txt --server-side-encryption aws:kms)" NotImplemented
-# SSE-C waits (ADR-0046 §7): a request that asks for it is refused, not stored in the clear.
-check "SSE-C asked for" "$(code s3api put-object --bucket smoke --key sse.txt --body pub.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901)" NotImplemented
-check "a read with a key" "$(code s3api get-object --bucket smoke --key sse.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901 got.txt)" NotImplemented
+# SSE-C only over TLS (ADR-0046 §6; tools/tls_smoke.sh serves it): over plain HTTP it is refused, not stored.
+check "SSE-C over HTTP" "$(code s3api put-object --bucket smoke --key sse.txt --body pub.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901)" InvalidRequest
+check "a read with a key over HTTP" "$(code s3api get-object --bucket smoke --key sse.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901 got.txt)" InvalidRequest
 check "nothing stored" "$(aws s3api list-objects-v2 --bucket smoke --prefix sse.txt --query 'Contents[].Key' --output text)" None
 
 # CORS (ADR-0049): the rules, a browser's preflight, and the fields on answers to requests that name an origin.

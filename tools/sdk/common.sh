@@ -13,8 +13,10 @@ export AWS_REGION=us-east-1
 export AWS_EC2_METADATA_DISABLED=true
 export AWS_ENDPOINT_URL="http://127.0.0.1:$port"
 echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > "$work/credentials"
+# SSE-S3's master key (ADR-0046 §4).
+printf 'k1 %s\n' "$(head -c 32 /dev/urandom | base64)" > "$work/sse.keys"
 
-"$bin" serve "$work/store" "$port" "$work/credentials" localhost 2> "$work/server.log" &
+"$bin" serve "$work/store" "$port" "$work/credentials" localhost --sse-key-file "$work/sse.keys" 2> "$work/server.log" &
 server=$!
 sleep 1
 

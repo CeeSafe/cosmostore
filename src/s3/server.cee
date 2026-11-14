@@ -63,6 +63,9 @@ struct S3App {
     audit: AuditLog?;
     /// Buckets with CORS rules (ADR-0049 §4): while 0, a request's `Origin` is not looked at.
     corsBuckets: AtomicU64;
+    /// Buckets with a default encryption (ADR-0046 §5): while 0, a write without encryption fields reads none, and
+    /// an inline PUT keeps its start without the lock (ADR-0032).
+    encryptedBuckets: AtomicU64;
     /// The webhooks notification rules may name (`serve --notify-targets`, ADR-0048).
     notifyTargets: Vector<NotifyTarget>;
     /// The master keys of server-side encryption (`serve --sse-key-file`, ADR-0046 §4): the first seals new objects;
@@ -282,9 +285,15 @@ async fn serveS3(
         Ok(a) => a,
         Err(code) => { return Err(S3Fail.Code(code)); }
     };
-    // Encryption is served for SSE-S3 on PutObject (ADR-0046 §5); anything else that asks for it is refused, not
-    // ignored, so nothing asked to be sealed is stored in the clear.
-    if (asksEncryption(borrow req) && !sseServedFor(borrow req)) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    // Encryption fields on an operation that does not take them are refused, not ignored, so nothing asked to be
+    // sealed is stored in the clear (ADR-0046 §7); an SSE-C key comes only over TLS, as S3 answers plain HTTP (§6).
+    if (asksEncryption(borrow req)) {
+        match (sseRefusal(borrow req)) {
+            Some(code) => { return Err(S3Fail.Code(code)); }
+            null => {}
+        }
+        if (bringsCustomerKey(borrow req) && !app.secure) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    }
     // The key's rate limit, once it is known whose request it is (ADR-0053).
     match (auth.key) {
         Some(place) => {
@@ -356,6 +365,22 @@ async fn serveS3(
             return Err(S3Fail.Code(S3Code.MethodNotAllowed));
         }
         // A bucket's CORS rules (ADR-0049).
+        if (req.hasParam("encryption")) {
+            if (!req.onlyParams("encryption")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            if (isMethod(m, Method.Get)) {
+                await authorize(app, borrow req, borrow who, "s3:GetEncryptionConfiguration", bucket, none)?;
+                return await getBucketEncryption(app, borrow req, exchange);
+            }
+            if (isMethod(m, Method.Put)) {
+                await authorize(app, borrow req, borrow who, "s3:PutEncryptionConfiguration", bucket, none)?;
+                return await putBucketEncryption(app, borrow req, auth, exchange);
+            }
+            if (isMethod(m, Method.Delete)) {
+                await authorize(app, borrow req, borrow who, "s3:PutEncryptionConfiguration", bucket, none)?;
+                return await deleteBucketEncryption(app, borrow req, exchange);
+            }
+            return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+        }
         if (req.hasParam("cors")) {
             if (!req.onlyParams("cors")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
             if (isMethod(m, Method.Get)) {
@@ -803,6 +828,7 @@ async fn deleteBucket(app: borrow S3App, req: borrow S3Request, exchange: borrow
     // Its policy, if it had one, no longer counts (ADR-0043 §8).
     if (app.policyBuckets.load() > 0) { await recountPolicies(app)?; }
     if (app.corsBuckets.load() > 0) { await recountCors(app)?; }
+    if (app.encryptedBuckets.load() > 0) { await recountEncrypted(app)?; }
     await exchange.send(Status.noContent(), "".bytes())?;
     return Ok();
 }

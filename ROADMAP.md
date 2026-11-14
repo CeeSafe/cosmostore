@@ -2164,3 +2164,42 @@ Browser form uploads with a SigV4 POST policy.
 - **Known:** nothing ties a part to its place, so whoever can write the disk can swap two parts with their salts,
   as ADR-0046 already accepts for moving a sealed object; the parts are admitted at their plaintext size.
 - **Next:** SSE-C, copies (open and seal again), POST, and bucket default encryption.
+
+### 14 Nov 2026: M5 item 4 done, SSE-C, copies, POST forms and bucket default encryption (ADR-0046)
+
+- **Asked by the user** (14 Nov: "Commit and go-ahead implementing copies, POST forms, bucket default encryption
+  and SSE-C").
+- **SSE-C:** the customer key fields on Put, Get, Head, GetObjectAttributes, POST, CreateMultipartUpload,
+  UploadPart and Complete, and a copy source's; only over TLS. The data key is wrapped under the request's key;
+  without it a read is InvalidRequest, with another key 400. Its ETag is HMAC-SHA256 of the plaintext's MD5 under
+  the key (16 bytes), so a part uploaded again keeps its ETag.
+- **Copies:** a sealed source (SSE-S3 or SSE-C, one PUT or multipart, any range) is opened and the copy sealed as
+  the request or the destination bucket asks, or stored in the clear; UploadPartCopy into a sealed upload seals
+  the part under its own salt. A copy onto itself that asks for encryption is allowed: re-sealing under the newest
+  master key after a rotation. A copy never takes its source's envelope.
+- **POST forms:** the form's SSE-S3 or SSE-C fields, else the bucket's default. The sealer now holds a full chunk
+  until more plaintext comes, so it marks the last chunk without knowing the size.
+- **Bucket default encryption:** Put-, Get- and DeleteBucketEncryption (`AES256`; `aws:kms` NotImplemented;
+  refused without a key file), `BucketConfig` kind 11, checkpoint format 14 (formats 1 to 13 load). A write
+  without fields reads the default only while some bucket has one (`encryptedBuckets`, as `corsBuckets`), so the
+  inline PUT's lock-free start (ADR-0032) is kept. Every checkpoint this build writes is format 14, which an
+  older build does not open, as with each format before it.
+- **Refusals:** SSE-S3's field on a read, UploadPart or Complete is InvalidArgument (was NotImplemented), as S3
+  answers; SSE-KMS's fields stay NotImplemented.
+- **Tests (226 passed, 0 failed):** `sseCustomerEnvelopesNeedTheirKey` (the envelope, the key, the ETag),
+  `sseSealsWithoutKnowingTheSize`, `sseBucketEncryptionXml`, `defaultEncryptionSurvivesReplayAndCheckpoints`.
+- **Clients:** `tools/s3_smoke.sh` 394 checks, all passed (copies both ways, sealed again onto itself, a sealed
+  multipart object copied whole and by parts whose ranges start inside and cross its parts, the default on PUT,
+  copy and multipart, no plaintext on disk; SSE-C over HTTP refused). `tools/tls_smoke.sh` 41 (SSE-C: put, get, a
+  range, HEAD and attributes with and without the key, another key, no key stored on disk, multipart with
+  `aws s3 cp --sse-c`, copies to the clear, to SSE-S3 and under a new key). boto3 145 (POST sealed by its field and
+  by the default, POST with SSE-KMS refused). The s3-tests subset 377, as before.
+- **s3-tests' encryption tests** (`encryption`, `sse_s3`, `bucket_encryption`; outside the subset), over TLS:
+  81 passed, 65 failed, 1 skipped. Of the failures, 59 are SSE-KMS, 4 put bucket policies with the condition keys
+  `s3:x-amz-server-side-encryption*` (refused when a policy is put), and 2 are POST tests that sign with SigV2 or
+  do not trust the test certificate. They drove three changes above: the SSE-C ETag, 400 for another key, and the
+  key on Complete.
+- **No fault sweep of its own:** the new record is a BucketConfig record, through the commits that were swept (as
+  for kinds 8 to 10); the store's fault tests pass.
+- **Not done:** SSE-KMS; the policy condition keys for encryption; wiping every copy of an SSE-C key in memory
+  (the request's buffer is not wiped).

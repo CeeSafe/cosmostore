@@ -1,7 +1,8 @@
 // Server-side encryption (ADR-0046): the chunks an object is sealed in and where they are stored, sealing and opening
 // them with lib/std's AES-256-GCM (ceesafec 0.45.0; CEESAFE_GAPS.md, G33), the envelope kept with a version, the key
-// file, and the request's fields. SSE-S3 is served on PutObject, multipart uploads, GetObject and HeadObject; any other
-// request that asks for encryption is NotImplemented (`sseServedFor`).
+// file, the request's fields, and a bucket's default. SSE-S3 and SSE-C are served on writes (PUT, POST, copies,
+// multipart uploads) and reads; SSE-KMS, and the fields on an operation that does not take them, are refused
+// (`sseRefusal`).
 import web_core;
 import web_http;
 import web_server;
@@ -87,6 +88,9 @@ struct SseSealer {
     /// Bytes given out before the first chunk: a multipart part's salt; empty once given, or for one PUT.
     header: Vector<u8>;
     headerLength: u64;
+    /// SSE-C: the request's key, under which the ETag is a digest of the plaintext's MD5, not that MD5 (ADR-0046
+    /// §6, `sseCustomerEtag`).
+    etagKey: [u8; 32]?;
 
     /// A sealer for a part of `size` plaintext bytes under `key`; null if the cipher refuses the key.
     fn create(key: borrow [u8; 32], part: u32, size: u64) -> SseSealer? => match (sseCipher(key)) {
@@ -100,6 +104,7 @@ struct SseSealer {
                 pending: Vector<u8>.create(),
                 header: Vector<u8>.create(),
                 headerLength: 0,
+                etagKey: null,
             },
         ),
         null => null,
@@ -132,8 +137,8 @@ struct SseSealer {
         return Ok();
     }
 
-    fn emit(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
-        let flag = sseFlag(this.chunk + 1 >= this.chunks);
+    fn emit(borrow mut this, out: borrow mut Vector<u8>, last: bool) -> Result<void, AllocError> {
+        let flag = sseFlag(last);
         let tag = this.cipher.seal(sseNonce(this.part, this.chunk), flag[..], this.pending.viewMut());
         out.extend(this.pending.view())?;
         out.extend(tag[..])?;
@@ -142,24 +147,25 @@ struct SseSealer {
         return Ok();
     }
 
-    /// Takes plaintext and appends to `out` every chunk it completes.
+    /// Takes plaintext and appends to `out` every chunk it completes. A full chunk is held until more plaintext
+    /// comes, so whether it is the last is known without the size (a POST form's file has none in advance).
     fn feed(borrow mut this, data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
         this.emitHeader(out)?;
         var at: usize = 0;
         while (at < data.length) {
+            if (this.pending.length == SSE_CHUNK as usize) { this.emit(out, false)?; }
             let room = SSE_CHUNK as usize - this.pending.length;
             let take = if (data.length - at < room) data.length - at else room;
             this.pending.extend(data[at..at + take])?;
             at += take;
-            if (this.pending.length == SSE_CHUNK as usize) { this.emit(out)?; }
         }
         return Ok();
     }
 
-    /// The part's end: its last chunk, if it was not a full one (an empty part's one empty chunk too).
+    /// The part's end: its last chunk (an empty part's one empty chunk too).
     fn finish(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
         this.emitHeader(out)?;
-        if (this.chunk < this.chunks) { this.emit(out)?; }
+        if (this.pending.length > 0 || this.chunk == 0) { this.emit(out, true)?; }
         return Ok();
     }
 }
@@ -639,20 +645,56 @@ fn asksEncryption(req: borrow S3Request) -> bool {
     return false;
 }
 
-/// Whether the request's encryption fields are served: SSE-S3's field alone, on a PutObject (a PUT of a key with no
-/// query and no copy source) or a CreateMultipartUpload. Every other request that asks for encryption is
-/// NotImplemented until copies, POST and SSE-C are served, so nothing asked to be sealed is stored in the clear.
-fn sseServedFor(req: borrow S3Request) -> bool {
-    if (req.key.length == 0) { return false; }
-    let put = isMethod(req.method, Method.Put) && req.onlyParams("");
-    let create = isMethod(req.method, Method.Post) && req.hasParam("uploads") && req.onlyParams("uploads");
-    if (!put && !create) { return false; }
-    if (headerOf(req, "x-amz-copy-source").isSome()) { return false; }
+/// The prefixes of SSE-C's fields, a request's own and a copy source's.
+const SSE_CUSTOMER: StringView = "x-amz-server-side-encryption-customer-";
+const SSE_SOURCE_CUSTOMER: StringView = "x-amz-copy-source-server-side-encryption-customer-";
+
+/// Why the request's encryption fields are not ones its operation takes, or null when they are (ADR-0046 §5 to §7):
+/// SSE-S3's field goes on PutObject, CopyObject and CreateMultipartUpload, and elsewhere is InvalidArgument, as S3
+/// answers; SSE-C's on those, UploadPart, UploadPartCopy, CompleteMultipartUpload, GetObject, HeadObject and
+/// GetObjectAttributes; a copy source's SSE-C fields on a copy. Anything else (SSE-KMS's fields, or the fields on
+/// another operation) is NotImplemented, so nothing asked to be sealed is stored in the clear.
+fn sseRefusal(req: borrow S3Request) -> S3Code? {
+    if (req.key.length == 0) { return S3Code.NotImplemented; }
+    let copying = headerOf(req, "x-amz-copy-source").isSome();
+    let m = req.method;
+    let put = isMethod(m, Method.Put) && req.onlyParams("");
+    let create = isMethod(m, Method.Post) && req.hasParam("uploads") && req.onlyParams("uploads");
+    let part = isMethod(m, Method.Put) && req.hasParam("uploadId") && req.hasParam("partNumber") &&
+        req.onlyParams("partNumber,uploadId");
+    let complete = isMethod(m, Method.Post) && req.hasParam("uploadId") && req.onlyParams("uploadId");
+    let read = (isMethod(m, Method.Get) || isMethod(m, Method.Head)) && (req.onlyParams(
+        "versionId,partNumber,response-content-type,response-content-language,response-expires,response-cache-control,response-content-disposition,response-content-encoding",
+    ) || (req.hasParam("attributes") && req.onlyParams("attributes,versionId")));
     for (i in 0..req.headers.length) {
         let name = req.headers[i].name.view();
-        if (isSseField(name) && name != SSE_FIELD.bytes()) { return false; }
+        if (!isSseField(name)) { continue; }
+        if (name == SSE_FIELD.bytes()) {
+            if (put || create) { continue; }
+            if (part || complete || read) { return S3Code.InvalidArgument; }
+            return S3Code.NotImplemented;
+        }
+        let fine = if (startsWithBytes(name, SSE_CUSTOMER.bytes())) {
+            put || create || part || complete || read
+        } else if (startsWithBytes(name, SSE_SOURCE_CUSTOMER.bytes())) {
+            copying && (put || part)
+        } else {
+            false
+        };
+        if (!fine) { return S3Code.NotImplemented; }
     }
-    return true;
+    return null;
+}
+
+/// Whether the request brings an SSE-C key, its own or a copy source's: only over TLS (ADR-0046 §6).
+fn bringsCustomerKey(req: borrow S3Request) -> bool {
+    for (i in 0..req.headers.length) {
+        let name = req.headers[i].name.view();
+        if (startsWithBytes(name, SSE_CUSTOMER.bytes()) || startsWithBytes(name, SSE_SOURCE_CUSTOMER.bytes())) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// The encryption a request's fields ask for.
@@ -664,36 +706,231 @@ fn sseRequestOf(req: borrow S3Request) -> Result<SseRequest, S3Fail> =>
         headerOf(req, "x-amz-server-side-encryption-customer-key-md5"),
     );
 
-// ---- Sealing a new object, opening a stored one (ADR-0046 §2 to §5) ----
+/// The SSE-C key a request brings to read or write a sealed object: its own fields, or a copy source's.
+fn sseCustomerKeyOf(req: borrow S3Request, source: bool) -> Result<[u8; 32]?, S3Fail> {
+    let fields = if (source) {
+        sseOfFields(
+            null,
+            headerOf(req, "x-amz-copy-source-server-side-encryption-customer-algorithm"),
+            headerOf(req, "x-amz-copy-source-server-side-encryption-customer-key"),
+            headerOf(req, "x-amz-copy-source-server-side-encryption-customer-key-md5"),
+        )?
+    } else {
+        sseOfFields(
+            null,
+            headerOf(req, "x-amz-server-side-encryption-customer-algorithm"),
+            headerOf(req, "x-amz-server-side-encryption-customer-key"),
+            headerOf(req, "x-amz-server-side-encryption-customer-key-md5"),
+        )?
+    };
+    return match (fields) {
+        SseRequest.Customer(k) => Ok(Some(k)),
+        _ => Ok(null),
+    };
+}
+
+/// Whether a stored envelope is SSE-C's.
+fn isCustomerEnvelope(field: Slice<u8>) -> bool => startsWithBytes(field, "v1.c.".bytes());
+
+/// The answer's fields for a sealed object: SSE-S3's, or SSE-C's algorithm and the MD5 of the request's key.
+fn sseAnswerFields(exchange: borrow mut Exchange, customer: [u8; 32]?) -> Result<void, S3Fail> {
+    match (customer) {
+        Some(k) => {
+            exchange.header("x-amz-server-side-encryption-customer-algorithm", "AES256".bytes())?;
+            var md5 = Vector<u8>.create();
+            appendBase64(mut md5, Md5.of(k[..])[..])?;
+            exchange.header("x-amz-server-side-encryption-customer-key-md5", md5.view())?;
+        }
+        null => { exchange.header(SSE_FIELD, "AES256".bytes())?; }
+    }
+    return Ok();
+}
+
+// ---- Sealing a new object, opening a stored one (ADR-0046 §2 to §6) ----
 
 /// A new object's data key, and its envelope as the metadata field holds it.
 struct NewSeal {
     dataKey: [u8; 32];
     field: Vector<u8>;
+    /// SSE-C's, sealed under the request's key: its ETag is the MD5 of what is stored.
+    customer: bool;
+
+    drop {
+        for (i in 0..32) { this.dataKey[i] = 0; }
+    }
+}
+
+/// A new object's data key wrapped under `wrapping` (a master key, or the request's for SSE-C).
+fn newSealUnder(wrapping: borrow [u8; 32], customer: bool, keyId: Slice<u8>) -> Result<NewSeal, S3Fail> {
+    let failed = S3Fail.Code(S3Code.InternalError);
+    var dataKey = [0u8; 32];
+    var nonce = [0u8; 12];
+    if (Random.fill(mut dataKey[..]).isErr() || Random.fill(mut nonce[..]).isErr()) { return Err(failed); }
+    let wrapped = match (wrapDataKey(wrapping, customer, borrow dataKey, nonce)) {
+        Some(w) => w,
+        null => { return Err(failed); }
+    };
+    let e = SseEnvelope { customer: customer, keyId: copyBytes(keyId)?, nonce: nonce, wrapped: wrapped };
+    var field = Vector<u8>.create();
+    encodeEnvelope(borrow e, mut field)?;
+    var seal = NewSeal { dataKey: [0u8; 32], field: field, customer: customer };
+    for (i in 0..32) {
+        seal.dataKey[i] = dataKey[i];
+        dataKey[i] = 0;
+    }
+    return Ok(seal);
 }
 
 /// SSE-S3 for a new object: a random data key, wrapped under the first master key with a random nonce.
 fn newManagedSeal(keys: Slice<MasterKey>) -> Result<NewSeal, S3Fail> {
-    let failed = S3Fail.Code(S3Code.InternalError);
     if (keys.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); } // `serve` has no key file
-    var dataKey = [0u8; 32];
-    var nonce = [0u8; 12];
-    if (Random.fill(mut dataKey[..]).isErr() || Random.fill(mut nonce[..]).isErr()) { return Err(failed); }
-    let wrapped = match (wrapDataKey(borrow keys[0].key, false, borrow dataKey, nonce)) {
-        Some(w) => w,
-        null => { return Err(failed); }
+    return newSealUnder(borrow keys[0].key, false, keys[0].id.view());
+}
+
+/// The seal a new object gets for what is asked: SSE-S3, SSE-C under the request's key, or none.
+fn newSeal(keys: Slice<MasterKey>, asked: borrow SseRequest) -> Result<NewSeal?, S3Fail> => match (asked) {
+    SseRequest.None => Ok(null),
+    SseRequest.Managed => Ok(Some(newManagedSeal(keys)?)),
+    SseRequest.Customer(k) => Ok(Some(newSealUnder(k, true, "-".bytes())?)),
+};
+
+/// An SSE-C object's ETag (ADR-0046 §6): HMAC-SHA256 of its plaintext's MD5 under the request's key, its first 16
+/// bytes. It is not the MD5, which would let whoever reads a listing test a guess of the content, and it is the same
+/// for the same bytes under the same key, as a part uploaded again must be for Complete to find it.
+fn sseCustomerEtag(key: borrow [u8; 32], md5: borrow [u8; 16]) -> [u8; 16] {
+    var mac = HmacSha256.create(key[..]);
+    mac.update("cosmostore sse-c etag v1".bytes());
+    mac.update(md5[..]);
+    let digest = mac.finish();
+    var etag = [0u8; 16];
+    for (i in 0..16) { etag[i] = digest[i]; }
+    return etag;
+}
+
+/// The ETag of a sealed body whose plaintext's MD5 is `md5`: that MD5, or SSE-C's digest of it.
+fn sealedEtag(sealer: borrow SseSealer, md5: [u8; 16]) -> [u8; 16] => match (sealer.etagKey) {
+    Some(k) => sseCustomerEtag(borrow k, borrow md5),
+    null => md5,
+};
+
+/// A sealer for one PUT's body of `size` bytes under a new object's data key.
+fn sealerOf(seal: borrow NewSeal, size: u64, customer: [u8; 32]?) -> Result<SseSealer, S3Fail> {
+    var sealer = match (SseSealer.create(borrow seal.dataKey, 0, size)) {
+        Some(s) => s,
+        null => { return Err(S3Fail.Code(S3Code.InternalError)); }
     };
-    let e = SseEnvelope { customer: false, keyId: copyBytes(keys[0].id.view())?, nonce: nonce, wrapped: wrapped };
-    var field = Vector<u8>.create();
-    encodeEnvelope(borrow e, mut field)?;
-    return Ok(NewSeal { dataKey: dataKey, field: field });
+    if (seal.customer) { sealer.etagKey = customer; }
+    return Ok(sealer);
+}
+
+/// SSE-C's key, when that is what is asked.
+fn customerKeyOf(asked: borrow SseRequest) -> [u8; 32]? => match (asked) {
+    SseRequest.Customer(k) => Some(k),
+    _ => null,
+};
+
+/// What a new object is sealed with (ADR-0046 §5, §6): the request's fields, else its bucket's default encryption.
+async fn sseAskedFor(app: borrow S3App, req: borrow S3Request) -> Result<SseRequest, S3Fail> {
+    let asked = sseRequestOf(req)?;
+    match (asked) {
+        SseRequest.None => {}
+        _ => { return Ok(asked); }
+    }
+    return await bucketDefaultSse(app, req.bucket.view());
+}
+
+/// A bucket's default encryption (ADR-0046 §5): SSE-S3, or none. Read under the lock, without I/O.
+async fn bucketDefaultSse(app: borrow S3App, bucket: StringView) -> Result<SseRequest, S3Fail> {
+    if (app.encryptedBuckets.load() == 0) { return Ok(SseRequest.None); }
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    let stored = match (store.bucketConfig(bucket, BUCKET_CONFIG_ENCRYPTION)) {
+        Ok(v) => v,
+        Err(StoreError.NoSuchBucket) => { return Ok(SseRequest.None); } // the write reports it
+        Err(e) => { return Err(storeFail(e, 0)); }
+    };
+    return Ok(if (stored.length > 0) SseRequest.Managed else SseRequest.None);
+}
+
+// ---- A bucket's default encryption: Get-, Put- and DeleteBucketEncryption (ADR-0046 §5) ----
+
+async fn recountEncrypted(app: borrow S3App) -> Result<void, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    app.encryptedBuckets.store(store.encryptedBucketCount());
+    return Ok();
+}
+
+async fn getBucketEncryption(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let stored = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_ENCRYPTION)?;
+    if (stored.length == 0) { return Err(S3Fail.Code(S3Code.ServerSideEncryptionConfigurationNotFoundError)); }
+    var body = Vector<u8>.create();
+    xmlHead(mut body, "ServerSideEncryptionConfiguration")?;
+    body.extend(
+        "<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>false</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>".bytes(),
+    )?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// The default a `<ServerSideEncryptionConfiguration>` names: one rule of `AES256`. `aws:kms` and `aws:kms:dsse`
+/// are NotImplemented; anything else is MalformedXML.
+fn parseBucketEncryption(xml: Slice<u8>) -> Result<void, S3Fail> {
+    // The root element carries S3's namespace (`xmlns=`), so it is found by its name alone.
+    if (findBytes(xml, "<ServerSideEncryptionConfiguration".bytes(), 0).isNull()) {
+        return Err(S3Fail.Code(S3Code.MalformedXML));
+    }
+    let rule = match (elementText(xml, "ApplyServerSideEncryptionByDefault")) {
+        Some(r) => r,
+        null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    };
+    let algorithm = trimBlank(elementText(rule, "SSEAlgorithm") ?? "".bytes());
+    if (algorithm == "AES256".bytes()) {
+        if (elementText(rule, "KMSMasterKeyID").isSome()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        return Ok();
+    }
+    if (algorithm == "aws:kms".bytes() || algorithm == "aws:kms:dsse".bytes()) {
+        return Err(S3Fail.Code(S3Code.NotImplemented));
+    }
+    return Err(S3Fail.Code(S3Code.MalformedXML));
+}
+
+async fn putBucketEncryption(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    verifySmallBody(req, xml.view(), true)?;
+    parseBucketEncryption(xml.view())?;
+    // Objects are sealed under the key file's first key: without one, a default could not be honoured.
+    if (app.sseKeys.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_ENCRYPTION, "AES256".bytes())?;
+    await recountEncrypted(app)?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn deleteBucketEncryption(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_ENCRYPTION, "".bytes())?;
+    await recountEncrypted(app)?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
 }
 
 /// Why a stored envelope does not give its data key.
 enum SseKeyFault {
     /// The field is not an envelope, or the key it names does not open it: InternalError.
     Broken,
-    /// SSE-C: the request must bring the key, which is not served yet.
+    /// SSE-C: the request must bring the key.
     Customer,
     /// No key of the key file has the id: InternalError, and a line in the log.
     UnknownKey,
@@ -717,11 +954,29 @@ fn managedDataKey(keys: Slice<MasterKey>, field: Slice<u8>) -> Result<[u8; 32], 
     return Err(SseKeyFault.UnknownKey);
 }
 
-/// `managedDataKey` as a request's answer, with the log line ADR-0046 §4 asks for when no key has the id.
-async fn sealedDataKey(app: borrow S3App, field: Slice<u8>) -> Result<[u8; 32], S3Fail> {
+/// The data key of a stored envelope with what the request brings (ADR-0046 §4, §6): SSE-S3's under the master key
+/// its id names (no key may be brought: InvalidRequest), SSE-C's under the request's key (none brought:
+/// InvalidRequest; another: InvalidRequest too, 400). A key id not in the key file is InternalError and a line in the log.
+async fn sealedDataKey(app: borrow S3App, field: Slice<u8>, customer: [u8; 32]?) -> Result<[u8; 32], S3Fail> {
+    if (isCustomerEnvelope(field)) {
+        let key = match (customer) {
+            Some(k) => k,
+            null => { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        };
+        let e = match (decodeEnvelope(field)?) {
+            Some(e) => e,
+            null => { return Err(S3Fail.Code(S3Code.InternalError)); }
+        };
+        // Another key is 400, as s3-tests has S3 answer (ADR-0046 §6).
+        return match (unwrapDataKey(borrow key, borrow e)) {
+            Some(k) => Ok(k),
+            null => Err(S3Fail.Code(S3Code.InvalidRequest)),
+        };
+    }
+    if (customer.isSome()) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
     return match (managedDataKey(app.sseKeys.view(), field)) {
         Ok(k) => Ok(k),
-        Err(SseKeyFault.Customer) => Err(S3Fail.Code(S3Code.NotImplemented)),
+        Err(SseKeyFault.Customer) => Err(S3Fail.Code(S3Code.InvalidRequest)),
         Err(SseKeyFault.UnknownKey) => {
             var line = Vector<u8>.create();
             line.extend("cosmostore: an object is sealed under a master key that is not in the key file: ".bytes())?;

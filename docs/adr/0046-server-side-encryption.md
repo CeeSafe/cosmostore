@@ -4,10 +4,12 @@
 (`src/s3/sse.cee`); sealing and opening wait for AES-256-GCM in CeeSafe's lib/std (`CEESAFE_GAPS.md`, G33). Until
 then a request that asks for encryption is NotImplemented.
 
-**14 Nov 2026:** G33 is fixed in ceesafec 0.45.0 (CeeSafe ADR 0135). Built: `serve --sse-key-file`, SSE-S3 on
-PutObject, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, GetObject and HeadObject (ranges and
-`?partNumber` too), the reader over stored offsets, and `fsck` of sealed versions. Still NotImplemented: copies of
-or into a sealed object, POST forms, bucket default encryption and SSE-C (§5 to §7).
+**14 Nov 2026: built.** G33 is fixed in ceesafec 0.45.0 (CeeSafe ADR 0135). `serve --sse-key-file`; SSE-S3, SSE-C and
+a bucket's default on PutObject, POST object, CopyObject, CreateMultipartUpload, UploadPart, UploadPartCopy and
+CompleteMultipartUpload, and on GetObject, HeadObject and GetObjectAttributes (ranges and `?partNumber` too); the
+reader over stored offsets; `fsck` of sealed versions. SSE-KMS stays NotImplemented. Changed from the text below
+as it was built, and marked there: SSE-C's ETag (§6), its answer to another key (§6), Complete taking SSE-C's key
+(§6), SSE-S3's field on a read (§5), and a bucket's default needing the key file (§5).
 
 **Multipart, revised 14 Nov 2026** (chosen with the user, over the part's index first chosen the same day): each
 upload of a part is sealed under a key of its own, derived from the object's data key and a random salt that the
@@ -83,20 +85,31 @@ nonces under one key. No format changes.
    Without the option, a request for SSE-S3 is InvalidRequest. An object whose key id is not in the file cannot be
    read: InternalError, and a line in the log naming the id.
 5. **SSE-S3:** `x-amz-server-side-encryption: AES256` on PutObject, CopyObject, CreateMultipartUpload and POST
-   object, or the bucket's default (Put-, Get- and DeleteBucketEncryption, a `BucketConfig` record of a new kind;
-   `aws:kms` is NotImplemented). Responses to writes and reads of such an object carry the field. Its ETag is the
-   MD5 of the plaintext, as in S3, which the S3 layer computes itself.
+   object, or the bucket's default (Put-, Get- and DeleteBucketEncryption, `BucketConfig` kind 11, checkpoint
+   format 14; `aws:kms` is NotImplemented). Responses to writes and reads of such an object carry the field. Its
+   ETag is the MD5 of the plaintext, as in S3, which the S3 layer computes itself.
+   - *As built:* the field on GetObject, HeadObject, UploadPart or Complete is InvalidArgument, as S3 answers
+     (s3-tests). PutBucketEncryption without a key file is InvalidRequest: the default could not be honoured. A
+     write that brings no fields reads the default only while some bucket has one (a count, as for CORS), so an
+     inline PUT still starts without the store's lock (ADR-0032).
+   - A POST form's file has no size in advance: the sealer holds a full chunk until more comes, so it knows the
+     last chunk without the size.
 6. **SSE-C:** the three customer fields on the same calls, and on UploadPart, GetObject, HeadObject,
    GetObjectAttributes and, as the `x-amz-copy-source-` fields, on a copy's source.
    - The key must be 32 bytes and its MD5 must match (InvalidArgument); the algorithm must be `AES256`.
    - Only over TLS: InvalidRequest when `serve` listens without it, as S3 answers plain HTTP.
    - A read without the key, or with SSE-S3's field, is InvalidRequest; with another key the data key does not
-     open: AccessDenied. The key is never stored or logged, and its buffer is wiped after the request.
-   - Its ETag is the MD5 of what is stored, not of the plaintext, as S3's is not.
+     open: *as built,* InvalidRequest (400), as s3-tests has S3 answer, not AccessDenied. A key brought for an
+     object in the clear is InvalidRequest. The key is never stored or logged.
+   - *As built,* its ETag is HMAC-SHA256 of the plaintext's MD5 under the request's key, its first 16 bytes: not
+     the MD5, which would let whoever reads a listing test a guess, and not the MD5 of what is stored, which
+     changes with every upload of a part (a random salt, §2), so Complete could not find a part uploaded again.
+   - *As built,* CompleteMultipartUpload of an SSE-C upload takes its key too (400 without, or with another), as
+     the AWS CLI sends it and s3-tests expects.
    - A presigned URL does not carry the key: the fields come with the request.
-7. **Until G33 is fixed,** every request with an `x-amz-server-side-encryption*` or
-   `x-amz-copy-source-server-side-encryption*` field, and a POST form with one, is NotImplemented. Before this ADR
-   they were ignored, and the object was stored in the clear under a 200.
+7. **Fields an operation does not take** (SSE-KMS's, or encryption fields on an operation that has none) are
+   NotImplemented, so nothing asked to be sealed is stored in the clear. Before this ADR they were ignored, and the
+   object was stored in the clear under a 200.
 
 ## Consequences
 

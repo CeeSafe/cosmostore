@@ -24,6 +24,8 @@ failed=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1"; failed=1; }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1: expected [$3], got [$2]"; fi; }
+code() { aws "$@" 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9]*\)).*/\1/p' | head -1; }
+printf 'k1 %s\n' "$(head -c 32 /dev/urandom | base64)" > sse.keys
 
 # A CA, and a certificate for localhost and 127.0.0.1 signed by it.
 "$openssl" req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj "/CN=CosmoStore test CA" \
@@ -46,7 +48,7 @@ check "missing certificate" "$(sed 's/ (.*//' out.txt)" "cannot read the TLS cer
 [ -e store ] && fail "a refused setup opened the store" || pass "a refused setup opens no store"
 
 "$bin" serve store "0.0.0.0:$port" credentials --tls-cert server.pem --tls-key server.key --maintain-seconds 1 \
-    2> server.log &
+    --sse-key-file sse.keys 2> server.log &
 server=$!
 until curl -s -o /dev/null --cacert ca.pem "https://localhost:$port/"; do
     kill -0 "$server" 2> /dev/null || { fail "server exited"; cat server.log; exit 1; }
@@ -72,6 +74,7 @@ check "TLS version" "$(curl -s -o /dev/null -w '%{ssl_verify_result} %{http_vers
 check "anonymous over TLS" "$(curl -s --cacert ca.pem "https://127.0.0.1:$port/" | sed -n 's/.*<Code>\(.*\)<\/Code>.*/\1/p')" AccessDenied
 url=$(aws s3 presign s3://tls-smoke/big.bin --expires-in 60)
 curl -s --cacert ca.pem "$url" | cmp -s - big.bin && pass "presigned GET over TLS" || fail "presigned GET over TLS"
+
 if command -v rclone > /dev/null; then
     RCLONE_CONFIG_T_TYPE=s3 RCLONE_CONFIG_T_PROVIDER=Other RCLONE_CONFIG_T_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
     RCLONE_CONFIG_T_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" RCLONE_CONFIG_T_ENDPOINT="$AWS_ENDPOINT_URL" \
@@ -79,6 +82,45 @@ if command -v rclone > /dev/null; then
         rclone --config /dev/null --ca-cert ca.pem lsf t:tls-smoke > rc.txt 2>&1
     check "rclone over TLS" "$(cat rc.txt)" "big.bin"
 fi
+
+# SSE-C (ADR-0046 §6): the request's key seals and opens; the key is never stored.
+ckey=0123456789abcdef0123456789abcdef
+other=fedcba9876543210fedcba9876543210
+sc="--sse-customer-algorithm AES256 --sse-customer-key $ckey"
+head -c 200000 /dev/urandom > c.bin
+check "SSE-C put" "$(aws s3api put-object --bucket tls-smoke --key c.bin --body c.bin $sc --query SSECustomerAlgorithm --output text)" AES256
+aws s3api get-object --bucket tls-smoke --key c.bin $sc got.bin > /dev/null 2>&1
+cmp -s got.bin c.bin && pass "SSE-C get" || fail "SSE-C get"
+aws s3api get-object --bucket tls-smoke --key c.bin $sc --range bytes=65000-140000 got.bin > /dev/null 2>&1
+dd if=c.bin of=want.bin bs=1 skip=65000 count=75001 2> /dev/null
+cmp -s got.bin want.bin && pass "SSE-C range" || fail "SSE-C range"
+check "SSE-C head" "$(aws s3api head-object --bucket tls-smoke --key c.bin $sc --query '[SSECustomerAlgorithm,SSECustomerKeyMD5,ContentLength]' --output text | tr '\t' ' ')" "AES256 $(printf '%s' "$ckey" | "$openssl" dgst -md5 -binary | base64) 200000"
+check "SSE-C get without the key" "$(code s3api get-object --bucket tls-smoke --key c.bin got.bin)" InvalidRequest
+check "SSE-C head without the key" "$(code s3api head-object --bucket tls-smoke --key c.bin)" 400
+check "SSE-C with another key" "$(code s3api get-object --bucket tls-smoke --key c.bin --sse-customer-algorithm AES256 --sse-customer-key $other got.bin)" InvalidRequest
+check "SSE-C attributes without the key" "$(code s3api get-object-attributes --bucket tls-smoke --key c.bin --object-attributes ObjectSize)" InvalidRequest
+# get-object-attributes takes the key as it is sent, in base64 with its MD5 (the CLI encodes it only for some calls).
+b64=$(printf '%s' "$ckey" | base64)
+kmd5=$(printf '%s' "$ckey" | "$openssl" dgst -md5 -binary | base64)
+check "SSE-C attributes" "$(aws s3api get-object-attributes --bucket tls-smoke --key c.bin --object-attributes ObjectSize --sse-customer-algorithm AES256 --sse-customer-key "$b64" --sse-customer-key-md5 "$kmd5" --query ObjectSize --output text)" 200000
+check "a key for an object in the clear" "$(code s3api get-object --bucket tls-smoke --key big.bin $sc got.bin)" InvalidRequest
+check "the key is not stored" "$(grep -rl "$ckey" store | wc -l | tr -d ' ')" 0
+aws s3 cp --only-show-errors big.bin s3://tls-smoke/c-mp.bin --sse-c AES256 --sse-c-key "$ckey" > cpc.txt 2>&1 \
+    || { fail "SSE-C multipart cp"; tail -5 cpc.txt; grep -v '^cosmostore: serving' server.log | tail -5; }
+aws s3 cp --only-show-errors s3://tls-smoke/c-mp.bin got.bin --sse-c AES256 --sse-c-key "$ckey" > /dev/null 2>&1
+cmp -s got.bin big.bin && pass "SSE-C multipart both ways" || fail "SSE-C multipart both ways"
+src="--copy-source tls-smoke/c.bin --copy-source-sse-customer-algorithm AES256 --copy-source-sse-customer-key $ckey"
+aws s3api copy-object --bucket tls-smoke --key c-clear.bin $src > /dev/null 2>&1 || fail "SSE-C copy to the clear"
+aws s3api get-object --bucket tls-smoke --key c-clear.bin got.bin > /dev/null 2>&1
+cmp -s got.bin c.bin && pass "SSE-C copied to the clear" || fail "SSE-C copied to the clear"
+check "SSE-C copied to SSE-S3" "$(aws s3api copy-object --bucket tls-smoke --key c-s3.bin $src --server-side-encryption AES256 --query ServerSideEncryption --output text)" AES256
+aws s3api get-object --bucket tls-smoke --key c-s3.bin got.bin > /dev/null 2>&1
+cmp -s got.bin c.bin && pass "SSE-C copied to SSE-S3 reads" || fail "SSE-C copied to SSE-S3 reads"
+aws s3api copy-object --bucket tls-smoke --key c.bin $src --sse-customer-algorithm AES256 --sse-customer-key "$other" > /dev/null 2>&1 || fail "SSE-C sealed again under another key"
+aws s3api get-object --bucket tls-smoke --key c.bin --sse-customer-algorithm AES256 --sse-customer-key "$other" got.bin > /dev/null 2>&1
+cmp -s got.bin c.bin && pass "SSE-C under the new key" || fail "SSE-C under the new key"
+check "SSE-C under the old key" "$(code s3api get-object --bucket tls-smoke --key c.bin $sc got.bin)" InvalidRequest
+check "a copy without the source's key" "$(code s3api copy-object --bucket tls-smoke --key c-no.bin --copy-source tls-smoke/c.bin)" InvalidRequest
 
 # Reload (ADR-0019): a new certificate and key in place of the old ones are served within a few upkeep rounds, and a
 # broken key keeps the certificate that works.

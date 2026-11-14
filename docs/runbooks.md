@@ -82,7 +82,13 @@ connections get the new certificate; open ones are not closed.
 - **Keep it off the data's volume**, readable only by the server's user, and backed up apart from the data:
   whoever has both reads everything, and losing a key loses every object sealed under it.
 - **Rotate:** put a new line first and keep the old ones, then restart. New objects are sealed under the first
-  key; every key in the file opens what it sealed. An object stays under its key until it is written again.
+  key; every key in the file opens what it sealed. An object stays under its key until it is written again: a
+  CopyObject onto itself with `x-amz-server-side-encryption: AES256` seals it again under the first key, and once
+  nothing is under an old key, its line can go.
+- **A bucket's default** (PutBucketEncryption with `AES256`) seals every object written without fields of its own;
+  it needs the key file, and is refused without one. It does not seal objects already stored.
+- **SSE-C** needs TLS: over plain HTTP a request with a customer key is refused (`InvalidRequest`). The key is never
+  stored or logged; an object under it cannot be read without it, by anyone, and a lost key loses the object.
 - **An object whose key is not in the file** cannot be read: `InternalError`, and stderr says
   `an object is sealed under a master key that is not in the key file: <id>`. Put the key back and restart.
 - `fsck` checks a sealed object's length and its extents' CRCs without the keys; its MD5 is the plaintext's, which
@@ -233,10 +239,9 @@ There is no backup command and no replication yet (M6).
 
 ## Not yet
 
-- **Encryption at rest** is SSE-S3 on PutObject, multipart uploads, GetObject and HeadObject (ADR-0046), with
-  `serve --sse-key-file`. Copies of or into a sealed object, POST forms, a bucket's default and SSE-C are not served yet: a
-  request that asks for them is refused with `NotImplemented`, never stored in the clear. Keys, metadata, sizes and
-  the ETag (the plaintext's MD5) are not encrypted; for those, encrypt the volume too.
+- **Encryption at rest** is SSE-S3 and SSE-C on every write and read, with `serve --sse-key-file`, and a bucket's
+  default (ADR-0046). SSE-KMS is refused with `NotImplemented`, never stored in the clear. Keys, metadata, sizes and an
+  SSE-S3 object's ETag (its plaintext's MD5) are not encrypted; for those, encrypt the volume too.
 - One node: no replication, no failover.
 - No call to force a credentials reload or an upkeep round (both come within a round), nor to change an option
   without a restart.

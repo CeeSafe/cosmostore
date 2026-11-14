@@ -423,9 +423,16 @@ async fn receiveBody(
         Some(f) => f,
         null => await finishSpilled(mut w)?,
     };
-    if (seal.isSome()) {
-        finished.size = received;
-        finished.md5 = plainMd5.finish();
+    // The plaintext's MD5, which Content-MD5 is checked against; the ETag too, except under SSE-C, whose ETag is the
+    // MD5 of what is stored (ADR-0046 §6).
+    var plainDigest = finished.md5;
+    match (seal.asBorrow()) {
+        Some(s) => {
+            finished.size = received;
+            plainDigest = plainMd5.finish();
+            finished.md5 = sealedEtag(s, plainDigest);
+        }
+        null => {}
     }
 
     var refusal: S3Code? = null;
@@ -437,7 +444,7 @@ async fn receiveBody(
     }
     match (spec.md5Expected) {
         Some(m) => {
-            if (m[..] != finished.md5[..]) { refusal = S3Code.BadDigest; }
+            if (m[..] != plainDigest[..]) { refusal = S3Code.BadDigest; }
         }
         null => {}
     }
@@ -531,18 +538,16 @@ async fn putObject(
     // Refused before the body is read; the ACL of the request's fields goes with the metadata (ADR-0045 §3).
     let tagged = await withRequestAcl(app, req, withRequestTags(req, metadataOf(req)?)?)?;
     var metadata = await withRequestLock(app, req, tagged)?;
-    // SSE-S3 (ADR-0046 §5): a data key for the object, whose envelope goes with its metadata.
+    // SSE-S3 or SSE-C, as the request or the bucket's default asks (ADR-0046 §5, §6): a data key for the object,
+    // whose envelope goes with its metadata.
+    let asked = await sseAskedFor(app, req)?;
     var sealer: SseSealer? = null;
-    match (sseRequestOf(req)?) {
-        SseRequest.None => {}
-        SseRequest.Managed => {
-            var seal = newManagedSeal(app.sseKeys.view())?;
+    match (newSeal(app.sseKeys.view(), borrow asked)?) {
+        Some(seal) => {
             metadataAdd(mut metadata, SSE_FIELD.bytes(), seal.field.view())?;
-            sealer = SseSealer.create(borrow seal.dataKey, 0, spec.size);
-            for (i in 0..32) { seal.dataKey[i] = 0; }
-            if (sealer.isNull()) { return Err(S3Fail.Code(S3Code.InternalError)); }
+            sealer = Some(sealerOf(borrow seal, spec.size, customerKeyOf(borrow asked))?);
         }
-        SseRequest.Customer(_) => { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        null => {}
     }
     let sealing = sealer.isSome();
     let storedSize = if (sealing) sseStoredLength(spec.size) else spec.size;
@@ -567,7 +572,7 @@ async fn putObject(
         ifMatch.view(),
     )?;
     writtenVersionHeader(exchange, borrow outcome)?;
-    if (sealing) { exchange.header(SSE_FIELD, "AES256".bytes())?; }
+    if (sealing) { sseAnswerFields(exchange, customerKeyOf(borrow asked))?; }
     return await sendStored(exchange, borrow outcome.md5, 0, borrow body);
 }
 
@@ -1121,7 +1126,15 @@ fn readHeader(prepared: borrow mut PreparedReader) -> Result<Vector<u8>, StoreEr
 async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
     let withBody = !isMethod(req.method, Method.Head);
     var plan = await openGet(app, req, withBody, exchange)?;
-    // A sealed object's data key, before any of the answer is given (ADR-0046 §2, §4).
+    // A sealed object's data key, before any of the answer is given (ADR-0046 §2, §4, §6). An SSE-C object needs its
+    // key for HEAD too; an object in the clear takes none.
+    let customer = sseCustomerKeyOf(req, false)?;
+    var envelope = Vector<u8>.create();
+    match (metadataFind(plan.info.metadata.view(), SSE_FIELD.bytes())) {
+        Some(f) => { envelope.extend(f)?; }
+        null => {}
+    }
+    if (envelope.length == 0 && customer.isSome()) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
     var opener: SseStream? = null;
     var skip: u64 = 0;
     var sealedRange: SseRange? = null;
@@ -1138,24 +1151,26 @@ async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
         }
         null => {}
     }
-    match (sealedRange) {
-        Some(r) => {
-            var field = Vector<u8>.create();
-            match (metadataFind(plan.info.metadata.view(), SSE_FIELD.bytes())) {
-                Some(f) => { field.extend(f)?; }
-                null => {}
+    if (envelope.length > 0 && (sealedRange.isSome() || isCustomerEnvelope(envelope.view()))) {
+        var dataKey = await sealedDataKey(app, envelope.view(), customer)?;
+        match (sealedRange) {
+            Some(r) => {
+                skip = r.skip;
+                opener = if (plan.info.parts == 0) {
+                    SseStream.single(borrow dataKey, plan.info.size, r.chunk)
+                } else {
+                    SseStream.multipart(
+                        borrow dataKey,
+                        plan.extras.partSizes.view()[r.part..],
+                        r.chunk,
+                        plan.salt.view(),
+                    )?
+                };
+                if (opener.isNull()) { return Err(S3Fail.Code(S3Code.InternalError)); }
             }
-            var dataKey = await sealedDataKey(app, field.view())?;
-            skip = r.skip;
-            opener = if (plan.info.parts == 0) {
-                SseStream.single(borrow dataKey, plan.info.size, r.chunk)
-            } else {
-                SseStream.multipart(borrow dataKey, plan.extras.partSizes.view()[r.part..], r.chunk, plan.salt.view())?
-            };
-            for (i in 0..32) { dataKey[i] = 0; }
-            if (opener.isNull()) { return Err(S3Fail.Code(S3Code.InternalError)); }
+            null => {}
         }
-        null => {}
+        for (i in 0..32) { dataKey[i] = 0; }
     }
     readVersionHeader(exchange, borrow plan.info)?;
     var field = Vector<u8>.create();
@@ -1224,7 +1239,7 @@ async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
                 if (name == ACL_FIELD.bytes()) { continue; }
                 // Nor the envelope: S3's field for the mode (ADR-0046 §3).
                 if (name == SSE_FIELD.bytes()) {
-                    exchange.header(SSE_FIELD, "AES256".bytes())?;
+                    sseAnswerFields(exchange, if (isCustomerEnvelope(pairs[i].value.view())) customer else null)?;
                     continue;
                 }
                 // The lock is S3's three fields (ADR-0047).
@@ -1351,6 +1366,21 @@ async fn getObjectAttributes(
         null => {}
     }
     let info = await objectInfo(app, req, exchange)?;
+    // An SSE-C object's attributes need its key, as its HEAD does (ADR-0046 §6).
+    let customer = sseCustomerKeyOf(req, false)?;
+    match (metadataFind(info.metadata.view(), SSE_FIELD.bytes())) {
+        Some(f) => {
+            if (isCustomerEnvelope(f) || customer.isSome()) {
+                var envelope = Vector<u8>.create();
+                envelope.extend(f)?;
+                var dataKey = await sealedDataKey(app, envelope.view(), customer)?;
+                for (i in 0..32) { dataKey[i] = 0; }
+            }
+        }
+        null => {
+            if (customer.isSome()) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        }
+    }
     readVersionHeader(exchange, borrow info)?;
     let extras = match (decodeExtras(info.extras.view())) {
         Ok(e) => e,

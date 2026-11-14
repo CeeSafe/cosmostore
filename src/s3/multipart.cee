@@ -82,16 +82,16 @@ async fn createMultipartUpload(
     contentTypeOf(req, mut contentType)?;
     let tagged = await withRequestAcl(app, req, withRequestTags(req, metadataOf(req)?)?)?;
     var metadata = await withRequestLock(app, req, tagged)?;
-    // SSE-S3 (ADR-0046 §2): the object's data key is made now; every part is sealed under a key of its own from it.
+    // SSE-S3 or SSE-C, as the request or the bucket's default asks (ADR-0046 §2): the object's data key is made now;
+    // every part is sealed under a key of its own from it.
+    let asked = await sseAskedFor(app, req)?;
     var sealing = false;
-    match (sseRequestOf(req)?) {
-        SseRequest.None => {}
-        SseRequest.Managed => {
-            let seal = newManagedSeal(app.sseKeys.view())?;
+    match (newSeal(app.sseKeys.view(), borrow asked)?) {
+        Some(seal) => {
             metadataAdd(mut metadata, SSE_FIELD.bytes(), seal.field.view())?;
             sealing = true;
         }
-        SseRequest.Customer(_) => { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        null => {}
     }
     let checksum = uploadChecksumOf(req)?;
     let bucket = req.bucket.view();
@@ -102,7 +102,7 @@ async fn createMultipartUpload(
         exchange.header("x-amz-checksum-algorithm", checksumNameUpper(checksum.algorithm).bytes())?;
         exchange.header("x-amz-checksum-type", checksumTypeName(checksum.kind).bytes())?;
     }
-    if (sealing) { exchange.header(SSE_FIELD, "AES256".bytes())?; }
+    if (sealing) { sseAnswerFields(exchange, customerKeyOf(borrow asked))?; }
     var body = Vector<u8>.create();
     xmlHead(mut body, "InitiateMultipartUploadResult")?;
     xmlElement(mut body, "Bucket", bucket.bytes(), false)?;
@@ -211,18 +211,27 @@ async fn uploadPart(
     }
     // A sealed upload's part: under the key of a random salt of its own, which its stored bytes start with (ADR-0046
     // §2). The part is admitted at its plaintext size, 16 bytes in 64 KiB short of what it stores.
+    // An SSE-C upload's parts bring its key, each time (ADR-0046 §6).
+    let customer = sseCustomerKeyOf(req, false)?;
     var sealer: SseSealer? = null;
     if (start.envelope.length > 0) {
-        var dataKey = await sealedDataKey(app, start.envelope.view())?;
+        var dataKey = await sealedDataKey(app, start.envelope.view(), customer)?;
         var salt = [0u8; 16];
         if (Random.fill(mut salt[..]).isErr()) { return Err(S3Fail.Code(S3Code.InternalError)); }
         sealer = SseSealer.createPart(borrow dataKey, salt, spec.size)?;
         for (i in 0..32) { dataKey[i] = 0; }
-        if (sealer.isNull()) { return Err(S3Fail.Code(S3Code.InternalError)); }
+        match (sealer.asBorrowMut()) {
+            Some(s) => {
+                if (isCustomerEnvelope(start.envelope.view())) { s.etagKey = customer; }
+            }
+            null => { return Err(S3Fail.Code(S3Code.InternalError)); }
+        }
+    } else if (customer.isSome()) {
+        return Err(S3Fail.Code(S3Code.InvalidRequest));
     }
     let sealing = sealer.isSome();
     let body = await receiveBody(app, auth, mut spec, start.writer, exchange, start.algorithm, sealer)?;
-    if (sealing) { exchange.header(SSE_FIELD, "AES256".bytes())?; }
+    if (sealing) { sseAnswerFields(exchange, customer)?; }
     let md5 = await commitPart(
         app,
         req.bucket.view(),
@@ -440,11 +449,20 @@ async fn completeMultipartUpload(
     let condition = putConditionOf(req, mut etags)?;
     let xml = await readSmallBody(auth, exchange, MAX_COMPLETE_BODY)?;
     verifySmallBody(req, xml.view(), false)?;
+    // An SSE-C upload is completed with its key, as its parts are uploaded (ADR-0046 §6); another upload takes none.
+    let customer = sseCustomerKeyOf(req, false)?;
+    let sealedWith = await storeUploadEnvelope(app, id)?;
+    if (isCustomerEnvelope(sealedWith.view())) {
+        var dataKey = await sealedDataKey(app, sealedWith.view(), customer)?;
+        for (i in 0..32) { dataKey[i] = 0; }
+    } else if (customer.isSome()) {
+        return Err(S3Fail.Code(S3Code.InvalidRequest));
+    }
     let chosen = parseCompleteBody(xml.view())?;
     let expected = expectedObjectChecksum(req)?;
     let bucket = req.bucket.view();
     let key = req.key.view();
-    var sealed = false;
+    var envelope = Vector<u8>.create();
     let outcome = await storeComplete(
         app,
         bucket,
@@ -454,10 +472,14 @@ async fn completeMultipartUpload(
         condition,
         etags.view(),
         expected.view(),
-        mut sealed,
+        mut envelope,
     )?;
     writtenVersionHeader(exchange, borrow outcome)?;
-    if (sealed) { exchange.header(SSE_FIELD, "AES256".bytes())?; }
+    if (isCustomerEnvelope(envelope.view())) {
+        sseAnswerFields(exchange, customer)?;
+    } else if (envelope.length > 0) {
+        exchange.header(SSE_FIELD, "AES256".bytes())?;
+    }
     var body = Vector<u8>.create();
     xmlHead(mut body, "CompleteMultipartUploadResult")?;
     var location = Vector<u8>.create();
@@ -527,6 +549,13 @@ fn xmlChecksum(out: borrow mut Vector<u8>, extras: Slice<u8>) -> Result<void, S3
     return Ok();
 }
 
+/// An upload's sealed envelope (ADR-0046), under the lock; empty for one in the clear.
+async fn storeUploadEnvelope(app: borrow S3App, id: [u8; 16]) -> Result<Vector<u8>, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return Ok(store.uploadEnvelope(id)?);
+}
+
 async fn storeComplete(
     app: borrow S3App,
     bucket: StringView,
@@ -536,12 +565,12 @@ async fn storeComplete(
     condition: PutIf,
     etags: Slice<u8>,
     expected: Slice<u8>,
-    sealed: borrow mut bool,
+    envelope: borrow mut Vector<u8>,
 ) -> Result<PutOutcome, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
     // Whether the object is sealed (ADR-0046), for the answer: the upload is gone once completed.
-    sealed = store.uploadEnvelope(id)?.length > 0;
+    envelope.extend(store.uploadEnvelope(id)?.view())?;
     return match (await Async.blocking(
         () => completeWith(store, bucket, key, id, parts, condition, etags, expected),
     )) {
