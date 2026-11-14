@@ -1,0 +1,287 @@
+// The cluster file (ADR-0059 §1) and placement (§2). Lines of words; `#` begins a comment to the end of its line:
+//
+//   cluster <16 hex digits>
+//   shards <1 to 256>
+//   replicas <1 to 7, at most the node count>
+//   secret-file <path>
+//   node <1 to 255> peer=<a.b.c.d:port | [v6]:port> domain=<1 to 64 of A-Z a-z 0-9 . _ ->
+//
+// Every node reads the same file. Its canonical form (each line's words joined by one space, the lines by a newline,
+// comments and blank lines gone) has a SHA-256, the digest, which every request between nodes carries: nodes that
+// disagree on the file, and so on the placement, never talk.
+
+const MAX_CLUSTER_NODES: usize = 255;
+const MAX_SHARDS: u32 = 256;
+const MAX_REPLICAS: u32 = 7;
+
+struct ClusterNode {
+    id: u32;
+    peer: SocketAddress;
+    domain: String;
+}
+
+struct ClusterFile {
+    /// The cluster's name, as its 16 hex digits' bytes.
+    name: [u8; 8];
+    shards: u32;
+    replicas: u32;
+    secretFile: String;
+    nodes: Vector<ClusterNode>;
+    digest: [u8; 32];
+
+    fn node(borrow this, id: u32) -> borrow(this) ClusterNode? {
+        for (i in 0..this.nodes.length) {
+            if (this.nodes[i].id == id) { return Some(borrow this.nodes[i]); }
+        }
+        return null;
+    }
+
+    /// The nodes that hold shard `shard`, best first (ADR-0059 §2): by score `SHA-256(name ‖ shard ‖ node)`, one per
+    /// failure domain while there are domains left, then the next best.
+    fn placement(borrow this, shard: u32) -> Result<Vector<u32>, AllocError> {
+        var order = Vector<u32>.create(); // indexes into nodes, best score first
+        var scores = Vector<u64>.create();
+        for (i in 0..this.nodes.length) {
+            var h = Sha256.create();
+            h.update(this.name[..]);
+            var tail = [0u8; 8];
+            tail.writeLE(0, shard);
+            tail.writeLE(4, this.nodes[i].id);
+            h.update(tail[..]);
+            let digest = h.finish();
+            let score = digest[..].readBE<u64>(0);
+            // Insertion by score, then by id: a handful of nodes.
+            var at = order.length;
+            while (at > 0) {
+                let other = scores[at - 1];
+                let otherId = this.nodes[order[at - 1] as usize].id;
+                if (other > score || (other == score && otherId < this.nodes[i].id)) { break; }
+                at -= 1;
+            }
+            order.insert(at, truncate<u32>(i))?;
+            scores.insert(at, score)?;
+        }
+        var chosen = Vector<u32>.create();
+        var taken = Vector<bool>.create();
+        for (i in 0..order.length) { taken.push(false)?; }
+        let want = this.replicas as usize;
+        // First one per domain, then the rest by score.
+        for (k in 0..order.length) {
+            if (chosen.length == want) { break; }
+            let n = borrow this.nodes[order[k] as usize];
+            var domainUsed = false;
+            for (c in 0..chosen.length) {
+                let id = chosen[c];
+                match (this.node(id)) {
+                    Some(m) => {
+                        if (m.domain.view() == n.domain.view()) { domainUsed = true; }
+                    }
+                    null => {}
+                }
+            }
+            if (!domainUsed) {
+                chosen.push(n.id)?;
+                taken[k] = true;
+            }
+        }
+        for (k in 0..order.length) {
+            if (chosen.length == want) { break; }
+            if (!taken[k]) {
+                chosen.push(this.nodes[order[k] as usize].id)?;
+                taken[k] = true;
+            }
+        }
+        return Ok(chosen);
+    }
+
+    /// The shards a node holds a replica of, ascending.
+    fn shardsOf(borrow this, id: u32) -> Result<Vector<u32>, AllocError> {
+        var out = Vector<u32>.create();
+        var s = 0u32;
+        while (s < this.shards) {
+            let placed = this.placement(s)?;
+            for (i in 0..placed.length) {
+                if (placed[i] == id) { out.push(s)?; }
+            }
+            s += 1;
+        }
+        return Ok(out);
+    }
+}
+
+/// Why a cluster file is refused, with the line it is on (0: the file as a whole).
+enum ClusterFault {
+    UnknownWord,
+    BadName,
+    BadShards,
+    BadReplicas,
+    BadNode,
+    BadPeer,
+    BadDomain,
+    DuplicateNode,
+    Repeated,
+    MissingCluster,
+    MissingShards,
+    MissingSecret,
+    NoNodes,
+    TooManyReplicas,
+    OutOfMemory,
+}
+
+struct ClusterFileError {
+    line: u32;
+    fault: ClusterFault;
+}
+
+fn clusterFaultText(f: ClusterFault) -> StringView => match (f) {
+    ClusterFault.UnknownWord => "a line begins with a word that is not cluster, shards, replicas, secret-file or node",
+    ClusterFault.BadName => "the cluster's name is not 16 hex digits",
+    ClusterFault.BadShards => "shards is not a number from 1 to 256",
+    ClusterFault.BadReplicas => "replicas is not a number from 1 to 7",
+    ClusterFault.BadNode => "a node line is not: node <1 to 255> peer=<address:port> domain=<name>",
+    ClusterFault.BadPeer => "a peer address is not a.b.c.d:port or [v6]:port",
+    ClusterFault.BadDomain => "a domain is not 1 to 64 of A-Z a-z 0-9 . _ -",
+    ClusterFault.DuplicateNode => "two nodes have the same id",
+    ClusterFault.Repeated => "cluster, shards, replicas or secret-file is given twice",
+    ClusterFault.MissingCluster => "no cluster line",
+    ClusterFault.MissingShards => "no shards line",
+    ClusterFault.MissingSecret => "no secret-file line",
+    ClusterFault.NoNodes => "no node lines",
+    ClusterFault.TooManyReplicas => "replicas is more than the nodes",
+    ClusterFault.OutOfMemory => "out of memory",
+};
+
+fn clusterError(line: u32, fault: ClusterFault) -> Result<ClusterFile, ClusterFileError> =>
+    Err(ClusterFileError { line: line, fault: fault });
+
+/// A peer address: `a.b.c.d:port` or `[v6]:port`, never a bare port.
+fn peerAddressOf(text: StringView) -> SocketAddress? {
+    if (!text.contains(":")) { return null; }
+    return listenAddress(text);
+}
+
+fn isDomainName(text: StringView) -> bool {
+    if (text.length == 0 || text.length > 64) { return false; }
+    for (b in text.bytes()) {
+        let ok = (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || (b >= 0x30 && b <= 0x39) || b == 0x2E ||
+            b == 0x5F || b == 0x2D;
+        if (!ok) { return false; }
+    }
+    return true;
+}
+
+fn parseClusterFile(text: StringView) -> Result<ClusterFile, ClusterFileError> {
+    var name: [u8; 8]? = null;
+    var shards: u32? = null;
+    var replicas: u32? = null;
+    var secretFile: String? = null;
+    var nodes = Vector<ClusterNode>.create();
+    var canonical = Vector<u8>.create();
+    var lineNumber = 0u32;
+    for (raw in text.split("\n")) {
+        lineNumber += 1;
+        let content = match (raw.splitOnce("#")) {
+            Some(p) => p.left,
+            null => raw,
+        };
+        var words = Vector<StringView>.create();
+        for (w in content.split(" ")) {
+            let t = w.trim();
+            if (t.length > 0) {
+                if (words.push(t).isErr()) { return clusterError(lineNumber, ClusterFault.OutOfMemory); }
+            }
+        }
+        if (words.length == 0) { continue; }
+        // The canonical form: the words, one space apart, a line per line.
+        for (i in 0..words.length) {
+            let ok = (i == 0 || canonical.push(0x20).isOk()) && canonical.extend(words[i].bytes()).isOk();
+            if (!ok) { return clusterError(lineNumber, ClusterFault.OutOfMemory); }
+        }
+        if (canonical.push(0x0A).isErr()) { return clusterError(lineNumber, ClusterFault.OutOfMemory); }
+        let head = words[0];
+        if (head == "cluster") {
+            if (name.isSome()) { return clusterError(lineNumber, ClusterFault.Repeated); }
+            var bytes = [0u8; 8];
+            if (words.length != 2 || words[1].length != 16 || !hexInto(words[1].bytes(), mut bytes[..])) {
+                return clusterError(lineNumber, ClusterFault.BadName);
+            }
+            name = Some(bytes);
+        } else if (head == "shards") {
+            if (shards.isSome()) { return clusterError(lineNumber, ClusterFault.Repeated); }
+            let n = if (words.length == 2) words[1].parseInt<u32>() else null;
+            match (n) {
+                Some(v) => {
+                    if (v < 1 || v > MAX_SHARDS) { return clusterError(lineNumber, ClusterFault.BadShards); }
+                    shards = Some(v);
+                }
+                null => { return clusterError(lineNumber, ClusterFault.BadShards); }
+            }
+        } else if (head == "replicas") {
+            if (replicas.isSome()) { return clusterError(lineNumber, ClusterFault.Repeated); }
+            let n = if (words.length == 2) words[1].parseInt<u32>() else null;
+            match (n) {
+                Some(v) => {
+                    if (v < 1 || v > MAX_REPLICAS) { return clusterError(lineNumber, ClusterFault.BadReplicas); }
+                    replicas = Some(v);
+                }
+                null => { return clusterError(lineNumber, ClusterFault.BadReplicas); }
+            }
+        } else if (head == "secret-file") {
+            if (secretFile.isSome()) { return clusterError(lineNumber, ClusterFault.Repeated); }
+            if (words.length != 2) { return clusterError(lineNumber, ClusterFault.MissingSecret); }
+            var path = String.create();
+            if (path.append(words[1]).isErr()) { return clusterError(lineNumber, ClusterFault.OutOfMemory); }
+            secretFile = Some(path);
+        } else if (head == "node") {
+            if (words.length != 4) { return clusterError(lineNumber, ClusterFault.BadNode); }
+            let id = match (words[1].parseInt<u32>()) {
+                Some(v) => v,
+                null => { return clusterError(lineNumber, ClusterFault.BadNode); }
+            };
+            if (id < 1 || id > 255) { return clusterError(lineNumber, ClusterFault.BadNode); }
+            if (!words[2].startsWith("peer=") || !words[3].startsWith("domain=")) {
+                return clusterError(lineNumber, ClusterFault.BadNode);
+            }
+            let peer = match (peerAddressOf(words[2][5..words[2].length])) {
+                Some(a) => a,
+                null => { return clusterError(lineNumber, ClusterFault.BadPeer); }
+            };
+            let domainText = words[3][7..words[3].length];
+            if (!isDomainName(domainText)) { return clusterError(lineNumber, ClusterFault.BadDomain); }
+            for (i in 0..nodes.length) {
+                if (nodes[i].id == id) { return clusterError(lineNumber, ClusterFault.DuplicateNode); }
+            }
+            var domain = String.create();
+            if (domain.append(domainText).isErr()) { return clusterError(lineNumber, ClusterFault.OutOfMemory); }
+            if (nodes.length >= MAX_CLUSTER_NODES) { return clusterError(lineNumber, ClusterFault.BadNode); }
+            if (nodes.push(ClusterNode { id: id, peer: peer, domain: domain }).isErr()) {
+                return clusterError(lineNumber, ClusterFault.OutOfMemory);
+            }
+        } else {
+            return clusterError(lineNumber, ClusterFault.UnknownWord);
+        }
+    }
+    let n = match (name) {
+        Some(v) => v,
+        null => { return clusterError(0, ClusterFault.MissingCluster); }
+    };
+    let s = match (shards) {
+        Some(v) => v,
+        null => { return clusterError(0, ClusterFault.MissingShards); }
+    };
+    let secret = match (secretFile) {
+        Some(v) => v,
+        null => { return clusterError(0, ClusterFault.MissingSecret); }
+    };
+    if (nodes.length == 0) { return clusterError(0, ClusterFault.NoNodes); }
+    let r = replicas ?? (if (nodes.length < 3) truncate<u32>(nodes.length) else 3);
+    if ((r as usize) > nodes.length) { return clusterError(0, ClusterFault.TooManyReplicas); }
+    return Ok(ClusterFile {
+        name: n,
+        shards: s,
+        replicas: r,
+        secretFile: secret,
+        nodes: nodes,
+        digest: Sha256.of(canonical.view()),
+    });
+}

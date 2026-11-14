@@ -1,0 +1,172 @@
+// Signed requests between nodes (ADR-0059 §4). A request carries `x-cosmo-cluster` (the cluster file's digest, hex),
+// `x-cosmo-node` (its sender), `x-cosmo-time` (Unix ms), `x-cosmo-nonce` (16 random bytes, hex) and
+// `x-cosmo-signature`: the hex HMAC-SHA256, under the cluster secret, of these lines, each ended by a newline:
+//
+//   cosmo-peer-v1, the method, the path, the digest (hex), the sender, the time, the nonce (hex), the body's SHA-256 (hex)
+//
+// Sender 0 is an operator who holds the secret (`cosmostore cluster-status`), taken where the caller allows it: only
+// for the status. A node refuses a request from a node not in the file or from itself, with another digest, more than 60 s from its
+// own clock, with a nonce it has seen from that sender in the last two minutes, or with a wrong signature.
+
+const PEER_SKEW_MS: i64 = 60000;
+const PEER_NONCE_MS: i64 = 120000;
+/// The nonces a node remembers per sender: about two minutes of requests at a few dozen a second.
+const PEER_NONCES_KEPT: usize = 8192;
+
+/// The lines a signature covers, signed.
+fn peerSignature(
+    secret: Slice<u8>,
+    method: StringView,
+    path: StringView,
+    digest: Slice<u8>,
+    node: u32,
+    time: i64,
+    nonce: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<[u8; 32], AllocError> {
+    var text = Vector<u8>.create();
+    text.extend("cosmo-peer-v1\n".bytes())?;
+    text.extend(method.bytes())?;
+    text.push(0x0A)?;
+    text.extend(path.bytes())?;
+    text.push(0x0A)?;
+    appendHexBytes(mut text, digest)?;
+    text.push(0x0A)?;
+    appendDecimal(mut text, node as u64)?;
+    text.push(0x0A)?;
+    if (time < 0) { text.push(0x2D)?; }
+    appendDecimal(mut text, time.unsignedAbs())?;
+    text.push(0x0A)?;
+    appendHexBytes(mut text, nonce)?;
+    text.push(0x0A)?;
+    let bodyHash = Sha256.of(body);
+    appendHexBytes(mut text, bodyHash[..])?;
+    text.push(0x0A)?;
+    var mac = HmacSha256.create(secret);
+    mac.update(text.view());
+    return Ok(mac.finish());
+}
+
+/// The headers of a signed request, as they came (copied out of the request).
+struct PeerHeaders {
+    cluster: Vector<u8>;
+    node: Vector<u8>;
+    time: Vector<u8>;
+    nonce: Vector<u8>;
+    signature: Vector<u8>;
+}
+
+/// Why a request between nodes is refused.
+enum PeerRefusal {
+    Malformed,
+    OtherCluster,
+    UnknownNode,
+    Itself,
+    Skewed,
+    Replayed,
+    BadSignature,
+}
+
+/// The nonces seen lately, per sender (by node id).
+struct NonceWindow {
+    senders: Vector<NonceRing>;
+
+    fn create() -> NonceWindow => NonceWindow { senders: Vector<NonceRing>.create() };
+
+    /// Whether `nonce` from `node` is new within PEER_NONCE_MS of `now`; it is remembered if so.
+    fn admit(borrow mut this, node: u32, nonce: [u8; 16], now: i64) -> Result<bool, AllocError> {
+        var at = this.senders.length;
+        for (i in 0..this.senders.length) {
+            if (this.senders[i].node == node) { at = i; }
+        }
+        if (at == this.senders.length) {
+            this.senders.push(
+                NonceRing { node: node, nonces: Vector<[u8; 16]>.create(), times: Vector<i64>.create(), next: 0 },
+            )?;
+        }
+        let ring = borrow mut this.senders[at];
+        for (i in 0..ring.nonces.length) {
+            if (ring.times[i] > now - PEER_NONCE_MS && ConstantTime.equal(ring.nonces[i][..], nonce[..])) {
+                return Ok(false);
+            }
+        }
+        if (ring.nonces.length < PEER_NONCES_KEPT) {
+            ring.nonces.push(nonce)?;
+            ring.times.push(now)?;
+        } else {
+            ring.nonces[ring.next] = nonce;
+            ring.times[ring.next] = now;
+            ring.next = (ring.next + 1) % PEER_NONCES_KEPT;
+        }
+        return Ok(true);
+    }
+}
+
+struct NonceRing {
+    node: u32;
+    nonces: Vector<[u8; 16]>;
+    times: Vector<i64>;
+    next: usize;
+}
+
+/// Checks a request between nodes (ADR-0059 §4) at `now`, for this node `self` of `file`; the sender on success (0:
+/// an operator, when `operator` allows one).
+fn checkPeerRequest(
+    file: borrow ClusterFile,
+    secret: Slice<u8>,
+    self: u32,
+    operator: bool,
+    method: StringView,
+    path: StringView,
+    headers: borrow PeerHeaders,
+    body: Slice<u8>,
+    now: i64,
+    nonces: borrow mut NonceWindow,
+) -> Result<u32, PeerRefusal> {
+    var digest = [0u8; 32];
+    if (headers.cluster.length != 64 || !hexInto(
+        headers.cluster.view(),
+        mut digest[..],
+    )) { return Err(PeerRefusal.Malformed); }
+    if (!ConstantTime.equal(digest[..], file.digest[..])) { return Err(PeerRefusal.OtherCluster); }
+    let nodeText = match (StringView.fromUtf8(headers.node.view())) {
+        Some(t) => t,
+        null => { return Err(PeerRefusal.Malformed); }
+    };
+    let node = match (nodeText.parseInt<u32>()) {
+        Some(n) => n,
+        null => { return Err(PeerRefusal.Malformed); }
+    };
+    if (file.node(node).isNull() && !(operator && node == 0)) { return Err(PeerRefusal.UnknownNode); }
+    if (node == self) { return Err(PeerRefusal.Itself); }
+    let timeText = match (StringView.fromUtf8(headers.time.view())) {
+        Some(t) => t,
+        null => { return Err(PeerRefusal.Malformed); }
+    };
+    let time = match (timeText.parseInt<i64>()) {
+        Some(t) => t,
+        null => { return Err(PeerRefusal.Malformed); }
+    };
+    if (time > now + PEER_SKEW_MS || time < now - PEER_SKEW_MS) { return Err(PeerRefusal.Skewed); }
+    var nonce = [0u8; 16];
+    if (headers.nonce.length != 32 || !hexInto(
+        headers.nonce.view(),
+        mut nonce[..],
+    )) { return Err(PeerRefusal.Malformed); }
+    var given = [0u8; 32];
+    if (headers.signature.length != 64 || !hexInto(headers.signature.view(), mut given[..])) {
+        return Err(PeerRefusal.Malformed);
+    }
+    let expected = match (peerSignature(secret, method, path, file.digest[..], node, time, nonce[..], body)) {
+        Ok(s) => s,
+        Err(_) => { return Err(PeerRefusal.Malformed); }
+    };
+    if (!ConstantTime.equal(expected[..], given[..])) { return Err(PeerRefusal.BadSignature); }
+    // Remembered only once the signature holds, so a forged request cannot fill the window.
+    match (nonces.admit(node, nonce, now)) {
+        Ok(true) => {}
+        Ok(false) => { return Err(PeerRefusal.Replayed); }
+        Err(_) => { return Err(PeerRefusal.Malformed); }
+    }
+    return Ok(node);
+}

@@ -2358,3 +2358,28 @@ Browser form uploads with a SigV4 POST policy.
   journal seals only at applied entries; the code keeps the general rule.
 - **M6 item 2 is done:** the journal is the Raft log, under every fault sweep, for everything that lives in records.
   **Next:** item 3, the cluster file, the peer port and signed messages, so three `serve` processes replicate.
+
+### 15 Nov 2026: M6 item 3: the cluster file, the peer port, signed messages (ADR-0059)
+
+- **Asked by the owner** (15 Nov, "Yes. Go ahead", after item 2). **ADR-0059** (accepted by the owner as recommended, 15 Nov): a cluster file of words
+  (name, shards, replicas, secret file, nodes with peer addresses and failure domains) whose canonical digest every
+  request carries; rendezvous placement, one replica per domain while there are domains; the peer port plain HTTP/1.1
+  for now, every request signed (HMAC-SHA256 over method, path, digest, sender, time, nonce and the body's SHA-256),
+  60 s of skew and two minutes of nonces; Raft's messages in batches, replies as the receiver's own batches; a tick
+  every 100 ms; a sender per peer, one request at a time.
+- **Slice a:** `src/cluster/cluster_file.cee` (parsing, every refusal with its line, the digest, placement),
+  `src/cluster/wire.cee` (batches, every length checked), `src/cluster/peer_auth.cee` (signing, checking, the nonce
+  window). Tests: parsing and its seventeen refusals, placement (one per domain, spread, the same every time), round
+  trips and every truncation, and each refusal of a request.
+- **Slice b:** `src/cluster/node.cee`, the runtime: each replica behind its own lock, stepped on the event loop and
+  drained on a worker; the tick (and upkeep every 50 ticks); the senders; the peer port's `/raft` and `/cluster/status`.
+  `cosmostore node <dir> --cluster-file <file> --node <id>` runs a node (no S3 until item 4);
+  `cosmostore cluster-status` asks one, signed as the operator (sender 0, taken for the status only).
+- **`tools/cluster_smoke.sh`** (5 checks): three nodes on loopback elect one leader per shard and apply the same
+  entries; the leader of shard 0 killed with `-9`, its shards get leaders in a later term and the survivors agree; it
+  restarts and catches up, deposing no one (pre-vote); a request under another cluster file is refused. Passed three
+  runs in a row.
+- **The first run on real processes worked as the in-process tests said it would**: the only failure was the smoke
+  script's own, expecting a new entry on shards whose leader had not been killed.
+- **Runbooks:** "A cluster (preview, M6)": the file, the secret, starting and watching nodes, the plain peer port.
+- **Next:** item 4, routing, forwarding and ReadIndex, so S3 works against any node of a cluster.

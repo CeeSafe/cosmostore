@@ -1,0 +1,153 @@
+// Raft's messages between nodes (ADR-0059 §5): a batch is the body of `POST /raft`. Little-endian:
+//
+//   u32 count, then per message:
+//     u16 shard, u8 kind, u32 from, u32 to, u64 term, u64 index, u64 log term, u64 commit, u8 granted (0 or 1),
+//     u64 round, u32 entry count, per entry (u64 term, u64 index, u32 length, the record), u32 data length, the data
+//
+// Decoding checks every length against what is left, so a short or long body is refused, never read past.
+
+const WIRE_MAX_MESSAGES: u32 = 65536;
+
+struct ShardMessage {
+    shard: u32;
+    message: RaftMessage;
+}
+
+fn encodeBatch(out: borrow mut Vector<u8>, messages: Slice<ShardMessage>) -> Result<void, AllocError> {
+    out.pushLE(truncate<u32>(messages.length))?;
+    for (i in 0..messages.length) {
+        let s = borrow messages[i];
+        let m = borrow s.message;
+        out.pushLE(truncate<u16>(s.shard))?;
+        out.pushLE(m.kind)?;
+        out.pushLE(m.from)?;
+        out.pushLE(m.to)?;
+        out.pushLE(m.term)?;
+        out.pushLE(m.index)?;
+        out.pushLE(m.logTerm)?;
+        out.pushLE(m.commit)?;
+        out.pushLE(if (m.granted) 1u8 else 0u8)?;
+        out.pushLE(m.round)?;
+        out.pushLE(truncate<u32>(m.entries.length))?;
+        for (k in 0..m.entries.length) {
+            let e = borrow m.entries[k];
+            out.pushLE(e.term)?;
+            out.pushLE(e.index)?;
+            out.pushLE(truncate<u32>(e.data.length))?;
+            out.extend(e.data.view())?;
+        }
+        out.pushLE(truncate<u32>(m.data.length))?;
+        out.extend(m.data.view())?;
+    }
+    return Ok();
+}
+
+/// Why a batch does not decode.
+enum WireFault {
+    Short,
+    Long,
+    BadKind,
+    BadFlag,
+    TooMany,
+    OutOfMemory,
+}
+
+struct WireReader {
+    at: usize;
+
+    fn need(borrow this, bytes: Slice<u8>, n: usize) -> Result<void, WireFault> {
+        if (bytes.length - this.at < n) { return Err(WireFault.Short); }
+        return Ok();
+    }
+
+    fn u8Of(borrow mut this, bytes: Slice<u8>) -> Result<u8, WireFault> {
+        this.need(bytes, 1)?;
+        let v = bytes.readLE<u8>(this.at);
+        this.at += 1;
+        return Ok(v);
+    }
+
+    fn u16Of(borrow mut this, bytes: Slice<u8>) -> Result<u16, WireFault> {
+        this.need(bytes, 2)?;
+        let v = bytes.readLE<u16>(this.at);
+        this.at += 2;
+        return Ok(v);
+    }
+
+    fn u32Of(borrow mut this, bytes: Slice<u8>) -> Result<u32, WireFault> {
+        this.need(bytes, 4)?;
+        let v = bytes.readLE<u32>(this.at);
+        this.at += 4;
+        return Ok(v);
+    }
+
+    fn u64Of(borrow mut this, bytes: Slice<u8>) -> Result<u64, WireFault> {
+        this.need(bytes, 8)?;
+        let v = bytes.readLE<u64>(this.at);
+        this.at += 8;
+        return Ok(v);
+    }
+
+    fn bytesOf(borrow mut this, bytes: Slice<u8>) -> Result<Vector<u8>, WireFault> {
+        let n = this.u32Of(bytes)? as usize;
+        this.need(bytes, n)?;
+        var out = Vector<u8>.create();
+        if (out.extend(bytes[this.at..this.at + n]).isErr()) { return Err(WireFault.OutOfMemory); }
+        this.at += n;
+        return Ok(out);
+    }
+}
+
+fn decodeBatch(bytes: Slice<u8>) -> Result<Vector<ShardMessage>, WireFault> {
+    var r = WireReader { at: 0 };
+    let count = r.u32Of(bytes)?;
+    if (count > WIRE_MAX_MESSAGES) { return Err(WireFault.TooMany); }
+    var out = Vector<ShardMessage>.create();
+    var n = 0u32;
+    while (n < count) {
+        let shard = r.u16Of(bytes)? as u32;
+        let kind = r.u8Of(bytes)?;
+        if (kind < RAFT_PRE_VOTE || kind > RAFT_SNAPSHOT) { return Err(WireFault.BadKind); }
+        let from = r.u32Of(bytes)?;
+        let to = r.u32Of(bytes)?;
+        let term = r.u64Of(bytes)?;
+        let index = r.u64Of(bytes)?;
+        let logTerm = r.u64Of(bytes)?;
+        let commit = r.u64Of(bytes)?;
+        let flag = r.u8Of(bytes)?;
+        if (flag > 1) { return Err(WireFault.BadFlag); }
+        let round = r.u64Of(bytes)?;
+        let entryCount = r.u32Of(bytes)?;
+        if (entryCount > WIRE_MAX_MESSAGES) { return Err(WireFault.TooMany); }
+        var entries = Vector<RaftEntry>.create();
+        var k = 0u32;
+        while (k < entryCount) {
+            let eTerm = r.u64Of(bytes)?;
+            let eIndex = r.u64Of(bytes)?;
+            let data = r.bytesOf(bytes)?;
+            if (entries.push(RaftEntry { term: eTerm, index: eIndex, data: data }).isErr()) {
+                return Err(WireFault.OutOfMemory);
+            }
+            k += 1;
+        }
+        let data = r.bytesOf(bytes)?;
+        let message = RaftMessage {
+            kind: kind,
+            from: from,
+            to: to,
+            term: term,
+            index: index,
+            logTerm: logTerm,
+            commit: commit,
+            granted: flag == 1,
+            round: round,
+            count: 0,
+            entries: entries,
+            data: data,
+        };
+        if (out.push(ShardMessage { shard: shard, message: message }).isErr()) { return Err(WireFault.OutOfMemory); }
+        n += 1;
+    }
+    if (r.at != bytes.length) { return Err(WireFault.Long); }
+    return Ok(out);
+}

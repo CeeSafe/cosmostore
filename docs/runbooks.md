@@ -244,12 +244,33 @@ There is no backup command and no replication yet (M6).
   files change under the copy.
 - Back up the credentials file, the targets file and the certificates beside it; they are not in the store.
 
+## A cluster (preview, M6)
+
+A cluster of nodes replicates each shard over Raft (ADR-0056 to ADR-0059). It does not serve S3 yet (M6 item 4):
+what runs today is the replication itself.
+
+- **The cluster file** is the same on every node: `cluster` (16 hex digits), `shards`, `replicas`, `secret-file`,
+  and a `node <id> peer=<address:port> domain=<rack>` line per node (ADR-0059 §1). Make the secret with
+  `head -c 32 /dev/urandom | base64 > cluster.key`, copy it to every node, and keep it as secret as the access
+  keys: whoever holds it can speak for a node.
+- **Start a node** with `cosmostore node <dir> --cluster-file <file> --node <id>`; its shards' replicas are under
+  `<dir>/shard-<2 hex>`. A node that is down is caught up when it comes back, from its peers' logs or, if it fell
+  behind a checkpoint, from a snapshot; it deposes no working leader.
+- **Watch it** with `cosmostore cluster-status --cluster-file <file> --node <id>`: a line per replica (shard, role,
+  term, leader, last entry, commit, applied). Each shard should have one leader, and the nodes the same applied
+  index once writes stop.
+- **The peer port is plain HTTP** for now: every request is signed (HMAC-SHA256 under the secret, with a time and a
+  nonce), so a node takes only messages its peers sent, but the traffic itself can be read. Run the peer ports on a
+  private network until their TLS comes.
+- **Clocks** must be within a minute of each other: a request more than 60 s off is refused.
+
 ## Not yet
 
 - **Encryption at rest** is SSE-S3, SSE-KMS and SSE-C on every write and read, with `serve --sse-key-file` and
   `--kms-key-file`, and a bucket's default (ADR-0046, ADR-0055). There is no KMS service behind SSE-KMS: its keys
   are a file. An encryption context and `aws:kms:dsse` are refused with `NotImplemented`, never ignored. Keys, metadata, sizes and an
   SSE-S3 object's ETag (its plaintext's MD5) are not encrypted; for those, encrypt the volume too.
-- One node: no replication, no failover.
+- A cluster replicates but does not serve S3 yet (M6 item 4), nor large objects (item 5); membership is the cluster
+  file's (item 6).
 - No call to force a credentials reload or an upkeep round (both come within a round), nor to change an option
   without a restart.

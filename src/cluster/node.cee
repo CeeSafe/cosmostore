@@ -1,0 +1,783 @@
+// A cluster node (ADR-0059 §3, §6–§8, M6 item 3 slice b): the replicas of the shards placed on it, the peer port, a
+// tick, and a sender per peer. `cosmostore node <dir> --cluster-file <path> --node <id>` runs one;
+// `cosmostore cluster-status --cluster-file <path> --node <id>` asks one for its replicas' state.
+//
+// Each replica is behind its own lock. A message received is stepped on the event loop (the core does no I/O) and
+// drained on a worker (`Async.blocking`: the journal and the hard state do I/O); so is each tick. What a replica sends
+// goes to its peer's queue; that peer's sender takes the whole queue, posts it as one batch, and on a failure drops it
+// (Raft sends again) and waits before the next.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+import web_client;
+
+const NODE_TICK_MS: u64 = 100;
+const NODE_MAINTAIN_TICKS: u64 = 50;
+const NODE_SEND_IDLE_MS: u64 = 10;
+const NODE_SEND_RETRY_MS: u64 = 100;
+/// A batch can hold a snapshot: the store's inline payloads (ADR-0058 §9).
+const NODE_MAX_BODY: u64 = 1073741824;
+
+struct ShardSlot {
+    shard: u32;
+    replica: AsyncMutex<ShardReplica>;
+    /// Set once the replica's journal failed: it is left alone until the node restarts (fail-stop, ADR-0001).
+    failed: AtomicU64;
+}
+
+struct PeerLink {
+    node: u32;
+    url: String;
+    queue: AsyncMutex<Vector<ShardMessage>>;
+}
+
+struct NodeShared {
+    file: ClusterFile;
+    secret: Vector<u8>;
+    id: u32;
+    slots: Vector<ShardSlot>;
+    peers: Vector<PeerLink>;
+    nonces: AsyncMutex<NonceWindow>;
+    /// Requests refused (ADR-0059 §4), batches that could not be sent, and ticks so far.
+    refused: AtomicU64;
+    unsent: AtomicU64;
+    ticks: AtomicU64;
+}
+
+struct NodeApp {
+    shared: Arc<NodeShared>;
+}
+
+struct PeerHandler {}
+
+/// Why a node stops.
+enum NodeFault {
+    OutOfMemory,
+    Net,
+    Store,
+}
+
+fn replicaConfigOf(id: u32, voters: Vector<u32>, shard: u32) -> ReplicaConfig {
+    var store = StoreConfig.defaults();
+    store.journal.shardId = shard;
+    var seed = [0u8; 8];
+    let _ = Random.fill(mut seed[..]);
+    return ReplicaConfig {
+        id: id,
+        voters: voters,
+        electionTicks: 10,
+        heartbeatTicks: 1,
+        maxAppendEntries: 64,
+        seed: seed[..].readLE<u64>(0),
+        store: store,
+    };
+}
+
+/// Opens the replicas of the shards placed on node `id`, under `<dir>/shard-<2 hex>`, and the peer links.
+fn openNode(dir: StringView, file: ClusterFile, secret: Vector<u8>, id: u32) -> Result<NodeShared, String> {
+    if (file.node(id).isNull()) { return Err(textOf("this node is not in the cluster file")); }
+    var slots = Vector<ShardSlot>.create();
+    let shards = match (file.shardsOf(id)) {
+        Ok(s) => s,
+        Err(_) => { return Err(textOf("out of memory")); }
+    };
+    for (i in 0..shards.length) {
+        let shard = shards[i];
+        let voters = match (file.placement(shard)) {
+            Ok(v) => v,
+            Err(_) => { return Err(textOf("out of memory")); }
+        };
+        var path = String.create();
+        let named = path.append(dir).isOk() && path.append("/shard-").isOk() && appendHex2(mut path, shard).isOk();
+        if (!named) { return Err(textOf("out of memory")); }
+        match (Fs.ensureDirectory(path.view())) {
+            Ok() => {}
+            Err(_) => { return Err(textOf("a shard's directory cannot be made")); }
+        }
+        let replica = match (ShardReplica.open(path.view(), replicaConfigOf(id, voters, shard))) {
+            Ok(r) => r,
+            Err(e) => { return Err(storeErrorLine(e)); }
+        };
+        let locked = match (AsyncMutex<ShardReplica>.create(replica)) {
+            Ok(l) => l,
+            Err(_) => { return Err(textOf("out of memory")); }
+        };
+        if (slots.push(ShardSlot { shard: shard, replica: locked, failed: AtomicU64.create(0) }).isErr()) {
+            return Err(textOf("out of memory"));
+        }
+    }
+    var peers = Vector<PeerLink>.create();
+    for (i in 0..file.nodes.length) {
+        let n = borrow file.nodes[i];
+        if (n.id == id) { continue; }
+        var url = String.create();
+        let ok = url.append("http://").isOk() && appendPeerAddress(
+            mut url,
+            n.peer,
+        ).isOk() && url.append("/raft").isOk();
+        if (!ok) { return Err(textOf("out of memory")); }
+        let queue = match (AsyncMutex<Vector<ShardMessage>>.create(Vector<ShardMessage>.create())) {
+            Ok(q) => q,
+            Err(_) => { return Err(textOf("out of memory")); }
+        };
+        if (peers.push(
+            PeerLink { node: n.id, url: url, queue: queue },
+        ).isErr()) { return Err(textOf("out of memory")); }
+    }
+    let nonces = match (AsyncMutex<NonceWindow>.create(NonceWindow.create())) {
+        Ok(n) => n,
+        Err(_) => { return Err(textOf("out of memory")); }
+    };
+    return Ok(NodeShared {
+        file: file,
+        secret: secret,
+        id: id,
+        slots: slots,
+        peers: peers,
+        nonces: nonces,
+        refused: AtomicU64.create(0),
+        unsent: AtomicU64.create(0),
+        ticks: AtomicU64.create(0),
+    });
+}
+
+fn appendHex2(s: borrow mut String, v: u32) -> Result<void, AllocError> {
+    let digits = "0123456789abcdef".bytes();
+    var b = [digits[((v >> 4) & 0xF) as usize], digits[(v & 0xF) as usize]];
+    s.append(StringView.fromUtf8(b[..])!)?;
+    return Ok();
+}
+
+/// `a.b.c.d:port` or `[v6]:port`.
+fn appendPeerAddress(s: borrow mut String, a: SocketAddress) -> Result<void, AllocError> {
+    var out = Vector<u8>.create();
+    match (a) {
+        SocketAddress.V4(ip, port) => {
+            for (i in 0..4) {
+                if (i > 0) { out.push(0x2E)?; }
+                appendDecimal(mut out, ip[i] as u64)?;
+            }
+            out.push(0x3A)?;
+            appendDecimal(mut out, port as u64)?;
+        }
+        SocketAddress.V6(ip, port, _) => {
+            out.push(0x5B)?;
+            for (g in 0..8) {
+                if (g > 0) { out.push(0x3A)?; }
+                let group = ((ip[g * 2] as u32) << 8) | (ip[g * 2 + 1] as u32);
+                appendHexGroup(mut out, group)?;
+            }
+            out.extend("]:".bytes())?;
+            appendDecimal(mut out, port as u64)?;
+        }
+    }
+    s.append(StringView.fromUtf8(out.view())!)?;
+    return Ok();
+}
+
+fn appendHexGroup(out: borrow mut Vector<u8>, v: u32) -> Result<void, AllocError> {
+    let digits = "0123456789abcdef".bytes();
+    var started = false;
+    var shift = 12u32;
+    loop {
+        let d = (v >> shift) & 0xF;
+        if (d != 0 || started || shift == 0) {
+            out.push(digits[d as usize])?;
+            started = true;
+        }
+        if (shift == 0) { break; }
+        shift -= 4;
+    }
+    return Ok();
+}
+
+// --- The replicas' work ---
+
+fn drainOf(r: borrow mut ShardReplica) -> Result<Vector<RaftMessage>, StoreError> {
+    var out = Vector<RaftMessage>.create();
+    r.drain(mut out)?;
+    return Ok(out);
+}
+
+fn tickOf(r: borrow mut ShardReplica, maintain: bool) -> Result<Vector<RaftMessage>, StoreError> {
+    r.tick()?;
+    var out = Vector<RaftMessage>.create();
+    r.drain(mut out)?;
+    if (maintain) {
+        r.maintain()?;
+        r.drain(mut out)?;
+    }
+    return Ok(out);
+}
+
+/// Puts what a replica of `shard` sends on its peers' queues.
+async fn enqueue(shared: borrow NodeShared, shard: u32, messages: Vector<RaftMessage>) -> Result<void, NodeFault> {
+    var all = messages;
+    while (true) {
+        let m = match (all.pop()) {
+            Some(m) => m,
+            null => { break; }
+        };
+        for (i in 0..shared.peers.length) {
+            if (shared.peers[i].node != m.to) { continue; }
+            var guard = match (await shared.peers[i].queue.lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            if (guard.data().push(ShardMessage { shard: shard, message: m }).isErr()) {
+                return Err(NodeFault.OutOfMemory);
+            }
+            break;
+        }
+    }
+    return Ok();
+}
+
+async fn noteFailure(slot: borrow ShardSlot, e: StoreError) {
+    if (slot.failed.swap(1) == 0) {
+        var line = textOf("cosmostore: a shard's replica stopped: ");
+        let _ = line.append(storeErrorLine(e).view());
+        let _ = line.append("\n");
+        let _ = await AsyncConsole.writeError(line.view());
+    }
+}
+
+/// Steps a received message into its shard's replica, and drains it.
+async fn deliver(shared: borrow NodeShared, sm: ShardMessage) -> Result<void, NodeFault> {
+    for (i in 0..shared.slots.length) {
+        let slot = borrow shared.slots[i];
+        if (slot.shard != sm.shard) { continue; }
+        if (slot.failed.load() != 0) { return Ok(); }
+        var guard = match (await slot.replica.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let r = guard.data();
+        match (r.step(sm.message)) {
+            Ok() => {}
+            Err(e) => {
+                await noteFailure(slot, e);
+                return Ok();
+            }
+        }
+        let drained = await Async.blocking(() => drainOf(r));
+        match (drained) {
+            Ok(out) => { return await enqueue(shared, slot.shard, out); }
+            Err(e) => { await noteFailure(slot, e); }
+        }
+        return Ok();
+    }
+    return Ok(); // not a shard of this node: a stale sender
+}
+
+/// Ticks every replica every NODE_TICK_MS, and runs their upkeep every NODE_MAINTAIN_TICKS.
+async fn tickForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
+    while (true) {
+        match (await Timer.sleep(NODE_TICK_MS)) {
+            Ok() => {}
+            Err(_) => { return Err(NodeFault.Net); }
+        }
+        let tick = shared.ticks.fetchAdd(1) + 1;
+        let maintain = tick % NODE_MAINTAIN_TICKS == 0;
+        for (i in 0..shared.slots.length) {
+            let slot = borrow shared.slots[i];
+            if (slot.failed.load() != 0) { continue; }
+            var guard = match (await slot.replica.lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let r = guard.data();
+            let ticked = await Async.blocking(() => tickOf(r, maintain));
+            match (ticked) {
+                Ok(out) => { await enqueue(shared, slot.shard, out)?; }
+                Err(e) => { await noteFailure(slot, e); }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// The signed headers of a request from this node (or the operator, node 0).
+fn signRequest(
+    request: borrow mut ClientRequest,
+    file: borrow ClusterFile,
+    secret: Slice<u8>,
+    node: u32,
+    method: StringView,
+    path: StringView,
+    body: Slice<u8>,
+) -> bool {
+    var nonce = [0u8; 16];
+    if (Random.fill(mut nonce[..]).isErr()) { return false; }
+    let time = Clock.unixMillis();
+    let signature = match (peerSignature(secret, method, path, file.digest[..], node, time, nonce[..], body)) {
+        Ok(s) => s,
+        Err(_) => { return false; }
+    };
+    var cluster = Vector<u8>.create();
+    var sender = Vector<u8>.create();
+    var when = Vector<u8>.create();
+    var nonceHex = Vector<u8>.create();
+    var signatureHex = Vector<u8>.create();
+    let built = appendHexBytes(mut cluster, file.digest[..]).isOk() && appendDecimal(mut sender, node as u64).isOk() &&
+        appendDecimal(mut when, truncate<u64>(time)).isOk() && appendHexBytes(mut nonceHex, nonce[..]).isOk() &&
+        appendHexBytes(mut signatureHex, signature[..]).isOk();
+    return built && request.header("x-cosmo-cluster", cluster.view()).isOk() &&
+        request.header("x-cosmo-node", sender.view()).isOk() && request.header("x-cosmo-time", when.view()).isOk() &&
+        request.header("x-cosmo-nonce", nonceHex.view()).isOk() &&
+        request.header("x-cosmo-signature", signatureHex.view()).isOk();
+}
+
+/// Posts batch `body` to `url`, signed; whether the peer took it (204).
+async fn postBatch(client: borrow Client, shared: borrow NodeShared, url: StringView, body: Slice<u8>) -> bool {
+    var request = match (ClientRequest.create(Method.Post, url)) {
+        Ok(r) => r,
+        Err(_) => { return false; }
+    };
+    if (!signRequest(mut request, borrow shared.file, shared.secret.view(), shared.id, "POST", "/raft", body)) {
+        return false;
+    }
+    var content = match (BytesBody.of(body)) {
+        Ok(b) => b,
+        Err(_) => { return false; }
+    };
+    var response = match (await client.send(request, mut content)) {
+        Ok(r) => r,
+        Err(_) => { return false; }
+    };
+    let status = response.status();
+    var answer = Vector<u8>.create();
+    let _ = await response.readToEnd(mut answer, 65536);
+    let _ = await response.finish(client);
+    return status == 204;
+}
+
+/// Sends peer `at`'s queue as batches, one request at a time, for as long as the node runs.
+async fn sendForever(shared: borrow NodeShared, at: usize) -> Result<void, NodeFault> {
+    var options = ClientOptions.defaults();
+    options.totalMs = 30000;
+    options.retry = RetryPolicy.never();
+    let client = match (Client.create(options, null)) {
+        Ok(c) => c,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    let link = borrow shared.peers[at];
+    while (true) {
+        var batch = Vector<ShardMessage>.create();
+        {
+            var guard = match (await link.queue.lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let q = guard.data();
+            while (true) {
+                match (q.pop()) {
+                    Some(m) => {
+                        if (batch.push(m).isErr()) { return Err(NodeFault.OutOfMemory); }
+                    }
+                    null => { break; }
+                }
+            }
+            reverseShardMessages(mut batch);
+        }
+        if (batch.length == 0) {
+            match (await Timer.sleep(NODE_SEND_IDLE_MS)) {
+                Ok() => {}
+                Err(_) => { return Err(NodeFault.Net); }
+            }
+            continue;
+        }
+        var body = Vector<u8>.create();
+        if (encodeBatch(mut body, batch.view()).isErr()) { return Err(NodeFault.OutOfMemory); }
+        if (!(await postBatch(borrow client, shared, link.url.view(), body.view()))) {
+            let _ = shared.unsent.fetchAdd(1);
+            match (await Timer.sleep(NODE_SEND_RETRY_MS)) {
+                Ok() => {}
+                Err(_) => { return Err(NodeFault.Net); }
+            }
+        }
+    }
+    return Ok();
+}
+
+// --- The peer port ---
+
+/// A header's value, copied; empty when absent.
+fn headerCopy(request: borrow Request, name: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    let fields = request.headers();
+    for (i in 0..fields.count()) {
+        let n = fields.nameBytes(i);
+        if (n.length != name.length) { continue; }
+        var same = true;
+        for (k in 0..n.length) {
+            if (lowerAscii(n[k]) != name.bytes()[k]) { same = false; }
+        }
+        if (same) {
+            let _ = out.extend(fields.value(i));
+            return out;
+        }
+    }
+    return out;
+}
+
+/// One line per replica: shard, role, term, leader, last, commit, applied.
+async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> {
+    var out = Vector<u8>.create();
+    let ok = out.extend("shard role term leader last commit applied\n".bytes()).isOk();
+    if (!ok) { return Err(NodeFault.OutOfMemory); }
+    for (i in 0..shared.slots.length) {
+        let slot = borrow shared.slots[i];
+        var guard = match (await slot.replica.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let r = guard.data();
+        let role = if (slot.failed.load() != 0) "failed" else match (r.core.role) {
+            RAFT_LEADER => "leader",
+            RAFT_CANDIDATE => "candidate",
+            RAFT_PRE_CANDIDATE => "precandidate",
+            _ => "follower",
+        };
+        let line = appendDecimal(mut out, slot.shard as u64).isOk() && out.push(0x20).isOk() &&
+            out.extend(role.bytes()).isOk() && out.push(0x20).isOk() && appendDecimal(mut out, r.core.term).isOk() &&
+            out.push(0x20).isOk() && appendDecimal(mut out, r.core.leader as u64).isOk() && out.push(0x20).isOk() &&
+            appendDecimal(mut out, r.core.lastIndex()).isOk() && out.push(0x20).isOk() &&
+            appendDecimal(mut out, r.core.commit).isOk() && out.push(0x20).isOk() &&
+            appendDecimal(mut out, r.store.appliedIndex()).isOk() && out.push(0x0A).isOk();
+        if (!line) { return Err(NodeFault.OutOfMemory); }
+    }
+    return Ok(out);
+}
+
+impl Handler<NodeApp> for PeerHandler {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<NodeApp>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let shared = ctx.state().shared.get();
+        let path = request.path();
+        let isRaft = request.method() == Method.Post && path == "/raft";
+        let isStatus = request.method() == Method.Get && path == "/cluster/status";
+        if (!isRaft && !isStatus) { return await exchange.send(Status.notFound(), "".bytes()); }
+        // The body, whole: a batch is decoded only once its signature holds.
+        var body = Vector<u8>.create();
+        var buf = Vector<u8>.create();
+        if (buf.resize(65536, 0).isErr()) { return Err(HandlerError.Internal); }
+        while (true) {
+            let n = await exchange.read(mut buf.viewMut()[..])?;
+            if (n == 0) { break; }
+            if ((body.length + n) as u64 > NODE_MAX_BODY) { return await exchange.send(statusOf(413), "".bytes()); }
+            if (body.extend(buf.view()[0..n]).isErr()) { return Err(HandlerError.Internal); }
+        }
+        let headers = PeerHeaders {
+            cluster: headerCopy(request, "x-cosmo-cluster"),
+            node: headerCopy(request, "x-cosmo-node"),
+            time: headerCopy(request, "x-cosmo-time"),
+            nonce: headerCopy(request, "x-cosmo-nonce"),
+            signature: headerCopy(request, "x-cosmo-signature"),
+        };
+        let method = if (isRaft) "POST" else "GET";
+        var checked: Result<u32, PeerRefusal> = Err(PeerRefusal.Malformed);
+        {
+            var guard = match (await shared.nonces.lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(HandlerError.Internal); }
+            };
+            checked = checkPeerRequest(
+                borrow shared.file,
+                shared.secret.view(),
+                shared.id,
+                isStatus,
+                method,
+                path,
+                borrow headers,
+                body.view(),
+                Clock.unixMillis(),
+                mut guard.data(),
+            );
+        }
+        if (checked.isErr()) {
+            let _ = shared.refused.fetchAdd(1);
+            return await exchange.send(statusOf(403), "".bytes());
+        }
+        if (isStatus) {
+            let text = match (await statusText(shared)) {
+                Ok(t) => t,
+                Err(_) => { return Err(HandlerError.Internal); }
+            };
+            return await exchange.send(Status.ok(), text.view());
+        }
+        var batch = match (decodeBatch(body.view())) {
+            Ok(b) => b,
+            Err(_) => { return await exchange.send(Status.badRequest(), "".bytes()); }
+        };
+        reverseShardMessages(mut batch);
+        while (true) {
+            let sm = match (batch.pop()) {
+                Some(m) => m,
+                null => { break; }
+            };
+            match (await deliver(shared, sm)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+        }
+        return await exchange.send(Status.noContent(), "".bytes());
+    }
+}
+
+fn reverseShardMessages(v: borrow mut Vector<ShardMessage>) {
+    if (v.length < 2) { return; }
+    var i = 0usize;
+    var j = v.length - 1;
+    while (i < j) {
+        v.swap(i, j);
+        i += 1;
+        j -= 1;
+    }
+}
+
+fn peerHandler() -> Result<Box<dyn Handler<NodeApp> + Send + Share>, RouteError> {
+    match (Box.create(PeerHandler {})) {
+        Ok(h) => {
+            let d: Box<dyn Handler<NodeApp> + Send + Share> = h;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+/// The peer port, the tick, and a sender per peer, until one fails.
+async fn runNode(
+    shared: borrow Arc<NodeShared>,
+    server: Server<NodeApp>,
+    address: SocketAddress,
+) -> Result<void, NodeFault> {
+    let listener = match (listenOn(address)) {
+        Ok(l) => l,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    let plain = PlainAcceptor {};
+    let node = shared.get();
+    var line = textOf("cosmostore: node ");
+    var number = Vector<u8>.create();
+    let _ = appendDecimal(mut number, node.id as u64);
+    let _ = line.append(StringView.fromUtf8(number.view()) ?? "");
+    let _ = line.append(" of the cluster, its peer port open\n");
+    let _ = await AsyncConsole.write(line.view());
+    let peers = node.peers.length;
+    let scoped = await Async.scope(NodeFault.OutOfMemory, (s) => {
+        s.spawn(async move () => {
+            match (await server.run(listener, borrow plain, ConnectionLimits.defaults(), drain)) {
+                Ok(_) => { return Err(NodeFault.Net); }
+                Err(_) => { return Err(NodeFault.Net); }
+            }
+        });
+        s.spawn(async () => await tickForever(node));
+        for (i in 0..peers) {
+            let at = i;
+            s.spawn(async move () => await sendForever(node, at));
+        }
+    });
+    return scoped;
+}
+
+/// `cosmostore node <dir> --cluster-file <path> --node <id>`.
+fn nodeCommand() -> i32 {
+    let dir = Process.argument(2) ?? "";
+    if (dir.length == 0 || dir.startsWith("--")) { return 2; }
+    let args = match (clusterArguments(3)) {
+        Some(a) => a,
+        null => { return 2; }
+    };
+    let id = args.node;
+    let loaded = match (loadCluster(args.file.view())) {
+        Ok(l) => l,
+        Err(message) => {
+            Console.writeErrorLine(message.view());
+            return 1;
+        }
+    };
+    let address = match (loaded.file.node(id)) {
+        Some(n) => n.peer,
+        null => {
+            Console.writeErrorLine("cosmostore: this node is not in the cluster file");
+            return 1;
+        }
+    };
+    let shared = match (openNode(dir, loaded.file, loaded.secret, id)) {
+        Ok(s) => s,
+        Err(message) => {
+            Console.writeErrorLine(message.view());
+            return 1;
+        }
+    };
+    let arc = match (Arc<NodeShared>.create(shared)) {
+        Ok(a) => a,
+        Err(_) => { return 1; }
+    };
+    var limits = Limits.defaults();
+    limits.maxBodyBytes = NODE_MAX_BODY;
+    let app = NodeApp { shared: arc.clone() };
+    var server = match (Server<NodeApp>.create(app, limits)) {
+        Ok(s) => s,
+        Err(_) => { return 1; }
+    };
+    let routed = match (peerHandler()) {
+        Ok(h) => server.router().post("/raft", h).isOk(),
+        Err(_) => false,
+    } && match (peerHandler()) {
+        Ok(h) => server.router().get("/cluster/status", h).isOk(),
+        Err(_) => false,
+    };
+    if (!routed) { return 1; }
+    match (Async.run(runNode(borrow arc, server, address))) {
+        Ok(_) => { return 1; }
+        Err(_) => { return 1; }
+    }
+}
+
+/// `--cluster-file <path> --node <id>`, from argument `from` on.
+struct ClusterArguments {
+    file: String;
+    node: u32;
+}
+
+fn clusterArguments(from: usize) -> ClusterArguments? {
+    var file: String? = null;
+    var node: u32? = null;
+    var at = from;
+    while (true) {
+        let option = match (Process.argument(at)) {
+            Some(o) => o,
+            null => { break; }
+        };
+        let value = Process.argument(at + 1) ?? "";
+        if (value.length == 0) { return null; }
+        if (option == "--cluster-file") {
+            file = Some(textOf(value));
+        } else if (option == "--node") {
+            node = value.parseInt<u32>();
+            if (node.isNull()) { return null; }
+        } else {
+            return null;
+        }
+        at += 2;
+    }
+    return match (file) {
+        Some(f) => match (node) {
+            Some(n) => Some(ClusterArguments { file: f, node: n }),
+            null => null,
+        },
+        null => null,
+    };
+}
+
+/// The cluster file and its secret, or why not.
+struct LoadedCluster {
+    file: ClusterFile;
+    secret: Vector<u8>;
+}
+
+fn loadCluster(path: StringView) -> Result<LoadedCluster, String> {
+    let bytes = readSmallFile(path, "the cluster file")?;
+    let text = match (StringView.fromUtf8(bytes.view())) {
+        Some(t) => t,
+        null => { return Err(textOf("cosmostore: the cluster file is not UTF-8")); }
+    };
+    let file = match (parseClusterFile(text)) {
+        Ok(f) => f,
+        Err(e) => {
+            var line = textOf("cosmostore: the cluster file, line ");
+            var n = Vector<u8>.create();
+            let _ = appendDecimal(mut n, e.line as u64);
+            let _ = line.append(StringView.fromUtf8(n.view()) ?? "");
+            let _ = line.append(": ");
+            let _ = line.append(clusterFaultText(e.fault));
+            return Err(line);
+        }
+    };
+    let keyText = readSmallFile(file.secretFile.view(), "the cluster's secret file")?;
+    var trimmed = Vector<u8>.create();
+    for (b in keyText.view()) {
+        if (b != 0x0A && b != 0x0D && b != 0x20) { let _ = trimmed.push(b); }
+    }
+    var secret = Vector<u8>.create();
+    let decoded = decodeBase64(trimmed.view(), mut secret).isOk() && secret.length == 32;
+    if (!decoded) { return Err(textOf("cosmostore: the cluster's secret file is not base64 of 32 bytes")); }
+    return Ok(LoadedCluster { file: file, secret: secret });
+}
+
+/// `cosmostore cluster-status --cluster-file <path> --node <id>`: asks the node, signed as the operator.
+fn clusterStatusCommand() -> i32 {
+    let args = match (clusterArguments(2)) {
+        Some(a) => a,
+        null => { return 2; }
+    };
+    let loaded = match (loadCluster(args.file.view())) {
+        Ok(l) => l,
+        Err(message) => {
+            Console.writeErrorLine(message.view());
+            return 1;
+        }
+    };
+    let peer = match (loaded.file.node(args.node)) {
+        Some(n) => n.peer,
+        null => {
+            Console.writeErrorLine("cosmostore: that node is not in the cluster file");
+            return 1;
+        }
+    };
+    var url = textOf("http://");
+    if (appendPeerAddress(mut url, peer).isErr() || url.append("/cluster/status").isErr()) { return 1; }
+    var answer = Vector<u8>.create();
+    let status = match (Async.run(askStatus(borrow loaded, url.view(), mut answer))) {
+        Ok(s) => s,
+        Err(_) => 0u16,
+    };
+    if (status != 200) {
+        Console.writeErrorLine("cosmostore: the node did not answer (or refused the request)");
+        return 1;
+    }
+    Console.write(StringView.fromUtf8(answer.view()) ?? "");
+    return 0;
+}
+
+async fn askStatus(
+    loaded: borrow LoadedCluster,
+    url: StringView,
+    answer: borrow mut Vector<u8>,
+) -> Result<u16, NodeFault> {
+    var options = ClientOptions.defaults();
+    options.totalMs = 10000;
+    options.retry = RetryPolicy.never();
+    let client = match (Client.create(options, null)) {
+        Ok(c) => c,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    var request = match (ClientRequest.create(Method.Get, url)) {
+        Ok(r) => r,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    if (!signRequest(mut request, borrow loaded.file, loaded.secret.view(), 0, "GET", "/cluster/status", "".bytes())) {
+        return Err(NodeFault.OutOfMemory);
+    }
+    var none = NoBody {};
+    var response = match (await client.send(request, mut none)) {
+        Ok(r) => r,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let status = response.status();
+    if ((await response.readToEnd(answer, 1048576)).isErr()) { return Err(NodeFault.Net); }
+    let _ = await response.finish(client);
+    await client.shutdown();
+    return Ok(status);
+}

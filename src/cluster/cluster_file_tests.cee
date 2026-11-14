@@ -1,0 +1,502 @@
+// The cluster file and placement, the wire format, and signed requests (ADR-0059, M6 item 3 slice a).
+
+fn threeNodeFile() -> StringView => """
+    # A test cluster.
+    cluster 7f3a9c2e5b1d4f60
+    shards 16
+    replicas 3
+    secret-file /tmp/cluster.key
+    node 1 peer=127.0.0.1:9101 domain=rack-a
+    node 2 peer=127.0.0.1:9102 domain=rack-b   # a comment after the words
+    node 3 peer=[::1]:9103 domain=rack-c
+    """;
+
+fn faultOf(text: StringView) -> ClusterFault? {
+    match (parseClusterFile(text)) {
+        Ok(_) => { return null; }
+        Err(e) => { return Some(e.fault); }
+    }
+}
+
+fn isFault(text: StringView, expected: ClusterFault) -> bool {
+    match (faultOf(text)) {
+        Some(f) => { return clusterFaultText(f) == clusterFaultText(expected); }
+        null => { return false; }
+    }
+}
+
+@test
+fn clusterFileParses() -> Result<void, TestFailure> {
+    let f = parseClusterFile(threeNodeFile())!;
+    Check.equalU64(16, f.shards as u64)?;
+    Check.equalU64(3, f.replicas as u64)?;
+    Check.equalU64(3, f.nodes.length as u64)?;
+    Check.equalBytes([0x7Fu8, 0x3A, 0x9C, 0x2E, 0x5B, 0x1D, 0x4F, 0x60][..], f.name[..])?;
+    Check.equalText("/tmp/cluster.key", f.secretFile.view())?;
+    Check.equalText("rack-b", f.node(2)!.domain.view())?;
+    Check.isTrue(f.node(4).isNull(), "no node 4")?;
+    // The digest is of the words, not of the spacing or the comments; any word changes it.
+    let spaced = parseClusterFile("""
+        cluster   7f3a9c2e5b1d4f60
+        shards 16
+        replicas 3
+
+        secret-file /tmp/cluster.key   # elsewhere
+        node 1 peer=127.0.0.1:9101 domain=rack-a
+        node 2    peer=127.0.0.1:9102 domain=rack-b
+        node 3 peer=[::1]:9103 domain=rack-c
+        """)!;
+    Check.equalBytes(f.digest[..], spaced.digest[..])?;
+    let other = parseClusterFile("""
+        cluster 7f3a9c2e5b1d4f60
+        shards 16
+        replicas 3
+        secret-file /tmp/cluster.key
+        node 1 peer=127.0.0.1:9101 domain=rack-a
+        node 2 peer=127.0.0.1:9102 domain=rack-b
+        node 3 peer=[::1]:9104 domain=rack-c
+        """)!;
+    Check.isFalse(ConstantTime.equal(f.digest[..], other.digest[..]), "another port is another cluster")?;
+    // Replicas default to three, or the node count when it is smaller.
+    let two = parseClusterFile("""
+        cluster 0000000000000001
+        shards 4
+        secret-file k
+        node 1 peer=127.0.0.1:1 domain=a
+        node 2 peer=127.0.0.1:2 domain=a
+        """)!;
+    Check.equalU64(2, two.replicas as u64)?;
+    return Ok();
+}
+
+@test
+fn clusterFileRefusals() -> Result<void, TestFailure> {
+    let tail = "shards 4\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a\n";
+    var bad = Vector<String>.create();
+    Check.isTrue(
+        isFault(
+            "cluster 7f3a9c2e5b1d4f6\nshards 4\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a",
+            ClusterFault.BadName,
+        ),
+        "15 digits",
+    )?;
+    Check.isTrue(
+        isFault(
+            "cluster 7f3a9c2e5b1d4f6z\nshards 4\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a",
+            ClusterFault.BadName,
+        ),
+        "not hex",
+    )?;
+    Check.isTrue(
+        isFault(
+            "cluster 0000000000000001\nshards 0\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a",
+            ClusterFault.BadShards,
+        ),
+        "no shards",
+    )?;
+    Check.isTrue(
+        isFault(
+            "cluster 0000000000000001\nshards 257\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a",
+            ClusterFault.BadShards,
+        ),
+        "too many shards",
+    )?;
+    Check.isTrue(
+        isFault(
+            "cluster 0000000000000001\nshards 4\nreplicas 8\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a",
+            ClusterFault.BadReplicas,
+        ),
+        "eight replicas",
+    )?;
+    Check.isTrue(
+        isFault(
+            "cluster 0000000000000001\nshards 4\nreplicas 2\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a",
+            ClusterFault.TooManyReplicas,
+        ),
+        "more replicas than nodes",
+    )?;
+    Check.isTrue(
+        isFault("cluster 0000000000000001\nshards 4\nsecret-file k\nnode 1 peer=9101 domain=a", ClusterFault.BadPeer),
+        "a bare port",
+    )?;
+    Check.isTrue(
+        isFault(
+            "cluster 0000000000000001\nshards 4\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a/b",
+            ClusterFault.BadDomain,
+        ),
+        "a slash in a domain",
+    )?;
+    Check.isTrue(
+        isFault(
+            "cluster 0000000000000001\nshards 4\nsecret-file k\nnode 0 peer=127.0.0.1:1 domain=a",
+            ClusterFault.BadNode,
+        ),
+        "node 0",
+    )?;
+    Check.isTrue(
+        isFault("cluster 0000000000000001\nshards 4\nsecret-file k\nnode 1 peer=127.0.0.1:1", ClusterFault.BadNode),
+        "no domain",
+    )?;
+    Check.isTrue(
+        isFault(
+            "cluster 0000000000000001\nshards 4\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a\nnode 1 peer=127.0.0.1:2 domain=b",
+            ClusterFault.DuplicateNode,
+        ),
+        "two node 1s",
+    )?;
+    Check.isTrue(
+        isFault(
+            "cluster 0000000000000001\ncluster 0000000000000002\nshards 4\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a",
+            ClusterFault.Repeated,
+        ),
+        "two names",
+    )?;
+    Check.isTrue(
+        isFault("shards 4\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a", ClusterFault.MissingCluster),
+        "no name",
+    )?;
+    Check.isTrue(
+        isFault(
+            "cluster 0000000000000001\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a",
+            ClusterFault.MissingShards,
+        ),
+        "no shards line",
+    )?;
+    Check.isTrue(
+        isFault("cluster 0000000000000001\nshards 4\nnode 1 peer=127.0.0.1:1 domain=a", ClusterFault.MissingSecret),
+        "no secret",
+    )?;
+    Check.isTrue(isFault("cluster 0000000000000001\nshards 4\nsecret-file k", ClusterFault.NoNodes), "no nodes")?;
+    Check.isTrue(
+        isFault(
+            "cluster 0000000000000001\nshards 4\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a\nnodes 2",
+            ClusterFault.UnknownWord,
+        ),
+        "a misspelling",
+    )?;
+    let _ = tail;
+    let _ = bad.length;
+    // The line of the fault is named.
+    match (parseClusterFile("cluster 0000000000000001\nshards 4\nsecret-file k\n# fine\nnode 1 peer=9 domain=a")) {
+        Err(e) => { Check.equalU64(5, e.line as u64)?; }
+        Ok(_) => { return Check.fail("a bad peer was taken"); }
+    }
+    return Ok();
+}
+
+@test
+fn clusterPlacement() -> Result<void, TestFailure> {
+    let f = parseClusterFile(threeNodeFile())!;
+    // Three nodes, three replicas: every shard on every node.
+    for (s in 0u32..16u32) {
+        let p = f.placement(s)!;
+        Check.equalU64(3, p.length as u64)?;
+        Check.isTrue(p[0] != p[1] && p[1] != p[2] && p[0] != p[2], "distinct nodes")?;
+    }
+    Check.equalU64(16, f.shardsOf(1)!.length as u64)?;
+    // Five nodes in three domains: three replicas, one per domain, the same placement every time.
+    let five = parseClusterFile("""
+        cluster 0123456789abcdef
+        shards 64
+        replicas 3
+        secret-file k
+        node 1 peer=127.0.0.1:1 domain=a
+        node 2 peer=127.0.0.1:2 domain=a
+        node 3 peer=127.0.0.1:3 domain=b
+        node 4 peer=127.0.0.1:4 domain=b
+        node 5 peer=127.0.0.1:5 domain=c
+        """)!;
+    var held = [0u64; 6];
+    for (s in 0u32..64u32) {
+        let p = five.placement(s)!;
+        let again = five.placement(s)!;
+        Check.equalU64(3, p.length as u64)?;
+        var domains = Vector<u8>.create();
+        for (i in 0..3) {
+            Check.equalU64(p[i] as u64, again[i] as u64)?;
+            held[p[i] as usize] += 1;
+            domains.push(five.node(p[i])!.domain.view().bytes()[0])!;
+        }
+        Check.isTrue(
+            domains[0] != domains[1] && domains[1] != domains[2] && domains[0] != domains[2],
+            "one per domain",
+        )?;
+        Check.isTrue(p[0] == 5 || p[1] == 5 || p[2] == 5, "the lone node of domain c holds every shard")?;
+    }
+    // The four nodes that share domains share the rest about evenly.
+    for (n in 1..5) { Check.isTrue(held[n] >= 20 && held[n] <= 44, "placement spread over the domain's nodes")?; }
+    // Fewer domains than replicas: one per domain first, then the best of the rest.
+    let two = parseClusterFile("""
+        cluster 0123456789abcdef
+        shards 8
+        replicas 3
+        secret-file k
+        node 1 peer=127.0.0.1:1 domain=a
+        node 2 peer=127.0.0.1:2 domain=a
+        node 3 peer=127.0.0.1:3 domain=b
+        """)!;
+    for (s in 0u32..8u32) {
+        let p = two.placement(s)!;
+        Check.equalU64(3, p.length as u64)?;
+        Check.isTrue(two.node(p[0])!.domain.view() != two.node(p[1])!.domain.view(), "the first two in two domains")?;
+    }
+    return Ok();
+}
+
+fn sampleMessage(kind: u8, entries: u64) -> RaftMessage {
+    var m = RaftMessage {
+        kind: kind,
+        from: 2,
+        to: 3,
+        term: 0x0102030405060708,
+        index: 77,
+        logTerm: 5,
+        commit: 70,
+        granted: true,
+        round: 9,
+        count: 0,
+        entries: Vector<RaftEntry>.create(),
+        data: Vector<u8>.create(),
+    };
+    var i = 0u64;
+    while (i < entries) {
+        var data = Vector<u8>.create();
+        data.resize((i * 37 + 1) as usize, truncate<u8>(i))!;
+        m.entries.push(RaftEntry { term: 5, index: 78 + i, data: data })!;
+        i += 1;
+    }
+    m.data.extend("snapshot bytes".bytes())!;
+    return m;
+}
+
+@test
+fn wireRoundTrips() -> Result<void, TestFailure> {
+    var batch = Vector<ShardMessage>.create();
+    batch.push(ShardMessage { shard: 0, message: sampleMessage(RAFT_APPEND, 3) })!;
+    batch.push(ShardMessage { shard: 15, message: sampleMessage(RAFT_VOTE_REPLY, 0) })!;
+    var bytes = Vector<u8>.create();
+    encodeBatch(mut bytes, batch.view())!;
+    let back = match (decodeBatch(bytes.view())) {
+        Ok(b) => b,
+        Err(_) => { return Check.fail("a batch did not decode"); }
+    };
+    Check.equalU64(2, back.length as u64)?;
+    Check.equalU64(15, back[1].shard as u64)?;
+    let m = borrow back[0].message;
+    Check.equalU64(RAFT_APPEND as u64, m.kind as u64)?;
+    Check.equalU64(2, m.from as u64)?;
+    Check.equalU64(3, m.to as u64)?;
+    Check.equalU64(0x0102030405060708, m.term)?;
+    Check.equalU64(77, m.index)?;
+    Check.equalU64(5, m.logTerm)?;
+    Check.equalU64(70, m.commit)?;
+    Check.isTrue(m.granted, "granted")?;
+    Check.equalU64(9, m.round)?;
+    Check.equalU64(3, m.entries.length as u64)?;
+    Check.equalU64(80, m.entries[2].index)?;
+    Check.equalU64(75, m.entries[2].data.length as u64)?;
+    Check.equalBytes("snapshot bytes".bytes(), m.data.view())?;
+    // Every cut short is refused, and so are trailing bytes and an unknown kind.
+    for (cut in 0..bytes.length) {
+        Check.isTrue(decodeBatch(bytes.view()[0..cut]).isErr(), "a short batch")?;
+    }
+    var long = bytes.clone()!;
+    long.push(0)!;
+    Check.isTrue(decodeBatch(long.view()).isErr(), "a long batch")?;
+    var badKind = bytes.clone()!;
+    badKind[6] = 99;
+    Check.isTrue(decodeBatch(badKind.view()).isErr(), "an unknown kind")?;
+    return Ok();
+}
+
+fn hexOf(bytes: Slice<u8>) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    appendHexBytes(mut out, bytes)!;
+    return out;
+}
+
+fn decimalOf(v: i64) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    appendDecimal(mut out, truncate<u64>(v))!;
+    return out;
+}
+
+/// The headers node `node` sends for `body` at `time` with `nonce`, signed under `secret`.
+fn signedHeaders(
+    f: borrow ClusterFile,
+    secret: Slice<u8>,
+    node: u32,
+    time: i64,
+    nonce: [u8; 16],
+    body: Slice<u8>,
+) -> PeerHeaders {
+    let signature = peerSignature(secret, "POST", "/raft", f.digest[..], node, time, nonce[..], body)!;
+    return PeerHeaders {
+        cluster: hexOf(f.digest[..]),
+        node: decimalOf(node as i64),
+        time: decimalOf(time),
+        nonce: hexOf(nonce[..]),
+        signature: hexOf(signature[..]),
+    };
+}
+
+fn peerRefusalCode(r: Result<u32, PeerRefusal>) -> u8 => match (r) {
+    Ok(_) => 0,
+    Err(PeerRefusal.Malformed) => 1,
+    Err(PeerRefusal.OtherCluster) => 2,
+    Err(PeerRefusal.UnknownNode) => 3,
+    Err(PeerRefusal.Itself) => 4,
+    Err(PeerRefusal.Skewed) => 5,
+    Err(PeerRefusal.Replayed) => 6,
+    Err(PeerRefusal.BadSignature) => 7,
+};
+
+@test
+fn peerRequestsAreSignedAndChecked() -> Result<void, TestFailure> {
+    let f = parseClusterFile(threeNodeFile())!;
+    let secret = [7u8; 32];
+    let now = 1763200000000i64;
+    let body = "a batch".bytes();
+    var nonces = NonceWindow.create();
+    var nonce = [1u8; 16];
+    let h = signedHeaders(borrow f, secret[..], 2, now, nonce, body);
+    let ok = checkPeerRequest(borrow f, secret[..], 1, false, "POST", "/raft", borrow h, body, now, mut nonces);
+    Check.equalU64(2, (ok.ok() ?? 0) as u64)?;
+    // The same request again is a replay; another nonce is not.
+    Check.equalU64(
+        6,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, false, "POST", "/raft", borrow h, body, now, mut nonces),
+        ) as u64,
+    )?;
+    nonce[0] = 2;
+    let fresh = signedHeaders(borrow f, secret[..], 2, now + 5, nonce, body);
+    Check.equalU64(
+        0,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, false, "POST", "/raft", borrow fresh, body, now + 5, mut nonces),
+        ) as u64,
+    )?;
+    // Another body, path, method or secret breaks the signature.
+    nonce[0] = 3;
+    let other = signedHeaders(borrow f, secret[..], 2, now, nonce, body);
+    Check.equalU64(
+        7,
+        peerRefusalCode(
+            checkPeerRequest(
+                borrow f,
+                secret[..],
+                1,
+                false,
+                "POST",
+                "/raft",
+                borrow other,
+                "another".bytes(),
+                now,
+                mut nonces,
+            ),
+        ) as u64,
+    )?;
+    Check.equalU64(
+        7,
+        peerRefusalCode(
+            checkPeerRequest(
+                borrow f,
+                secret[..],
+                1,
+                false,
+                "POST",
+                "/cluster/status",
+                borrow other,
+                body,
+                now,
+                mut nonces,
+            ),
+        ) as u64,
+    )?;
+    Check.equalU64(
+        7,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, false, "GET", "/raft", borrow other, body, now, mut nonces),
+        ) as u64,
+    )?;
+    Check.equalU64(
+        7,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, [8u8; 32][..], 1, false, "POST", "/raft", borrow other, body, now, mut nonces),
+        ) as u64,
+    )?;
+    // A forged request did not spend the nonce: signed properly, it is taken.
+    Check.equalU64(
+        0,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, false, "POST", "/raft", borrow other, body, now, mut nonces),
+        ) as u64,
+    )?;
+    // Too far from this node's clock, either way.
+    nonce[0] = 4;
+    let early = signedHeaders(borrow f, secret[..], 2, now - 60001, nonce, body);
+    Check.equalU64(
+        5,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, false, "POST", "/raft", borrow early, body, now, mut nonces),
+        ) as u64,
+    )?;
+    let late = signedHeaders(borrow f, secret[..], 2, now + 60001, nonce, body);
+    Check.equalU64(
+        5,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, false, "POST", "/raft", borrow late, body, now, mut nonces),
+        ) as u64,
+    )?;
+    // A sender not in the file, or this node itself.
+    let stranger = signedHeaders(borrow f, secret[..], 9, now, nonce, body);
+    Check.equalU64(
+        3,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, false, "POST", "/raft", borrow stranger, body, now, mut nonces),
+        ) as u64,
+    )?;
+    let itself = signedHeaders(borrow f, secret[..], 1, now, nonce, body);
+    Check.equalU64(
+        4,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, false, "POST", "/raft", borrow itself, body, now, mut nonces),
+        ) as u64,
+    )?;
+    // Another cluster file's digest.
+    var foreign = signedHeaders(borrow f, secret[..], 2, now, nonce, body);
+    foreign.cluster = hexOf([0u8; 32][..]);
+    Check.equalU64(
+        2,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, false, "POST", "/raft", borrow foreign, body, now, mut nonces),
+        ) as u64,
+    )?;
+    // An operator, sender 0, only where allowed.
+    nonce[0] = 5;
+    let operator = signedHeaders(borrow f, secret[..], 0, now, nonce, body);
+    Check.equalU64(
+        3,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, false, "POST", "/raft", borrow operator, body, now, mut nonces),
+        ) as u64,
+    )?;
+    Check.equalU64(
+        0,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, true, "POST", "/raft", borrow operator, body, now, mut nonces),
+        ) as u64,
+    )?;
+    // Headers that do not parse.
+    var garbled = signedHeaders(borrow f, secret[..], 2, now, nonce, body);
+    garbled.time.clear();
+    garbled.time.extend("soon".bytes())!;
+    Check.equalU64(
+        1,
+        peerRefusalCode(
+            checkPeerRequest(borrow f, secret[..], 1, false, "POST", "/raft", borrow garbled, body, now, mut nonces),
+        ) as u64,
+    )?;
+    return Ok();
+}
