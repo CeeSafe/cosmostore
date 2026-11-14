@@ -85,10 +85,12 @@ async fn createMultipartUpload(
     // SSE-S3 or SSE-C, as the request or the bucket's default asks (ADR-0046 §2): the object's data key is made now;
     // every part is sealed under a key of its own from it.
     let asked = await sseAskedFor(app, req)?;
+    var envelope = Vector<u8>.create();
     var sealing = false;
-    match (newSeal(app.sseKeys.view(), borrow asked)?) {
+    match (newSeal(app.sseKeys.view(), app.kmsKeys.view(), borrow asked)?) {
         Some(seal) => {
             metadataAdd(mut metadata, SSE_FIELD.bytes(), seal.field.view())?;
+            envelope.extend(seal.field.view())?;
             sealing = true;
         }
         null => {}
@@ -102,7 +104,7 @@ async fn createMultipartUpload(
         exchange.header("x-amz-checksum-algorithm", checksumNameUpper(checksum.algorithm).bytes())?;
         exchange.header("x-amz-checksum-type", checksumTypeName(checksum.kind).bytes())?;
     }
-    if (sealing) { sseAnswerFields(exchange, customerKeyOf(borrow asked))?; }
+    if (sealing) { sseAnswerOf(exchange, envelope.view(), customerKeyOf(borrow asked))?; }
     var body = Vector<u8>.create();
     xmlHead(mut body, "InitiateMultipartUploadResult")?;
     xmlElement(mut body, "Bucket", bucket.bytes(), false)?;
@@ -213,25 +215,28 @@ async fn uploadPart(
     // §2). The part is admitted at its plaintext size, 16 bytes in 64 KiB short of what it stores.
     // An SSE-C upload's parts bring its key, each time (ADR-0046 §6).
     let customer = sseCustomerKeyOf(req, false)?;
+    checkPartFields(req, start.envelope.view())?;
     var sealer: SseSealer? = null;
     if (start.envelope.length > 0) {
         var dataKey = await sealedDataKey(app, start.envelope.view(), customer)?;
         var salt = [0u8; 16];
         if (Random.fill(mut salt[..]).isErr()) { return Err(S3Fail.Code(S3Code.InternalError)); }
         sealer = SseSealer.createPart(borrow dataKey, salt, spec.size)?;
-        for (i in 0..32) { dataKey[i] = 0; }
         match (sealer.asBorrowMut()) {
             Some(s) => {
+                // SSE-C's ETag is under the request's key, SSE-KMS's under the upload's data key.
                 if (isCustomerEnvelope(start.envelope.view())) { s.etagKey = customer; }
+                if (isKmsEnvelope(start.envelope.view())) { s.etagKey = Some(dataKey); }
             }
             null => { return Err(S3Fail.Code(S3Code.InternalError)); }
         }
+        for (i in 0..32) { dataKey[i] = 0; }
     } else if (customer.isSome()) {
         return Err(S3Fail.Code(S3Code.InvalidRequest));
     }
     let sealing = sealer.isSome();
     let body = await receiveBody(app, auth, mut spec, start.writer, exchange, start.algorithm, sealer)?;
-    if (sealing) { sseAnswerFields(exchange, customer)?; }
+    if (sealing) { sseAnswerOf(exchange, start.envelope.view(), customer)?; }
     let md5 = await commitPart(
         app,
         req.bucket.view(),
@@ -452,6 +457,7 @@ async fn completeMultipartUpload(
     // An SSE-C upload is completed with its key, as its parts are uploaded (ADR-0046 §6); another upload takes none.
     let customer = sseCustomerKeyOf(req, false)?;
     let sealedWith = await storeUploadEnvelope(app, id)?;
+    checkPartFields(req, sealedWith.view())?;
     if (isCustomerEnvelope(sealedWith.view())) {
         var dataKey = await sealedDataKey(app, sealedWith.view(), customer)?;
         for (i in 0..32) { dataKey[i] = 0; }
@@ -475,11 +481,7 @@ async fn completeMultipartUpload(
         mut envelope,
     )?;
     writtenVersionHeader(exchange, borrow outcome)?;
-    if (isCustomerEnvelope(envelope.view())) {
-        sseAnswerFields(exchange, customer)?;
-    } else if (envelope.length > 0) {
-        exchange.header(SSE_FIELD, "AES256".bytes())?;
-    }
+    if (envelope.length > 0) { sseAnswerOf(exchange, envelope.view(), customer)?; }
     var body = Vector<u8>.create();
     xmlHead(mut body, "CompleteMultipartUploadResult")?;
     var location = Vector<u8>.create();

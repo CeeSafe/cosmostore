@@ -129,6 +129,15 @@ struct SseSealer {
     /// The bytes the part is stored in: its header and its chunks.
     fn storedLength(borrow this) -> u64 => this.headerLength + sseStoredLength(this.size);
 
+    drop {
+        match (this.etagKey.asBorrowMut()) {
+            Some(k) => {
+                for (i in 0..32) { k[i] = 0; }
+            }
+            null => {}
+        }
+    }
+
     fn emitHeader(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
         if (this.header.length > 0) {
             out.extend(this.header.view())?;
@@ -423,16 +432,19 @@ struct SseStream {
 /// The associated data of a wrapped data key: its mode (ADR-0046 §3).
 fn sseModeText(customer: bool) -> StringView => if (customer) "c" else "s3";
 
+/// An envelope's mode, as its text holds it: `s3`, `c` or `kms` (ADR-0055).
+fn envelopeMode(e: borrow SseEnvelope) -> StringView => if (e.kms) "kms" else sseModeText(e.customer);
+
 /// A data key sealed under `master` (a master key, or the request's key for SSE-C) with `nonce`, which must be
 /// random: the envelope's last two fields.
-fn wrapDataKey(master: borrow [u8; 32], customer: bool, dataKey: borrow [u8; 32], nonce: [u8; 12]) -> [u8; 48]? {
+fn wrapDataKey(master: borrow [u8; 32], mode: StringView, dataKey: borrow [u8; 32], nonce: [u8; 12]) -> [u8; 48]? {
     let cipher = match (sseCipher(master)) {
         Some(c) => c,
         null => { return null; }
     };
     var sealed = [0u8; 32];
     for (i in 0..32) { sealed[i] = dataKey[i]; }
-    let tag = cipher.seal(nonce, sseModeText(customer).bytes(), mut sealed[..]);
+    let tag = cipher.seal(nonce, mode.bytes(), mut sealed[..]);
     var wrapped = [0u8; 48];
     for (i in 0..32) { wrapped[i] = sealed[i]; }
     for (i in 0..16) { wrapped[32 + i] = tag[i]; }
@@ -449,7 +461,7 @@ fn unwrapDataKey(master: borrow [u8; 32], e: borrow SseEnvelope) -> [u8; 32]? {
     var tag = [0u8; 16];
     for (i in 0..32) { key[i] = e.wrapped[i]; }
     for (i in 0..16) { tag[i] = e.wrapped[32 + i]; }
-    if (!cipher.open(e.nonce, sseModeText(e.customer).bytes(), mut key[..], tag)) { return null; }
+    if (!cipher.open(e.nonce, envelopeMode(e).bytes(), mut key[..], tag)) { return null; }
     return key;
 }
 
@@ -459,6 +471,8 @@ fn unwrapDataKey(master: borrow [u8; 32], e: borrow SseEnvelope) -> [u8; 32]? {
 struct SseEnvelope {
     /// SSE-C: the data key is sealed under the request's key, and `keyId` is `-`.
     customer: bool;
+    /// SSE-KMS (ADR-0055): sealed under the KMS key `keyId` names.
+    kms: bool;
     keyId: Vector<u8>;
     nonce: [u8; 12];
     wrapped: [u8; 48];
@@ -476,7 +490,9 @@ fn isKeyId(id: Slice<u8>) -> bool {
 
 /// The envelope as the field holds it: `v1.<mode>.<key id>.<nonce>.<wrapped data key>`, the last two in hex.
 fn encodeEnvelope(e: borrow SseEnvelope, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
-    out.extend(if (e.customer) "v1.c.".bytes() else "v1.s3.".bytes())?;
+    out.extend("v1.".bytes())?;
+    out.extend(envelopeMode(e).bytes())?;
+    out.push('.')?;
     out.extend(e.keyId.view())?;
     out.push('.')?;
     appendHexBytes(out, e.nonce[..])?;
@@ -512,10 +528,17 @@ fn decodeEnvelope(text: Slice<u8>) -> Result<SseEnvelope?, AllocError> {
     if (text[pieces[0]..pieces[1] - 1] != "v1".bytes()) { return Ok(null); }
     let mode = text[pieces[1]..pieces[2] - 1];
     let customer = mode == "c".bytes();
-    if (!customer && mode != "s3".bytes()) { return Ok(null); }
+    let kms = mode == "kms".bytes();
+    if (!customer && !kms && mode != "s3".bytes()) { return Ok(null); }
     let id = text[pieces[2]..pieces[3] - 1];
     if (!isKeyId(id) || customer != (id == "-".bytes())) { return Ok(null); }
-    var e = SseEnvelope { customer: customer, keyId: copyBytes(id)?, nonce: [0u8; 12], wrapped: [0u8; 48] };
+    var e = SseEnvelope {
+        customer: customer,
+        kms: kms,
+        keyId: copyBytes(id)?,
+        nonce: [0u8; 12],
+        wrapped: [0u8; 48],
+    };
     if (!hexInto(text[pieces[3]..pieces[4] - 1], mut e.nonce[..])) { return Ok(null); }
     if (!hexInto(text[pieces[4]..pieces[5] - 1], mut e.wrapped[..])) { return Ok(null); }
     return Ok(Some(e));
@@ -593,25 +616,67 @@ enum SseRequest {
     Managed,
     /// SSE-C: the request's key.
     Customer([u8; 32]),
+    /// SSE-KMS (ADR-0055): `aws:kms`, and the KMS key named (an empty name: the KMS key file's first key).
+    Kms(KmsKeyName),
 }
 
-/// The encryption a request's fields ask for: the SSE-S3 field, or the three customer fields (the algorithm, the
-/// key in base64 and its MD5 in base64), not both.
+/// A KMS key's id, as `x-amz-server-side-encryption-aws-kms-key-id` names it (its last `/`-piece, so an ARN or an
+/// alias path names the same key): 0 to 32 of `A-Z a-z 0-9 _ -`.
+struct KmsKeyName {
+    length: usize;
+    bytes: [u8; 32];
+
+    fn view(borrow this) -> Slice<u8> => this.bytes[0..this.length];
+}
+
+/// The KMS key a request names: null when the text is not a key id.
+fn kmsKeyNameOf(text: Slice<u8>) -> KmsKeyName? {
+    let t = trimBlank(text);
+    var from: usize = 0;
+    for (i in 0..t.length) {
+        if (t[i] == '/') { from = i + 1; }
+    }
+    let id = t[from..];
+    if (!isKeyId(id)) { return null; }
+    var name = KmsKeyName { length: id.length, bytes: [0u8; 32] };
+    for (i in 0..id.length) { name.bytes[i] = id[i]; }
+    return name;
+}
+
+/// The encryption a request's fields ask for: the SSE-S3 field (`AES256`, or `aws:kms` with the KMS key's id), or
+/// the three customer fields (the algorithm, the key in base64 and its MD5 in base64), not both. An encryption
+/// context and `aws:kms:dsse` are NotImplemented (ADR-0055).
 fn sseOfFields(
     managed: Slice<u8>?,
+    kmsKeyId: Slice<u8>?,
+    context: Slice<u8>?,
     algorithm: Slice<u8>?,
     key: Slice<u8>?,
     keyMd5: Slice<u8>?,
 ) -> Result<SseRequest, S3Fail> {
     let invalid = S3Fail.Code(S3Code.InvalidArgument);
     let customer = algorithm.isSome() || key.isSome() || keyMd5.isSome();
+    let kms = match (managed) {
+        Some(m) => trimBlank(m) == "aws:kms".bytes(),
+        null => false,
+    };
+    // The KMS fields go only with `aws:kms`.
+    if (!kms && (kmsKeyId.isSome() || context.isSome())) { return Err(invalid); }
     match (managed) {
         Some(m) => {
             if (customer) { return Err(invalid); }
             if (trimBlank(m) == "AES256".bytes()) { return Ok(SseRequest.Managed); }
-            if (trimBlank(m) == "aws:kms".bytes() || trimBlank(m) == "aws:kms:dsse".bytes()) {
-                return Err(S3Fail.Code(S3Code.NotImplemented));
+            if (kms) {
+                if (context.isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+                return match (kmsKeyId) {
+                    Some(id) => match (kmsKeyNameOf(id)) {
+                        Some(name) => Ok(SseRequest.Kms(name)),
+                        null => Err(invalid),
+                    },
+                    null => Ok(SseRequest.Kms(KmsKeyName { length: 0, bytes: [0u8; 32] })),
+                };
             }
+            if (trimBlank(m) == "aws:kms:dsse".bytes()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
             return Err(invalid);
         }
         null => {}
@@ -669,9 +734,13 @@ fn sseRefusal(req: borrow S3Request) -> S3Code? {
     for (i in 0..req.headers.length) {
         let name = req.headers[i].name.view();
         if (!isSseField(name)) { continue; }
-        if (name == SSE_FIELD.bytes()) {
-            if (put || create) { continue; }
-            if (part || complete || read) { return S3Code.InvalidArgument; }
+        let kmsField = name == "x-amz-server-side-encryption-aws-kms-key-id".bytes() ||
+            name == "x-amz-server-side-encryption-context".bytes();
+        if (name == SSE_FIELD.bytes() || kmsField) {
+            // On UploadPart and Complete, clients repeat the upload's fields: the upload's key governs
+            // (`checkPartFields`).
+            if (put || create || part || complete) { continue; }
+            if (read) { return S3Code.InvalidArgument; }
             return S3Code.NotImplemented;
         }
         let fine = if (startsWithBytes(name, SSE_CUSTOMER.bytes())) {
@@ -685,6 +754,11 @@ fn sseRefusal(req: borrow S3Request) -> S3Code? {
     }
     return null;
 }
+
+/// Whether a field holds an SSE-C key: `...-customer-key`, a request's or a copy source's (not its MD5).
+fn isCustomerKeyField(name: Slice<u8>) -> bool =>
+    name == "x-amz-server-side-encryption-customer-key".bytes() ||
+        name == "x-amz-copy-source-server-side-encryption-customer-key".bytes();
 
 /// Whether the request brings an SSE-C key, its own or a copy source's: only over TLS (ADR-0046 §6).
 fn bringsCustomerKey(req: borrow S3Request) -> bool {
@@ -701,6 +775,8 @@ fn bringsCustomerKey(req: borrow S3Request) -> bool {
 fn sseRequestOf(req: borrow S3Request) -> Result<SseRequest, S3Fail> =>
     sseOfFields(
         headerOf(req, SSE_FIELD),
+        headerOf(req, "x-amz-server-side-encryption-aws-kms-key-id"),
+        headerOf(req, "x-amz-server-side-encryption-context"),
         headerOf(req, "x-amz-server-side-encryption-customer-algorithm"),
         headerOf(req, "x-amz-server-side-encryption-customer-key"),
         headerOf(req, "x-amz-server-side-encryption-customer-key-md5"),
@@ -711,12 +787,16 @@ fn sseCustomerKeyOf(req: borrow S3Request, source: bool) -> Result<[u8; 32]?, S3
     let fields = if (source) {
         sseOfFields(
             null,
+            null,
+            null,
             headerOf(req, "x-amz-copy-source-server-side-encryption-customer-algorithm"),
             headerOf(req, "x-amz-copy-source-server-side-encryption-customer-key"),
             headerOf(req, "x-amz-copy-source-server-side-encryption-customer-key-md5"),
         )?
     } else {
         sseOfFields(
+            null,
+            null,
             null,
             headerOf(req, "x-amz-server-side-encryption-customer-algorithm"),
             headerOf(req, "x-amz-server-side-encryption-customer-key"),
@@ -729,8 +809,43 @@ fn sseCustomerKeyOf(req: borrow S3Request, source: bool) -> Result<[u8; 32]?, S3
     };
 }
 
-/// Whether a stored envelope is SSE-C's.
+/// A part's SSE-S3 or SSE-KMS fields (ADR-0055): clients repeat the upload's on UploadPart, and the part is sealed
+/// under the upload's key whatever they name, as S3 and s3-tests do. Into an upload in the clear, or an SSE-C one,
+/// they are InvalidArgument: nothing asked to be sealed goes in the clear.
+fn checkPartFields(req: borrow S3Request, uploadEnvelope: Slice<u8>) -> Result<void, S3Fail> {
+    let asked = headerOf(req, SSE_FIELD).isSome() ||
+        headerOf(req, "x-amz-server-side-encryption-aws-kms-key-id").isSome();
+    if (asked && (uploadEnvelope.length == 0 || isCustomerEnvelope(uploadEnvelope))) {
+        return Err(S3Fail.Code(S3Code.InvalidArgument));
+    }
+    return Ok();
+}
+
+/// Whether a stored envelope is SSE-C's, or SSE-KMS's.
 fn isCustomerEnvelope(field: Slice<u8>) -> bool => startsWithBytes(field, "v1.c.".bytes());
+fn isKmsEnvelope(field: Slice<u8>) -> bool => startsWithBytes(field, "v1.kms.".bytes());
+
+/// The answer's fields for an object sealed with `envelope`: SSE-S3's `AES256`; SSE-KMS's `aws:kms` and its key's id
+/// (ADR-0055); SSE-C's algorithm and, when the request brought it, its key's MD5.
+fn sseAnswerOf(exchange: borrow mut Exchange, envelope: Slice<u8>, customer: [u8; 32]?) -> Result<void, S3Fail> {
+    if (isCustomerEnvelope(envelope)) {
+        match (customer) {
+            Some(_) => { sseAnswerFields(exchange, customer)?; }
+            null => { exchange.header("x-amz-server-side-encryption-customer-algorithm", "AES256".bytes())?; }
+        }
+        return Ok();
+    }
+    if (isKmsEnvelope(envelope)) {
+        exchange.header(SSE_FIELD, "aws:kms".bytes())?;
+        match (decodeEnvelope(envelope)?) {
+            Some(e) => { exchange.header("x-amz-server-side-encryption-aws-kms-key-id", e.keyId.view())?; }
+            null => {}
+        }
+        return Ok();
+    }
+    exchange.header(SSE_FIELD, "AES256".bytes())?;
+    return Ok();
+}
 
 /// The answer's fields for a sealed object: SSE-S3's, or SSE-C's algorithm and the MD5 of the request's key.
 fn sseAnswerFields(exchange: borrow mut Exchange, customer: [u8; 32]?) -> Result<void, S3Fail> {
@@ -752,8 +867,10 @@ fn sseAnswerFields(exchange: borrow mut Exchange, customer: [u8; 32]?) -> Result
 struct NewSeal {
     dataKey: [u8; 32];
     field: Vector<u8>;
-    /// SSE-C's, sealed under the request's key: its ETag is the MD5 of what is stored.
+    /// SSE-C's, sealed under the request's key; SSE-KMS's, under a KMS key (ADR-0055). Neither has the plaintext's
+    /// MD5 for its ETag.
     customer: bool;
+    kms: bool;
 
     drop {
         for (i in 0..32) { this.dataKey[i] = 0; }
@@ -761,19 +878,19 @@ struct NewSeal {
 }
 
 /// A new object's data key wrapped under `wrapping` (a master key, or the request's for SSE-C).
-fn newSealUnder(wrapping: borrow [u8; 32], customer: bool, keyId: Slice<u8>) -> Result<NewSeal, S3Fail> {
+fn newSealUnder(wrapping: borrow [u8; 32], customer: bool, kms: bool, keyId: Slice<u8>) -> Result<NewSeal, S3Fail> {
     let failed = S3Fail.Code(S3Code.InternalError);
     var dataKey = [0u8; 32];
     var nonce = [0u8; 12];
     if (Random.fill(mut dataKey[..]).isErr() || Random.fill(mut nonce[..]).isErr()) { return Err(failed); }
-    let wrapped = match (wrapDataKey(wrapping, customer, borrow dataKey, nonce)) {
+    var e = SseEnvelope { customer: customer, kms: kms, keyId: copyBytes(keyId)?, nonce: nonce, wrapped: [0u8; 48] };
+    e.wrapped = match (wrapDataKey(wrapping, envelopeMode(borrow e), borrow dataKey, nonce)) {
         Some(w) => w,
         null => { return Err(failed); }
     };
-    let e = SseEnvelope { customer: customer, keyId: copyBytes(keyId)?, nonce: nonce, wrapped: wrapped };
     var field = Vector<u8>.create();
     encodeEnvelope(borrow e, mut field)?;
-    var seal = NewSeal { dataKey: [0u8; 32], field: field, customer: customer };
+    var seal = NewSeal { dataKey: [0u8; 32], field: field, customer: customer, kms: kms };
     for (i in 0..32) {
         seal.dataKey[i] = dataKey[i];
         dataKey[i] = 0;
@@ -784,15 +901,30 @@ fn newSealUnder(wrapping: borrow [u8; 32], customer: bool, keyId: Slice<u8>) -> 
 /// SSE-S3 for a new object: a random data key, wrapped under the first master key with a random nonce.
 fn newManagedSeal(keys: Slice<MasterKey>) -> Result<NewSeal, S3Fail> {
     if (keys.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); } // `serve` has no key file
-    return newSealUnder(borrow keys[0].key, false, keys[0].id.view());
+    return newSealUnder(borrow keys[0].key, false, false, keys[0].id.view());
 }
 
-/// The seal a new object gets for what is asked: SSE-S3, SSE-C under the request's key, or none.
-fn newSeal(keys: Slice<MasterKey>, asked: borrow SseRequest) -> Result<NewSeal?, S3Fail> => match (asked) {
-    SseRequest.None => Ok(null),
-    SseRequest.Managed => Ok(Some(newManagedSeal(keys)?)),
-    SseRequest.Customer(k) => Ok(Some(newSealUnder(k, true, "-".bytes())?)),
-};
+/// SSE-KMS for a new object (ADR-0055): its data key wrapped under the KMS key named, or the KMS key file's first.
+/// Without a KMS key file, NotImplemented, as before; a name the file does not have is InvalidArgument.
+fn newKmsSeal(kmsKeys: Slice<MasterKey>, name: borrow KmsKeyName) -> Result<NewSeal, S3Fail> {
+    if (kmsKeys.length == 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    if (name.length == 0) { return newSealUnder(borrow kmsKeys[0].key, false, true, kmsKeys[0].id.view()); }
+    for (i in 0..kmsKeys.length) {
+        if (kmsKeys[i].id.view() == name.view()) {
+            return newSealUnder(borrow kmsKeys[i].key, false, true, kmsKeys[i].id.view());
+        }
+    }
+    return Err(S3Fail.Code(S3Code.InvalidArgument));
+}
+
+/// The seal a new object gets for what is asked: SSE-S3, SSE-C under the request's key, SSE-KMS, or none.
+fn newSeal(keys: Slice<MasterKey>, kmsKeys: Slice<MasterKey>, asked: borrow SseRequest) -> Result<NewSeal?, S3Fail> =>
+    match (asked) {
+        SseRequest.None => Ok(null),
+        SseRequest.Managed => Ok(Some(newManagedSeal(keys)?)),
+        SseRequest.Customer(k) => Ok(Some(newSealUnder(k, true, false, "-".bytes())?)),
+        SseRequest.Kms(name) => Ok(Some(newKmsSeal(kmsKeys, name)?)),
+    };
 
 /// An SSE-C object's ETag (ADR-0046 §6): HMAC-SHA256 of its plaintext's MD5 under the request's key, its first 16
 /// bytes. It is not the MD5, which would let whoever reads a listing test a guess of the content, and it is the same
@@ -820,6 +952,8 @@ fn sealerOf(seal: borrow NewSeal, size: u64, customer: [u8; 32]?) -> Result<SseS
         null => { return Err(S3Fail.Code(S3Code.InternalError)); }
     };
     if (seal.customer) { sealer.etagKey = customer; }
+    // SSE-KMS's ETag is not the plaintext's MD5 either: a digest of it under the object's data key (ADR-0055).
+    if (seal.kms) { sealer.etagKey = Some(seal.dataKey); }
     return Ok(sealer);
 }
 
@@ -849,7 +983,17 @@ async fn bucketDefaultSse(app: borrow S3App, bucket: StringView) -> Result<SseRe
         Err(StoreError.NoSuchBucket) => { return Ok(SseRequest.None); } // the write reports it
         Err(e) => { return Err(storeFail(e, 0)); }
     };
-    return Ok(if (stored.length > 0) SseRequest.Managed else SseRequest.None);
+    return Ok(defaultOfStored(stored.view()));
+}
+
+/// A stored default (`BucketConfig` kind 11) as a request: `AES256`, or `aws:kms` with its key's id after a space.
+fn defaultOfStored(stored: Slice<u8>) -> SseRequest {
+    if (stored.length == 0) { return SseRequest.None; }
+    if (startsWithBytes(stored, "aws:kms".bytes())) {
+        let id = if (stored.length > 8) stored[8..] else "".bytes();
+        return SseRequest.Kms(kmsKeyNameOf(id) ?? KmsKeyName { length: 0, bytes: [0u8; 32] });
+    }
+    return SseRequest.Managed;
 }
 
 // ---- A bucket's default encryption: Get-, Put- and DeleteBucketEncryption (ADR-0046 §5) ----
@@ -870,15 +1014,24 @@ async fn getBucketEncryption(
     if (stored.length == 0) { return Err(S3Fail.Code(S3Code.ServerSideEncryptionConfigurationNotFoundError)); }
     var body = Vector<u8>.create();
     xmlHead(mut body, "ServerSideEncryptionConfiguration")?;
+    body.extend("<Rule><ApplyServerSideEncryptionByDefault>".bytes())?;
+    if (startsWithBytes(stored.view(), "aws:kms".bytes())) {
+        body.extend("<SSEAlgorithm>aws:kms</SSEAlgorithm>".bytes())?;
+        if (stored.length > 8) { xmlElement(mut body, "KMSMasterKeyID", stored.view()[8..], false)?; }
+    } else {
+        body.extend("<SSEAlgorithm>AES256</SSEAlgorithm>".bytes())?;
+    }
     body.extend(
-        "<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>false</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>".bytes(),
+        "</ApplyServerSideEncryptionByDefault><BucketKeyEnabled>false</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>".bytes(),
     )?;
     return await sendXml(exchange, borrow body);
 }
 
 /// The default a `<ServerSideEncryptionConfiguration>` names: one rule of `AES256`. `aws:kms` and `aws:kms:dsse`
 /// are NotImplemented; anything else is MalformedXML.
-fn parseBucketEncryption(xml: Slice<u8>) -> Result<void, S3Fail> {
+/// What a `<ServerSideEncryptionConfiguration>` stores: `AES256`, or `aws:kms` and its KMS key's id after a space
+/// (ADR-0055). `aws:kms:dsse` is NotImplemented; anything else is MalformedXML.
+fn parseBucketEncryption(xml: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
     // The root element carries S3's namespace (`xmlns=`), so it is found by its name alone.
     if (findBytes(xml, "<ServerSideEncryptionConfiguration".bytes(), 0).isNull()) {
         return Err(S3Fail.Code(S3Code.MalformedXML));
@@ -890,11 +1043,24 @@ fn parseBucketEncryption(xml: Slice<u8>) -> Result<void, S3Fail> {
     let algorithm = trimBlank(elementText(rule, "SSEAlgorithm") ?? "".bytes());
     if (algorithm == "AES256".bytes()) {
         if (elementText(rule, "KMSMasterKeyID").isSome()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
-        return Ok();
+        return Ok(copyBytes("AES256".bytes())?);
     }
-    if (algorithm == "aws:kms".bytes() || algorithm == "aws:kms:dsse".bytes()) {
-        return Err(S3Fail.Code(S3Code.NotImplemented));
+    if (algorithm == "aws:kms".bytes()) {
+        var stored = copyBytes("aws:kms".bytes())?;
+        match (elementText(rule, "KMSMasterKeyID")) {
+            Some(id) => {
+                let name = match (kmsKeyNameOf(id)) {
+                    Some(n) => n,
+                    null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                };
+                stored.push(' ')?;
+                stored.extend(name.view())?;
+            }
+            null => {}
+        }
+        return Ok(stored);
     }
+    if (algorithm == "aws:kms:dsse".bytes()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
     return Err(S3Fail.Code(S3Code.MalformedXML));
 }
 
@@ -906,10 +1072,25 @@ async fn putBucketEncryption(
 ) -> Result<void, S3Fail> {
     let xml = await readSmallBody(auth, exchange, 65536)?;
     verifySmallBody(req, xml.view(), true)?;
-    parseBucketEncryption(xml.view())?;
-    // Objects are sealed under the key file's first key: without one, a default could not be honoured.
-    if (app.sseKeys.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
-    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_ENCRYPTION, "AES256".bytes())?;
+    let stored = parseBucketEncryption(xml.view())?;
+    // A default that could not be honoured is refused: SSE-S3 needs the key file; SSE-KMS the KMS key file (else
+    // NotImplemented, as SSE-KMS is without it) and, when it names one, a key the file has.
+    match (defaultOfStored(stored.view())) {
+        SseRequest.Kms(name) => {
+            if (app.kmsKeys.length == 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            if (name.length > 0) {
+                var found = false;
+                for (i in 0..app.kmsKeys.length) {
+                    if (app.kmsKeys[i].id.view() == name.view()) { found = true; }
+                }
+                if (!found) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+        }
+        _ => {
+            if (app.sseKeys.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        }
+    }
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_ENCRYPTION, stored.view())?;
     await recountEncrypted(app)?;
     await exchange.send(Status.ok(), "".bytes())?;
     return Ok();
@@ -974,12 +1155,19 @@ async fn sealedDataKey(app: borrow S3App, field: Slice<u8>, customer: [u8; 32]?)
         };
     }
     if (customer.isSome()) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
-    return match (managedDataKey(app.sseKeys.view(), field)) {
+    // SSE-S3's master keys and SSE-KMS's keys are apart: an id names a key of its own kind (ADR-0055).
+    let keys = if (isKmsEnvelope(field)) app.kmsKeys.view() else app.sseKeys.view();
+    return match (managedDataKey(keys, field)) {
         Ok(k) => Ok(k),
         Err(SseKeyFault.Customer) => Err(S3Fail.Code(S3Code.InvalidRequest)),
         Err(SseKeyFault.UnknownKey) => {
             var line = Vector<u8>.create();
-            line.extend("cosmostore: an object is sealed under a master key that is not in the key file: ".bytes())?;
+            line.extend(
+                if (isKmsEnvelope(
+                    field,
+                )) "cosmostore: an object is sealed under a KMS key that is not in the KMS key file: ".bytes()
+                    else "cosmostore: an object is sealed under a master key that is not in the key file: ".bytes(),
+            )?;
             match (decodeEnvelope(field)) {
                 Ok(Some(e)) => { line.extend(e.keyId.view())?; }
                 _ => {}

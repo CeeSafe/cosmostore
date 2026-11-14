@@ -190,7 +190,8 @@ cosmostore soak  <dir> <seconds> <keys> <capacity-bytes>
   for every request: who, from where, what and with what result (ADR-0051). `--rate-limit-address` and
   `--rate-limit-key` set the most requests a second from one address and by one access key; past them a request is
   503 SlowDown (ADR-0053). `--sse-key-file` names the master keys of server-side encryption, one
-  `<key id> <base64 of 32 bytes>` a line, the first sealing new objects (ADR-0046).
+  `<key id> <base64 of 32 bytes>` a line, the first sealing new objects (ADR-0046); `--kms-key-file` names SSE-KMS's
+  keys in the same format, chosen by id, the first by default (ADR-0055).
 
   The server raises its open-file limit to the most the system allows at start, and logs it: it holds a descriptor per
   connection and per upload in progress, and macOS starts processes at 256. If it still runs out, requests get 503 and
@@ -345,8 +346,8 @@ with the AWS CLI, boto3 and the Ceph versioning tests, and lifecycle rules expir
 markers (ADR-0042). Bucket policies are in (ADR-0043), with the access keys as principals, and so are the
 public-access block and GetBucketPolicyStatus (ADR-0044) and an ACL compatibility mode (ADR-0045). Object Lock and
 legal hold keep versions from being removed (ADR-0047). Event notifications go to webhooks, at least once, from
-an outbox that is the journal itself (ADR-0048). Objects are encrypted at rest with SSE-S3, SSE-C or a bucket's
-default, in 64 KiB chunks of AES-256-GCM from CeeSafe's lib/std (ADR-0046).
+an outbox that is the journal itself (ADR-0048). Objects are encrypted at rest with SSE-S3, SSE-KMS, SSE-C or a bucket's
+default, in 64 KiB chunks of AES-256-GCM from CeeSafe's lib/std (ADR-0046, ADR-0055).
 
 **Later:** M6 a Raft-based cluster, and M7 advanced S3 features.
 
@@ -354,8 +355,8 @@ default, in 64 KiB chunks of AES-256-GCM from CeeSafe's lib/std (ADR-0046).
 - a single node: no replication or erasure coding yet;
 - no MFA delete, and no SigV2 or session tokens;
 - event notifications go to HTTP webhooks only, in order, so one webhook that is down holds the others' events;
-- no SSE-KMS: SSE-S3's master keys are a file named when `serve` starts (ADR-0046), and keys, metadata, sizes and
-  an SSE-S3 object's ETag are not encrypted;
+- no KMS service: SSE-S3's and SSE-KMS's keys are files named when `serve` starts (ADR-0046, ADR-0055), and keys,
+  metadata, sizes and an SSE-S3 object's ETag are not encrypted;
 - one account: every access key may do what no bucket policy denies it, and an ACL can grant only to the owner, to
   everyone and to authenticated requesters;
 - no lifecycle transitions: there is one storage class;

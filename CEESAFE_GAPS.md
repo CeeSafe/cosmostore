@@ -42,6 +42,7 @@ boilerplate; **P2** ergonomics.
 | G31 | P2 | lib/std/checksums | `Crc32c` is software only (slicing-by-8, 1.5 GB/s on an M1): no way to use the CPU's CRC32C instructions (ARMv8 `crc32c`, x86 SSE4.2), 4.7 times faster in one chain. **Fixed in CeeSafe 0.30.0** (ADR 0089: the instruction where the CPU has it, asked at run time; `Crc32c.of` 1,652 to 8,147 MB/s on the M1). CosmoStore builds with 0.30.0 since 11 Nov 2026 |
 | G32 | P2 | std/process | No way to read or raise the open-file limit (`getrlimit`/`setrlimit` `RLIMIT_NOFILE`): a server cannot lift its soft limit (256 on macOS) to the hard one at start, as servers usually do **Fixed in CeeSafe 0.41.0** (ADR 0104: `ProcessLimits.openFiles`, `raiseOpenFiles`, `IoError.TooManyOpenFiles`); `serve` raises its limit at start since 13 Nov 2026 |
 | G33 | P1 | lib/std/crypto | No authenticated cipher (AES-256-GCM): S3 server-side encryption (ADR-0046) has nothing to seal an object's bytes with, and CosmoStore calls no C. Wanted on the CPU's AES and carry-less multiply instructions, with a constant-time fallback **Fixed in CeeSafe 0.45.0** (ADR 0135: `Aes256Gcm`, `ConstantTime.equal`); SSE-S3 on PutObject, GetObject and HeadObject since 14 Nov 2026 |
+| G34 | P3 | lib/std/checksums | `HmacSha256` keeps its key XOR 0x5C in `outerKey` (and the inner pad's state in `inner`) and has no `drop` that wipes them: an SSE-C key used for an ETag (ADR-0046 §6), or a data key deriving a part key, stays in freed memory |
 
 ## Status (2026-11-06)
 
@@ -490,6 +491,24 @@ the AES and PMULL extensions on ARMv8 (about 3.1 GB/s on an M1, 2.6 GB/s on the 
 Ryzen under gcc), chosen by a CPU probe at run time, and on a constant-time CeeSafe path elsewhere (about 16 MB/s).
 CosmoStore's `src/s3/sse.cee` seals and opens 64 KiB chunks with it; its tests check a sealed chunk and a wrapped
 data key against Python's `cryptography`.
+
+### G34: `HmacSha256` leaves its key in freed memory (P3)
+
+**Evidence.** `lib/std/checksums.cee` (ceesafec 0.45.0): `struct HmacSha256 { inner: Sha256; outerKey: [u8; 64]; }`.
+`outerKey` is the key, padded to a block, XOR 0x5C, so it gives the key back; `inner` has absorbed the key XOR
+0x36. There is no `drop`, so both stay in memory freed with the value. `Aes256Gcm` wipes its key on drop (ADR 0135);
+HMAC does not. CosmoStore keys an HMAC with an SSE-C customer's key (the ETag, ADR-0046 §6), with a data key (a
+multipart part's key, §2), and with SigV4 signing keys.
+
+**Why it matters.** CosmoStore wipes what it holds of an SSE-C key once a request is done (its fields, its buffers,
+the sealer's copy); the HMAC's copy is out of its reach. The key is never written to disk, so this is about memory
+read after the fact (a core dump, a later bug), not storage.
+
+**Repro.** `var mac = HmacSha256.create(key[..]); mac.update(x); let d = mac.finish();` then drop `mac`: its
+64-byte `outerKey` is left as it was.
+
+**Suggested.** A `drop` on `HmacSha256` that zeroes `outerKey` and the inner `Sha256`'s state, as `Aes256Gcm`'s
+does; or a `wipe()` callers can use. No API change.
 
 ## Not gaps (checked)
 

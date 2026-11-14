@@ -25,8 +25,10 @@ start_hook
 printf 'hook http://127.0.0.1:%s/events\n# a comment\n' "$hookport" > "$work/targets"
 # The master keys of SSE-S3 (ADR-0046 §4): the first seals, the second only opens.
 printf '# master keys\nk2 %s\nk1 %s\n' "$(head -c 32 /dev/urandom | base64)" "$(head -c 32 /dev/urandom | base64)" > "$work/sse.keys"
+# SSE-KMS's keys (ADR-0055): the first is the default.
+printf 'app-default %s\norders %s\n' "$(head -c 32 /dev/urandom | base64)" "$(head -c 32 /dev/urandom | base64)" > "$work/kms.keys"
 start_server() {
-    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" 2>> "$work/server.log" &
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" 2>> "$work/server.log" &
     server=$!
     sleep 1
 }
@@ -623,7 +625,8 @@ aws s3api create-bucket --bucket enc > /dev/null 2>&1
 check "no default encryption" "$(code s3api get-bucket-encryption --bucket enc)" ServerSideEncryptionConfigurationNotFoundError
 aws s3api put-bucket-encryption --bucket enc --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' > /dev/null 2>&1 || fail "put-bucket-encryption"
 check "get-bucket-encryption" "$(aws s3api get-bucket-encryption --bucket enc --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' --output text)" AES256
-check "a default of SSE-KMS" "$(code s3api put-bucket-encryption --bucket enc --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}')" NotImplemented
+check "a default of SSE-KMS:DSSE" "$(code s3api put-bucket-encryption --bucket enc --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms:dsse"}}]}')" NotImplemented
+check "a default of a KMS key there is not" "$(code s3api put-bucket-encryption --bucket enc --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"nobody"}}]}')" InvalidArgument
 printf 'sealed by default in cosmostore\n' > dflt.txt
 check "sealed by the default" "$(aws s3api put-object --bucket enc --key d.txt --body dflt.txt --query ServerSideEncryption --output text)" AES256
 aws s3api get-object --bucket enc --key d.txt got.txt > /dev/null 2>&1
@@ -635,9 +638,31 @@ aws s3api abort-multipart-upload --bucket enc --key m --upload-id "$(printf '%s'
 check "the default's plaintext not on disk" "$(grep -rl 'sealed by default in cosmostore' "$work/store" | wc -l | tr -d ' ')" 0
 aws s3api delete-bucket-encryption --bucket enc > /dev/null 2>&1 || fail "delete-bucket-encryption"
 check "no default after delete" "$(aws s3api put-object --bucket enc --key e.txt --body dflt.txt --query ServerSideEncryption --output text)" None
+aws s3api put-bucket-encryption --bucket enc --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"orders"}}]}' > /dev/null 2>&1 || fail "a default of SSE-KMS"
+check "get a default of SSE-KMS" "$(aws s3api get-bucket-encryption --bucket enc --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.[SSEAlgorithm,KMSMasterKeyID]' --output text | tr '\t' ' ')" "aws:kms orders"
+check "sealed by a default of SSE-KMS" "$(aws s3api put-object --bucket enc --key k.txt --body dflt.txt --query '[ServerSideEncryption,SSEKMSKeyId]' --output text | tr '\t' ' ')" "aws:kms orders"
 aws s3 rm --recursive s3://enc/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket enc > /dev/null 2>&1 || fail "delete the bucket with a default"
-check "SSE-KMS" "$(code s3api put-object --bucket smoke --key sse/kms --body sse.txt --server-side-encryption aws:kms)" NotImplemented
+# SSE-KMS (ADR-0055): named keys of the KMS key file, the first by default.
+check "SSE-KMS put, the default key" "$(aws s3api put-object --bucket smoke --key sse/kms --body sse.txt --server-side-encryption aws:kms --query '[ServerSideEncryption,SSEKMSKeyId]' --output text | tr '\t' ' ')" "aws:kms app-default"
+check "SSE-KMS put, a named key" "$(aws s3api put-object --bucket smoke --key sse/kms2 --body sse.bin --server-side-encryption aws:kms --ssekms-key-id arn:aws:kms:us-east-1:000000000000:key/orders --query SSEKMSKeyId --output text)" orders
+check "SSE-KMS head" "$(aws s3api head-object --bucket smoke --key sse/kms2 --query '[ServerSideEncryption,SSEKMSKeyId,ContentLength]' --output text | tr '\t' ' ')" "aws:kms orders 300001"
+aws s3api get-object --bucket smoke --key sse/kms2 got.bin > /dev/null 2>&1
+cmp -s got.bin sse.bin && pass "SSE-KMS get" || fail "SSE-KMS get"
+aws s3api get-object --bucket smoke --key sse/kms2 --range bytes=70000-70009 got.bin > /dev/null 2>&1
+dd if=sse.bin of=want.bin bs=1 skip=70000 count=10 2> /dev/null
+cmp -s got.bin want.bin && pass "SSE-KMS range" || fail "SSE-KMS range"
+check "SSE-KMS's ETag is not the MD5" "$([ "$(aws s3api head-object --bucket smoke --key sse/kms --query ETag --output text)" = "\"$(md5 -q sse.txt 2>/dev/null || md5sum sse.txt | cut -d' ' -f1)\"" ] && echo md5 || echo other)" other
+check "SSE-KMS, a key there is not" "$(code s3api put-object --bucket smoke --key sse/kms3 --body sse.txt --server-side-encryption aws:kms --ssekms-key-id nobody)" InvalidArgument
+check "SSE-KMS:DSSE" "$(code s3api put-object --bucket smoke --key sse/kms3 --body sse.txt --server-side-encryption aws:kms:dsse)" NotImplemented
+aws s3 cp --only-show-errors cp.bin s3://smoke/sse/kmsmp.bin --sse aws:kms --sse-kms-key-id orders > /dev/null 2>&1 || fail "SSE-KMS multipart cp"
+aws s3 cp --only-show-errors s3://smoke/sse/kmsmp.bin got.bin > /dev/null 2>&1
+cmp -s got.bin cp.bin && pass "SSE-KMS multipart both ways" || fail "SSE-KMS multipart both ways"
+check "SSE-KMS multipart head" "$(aws s3api head-object --bucket smoke --key sse/kmsmp.bin --query SSEKMSKeyId --output text)" orders
+check "SSE-KMS copied to SSE-S3" "$(aws s3api copy-object --bucket smoke --key sse/kmscopy --copy-source smoke/sse/kms2 --server-side-encryption AES256 --query ServerSideEncryption --output text)" AES256
+aws s3api get-object --bucket smoke --key sse/kmscopy got.bin > /dev/null 2>&1
+cmp -s got.bin sse.bin && pass "SSE-KMS copied reads" || fail "SSE-KMS copied reads"
+check "copied into SSE-KMS" "$(aws s3api copy-object --bucket smoke --key sse/tokms --copy-source smoke/a/small.txt --server-side-encryption aws:kms --ssekms-key-id orders --query SSEKMSKeyId --output text)" orders
 # SSE-C only over TLS (ADR-0046 §6; tools/tls_smoke.sh serves it): over plain HTTP it is refused, not stored.
 check "SSE-C over HTTP" "$(code s3api put-object --bucket smoke --key sse.txt --body pub.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901)" InvalidRequest
 check "a read with a key over HTTP" "$(code s3api get-object --bucket smoke --key sse.txt --sse-customer-algorithm AES256 --sse-customer-key 01234567890123456789012345678901 got.txt)" InvalidRequest

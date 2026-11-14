@@ -13,6 +13,13 @@ const POST_FIELDS_LIMIT: usize = 65536;
 struct FormField {
     name: Vector<u8>;
     value: Vector<u8>;
+
+    /// A form's SSE-C key is wiped with its field (ADR-0046 §6).
+    drop {
+        if (isCustomerKeyField(this.name.view())) {
+            for (k in 0..this.value.length) { this.value[k] = 0; }
+        }
+    }
 }
 
 fn fieldOf<region a>(fields: borrow(a) Vector<FormField>, name: StringView) -> Slice<a, u8>? {
@@ -564,12 +571,17 @@ async fn postObject(
     // TLS. Any other encryption field (SSE-KMS's) is refused, not ignored.
     for (i in 0..fields.length) {
         let name = fields[i].name.view();
-        if (isSseField(name) && name != SSE_FIELD.bytes() && !startsWithBytes(name, SSE_CUSTOMER.bytes())) {
+        let served = name == SSE_FIELD.bytes() || startsWithBytes(name, SSE_CUSTOMER.bytes()) ||
+            name == "x-amz-server-side-encryption-aws-kms-key-id".bytes() ||
+            name == "x-amz-server-side-encryption-context".bytes();
+        if (isSseField(name) && !served) {
             return Err(S3Fail.Code(S3Code.NotImplemented));
         }
     }
     let fromForm = sseOfFields(
         fieldOf(borrow fields, "x-amz-server-side-encryption"),
+        fieldOf(borrow fields, "x-amz-server-side-encryption-aws-kms-key-id"),
+        fieldOf(borrow fields, "x-amz-server-side-encryption-context"),
         fieldOf(borrow fields, "x-amz-server-side-encryption-customer-algorithm"),
         fieldOf(borrow fields, "x-amz-server-side-encryption-customer-key"),
         fieldOf(borrow fields, "x-amz-server-side-encryption-customer-key-md5"),
@@ -608,10 +620,12 @@ async fn postObject(
         null => {}
     }
     if (metadata.length > MAX_METADATA_BYTES) { return Err(S3Fail.Code(S3Code.MetadataTooLarge)); }
+    var envelope = Vector<u8>.create();
     var sealer: SseSealer? = null;
-    match (newSeal(app.sseKeys.view(), borrow asked)?) {
+    match (newSeal(app.sseKeys.view(), app.kmsKeys.view(), borrow asked)?) {
         Some(seal) => {
             metadataAdd(mut metadata, SSE_FIELD.bytes(), seal.field.view())?;
+            envelope.extend(seal.field.view())?;
             // The file's size is not known: the sealer does not need it.
             sealer = Some(sealerOf(borrow seal, 0, customer)?);
         }
@@ -700,7 +714,7 @@ async fn postObject(
         PutIf.None,
         "".bytes(),
     )?;
-    if (sealing) { sseAnswerFields(exchange, customer)?; }
+    if (sealing) { sseAnswerOf(exchange, envelope.view(), customer)?; }
     return await sendPostResult(exchange, borrow fields, bucket, keyText, borrow outcome);
 }
 

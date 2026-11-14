@@ -87,6 +87,13 @@ connections get the new certificate; open ones are not closed.
   nothing is under an old key, its line can go.
 - **A bucket's default** (PutBucketEncryption with `AES256`) seals every object written without fields of its own;
   it needs the key file, and is refused without one. It does not seal objects already stored.
+- **SSE-KMS's key file** (`--kms-key-file`) has the same format; a request picks a key by id (or an ARN ending in
+  `key/<id>`), and the first is the default. Keep its keys apart from the master keys: an id names a key of one
+  kind. A KMS key is not rotated under its id: add a key with a new id, point clients or the bucket default at it,
+  and copy objects onto themselves with `--ssekms-key-id <new id>`; remove the old line when nothing is under it.
+- **Requiring encryption:** a bucket policy that denies `s3:PutObject` unless
+  `s3:x-amz-server-side-encryption` is `AES256` (or `aws:kms`), or a bucket default, which seals what comes without
+  fields. A policy sees only the request's fields, not the default.
 - **SSE-C** needs TLS: over plain HTTP a request with a customer key is refused (`InvalidRequest`). The key is never
   stored or logged; an object under it cannot be read without it, by anyone, and a lost key loses the object.
 - **An object whose key is not in the file** cannot be read: `InternalError`, and stderr says
@@ -239,8 +246,9 @@ There is no backup command and no replication yet (M6).
 
 ## Not yet
 
-- **Encryption at rest** is SSE-S3 and SSE-C on every write and read, with `serve --sse-key-file`, and a bucket's
-  default (ADR-0046). SSE-KMS is refused with `NotImplemented`, never stored in the clear. Keys, metadata, sizes and an
+- **Encryption at rest** is SSE-S3, SSE-KMS and SSE-C on every write and read, with `serve --sse-key-file` and
+  `--kms-key-file`, and a bucket's default (ADR-0046, ADR-0055). There is no KMS service behind SSE-KMS: its keys
+  are a file. An encryption context and `aws:kms:dsse` are refused with `NotImplemented`, never ignored. Keys, metadata, sizes and an
   SSE-S3 object's ETag (its plaintext's MD5) are not encrypted; for those, encrypt the volume too.
 - One node: no replication, no failover.
 - No call to force a credentials reload or an upkeep round (both come within a round), nor to change an option

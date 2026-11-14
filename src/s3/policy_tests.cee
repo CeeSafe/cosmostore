@@ -46,6 +46,9 @@ fn plainFacts() -> PolicyFacts => PolicyFacts {
     prefix: null,
     delimiter: null,
     maxKeys: null,
+    sseAlgorithm: null,
+    sseKmsKeyId: null,
+    sseCustomerAlgorithm: null,
 };
 
 fn decisionName(d: PolicyDecision) -> StringView => match (d) {
@@ -577,5 +580,46 @@ fn publicAccessBlockDocument() -> Result<void, TestFailure> {
     Check.isTrue(publicAccessHas([8u8][..], PUBLIC_ACCESS_RESTRICT_BUCKETS), "the setting that is on")?;
     Check.isTrue(!publicAccessHas([7u8][..], PUBLIC_ACCESS_RESTRICT_BUCKETS), "the settings that are not")?;
     Check.isTrue(!publicAccessHas("".bytes(), PUBLIC_ACCESS_BLOCK_POLICY), "no block at all")?;
+    return Ok();
+}
+
+@test
+fn policyEncryptionKeys() -> Result<void, TestFailure> {
+    // The common policy that requires SSE-S3 on writes, and one that requires SSE-C (ADR-0046).
+    let policy = policyOf(
+        """
+        {"Statement": [
+          {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::pub/enc/*"},
+          {"Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::pub/enc/*",
+           "Condition": {"StringNotEquals": {"s3:x-amz-server-side-encryption": "AES256"}}},
+          {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::pub/cust/*"},
+          {"Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::pub/cust/*",
+           "Condition": {"Null": {"s3:x-amz-server-side-encryption-customer-algorithm": "true"}}},
+          {"Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::pub/kms/*",
+           "Condition": {"StringNotLike": {"s3:x-amz-server-side-encryption-aws-kms-key-id": "app-*"}}}
+        ]}
+        """,
+    )?;
+    var facts = plainFacts();
+    Check.equalBytes("deny".bytes(), decide(borrow policy, "", "s3:PutObject", "pub/enc/a", borrow facts).view())?;
+    facts.sseAlgorithm = copyBytes("aws:kms".bytes())!;
+    Check.equalBytes("deny".bytes(), decide(borrow policy, "", "s3:PutObject", "pub/enc/a", borrow facts).view())?;
+    facts.sseAlgorithm = copyBytes("AES256".bytes())!;
+    Check.equalBytes("allow".bytes(), decide(borrow policy, "", "s3:PutObject", "pub/enc/a", borrow facts).view())?;
+    Check.equalBytes("deny".bytes(), decide(borrow policy, "", "s3:PutObject", "pub/cust/a", borrow facts).view())?;
+    facts.sseCustomerAlgorithm = copyBytes("AES256".bytes())!;
+    Check.equalBytes("allow".bytes(), decide(borrow policy, "", "s3:PutObject", "pub/cust/a", borrow facts).view())?;
+    Check.equalBytes("deny".bytes(), decide(borrow policy, "", "s3:PutObject", "pub/kms/a", borrow facts).view())?;
+    facts.sseKmsKeyId = copyBytes("app-orders".bytes())!;
+    Check.equalBytes("neither".bytes(), decide(borrow policy, "", "s3:PutObject", "pub/kms/a", borrow facts).view())?;
+    // The keys come from the request's fields.
+    var req = bareRequest();
+    req.headers.push(policyHeader("x-amz-server-side-encryption", "AES256"))!;
+    req.headers.push(policyHeader("x-amz-server-side-encryption-aws-kms-key-id", "app-1"))!;
+    req.headers.push(policyHeader("x-amz-server-side-encryption-customer-algorithm", "AES256"))!;
+    let got = policyFacts(borrow req, false, true, null)!;
+    Check.isTrue(factText(borrow got, PolicyKey.SseAlgorithm).isSome(), "the algorithm")?;
+    Check.isTrue(factText(borrow got, PolicyKey.SseKmsKeyId).isSome(), "the KMS key id")?;
+    Check.isTrue(factText(borrow got, PolicyKey.SseCustomerAlgorithm).isSome(), "the customer algorithm")?;
     return Ok();
 }

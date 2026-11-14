@@ -1,8 +1,8 @@
 # ADR-0046: Server-side encryption (SSE-S3 and SSE-C)
 
-**Status:** proposed for M5 (item 4), 13 Nov 2026. The formats and the parts that need no cipher are built
-(`src/s3/sse.cee`); sealing and opening wait for AES-256-GCM in CeeSafe's lib/std (`CEESAFE_GAPS.md`, G33). Until
-then a request that asks for encryption is NotImplemented.
+**Status:** accepted for M5 (item 4), 14 Nov 2026, as built (the owner, asking for its status to be settled with
+the rest of item 4), and built (`src/s3/sse.cee`, `src/store/sealed.cee`). Proposed 13 Nov 2026, when sealing waited
+for AES-256-GCM in CeeSafe's lib/std (G33). SSE-KMS is ADR-0055.
 
 **14 Nov 2026: built.** G33 is fixed in ceesafec 0.45.0 (CeeSafe ADR 0135). `serve --sse-key-file`; SSE-S3, SSE-C and
 a bucket's default on PutObject, POST object, CopyObject, CreateMultipartUpload, UploadPart, UploadPartCopy and

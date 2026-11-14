@@ -75,7 +75,7 @@ fn sseChunkGeometry() -> Result<void, TestFailure> {
 @test
 fn sseEnvelopeAsText() -> Result<void, TestFailure> {
     var e = SseEnvelope {
-        customer: false,
+        customer: false, kms: false,
         keyId: copyBytes("key-2026_11".bytes())!,
         nonce: [0u8; 12],
         wrapped: [0u8; 48],
@@ -95,7 +95,13 @@ fn sseEnvelopeAsText() -> Result<void, TestFailure> {
     Check.equalBytes(e.nonce[..], back.nonce[..])?;
     Check.equalBytes(e.wrapped[..], back.wrapped[..])?;
     // SSE-C: no key id.
-    var c = SseEnvelope { customer: true, keyId: copyBytes("-".bytes())!, nonce: [7u8; 12], wrapped: [9u8; 48] };
+    var c = SseEnvelope {
+        customer: true,
+        kms: false,
+        keyId: copyBytes("-".bytes())!,
+        nonce: [7u8; 12],
+        wrapped: [9u8; 48],
+    };
     var ctext = Vector<u8>.create();
     encodeEnvelope(borrow c, mut ctext)!;
     Check.isTrue(startsWithBytes(ctext.view(), "v1.c.-.0707".bytes()), "a customer's envelope")?;
@@ -104,7 +110,7 @@ fn sseEnvelopeAsText() -> Result<void, TestFailure> {
     let hexNonce = "000102030405060708090a0b";
     var wrapped = Vector<u8>.create();
     for (i in 0..96) { wrapped.push('a')!; }
-    let heads = ["v2.s3.k.", "v1.kms.k.", "v1.s3..", "v1.s3.-.", "v1.c.k.", "v1.s3.bad id.", "v1.s3.k.x."];
+    let heads = ["v2.s3.k.", "v1.sse.k.", "v1.kms.-.", "v1.s3..", "v1.s3.-.", "v1.c.k.", "v1.s3.bad id.", "v1.s3.k.x."];
     for (h in heads) {
         var bad = Vector<u8>.create();
         bad.extend(h.bytes())!;
@@ -171,14 +177,32 @@ fn sseKeyFile() -> Result<void, TestFailure> {
     return Ok();
 }
 
-fn sseAnswer(managed: StringView, algorithm: StringView, key: StringView, md5: StringView) -> Vector<u8> {
+fn sseAnswer(managed: StringView, algorithm: StringView, key: StringView, md5: StringView) -> Vector<u8> =>
+    sseKmsAnswer(managed, "", "", algorithm, key, md5);
+
+fn sseKmsAnswer(
+    managed: StringView,
+    kmsKey: StringView,
+    context: StringView,
+    algorithm: StringView,
+    key: StringView,
+    md5: StringView,
+) -> Vector<u8> {
     let m: Slice<u8>? = if (managed.length > 0) Some(managed.bytes()) else null;
+    let kk: Slice<u8>? = if (kmsKey.length > 0) Some(kmsKey.bytes()) else null;
+    let c: Slice<u8>? = if (context.length > 0) Some(context.bytes()) else null;
     let a: Slice<u8>? = if (algorithm.length > 0) Some(algorithm.bytes()) else null;
     let k: Slice<u8>? = if (key.length > 0) Some(key.bytes()) else null;
     let d: Slice<u8>? = if (md5.length > 0) Some(md5.bytes()) else null;
-    let answer = match (sseOfFields(m, a, k, d)) {
+    var named = Vector<u8>.create();
+    let answer = match (sseOfFields(m, kk, c, a, k, d)) {
         Ok(SseRequest.None) => "none",
         Ok(SseRequest.Managed) => "managed",
+        Ok(SseRequest.Kms(name)) => {
+            named.extend("kms:".bytes())!;
+            named.extend(name.view())!;
+            StringView.fromUtf8(named.view()) ?? "?"
+        }
         Ok(SseRequest.Customer(given)) => if (given[0] == 0 && given[31] == 0) "customer" else "another key",
         Err(S3Fail.Code(code)) => s3CodeName(code),
         Err(_) => "failed",
@@ -198,7 +222,18 @@ fn sseRequestFields() -> Result<void, TestFailure> {
     };
     Check.equalBytes("none".bytes(), sseAnswer("", "", "", "").view())?;
     Check.equalBytes("managed".bytes(), sseAnswer("AES256", "", "", "").view())?;
-    Check.equalBytes("NotImplemented".bytes(), sseAnswer("aws:kms", "", "", "").view())?;
+    // SSE-KMS (ADR-0055): the key's id, or its last piece of an ARN; the default key without one.
+    Check.equalBytes("kms:".bytes(), sseAnswer("aws:kms", "", "", "").view())?;
+    Check.equalBytes("kms:orders".bytes(), sseKmsAnswer("aws:kms", "orders", "", "", "", "").view())?;
+    Check.equalBytes(
+        "kms:k-1".bytes(),
+        sseKmsAnswer("aws:kms", "arn:aws:kms:us-east-1:000000000000:key/k-1", "", "", "", "").view(),
+    )?;
+    Check.equalBytes("InvalidArgument".bytes(), sseKmsAnswer("aws:kms", "a key", "", "", "", "").view())?;
+    Check.equalBytes("InvalidArgument".bytes(), sseKmsAnswer("AES256", "orders", "", "", "", "").view())?;
+    Check.equalBytes("InvalidArgument".bytes(), sseKmsAnswer("", "orders", "", "", "", "").view())?;
+    Check.equalBytes("NotImplemented".bytes(), sseKmsAnswer("aws:kms", "", "e30=", "", "", "").view())?;
+    Check.equalBytes("NotImplemented".bytes(), sseAnswer("aws:kms:dsse", "", "", "").view())?;
     Check.equalBytes("InvalidArgument".bytes(), sseAnswer("AES128", "", "", "").view())?;
     Check.equalBytes("customer".bytes(), sseAnswer("", "AES256", zeros, md5).view())?;
     Check.equalBytes("InvalidArgument".bytes(), sseAnswer("AES256", "AES256", zeros, md5).view())?;
@@ -356,7 +391,7 @@ fn sseWrapsDataKeys() -> Result<void, TestFailure> {
     for (i in 0..32) { dataKey[i] = truncate<u8>(100 + i); }
     var nonce = [0u8; 12];
     for (i in 0..12) { nonce[i] = truncate<u8>(i); }
-    let wrapped = match (wrapDataKey(borrow master, false, borrow dataKey, nonce)) {
+    let wrapped = match (wrapDataKey(borrow master, "s3", borrow dataKey, nonce)) {
         Some(w) => w,
         null => { return Check.fail("no cipher for the master key"); }
     };
@@ -367,7 +402,13 @@ fn sseWrapsDataKeys() -> Result<void, TestFailure> {
         "2367b07cad8ca870e12cf9e4c1980a1ef7a3f14388022507441a9bfa9de88231f2b64d8bc19091e1ffbd90adf361693a".bytes(),
         hex.view(),
     )?;
-    var e = SseEnvelope { customer: false, keyId: copyBytes("k1".bytes())!, nonce: nonce, wrapped: wrapped };
+    var e = SseEnvelope {
+        customer: false,
+        kms: false,
+        keyId: copyBytes("k1".bytes())!,
+        nonce: nonce,
+        wrapped: wrapped,
+    };
     match (unwrapDataKey(borrow master, borrow e)) {
         Some(k) => { Check.equalBytes(dataKey[..], k[..])?; }
         null => { return Check.fail("the data key did not open"); }
@@ -448,7 +489,13 @@ fn sseManagedKeysRotate() -> Result<void, TestFailure> {
     Check.isTrue(sseKeyFaultIs(managedDataKey(swapped.view(), seal.field.view()), SseKeyFault.Broken), "broken")?;
     Check.isTrue(sseKeyFaultIs(managedDataKey(keys.view(), "v1.s3.k1.00".bytes()), SseKeyFault.Broken), "broken")?;
     // An SSE-C envelope needs the request's key.
-    var c = SseEnvelope { customer: true, keyId: copyBytes("-".bytes())!, nonce: [0u8; 12], wrapped: [0u8; 48] };
+    var c = SseEnvelope {
+        customer: true,
+        kms: false,
+        keyId: copyBytes("-".bytes())!,
+        nonce: [0u8; 12],
+        wrapped: [0u8; 48],
+    };
     var field = Vector<u8>.create();
     encodeEnvelope(borrow c, mut field)!;
     Check.isTrue(sseKeyFaultIs(managedDataKey(keys.view(), field.view()), SseKeyFault.Customer), "customer")?;
@@ -460,7 +507,13 @@ fn putSealed(s: borrow mut ObjectStore, key: StringView, text: Slice<u8>, stored
     var obj = s.writeAll(stored)!;
     obj.size = text.length as u64;
     obj.md5 = Md5.of(text);
-    var e = SseEnvelope { customer: false, keyId: copyBytes("k1".bytes())!, nonce: [0u8; 12], wrapped: [0u8; 48] };
+    var e = SseEnvelope {
+        customer: false,
+        kms: false,
+        keyId: copyBytes("k1".bytes())!,
+        nonce: [0u8; 12],
+        wrapped: [0u8; 48],
+    };
     var field = Vector<u8>.create();
     encodeEnvelope(borrow e, mut field)!;
     var metadata = Vector<u8>.create();
@@ -653,7 +706,7 @@ fn sseCustomerEnvelopesNeedTheirKey() -> Result<void, TestFailure> {
     for (i in 0..32) { key[i] = truncate<u8>(200 - i); }
     let keys = Vector<MasterKey>.create();
     let asked = SseRequest.Customer(key);
-    let seal = match (newSeal(keys.view(), borrow asked)) {
+    let seal = match (newSeal(keys.view(), keys.view(), borrow asked)) {
         Ok(Some(s)) => s,
         _ => { return Check.fail("no SSE-C seal"); }
     };
@@ -675,8 +728,8 @@ fn sseCustomerEnvelopesNeedTheirKey() -> Result<void, TestFailure> {
     Check.isTrue(sseKeyFaultIs(managedDataKey(keys.view(), seal.field.view()), SseKeyFault.Customer), "SSE-C")?;
     let managedAsked = SseRequest.Managed;
     let none = SseRequest.None;
-    Check.isTrue(newSeal(keys.view(), borrow managedAsked).isErr(), "no key file")?;
-    Check.isTrue(newSeal(keys.view(), borrow none)!.isNull(), "nothing asked")?;
+    Check.isTrue(newSeal(keys.view(), keys.view(), borrow managedAsked).isErr(), "no key file")?;
+    Check.isTrue(newSeal(keys.view(), keys.view(), borrow none)!.isNull(), "nothing asked")?;
     // Its ETag is a digest of the plaintext's MD5 under the key: not the MD5, the same for the same bytes, another
     // under another key.
     let sealer = sealerOf(borrow seal, 10, Some(key))!;
@@ -722,10 +775,56 @@ fn sseBucketEncryptionXml() -> Result<void, TestFailure> {
     Check.isTrue(parseBucketEncryption(aes.bytes()).isOk(), "AES256")?;
     let kms =
         "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
-    Check.isTrue(parseBucketEncryption(kms.bytes()).isErr(), "aws:kms")?;
+    Check.equalBytes("aws:kms".bytes(), parseBucketEncryption(kms.bytes())!.view())?;
+    let named =
+        "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>arn:aws:kms:us-east-1:1:key/orders</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
+    Check.equalBytes("aws:kms orders".bytes(), parseBucketEncryption(named.bytes())!.view())?;
+    let dsse =
+        "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms:dsse</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
+    Check.isTrue(parseBucketEncryption(dsse.bytes()).isErr(), "aws:kms:dsse")?;
+    Check.isTrue(isEncryptionValue("aws:kms orders".bytes()) && !isEncryptionValue("aws:kms a b".bytes()), "stored")?;
     Check.isTrue(parseBucketEncryption("<ServerSideEncryptionConfiguration/>".bytes()).isErr(), "no rule")?;
     let other =
         "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>DES</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
     Check.isTrue(parseBucketEncryption(other.bytes()).isErr(), "DES")?;
+    return Ok();
+}
+
+@test
+fn sseKmsSealsUnderNamedKeys() -> Result<void, TestFailure> {
+    var kmsKeys = Vector<MasterKey>.create();
+    kmsKeys.push(sseKeyOf("app-default", 9))!;
+    kmsKeys.push(sseKeyOf("orders", 40))!;
+    var masterKeys = Vector<MasterKey>.create();
+    masterKeys.push(sseKeyOf("orders", 77))!;
+    // No name: the KMS key file's first key; a name: that key; the envelope is SSE-KMS's and names it.
+    let byDefault = SseRequest.Kms(KmsKeyName { length: 0, bytes: [0u8; 32] });
+    let first = match (newSeal(masterKeys.view(), kmsKeys.view(), borrow byDefault)) {
+        Ok(Some(s)) => s,
+        _ => { return Check.fail("no SSE-KMS seal"); }
+    };
+    Check.isTrue(startsWithBytes(first.field.view(), "v1.kms.app-default.".bytes()), "the first key")?;
+    Check.isTrue(first.kms && !first.customer, "SSE-KMS")?;
+    let named = SseRequest.Kms(kmsKeyNameOf("orders".bytes()) ?? KmsKeyName { length: 0, bytes: [0u8; 32] });
+    let seal = match (newSeal(masterKeys.view(), kmsKeys.view(), borrow named)) {
+        Ok(Some(s)) => s,
+        _ => { return Check.fail("no SSE-KMS seal"); }
+    };
+    Check.isTrue(isKmsEnvelope(seal.field.view()), "a KMS envelope")?;
+    match (managedDataKey(kmsKeys.view(), seal.field.view())) {
+        Ok(k) => { Check.equalBytes(seal.dataKey[..], k[..])?; }
+        Err(_) => { return Check.fail("the KMS key does not open it"); }
+    }
+    // SSE-S3's master key of the same id does not open it: the mode is the wrapping's associated data.
+    Check.isTrue(sseKeyFaultIs(managedDataKey(masterKeys.view(), seal.field.view()), SseKeyFault.Broken), "apart")?;
+    // A name the file does not have, and no KMS key file at all.
+    let unknown = SseRequest.Kms(kmsKeyNameOf("nobody".bytes()) ?? KmsKeyName { length: 0, bytes: [0u8; 32] });
+    Check.isTrue(newSeal(masterKeys.view(), kmsKeys.view(), borrow unknown).isErr(), "unknown key")?;
+    let none = Vector<MasterKey>.create();
+    Check.isTrue(newSeal(masterKeys.view(), none.view(), borrow byDefault).isErr(), "no KMS keys")?;
+    // Its ETag is not the plaintext's MD5.
+    let sealer = sealerOf(borrow seal, 3, null)!;
+    let md5 = Md5.of("abc".bytes());
+    Check.isTrue(sealedEtag(borrow sealer, md5)[..] != md5[..], "not the MD5")?;
     return Ok();
 }

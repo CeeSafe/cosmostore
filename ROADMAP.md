@@ -2203,3 +2203,32 @@ Browser form uploads with a SigV4 POST policy.
   for kinds 8 to 10); the store's fault tests pass.
 - **Not done:** SSE-KMS; the policy condition keys for encryption; wiping every copy of an SSE-C key in memory
   (the request's buffer is not wiped).
+
+### 14 Nov 2026: M5 item 4 closed, SSE-KMS, the policy keys, wiping SSE-C keys (ADR-0055, ADR-0046 accepted)
+
+- **Asked by the user** (14 Nov, "Continue to those remaining": SSE-KMS, the policy condition keys, the SSE-C key
+  copies, ADR-0046's status).
+- **SSE-KMS** (ADR-0055, proposed): `serve --kms-key-file`, named keys in the key file's format, apart from SSE-S3's
+  master keys. `aws:kms` with a key id (or an ARN ending in it), else the file's first key; envelope mode `kms`;
+  answers name the key; the ETag is a digest of the plaintext's MD5 under the data key. On PutObject, POST,
+  CopyObject (both ways), CreateMultipartUpload, UploadPart, UploadPartCopy and Complete; a bucket default of
+  `aws:kms`, with or without `KMSMasterKeyID` (kind 11's value, no format change). An unknown key is
+  InvalidArgument; an encryption context and `aws:kms:dsse` NotImplemented; without the file, NotImplemented as
+  before. No KMS service: the keys are a file.
+- **UploadPart and Complete** may repeat the upload's SSE-S3 or SSE-KMS fields (the upload's key governs), as
+  s3-tests has S3 do; into an upload in the clear or under SSE-C they are InvalidArgument.
+- **Policy condition keys:** `s3:x-amz-server-side-encryption`, `...-aws-kms-key-id` and `...-customer-algorithm`,
+  from the request's fields, with the string operators and `Null`.
+- **SSE-C keys wiped:** a request's key fields (its own and a copy source's) when the request is dropped, a POST
+  form's, and the sealer's copy for the ETag. Not reached: CeeSafe.Web's receive buffer, 32-byte copies on the
+  stack, and `HmacSha256`'s key state, logged as G34 for CeeSafe.
+- **ADR-0046** is accepted as built.
+- **Tests (228 passed, 0 failed):** `sseKmsSealsUnderNamedKeys`, `policyEncryptionKeys`, SSE-KMS's fields in
+  `sseRequestFields`, KMS defaults in `sseBucketEncryptionXml` and `defaultEncryptionSurvivesReplayAndCheckpoints`.
+- **Clients:** `tools/s3_smoke.sh` 409 checks, all passed (15 new: SSE-KMS by default and by name, HEAD, GET, a
+  range, its ETag, an unknown key, DSSE refused, multipart both ways, copies out of and into SSE-KMS, a bucket
+  default of SSE-KMS). `tools/tls_smoke.sh` 41, boto3 145, the s3-tests subset 377, as before.
+- **s3-tests' encryption tests over TLS:** 141 passed, 5 failed, 1 skipped (from 81 passed). The five: four POST
+  tests that sign with SigV2 or do not trust the test certificate, and `test_sse_kms_no_key`, which expects
+  `aws:kms` without a key id to be refused (RGW); AWS uses its default key, and so does CosmoStore.
+- **M5 item 4 is done.** Left of it: a KMS service behind ADR-0055's keys, if one is wanted.

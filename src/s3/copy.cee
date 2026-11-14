@@ -538,10 +538,12 @@ async fn copyObject(
         Ok(b) => b,
         Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
     };
+    var envelope = Vector<u8>.create();
     var sealer: SseSealer? = null;
-    match (newSeal(app.sseKeys.view(), borrow asked)?) {
+    match (newSeal(app.sseKeys.view(), app.kmsKeys.view(), borrow asked)?) {
         Some(seal) => {
             metadataAdd(mut metadata, SSE_FIELD.bytes(), seal.field.view())?;
+            envelope.extend(seal.field.view())?;
             sealer = Some(sealerOf(borrow seal, plan.size, customerKeyOf(borrow asked))?);
         }
         null => {}
@@ -562,7 +564,7 @@ async fn copyObject(
         etags.view(),
     )?;
     writtenVersionHeader(exchange, borrow outcome)?;
-    if (sealing) { sseAnswerFields(exchange, customerKeyOf(borrow asked))?; }
+    if (sealing) { sseAnswerOf(exchange, envelope.view(), customerKeyOf(borrow asked))?; }
     return await sendCopyResult(exchange, "CopyObjectResult", borrow outcome.md5, outcome.extras.view());
 }
 
@@ -582,25 +584,29 @@ async fn uploadPartCopy(
     // Into a sealed upload, the part is sealed as UploadPart seals one: under the key of a salt of its own
     // (ADR-0046 §2); an SSE-C upload's key comes with the request.
     let customer = sseCustomerKeyOf(req, false)?;
+    checkPartFields(req, plan.uploadEnvelope.view())?;
     var sealer: SseSealer? = null;
     if (plan.uploadEnvelope.length > 0) {
         var dataKey = await sealedDataKey(app, plan.uploadEnvelope.view(), customer)?;
         var salt = [0u8; 16];
         if (Random.fill(mut salt[..]).isErr()) { return Err(S3Fail.Code(S3Code.InternalError)); }
         sealer = SseSealer.createPart(borrow dataKey, salt, plan.size)?;
-        for (i in 0..32) { dataKey[i] = 0; }
         match (sealer.asBorrowMut()) {
             Some(s) => {
                 if (isCustomerEnvelope(plan.uploadEnvelope.view())) { s.etagKey = customer; }
+                if (isKmsEnvelope(plan.uploadEnvelope.view())) { s.etagKey = Some(dataKey); }
             }
             null => { return Err(S3Fail.Code(S3Code.InternalError)); }
         }
+        for (i in 0..32) { dataKey[i] = 0; }
     } else if (customer.isSome()) {
         return Err(S3Fail.Code(S3Code.InvalidRequest));
     }
     let sealing = sealer.isSome();
+    var envelope = Vector<u8>.create();
+    envelope.extend(plan.uploadEnvelope.view())?;
     let copied = await runCopy(plan, opener, sealer)?;
-    if (sealing) { sseAnswerFields(exchange, customer)?; }
+    if (sealing) { sseAnswerOf(exchange, envelope.view(), customer)?; }
     let md5 = await commitPart(
         app,
         req.bucket.view(),
