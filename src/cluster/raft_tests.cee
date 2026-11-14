@@ -128,10 +128,21 @@ fn simDecodeState(data: Slice<u8>) -> Vector<u64> {
     return out;
 }
 
-fn simCopyEntries(from: Slice<RaftEntry>) -> Vector<RaftEntry> {
-    var out = Vector<RaftEntry>.create();
-    for (i in 0..from.length) { out.push(from[i].copy()!)!; }
+fn simTermsOf(from: Slice<RaftEntry>) -> Vector<u64> {
+    var out = Vector<u64>.create();
+    for (i in 0..from.length) { out.push(from[i].term)!; }
     return out;
+}
+
+/// A copy of entry `index` of a replica's persisted log: the host's, which the core names and never holds.
+fn simDiskEntry(sim: borrow Sim, at: usize, index: u64) -> Result<RaftEntry, TestFailure> {
+    let base = sim.nodes[at].disk.snapIndex;
+    if (index <= base || index > base + (sim.nodes[at].disk.log.length as u64)) {
+        return Err(TestFailure.create("the core named an entry the log does not have"));
+    }
+    let e = borrow sim.nodes[at].disk.log[(index - base - 1) as usize];
+    if (e.index != index) { return Err(TestFailure.create("the log's entries are not at their indexes")); }
+    return Ok(e.copy()!);
 }
 
 fn simCopyValues(from: Slice<u64>) -> Vector<u64> {
@@ -256,16 +267,27 @@ fn simDrain(sim: borrow mut Sim, at: usize) -> Result<void, TestFailure> {
                 m.data = simEncodeState(sim.nodes[at].disk.snapState.view());
                 sim.snapshotsSent = sim.snapshotsSent + 1;
             }
+            if (m.kind == RAFT_APPEND) {
+                // The core names the entries; the host reads them from its log.
+                var i = m.index + 1;
+                while (i <= m.index + m.count) {
+                    m.entries.push(simDiskEntry(sim, at, i)?)!;
+                    i = i + 1;
+                }
+                m.count = 0;
+            }
             simSend(sim, m);
         }
         // 4. Committed entries are applied in order.
-        for (k in 0..ready.committed.length) {
-            let e = borrow ready.committed[k];
+        var applying = ready.applyFrom;
+        while (applying <= ready.applyTo) {
             let expected = (sim.nodes[at].state.length as u64) + 1;
-            if (e.index != expected) { return Check.fail("an entry applied out of order"); }
-            let value = simValueOf(e.data.view());
-            simCheckApplied(sim, e.index, value)?;
+            if (applying != expected) { return Check.fail("an entry applied out of order"); }
+            let entry = simDiskEntry(sim, at, applying)?;
+            let value = simValueOf(entry.data.view());
+            simCheckApplied(sim, applying, value)?;
             sim.nodes[at].state.push(value)!;
+            applying = applying + 1;
         }
         // Reads: the index must cover every entry applied anywhere before the read was asked.
         for (k in 0..ready.reads.length) {
@@ -373,7 +395,7 @@ fn simRestart(sim: borrow mut Sim, at: usize, count: u32, seed: u64) {
         vote: sim.nodes[at].disk.vote,
         commit: sim.nodes[at].disk.commit,
     };
-    let entries = simCopyEntries(sim.nodes[at].disk.log.view());
+    let entries = simTermsOf(sim.nodes[at].disk.log.view());
     let core = RaftCore.restore(
         simConfig(id, count, seed + sim.now),
         hard,
@@ -648,7 +670,7 @@ fn raftAConflictingSuffixIsReplaced() -> Result<void, TestFailure> {
     core.step(append)!;
     let first = core.ready()!;
     Check.equalU64(3, first.entries.length as u64)?;
-    Check.equalU64(1, first.committed.length as u64)?;
+    Check.equalU64(1, first.applyTo + 1 - first.applyFrom)?;
     core.advance();
     // Leader 3 of term 2 has entry 1 of term 1, then its own entry 2 of term 2.
     var next = core.message(RAFT_APPEND, 2);
@@ -665,8 +687,9 @@ fn raftAConflictingSuffixIsReplaced() -> Result<void, TestFailure> {
     Check.equalU64(1, second.entries.length as u64)?; // persist from 2 on: the old 2 and 3 are gone
     Check.equalU64(2, second.entries[0].index)?;
     Check.equalU64(2, core.lastIndex())?;
-    Check.equalU64(1, second.committed.length as u64)?;
-    Check.equalU64(99, simValueOf(second.committed[0].data.view()))?;
+    Check.equalU64(2, second.applyFrom)?;
+    Check.equalU64(2, second.applyTo)?;
+    Check.equalU64(99, simValueOf(second.entries[0].data.view()))?;
     Check.equalU64(1, second.messages.length as u64)?; // one reply
     Check.isTrue(second.messages[0].granted, "the append is taken")?;
     return Ok();
@@ -720,6 +743,7 @@ fn simReply(kind: u8, from: u32, term: u64) -> RaftMessage {
         commit: 0,
         granted: true,
         round: 0,
+        count: 0,
         entries: Vector<RaftEntry>.create(),
         data: Vector<u8>.create(),
     };

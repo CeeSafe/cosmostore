@@ -1,0 +1,281 @@
+// The journal as a Raft log (ADR-0058, M6 item 2 slice b): entries with terms, the other kind refused, entries found
+// by LSN, rotation only at a committed entry, a suffix cut off, a checkpoint that does not seal; and fault sweeps in
+// which a recovered log is a prefix of what was being written, holding every entry acknowledged and nothing cut off.
+
+/// A segment fills after about seven entries; a batch holds at most three.
+fn raftJournalConfig() -> JournalConfig =>
+    JournalConfig { segmentTargetBytes: 700, maxBatchBytes: 4096, shardId: 0, raftLog: true };
+
+/// The terms of a Raft log's entries, as recovery replays them from `start`; null if the open fails.
+fn raftReplay(dir: StringView, start: JournalStart) -> Result<Vector<u64>, JournalError> {
+    var terms = Vector<u64>.create();
+    var last = start.lsn;
+    var order = true;
+    let journal = Journal.openFrom(dir, raftJournalConfig(), start, (segment, offset, header, bytes) => {
+        if (header.lsn != last + 1) { order = false; }
+        last = header.lsn;
+        terms.push(header.term)!;
+    })?;
+    if (!order) { return Err(JournalError.Corrupt(0, 0)); }
+    return Ok(terms);
+}
+
+fn entryRecord(lsn: u64, term: u64) -> Vector<u8> {
+    var payload = Vector<u8>.create();
+    payloadFor(lsn, mut payload);
+    var record = Vector<u8>.create();
+    encodeRecord(mut record, RecordType.PutInline, 0, lsn, term, "bucket\0key".bytes(), payload.view())!;
+    return record;
+}
+
+@test
+fn raftLogRefusesTheOtherKind() -> Result<void, TestFailure> {
+    let single = scratchDirectory("raft-kind-single");
+    {
+        var j = Journal.open(single.view(), smallConfig(), (s, o, h, b) => {})!;
+        let _ = j.stage(RecordType.PutInline, "m".bytes(), "p".bytes())!;
+        j.commit()!;
+    }
+    match (Journal.open(single.view(), raftJournalConfig(), (s, o, h, b) => {})) {
+        Err(JournalError.WrongMode(1)) => {}
+        _ => { return Check.fail("a single node's journal opened as a Raft log"); }
+    }
+    let raft = scratchDirectory("raft-kind-raft");
+    {
+        var j = Journal.open(raft.view(), raftJournalConfig(), (s, o, h, b) => {})!;
+        Check.isTrue(j.stage(RecordType.PutInline, "m".bytes(), "p".bytes()).isErr(), "a Raft log takes entries")?;
+        let _ = j.stageEntry(RecordType.PutInline, 1, "m".bytes(), "p".bytes())!;
+        j.commit()!;
+    }
+    match (Journal.open(raft.view(), smallConfig(), (s, o, h, b) => {})) {
+        Err(JournalError.WrongMode(1)) => {}
+        _ => { return Check.fail("a Raft log opened as a single node's journal"); }
+    }
+    removeTree(single.view());
+    removeTree(raft.view());
+    return Ok();
+}
+
+@test
+fn raftLogEntriesInOrder() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("raft-entries");
+    var j = Journal.open(dir.view(), raftJournalConfig(), (s, o, h, b) => {})!;
+    Check.isTrue(j.stageEntry(RecordType.PutInline, 0, "m".bytes(), "p".bytes()).isErr(), "term 0")?;
+    // A leader's entries, then a follower's copies of another leader's, byte for byte.
+    let first = j.stageEntry(RecordType.PutInline, 2, "m".bytes(), "p".bytes())!;
+    Check.equalU64(1, first.lsn)?;
+    Check.isTrue(j.stageEntry(RecordType.PutInline, 1, "m".bytes(), "p".bytes()).isErr(), "a term going down")?;
+    let wrongPlace = entryRecord(5, 2);
+    match (j.appendEncoded(wrongPlace.view())) {
+        Err(JournalError.OutOfOrder(2)) => {}
+        _ => { return Check.fail("an entry out of place was taken"); }
+    }
+    var lsn = 2u64;
+    while (lsn <= 20) {
+        let record = entryRecord(lsn, 3);
+        let at = j.appendEncoded(record.view())!;
+        Check.equalU64(lsn, at.lsn)?;
+        if (lsn % 3 == 0) { j.commit()!; }
+        lsn += 1;
+    }
+    j.commit()!;
+    // Nothing is committed, so the log stays in one segment past its target.
+    Check.equalU64(1, j.activeSegment())?;
+    for (k in 2..21) {
+        let index = truncate<u64>(k);
+        let expected = entryRecord(index, 3);
+        let got = j.entryBytes(index)!;
+        Check.equalBytes(expected.view(), got.view())?;
+    }
+    // Committed through the end: the full segment is sealed.
+    j.markCommitted(20);
+    Check.equalU64(2, j.activeSegment())?;
+    let more = j.stageEntry(RecordType.PutInline, 3, "m".bytes(), "p".bytes())!;
+    Check.equalU64(21, more.lsn)?;
+    j.commit()!;
+    Check.equalU64(21, j.entryAt(21)!.header.lsn)?;
+    Check.equalU64(2, j.entryAt(21)!.segment)?;
+    let terms = raftReplay(dir.view(), JournalStart.beginning())!;
+    Check.equalU64(21, terms.length as u64)?;
+    Check.equalU64(2, terms[0])?;
+    Check.equalU64(3, terms[20])?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn raftLogCutsAnUncommittedSuffix() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("raft-cut");
+    {
+        var j = Journal.open(dir.view(), raftJournalConfig(), (s, o, h, b) => {})!;
+        for (k in 1..10) {
+            let _ = j.stageEntry(RecordType.PutInline, 1, "m".bytes(), "p".bytes())!;
+            if (k % 3 == 0) { j.commit()!; }
+        }
+        j.markCommitted(6);
+        j.truncateAfter(7)!;
+        Check.equalU64(7, j.lastLsn())?;
+        Check.equalU64(1, j.lastEntryTerm())?;
+        // The new leader's entries take 8 on.
+        let at = j.appendEncoded(entryRecord(8, 2).view())!;
+        Check.equalU64(8, at.lsn)?;
+        j.commit()!;
+        // Cutting what follows the end changes nothing.
+        j.truncateAfter(8)!;
+        Check.equalU64(8, j.lastLsn())?;
+    }
+    let terms = raftReplay(dir.view(), JournalStart.beginning())!;
+    Check.equalU64(8, terms.length as u64)?;
+    Check.equalU64(1, terms[6])?;
+    Check.equalU64(2, terms[7])?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn raftLogCheckpointWithoutSealing() -> Result<void, TestFailure> {
+    // A checkpoint at 5, its segment the active one: recovery skips 1 to 5, counts their bytes, and replays 6 to 9.
+    let dir = scratchDirectory("raft-skip");
+    var bytes = 0u64;
+    {
+        var j = Journal.open(dir.view(), raftJournalConfig(), (s, o, h, b) => {})!;
+        for (k in 1..10) {
+            let at = j.stageEntry(RecordType.PutInline, 1, "m".bytes(), "p".bytes())!;
+            if (at.lsn <= 5) { bytes += recordLength(1, 1) as u64; }
+        }
+        j.commit()!;
+    }
+    var replayed = Vector<u64>.create();
+    let j = Journal.openFrom(dir.view(), raftJournalConfig(), JournalStart { segment: 1, lsn: 5 }, (s, o, h, b) => {
+        replayed.push(h.lsn)!;
+    })!;
+    Check.equalU64(4, replayed.length as u64)?;
+    Check.equalU64(6, replayed[0])?;
+    Check.equalU64(5, j.committedThrough())?; // a checkpoint's entries are committed
+    let skipped = j.skippedSegments();
+    Check.equalU64(1, skipped.length as u64)?;
+    Check.equalU64(1, skipped[0].id)?;
+    Check.equalU64(bytes, skipped[0].size)?;
+    Check.isTrue(j.entryAt(3).isErr(), "a skipped entry is the checkpoint's")?;
+    Check.equalU64(6, j.entryAt(6)!.header.lsn)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// What a Raft workload had acknowledged when it stopped, and what it was writing: a recovered log must be a prefix of
+/// `writing` (or, while a cut was failing, of `before`) at least as long as `acked`.
+struct RaftLogState {
+    acked: u64;
+    writing: Vector<u64>;
+    before: Vector<u64>;
+}
+
+/// Term 1: nine entries in three batches, six committed. A new leader of term 2 lacks 8 and 9: they are cut off,
+/// and nine entries of term 2 follow in three batches, each committed as it goes, so segments rotate.
+fn raftLogWorkload(dir: StringView) -> RaftLogState {
+    var state = RaftLogState { acked: 0, writing: Vector<u64>.create(), before: Vector<u64>.create() };
+    var j = match (Journal.open(dir, raftJournalConfig(), (s, o, h, b) => {})) {
+        Ok(j) => j,
+        Err(_) => { return state; }
+    };
+    var payload = Vector<u8>.create();
+    for (b in 0..3) {
+        for (r in 0..3) {
+            let lsn = (state.writing.length as u64) + 1;
+            payloadFor(lsn, mut payload);
+            match (j.stageEntry(RecordType.PutInline, 1, "bucket\0key".bytes(), payload.view())) {
+                Ok(_) => { state.writing.push(1)!; }
+                Err(_) => { return state; }
+            }
+        }
+        match (j.commit()) {
+            Ok() => { state.acked = state.writing.length as u64; }
+            Err(_) => { return state; }
+        }
+    }
+    j.markCommitted(6);
+    state.before = state.writing.clone()!;
+    state.writing.truncate(7);
+    state.acked = 7;
+    match (j.truncateAfter(7)) {
+        Ok() => { state.before.clear(); }
+        Err(_) => { return state; }
+    }
+    for (b in 0..3) {
+        for (r in 0..3) {
+            let lsn = (state.writing.length as u64) + 1;
+            match (j.appendEncoded(entryRecord(lsn, 2).view())) {
+                Ok(_) => { state.writing.push(2)!; }
+                Err(_) => { return state; }
+            }
+        }
+        match (j.commit()) {
+            Ok() => { state.acked = state.writing.length as u64; }
+            Err(_) => { return state; }
+        }
+        j.markCommitted(state.acked);
+    }
+    return state;
+}
+
+fn isPrefixOf(log: borrow Vector<u64>, of: borrow Vector<u64>) -> bool {
+    if (log.length > of.length) { return false; }
+    for (i in 0..log.length) {
+        if (log[i] != of[i]) { return false; }
+    }
+    return true;
+}
+
+fn sweepRaftLog(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    Faults.countOperations();
+    let all = raftLogWorkload(dir.view());
+    Faults.disarm();
+    Check.equalU64(16, all.acked)?;
+    Check.isTrue(listSegmentIds(dir.view())!.length > 1, "the workload rotated")?;
+    let points = Faults.seen();
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        armMode(borrow mode, n);
+        let state = raftLogWorkload(dir.view());
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired().min(1))?;
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        let log = raftReplay(dir.view(), JournalStart.beginning())!;
+        Check.isTrue((log.length as u64) >= state.acked, "an acknowledged entry was lost")?;
+        Check.isTrue(
+            isPrefixOf(borrow log, borrow state.writing) || isPrefixOf(borrow log, borrow state.before),
+            "the recovered log is not what was written (a cut-off entry came back?)",
+        )?;
+        // The recovered log takes the next entry.
+        {
+            var j = Journal.open(dir.view(), raftJournalConfig(), (s, o, h, b) => {})!;
+            let lsn = (log.length as u64) + 1;
+            let at = j.appendEncoded(entryRecord(lsn, 3).view())!;
+            Check.equalU64(lsn, at.lsn)?;
+            j.commit()!;
+        }
+        let again = raftReplay(dir.view(), JournalStart.beginning())!;
+        Check.equalU64((log.length as u64) + 1, again.length as u64)?;
+    }
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn raftLogFaultsOnce() -> Result<void, TestFailure> => sweepRaftLog("raft-fault-once", SweepMode.Once);
+
+@test
+fn raftLogFaultsSticky() -> Result<void, TestFailure> => sweepRaftLog("raft-fault-sticky", SweepMode.Sticky);
+
+@test
+fn raftLogFaultsTorn() -> Result<void, TestFailure> => sweepRaftLog("raft-fault-torn", SweepMode.StickyTorn);
+
+@test
+fn raftLogFaultsCrash() -> Result<void, TestFailure> => sweepRaftLog("raft-fault-crash", SweepMode.Crash);

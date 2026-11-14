@@ -15,10 +15,19 @@
 //   unacknowledged and is truncated.
 // - A failed write or sync puts the journal in the failed state: nothing more is accepted
 //   until it is reopened, because after a failed fsync the OS may have dropped dirty pages.
+//
+// A Raft log (ADR-0058, `raftLog`): every record is an entry, its LSN its Raft index and its term at least 1;
+// segment headers carry flag bit 0, and opening refuses a segment of the other kind. A segment is sealed only once
+// its last entry is committed (`markCommitted`), so an uncommitted suffix is always in the active segment, where
+// `truncateAfter` cuts it off. Terms never go down along the log.
 
 const SEGMENT_MAGIC: u64 = 0x31304745534A5343; // "CSJSEG01" in file order
 const SEGMENT_HEADER_LEN: usize = 64;
 const SEGMENT_FORMAT_VERSION: u16 = 1;
+/// Segment header flag bit 0: a Raft log (ADR-0058 §1).
+const SEGMENT_FLAG_RAFT: u32 = 1;
+/// A Raft log keeps the position of every this-many-th entry, so an entry is found by reading forward from one.
+const ENTRY_INDEX_EVERY: u64 = 64;
 
 struct JournalConfig {
     /// A segment is sealed and a new one started once it reaches this size.
@@ -26,11 +35,14 @@ struct JournalConfig {
     /// The most bytes one commit writes; also the torn-tail window of recovery.
     maxBatchBytes: usize;
     shardId: u32;
+    /// A cluster shard's Raft log (ADR-0058), not a single node's journal.
+    raftLog: bool;
 
     fn defaults() -> JournalConfig => JournalConfig {
         segmentTargetBytes: 134217728,
         maxBatchBytes: 33554432,
         shardId: 0,
+        raftLog: false,
     };
 }
 
@@ -48,11 +60,16 @@ enum JournalError {
     MissingSegment(u64),
     /// The active segment cannot be removed.
     ActiveSegment,
+    /// A segment of the other kind: a Raft log's in a single node's journal, or the other way round (ADR-0058 §1).
+    WrongMode(u64),
+    /// A Raft entry out of place: the LSN the journal expected, or a term of 0 or below the previous entry's.
+    OutOfOrder(u64),
 }
 
 /// Where recovery starts. Segments before `segment` are covered by a checkpoint whose last LSN
 /// is `lsn` (ADR-0005). They are not scanned, and are kept only for the inline payloads that
-/// live versions still point to.
+/// live versions still point to. Records of `segment` up to `lsn` are skipped, not replayed: a Raft log's
+/// checkpoint does not seal (ADR-0058 §3).
 struct JournalStart {
     segment: u64;
     lsn: u64;
@@ -61,7 +78,7 @@ struct JournalStart {
     fn beginning() -> JournalStart => JournalStart { segment: 0, lsn: 0 };
 }
 
-/// A sealed segment that recovery did not scan, and its size.
+/// A sealed segment that recovery did not scan, and its size; or the bytes of records recovery skipped in one.
 struct SegmentFile {
     id: u64;
     size: u64;
@@ -72,6 +89,20 @@ struct RecordPosition {
     segmentId: u64;
     offset: u64;
     lsn: u64;
+}
+
+/// Where a Raft log's entry is (ADR-0058): kept for every ENTRY_INDEX_EVERY-th entry and each segment's first.
+struct EntryPosition {
+    lsn: u64;
+    segment: u64;
+    offset: u64;
+}
+
+/// A written entry found by its LSN.
+struct EntryFound {
+    segment: u64;
+    offset: u64;
+    header: RecordHeader;
 }
 
 /// The bytes of a payload inside a segment.
@@ -123,6 +154,12 @@ struct Journal {
     /// Read handles of sealed segments, so a GET of an inline object does not open a file.
     /// A cache: a segment missing from it is opened per read.
     private sealedFiles: HashMap<u64, DurableFile>;
+    /// A Raft log (ADR-0058): the last entry known to be committed, the last entry's term, and where entries are.
+    private committedLsn: u64;
+    private lastTerm: u64;
+    private entryIndex: Vector<EntryPosition>;
+    /// Bytes of the records recovery skipped (ADR-0058 §3), by segment.
+    private skipped: Vector<SegmentFile>;
 
     /// Opens (or creates) the journal in `dir`, replaying every valid record through `visit`
     /// in LSN order: visit(segment id, record offset, header, whole record bytes).
@@ -146,10 +183,20 @@ struct Journal {
         var buffer = Vector<u8>.create();
         var unscanned = Vector<SegmentFile>.create();
         var sealedFiles = HashMap<u64, DurableFile>.create();
+        var scan = ScanState {
+            raft: config.raftLog,
+            skipThrough: start.lsn,
+            lastSkipped: 0,
+            lastTerm: 0,
+            index: Vector<EntryPosition>.create(),
+            skipped: Vector<SegmentFile>.create(),
+        };
         if (ids.length == 0) {
             if (start.segment > 0) { return Err(JournalError.MissingSegment(start.segment)); }
-            let first = Journal.createSegment(dir, 1, nextLsn, config.shardId)?;
-            return Ok(Journal.make(dir, first, 1, SEGMENT_HEADER_LEN as u64, nextLsn, config, unscanned, sealedFiles)?);
+            let first = Journal.createSegment(dir, 1, nextLsn, config.shardId, config.raftLog)?;
+            return Ok(
+                Journal.make(dir, first, 1, SEGMENT_HEADER_LEN as u64, nextLsn, config, unscanned, sealedFiles, scan)?,
+            );
         }
         var scanning = false;
         for (i in 0..ids.length) {
@@ -169,24 +216,44 @@ struct Journal {
             scanning = true;
             let file = DurableFile.openReadWrite(path.view())?;
             let size = file.size()?;
-            let headerOk = readSegmentHeader(borrow file, size, id)?;
+            let headerOk = readSegmentHeader(borrow file, size, id, config.raftLog)?;
             if (!headerOk) {
                 if (!last) { return Err(JournalError.BadSegmentHeader(id)); }
                 // The newest segment's creation was torn: start it again.
                 file.truncateTo(0)?;
-                writeSegmentHeader(borrow file, id, nextLsn, config.shardId)?;
+                writeSegmentHeader(borrow file, id, nextLsn, config.shardId, config.raftLog)?;
                 file.syncData()?;
                 return Ok(
-                    Journal.make(dir, file, id, SEGMENT_HEADER_LEN as u64, nextLsn, config, unscanned, sealedFiles)?,
+                    Journal.make(
+                        dir,
+                        file,
+                        id,
+                        SEGMENT_HEADER_LEN as u64,
+                        nextLsn,
+                        config,
+                        unscanned,
+                        sealedFiles,
+                        scan,
+                    )?,
                 );
             }
-            let end = scanSegment(borrow file, id, size, last, config.maxBatchBytes, mut nextLsn, mut buffer, visit)?;
+            let end = scanSegment(
+                borrow file,
+                id,
+                size,
+                last,
+                config.maxBatchBytes,
+                mut nextLsn,
+                mut buffer,
+                mut scan,
+                visit,
+            )?;
             if (last) {
                 if (end != size) {
                     file.truncateTo(end)?;
                     file.syncData()?;
                 }
-                return Ok(Journal.make(dir, file, id, end, nextLsn, config, unscanned, sealedFiles)?);
+                return Ok(Journal.make(dir, file, id, end, nextLsn, config, unscanned, sealedFiles, scan)?);
             }
             let _ = sealedFiles.put(id, file)?;
         }
@@ -202,10 +269,15 @@ struct Journal {
         config: JournalConfig,
         unscanned: Vector<SegmentFile>,
         sealedFiles: HashMap<u64, DurableFile>,
+        scan: ScanState,
     ) -> Result<Journal, JournalError> {
         var d = String.create();
         d.append(dir)?;
         return Ok(Journal {
+            committedLsn: scan.skipThrough,
+            lastTerm: scan.lastTerm,
+            entryIndex: scan.index,
+            skipped: scan.skipped,
             dir: d,
             file: file,
             segmentId: segmentId,
@@ -231,10 +303,16 @@ struct Journal {
     }
 
     /// Creates segment `id` with its header, durably (file and directory entry).
-    fn createSegment(dir: StringView, id: u64, firstLsn: u64, shardId: u32) -> Result<DurableFile, JournalError> {
+    fn createSegment(
+        dir: StringView,
+        id: u64,
+        firstLsn: u64,
+        shardId: u32,
+        raft: bool,
+    ) -> Result<DurableFile, JournalError> {
         let path = segmentPath(dir, id)?;
         let file = DurableFile.createNew(path.view())?;
-        Journal.initSegment(borrow file, dir, id, firstLsn, shardId)?;
+        Journal.initSegment(borrow file, dir, id, firstLsn, shardId, raft)?;
         return Ok(file);
     }
 
@@ -245,8 +323,9 @@ struct Journal {
         id: u64,
         firstLsn: u64,
         shardId: u32,
+        raft: bool,
     ) -> Result<void, JournalError> {
-        writeSegmentHeader(file, id, firstLsn, shardId)?;
+        writeSegmentHeader(file, id, firstLsn, shardId, raft)?;
         file.syncData()?;
         Fs.syncDirectory(dir)?;
         return Ok();
@@ -280,10 +359,155 @@ struct Journal {
 
     fn activeSegment(borrow this) -> u64 => this.segmentId;
 
-    /// Adds a record to the current batch. It is not durable until `commit` returns Ok.
+    /// Adds a record to the current batch. It is not durable until `commit` returns Ok. A Raft log takes entries
+    /// (`stageEntry`, `appendEncoded`) instead.
     fn stage(
         borrow mut this,
         kind: RecordType,
+        meta: Slice<u8>,
+        payload: Slice<u8>,
+    ) -> Result<RecordPosition, JournalError> {
+        if (this.config.raftLog) { return Err(JournalError.WrongMode(this.segmentId)); }
+        return this.stageWith(kind, 0, meta, payload);
+    }
+
+    /// A Raft log's next entry, of `term`, made by this replica as leader (ADR-0058 §1): its LSN is its index.
+    fn stageEntry(
+        borrow mut this,
+        kind: RecordType,
+        term: u64,
+        meta: Slice<u8>,
+        payload: Slice<u8>,
+    ) -> Result<RecordPosition, JournalError> {
+        if (!this.config.raftLog) { return Err(JournalError.WrongMode(this.segmentId)); }
+        if (term == 0 || term < this.lastTerm) { return Err(JournalError.OutOfOrder(this.nextLsn)); }
+        let at = this.stageWith(kind, term, meta, payload)?;
+        this.lastTerm = term;
+        this.noteEntry(borrow at)?;
+        return Ok(at);
+    }
+
+    /// A Raft log's next entry as a leader encoded it (a follower's): checked whole, and staged byte for byte, so
+    /// every replica holds the same record at the same LSN.
+    fn appendEncoded(borrow mut this, record: Slice<u8>) -> Result<RecordPosition, JournalError> {
+        if (this.failed) { return Err(JournalError.Failed); }
+        if (!this.config.raftLog) { return Err(JournalError.WrongMode(this.segmentId)); }
+        let h = match (decodeRecord(record)) {
+            Ok(h) => h,
+            Err(_) => { return Err(JournalError.Corrupt(0, 0)); }
+        };
+        if (record.length != h.totalLen as usize) { return Err(JournalError.Corrupt(0, 0)); }
+        if (h.lsn != this.nextLsn || h.term == 0 || h.term < this.lastTerm) {
+            return Err(JournalError.OutOfOrder(this.nextLsn));
+        }
+        if (this.pending.length + record.length > this.config.maxBatchBytes) { return Err(JournalError.TooLarge); }
+        let at = RecordPosition {
+            segmentId: this.segmentId,
+            offset: this.writtenEnd + this.pending.length as u64,
+            lsn: this.nextLsn,
+        };
+        this.pending.extend(record)?;
+        this.nextLsn += 1;
+        this.pendingCount += 1;
+        this.lastTerm = h.term;
+        this.noteEntry(borrow at)?;
+        return Ok(at);
+    }
+
+    fn noteEntry(borrow mut this, at: borrow RecordPosition) -> Result<void, AllocError> {
+        if (at.offset == SEGMENT_HEADER_LEN as u64 || at.lsn % ENTRY_INDEX_EVERY == 0 || this.entryIndex.length == 0) {
+            this.entryIndex.push(EntryPosition { lsn: at.lsn, segment: at.segmentId, offset: at.offset })?;
+        }
+        return Ok();
+    }
+
+    /// Where written entry `lsn` is, and its header: read forward from the nearest kept position before it.
+    fn entryAt(borrow this, lsn: u64) -> Result<EntryFound, JournalError> {
+        var k = this.entryIndex.length;
+        while (k > 0 && this.entryIndex[k - 1].lsn > lsn) { k -= 1; }
+        if (k == 0 || lsn >= this.nextLsn - this.pendingCount as u64) { return Err(JournalError.OutOfOrder(lsn)); }
+        let segment = this.entryIndex[k - 1].segment;
+        var offset = this.entryIndex[k - 1].offset;
+        var header = [0u8; 48];
+        while (true) {
+            this.readAt(segment, offset, mut header[..])?;
+            let h = match (decodeHeader(header[..])) {
+                Ok(h) => h,
+                Err(_) => { return Err(JournalError.Corrupt(segment, offset)); }
+            };
+            if (h.lsn == lsn) { return Ok(EntryFound { segment: segment, offset: offset, header: h }); }
+            if (h.lsn > lsn) { return Err(JournalError.OutOfOrder(lsn)); }
+            offset += h.totalLen as u64;
+        }
+        return Err(JournalError.OutOfOrder(lsn)); // unreachable
+    }
+
+    /// The whole record of written entry `lsn`, verified: what a leader sends a follower (ADR-0058 §7).
+    fn entryBytes(borrow this, lsn: u64) -> Result<Vector<u8>, JournalError> {
+        let at = this.entryAt(lsn)?;
+        return this.readRecord(at.segment, at.offset, at.header.totalLen);
+    }
+
+    /// The last entry written or staged, and its term (a Raft log).
+    fn lastLsn(borrow this) -> u64 => this.nextLsn - 1;
+
+    fn lastEntryTerm(borrow this) -> u64 => this.lastTerm;
+
+    fn committedThrough(borrow this) -> u64 => this.committedLsn;
+
+    /// Bytes of the records recovery skipped, by segment (ADR-0058 §3).
+    fn skippedSegments(borrow this) -> Slice<SegmentFile> => this.skipped.view();
+
+    /// Whether the active segment may be sealed: a single node's always; a Raft log's once every entry in it is
+    /// committed (ADR-0058 §4).
+    fn mayRotate(borrow this) -> bool => !this.config.raftLog || this.committedLsn + 1 >= this.nextLsn;
+
+    /// A Raft log's entries through `lsn` are committed; a full segment whose entries all are is sealed now.
+    fn markCommitted(borrow mut this, lsn: u64) {
+        if (lsn > this.committedLsn) { this.committedLsn = lsn; }
+        if (this.config.raftLog && !this.failed && this.pendingCount == 0 && !this.inflight &&
+            this.writeOffset >= this.config.segmentTargetBytes && this.mayRotate()) {
+            let _ = this.rotate();
+        }
+    }
+
+    /// Cuts a Raft log's entries after `lsn` off, durably, before any other entry is staged (ADR-0058 §4): the
+    /// suffix a new leader does not have. Nothing may be staged or in flight. They are uncommitted, so all in the
+    /// active segment; cutting a committed entry is a bug.
+    fn truncateAfter(borrow mut this, lsn: u64) -> Result<void, JournalError> {
+        if (this.failed) { return Err(JournalError.Failed); }
+        if (!this.config.raftLog) { return Err(JournalError.WrongMode(this.segmentId)); }
+        if (lsn + 1 >= this.nextLsn) { return Ok(); }
+        if (this.pendingCount > 0 || this.inflight) { return Err(JournalError.OutOfOrder(this.nextLsn)); }
+        if (lsn < this.committedLsn) { panic("journal: cutting off a committed entry"); }
+        let at = this.entryAt(lsn + 1)?;
+        if (at.segment != this.segmentId) { panic("journal: an uncommitted entry in a sealed segment"); }
+        match (this.file.truncateTo(at.offset)) {
+            Ok() => {}
+            Err(e) => { return this.fail(e); }
+        }
+        match (this.file.syncData()) {
+            Ok() => {}
+            Err(e) => { return this.fail(e); }
+        }
+        this.writeOffset = at.offset;
+        this.writtenEnd = at.offset;
+        this.inflightEnd = at.offset;
+        this.nextLsn = lsn + 1;
+        while (this.entryIndex.length > 0 && this.entryIndex[this.entryIndex.length - 1].lsn > lsn) {
+            let _ = this.entryIndex.pop();
+        }
+        this.lastTerm = match (this.entryAt(lsn)) {
+            Ok(e) => e.header.term,
+            Err(_) => 0,
+        };
+        return Ok();
+    }
+
+    fn stageWith(
+        borrow mut this,
+        kind: RecordType,
+        term: u64,
         meta: Slice<u8>,
         payload: Slice<u8>,
     ) -> Result<RecordPosition, JournalError> {
@@ -296,7 +520,7 @@ struct Journal {
             offset: this.writtenEnd + this.pending.length as u64,
             lsn: this.nextLsn,
         };
-        encodeRecord(mut this.pending, kind, 0, this.nextLsn, 0, meta, payload)?;
+        encodeRecord(mut this.pending, kind, 0, this.nextLsn, term, meta, payload)?;
         this.nextLsn += 1;
         this.pendingCount += 1;
         return Ok(position);
@@ -336,7 +560,7 @@ struct Journal {
         this.pendingCount = 0;
         // The batch is durable, so it is acknowledged even if the rotation fails: the caller
         // must publish it. A failed rotation fails the journal, so the next commit reports it.
-        if (this.writeOffset >= this.config.segmentTargetBytes) {
+        if (this.writeOffset >= this.config.segmentTargetBytes && this.mayRotate()) {
             let _ = this.rotate();
         }
         return Ok();
@@ -399,7 +623,7 @@ struct Journal {
         this.inflight = false;
         this.writeOffset = this.inflightEnd;
         // Rotate only when nothing is staged: staged records hold positions in this segment.
-        if (this.pendingCount == 0 && this.writeOffset >= this.config.segmentTargetBytes) {
+        if (this.pendingCount == 0 && this.writeOffset >= this.config.segmentTargetBytes && this.mayRotate()) {
             let _ = this.rotate();
         }
         return Ok(true);
@@ -408,6 +632,9 @@ struct Journal {
     /// Discards the staged records (used when a batch cannot be built).
     fn discardPending(borrow mut this) {
         this.nextLsn -= this.pendingCount as u64;
+        while (this.entryIndex.length > 0 && this.entryIndex[this.entryIndex.length - 1].lsn >= this.nextLsn) {
+            let _ = this.entryIndex.pop();
+        }
         this.pending.clear();
         this.pendingCount = 0;
     }
@@ -440,7 +667,14 @@ struct Journal {
                 return Err(JournalError.Io(e));
             }
         };
-        match (Journal.initSegment(borrow file, this.dir.view(), id, this.nextLsn, this.config.shardId)) {
+        match (Journal.initSegment(
+            borrow file,
+            this.dir.view(),
+            id,
+            this.nextLsn,
+            this.config.shardId,
+            this.config.raftLog,
+        )) {
             Ok() => {}
             Err(e) => {
                 // The new file must be gone, durably, before the active segment takes another record.
@@ -500,7 +734,7 @@ struct Journal {
     fn sealActive(borrow mut this) -> Result<u64, JournalError> {
         this.commit()?;
         if (this.failed) { return Err(JournalError.Failed); }
-        if (this.writeOffset > SEGMENT_HEADER_LEN as u64) { this.rotate()?; }
+        if (this.writeOffset > SEGMENT_HEADER_LEN as u64 && this.mayRotate()) { this.rotate()?; }
         return Ok(this.segmentId);
     }
 
@@ -509,6 +743,10 @@ struct Journal {
         if (id >= this.segmentId) { return Err(JournalError.ActiveSegment); }
         let path = segmentPath(this.dir.view(), id)?;
         let _ = this.sealedFiles.remove(borrow id);
+        var k = 0usize;
+        while (k < this.entryIndex.length) {
+            if (this.entryIndex[k].segment == id) { let _ = this.entryIndex.remove(k); } else { k += 1; }
+        }
         return Ok(Fs.unlink(path.view())?);
     }
 
@@ -604,12 +842,18 @@ fn listSegmentIds(dir: StringView) -> Result<Vector<u64>, JournalError> {
     return Ok(ids);
 }
 
-fn writeSegmentHeader(file: borrow DurableFile, id: u64, firstLsn: u64, shardId: u32) -> Result<void, JournalError> {
+fn writeSegmentHeader(
+    file: borrow DurableFile,
+    id: u64,
+    firstLsn: u64,
+    shardId: u32,
+    raft: bool,
+) -> Result<void, JournalError> {
     var h = [0u8; 64];
     h.writeLE(0, SEGMENT_MAGIC);
     h.writeLE(8, SEGMENT_FORMAT_VERSION);
     h.writeLE(10, truncate<u16>(SEGMENT_HEADER_LEN));
-    h.writeLE(12, 0u32);
+    h.writeLE(12, if (raft) SEGMENT_FLAG_RAFT else 0u32);
     h.writeLE(16, id);
     h.writeLE(24, firstLsn);
     h.writeLE(32, shardId);
@@ -624,15 +868,28 @@ fn writeSegmentHeader(file: borrow DurableFile, id: u64, firstLsn: u64, shardId:
 /// Whether the segment's header is valid. A read error is an error, not an invalid header:
 /// recovery reinitialises a newest segment whose header is invalid, which must never happen
 /// to one that merely could not be read.
-fn readSegmentHeader(file: borrow DurableFile, size: u64, id: u64) -> Result<bool, JournalError> {
+/// A valid header of the other kind (a Raft log's, or a single node's) is WrongMode.
+fn readSegmentHeader(file: borrow DurableFile, size: u64, id: u64, raft: bool) -> Result<bool, JournalError> {
     if (size < SEGMENT_HEADER_LEN as u64) { return Ok(false); }
     var h = [0u8; 64];
     file.readExactAt(mut h[..], 0)?;
     let r = h[..];
     if (r.readLE<u32>(60) != Crc32c.of(r[0..60])) { return Ok(false); }
-    return Ok(
-        r.readLE<u64>(0) == SEGMENT_MAGIC && r.readLE<u16>(8) == SEGMENT_FORMAT_VERSION && r.readLE<u64>(16) == id,
-    );
+    let valid = r.readLE<u64>(0) == SEGMENT_MAGIC && r.readLE<u16>(8) == SEGMENT_FORMAT_VERSION &&
+        r.readLE<u64>(16) == id;
+    if (valid && ((r.readLE<u32>(12) & SEGMENT_FLAG_RAFT) != 0) != raft) { return Err(JournalError.WrongMode(id)); }
+    return Ok(valid);
+}
+
+/// What recovery carries from segment to segment: which records it skips (ADR-0058 §3), and for a Raft log the
+/// terms seen and the entry positions kept.
+struct ScanState {
+    raft: bool;
+    skipThrough: u64;
+    lastSkipped: u64;
+    lastTerm: u64;
+    index: Vector<EntryPosition>;
+    skipped: Vector<SegmentFile>;
 }
 
 /// Replays one segment's valid records. Returns the end of the last valid record.
@@ -644,14 +901,35 @@ fn scanSegment(
     maxBatchBytes: usize,
     nextLsn: borrow mut u64,
     buffer: borrow mut Vector<u8>,
+    scan: borrow mut ScanState,
     visit: borrow mut fn(u64, u64, borrow RecordHeader, Slice<u8>),
 ) -> Result<u64, JournalError> {
     var offset = SEGMENT_HEADER_LEN as u64;
     var header = [0u8; 48];
+    var skippedHere = 0u64;
     while (offset < size) {
         let fault = match (readRecordAt(file, offset, size, mut header, buffer)) {
             Ok(h) => {
-                if (h.lsn < nextLsn) { return Err(JournalError.Corrupt(id, offset)); }
+                if (scan.raft) {
+                    // Entries have terms, which never go down along the log.
+                    if (h.term == 0 || h.term < scan.lastTerm) { return Err(JournalError.Corrupt(id, offset)); }
+                    scan.lastTerm = h.term;
+                }
+                if (h.lsn <= scan.skipThrough) {
+                    // Covered by the checkpoint: counted, not replayed.
+                    if (h.lsn <= scan.lastSkipped) { return Err(JournalError.Corrupt(id, offset)); }
+                    scan.lastSkipped = h.lsn;
+                    skippedHere += h.totalLen as u64;
+                    offset += h.totalLen as u64;
+                    continue;
+                }
+                if (h.lsn < nextLsn || (scan.raft && h.lsn != nextLsn)) {
+                    return Err(JournalError.Corrupt(id, offset));
+                }
+                if (scan.raft && (offset == SEGMENT_HEADER_LEN as u64 || h.lsn % ENTRY_INDEX_EVERY == 0 ||
+                    scan.index.length == 0)) {
+                    scan.index.push(EntryPosition { lsn: h.lsn, segment: id, offset: offset })?;
+                }
                 visit(id, offset, borrow h, buffer.view());
                 nextLsn = h.lsn + 1;
                 offset += h.totalLen as u64;
@@ -665,9 +943,11 @@ fn scanSegment(
             if (laterAcknowledgedRecord(file, offset, size, maxBatchBytes, buffer)?) {
                 return Err(JournalError.Corrupt(id, offset));
             }
+            if (skippedHere > 0) { scan.skipped.push(SegmentFile { id: id, size: skippedHere })?; }
             return Ok(offset);
         }
     }
+    if (skippedHere > 0) { scan.skipped.push(SegmentFile { id: id, size: skippedHere })?; }
     return Ok(offset);
 }
 

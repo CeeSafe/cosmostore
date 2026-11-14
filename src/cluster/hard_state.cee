@@ -1,0 +1,148 @@
+// A replica's Raft hard state on disk (ADR-0058 §5): its term and whom it voted for in it, synced before any message
+// that depends on them is sent. Two files, `raft-state.0` and `raft-state.1`, each a sequence of 32-byte records
+// appended and synced one by one; the valid record with the highest sequence in either is the state. A torn last
+// record is cut off when the file is opened: nothing was sent on it. When the file in use reaches
+// HARD_STATE_SWITCH_AT, the next save starts the other file afresh (created, written, synced, its directory synced);
+// until that directory sync the older file holds the state before the save. Files are only appended to between
+// syncs and never renamed, as the crash model (ADR-0004) assumes. The commit index is not kept here: a checkpoint's
+// index is a lower bound, and a leader tells the rest.
+//
+// Record (little-endian): u32 magic "CRST", u32 vote, u64 sequence, u64 term, u32 reserved (0), u32 CRC32C of 0..28.
+
+const HARD_STATE_MAGIC: u32 = 0x54535243; // "CRST" in file order
+const HARD_STATE_RECORD: usize = 32;
+const HARD_STATE_SWITCH_AT: u64 = 4096;
+
+/// What one of the two files holds: its last valid record, and where its valid records end.
+struct HardStateScan {
+    found: bool;
+    sequence: u64;
+    term: u64;
+    vote: u32;
+    end: u64;
+}
+
+struct HardStateFile {
+    private file: DurableFile;
+    private dir: String;
+    /// Which file is in use (0 or 1), and its valid length.
+    private which: u64;
+    private size: u64;
+    private sequence: u64;
+    term: u64;
+    vote: u32;
+
+    /// Opens `dir`'s hard state, or makes an empty one (term 0, no vote), durably.
+    fn open(dir: StringView) -> Result<HardStateFile, IoFailure> {
+        let first = scanHardState(dir, 0)?;
+        let second = scanHardState(dir, 1)?;
+        var which = 0u64;
+        if (second.found && (!first.found || second.sequence > first.sequence)) { which = 1; }
+        let chosen = if (which == 0) first else second;
+        let path = hardStatePath(dir, which)?;
+        let file = match (DurableFile.openReadWrite(path.view())) {
+            Ok(f) => f,
+            Err(e) => {
+                if (!e.isNotFound()) { return Err(e); }
+                let created = DurableFile.createNew(path.view())?;
+                created.syncData()?;
+                Fs.syncDirectory(dir)?;
+                created
+            }
+        };
+        if (file.size()? != chosen.end) {
+            // A torn save: cut off, durably, before anything is appended after it.
+            file.truncateTo(chosen.end)?;
+            file.syncData()?;
+        }
+        var d = String.create();
+        if (d.append(dir).isErr()) { return Err(IoFailure { op: IoOp.Open, errno: 0 }); }
+        return Ok(HardStateFile {
+            file: file,
+            dir: d,
+            which: which,
+            size: chosen.end,
+            sequence: chosen.sequence,
+            term: chosen.term,
+            vote: chosen.vote,
+        });
+    }
+
+    /// Makes `term` and `vote` the hard state, durably, before the caller sends anything that depends on them. On
+    /// error the state on disk is the old one or the new one, and the caller must send nothing.
+    fn save(borrow mut this, term: u64, vote: u32) -> Result<void, IoFailure> {
+        let sequence = this.sequence + 1;
+        let record = hardStateRecord(sequence, term, vote);
+        if (this.size + HARD_STATE_RECORD as u64 > HARD_STATE_SWITCH_AT) {
+            // The other file, afresh: what it held is older than anything in this one.
+            let other = 1 - this.which;
+            let path = hardStatePath(this.dir.view(), other)?;
+            match (Fs.unlink(path.view())) {
+                Ok() => {}
+                Err(e) => {
+                    if (!e.isNotFound()) { return Err(e); }
+                }
+            }
+            let fresh = DurableFile.createNew(path.view())?;
+            fresh.writeAt(record[..], 0)?;
+            fresh.syncData()?;
+            Fs.syncDirectory(this.dir.view())?;
+            this.file = fresh;
+            this.which = other;
+            this.size = HARD_STATE_RECORD as u64;
+        } else {
+            this.file.writeAt(record[..], this.size)?;
+            this.file.syncData()?;
+            this.size += HARD_STATE_RECORD as u64;
+        }
+        this.sequence = sequence;
+        this.term = term;
+        this.vote = vote;
+        return Ok();
+    }
+}
+
+/// Reads file `which`'s records up to the first invalid one. A missing file holds nothing.
+fn scanHardState(dir: StringView, which: u64) -> Result<HardStateScan, IoFailure> {
+    var scan = HardStateScan { found: false, sequence: 0, term: 0, vote: 0, end: 0 };
+    let path = hardStatePath(dir, which)?;
+    let file = match (DurableFile.openRead(path.view())) {
+        Ok(f) => f,
+        Err(e) => {
+            if (e.isNotFound()) { return Ok(scan); }
+            return Err(e);
+        }
+    };
+    let size = file.size()?;
+    var record = [0u8; 32];
+    while (scan.end + HARD_STATE_RECORD as u64 <= size) {
+        file.readExactAt(mut record[..], scan.end)?;
+        let r = record[..];
+        if (r.readLE<u32>(0) != HARD_STATE_MAGIC || r.readLE<u32>(28) != Crc32c.of(r[0..28])) { break; }
+        scan.found = true;
+        scan.sequence = r.readLE<u64>(8);
+        scan.vote = r.readLE<u32>(4);
+        scan.term = r.readLE<u64>(16);
+        scan.end += HARD_STATE_RECORD as u64;
+    }
+    return Ok(scan);
+}
+
+fn hardStateRecord(sequence: u64, term: u64, vote: u32) -> [u8; 32] {
+    var record = [0u8; 32];
+    record.writeLE(0, HARD_STATE_MAGIC);
+    record.writeLE(4, vote);
+    record.writeLE(8, sequence);
+    record.writeLE(16, term);
+    record.writeLE(24, 0u32);
+    let crc = Crc32c.of(record[0..28]);
+    record.writeLE(28, crc);
+    return record;
+}
+
+fn hardStatePath(dir: StringView, which: u64) -> Result<String, IoFailure> {
+    var path = String.create();
+    let ok = path.append(dir).isOk() && path.append(if (which == 0) "/raft-state.0" else "/raft-state.1").isOk();
+    if (!ok) { return Err(IoFailure { op: IoOp.Open, errno: 0 }); }
+    return Ok(path);
+}

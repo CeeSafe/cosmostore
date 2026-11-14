@@ -2279,3 +2279,31 @@ Browser form uploads with a SigV4 POST policy.
   without confirmation (with clocks all running, check-quorum hid it); and directed tests for a read confirmed by one
   peer of five and a snapshot that drops a log it matches. Two of the nine were no faults under the host's contract
   (ADR-0057 §5).
+
+### 14 Nov 2026: M6 item 2, slices a and b: the core keeps terms, the journal becomes a Raft log (ADR-0058)
+
+- **Asked by the owner** (14 Nov, "go ahead with item 2"). **ADR-0058** (accepted by the owner as recommended, 14 Nov): in a cluster shard every journal
+  record is a Raft entry and its LSN is its index, since a version's generation is its LSN and must be the same on
+  every replica; so no local records (compaction's `Relocate` becomes the leader's, replicated); a checkpoint need not
+  seal; a segment is sealed only at a committed entry, so an uncommitted suffix is in the active segment; the hard
+  state is a file of its own; the leader decides and replicas apply; extents wait for item 5. Four slices.
+- **Slice a:** the Raft core keeps only each entry's term. Entries leave it in the ready; an append names how many
+  entries the host attaches from its log; committed entries are a range the host applies from its log. ADR-0057's
+  simulation and all eight mutants pass as before.
+- **Slice b:** the journal in Raft-log mode (`JournalConfig.raftLog`): segment flag bit 0, and opening refuses the
+  other kind; `stageEntry` (a leader's, with its term) and `appendEncoded` (a follower's, the leader's record byte for
+  byte); recovery refuses a term of 0 or one that goes down; `entryBytes(lsn)` from a position kept every 64 entries;
+  `markCommitted` seals a full segment only once all its entries are committed; `truncateAfter(lsn)` cuts the
+  active segment and syncs before anything follows; `JournalStart` skips the records up to the checkpoint's LSN in
+  its segment and counts their bytes. Single-node journals are unchanged: their tests, sweeps and `tools/s3_smoke.sh`
+  pass.
+- **The hard state** (`src/cluster/hard_state.cee`): term and vote appended to one of two files, the highest sequence
+  wins, switching files at 4 KiB. Two designs failed the crash sweep first: two slots overwritten in place (the model
+  assumes appends only) and a rewrite through a rename (the model drops a renamed file whose directory was not
+  synced). The sweep fails without the sync of a save or the directory sync of a switch.
+- **Tests (248 passed):** the Raft log's order, the other kind refused, a suffix cut, a checkpoint that does not seal,
+  and fault sweeps in four modes in which the recovered log is a prefix of what was written, holds every acknowledged
+  entry and never brings a cut-off one back; the hard state's sweeps in three modes.
+- **Known limit:** the crash model treats a truncation as durable at once, so it cannot catch a missing sync after
+  one; the code syncs, and recovery refuses a term that goes down along the log.
+- **Next:** slice c, the replicated store: three replicas in one process over an in-memory network, under the sweeps.

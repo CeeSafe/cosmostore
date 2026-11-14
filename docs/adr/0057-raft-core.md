@@ -20,6 +20,10 @@ FoundationDB's simulation).
    a commit index), messages, committed entries to apply, and reads that may be served; then `advance()`. The host
    persists before it sends and applies, and gives the core nothing more until `advance()`. Times are ticks; the
    election timer's randomness is a seeded SplitMix64, so a run is fixed by its seeds.
+   - **Amended by ADR-0058 §7 (M6 item 2, slice a):** the core keeps only the term of each entry. Entries to persist
+     leave it in the ready; an append it sends names how many entries follow its `index`, which the host reads from
+     its log and attaches; committed entries come out as a range (`applyFrom`, `applyTo`) the host applies from its
+     log.
 2. **The protocol** is Raft's (Ongaro's thesis), with:
    - **pre-vote** (§9.6): a replica asks whether it could win before it raises its term, so one that was cut off
      does not depose a working leader when it returns;
@@ -72,8 +76,8 @@ FoundationDB's simulation).
 ## Consequences
 
 - Item 2 puts the core over the journal: entries become records with their Raft index and term, the hard state a
-  small synced file, the snapshot a checkpoint. The core keeps the entries after its last compaction in memory; the
-  store compacts at each checkpoint (every 64 MiB of journal by default), which bounds that.
+  small synced file, the snapshot a checkpoint (ADR-0058). The core keeps 8 bytes per entry since its last compaction;
+  the entries themselves are the journal's.
 - The simulation is the place a later protocol change is tried first: membership changes (item 6) add their own
   properties to the checker.
 - What the simulation cannot show: performance, and a host that breaks the contract; item 3's tests and the chaos

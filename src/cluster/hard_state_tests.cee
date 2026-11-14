@@ -1,0 +1,90 @@
+// The hard state file (ADR-0058 §5): what was saved survives, and a fault or crash while saving leaves the state
+// before it or after it, never anything else.
+
+@test
+fn hardStateKeepsTheLastSave() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("hard-state");
+    {
+        let fresh = HardStateFile.open(dir.view())!;
+        Check.equalU64(0, fresh.term)?;
+        Check.equalU64(0, fresh.vote as u64)?;
+    }
+    {
+        var h = HardStateFile.open(dir.view())!;
+        h.save(3, 2)!;
+        h.save(4, 0)!;
+        h.save(4, 5)!;
+    }
+    let again = HardStateFile.open(dir.view())!;
+    Check.equalU64(4, again.term)?;
+    Check.equalU64(5, again.vote as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// Save number `i` (from 0): its term and vote. Terms go up every other save; votes change within them only from
+/// none, as Raft's do.
+fn savedTerm(i: u64) -> u64 => i / 2 + 1;
+
+fn savedVote(i: u64) -> u32 => if (i % 2 == 0) 0 else truncate<u32>(i % 5 + 1);
+
+/// The state after `k` saves.
+fn stateAfter(k: u64) -> [u64; 2] => if (k == 0) [0u64, 0] else [savedTerm(k - 1), savedVote(k - 1) as u64];
+
+/// Saves `count` states in turn; how many were saved before a failure. 140 saves pass the rewrite at 4 KiB.
+fn hardStateWorkload(dir: StringView, count: u64) -> u64 {
+    var h = match (HardStateFile.open(dir)) {
+        Ok(h) => h,
+        Err(_) => { return 0; }
+    };
+    var saved = 0u64;
+    while (saved < count) {
+        if (h.save(savedTerm(saved), savedVote(saved)).isErr()) { return saved; }
+        saved += 1;
+    }
+    return saved;
+}
+
+fn sweepHardState(name: StringView, mode: SweepMode, count: u64) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    Faults.countOperations();
+    Check.equalU64(count, hardStateWorkload(dir.view(), count))?;
+    Faults.disarm();
+    let points = Faults.seen();
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        armMode(borrow mode, n);
+        let saved = hardStateWorkload(dir.view(), count);
+        Faults.disarm();
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        let h = HardStateFile.open(dir.view())!;
+        // The state after the last save that returned, or after the one that failed.
+        let before = stateAfter(saved);
+        let after = stateAfter(if (saved < count) saved + 1 else count);
+        let ok = (h.term == before[0] && (h.vote as u64) == before[1]) ||
+            (h.term == after[0] && (h.vote as u64) == after[1]);
+        Check.isTrue(ok, "the hard state is neither the one saved nor the one being saved")?;
+        // It goes on saving.
+        var again = HardStateFile.open(dir.view())!;
+        again.save(1000, 7)!;
+        let reread = HardStateFile.open(dir.view())!;
+        Check.equalU64(1000, reread.term)?;
+    }
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn hardStateFaultsOnce() -> Result<void, TestFailure> => sweepHardState("hard-state-once", SweepMode.Once, 140);
+
+@test
+fn hardStateFaultsTorn() -> Result<void, TestFailure> => sweepHardState("hard-state-torn", SweepMode.StickyTorn, 140);
+
+@test
+fn hardStateFaultsCrash() -> Result<void, TestFailure> => sweepHardState("hard-state-crash", SweepMode.Crash, 140);
