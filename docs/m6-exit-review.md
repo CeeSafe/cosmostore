@@ -46,26 +46,37 @@ and the cluster answers through every node after the heal.
 4. **In item 8, a coded extent's whole copy removed with no piece written** after a failed read (the fault sweep).
 5. Harness bugs: a pruning that hid unknown writes from listings; descriptors leaked (shown only on Linux's 1024).
 
+## The gaps, closed (the owner: "Fix all those gaps before closing")
+
+| Gap the first review left | What closed it | Evidence |
+|---|---|---|
+| A node started on an empty directory could vote twice | A directory marker; `--init` or `--join`, which asks the peers first (ADR-0066) | `tools/cluster_identity_smoke.sh` (25 checks) |
+| Group 0 fixed on the first three nodes | Group 0 moves; a lost log is sent again, not counted as caught up (ADR-0067) | the identity smoke's group 0 part; `raftALostLogIsSentAgain`; disk loss of any node in the harness |
+| Listings checked per key | The whole history checked as one register per key | the checker's self-test (a listing of two moments fails) |
+| A write answered 503 may have been done, a resend done twice | Request ids and their answers in the log (ADR-0068) | `tools/cluster_sessions_check.py`; its mutant killed |
+| One machine, a perfect network | Slow, flaky and throttled links; nodes on several machines through SSH tunnels (ADR-0069) | runs with nodes on this Mac, binfadel and alghobashi |
+| Sealed packs not coded | Every replica's segments the same bytes; sealed segments coded; pieces re-homed when a holder leaves (ADR-0070) | `raftLogSegmentsAreTheSameOnEveryReplica`; `tools/cluster_ec_segments_smoke.sh`; the EC smoke's last part |
+
+**Found while closing them:** a learner whose disk was replaced counted as caught up with an empty log; a replica a
+shard removed still showing its old group, so a check that took any peer's word could wait for ever; segments that
+were not the same on every replica, so that coding one would have thrown a follower's records away; coded pieces
+staying with a holder that left; a segment's coding told from an extent's by a bit half of all extent ids have. Each
+is fixed and tested.
+
 ## Not covered, or not yet
 
-- **Group 0 stays on the first three nodes** (ADR-0062): it cannot be moved, so a disk lost on one of those is not
-  recoverable the runbook's way. Keep them on redundant disks. A node started again on an empty directory under its id
-  would vote twice in a term; nothing detects it (the runbook says never to).
-- **Sealed segment packs are not erasure-coded**, only extents (ADR-0064 §1): M6's plan named packs; that is later
-  work.
-- **Listings are checked per key:** a listing stale on any key is found, one that mixes two moments is not.
-- **Writes are not idempotent across a lost answer:** a write answered 503 may have been done, and a client's retry
-  is a write of its own (what S3 allows). Client sessions in the log (the Raft thesis §6.3) would make them exact.
-- **One machine per run:** the nodes share a machine, so no real network latency, loss or reordering below TCP, and
-  no real disk dying (the crash model covers the disk's failure modes at the unit level). Clock skew is injected where
-  the cluster reads the clock, not system-wide.
+- **Listings across shards** are a merge of each shard's (ADR-0060 §7), not one moment of the whole cluster; S3 does
+  not promise more.
+- **A client's own retry** is a new write, as S3 has it; only the nodes' own resending is exactly once.
+- **Clock skew** is injected where the cluster reads the clock (peer signatures), not system-wide.
+- **The multi-machine runs** put the proxy and the clients on one machine, so every message between nodes crosses the
+  network twice through it; no two nodes talk directly.
 - **The limits the runbook lists** stand: no request streamed past 64 MiB, no copy between buckets of two shards, the
-  peer port is plain HTTP (signed, not encrypted), and the cluster's S3 port lacks TLS, rate limits, audit and
-  notifications.
+  peer port signed but not encrypted, and the cluster's S3 port without TLS, rate limits, audit or notifications.
 
 ## Verdict
 
-For what M6 built, the exit holds: under node, disk, rack, network and clock failures, injected alone and together on
-three machines and two operating systems, acknowledged writes survived and no read or listing was stale. The harness
-found four bugs on the way to that, and each is fixed and tested. The gaps above are known and written down; the two
-that matter most for running it are group 0's fixed place and the unguarded empty-directory restart.
+For what M6 built, the exit holds: under node, disk, rack, network and clock failures, alone and together, on
+three machines and two operating systems, and with nodes on separate machines, acknowledged writes survived and no
+read or listing was stale. The gaps the first review listed are closed, each with a test; for the lost log, the write sessions, the
+listings and the segments, the test was seen to fail without its fix.

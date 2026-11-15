@@ -2647,3 +2647,17 @@ Browser form uploads with a SigV4 POST policy.
   disk-loss and racks linearizable. (Two of those runs once printed nothing, no summary, and passed when run again.)
 - **Next:** the exit review brought up to date, and the owner's word on ADR-0066 to ADR-0070.
 
+### 15 Nov 2026: M6 exit review brought up to date; the checker's last fixes
+
+- **`docs/m6-exit-review.md`** now lists the six gaps, what closed each and its evidence, what was found while closing
+  them, and what is still not covered (listings across shards, a client's own retries, system-wide clock skew, the
+  proxy on one machine, the runbook's limits). Its verdict: the exit holds for what M6 built.
+- **Two runs with coded data had printed nothing:** the check across keys found its search too large and raised,
+  which the harness did not catch, and its cleanup then removed the evidence. It now tries the smallest search first
+  (no unknown write no GET saw), reports a search too large as a failure, and a run that crashes keeps its directory.
+  One run failed a key because the search let in unknown writes only near where it first stuck; it now widens
+  step by step. The histories of the real double-write bug still fail.
+- **Then:** two local runs and a 300 s run with nodes on this Mac, binfadel and alghobashi and coded data: linearizable
+  per key and across keys.
+- **Next:** the owner's word on ADR-0066 to ADR-0070, and closing M6.
+

@@ -76,7 +76,9 @@ def prune(ops, keep_unseen, window=None):
     unseen = sorted((op for op in ops if op.kind == "w" and op.end == INF and op.value is not None
                      and op.value not in seen), key=lambda o: o.start)
     if window is not None:
-        unseen = [op for op in unseen if window[0] <= op.start <= window[1]]
+        # One window, or several: the unseen writes that began in any of them.
+        windows = window if isinstance(window, list) else [window]
+        unseen = [op for op in unseen if any(w[0] <= op.start <= w[1] for w in windows)]
     keep = {id(op) for op in unseen[:keep_unseen]} if listed else set()
     out = []
     for op in ops:
@@ -93,15 +95,25 @@ def linearizable(ops, initial=None):
     good, at = search(ops, initial, 1)
     if good:
         return True, None
-    # The unseen writes that began in the seconds before the operation no order got past.
-    try:
-        again, at2 = search(ops, initial, len(ops), (at.start - UNSEEN_WINDOW_S, at.end))
-    except RuntimeError as e:
-        return None, str(e)
-    return (True, None) if again else (False, at2 or at)
+    # The unseen writes that began in the seconds before each operation a search could not get past, the windows
+    # added one search at a time: where a search sticks moves as writes are let in.
+    windows = []
+    for _ in range(UNSEEN_WIDENINGS):
+        windows.append((at.start - UNSEEN_WINDOW_S, at.end))
+        try:
+            again, stuck = search(ops, initial, len(ops), list(windows))
+        except RuntimeError as e:
+            return None, str(e)
+        if again:
+            return True, None
+        if stuck is None or stuck is at:
+            return False, stuck or at
+        at = stuck
+    return False, at
 
 
 UNSEEN_WINDOW_S = 5.0
+UNSEEN_WIDENINGS = 8
 
 
 def step_all(state, op):
@@ -126,15 +138,33 @@ def linearizable_all(per_key, lists, keys):
                     ops.append(op)
         return ops + lists
     initial = tuple(None for _ in keys)
-    good, at = search(gather(1, None), initial, 0, None, step_all, prepared=True)
-    if good:
-        return True, None
-    try:
-        again, at2 = search(gather(10**9, (at.start - UNSEEN_WINDOW_S, at.end)), initial, 0, None, step_all,
-                            prepared=True)
-    except RuntimeError as e:
-        return None, str(e)
-    return (True, None) if again else (False, at2 or at)
+    # Tiers, smallest first: no unseen unknown write at all (they only stand in a GET's way; a listing may need one),
+    # then the earliest of each key's, then those near where the search stuck. Leaving operations out only makes a
+    # history harder to explain, so a pass at any tier is a pass.
+    at = None
+    for keep in (0, 1):
+        try:
+            good, stuck = search(gather(keep, None), initial, 0, None, step_all, prepared=True)
+        except RuntimeError as e:
+            return None, str(e)
+        if good:
+            return True, None
+        at = stuck or at
+    windows = []
+    for _ in range(UNSEEN_WIDENINGS):
+        if at is None:
+            break
+        windows.append((at.start - UNSEEN_WINDOW_S, at.end))
+        try:
+            good, stuck = search(gather(10**9, list(windows)), initial, 0, None, step_all, prepared=True)
+        except RuntimeError as e:
+            return None, str(e)
+        if good:
+            return True, None
+        if stuck is None or stuck is at:
+            return False, stuck or at
+        at = stuck
+    return False, at
 
 
 def search(ops, initial, keep_unseen, window=None, stepper=step, prepared=False):
@@ -1051,6 +1081,7 @@ def run(args):
     proxy = Proxy({i: (cluster.proxy_port(i), cluster.peer_port(i)) for i in range(1, args.nodes + 1)})
     proxy.start()
     ok = False
+    finished = False
     try:
         cluster.setup_remote()
         for i in range(1, args.nodes + 1):
@@ -1206,13 +1237,19 @@ def run(args):
             t = time.time()
             good, at = linearizable_all(per, lists, keys)
             took = time.time() - t
-            if good:
+            if good is None:
+                ok = False
+                print(f"FAIL every key together: not settled ({at})")
+            elif good:
                 print(f"ok   every key together: {len(lists)} listings, each one moment ({took:.1f} s)")
             else:
                 ok = False
-                print(f"FAIL every key together: no order puts {at!r} ({at if good is None else 'a listing of no one moment'})")
+                print(f"FAIL every key together: no order puts {at!r} (a listing of no one moment)")
+        finished = True
         return ok
     finally:
+        # A run that did not reach its end (the harness's own exception) keeps its evidence.
+        ok = ok and finished
         proxy.stop()
         cluster.stop_all()
         if cluster.tunnels:
