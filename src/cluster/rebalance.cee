@@ -35,6 +35,19 @@ fn baseMembers(file: borrow ClusterFile, shard: u32) -> Result<RaftMembership, A
     return Ok(RaftMembership { voters: voters, learners: learners });
 }
 
+/// `m` with node `id` in neither its voters nor its learners.
+fn withoutNode(m: borrow RaftMembership, id: u32) -> RaftMembership {
+    var voters = Vector<u32>.create();
+    var learners = Vector<u32>.create();
+    for (v in m.voters.view()) {
+        if (v != id && voters.push(v).isErr()) { return RaftMembership { voters: voters, learners: learners }; }
+    }
+    for (l in m.learners.view()) {
+        if (l != id && learners.push(l).isErr()) { return RaftMembership { voters: voters, learners: learners }; }
+    }
+    return RaftMembership { voters: voters, learners: learners };
+}
+
 fn encodeIds(ids: Slice<u32>) -> Result<Vector<u8>, AllocError> {
     var out = Vector<u8>.create();
     out.pushLE(truncate<u32>(ids.length))?;
@@ -186,6 +199,74 @@ async fn group0Write(
     return Ok(false);
 }
 
+/// Group 0's voters among the active nodes (ADR-0067 §1): its active voters kept, in their order; then active nodes in
+/// failure domains not yet among them, in the roster's order; then any active nodes; at most GROUP0_VOTERS.
+fn group0Target(file: borrow ClusterFile, active: Slice<u32>, voters: Slice<u32>) -> Result<Vector<u32>, AllocError> {
+    var out = Vector<u32>.create();
+    for (v in voters) {
+        if (out.length < GROUP0_VOTERS && contains(active, v)) { out.push(v)?; }
+    }
+    for (pass in 0..2) {
+        for (i in 0..file.nodes.length) {
+            if (out.length >= GROUP0_VOTERS) { break; }
+            let n = borrow file.nodes[i];
+            if (!contains(active, n.id) || contains(out.view(), n.id)) { continue; }
+            var domainTaken = false;
+            for (o in out.view()) {
+                match (file.node(o)) {
+                    Some(m) => {
+                        if (m.domain.view() == n.domain.view()) { domainTaken = true; }
+                    }
+                    null => {}
+                }
+            }
+            if (pass == 0 && domainTaken) { continue; }
+            out.push(n.id)?;
+        }
+    }
+    return Ok(out);
+}
+
+/// One step of group 0 toward `target` voters, as its leader (ADR-0067 §2): every roster node stays in it, a voter
+/// or a learner, since every node reads the active set from it. A target learner that has caught up becomes a voter;
+/// then a voter the target leaves out becomes a learner (the leader too, which then steps down). True when a change
+/// was proposed.
+fn group0Step(r: borrow mut ShardReplica, target: Slice<u32>) -> Result<bool, StoreError> {
+    if (!r.core.isLeader()) { return Ok(false); }
+    let m = r.core.members.copy()?;
+    for (t in target) {
+        if (m.isVoter(t)) { continue; }
+        if (!m.isLearner(t)) {
+            var next = m.copy()?;
+            next.learners.push(t)?;
+            return Ok(r.changeMembers(next)?.isSome());
+        }
+        let caughtUp = match (r.core.peerAt(t)) {
+            Some(p) => r.core.peers[p].matched >= r.core.commit,
+            null => false,
+        };
+        if (!caughtUp) { return Ok(false); } // wait for it
+        var next = m.copy()?;
+        var k = 0usize;
+        while (k < next.learners.length) {
+            if (next.learners[k] == t) { let _ = next.learners.remove(k); } else { k += 1; }
+        }
+        next.voters.push(t)?;
+        return Ok(r.changeMembers(next)?.isSome());
+    }
+    for (v in m.voters.view()) {
+        if (contains(target, v)) { continue; }
+        var next = m.copy()?;
+        var k = 0usize;
+        while (k < next.voters.length) {
+            if (next.voters[k] == v) { let _ = next.voters.remove(k); } else { k += 1; }
+        }
+        next.learners.push(v)?;
+        return Ok(r.changeMembers(next)?.isSome());
+    }
+    return Ok(false);
+}
+
 /// One step of shard `r` toward `target` (ADR-0062 §4), as its leader: true when a change was proposed.
 fn rebalanceStep(r: borrow mut ShardReplica, target: Slice<u32>) -> Result<bool, StoreError> {
     if (!r.core.isLeader()) { return Ok(false); }
@@ -240,8 +321,9 @@ fn rebalanceAndDrain(
     r: borrow mut ShardReplica,
     st: borrow mut ObjectStore,
     target: Slice<u32>,
+    group0: bool,
 ) -> Result<Vector<RaftMessage>, StoreError> {
-    let _ = rebalanceStep(r, target)?;
+    let _ = if (group0) group0Step(r, target)? else rebalanceStep(r, target)?;
     var out = Vector<RaftMessage>.create();
     r.drain(st, mut out)?;
     return Ok(out);
@@ -278,23 +360,33 @@ async fn rebalanceForever(shared: borrow NodeShared) -> Result<void, NodeFault> 
         }
         for (i in 0..shared.slots.length) {
             let slot = borrow shared.slots[i];
-            if (slot.shard == GROUP0_SHARD || slot.failed.load() != 0) { continue; }
-            let target = match (shared.file.placementAmong(slot.shard, active.view())) {
-                Ok(t) => t,
-                Err(_) => { return Err(NodeFault.OutOfMemory); }
-            };
+            if (slot.failed.load() != 0) { continue; }
             var guard = match (await slot.replica.lock()) {
                 Ok(g) => g,
                 Err(_) => { return Err(NodeFault.Net); }
             };
             let r = guard.data();
             if (!r.core.isLeader()) { continue; }
+            // Group 0 moves too (ADR-0067): three voters among the active nodes, every other roster node its
+            // learner; a shard, to its placement among them.
+            let group0 = slot.shard == GROUP0_SHARD;
+            let target = match (if (group0) group0Target(
+                borrow shared.file,
+                active.view(),
+                r.core.members.voters.view(),
+            ) else shared.file.placementAmong(
+                slot.shard,
+                active.view(),
+            )) {
+                Ok(t) => t,
+                Err(_) => { return Err(NodeFault.OutOfMemory); }
+            };
             var storeGuard = match (await slot.store.get().lock()) {
                 Ok(g) => g,
                 Err(_) => { return Err(NodeFault.Net); }
             };
             let st = storeGuard.data();
-            let stepped = await Async.blocking(() => rebalanceAndDrain(r, st, target.view()));
+            let stepped = await Async.blocking(() => rebalanceAndDrain(r, st, target.view(), group0));
             match (stepped) {
                 Ok(out) => { await enqueue(shared, slot.shard, out)?; }
                 Err(e) => { await noteFailure(slot, e); }
@@ -344,7 +436,10 @@ fn clusterActiveCommand(op: u8) -> i32 {
     };
     var body = Vector<u8>.create();
     if (body.push(op).isErr() || body.pushLE(args.node).isErr()) { return 1; }
-    for (attempt in 0..10) {
+    // Each node in turn, for about fifteen seconds: a group 0 between leaders, or a write that needs a moment, answers
+    // 421 or 503 at once, so the rounds pause (ten back to back were over in milliseconds).
+    for (attempt in 0..30) {
+        if (attempt > 0) { let _ = Async.run(Timer.sleep(500)); }
         for (i in 0..loaded.file.nodes.length) {
             var url = textOf("http://");
             if (appendPeerAddress(

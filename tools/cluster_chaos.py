@@ -41,10 +41,11 @@ INF = float("inf")
 
 
 class Op:
-    __slots__ = ("id", "kind", "value", "start", "end", "client", "note")
+    __slots__ = ("id", "kind", "value", "start", "end", "client", "note", "key")
 
-    def __init__(self, kind, value, start, end, client=-1, note=""):
+    def __init__(self, kind, value, start, end, client=-1, note="", key=0):
         self.id = 0
+        self.key = key  # the key's index, for the check across keys
         self.kind = kind  # "w" write value (None: delete), "r" read value (None: absent), "p" read presence (bool)
         self.value = value
         self.start = start
@@ -103,10 +104,44 @@ def linearizable(ops, initial=None):
 UNSEEN_WINDOW_S = 5.0
 
 
-def search(ops, initial, keep_unseen, window=None):
+def step_all(state, op):
+    """The registers of every key at once, a tuple: a listing ("L") sees the exact set of keys present at one moment."""
+    if op.kind == "w":
+        return True, state[:op.key] + (op.value,) + state[op.key + 1:]
+    if op.kind == "r":
+        return state[op.key] == op.value, state
+    return frozenset(i for i, v in enumerate(state) if v is not None) == op.value, state
+
+
+def linearizable_all(per_key, lists, keys):
+    """The history of every key together (ADR-0065 §5, the exit review's gap): each key's writes and reads, pruned as
+    its own check prunes them, and each listing as one operation that saw every key's presence at a single moment.
+    The same two tiers as `linearizable`: (True, None), (False, the operation no order gets past), or (None, why)."""
+    def gather(keep_unseen, window):
+        ops = []
+        for i, k in enumerate(keys):
+            for op in prune(per_key[k], keep_unseen, window):
+                if op.kind != "p":
+                    op.key = i
+                    ops.append(op)
+        return ops + lists
+    initial = tuple(None for _ in keys)
+    good, at = search(gather(1, None), initial, 0, None, step_all, prepared=True)
+    if good:
+        return True, None
+    try:
+        again, at2 = search(gather(10**9, (at.start - UNSEEN_WINDOW_S, at.end)), initial, 0, None, step_all,
+                            prepared=True)
+    except RuntimeError as e:
+        return None, str(e)
+    return (True, None) if again else (False, at2 or at)
+
+
+def search(ops, initial, keep_unseen, window=None, stepper=step, prepared=False):
     """Whether `ops` (one key's) have a linearization from `initial`. Unknown ones (end INF) may be left out. When
     not, the operation the longest partial linearization could not get past: no order puts it there."""
-    ops = prune(ops, keep_unseen, window)
+    if not prepared:
+        ops = prune(ops, keep_unseen, window)
     for i, op in enumerate(ops):
         op.id = i
     # Entries: (time, is_return, op); calls before returns at equal times.
@@ -154,7 +189,7 @@ def search(ops, initial, keep_unseen, window=None):
             raise RuntimeError("the search is too large")
         is_ret, op = call_at[entry]
         if not is_ret:
-            ok, after = step(state, op)
+            ok, after = stepper(state, op)
             if ok:
                 bits = done | (1 << op.id)
                 memo = (bits, after)
@@ -212,6 +247,20 @@ def self_test():
         ("a listing after the delete, with no write to explain it",
          [w("a", 0, 1), w(None, 2, 3), p(False, 4, 5), p(True, 6, 7)], False),
     ]
+    # Across keys: a listing that saw k0 before its delete and k1 after its write, which no single moment had.
+    def wk(k, v, s, e):
+        return Op("w", v, s, e, key=k)
+
+    def listing(present, s, e):
+        return Op("L", frozenset(present), s, e)
+
+    across = [
+        ("a listing that is one moment", [wk(0, "a", 0, 1), wk(1, "b", 2, 3), listing({0, 1}, 4, 5)], True),
+        ("a listing of two moments", [wk(0, "a", 0, 1), wk(0, None, 2, 3), wk(1, "b", 4, 5),
+                                       listing({0, 1}, 0.5, 6)], False),
+        ("a listing concurrent with both", [wk(0, "a", 0, 1), wk(0, None, 2, 6), wk(1, "b", 3, 5),
+                                             listing({0, 1}, 0.5, 7)], True),
+    ]
     # A larger random history from a real register: linearizable by construction.
     rng = random.Random(7)
     big = []
@@ -233,6 +282,11 @@ def self_test():
         got, _ = linearizable(ops)
         print(("ok  " if got is want else "FAIL"), name)
         failures += got is not want
+    for name, ops, want in across:
+        got, _ = search(ops, (None, None), 0, None, step_all, prepared=True)
+        print(("ok  " if got is want else "FAIL"), name)
+        failures += got is not want
+    cases = cases + across
     print(f"checker self-test: {len(cases) - failures} passed, {failures} failed")
     return failures == 0
 
@@ -428,6 +482,9 @@ class Cluster:
         # With racks, node i is in rack (i - 1) % racks: nodes 1 to `racks` in different ones (group 0's three).
         self.racks = racks
         self.extra = []  # more options for every node
+        # How an empty directory starts (ADR-0066): --init at the cluster's formation, --join after a disk is lost.
+        # Ignored once a node's directory has its marker.
+        self.start_mode = {}
         self.skew = {}
         self.binary = binary
         self.work = work
@@ -469,7 +526,7 @@ class Cluster:
         os.makedirs(d, exist_ok=True)
         log = open(os.path.join(self.work, f"log{i}"), "ab")
         self.procs[i] = subprocess.Popen(
-            [self.binary, "node", d, "--cluster-file", self.conf, "--node", str(i),
+            [self.binary, "node", d, "--cluster-file", self.conf, "--node", str(i), self.start_mode.get(i, "--init"),
              "--listen", str(self.s3_port(i)), "--credentials", os.path.join(self.work, "credentials"),
              "--peer-listen", str(self.peer_port(i))]
             + (["--clock-skew-ms", str(self.skew[i])] if self.skew.get(i) else []) + self.extra,
@@ -524,28 +581,36 @@ class Cluster:
         return rows
 
     def operator(self, command, i):
-        """`cluster-join` or `cluster-leave` of node i; whether it answered 0."""
+        """`cluster-join` or `cluster-leave` of node i: (whether it answered 0, what it said on stderr)."""
         try:
-            return subprocess.run([self.binary, command, "--cluster-file", self.conf, "--node", str(i)],
-                                  capture_output=True, timeout=60).returncode == 0
+            r = subprocess.run([self.binary, command, "--cluster-file", self.conf, "--node", str(i)],
+                               capture_output=True, text=True, timeout=60)
+            return r.returncode == 0, r.stderr.strip()
         except subprocess.TimeoutExpired:
-            return False
+            return False, "no answer in 60 s"
 
     def holders_of(self, i):
-        """How many shards (group 0 aside) some live node reports node i among the voters or learners of."""
-        shards = set()
+        """How many groups still hold node i: shards with it among their voters or learners, and group 0 with it among
+        its voters (a learner of group 0 is every node that does not vote in it, ADR-0067). Each judged by the view of
+        its highest term, a leader's first: a replica a group removed goes on showing the group it was removed from
+        (ADR-0066 §2)."""
+        best = {}
         for j in range(1, self.n + 1):
             if j == i or j in self.paused or self.procs.get(j) is None or self.procs[j].poll() is not None:
                 continue
             for r in self.status(j):
-                if r[0] == "65535" or len(r) < 9:
+                if len(r) < 9:
                     continue
-                if str(i) in r[7].split(",") or str(i) in r[8].split(","):
-                    shards.add(r[0])
-        return len(shards)
+                rank = (int(r[2]), r[1] == "leader")
+                if r[0] not in best or rank > best[r[0]][0]:
+                    best[r[0]] = (rank, r)
+        return sum(1 for s, (_, r) in best.items()
+                   if (s != "65535" and (str(i) in r[7].split(",") or str(i) in r[8].split(",")))
+                   or (s == "65535" and str(i) in r[7].split(",")))
 
     def wipe(self, i):
         shutil.rmtree(os.path.join(self.work, f"d{i}"), ignore_errors=True)
+        self.start_mode[i] = "--join"
 
     def leaders(self):
         for i in range(1, self.n + 1):
@@ -637,8 +702,9 @@ def lose_disk(cluster, victim, stop, log, history):
     held = cluster.holders_of(victim)
     log.append(f"{history.now():8.3f}   node {victim} held replicas of {held} shards")
     cluster.kill(victim)
-    if not cluster.operator("cluster-leave", victim):
-        log.append(f"{history.now():8.3f}   cluster-leave {victim} did not answer")
+    answered, said = cluster.operator("cluster-leave", victim)
+    if not answered:
+        log.append(f"{history.now():8.3f}   cluster-leave {victim} did not answer: {said}")
     # A loss begun is seen through, even if the run's time is up meanwhile: a node left half out is the harness's
     # doing, not the cluster's.
     deadline = time.time() + 90
@@ -651,8 +717,16 @@ def lose_disk(cluster, victim, stop, log, history):
         return False
     cluster.wipe(victim)
     cluster.start(victim)
-    if not cluster.operator("cluster-join", victim):
-        log.append(f"{history.now():8.3f}   cluster-join {victim} did not answer")
+    time.sleep(2)
+    if cluster.procs[victim].poll() is not None:
+        # Refused (ADR-0066): what it said is the last line of its log.
+        with open(os.path.join(cluster.work, f"log{victim}"), errors="replace") as f:
+            last = (f.read().strip().splitlines() or [""])[-1]
+        log.append(f"{history.now():8.3f}   node {victim} did not start with --join: {last}")
+        return False
+    answered, said = cluster.operator("cluster-join", victim)
+    if not answered:
+        log.append(f"{history.now():8.3f}   cluster-join {victim} did not answer: {said}")
         return False
     log.append(f"{history.now():8.3f}   node {victim} wiped, started again and joined")
     # Shards back on it before anything else happens, so that the next loss loses something.
@@ -680,8 +754,8 @@ def faults(cluster, proxy, rng, stop, log, history, kinds, failures):
         kind = rng.choice(kinds)
         victim = rng.randint(1, cluster.n)
         if kind == "lose-disk":
-            # Only a node outside group 0, which stays on the first three (ADR-0062 §3).
-            spare = [i for i in range(4, cluster.n + 1)]
+            # Any node: group 0 moves off a node that leaves (ADR-0067).
+            spare = list(range(1, cluster.n + 1))
             if not spare:
                 continue
             victim = rng.choice(spare)
@@ -762,6 +836,19 @@ def faults(cluster, proxy, rng, stop, log, history, kinds, failures):
         log.append(f"{history.now():8.3f} healed")
 
 
+def lists_of(events, keys):
+    """The listings, as operations of the check across keys: the set of key indexes each saw."""
+    out = []
+    index = {k: i for i, k in enumerate(keys)}
+    for e in events:
+        if e["op"] != "list" or e["outcome"] == "fail":
+            continue
+        end = e["end"] if e["outcome"] == "ok" else INF
+        seen = frozenset(index[k] for k in e["value"] if k in index)
+        out.append(Op("L", seen, e["start"], end, e["c"], f"list@n{e['n']}"))
+    return out
+
+
 def ops_by_key(events, keys):
     per = {k: [] for k in keys}
     for e in events:
@@ -831,8 +918,9 @@ def run(args):
             return False
         # The standbys joined before the clients start, so that there are nodes outside group 0 to lose disks of.
         for i in standby:
-            if not cluster.operator("cluster-join", i):
-                print(f"FAIL node {i} could not join")
+            answered, said = cluster.operator("cluster-join", i)
+            if not answered:
+                print(f"FAIL node {i} could not join: {said}")
                 return False
             deadline = time.time() + 60
             while time.time() < deadline and cluster.holders_of(i) == 0:
@@ -939,6 +1027,7 @@ def run(args):
                         print(f"FAIL node {i}: {line.strip()}")
                         ok = False
         per = ops_by_key(history.events, keys)
+        lists = lists_of(history.events, keys)
         for k in keys:
             good, at = linearizable(per[k])
             if good:
@@ -954,6 +1043,17 @@ def run(args):
                     wrote_it = at.kind == "r" and op.kind == "w" and op.value == at.value and op is not at
                     if wrote_it or op is at or -1.0 < op.start - at.start < 0.2:
                         print(f"       {'>' if op is at else ' '} {op!r}{'   (the write it read)' if wrote_it else ''}")
+        # Every key together: a listing is one moment (the exit review's gap); after the per-key checks, which name a
+        # bad operation more plainly.
+        if ok:
+            t = time.time()
+            good, at = linearizable_all(per, lists, keys)
+            took = time.time() - t
+            if good:
+                print(f"ok   every key together: {len(lists)} listings, each one moment ({took:.1f} s)")
+            else:
+                ok = False
+                print(f"FAIL every key together: no order puts {at!r} ({at if good is None else 'a listing of no one moment'})")
         return ok
     finally:
         proxy.stop()

@@ -45,7 +45,7 @@ EOF
 
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 on() { local n="$1"; shift; aws --no-cli-pager --endpoint-url "http://127.0.0.1:$((BASE + 10 + n))" "$@"; }

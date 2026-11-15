@@ -2587,4 +2587,23 @@ Browser form uploads with a SigV4 POST policy.
   undetected, sealed packs not coded, listings checked per key, writes not idempotent across a lost answer, one
   machine per run.
 - **Next:** the owner's call on closing M6 with those gaps, or taking the first two first.
+- **The owner:** "Fix all those gaps before closing".
+
+### 15 Nov 2026: M6 exit gaps A to C: empty directories, group 0, listings across keys (ADR-0066, ADR-0067)
+
+- **A, an empty directory (ADR-0066, proposed):** a node's directory gets a `cosmo-node` marker (cluster, node, how it
+  began); an empty one starts only with `--init` (formation) or `--join`, which first asks the peers and refuses while
+  a shard (judged by its highest-term view) lists the node as a voter; a joined node opens what it holds nothing of
+  outside the group. `cluster-join`/`cluster-leave` keep trying for 15 s (they gave up in milliseconds).
+  `tools/cluster_identity_smoke.sh` (25 checks).
+- **B, group 0 moves (ADR-0067, proposed):** three voters among the active nodes, every other node its learner; a
+  leaving voter is made a learner. Found on the way: a leader never lowered a peer's match, so a learner whose disk was
+  replaced was counted as caught up with an empty log; a refusal below the match now lowers it and the log is sent
+  again (`raftALostLogIsSentAgain`; the 12 Raft mutants still killed). Disk loss in the harness now hits any node,
+  group 0's included: five losses in a run, all recovered, linearizable.
+- **C, listings across keys:** the checker also checks the whole history as one register per key, so a listing that
+  is no single moment fails (self-test 20 of 20; about a second a run).
+- **Tests:** 279 pass; every smoke passes (identity 25, EC 14, repair 13, moves 14, cluster S3 33, cluster 5, S3); the
+  chaos mutants are killed; three 90 s chaos runs linearizable per key and across keys.
+- **Next:** D, write sessions (ADR-0068): a forwarded write done once.
 

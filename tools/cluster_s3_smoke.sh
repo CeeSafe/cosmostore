@@ -46,7 +46,7 @@ EOF
 
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.

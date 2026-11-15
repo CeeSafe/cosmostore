@@ -47,7 +47,7 @@ EOF
 
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials \
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials \
         --scrub-seconds 2 --code-after-seconds 2 >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }

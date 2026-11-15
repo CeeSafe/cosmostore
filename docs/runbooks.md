@@ -256,7 +256,10 @@ any object by multipart upload, and any object by ranged GETs (the AWS CLI's way
   `head -c 32 /dev/urandom | base64 > cluster.key`, copy it to every node, and keep it as secret as the access
   keys: whoever holds it can speak for a node.
 - **Start a node** with `cosmostore node <dir> --cluster-file <file> --node <id> --listen <[address:]port>
-  --credentials <file>` (without the last two, it replicates and serves no S3); its shards' replicas are under
+  --credentials <file>` (without the last two, it replicates and serves no S3). Its first start in an empty
+  directory needs `--init` when the cluster is being formed (or the node was never part of it), or `--join` when it
+  joins or comes back after losing its disk; later starts need neither, and a node refuses another node's or another
+  cluster's directory (its `cosmo-node` file, ADR-0066). Its shards' replicas are under
   `<dir>/shard-<2 hex>`. Point clients at any node's S3 port: a request goes to its bucket's leader, and a write is
   answered once a majority holds it. A node that is down is caught up when it comes back, from its peers' logs or, if it fell
   behind a checkpoint, from a snapshot; it deposes no working leader.
@@ -278,11 +281,12 @@ any object by multipart upload, and any object by ranged GETs (the AWS CLI's way
   node decodes it from its peers' pieces, and the client's retry reads it; the decoded copy is kept an hour. Let
   clients retry (the AWS CLI's `AWS_MAX_ATTEMPTS`, 5 or more). With more nodes down than the code survives (two of
   three), a coded object cannot be read until one comes back.
-- **A node's disk lost:** never start it again on an empty directory under its id. It would vote again in terms
-  it voted in before, and two leaders of a term become possible. Take it out first (`cluster-leave`), wait until the
-  status shows it in no shard's voters or learners, then wipe it, start it, and `cluster-join` it again (ADR-0065
-  §7; `tools/cluster_chaos.py --disk-loss` does exactly this under load). A node of group 0 (the first three active)
-  cannot be taken out this way yet: keep those three on redundant disks.
+- **A node's disk lost:** take it out first (`cluster-leave`), wait until the status shows it in no shard's voters
+  or learners, then start it on the empty directory with `--join` and `cluster-join` it again (ADR-0065 §7,
+  ADR-0066; `tools/cluster_chaos.py --disk-loss` does exactly this under load). `--join` refuses while a peer still
+  lists the node as a voter. Never use `--init` there: it is the operator's word that the node was never part of the
+  cluster, and a voter started so would vote again in terms it voted in. Any node can be taken out so: group 0 moves
+  its vote off a node that leaves (ADR-0067).
 - **A write answered 503 through a node that is not its shard's leader** may have been done: the node lost its
   exchange with the leader and does not send it again (ADR-0065). A client's retry is a write of its own; S3 clients
   retry 503s, which is what an S3 PUT allows.
@@ -296,8 +300,8 @@ any object by multipart upload, and any object by ranged GETs (the AWS CLI's way
   the ones to add later with the word `standby`, and start them; `cosmostore cluster-join --cluster-file <file>
   --node <id>` makes one active and shards move onto it, one replica at a time; `cluster-leave` moves every shard
   off a node, after which it can be stopped. A node removed keeps its data directory; remove it by hand once the
-  status shows it in no shard's voters or learners. The first three nodes active at the start hold group 0 and
-  should stay up.
+  status shows it in no shard's voters or learners. Group 0 (three voters among the active nodes) moves as shards
+  do (ADR-0067).
 
 ## Not yet
 

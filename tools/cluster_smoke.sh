@@ -40,7 +40,7 @@ EOF
 
 start() {
     mkdir -p "$WORK/d$1"
-    "$BIN" node "$WORK/d$1" --cluster-file "$WORK/cluster.conf" --node "$1" >> "$WORK/log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file "$WORK/cluster.conf" --node "$1" >> "$WORK/log$1" 2>&1 &
     PIDS[$1]=$!
 }
 

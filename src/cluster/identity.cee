@@ -1,0 +1,219 @@
+// A node's directory knows whose it is and how it began (ADR-0066). `<dir>/cosmo-node` is written once, the first
+// time the node starts there, through a temporary file renamed into place (synced, its directory synced):
+//
+//   cosmo-node v1
+//   cluster <the cluster file's digest, 64 hex>
+//   node <id>
+//   start init | join
+//
+// A directory without it and without data must be started with `--init` (the cluster's first formation, or a node
+// never part of it) or `--join` (a node joining, or coming back after its disk was lost): a node started again on an
+// empty directory under its id would vote again in terms it voted in. A `join` directory opens every shard it holds
+// nothing of as a replica outside the shard's group, on every start: only the shard's leader adds it.
+
+const MARKER_NAME: StringView = "/cosmo-node";
+
+/// How a node's directory began.
+enum NodeStart {
+    Init,
+    Join,
+}
+
+/// What a directory's marker says.
+struct NodeMarker {
+    digest: [u8; 32];
+    node: u32;
+    start: NodeStart;
+}
+
+fn markerPath(dir: StringView, suffix: StringView) -> Result<String, AllocError> {
+    var s = String.create();
+    s.append(dir)?;
+    s.append(MARKER_NAME)?;
+    s.append(suffix)?;
+    return Ok(s);
+}
+
+/// The marker of `dir`, null when there is none; an error when it is there but not one (a torn or foreign file).
+fn readMarker(dir: StringView) -> Result<NodeMarker?, String> {
+    let path = markerPath(dir, "").ok() ?? String.create();
+    let file = match (DurableFile.openRead(path.view())) {
+        Ok(f) => f,
+        Err(e) => {
+            if (e.isNotFound()) { return Ok(null); }
+            return Err(textOf("cosmostore: the node directory's cosmo-node file cannot be read"));
+        }
+    };
+    let size = match (file.size()) {
+        Ok(n) => n,
+        Err(_) => { return Err(textOf("cosmostore: the node directory's cosmo-node file cannot be read")); }
+    };
+    if (size > 4096) { return Err(textOf("cosmostore: the node directory's cosmo-node file is not one")); }
+    var bytes = Vector<u8>.create();
+    if (bytes.resize(size as usize, 0).isErr() || file.readExactAt(mut bytes.viewMut(), 0).isErr()) {
+        return Err(textOf("cosmostore: the node directory's cosmo-node file cannot be read"));
+    }
+    return match (parseMarker(bytes.view())) {
+        Some(m) => Ok(Some(m)),
+        null => Err(textOf("cosmostore: the node directory's cosmo-node file is not one (torn, or another program's)")),
+    };
+}
+
+/// `s` from byte `from` on (ASCII text).
+fn after(s: StringView, from: usize) -> StringView => StringView.fromUtf8(s.bytes()[from..s.length]) ?? "";
+
+fn parseMarker(b: Slice<u8>) -> NodeMarker? {
+    let text = StringView.fromUtf8(b) ?? "";
+    var lines = Vector<StringView>.create();
+    for (line in text.split("\n")) {
+        if (line.length > 0 && lines.push(line).isErr()) { return null; }
+    }
+    if (lines.length != 4 || lines[0] != "cosmo-node v1") { return null; }
+    if (!lines[1].startsWith("cluster ") || !lines[2].startsWith("node ") || !lines[3].startsWith("start ")) {
+        return null;
+    }
+    var digest = [0u8; 32];
+    let hex = after(lines[1], 8);
+    if (hex.length != 64 || !hexInto(hex.bytes(), mut digest[..])) { return null; }
+    let node = match (after(lines[2], 5).parseInt<u32>()) {
+        Some(n) => n,
+        null => { return null; }
+    };
+    let mode = after(lines[3], 6);
+    let start = if (mode == "init") NodeStart.Init else if (mode == "join") NodeStart.Join else {
+        return null;
+    };
+    return Some(NodeMarker { digest: digest, node: node, start: start });
+}
+
+/// Writes `dir`'s marker, once: a temporary file synced, renamed into place, the directory synced.
+fn writeMarker(dir: StringView, digest: Slice<u8>, node: u32, start: NodeStart) -> Result<void, String> {
+    var text = Vector<u8>.create();
+    let built = text.extend("cosmo-node v1\ncluster ".bytes()).isOk() && appendHexBytes(mut text, digest).isOk() &&
+        text.extend("\nnode ".bytes()).isOk() && appendDecimal(mut text, node as u64).isOk() &&
+        text.extend(match (start) {
+            NodeStart.Init => "\nstart init\n".bytes(),
+            NodeStart.Join => "\nstart join\n".bytes(),
+        }).isOk();
+    if (!built) { return Err(textOf("out of memory")); }
+    let tmp = markerPath(dir, ".tmp").ok() ?? String.create();
+    let path = markerPath(dir, "").ok() ?? String.create();
+    let _ = Fs.unlink(tmp.view());
+    let wrote = match (DurableFile.createNew(tmp.view())) {
+        Ok(f) => f.writeAt(text.view(), 0).isOk() && f.syncData().isOk(),
+        Err(_) => false,
+    };
+    if (!wrote || Fs.rename(tmp.view(), path.view()).isErr() || Fs.syncDirectory(dir).isErr()) {
+        return Err(textOf("cosmostore: the node directory's cosmo-node file cannot be written"));
+    }
+    return Ok();
+}
+
+/// Whether `dir` holds a node's data from before markers (group 0's hard state): such a directory began with its
+/// cluster, as `init`.
+fn hasNodeData(dir: StringView) -> bool {
+    var path = String.create();
+    if (path.append(dir).isErr() || path.append("/group-0/raft-state.0").isErr()) { return false; }
+    return DurableFile.openRead(path.view()).isOk();
+}
+
+/// How a node may start in `dir` (ADR-0066 §1, §2): its marker's way, checked against the cluster and the node; a
+/// directory with data from before markers as `init`; an empty one as the flag says, or not at all. `Join` still needs
+/// its peers' word that the node is in no shard's voters (`checkNotAVoter`) before it is written.
+fn startOf(
+    dir: StringView,
+    digest: Slice<u8>,
+    node: u32,
+    init: bool,
+    join: bool,
+) -> Result<NodeDecision, String> {
+    match (readMarker(dir)?) {
+        Some(m) => {
+            if (m.digest[..] != digest) {
+                return Err(
+                    textOf("cosmostore: this directory belongs to another cluster (its cosmo-node file says so)"),
+                );
+            }
+            if (m.node != node) {
+                return Err(
+                    textOf(
+                        "cosmostore: this directory belongs to another node of the cluster (its cosmo-node file says so)",
+                    ),
+                );
+            }
+            return Ok(NodeDecision { start: m.start, fresh: false });
+        }
+        null => {}
+    }
+    if (hasNodeData(dir)) { return Ok(NodeDecision { start: NodeStart.Init, fresh: true }); }
+    if (init && join) { return Err(textOf("cosmostore: --init and --join are each other's opposites: give one")); }
+    if (init) { return Ok(NodeDecision { start: NodeStart.Init, fresh: true }); }
+    if (join) { return Ok(NodeDecision { start: NodeStart.Join, fresh: true }); }
+    return Err(textOf(
+        "cosmostore: an empty node directory: start it with --init when the cluster is being formed (or the node was never part of it), or with --join when the node joins or comes back after losing its disk (never start a node again on an empty directory as if it had its data)",
+    ));
+}
+
+/// What `startOf` decided: how the node starts, and whether its marker is still to be written.
+struct NodeDecision {
+    start: NodeStart;
+    fresh: bool;
+}
+
+/// One shard's line of a node's status: its term, whether that replica leads, and its voters.
+struct ShardView {
+    shard: u32;
+    term: u64;
+    leads: bool;
+    voters: Vector<u32>;
+}
+
+/// Each shard's line of `text` (a node's `statusText`): shard, role, term, leader, last, commit, applied, voters,
+/// learners.
+fn shardViews(text: Slice<u8>, out: borrow mut Vector<ShardView>) -> Result<void, AllocError> {
+    let all = StringView.fromUtf8(text) ?? "";
+    for (line in all.split("\n")) {
+        if (line.length == 0 || line.startsWith("#") || line.startsWith("shard")) { continue; }
+        var field = 0usize;
+        var view = ShardView { shard: 0, term: 0, leads: false, voters: Vector<u32>.create() };
+        for (word in line.split(" ")) {
+            if (field == 0) { view.shard = word.parseInt<u32>() ?? 0; }
+            if (field == 1) { view.leads = word == "leader"; }
+            if (field == 2) { view.term = word.parseInt<u64>() ?? 0; }
+            if (field == 7) {
+                for (v in word.split(",")) {
+                    match (v.parseInt<u32>()) {
+                        Some(x) => { view.voters.push(x)?; }
+                        null => {}
+                    }
+                }
+            }
+            field += 1;
+        }
+        if (field >= 9) { out.push(view)?; }
+    }
+    return Ok();
+}
+
+/// Whether, by the views a node's peers gave, `node` is among a shard's voters. Each shard is judged by its view of
+/// the highest term, a leader's before others of that term: a replica the shard has removed never hears of its
+/// removal, and goes on showing the group it was removed from, at the term it was removed in (ADR-0066 §2).
+fn votesInSomeShard(views: Slice<ShardView>, node: u32) -> bool {
+    for (i in 0..views.length) {
+        let v = borrow views[i];
+        var best = true;
+        for (j in 0..views.length) {
+            let w = borrow views[j];
+            if (w.shard != v.shard || j == i) { continue; }
+            if (w.term > v.term || (w.term == v.term && w.leads && !v.leads) ||
+                (w.term == v.term && w.leads == v.leads && j < i)) {
+                best = false;
+            }
+        }
+        if (!best) { continue; }
+        for (x in v.voters.view()) {
+            if (x == node) { return true; }
+        }
+    }
+    return false;
+}

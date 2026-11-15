@@ -879,6 +879,52 @@ fn simReply(kind: u8, from: u32, term: u64) -> RaftMessage {
 }
 
 @test
+fn raftALostLogIsSentAgain() -> Result<void, TestFailure> {
+    // Follower 2 acknowledged entry 4, then lost its log (its disk replaced, ADR-0066): its refusal says it holds
+    // nothing. The leader stops counting it as matched to 4 and sends from the start.
+    var core = RaftCore.create(simConfig(1, 3, 7))!;
+    var ticks = 0;
+    while (core.role != RAFT_PRE_CANDIDATE && ticks < 40) {
+        core.tick()!;
+        let _ = simDiscard(mut core)?;
+        ticks = ticks + 1;
+    }
+    core.step(simReply(RAFT_PRE_VOTE_REPLY, 2, 1))!;
+    let _ = simDiscard(mut core)?;
+    core.step(simReply(RAFT_VOTE_REPLY, 2, 1))!;
+    let _ = simDiscard(mut core)?;
+    Check.isTrue(core.isLeader(), "elected")?;
+    for (i in 0..3) {
+        var data = Vector<u8>.create();
+        data.pushLE(truncate<u64>(i))!;
+        let _ = core.propose(data)!;
+    }
+    let _ = simDiscard(mut core)?;
+    Check.equalU64(4, core.lastIndex())?;
+    var ack = simReply(RAFT_APPEND_REPLY, 2, 1);
+    ack.index = 4;
+    core.step(ack)!;
+    let _ = simDiscard(mut core)?;
+    Check.equalU64(4, core.commit)?;
+    let p = core.peerAt(2)!;
+    Check.equalU64(4, core.peers[p].matched)?;
+    // Its log lost: a refusal of a heartbeat at 4, hinting 0.
+    var lost = simReply(RAFT_APPEND_REPLY, 2, 1);
+    lost.granted = false;
+    lost.index = 0;
+    core.step(lost)!;
+    let r = simDiscard(mut core)?;
+    Check.equalU64(0, core.peers[p].matched)?;
+    var sent = false;
+    for (m in r.messages.view()) {
+        if (m.kind == RAFT_APPEND && m.to == 2 && m.index == 0) { sent = true; }
+    }
+    Check.isTrue(sent, "the log is sent again from its start")?;
+    Check.equalU64(4, core.commit)?; // the commit index never goes back
+    return Ok();
+}
+
+@test
 fn raftAStaleSnapshotKeepsTheLog() -> Result<void, TestFailure> {
     // A follower that took entries 1 to 5 and then gets a snapshot to 3, sent before them and delayed: it has entry
     // 3, so it keeps 4 and 5, which the leader may have counted towards a commit.

@@ -120,6 +120,7 @@ fn openNode(
     scrubEveryMs: u64,
     codeAfterMs: u64,
     clockSkewMs: i64,
+    joined: bool,
 ) -> Result<NodeParts, String> {
     if (file.node(id).isNull()) { return Err(textOf("this node is not in the cluster file")); }
     var slots = Vector<ShardSlot>.create();
@@ -136,10 +137,13 @@ fn openNode(
     if (shards.push(GROUP0_SHARD).isErr()) { return Err(textOf("out of memory")); }
     for (i in 0..shards.length) {
         let shard = shards[i];
-        let base = match (baseMembers(borrow file, shard)) {
+        var base = match (baseMembers(borrow file, shard)) {
             Ok(b) => b,
             Err(_) => { return Err(textOf("out of memory")); }
         };
+        // A node that joined (ADR-0066 §3): a shard it holds nothing of is one it is not in, whatever the cluster
+        // began as; its leader adds it.
+        if (joined) { base = withoutNode(borrow base, id); }
         let voters = base.voters;
         let learners = base.learners;
         var path = String.create();
@@ -984,6 +988,48 @@ fn nodeCommand() -> i32 {
         }
         null => {}
     }
+    // How this directory starts (ADR-0066): its marker's way; or, empty, as --init or --join says, a join only once
+    // the node's peers say it is in no shard's voters.
+    let decision = match (startOf(dir, loaded.file.digest[..], id, args.init, args.join)) {
+        Ok(d) => d,
+        Err(message) => {
+            Console.writeErrorLine(message.view());
+            return 2;
+        }
+    };
+    let joined = match (decision.start) {
+        NodeStart.Join => true,
+        NodeStart.Init => false,
+    };
+    if (decision.fresh) {
+        if (joined) {
+            let refusal = match (Async.run(checkNotAVoter(borrow loaded, id))) {
+                Ok(r) => r,
+                Err(_) => Some(textOf("cosmostore: the node's peers could not be asked")),
+            };
+            match (refusal) {
+                Some(message) => {
+                    Console.writeErrorLine(message.view());
+                    return 1;
+                }
+                null => {}
+            }
+        }
+        match (Fs.ensureDirectory(dir)) {
+            Ok() => {}
+            Err(_) => {
+                Console.writeErrorLine("cosmostore: the node directory cannot be made");
+                return 1;
+            }
+        }
+        match (writeMarker(dir, loaded.file.digest[..], id, decision.start)) {
+            Ok() => {}
+            Err(message) => {
+                Console.writeErrorLine(message.view());
+                return 1;
+            }
+        }
+    }
     let scrubMs = (args.scrubSeconds ?? 3600) * 1000;
     let codeMs = (args.codeAfterSeconds ?? 86400) * 1000;
     let parts = match (openNode(
@@ -995,6 +1041,7 @@ fn nodeCommand() -> i32 {
         scrubMs,
         codeMs,
         args.clockSkewMs ?? 0,
+        joined,
     )) {
         Ok(s) => s,
         Err(message) => {
@@ -1068,6 +1115,9 @@ struct ClusterArguments {
     peerListen: String?;
     /// How far off the machine's clock this node signs and checks peer requests (testing only, ADR-0065 §7).
     clockSkewMs: i64?;
+    /// How an empty directory starts (ADR-0066): the cluster's formation, or joining it.
+    init: bool;
+    join: bool;
 }
 
 fn clusterArguments(from: usize) -> ClusterArguments? {
@@ -1079,12 +1129,20 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var codeAfterSeconds: u64? = null;
     var peerListen: String? = null;
     var clockSkewMs: i64? = null;
+    var init = false;
+    var join = false;
     var at = from;
     while (true) {
         let option = match (Process.argument(at)) {
             Some(o) => o,
             null => { break; }
         };
+        // The two flags without a value.
+        if (option == "--init" || option == "--join") {
+            if (option == "--init") { init = true; } else { join = true; }
+            at += 1;
+            continue;
+        }
         let value = Process.argument(at + 1) ?? "";
         if (value.length == 0) { return null; }
         if (option == "--cluster-file") {
@@ -1123,6 +1181,8 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 codeAfterSeconds: codeAfterSeconds,
                 peerListen: peerListen,
                 clockSkewMs: clockSkewMs,
+                init: init,
+                join: join,
             }),
             null => null,
         },
@@ -1198,6 +1258,48 @@ fn clusterStatusCommand() -> i32 {
     }
     Console.write(StringView.fromUtf8(answer.view()) ?? "");
     return 0;
+}
+
+/// Before a node joins on an empty directory (ADR-0066 §2): a majority of its peers answer, and none lists it among a
+/// shard's voters (a voter that lost its disk must be taken out first, `cluster-leave`). Why not, or null.
+async fn checkNotAVoter(loaded: borrow LoadedCluster, id: u32) -> Result<String?, NodeFault> {
+    var others = 0usize;
+    var answered = 0usize;
+    var views = Vector<ShardView>.create();
+    for (i in 0..loaded.file.nodes.length) {
+        let n = borrow loaded.file.nodes[i];
+        if (n.id == id) { continue; }
+        others += 1;
+        var url = textOf("http://");
+        if (appendPeerAddress(mut url, n.peer).isErr() || url.append("/cluster/status").isErr()) {
+            return Err(NodeFault.OutOfMemory);
+        }
+        var answer = Vector<u8>.create();
+        let status = match (await askStatus(loaded, url.view(), mut answer)) {
+            Ok(s) => s,
+            Err(_) => 0u16,
+        };
+        if (status != 200) { continue; }
+        answered += 1;
+        if (shardViews(answer.view(), mut views).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    if (votesInSomeShard(views.view(), id)) {
+        var line = textOf("cosmostore: node ");
+        let _ = line.appendNumber(id as i64);
+        let _ = line.append(
+            " is still a voter of a shard, as its leader sees it: take it out with cluster-leave, wait until no shard lists it, then start it with --join",
+        );
+        return Ok(Some(line));
+    }
+    if (answered < others / 2 + 1) {
+        var line = textOf("cosmostore: only ");
+        let _ = line.appendNumber(truncate<i64>(answered));
+        let _ = line.append(" of the node's ");
+        let _ = line.appendNumber(truncate<i64>(others));
+        let _ = line.append(" peers answered: a majority must, to show it is in no shard's voters, before it joins");
+        return Ok(Some(line));
+    }
+    return Ok(null);
 }
 
 async fn askStatus(

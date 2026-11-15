@@ -100,6 +100,10 @@ and b built under the owner's standing go-ahead.
   killed) and `rack-isolate` (a rack cut off from the rest) among the faults; `--code-after-seconds 2` passes the
   coding age to the nodes and writes two large keys once, which clients only read, so that reads decode coded
   extents while the faults go on. Both linearizable, on macOS and on binfadel.
+- **Listings across keys** (an M6 exit gap): after the per-key checks, the whole history is checked again as one
+  register per key, a listing one operation that saw the exact set of present keys at a single moment (each key's
+  unknown writes pruned as its own check prunes them, the same two tiers). A listing of two moments, which the
+  per-key checks pass, fails it (self-test). On real runs it takes about a second.
 - **Diagnostics it brought:** `cluster-status` prints `# peer <ticks> <sent> <unsent> <received> <refused>`; a node
   logs a tick that took over a second, with where the time went; a replica stopped fails a run; a final read slow
   to come back saves every node's status and, on macOS, a `sample` of its threads, in the work directory.
