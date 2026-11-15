@@ -1,6 +1,7 @@
 # ADR-0070: Sealed segments coded; pieces re-homed when a holder leaves (M6 exit gap F)
 
-**Status:** proposed, 15 Nov 2026, for the gaps of the M6 exit review (`docs/m6-exit-review.md`), which the owner
+**Status:** accepted, 15 Nov 2026, as recommended (the owner: "Yes I accept ADR-0066 to ADR-0070 as recommended"); for
+the gaps of the M6 exit review (`docs/m6-exit-review.md`), which the owner
 asked to fix before closing M6 ("Fix all those gaps before closing").
 
 ## Context

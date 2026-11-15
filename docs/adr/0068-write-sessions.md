@@ -1,6 +1,7 @@
 # ADR-0068: A forwarded write is done once: request ids and their answers in the log (M6 exit gap)
 
-**Status:** proposed, 15 Nov 2026, for the gaps of the M6 exit review (`docs/m6-exit-review.md`), which the owner
+**Status:** accepted, 15 Nov 2026, as recommended (the owner: "Yes I accept ADR-0066 to ADR-0070 as recommended"); for
+the gaps of the M6 exit review (`docs/m6-exit-review.md`), which the owner
 asked to fix before closing M6 ("Fix all those gaps before closing").
 
 ## Context

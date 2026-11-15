@@ -2661,3 +2661,11 @@ Browser form uploads with a SigV4 POST policy.
   per key and across keys.
 - **Next:** the owner's word on ADR-0066 to ADR-0070, and closing M6.
 
+### 15 Nov 2026: ADR-0066 to ADR-0070 accepted; M6 closed
+
+- The owner: "Yes I accept ADR-0066 to ADR-0070 as recommended." Node identity and empty directories (0066), group
+  0 moving (0067), write sessions (0068), network faults and many machines (0069), coded segments and re-homed pieces
+  (0070) are accepted as built.
+- **M6 (the distributed cluster) is closed:** its exit holds for what it built (`docs/m6-exit-review.md`), the gaps
+  of the first review closed, ADR-0056 to ADR-0070 accepted. What is not covered is listed there.
+
