@@ -1212,6 +1212,26 @@ const LIFECYCLE_BATCH: usize = 1000;
 /// Abandoned extents queued between reaps; more are left to the orphan sweep at open.
 const ABANDONED_CAPACITY: usize = 4096;
 
+/// What a scrub step found damaged (ADR-0063): an extent (`extent`, its `id`), or an inline version's record (where it
+/// is: `segment`, `offset`, `length`), and the version it belongs to.
+struct ScrubDamage {
+    extent: bool;
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    versionId: [u8; 16];
+    id: u64;
+    segment: u64;
+    offset: u64;
+    length: u32;
+}
+
+/// One scrub step: versions checked, what was damaged, and the key to go on after (null: the pass is done).
+struct ScrubPage {
+    checked: u64;
+    damages: Vector<ScrubDamage>;
+    next: IndexKey?;
+}
+
 /// A Config record found unapplied on recovery: its index and membership bytes.
 struct RecoveredConfig {
     index: u64;
@@ -1636,6 +1656,136 @@ struct ObjectStore {
 
     /// Where the store's extent files are.
     fn extentDirectory(borrow this) -> StringView => this.extentDir.view();
+
+    // --- Scrub and repair (ADR-0063) ---
+
+    /// Checks up to `max` live versions after `after` (from the first when null): an inline version's record read and
+    /// verified, an extent read whole and checked against its manifest. What it finds damaged, and where to go on.
+    fn scrubStep(borrow this, after: borrow (IndexKey?), max: usize) -> Result<ScrubPage, StoreError> {
+        var page = ScrubPage { checked: 0, damages: Vector<ScrubDamage>.create(), next: null };
+        var cursor = match (after.asBorrow()) {
+            Some(k) => this.state.index.seekAfter(k),
+            null => this.state.index.first(),
+        };
+        var seen = 0usize;
+        while (seen < max) {
+            let i = match (cursor) {
+                Some(c) => c,
+                null => { break; }
+            };
+            cursor = this.state.index.next(i);
+            seen += 1;
+            let k = this.state.index.keyAt(i);
+            if (seen == max && cursor.isSome()) { page.next = copyIndexKey(k)?; }
+            var slot = this.state.index.slotAt(i);
+            while (slot != NO_VERSION_SLOT) {
+                let v = this.state.index.versionAt(slot);
+                slot = this.state.index.olderOf(slot);
+                if (isDeleteMarker(v)) { continue; }
+                page.checked += 1;
+                if (v.extents.length == 0) {
+                    match (this.readLiveRecord(v)) {
+                        Ok(_) => {}
+                        Err(StoreError.DataCorrupt) => {
+                            page.damages.push(ScrubDamage {
+                                extent: false,
+                                bucket: copyBytes(this.state.bucketName(k.bucket))?,
+                                key: copyBytes(k.key.view())?,
+                                versionId: v.versionId,
+                                id: 0,
+                                segment: v.recordSegment,
+                                offset: v.payload.offset + v.payload.length as u64 + RECORD_TRAILER_LEN as u64 -
+                                    v.recordLength as u64,
+                                length: v.recordLength,
+                            })?;
+                        }
+                        Err(_) => {}
+                    }
+                    continue;
+                }
+                for (e in 0..v.extents.length) {
+                    let want = borrow v.extents[e];
+                    let whole = match (this.extentFileBytes(want.id)) {
+                        Ok(b) => {
+                            let h = b.view();
+                            (h.length as u64) == EXTENT_HEADER_LEN + want.length && h.readLE<u64>(0) == EXTENT_MAGIC &&
+                                h.readLE<u64>(8) == want.id && h.readLE<u32>(60) == Crc32c.of(h[0..60]) &&
+                                Crc32c.of(h[EXTENT_HEADER_LEN as usize..h.length]) == want.crc
+                        }
+                        Err(_) => true, // missing: fetching sees to it (ADR-0061 §3)
+                    };
+                    if (!whole) {
+                        page.damages.push(ScrubDamage {
+                            extent: true,
+                            bucket: copyBytes(this.state.bucketName(k.bucket))?,
+                            key: copyBytes(k.key.view())?,
+                            versionId: v.versionId,
+                            id: want.id,
+                            segment: 0,
+                            offset: 0,
+                            length: 0,
+                        })?;
+                    }
+                }
+            }
+        }
+        return Ok(page);
+    }
+
+    /// Removes a damaged extent's file, so that fetching what is missing puts a good copy back (ADR-0063 §2).
+    fn quarantineExtent(borrow mut this, id: u64) { removeExtent(this.extentDir.view(), id); }
+
+    /// This replica's live record of a version, whole and verified, when it is inline and `length` bytes long: what
+    /// another replica asks for to repair its own (ADR-0063 §3).
+    fn recordOfVersion(
+        borrow this,
+        bucket: Slice<u8>,
+        key: Slice<u8>,
+        versionId: [u8; 16],
+        length: u32,
+    ) -> Result<Vector<u8>?, StoreError> {
+        if (!this.state.hasBucket(bucket)?) { return Ok(null); }
+        let k = this.state.keyFor(bucket, key)?;
+        let v = match (this.state.index.find(borrow k, versionId)) {
+            Some(v) => v,
+            null => { return Ok(null); }
+        };
+        if (v.extents.length != 0 || isDeleteMarker(v) || v.recordLength != length) { return Ok(null); }
+        return match (this.readLiveRecord(v)) {
+            Ok(b) => Ok(Some(b)),
+            Err(_) => Ok(null),
+        };
+    }
+
+    /// Writes another replica's copy of a version's record over this replica's damaged one (ADR-0063 §3), once it is
+    /// checked: a valid record of the same length, in the same place the version names, whose payload has the
+    /// version's MD5 (a sealed one: its length). Whether it was written.
+    fn repairRecord(
+        borrow mut this,
+        bucket: Slice<u8>,
+        key: Slice<u8>,
+        versionId: [u8; 16],
+        record: Slice<u8>,
+    ) -> Result<bool, StoreError> {
+        if (!this.state.hasBucket(bucket)?) { return Ok(false); }
+        let k = this.state.keyFor(bucket, key)?;
+        let v = match (this.state.index.find(borrow k, versionId)) {
+            Some(v) => v,
+            null => { return Ok(false); }
+        };
+        if (v.extents.length != 0 || record.length != v.recordLength as usize) { return Ok(false); }
+        let h = match (decodeRecord(record)) {
+            Ok(h) => h,
+            Err(_) => { return Ok(false); }
+        };
+        if (h.payloadLen != v.payload.length) { return Ok(false); }
+        let end = record.length - RECORD_TRAILER_LEN;
+        let payload = record[end - h.payloadLen as usize..end];
+        if (!isSealed(v) && v.parts == 0 && Md5.of(payload)[..] != v.md5[..]) { return Ok(false); }
+        let offset = v.payload.offset + v.payload.length as u64 + RECORD_TRAILER_LEN as u64 - v.recordLength as u64;
+        this.journal.repairAt(v.recordSegment, offset, record)?;
+        return Ok(true);
+    }
 
     /// Extent `id`'s file, whole: what a leader pushes, or a replica sends one that lacks it.
     fn extentFileBytes(borrow this, id: u64) -> Result<Vector<u8>, StoreError> {

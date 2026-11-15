@@ -51,6 +51,13 @@ struct NodeShared {
     ticks: AtomicU64;
     /// The ids of ReadIndex reads (ADR-0060 §6).
     readIds: AtomicU64;
+    /// Scrub (ADR-0063): how often a pass starts, and what passes found: versions checked, damage found, records
+    /// repaired from a replica, extents fetched (a damaged one removed comes back this way, as a missing one does).
+    scrubEveryMs: u64;
+    scrubChecked: AtomicU64;
+    scrubDamaged: AtomicU64;
+    scrubRepaired: AtomicU64;
+    extentsFetched: AtomicU64;
 }
 
 struct NodeApp {
@@ -102,6 +109,7 @@ fn openNode(
     secret: Vector<u8>,
     id: u32,
     credentials: Arc<CredentialSets>?,
+    scrubEveryMs: u64,
 ) -> Result<NodeParts, String> {
     if (file.node(id).isNull()) { return Err(textOf("this node is not in the cluster file")); }
     var slots = Vector<ShardSlot>.create();
@@ -230,6 +238,11 @@ fn openNode(
         unsent: AtomicU64.create(0),
         ticks: AtomicU64.create(0),
         readIds: AtomicU64.create(0),
+        scrubEveryMs: scrubEveryMs,
+        scrubChecked: AtomicU64.create(0),
+        scrubDamaged: AtomicU64.create(0),
+        scrubRepaired: AtomicU64.create(0),
+        extentsFetched: AtomicU64.create(0),
     };
     return Ok(NodeParts { shared: shared, internals: internals });
 }
@@ -561,6 +574,13 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
             appendIdList(mut out, r.core.members.learners.view()).isOk() && out.push(0x0A).isOk();
         if (!line) { return Err(NodeFault.OutOfMemory); }
     }
+    // The node's scrub (ADR-0063 §4).
+    let scrub = out.extend("# scrub ".bytes()).isOk() && appendDecimal(mut out, shared.scrubChecked.load()).isOk() &&
+        out.push(0x20).isOk() && appendDecimal(mut out, shared.scrubDamaged.load()).isOk() &&
+        out.push(0x20).isOk() && appendDecimal(mut out, shared.scrubRepaired.load()).isOk() &&
+        out.push(0x20).isOk() && appendDecimal(mut out, shared.extentsFetched.load()).isOk() &&
+        out.push(0x0A).isOk();
+    if (!scrub) { return Err(NodeFault.OutOfMemory); }
     return Ok(out);
 }
 
@@ -582,7 +602,9 @@ impl Handler<NodeApp> for PeerHandler {
         let isFetch = request.method() == Method.Post && path == "/extent-fetch";
         // An operator's change of the active nodes (ADR-0062 §5).
         let isActive = request.method() == Method.Post && path == "/cluster/active";
-        if (!isRaft && !isStatus && !isS3 && !isExtent && !isFetch && !isActive) {
+        // A replica's own copy of a record another replica found damaged (ADR-0063 §3).
+        let isRecord = request.method() == Method.Post && path == "/record-fetch";
+        if (!isRaft && !isStatus && !isS3 && !isExtent && !isFetch && !isActive && !isRecord) {
             return await exchange.send(Status.notFound(), "".bytes());
         }
         // The body, whole: a batch is decoded only once its signature holds.
@@ -625,6 +647,12 @@ impl Handler<NodeApp> for PeerHandler {
         if (checked.isErr()) {
             let _ = shared.refused.fetchAdd(1);
             return await exchange.send(statusOf(403), "".bytes());
+        }
+        if (isRecord) {
+            return match (await recordFor(shared, body.view())) {
+                Some(bytes) => await exchange.send(Status.ok(), bytes.view()),
+                null => await exchange.send(Status.notFound(), "".bytes()),
+            };
         }
         if (isActive) {
             let status = match (await changeActive(shared, body.view())) {
@@ -807,6 +835,7 @@ async fn runNode(
         s.spawn(async () => await tickForever(node));
         s.spawn(async () => await fetchForever(node));
         s.spawn(async () => await rebalanceForever(node));
+        s.spawn(async () => await scrubForever(node));
         for (i in 0..peers) {
             let at = i;
             s.spawn(async move () => await sendForever(node, at));
@@ -869,7 +898,8 @@ fn nodeCommand() -> i32 {
         }
         null => {}
     }
-    let parts = match (openNode(dir, loaded.file, loaded.secret, id, credentials)) {
+    let scrubMs = (args.scrubSeconds ?? 3600) * 1000;
+    let parts = match (openNode(dir, loaded.file, loaded.secret, id, credentials, scrubMs)) {
         Ok(s) => s,
         Err(message) => {
             Console.writeErrorLine(message.view());
@@ -907,6 +937,9 @@ fn nodeCommand() -> i32 {
     } && match (peerHandler()) {
         Ok(h) => server.router().post("/cluster/active", h).isOk(),
         Err(_) => false,
+    } && match (peerHandler()) {
+        Ok(h) => server.router().post("/record-fetch", h).isOk(),
+        Err(_) => false,
     };
     if (!routed || !routedS3) { return 1; }
     var front: Server<FrontApp>? = null;
@@ -929,6 +962,8 @@ struct ClusterArguments {
     /// S3 on the node (ADR-0060): where its front listens, and the credentials file.
     listen: String?;
     credentials: String?;
+    /// How often a scrub pass starts (ADR-0063 §1).
+    scrubSeconds: u64?;
 }
 
 fn clusterArguments(from: usize) -> ClusterArguments? {
@@ -936,6 +971,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var node: u32? = null;
     var listen: String? = null;
     var credentials: String? = null;
+    var scrubSeconds: u64? = null;
     var at = from;
     while (true) {
         let option = match (Process.argument(at)) {
@@ -953,6 +989,9 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             listen = Some(textOf(value));
         } else if (option == "--credentials") {
             credentials = Some(textOf(value));
+        } else if (option == "--scrub-seconds") {
+            scrubSeconds = value.parseInt<u64>();
+            if (scrubSeconds.isNull() || (scrubSeconds ?? 0) == 0) { return null; }
         } else {
             return null;
         }
@@ -960,7 +999,13 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     }
     return match (file) {
         Some(f) => match (node) {
-            Some(n) => Some(ClusterArguments { file: f, node: n, listen: listen, credentials: credentials }),
+            Some(n) => Some(ClusterArguments {
+                file: f,
+                node: n,
+                listen: listen,
+                credentials: credentials,
+                scrubSeconds: scrubSeconds,
+            }),
             null => null,
         },
         null => null,

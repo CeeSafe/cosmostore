@@ -78,3 +78,97 @@ fn raftStoreKeepsAndRepairsExtents() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// Turns over the byte at `at` of the file at `path`, as a disk's error might.
+fn flipByteOf(path: StringView, at: u64) {
+    let f = DurableFile.openReadWrite(path)!;
+    var b = [0u8; 1];
+    f.readExactAt(mut b[..], at)!;
+    b[0] = b[0] ^ 0xFF;
+    f.writeAt(b[..], at)!;
+    f.syncData()!;
+}
+
+@test
+fn scrubFindsAndRepairsDamage() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("scrub-repair");
+    var small = Vector<u8>.create();
+    for (i in 0..3000) { small.push(truncate<u8>(i * 13 + 1))!; }
+    var big = Vector<u8>.create();
+    for (i in 0..300000) { big.push(truncate<u8>(i * 7))!; }
+    var store = ObjectStore.open(dir.view(), raftStoreConfig())!;
+    store.setLeaderTerm(1);
+    store.appendNoop(1)!;
+    store.persistEntries()!;
+    store.applyEntries(1, 1)!;
+    store.createBucket("bkt")!;
+    store.applyEntries(2, 2)!;
+    let small1 = store.putObject("bkt", "small", "application/octet-stream", small.view(), PutCondition.None)!;
+    store.persistEntries()!;
+    store.applyEntries(3, 3)!;
+    let _ = store.putObject("bkt", "big", "application/octet-stream", big.view(), PutCondition.None)!;
+    store.persistEntries()!;
+    store.applyEntries(4, 4)!;
+    let none: IndexKey? = null;
+    let clean = store.scrubStep(borrow none, 100)!;
+    Check.equalU64(2, clean.checked)?;
+    Check.equalU64(0, clean.damages.length as u64)?;
+    // Another replica's copy of the inline record, as it would come; then this one's damaged on disk.
+    let good = store.recordOfVersion("bkt".bytes(), "small".bytes(), small1.versionId, 0)!;
+    Check.isTrue(good.isNull(), "a length that is not the record's: nothing")?;
+    var damaged = false;
+    var copy = Vector<u8>.create();
+    for (len in 3000u32..3200u32) {
+        match (store.recordOfVersion("bkt".bytes(), "small".bytes(), small1.versionId, len)!) {
+            Some(b) => {
+                copy = b;
+                damaged = true;
+            }
+            null => {}
+        }
+    }
+    Check.isTrue(damaged, "the record is found by its length")?;
+    let first = store.scrubStep(borrow none, 100)!;
+    Check.equalU64(0, first.damages.length as u64)?;
+    var path = String.create();
+    path.append(dir.view())!;
+    path.append("/seg-0000000000000001.cj")!;
+    // The record is the third entry: find it by its own bytes in the segment.
+    let file = DurableFile.openRead(path.view())!;
+    var all = Vector<u8>.create();
+    all.resize(file.size()! as usize, 0)!;
+    file.readExactAt(mut all.viewMut(), 0)!;
+    var at = 0usize;
+    var found = false;
+    while (at + copy.length <= all.length) {
+        if (all.view()[at..at + copy.length] == copy.view()) {
+            found = true;
+            break;
+        }
+        at += 1;
+    }
+    Check.isTrue(found, "the record is in the segment")?;
+    flipByteOf(path.view(), (at + 200) as u64);
+    let hurt = store.scrubStep(borrow none, 100)!;
+    Check.equalU64(1, hurt.damages.length as u64)?;
+    Check.isFalse(hurt.damages[0].extent, "the inline record")?;
+    Check.equalU64(at as u64, hurt.damages[0].offset)?;
+    // A copy that is not the version's (another payload) is refused; the right one repairs it.
+    var wrong = copy.clone()!;
+    wrong[wrong.length - 20] = wrong[wrong.length - 20] ^ 1;
+    Check.isFalse(store.repairRecord("bkt".bytes(), "small".bytes(), small1.versionId, wrong.view())!, "a wrong copy")?;
+    Check.isTrue(store.repairRecord("bkt".bytes(), "small".bytes(), small1.versionId, copy.view())!, "repaired")?;
+    Check.equalU64(0, store.scrubStep(borrow none, 100)!.damages.length as u64)?;
+    Check.equalBytes(small.view(), store.getObject("bkt", "small")!.view())?;
+    // A damaged extent: found, and once quarantined, missing (fetching puts it back).
+    let ids = store.extentsOfEntries(4, 4)!;
+    let extentPathText = extentPath(store.extentDirectory(), ids[0])!;
+    flipByteOf(extentPathText.view(), 1000);
+    let hurtExtent = store.scrubStep(borrow none, 100)!;
+    Check.equalU64(1, hurtExtent.damages.length as u64)?;
+    Check.isTrue(hurtExtent.damages[0].extent, "the extent")?;
+    store.quarantineExtent(hurtExtent.damages[0].id);
+    Check.equalU64(1, store.missingExtents(16)!.length as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}

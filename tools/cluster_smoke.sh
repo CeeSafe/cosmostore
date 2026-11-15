@@ -44,7 +44,7 @@ start() {
     PIDS[$1]=$!
 }
 
-status() { "$BIN" cluster-status --cluster-file "$WORK/cluster.conf" --node "$1" 2>/dev/null | tail -n +2; }
+status() { "$BIN" cluster-status --cluster-file "$WORK/cluster.conf" --node "$1" 2>/dev/null | tail -n +2 | grep -v "^#"; }
 
 # Whether, among the nodes given, every shard has exactly one leader and every node has applied the same index of
 # each shard, at least `min`.

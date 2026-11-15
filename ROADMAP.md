@@ -2482,3 +2482,19 @@ Browser form uploads with a SigV4 POST policy.
   the failed write left an entry persisted and unproposed that stopped every later write: group 0 writes twice now,
   and a failed write cuts what it staged off.
 - **M6 item 6 is done** in that form. **Next:** item 7, health, scrub, repair and rolling upgrades.
+
+### 15 Nov 2026: M6 item 7: scrub, repair from a replica, health, rolling restarts (ADR-0063)
+
+- **Under the owner's standing go-ahead.** **ADR-0063** (proposed): each replica scrubs its live versions in steps (an
+  inline record verified, an extent checked against its manifest); a damaged extent is removed and fetched again
+  (ADR-0061 §3); a damaged record is asked of the shard's other replicas (`/record-fetch`) and written over the bad one
+  at its place, the copy checked first (a valid record of that length whose payload has the version's MD5); the status
+  gets a `# scrub` line; rolling restarts one node at a time.
+- **The write in place** is the one write below a segment's synced end: a crash during it leaves the record as
+  damaged as it was, or repaired. The crash model assumes appends and is not asked to judge it.
+- **Tests:** `scrubFindsAndRepairsDamage` (a record damaged on disk found at its offset, a wrong copy refused, the
+  right one repairing it; a damaged extent found and, once removed, listed missing). `tools/cluster_repair_smoke.sh`
+  (13 checks): a byte flipped in a follower's copy of an inline object's record and one in its extent; its scrub finds
+  both and repairs them, byte for byte the leader's; then a rolling restart of all three nodes, writes between, each
+  caught up before the next, and everything read back. Passed three runs.
+- **M6 item 7 is done.** **Next:** item 8, erasure coding of sealed packs and extents.

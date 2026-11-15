@@ -398,3 +398,145 @@ async fn askActive(loaded: borrow LoadedCluster, url: StringView, body: Slice<u8
     await client.shutdown();
     return Ok(status);
 }
+
+// --- Scrub and repair (ADR-0063) ---
+
+const SCRUB_STEP_VERSIONS: usize = 256;
+
+/// A request for a record: u32 shard, u32 length, 16 version id, u16 + bytes bucket, u16 + bytes key.
+fn encodeRecordAsk(shard: u32, d: borrow ScrubDamage) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    out.pushLE(shard)?;
+    out.pushLE(d.length)?;
+    out.extend(d.versionId[..])?;
+    out.pushLE(truncate<u16>(d.bucket.length))?;
+    out.extend(d.bucket.view())?;
+    out.pushLE(truncate<u16>(d.key.length))?;
+    out.extend(d.key.view())?;
+    return Ok(out);
+}
+
+/// This node's copy of the record another replica asks for, or null.
+async fn recordFor(shared: borrow NodeShared, body: Slice<u8>) -> Vector<u8>? {
+    if (body.length < 26) { return null; }
+    let shard = body.readLE<u32>(0);
+    let length = body.readLE<u32>(4);
+    var versionId = [0u8; 16];
+    for (i in 0..16) { versionId[i] = body[8 + i]; }
+    let bl = body.readLE<u16>(24) as usize;
+    if (body.length < 26 + bl + 2) { return null; }
+    let bucket = body[26..26 + bl];
+    let kl = body.readLE<u16>(26 + bl) as usize;
+    if (body.length != 28 + bl + kl) { return null; }
+    let key = body[28 + bl..28 + bl + kl];
+    let at = match (slotOf(shared, shard)) {
+        Some(i) => i,
+        null => { return null; }
+    };
+    var storeGuard = match (await shared.slots[at].store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return null; }
+    };
+    let st = storeGuard.data();
+    let found = await Async.blocking(() => st.recordOfVersion(bucket, key, versionId, length));
+    return match (found) {
+        Ok(r) => r,
+        Err(_) => null,
+    };
+}
+
+/// Puts one damaged record right from the first of the shard's other replicas that has it whole.
+async fn repairFromReplica(shared: borrow NodeShared, slot: borrow ShardSlot, d: borrow ScrubDamage) -> bool {
+    let group = match (await shardGroupOf(slot)) {
+        Ok(g) => g,
+        Err(_) => { return false; }
+    };
+    let ask = match (encodeRecordAsk(slot.shard, d)) {
+        Ok(a) => a,
+        Err(_) => { return false; }
+    };
+    for (p in 0..group.length) {
+        if (group[p] == shared.id) { continue; }
+        let url = match (peerUrl(shared, group[p], "/record-fetch")) {
+            Some(u) => u,
+            null => { continue; }
+        };
+        let empty = RawMessage.empty();
+        let reply = match (await exchangeRaw(shared, url.view(), borrow empty, Some("/record-fetch"), ask.view())) {
+            Ok(r) => r,
+            Err(_) => { continue; }
+        };
+        if (reply.status != 200) { continue; }
+        var storeGuard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return false; }
+        };
+        let st = storeGuard.data();
+        let bucket = d.bucket.view();
+        let key = d.key.view();
+        let id = d.versionId;
+        let record = reply.body.view();
+        match (await Async.blocking(() => st.repairRecord(bucket, key, id, record))) {
+            Ok(true) => { return true; }
+            _ => {}
+        }
+    }
+    return false;
+}
+
+/// Every `scrubEveryMs`, a pass over each replica's live versions (ADR-0063 §1): damaged extents removed for fetching to
+/// replace, damaged records repaired from another replica's copy.
+async fn scrubForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
+    while (true) {
+        if (!(await frontPause(shared.scrubEveryMs))) { return Err(NodeFault.Net); }
+        for (i in 0..shared.slots.length) {
+            let slot = borrow shared.slots[i];
+            if (slot.failed.load() != 0) { continue; }
+            var after: IndexKey? = null;
+            while (true) {
+                var page = ScrubPage { checked: 0, damages: Vector<ScrubDamage>.create(), next: null };
+                {
+                    var storeGuard = match (await slot.store.get().lock()) {
+                        Ok(g) => g,
+                        Err(_) => { return Err(NodeFault.Net); }
+                    };
+                    let st = storeGuard.data();
+                    let from = replace(mut after, null);
+                    page = match (await Async.blocking(() => st.scrubStep(borrow from, SCRUB_STEP_VERSIONS))) {
+                        Ok(p) => p,
+                        Err(_) => { break; }
+                    };
+                }
+                let _ = shared.scrubChecked.fetchAdd(page.checked);
+                for (k in 0..page.damages.length) {
+                    let d = borrow page.damages[k];
+                    let _ = shared.scrubDamaged.fetchAdd(1);
+                    if (d.extent) {
+                        var storeGuard = match (await slot.store.get().lock()) {
+                            Ok(g) => g,
+                            Err(_) => { return Err(NodeFault.Net); }
+                        };
+                        let st = storeGuard.data();
+                        let id = d.id;
+                        await Async.blocking(() => st.quarantineExtent(id));
+                        let _ = shared.scrubRepaired.fetchAdd(1); // fetching puts it back
+                    } else if (await repairFromReplica(shared, slot, d)) {
+                        let _ = shared.scrubRepaired.fetchAdd(1);
+                    } else {
+                        var line = textOf("cosmostore: scrub: a damaged record no replica could repair, shard ");
+                        var n = Vector<u8>.create();
+                        let _ = appendDecimal(mut n, slot.shard as u64);
+                        let _ = line.append(StringView.fromUtf8(n.view()) ?? "");
+                        let _ = line.append("\n");
+                        let _ = await AsyncConsole.writeError(line.view());
+                    }
+                }
+                match (page.next) {
+                    Some(k) => { after = Some(k); }
+                    null => { break; }
+                }
+            }
+        }
+    }
+    return Ok();
+}

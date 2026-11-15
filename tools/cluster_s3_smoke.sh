@@ -52,7 +52,7 @@ start() {
 # The AWS CLI against node n's S3 port.
 on() { local n="$1"; shift; aws --no-cli-pager --endpoint-url "http://127.0.0.1:$((BASE + 10 + n))" "$@"; }
 code() { local n="$1"; shift; on "$n" "$@" 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9]*\)).*/\1/p' | head -1; }
-status() { "$BIN" cluster-status --cluster-file cluster.conf --node "$1" 2>/dev/null | tail -n +2; }
+status() { "$BIN" cluster-status --cluster-file cluster.conf --node "$1" 2>/dev/null | tail -n +2 | grep -v "^#"; }
 
 for n in 1 2 3; do start "$n"; done
 # Every shard has a leader.

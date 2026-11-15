@@ -267,6 +267,12 @@ any object by multipart upload, and any object by ranged GETs (the AWS CLI's way
   nonce), so a node takes only messages its peers sent, but the traffic itself can be read. Run the peer ports on a
   private network until their TLS comes.
 - **Clocks** must be within a minute of each other: a request more than 60 s off is refused.
+- **Scrub** (ADR-0063): every node checks its replicas' data once an hour (`--scrub-seconds` to change it) and puts a
+  damaged copy right from another replica; the status's last line is `# scrub <checked> <damaged> <repaired>
+  <fetched>`. A log line `scrub: a damaged record no replica could repair` means every copy was damaged: restore
+  that object from a backup.
+- **Rolling restarts and upgrades:** restart one node at a time, the next only once the status shows the first's
+  replicas at the others' applied index; a node reads older formats, so upgrade forwards, never back.
 - **Adding and removing nodes** (ADR-0062): put every node that may take part in the cluster file from the start,
   the ones to add later with the word `standby`, and start them; `cosmostore cluster-join --cluster-file <file>
   --node <id>` makes one active and shards move onto it, one replica at a time; `cluster-leave` moves every shard

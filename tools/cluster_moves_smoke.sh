@@ -49,7 +49,7 @@ start() {
     PIDS[$1]=$!
 }
 on() { local n="$1"; shift; aws --no-cli-pager --endpoint-url "http://127.0.0.1:$((BASE + 10 + n))" "$@"; }
-status() { "$BIN" cluster-status --cluster-file cluster.conf --node "$1" 2>/dev/null | tail -n +2 | awk '$1 != 65535'; }
+status() { "$BIN" cluster-status --cluster-file cluster.conf --node "$1" 2>/dev/null | tail -n +2 | grep -v '^#' | awk '$1 != 65535'; }
 # Shards whose voters include node n, as node m sees them (each shard's line is right on its leader; ask every node).
 votesIn() { local n="$1" m="$2"; status "$m" | awk -v n="$n" '{ split($8, v, ","); for (i in v) if (v[i] == n) c++ } END { print c + 0 }'; }
 learning() { status "$1" | awk '$9 != "-"' | wc -l | tr -d ' '; }
