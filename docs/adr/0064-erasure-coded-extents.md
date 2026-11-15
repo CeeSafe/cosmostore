@@ -1,6 +1,7 @@
 # ADR-0064: Erasure-coded extents (M6 item 8)
 
-**Status:** proposed for M6 item 8 (ADR-0056 §9), 15 Nov 2026, under the owner's standing go-ahead.
+**Status:** accepted for M6 item 8 (ADR-0056 §9), 15 Nov 2026, as recommended (the owner: "I accept ADRS: ADR-0062 to ADR-0065 as recommended"); built
+under the owner's standing go-ahead.
 
 ## Context
 

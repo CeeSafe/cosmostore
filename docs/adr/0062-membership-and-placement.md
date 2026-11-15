@@ -1,7 +1,8 @@
 # ADR-0062: Membership changes, group 0, placement and rebalance (M6 item 6)
 
-**Status:** proposed for M6 item 6 (ADR-0056 §5), 15 Nov 2026, started under the owner's standing go-ahead ("From now
-on, I give you permission to commit and push, then start the next"). Slices a, b and c are built (c narrower than §3 to §5: see As built).
+**Status:** accepted for M6 item 6 (ADR-0056 §5), 15 Nov 2026, as recommended (the owner: "I accept ADRS: ADR-0062 to ADR-0065 as recommended"); started under the owner's
+standing go-ahead ("From now on, I give you permission to commit and push, then start the next"). Slices a, b and c
+are built (c narrower than §3 to §5: see As built).
 
 ## Context
 

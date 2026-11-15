@@ -1,6 +1,6 @@
 # ADR-0063: Scrub, repair from a replica, health, rolling restarts (M6 item 7)
 
-**Status:** proposed for M6 item 7 (ADR-0056 §8, item 7), 15 Nov 2026, under the owner's standing go-ahead; built
+**Status:** accepted for M6 item 7 (ADR-0056 §8, item 7), 15 Nov 2026, as recommended (the owner: "I accept ADRS: ADR-0062 to ADR-0065 as recommended"); built
 (`ObjectStore.scrubStep`, `repairRecord`, `quarantineExtent`, `Journal.repairAt`; `scrubForever` and
 `/record-fetch` in the node; `cosmostore node --scrub-seconds`).
 

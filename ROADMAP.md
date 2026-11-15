@@ -2551,6 +2551,10 @@ Browser form uploads with a SigV4 POST policy.
   replicas, under every other fault: linearizable. Only nodes outside group 0 can be lost so; the runbook says never
   to start a node on an empty directory under its id (it would vote twice in a term).
 - **Tests:** 278 pass; the S3 smoke and the cluster, cluster S3 (33), moves (14), repair (13) and EC (14) smokes pass.
-- **Next:** longer runs on other machines (the Mac mini, binfadel), then M6's exit review; ADR-0062 to ADR-0065 await
-  the owner.
+- **Next:** longer runs on other machines (the Mac mini, binfadel), then M6's exit review.
+
+### 15 Nov 2026: ADR-0062 to ADR-0065 accepted
+
+- The owner: "I accept ADRS: ADR-0062 to ADR-0065 as recommended." Membership and placement (0062), scrub, repair
+  and rolling restarts (0063), erasure-coded extents (0064) and the chaos harness (0065) are accepted as built.
 

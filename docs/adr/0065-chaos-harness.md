@@ -1,6 +1,7 @@
 # ADR-0065: The chaos harness and its linearizability check (M6 item 9)
 
-**Status:** proposed for M6 item 9 (ADR-0056 §10), 15 Nov 2026, under the owner's standing go-ahead.
+**Status:** accepted for M6 item 9 (ADR-0056 §10), 15 Nov 2026, as recommended (the owner: "I accept ADRS: ADR-0062 to ADR-0065 as recommended"); slices a
+and b built under the owner's standing go-ahead.
 
 ## Context
 
