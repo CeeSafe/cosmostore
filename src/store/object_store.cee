@@ -459,6 +459,8 @@ struct StoreState {
     membership: Vector<u8>;
     /// The coded extents, by id (ADR-0064).
     coded: HashMap<u64, CodedExtent>;
+    /// A shard's recent write sessions, by request id (ADR-0068).
+    sessions: SessionTable;
 
     fn create() -> StoreState => StoreState {
         index: VersionIndex.create(),
@@ -474,6 +476,7 @@ struct StoreState {
         outbox: Outbox.create(),
         membership: Vector<u8>.create(),
         coded: HashMap<u64, CodedExtent>.create(),
+        sessions: SessionTable.create(),
     };
 
     /// Queues the event of a record just applied, if its bucket has a notification rule for it (ADR-0048 §2).
@@ -954,6 +957,16 @@ fn applyRecord(
                 Some(c) => { let _ = state.coded.put(c.id, c)?; }
                 null => { return Err(StoreError.BadMeta(segment, offset)); }
             }
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
+        }
+        RecordType.Session => {
+            // A write's request id and answer (ADR-0068): `manifest` is the payload here.
+            if (meta.length != 17) { return Err(StoreError.BadMeta(segment, offset)); }
+            var id = [0u8; 16];
+            id[..].copyFrom(meta[0..16]);
+            var answer = Vector<u8>.create();
+            answer.extend(manifest)?;
+            state.sessions.put(SessionEntry { id: id, index: lsn, kept: meta[16] == 1, answer: answer })?;
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
         }
         _ => {
@@ -1503,7 +1516,7 @@ struct ObjectStore {
             }
             let metaEnd = RECORD_HEADER_LEN + header.metaLen as usize;
             let payloadEnd = metaEnd + header.payloadLen as usize;
-            let manifest = if (carriesManifest(header.kind)) bytes[metaEnd..payloadEnd] else bytes[0..0];
+            let manifest = if (payloadToApply(header.kind)) bytes[metaEnd..payloadEnd] else bytes[0..0];
             match (applyRecord(
                 mut state,
                 header.kind,
@@ -1691,6 +1704,21 @@ struct ObjectStore {
 
     /// Where the store's extent files are.
     fn extentDirectory(borrow this) -> StringView => this.extentDir.view();
+
+    // --- Write sessions (ADR-0068) ---
+
+    /// The session of request `id`, if this replica has applied one.
+    fn sessionOf(borrow this, id: [u8; 16]) -> SessionEntry? => this.state.sessions.find(id);
+
+    /// Stages the Session record of a write the leader did (ADR-0068 §2): its id and answer, or only that it was done
+    /// when the answer is over SESSION_ANSWER_MAX.
+    fn stageSession(borrow mut this, id: [u8; 16], answer: Slice<u8>) -> Result<void, StoreError> {
+        let kept = answer.length <= SESSION_ANSWER_MAX;
+        let meta = sessionMeta(id, kept)?;
+        let empty = Vector<u8>.create();
+        let _ = this.stageRecord(RecordType.Session, meta.view(), if (kept) answer else empty.view())?;
+        return Ok();
+    }
 
     // --- Coded extents (ADR-0064) ---
 
@@ -2574,7 +2602,7 @@ struct ObjectStore {
             total,
             this.scratch.view(),
             truncate<u32>(payload.length),
-            if (carriesManifest(kind)) payload else payload[0..0],
+            if (payloadToApply(kind)) payload else payload[0..0],
         )?;
         this.publishedNext = pos.lsn + 1;
         this.reapExtents();
@@ -2676,7 +2704,7 @@ struct ObjectStore {
             let h = borrow at.header;
             let metaEnd = RECORD_HEADER_LEN + h.metaLen as usize;
             let payloadEnd = metaEnd + h.payloadLen as usize;
-            let manifest = if (carriesManifest(h.kind)) record[metaEnd..payloadEnd] else record[0..0];
+            let manifest = if (payloadToApply(h.kind)) record[metaEnd..payloadEnd] else record[0..0];
             this.sinceCheckpoint += h.totalLen as u64;
             this.counts.journalBytesWritten += h.totalLen as u64;
             applyRecord(

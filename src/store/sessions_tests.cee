@@ -1,0 +1,69 @@
+// Write sessions (ADR-0068): a Session record applied puts its id and answer in the table, an answer too large is
+// recorded as done without it, the table survives a checkpoint and a reopen, and it keeps the most recent
+// SESSION_KEEP.
+
+fn sessionStoreConfig() -> StoreConfig {
+    var c = storeConfig();
+    c.journal = JournalConfig { segmentTargetBytes: 1048576, maxBatchBytes: 1048576, shardId: 0, raftLog: true };
+    return c;
+}
+
+fn requestId(n: u64) -> [u8; 16] {
+    var id = [0u8; 16];
+    id[..].writeLE(0, 0xABCD0001u64);
+    id[..].writeLE(8, n);
+    return id;
+}
+
+@test
+fn sessionsAreAppliedAndKept() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("sessions");
+    {
+        var store = ObjectStore.open(dir.view(), sessionStoreConfig())!;
+        store.setLeaderTerm(1);
+        store.appendNoop(1)!;
+        store.persistEntries()!;
+        store.applyEntries(1, 1)!;
+        Check.isTrue(store.sessionOf(requestId(1)).isNull(), "none yet")?;
+        store.stageSession(requestId(1), "an answer".bytes())!;
+        var big = Vector<u8>.create();
+        big.resize(SESSION_ANSWER_MAX + 1, 7)!;
+        store.stageSession(requestId(2), big.view())!;
+        store.persistEntries()!;
+        store.applyEntries(2, 3)!;
+        let one = store.sessionOf(requestId(1))!;
+        Check.isTrue(one.kept, "kept")?;
+        Check.equalBytes("an answer".bytes(), one.answer.view())?;
+        Check.equalU64(2, one.index)?;
+        let two = store.sessionOf(requestId(2))!;
+        Check.isFalse(two.kept, "too large to keep")?;
+        Check.equalU64(0, two.answer.length as u64)?;
+        Check.isTrue(store.sessionOf(requestId(3)).isNull(), "another id")?;
+        Check.isTrue(store.checkpoint()!, "a checkpoint")?;
+    }
+    // Reopened from the checkpoint: the sessions are there.
+    var store = ObjectStore.open(dir.view(), sessionStoreConfig())!;
+    let _ = store.takeRecoveredTerms();
+    Check.equalBytes("an answer".bytes(), store.sessionOf(requestId(1))!.answer.view())?;
+    Check.isFalse(store.sessionOf(requestId(2))!.kept, "still done without its answer")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn sessionTableKeepsTheMostRecent() -> Result<void, TestFailure> {
+    var t = SessionTable.create();
+    for (n in 0u64..(SESSION_KEEP as u64 + 100)) {
+        t.put(SessionEntry { id: requestId(n), index: n + 1, kept: true, answer: Vector<u8>.create() })!;
+    }
+    Check.equalU64(SESSION_KEEP as u64, t.count() as u64)?;
+    Check.isTrue(t.find(requestId(99)).isNull(), "the oldest went")?;
+    Check.isTrue(t.find(requestId(100)).isSome(), "the oldest kept")?;
+    Check.isTrue(t.find(requestId(SESSION_KEEP as u64 + 99)).isSome(), "the newest")?;
+    let encoded = t.encoded()!;
+    Check.equalU64(SESSION_KEEP as u64, encoded.length as u64)?;
+    // Oldest first, as a checkpoint keeps them.
+    let first = decodeSessionEntry(encoded[0].view())!!;
+    Check.equalU64(101, first.index)?;
+    return Ok();
+}

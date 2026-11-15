@@ -1,0 +1,126 @@
+// Write sessions (ADR-0068): the request ids of a shard's recent writes, each with the answer the shard's S3 server gave
+// it, so that a write sent again is answered and not done again. A `Session` record (type 18) is staged after a
+// write's entries; its meta is the 16-byte id and a u8 (1: the answer is kept, 0: too large to keep), its payload the
+// answer (`encodeRaw`). Every replica keeps the SESSION_KEEP most recent, by index, in the same table: it follows the
+// log. A checkpoint's entries of kind 8 (after a count of kind 7) are the table's, oldest first: the id, the u64
+// index, the u8, the answer.
+
+/// How many write sessions a shard keeps: far more than the writes of the few seconds a node goes on sending one.
+const SESSION_KEEP: usize = 16384;
+/// The largest answer kept; a write with a larger one is recorded as done, its answer not kept.
+const SESSION_ANSWER_MAX: usize = 262144;
+
+struct SessionEntry {
+    id: [u8; 16];
+    index: u64;
+    kept: bool;
+    answer: Vector<u8>;
+}
+
+/// The table's key of an id: a hash. Two ids that share it only cost one of them its dedupe (the full id is checked).
+fn sessionKey(id: [u8; 16]) -> u64 {
+    let a = id[..].readLE<u64>(0);
+    let b = id[..].readLE<u64>(8);
+    return a ^ b.wrappingMul(0x9E3779B97F4A7C15) ^ (b >> 29);
+}
+
+struct SessionTable {
+    entries: HashMap<u64, SessionEntry>;
+    /// The keys and indexes in the order they were put: the oldest go first.
+    order: Vector<u64>;
+    orderIndex: Vector<u64>;
+    head: usize;
+
+    fn create() -> SessionTable => SessionTable {
+        entries: HashMap<u64, SessionEntry>.create(),
+        order: Vector<u64>.create(),
+        orderIndex: Vector<u64>.create(),
+        head: 0,
+    };
+
+    fn count(borrow this) -> usize => this.order.length - this.head;
+
+    /// The session of `id`, if the table has it.
+    fn find(borrow this, id: [u8; 16]) -> SessionEntry? {
+        let key = sessionKey(id);
+        return match (this.entries.get(borrow key)) {
+            Some(e) => if (e.id[..] == id[..]) Some(SessionEntry {
+                id: e.id,
+                index: e.index,
+                kept: e.kept,
+                answer: e.answer.clone().ok() ?? Vector<u8>.create(),
+            }) else null,
+            null => null,
+        };
+    }
+
+    /// Puts a session applied at `index`, and lets the oldest go past SESSION_KEEP.
+    fn put(borrow mut this, e: SessionEntry) -> Result<void, AllocError> {
+        let key = sessionKey(e.id);
+        let index = e.index;
+        let _ = this.entries.put(key, e)?;
+        this.order.push(key)?;
+        this.orderIndex.push(index)?;
+        while (this.count() > SESSION_KEEP) {
+            let old = this.order[this.head];
+            let oldIndex = this.orderIndex[this.head];
+            this.head += 1;
+            let stale = match (this.entries.get(borrow old)) {
+                Some(x) => x.index == oldIndex,
+                null => false,
+            };
+            if (stale) { let _ = this.entries.remove(borrow old); }
+        }
+        // The order's spent front, given back now and then.
+        if (this.head > SESSION_KEEP) {
+            var order = Vector<u64>.create();
+            var orderIndex = Vector<u64>.create();
+            for (i in this.head..this.order.length) {
+                order.push(this.order[i])?;
+                orderIndex.push(this.orderIndex[i])?;
+            }
+            this.order = order;
+            this.orderIndex = orderIndex;
+            this.head = 0;
+        }
+        return Ok();
+    }
+
+    /// The sessions oldest first, as a checkpoint keeps them.
+    fn encoded(borrow this) -> Result<Vector<Vector<u8>>, AllocError> {
+        var out = Vector<Vector<u8>>.create();
+        for (i in this.head..this.order.length) {
+            match (this.entries.get(borrow this.order[i])) {
+                Some(e) => {
+                    if (e.index != this.orderIndex[i]) { continue; }
+                    var b = Vector<u8>.create();
+                    b.extend(e.id[..])?;
+                    b.pushLE(e.index)?;
+                    b.push(if (e.kept) 1u8 else 0u8)?;
+                    b.extend(e.answer.view())?;
+                    out.push(b)?;
+                }
+                null => {}
+            }
+        }
+        return Ok(out);
+    }
+}
+
+/// A checkpoint's session entry.
+fn decodeSessionEntry(b: Slice<u8>) -> Result<SessionEntry?, AllocError> {
+    if (b.length < 25) { return Ok(null); }
+    var id = [0u8; 16];
+    id[..].copyFrom(b[0..16]);
+    var answer = Vector<u8>.create();
+    answer.extend(b[25..b.length])?;
+    return Ok(Some(SessionEntry { id: id, index: b.readLE<u64>(16), kept: b[24] == 1, answer: answer }));
+}
+
+/// A Session record's meta: the id, then whether its answer is kept.
+fn sessionMeta(id: [u8; 16], kept: bool) -> Result<Vector<u8>, AllocError> {
+    var m = Vector<u8>.create();
+    m.extend(id[..])?;
+    m.push(if (kept) 1u8 else 0u8)?;
+    return Ok(m);
+}

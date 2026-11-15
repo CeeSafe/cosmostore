@@ -2607,3 +2607,21 @@ Browser form uploads with a SigV4 POST policy.
   chaos mutants are killed; three 90 s chaos runs linearizable per key and across keys.
 - **Next:** D, write sessions (ADR-0068): a forwarded write done once.
 
+### 15 Nov 2026: M6 exit gaps D and E (first part): write sessions, a network that misbehaves (ADR-0068, ADR-0069)
+
+- **D, a forwarded write done once (ADR-0068, proposed):** the node that takes a write gives it a request id (a
+  client's `x-cosmo-*` headers taken off); the leader stages a `Session` record (type 18) with the id and its answer
+  after the write's entries; every replica keeps the 16,384 most recent (checkpoint format 18); a write sent again
+  with a known id gets the first answer and is not done. Forwarded writes are sent again whenever the exchange
+  fails. Chaos runs show about a third of the unknown outcomes they did.
+- **Its check:** `tools/cluster_sessions_check.py` (8 checks) sends a forwarded PUT, another PUT, then the first again
+  with its id: answered with the first ETag, not done again. With the lookup off (a mutant), it finds the write done
+  again; a chaos run rarely does (the front sends again within milliseconds, inside the client's operation). The
+  check had a bug of its own: it signed as node 2, and node 2 refuses requests that say they are from itself.
+- **E, first part (ADR-0069, proposed):** the proxy shapes links: `slow` (20 to 200 ms, jitter), `flaky` (connections
+  reset at 1 to 5% of chunks), `throttle` (one node at 50 to 200 KB/s), among the default faults.
+- **Tests:** 281 pass; every smoke; the sessions check; three chaos mutants killed; three 90 s chaos runs with the new
+  faults linearizable per key and across keys.
+- **Next:** E's second part (nodes on several machines), then F: coded pieces re-homed when a holder leaves (a hole
+  in item 8 found while planning F), and sealed segments coded.
+

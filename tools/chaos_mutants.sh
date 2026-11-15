@@ -24,7 +24,7 @@ trap restore EXIT
 
 survivors=0
 mutant() {
-    local name="$1" nemesis="$2" expr="$3"
+    local name="$1" nemesis="$2" expr="$3" seed="${4:-11}" seconds="${5:-$EACH}" tries="${6:-1}"
     cp "$KEEP" "$SRC"
     perl -0pi -e "$expr" "$SRC"
     if cmp -s "$KEEP" "$SRC"; then
@@ -38,8 +38,23 @@ mutant() {
         return
     fi
     cp out/cosmostore "$BINS/$name"
-    local out
-    out=$(python3 -I tools/cluster_chaos.py --binary "$BINS/$name" --seconds "$EACH" --seed 11 --nemesis "$nemesis" 2>&1)
+    # A run's timing is its own: a mutant is killed when any of `tries` runs finds it. "sessions" is the direct check
+    # of ADR-0068 instead of a chaos run: killed when a write sent again is done again.
+    local out t
+    if [ "$nemesis" = "sessions" ]; then
+        # Up to three runs: one whose writes found no leader says nothing.
+        for t in 1 2 3; do
+            out=$(python3 -I tools/cluster_sessions_check.py --binary "$BINS/$name" 2>&1)
+            echo "$out" | grep -q "FAIL a forwarded PUT with an id is done" || break
+        done
+        echo "$out" | grep -q "FAIL and not done again" && out="$out
+not linearizable: $(echo "$out" | grep -m1 'FAIL and not done again')"
+    else
+        for t in $(seq 1 "$tries"); do
+            out=$(python3 -I tools/cluster_chaos.py --binary "$BINS/$name" --seconds "$seconds" --seed $((seed + t - 1)) --nemesis "$nemesis" 2>&1)
+            echo "$out" | grep -q "not linearizable" && break
+        done
+    fi
     if echo "$out" | grep -q "not linearizable"; then
         echo "killed       $name: $(echo "$out" | grep -m1 -A 12 "not linearizable")"
     else
@@ -52,6 +67,11 @@ mutant() {
 mutant "leader-reads-without-readindex" "isolate-leader" 's/(    let slot = borrow shared\.slots\[at\];\n    let id = shared\.readIds\.fetchAdd\(1\) \+ 1;\n)/$1    if ((await viewOf(slot)?).leads) { return await exchangeRaw(shared, slot.s3url.view(), raw, null, raw.body.view()); }\n/'
 # Any replica answers a read from its own store: one cut off, or behind, answers stale.
 mutant "replica-reads" "isolate,split,pause" 's/(    var turn = 0usize;\n    while \(true\) \{\n)/    if (!isWriteMethod(raw.method.view())) {\n        match (slotOf(shared, shard)) {\n            Some(at) => { return await exchangeRaw(shared, shared.slots[at].s3url.view(), raw, null, raw.body.view()); }\n            null => {}\n        }\n    }\n$1/'
+
+# Sessions off (ADR-0068): a forwarded write is still sent again, but the leader never looks its id up, so a write
+# whose answer was lost is done twice. A chaos run rarely shows it (the second doing falls inside the first's
+# operation); the direct check sends it twice with another write between.
+mutant "writes-sent-again-without-sessions" "sessions" 's/    let requestId = requestIdOf\(raw\);\n/    let requestId: [u8; 16]? = null;\n/'
 
 if [ "$survivors" -gt 0 ]; then
     echo "$survivors mutant(s) not killed"

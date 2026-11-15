@@ -287,9 +287,9 @@ any object by multipart upload, and any object by ranged GETs (the AWS CLI's way
   lists the node as a voter. Never use `--init` there: it is the operator's word that the node was never part of the
   cluster, and a voter started so would vote again in terms it voted in. Any node can be taken out so: group 0 moves
   its vote off a node that leaves (ADR-0067).
-- **A write answered 503 through a node that is not its shard's leader** may have been done: the node lost its
-  exchange with the leader and does not send it again (ADR-0065). A client's retry is a write of its own; S3 clients
-  retry 503s, which is what an S3 PUT allows.
+- **A write through a node that is not its shard's leader is done once** (ADR-0068): the node gives it a request id
+  and sends it again while the leader's answer does not come, and the leader answers a write it has done with the
+  answer it gave. A client's own retry is a write of its own, as S3 has it.
 - **Testing a build against faults** (ADR-0065): `tools/cluster_chaos.sh` runs three nodes on one machine behind a
   proxy of its own (no firewall rule), kills, pauses and partitions them for a minute while clients race, and checks
   what the clients saw for linearizability (`RUNS`, `SECONDS_EACH`, `NODES=5`). `tools/chaos_mutants.sh` checks that

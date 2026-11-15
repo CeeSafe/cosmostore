@@ -31,6 +31,20 @@ asked to fix before closing M6 ("Fix all those gaps before closing").
 5. **So a forwarded write is sent again** whenever the exchange fails, as a read is, for as long as the node waits
    for a leader (FRONT_WAIT_MS).
 
+## As built
+
+- `src/store/sessions.cee` (the table, by a 64-bit hash of the id with the full id kept and checked: two ids of one
+  hash only cost one its dedupe), the `Session` record and checkpoint format 18; `requestIdOf`, `sessionOfSlot` and
+  the staging in `proposeAndDrain` (`src/cluster/front.cee`); the id stamped and a client's `x-cosmo-*` headers taken
+  off at the front's door.
+- **Tests:** `sessionsAreAppliedAndKept` and `sessionTableKeepsTheMostRecent`; `tools/cluster_sessions_check.py`
+  (8 checks): a PUT forwarded to the leader with an id, another PUT of the key, the first sent again with the same id:
+  answered with the first ETag and not done again; a fresh id done. With the lookup turned off (a mutant in
+  `tools/chaos_mutants.sh`), the check finds the write done again. A chaos run alone rarely does: when an answer is
+  lost the front sends again within milliseconds, inside the client's own operation.
+- **What changed in runs:** forwarded writes whose answer was lost are now answered: chaos runs show half the unknown
+  outcomes they did, all linearizable.
+
 ## Consequences
 
 - Writes through a node other than the leader no longer turn a lost answer into a 503, and none is done twice.

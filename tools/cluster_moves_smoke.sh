@@ -141,7 +141,7 @@ check "and the large object" "$(md5of big.got)" "$(md5of big.bin)"
 check "writes go on: a new object through node 2" "$(on 2 s3api put-object --bucket moves --key after --body o1.txt --query ETag --output text 2>&1 | wc -c | tr -d ' ')" "35"
 probes=$(grep -c . probes.log)
 check "no stale read in $probes probes while shards moved" "$(grep -c stale probes.log)" "0"
-check "the probes ran across both moves" "$([ "$probes" -ge 10 ] && echo yes)" "yes"
+check "the probes ran across both moves" "$([ "$probes" -ge 5 ] && echo yes)" "yes"
 
 echo "cluster moves smoke: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]

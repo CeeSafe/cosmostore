@@ -348,6 +348,10 @@ class Proxy:
     def __init__(self, fronts):
         self.fronts = fronts  # node -> (proxy port, real port)
         self.cut = set()  # frozenset({a, b})
+        # Links shaped (ADR-0069 §1): per node (0: every link), a delay and jitter in seconds, a chance of a reset at
+        # each chunk, a bandwidth in bytes a second (0: none).
+        self.shape = {}
+        self.rng = random.Random(1)
         self.lock = threading.Lock()
         self.conns = []  # (sender, node, client socket, upstream socket)
         self.stopping = False
@@ -375,6 +379,8 @@ class Proxy:
         return a != 0 and frozenset((a, b)) in self.cut
 
     def partition(self, cut):
+        if not cut:
+            self.shape.clear()
         with self.lock:
             self.cut = set(cut)
             keep = []
@@ -441,9 +447,9 @@ class Proxy:
             up.sendall(head)
         except OSError:
             pass
-        back = threading.Thread(target=self._pipe, args=(up, down), daemon=True)
+        back = threading.Thread(target=self._pipe, args=(up, down, sender, node), daemon=True)
         back.start()
-        self._pipe(down, up)
+        self._pipe(down, up, sender, node)
         back.join()
         # Both ways done: the sockets closed and forgotten, so that a long run does not run out of descriptors.
         with self.lock:
@@ -455,13 +461,32 @@ class Proxy:
             except OSError:
                 pass
 
-    @staticmethod
-    def _pipe(a, b):
+    def shaping(self, sender, node):
+        """The shape of the link between `sender` and `node`: the strongest of every link's and either end's."""
+        delay = jitter = drop = 0.0
+        bw = 0
+        for key in (0, sender, node):
+            sh = self.shape.get(key)
+            if not sh:
+                continue
+            delay, jitter, drop = max(delay, sh["delay"]), max(jitter, sh["jitter"]), max(drop, sh["drop"])
+            if sh["bw"]:
+                bw = sh["bw"] if bw == 0 else min(bw, sh["bw"])
+        return delay, jitter, drop, bw
+
+    def _pipe(self, a, b, sender=0, node=0):
         try:
             while True:
                 data = a.recv(65536)
                 if not data:
                     break
+                if sender != 0:
+                    delay, jitter, drop, bw = self.shaping(sender, node)
+                    if drop and self.rng.random() < drop:
+                        break  # the connection reset mid-stream, as a flaky network does
+                    wait = delay + (self.rng.random() * jitter if jitter else 0) + (len(data) / bw if bw else 0)
+                    if wait:
+                        time.sleep(wait)
                 b.sendall(data)
         except OSError:
             pass
@@ -691,9 +716,9 @@ def client(cid, cluster, history, keys, rng, stop, counts, large=0.1, cold=()):
 
 
 NEMESES = ["kill", "pause", "isolate", "isolate-leader", "split", "bridge", "skew", "lose-disk", "rack-kill",
-           "rack-isolate"]
+           "rack-isolate", "slow", "flaky", "throttle"]
 # The default: every fault but the two that need a mode of their own (`--disk-loss`) or that only cut a node off.
-DEFAULT_NEMESES = ["kill", "pause", "isolate", "isolate-leader", "split", "bridge", "skew"]
+DEFAULT_NEMESES = ["kill", "pause", "isolate", "isolate-leader", "split", "bridge", "skew", "slow", "flaky", "throttle"]
 
 
 def lose_disk(cluster, victim, stop, log, history):
@@ -771,7 +796,24 @@ def faults(cluster, proxy, rng, stop, log, history, kinds, failures):
             kind = "isolate"
         hold = rng.uniform(2.0, 6.0)
         t = history.now()
-        if kind in ("rack-kill", "rack-isolate"):
+        if kind in ("slow", "flaky", "throttle"):
+            # The network misbehaving without parting (ADR-0069 §1): every link slow and jittery, every link
+            # resetting connections now and then, or one node's links throttled.
+            if kind == "slow":
+                delay, jitter = rng.uniform(0.02, 0.2), rng.uniform(0, 0.1)
+                proxy.shape[0] = dict(delay=delay, jitter=jitter, drop=0.0, bw=0)
+                log.append(f"{t:8.3f} slow every link: {delay * 1000:.0f} ms, jitter {jitter * 1000:.0f} ms")
+            elif kind == "flaky":
+                drop = rng.uniform(0.01, 0.05)
+                proxy.shape[0] = dict(delay=0.0, jitter=0.0, drop=drop, bw=0)
+                log.append(f"{t:8.3f} flaky links: {drop * 100:.1f}% of chunks reset their connection")
+            else:
+                bw = rng.randint(50_000, 200_000)
+                proxy.shape[victim] = dict(delay=0.0, jitter=0.0, drop=0.0, bw=bw)
+                log.append(f"{t:8.3f} throttle node {victim}'s links to {bw // 1000} KB/s")
+            stop.wait(hold)
+            proxy.shape.clear()
+        elif kind in ("rack-kill", "rack-isolate"):
             # A rack (a failure domain, ADR-0059 §2) at once: its nodes killed, or cut off from the other racks while
             # they still see each other. Each shard has one replica a rack, so the others keep a majority.
             r = rng.randrange(cluster.racks or cluster.n)

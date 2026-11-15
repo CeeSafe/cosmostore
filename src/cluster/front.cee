@@ -305,7 +305,12 @@ async fn viewOf(slot: borrow ShardSlot) -> Result<LeaderView, NodeFault> {
 
 /// Proposes what the shard's S3 server staged and persisted since `before`; the last index and the term, or null if
 /// it staged nothing (or this replica stopped leading: its entries will be cut off).
-async fn proposeStaged(shared: borrow NodeShared, slot: borrow ShardSlot) -> Result<LeaderView?, NodeFault> {
+async fn proposeStaged(
+    shared: borrow NodeShared,
+    slot: borrow ShardSlot,
+    requestId: [u8; 16]?,
+    answer: Slice<u8>,
+) -> Result<LeaderView?, NodeFault> {
     var guard = match (await slot.replica.lock()) {
         Ok(g) => g,
         Err(_) => { return Err(NodeFault.Net); }
@@ -319,7 +324,7 @@ async fn proposeStaged(shared: borrow NodeShared, slot: borrow ShardSlot) -> Res
     if (!r.core.isLeader()) { return Ok(null); }
     let before = r.core.lastIndex();
     let term = r.core.term;
-    let proposed = await Async.blocking(() => proposeAndDrain(r, st, before));
+    let proposed = await Async.blocking(() => proposeAndDrain(r, st, before, requestId, answer));
     let out = match (proposed) {
         Ok(o) => o,
         Err(e) => {
@@ -342,7 +347,16 @@ fn proposeAndDrain(
     r: borrow mut ShardReplica,
     st: borrow mut ObjectStore,
     before: u64,
+    requestId: [u8; 16]?,
+    answer: Slice<u8>,
 ) -> Result<Proposed, StoreError> {
+    // A write that staged entries, with an id: its session after them (ADR-0068 §2).
+    match (requestId) {
+        Some(id) => {
+            if (st.lastEntry() > before) { st.stageSession(id, answer)?; }
+        }
+        null => {}
+    }
     let last = r.finishWrite(st, before)?;
     var out = Vector<RaftMessage>.create();
     r.drain(st, mut out)?;
@@ -366,13 +380,33 @@ async fn leadWrite(shared: borrow NodeShared, at: usize, raw: borrow RawMessage)
         if (waited >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(statusOnly(503)); }
         waited += FRONT_POLL_MS;
     }
+    // Done before (ADR-0068 §4): everything this replica holds is applied, so its table has every session there is.
+    let requestId = requestIdOf(raw);
+    match (requestId) {
+        Some(id) => {
+            match (await sessionOfSlot(slot, id)?) {
+                Some(e) => {
+                    if (!e.kept) { return Ok(statusOnly(503)); }
+                    return match (decodeRaw(e.answer.view())) {
+                        Ok(answer) => Ok(answer),
+                        Err(_) => Ok(statusOnly(503)),
+                    };
+                }
+                null => {}
+            }
+        }
+        null => {}
+    }
     let response = await exchangeRaw(shared, slot.s3url.view(), raw, null, raw.body.view())?;
     // The extents the write staged, on a majority before its entries are proposed (ADR-0061 §1).
     if (!(await pushExtents(shared, slot)?)) {
         await abandonStaged(slot);
         return Ok(statusOnly(503));
     }
-    let proposed = match (await proposeStaged(shared, slot)?) {
+    // Its session, after its entries and proposed with them (ADR-0068 §2).
+    var session = Vector<u8>.create();
+    if (requestId.isSome() && encodeRaw(mut session, borrow response).isErr()) { return Err(NodeFault.OutOfMemory); }
+    let proposed = match (await proposeStaged(shared, slot, requestId, session.view())?) {
         Some(p) => p,
         null => {
             // Nothing staged (a refusal, a delete of nothing): the answer stands; or no longer the leader, and what it
@@ -523,6 +557,25 @@ fn peerUrl(shared: borrow NodeShared, node: u32, path: StringView) -> String? {
         }
         null => null,
     };
+}
+
+/// The request id a forwarded write carries (ADR-0068 §1), or null.
+fn requestIdOf(raw: borrow RawMessage) -> [u8; 16]? {
+    for (i in 0..raw.names.length) {
+        if (raw.names[i].view() != "x-cosmo-request".bytes()) { continue; }
+        var id = [0u8; 16];
+        if (raw.values[i].length != 32 || !hexInto(raw.values[i].view(), mut id[..])) { return null; }
+        return Some(id);
+    }
+    return null;
+}
+
+async fn sessionOfSlot(slot: borrow ShardSlot, id: [u8; 16]) -> Result<SessionEntry?, NodeFault> {
+    var storeGuard = match (await slot.store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    return Ok(storeGuard.data().sessionOf(id));
 }
 
 /// Cuts off the entries a write staged but could not get its extents to a majority for: uncommitted, this leader's.
@@ -726,6 +779,7 @@ async fn routeRequest(shared: borrow NodeShared, shard: u32, raw: borrow RawMess
         Err(_) => { return Err(NodeFault.OutOfMemory); }
     };
     let write = isWriteMethod(raw.method.view());
+    let once = requestIdOf(raw).isSome();
     var turn = 0usize;
     while (true) {
         var target = 0u32;
@@ -770,11 +824,14 @@ async fn routeRequest(shared: borrow NodeShared, shard: u32, raw: borrow RawMess
                             // anything. A write that reached a leader may have been done: sent again, it would be
                             // done twice, the second time after writes that came between (ADR-0065: the chaos
                             // harness found it). Its outcome is the client's to find out.
-                            if (write && reply.status != 421 && reply.status != 403) { return Ok(statusOnly(503)); }
+                            // A write with a request id is done once however often it is sent (ADR-0068 §5).
+                            if (write && !once && reply.status != 421 && reply.status != 403) {
+                                return Ok(statusOnly(503));
+                            }
                         }
                         Err(NodeFault.Unreached) => {}
                         Err(_) => {
-                            if (write) { return Ok(statusOnly(503)); }
+                            if (write && !once) { return Ok(statusOnly(503)); }
                         }
                     }
                 }
@@ -915,7 +972,23 @@ impl Handler<FrontApp> for FrontHandler {
         }
         let fields = request.headers();
         for (i in 0..fields.count()) {
-            if (raw.addHeader(fields.nameBytes(i), fields.value(i)).isErr()) { return Err(HandlerError.Internal); }
+            // The cluster's own headers are the nodes' to set: a client's go (ADR-0068 §1).
+            let name = fields.nameBytes(i);
+            if (name.length >= 8 && Ascii.equalsIgnoringCase(name[0..8], "x-cosmo-")) { continue; }
+            if (raw.addHeader(name, fields.value(i)).isErr()) { return Err(HandlerError.Internal); }
+        }
+        // A write's request id (ADR-0068 §1): the node's prefix, then its count of requests.
+        if (isWriteMethod(raw.method.view())) {
+            var id = [0u8; 16];
+            id[..].writeLE(0, shared.requestPrefix);
+            id[..].writeLE(8, shared.requests.fetchAdd(1));
+            var hex = Vector<u8>.create();
+            if (appendHexBytes(mut hex, id[..]).isErr() || raw.addHeader(
+                "x-cosmo-request".bytes(),
+                hex.view(),
+            ).isErr()) {
+                return Err(HandlerError.Internal);
+            }
         }
         var buf = Vector<u8>.create();
         if (buf.resize(65536, 0).isErr()) { return Err(HandlerError.Internal); }
