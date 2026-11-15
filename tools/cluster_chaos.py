@@ -4,7 +4,8 @@ keys, faults injected (kills, pauses, partitions), and the history checked for l
 
 usage:
   cluster_chaos.py [--binary out/cosmostore] [--nodes 3] [--seconds 60] [--seed N] [--port-base 20100]
-                   [--clients 6] [--keys 4] [--keep] [--nemesis kill,pause,isolate,isolate-leader,split,bridge]
+                   [--clients 6] [--keys 4] [--keep] [--disk-loss]
+                   [--nemesis kill,pause,isolate,isolate-leader,split,bridge,skew,lose-disk]
   cluster_chaos.py --self-test          the checker against histories whose answer is known
 
 Standard library only; no firewall rule, nothing installed. Exit status 0 when the history is linearizable and the
@@ -404,7 +405,9 @@ class Proxy:
 
 
 class Cluster:
-    def __init__(self, binary, work, nodes, base):
+    def __init__(self, binary, work, nodes, base, standby=()):
+        self.standby = set(standby)
+        self.skew = {}
         self.binary = binary
         self.work = work
         self.n = nodes
@@ -419,7 +422,8 @@ class Cluster:
         lines = ["cluster 0dd0ee0ff0aa0bb0", "shards 2", "replicas 3", f"secret-file {work}/cluster.key"]
         domains = "abcdefgh"
         for i in range(1, nodes + 1):
-            lines.append(f"node {i} peer=127.0.0.1:{self.proxy_port(i)} domain={domains[i - 1]}")
+            lines.append(f"node {i} peer=127.0.0.1:{self.proxy_port(i)} domain={domains[i - 1]}"
+                         + (" standby" if i in self.standby else ""))
         with open(self.conf, "w") as f:
             f.write("\n".join(lines) + "\n")
 
@@ -439,7 +443,8 @@ class Cluster:
         self.procs[i] = subprocess.Popen(
             [self.binary, "node", d, "--cluster-file", self.conf, "--node", str(i),
              "--listen", str(self.s3_port(i)), "--credentials", os.path.join(self.work, "credentials"),
-             "--peer-listen", str(self.peer_port(i))],
+             "--peer-listen", str(self.peer_port(i))]
+            + (["--clock-skew-ms", str(self.skew[i])] if self.skew.get(i) else []),
             stdout=log, stderr=log)
         self.paused.discard(i)
 
@@ -488,6 +493,30 @@ class Cluster:
             if len(f) >= 7 and f[0].isdigit():
                 rows.append(f)
         return rows
+
+    def operator(self, command, i):
+        """`cluster-join` or `cluster-leave` of node i; whether it answered 0."""
+        try:
+            return subprocess.run([self.binary, command, "--cluster-file", self.conf, "--node", str(i)],
+                                  capture_output=True, timeout=60).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+
+    def holders_of(self, i):
+        """How many shards (group 0 aside) some live node reports node i among the voters or learners of."""
+        shards = set()
+        for j in range(1, self.n + 1):
+            if j == i or j in self.paused or self.procs.get(j) is None or self.procs[j].poll() is not None:
+                continue
+            for r in self.status(j):
+                if r[0] == "65535" or len(r) < 9:
+                    continue
+                if str(i) in r[7].split(",") or str(i) in r[8].split(","):
+                    shards.add(r[0])
+        return len(shards)
+
+    def wipe(self, i):
+        shutil.rmtree(os.path.join(self.work, f"d{i}"), ignore_errors=True)
 
     def leaders(self):
         for i in range(1, self.n + 1):
@@ -566,16 +595,59 @@ def client(cid, cluster, history, keys, rng, stop, counts):
                 counts["lists without an answer"] = counts.get("lists without an answer", 0) + 1
 
 
-NEMESES = ["kill", "pause", "isolate", "isolate-leader", "split", "bridge"]
+NEMESES = ["kill", "pause", "isolate", "isolate-leader", "split", "bridge", "skew", "lose-disk"]
+# The default: every fault but the two that need a mode of their own (`--disk-loss`) or that only cut a node off.
+DEFAULT_NEMESES = ["kill", "pause", "isolate", "isolate-leader", "split", "bridge", "skew"]
 
 
-def nemesis(cluster, proxy, rng, stop, log, history, kinds):
+def lose_disk(cluster, victim, stop, log, history):
+    """A disk lost, the way the runbook says to recover (ADR-0062, ADR-0065 §7): the node killed, taken out of every
+    shard by `cluster-leave`, its directory wiped, started again empty and joined again."""
+    held = cluster.holders_of(victim)
+    log.append(f"{history.now():8.3f}   node {victim} held replicas of {held} shards")
+    cluster.kill(victim)
+    if not cluster.operator("cluster-leave", victim):
+        log.append(f"{history.now():8.3f}   cluster-leave {victim} did not answer")
+    deadline = time.time() + 90
+    while time.time() < deadline and not stop.is_set() and cluster.holders_of(victim) > 0:
+        time.sleep(0.5)
+    left = cluster.holders_of(victim) == 0
+    log.append(f"{history.now():8.3f}   node {victim} {'out of every shard' if left else 'STILL in a shard'}")
+    if not left:
+        cluster.start(victim)  # its disk kept: it is still a member
+        return False
+    cluster.wipe(victim)
+    cluster.start(victim)
+    if not cluster.operator("cluster-join", victim):
+        log.append(f"{history.now():8.3f}   cluster-join {victim} did not answer")
+        return False
+    log.append(f"{history.now():8.3f}   node {victim} wiped, started again and joined")
+    # Shards back on it before anything else happens, so that the next loss loses something.
+    deadline = time.time() + 90
+    while time.time() < deadline and not stop.is_set() and cluster.holders_of(victim) == 0:
+        time.sleep(0.5)
+    log.append(f"{history.now():8.3f}   node {victim} holds replicas of {cluster.holders_of(victim)} shards again")
+    return stop.is_set() or cluster.holders_of(victim) > 0
+
+
+def nemesis(cluster, proxy, rng, stop, log, history, kinds, failures):
     others = lambda i: [j for j in range(1, cluster.n + 1) if j != i]
     while not stop.is_set():
         if stop.wait(rng.uniform(1.0, 3.0)):
             break
         kind = rng.choice(kinds)
         victim = rng.randint(1, cluster.n)
+        if kind == "lose-disk":
+            # Only a node outside group 0, which stays on the first three (ADR-0062 §3).
+            spare = [i for i in range(4, cluster.n + 1)]
+            if not spare:
+                continue
+            victim = rng.choice(spare)
+            log.append(f"{history.now():8.3f} lose the disk of node {victim}")
+            if not lose_disk(cluster, victim, stop, log, history):
+                failures.append(f"node {victim}'s disk loss could not be recovered from")
+            log.append(f"{history.now():8.3f} healed")
+            continue
         if kind == "isolate-leader":
             leaders = {s: l for s, l in cluster.leaders().items() if s != 65535 and l != 0}
             if leaders:
@@ -587,6 +659,18 @@ def nemesis(cluster, proxy, rng, stop, log, history, kinds):
             log.append(f"{t:8.3f} kill node {victim}")
             cluster.kill(victim)
             stop.wait(hold)
+            cluster.start(victim)
+        elif kind == "skew":
+            # Restarted with its peer clock off: within the signatures' 60 s, it should not matter; past it, the
+            # node is cut off as by a partition, its requests refused (ADR-0059 §4).
+            skew = rng.choice([-1, 1]) * rng.randint(20_000, 100_000)
+            log.append(f"{t:8.3f} skew node {victim}'s clock by {skew / 1000:+.0f} s")
+            cluster.kill(victim)
+            cluster.skew[victim] = skew
+            cluster.start(victim)
+            stop.wait(hold)
+            cluster.kill(victim)
+            cluster.skew.pop(victim, None)
             cluster.start(victim)
         elif kind == "pause":
             log.append(f"{t:8.3f} pause node {victim}")
@@ -641,13 +725,20 @@ def run(args):
     binary = os.path.abspath(args.binary)
     work = tempfile.mkdtemp(prefix="cosmo-chaos-")
     seed = args.seed if args.seed is not None else random.randrange(1 << 30)
+    if args.disk_loss:
+        args.nodes = max(args.nodes, 4)
     print(f"chaos: seed {seed}, {args.nodes} nodes, {args.seconds} s, work {work}")
     rng = random.Random(seed)
+    if args.nemesis is None:
+        args.nemesis = ",".join(DEFAULT_NEMESES + (["lose-disk"] if args.disk_loss else []))
     for k in args.nemesis.split(","):
         if k not in NEMESES:
             print(f"chaos: no fault called {k}; there are {', '.join(NEMESES)}")
             return False
-    cluster = Cluster(binary, work, args.nodes, args.port_base)
+    nodes = max(args.nodes, 4) if args.disk_loss else args.nodes
+    args.nodes = nodes
+    standby = list(range(4, nodes + 1)) if args.disk_loss else []
+    cluster = Cluster(binary, work, nodes, args.port_base, standby)
     proxy = Proxy({i: (cluster.proxy_port(i), cluster.peer_port(i)) for i in range(1, args.nodes + 1)})
     proxy.start()
     ok = False
@@ -669,15 +760,24 @@ def run(args):
         if status != 200:
             print(f"FAIL the bucket could not be made: {status} {data[:200]!r}")
             return False
+        # The standbys joined before the clients start, so that there are nodes outside group 0 to lose disks of.
+        for i in standby:
+            if not cluster.operator("cluster-join", i):
+                print(f"FAIL node {i} could not join")
+                return False
+            deadline = time.time() + 60
+            while time.time() < deadline and cluster.holders_of(i) == 0:
+                time.sleep(0.5)
         keys = [f"k{i}" for i in range(args.keys)]
         history = History()
         counts = {}
+        failures = []
         stop = threading.Event()
         log = []
         threads = [threading.Thread(target=client,
                                     args=(c, cluster, history, keys, random.Random(seed * 31 + c), stop, counts))
                    for c in range(args.clients)]
-        threads.append(threading.Thread(target=nemesis, args=(cluster, proxy, rng, stop, log, history, args.nemesis.split(","))))
+        threads.append(threading.Thread(target=nemesis, args=(cluster, proxy, rng, stop, log, history, args.nemesis.split(","), failures)))
         for t in threads:
             t.start()
         time.sleep(args.seconds)
@@ -740,6 +840,9 @@ def run(args):
         for line in log:
             print("  " + line)
         ok = True
+        for f in failures:
+            print(f"FAIL {f}")
+            ok = False
         if unanswered:
             print("FAIL after the heal, no answer for: " + ", ".join(unanswered))
             ok = False
@@ -786,7 +889,9 @@ def main():
     p.add_argument("--clients", type=int, default=6)
     p.add_argument("--keys", type=int, default=4)
     p.add_argument("--keep", action="store_true")
-    p.add_argument("--nemesis", default=",".join(NEMESES), help="the faults to choose from, by name, with commas")
+    p.add_argument("--nemesis", default=None, help="the faults to choose from, by name, with commas")
+    p.add_argument("--disk-loss", action="store_true",
+                   help="four nodes or more, the fourth on joined from standby, and lose-disk among the faults")
     p.add_argument("--self-test", action="store_true")
     args = p.parse_args()
     if args.self_test:

@@ -278,6 +278,11 @@ any object by multipart upload, and any object by ranged GETs (the AWS CLI's way
   node decodes it from its peers' pieces, and the client's retry reads it; the decoded copy is kept an hour. Let
   clients retry (the AWS CLI's `AWS_MAX_ATTEMPTS`, 5 or more). With more nodes down than the code survives (two of
   three), a coded object cannot be read until one comes back.
+- **A node's disk lost:** never start it again on an empty directory under its id. It would vote again in terms
+  it voted in before, and two leaders of a term become possible. Take it out first (`cluster-leave`), wait until the
+  status shows it in no shard's voters or learners, then wipe it, start it, and `cluster-join` it again (ADR-0065
+  §7; `tools/cluster_chaos.py --disk-loss` does exactly this under load). A node of group 0 (the first three active)
+  cannot be taken out this way yet: keep those three on redundant disks.
 - **A write answered 503 through a node that is not its shard's leader** may have been done: the node lost its
   exchange with the leader and does not send it again (ADR-0065). A client's retry is a write of its own; S3 clients
   retry 503s, which is what an S3 PUT allows.

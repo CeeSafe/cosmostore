@@ -2538,5 +2538,19 @@ Browser form uploads with a SigV4 POST policy.
   now, in two tiers to keep the search small.
 - **Diagnostics:** `cluster-status`'s `# peer` line, a log of slow ticks, a stopped replica failing a run, and each
   node's status and thread sample saved when the cluster is slow to answer after a heal.
-- **Next:** more runs on the Mac mini and binfadel, clock skew and disk loss (ADR-0065 §7), then M6's exit.
+- **Next:** slice b, clock skew and disk loss (ADR-0065 §7).
+
+### 15 Nov 2026: M6 item 9, slice b: clock skew and disk loss (ADR-0065 §7)
+
+- **Clock skew:** a test-only `node --clock-skew-ms` moves a node's clock where the cluster uses one (the peer
+  signatures' 60 s window; Raft runs on ticks), and the harness's `skew` fault restarts a node 20 to 100 s off for a
+  few seconds. A minute of nothing but skews (−100 s to +95 s), and three 90 s runs with every fault: linearizable.
+- **Disk loss**, recovered from as the runbook says: `--disk-loss` runs four nodes, the fourth joined from standby;
+  `lose-disk` kills it, takes it out with `cluster-leave`, waits until no shard has it, wipes its directory, starts it
+  and joins it again, and waits until it holds replicas again. Three to nine losses a run, each while the node held
+  replicas, under every other fault: linearizable. Only nodes outside group 0 can be lost so; the runbook says never
+  to start a node on an empty directory under its id (it would vote twice in a term).
+- **Tests:** 278 pass; the S3 smoke and the cluster, cluster S3 (33), moves (14), repair (13) and EC (14) smokes pass.
+- **Next:** longer runs on other machines (the Mac mini, binfadel), then M6's exit review; ADR-0062 to ADR-0065 await
+  the owner.
 

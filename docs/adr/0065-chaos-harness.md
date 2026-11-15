@@ -46,9 +46,15 @@
 6. **The checker is tested** (`--self-test`): histories that are linearizable pass, and a stale read, a lost
    acknowledged write, a read of a value never written and a listing that misses a present key fail. A mutant that
    serves reads without ReadIndex must be caught by a run of the harness.
-7. **Not in this item's first slice:** clock skew (a node's clock is the machine's; Raft does not trust clocks, the
-   peer signatures allow 60 s) and disk loss as a process fault (a node's directory lost is a node replaced by
-   membership change, ADR-0062; the crash model covers lost unsynced writes).
+7. **Clock skew and disk loss** (the second slice). Raft runs on ticks, not the clock; the clock matters between
+   nodes in the peer signatures' 60 s window, and a test-only `node --clock-skew-ms` moves a node's clock there (what
+   it signs with and checks by). The `skew` fault restarts a node with its clock 20 to 100 s off for a few seconds:
+   within the window nothing changes, past it the node is cut off as by a partition. A disk lost is recovered from
+   as the runbook says (ADR-0062): `--disk-loss` runs four nodes, the fourth joined from standby, and its `lose-disk`
+   fault kills that node, takes it out with `cluster-leave`, waits until no shard has it, wipes its directory, starts
+   it and joins it again, and waits for shards to come back to it. Only a node outside group 0 can be lost so:
+   group 0 stays on the first three (ADR-0062 §3). A node started again on an empty directory under its id would
+   vote again in terms it voted in, and nothing detects it; the runbook says never to.
 
 ## As built
 
@@ -78,6 +84,9 @@
   tick that would have made the core step down waited behind them (a log of slow ticks showed 78 s for the lock).
   The lock is let go before each pause now, and no lock but a shard's write gate is held across a pause or a send
   (the peer port's extent answers were sent holding the store's).
+- **Slice b:** under clock skew alone (twelve skews from −100 s to +95 s in a minute) and under disk loss (four
+  nodes, every fault, node 4's disk lost and recovered from three to nine times a run while it held replicas), the
+  histories are linearizable.
 - **Diagnostics it brought:** `cluster-status` prints `# peer <ticks> <sent> <unsent> <received> <refused>`; a node
   logs a tick that took over a second, with where the time went; a replica stopped fails a run; a final read slow
   to come back saves every node's status and, on macOS, a `sample` of its threads, in the work directory.

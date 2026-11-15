@@ -53,6 +53,8 @@ struct NodeShared {
     received: AtomicU64;
     /// The ids of ReadIndex reads (ADR-0060 §6).
     readIds: AtomicU64;
+    /// What this node's peer clock is off the machine's by (`--clock-skew-ms`, for the chaos harness, ADR-0065).
+    clockSkewMs: i64;
     /// Scrub (ADR-0063): how often a pass starts, and what passes found: versions checked, damage found, records
     /// repaired from a replica, extents fetched (a damaged one removed comes back this way, as a missing one does).
     scrubEveryMs: u64;
@@ -117,6 +119,7 @@ fn openNode(
     credentials: Arc<CredentialSets>?,
     scrubEveryMs: u64,
     codeAfterMs: u64,
+    clockSkewMs: i64,
 ) -> Result<NodeParts, String> {
     if (file.node(id).isNull()) { return Err(textOf("this node is not in the cluster file")); }
     var slots = Vector<ShardSlot>.create();
@@ -247,6 +250,7 @@ fn openNode(
         sent: AtomicU64.create(0),
         received: AtomicU64.create(0),
         readIds: AtomicU64.create(0),
+        clockSkewMs: clockSkewMs,
         scrubEveryMs: scrubEveryMs,
         codeAfterMs: codeAfterMs,
         scrubChecked: AtomicU64.create(0),
@@ -448,6 +452,9 @@ async fn tickForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
     return Ok();
 }
 
+/// The time this node signs and checks peer requests by: the machine's, off by `--clock-skew-ms` (ADR-0065 §7).
+fn peerNow(shared: borrow NodeShared) -> i64 => Clock.unixMillis() + shared.clockSkewMs;
+
 /// The signed headers of a request from this node (or the operator, node 0).
 fn signRequest(
     request: borrow mut ClientRequest,
@@ -457,10 +464,10 @@ fn signRequest(
     method: StringView,
     path: StringView,
     body: Slice<u8>,
+    time: i64,
 ) -> bool {
     var nonce = [0u8; 16];
     if (Random.fill(mut nonce[..]).isErr()) { return false; }
-    let time = Clock.unixMillis();
     let signature = match (peerSignature(secret, method, path, file.digest[..], node, time, nonce[..], body)) {
         Ok(s) => s,
         Err(_) => { return false; }
@@ -485,7 +492,16 @@ async fn postBatch(client: borrow Client, shared: borrow NodeShared, url: String
         Ok(r) => r,
         Err(_) => { return false; }
     };
-    if (!signRequest(mut request, borrow shared.file, shared.secret.view(), shared.id, "POST", "/raft", body)) {
+    if (!signRequest(
+        mut request,
+        borrow shared.file,
+        shared.secret.view(),
+        shared.id,
+        "POST",
+        "/raft",
+        body,
+        peerNow(shared),
+    )) {
         return false;
     }
     var content = match (BytesBody.of(body)) {
@@ -682,7 +698,7 @@ impl Handler<NodeApp> for PeerHandler {
                 path,
                 borrow headers,
                 body.view(),
-                Clock.unixMillis(),
+                peerNow(shared),
                 mut guard.data(),
             );
         }
@@ -970,7 +986,16 @@ fn nodeCommand() -> i32 {
     }
     let scrubMs = (args.scrubSeconds ?? 3600) * 1000;
     let codeMs = (args.codeAfterSeconds ?? 86400) * 1000;
-    let parts = match (openNode(dir, loaded.file, loaded.secret, id, credentials, scrubMs, codeMs)) {
+    let parts = match (openNode(
+        dir,
+        loaded.file,
+        loaded.secret,
+        id,
+        credentials,
+        scrubMs,
+        codeMs,
+        args.clockSkewMs ?? 0,
+    )) {
         Ok(s) => s,
         Err(message) => {
             Console.writeErrorLine(message.view());
@@ -1041,6 +1066,8 @@ struct ClusterArguments {
     codeAfterSeconds: u64?;
     /// Where the peer port listens, when not at the cluster file's address (ADR-0065).
     peerListen: String?;
+    /// How far off the machine's clock this node signs and checks peer requests (testing only, ADR-0065 §7).
+    clockSkewMs: i64?;
 }
 
 fn clusterArguments(from: usize) -> ClusterArguments? {
@@ -1051,6 +1078,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var scrubSeconds: u64? = null;
     var codeAfterSeconds: u64? = null;
     var peerListen: String? = null;
+    var clockSkewMs: i64? = null;
     var at = from;
     while (true) {
         let option = match (Process.argument(at)) {
@@ -1070,6 +1098,9 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             credentials = Some(textOf(value));
         } else if (option == "--peer-listen") {
             peerListen = Some(textOf(value));
+        } else if (option == "--clock-skew-ms") {
+            clockSkewMs = value.parseInt<i64>();
+            if (clockSkewMs.isNull()) { return null; }
         } else if (option == "--code-after-seconds") {
             codeAfterSeconds = value.parseInt<u64>();
             if (codeAfterSeconds.isNull()) { return null; }
@@ -1091,6 +1122,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 scrubSeconds: scrubSeconds,
                 codeAfterSeconds: codeAfterSeconds,
                 peerListen: peerListen,
+                clockSkewMs: clockSkewMs,
             }),
             null => null,
         },
@@ -1184,7 +1216,16 @@ async fn askStatus(
         Ok(r) => r,
         Err(_) => { return Err(NodeFault.Net); }
     };
-    if (!signRequest(mut request, borrow loaded.file, loaded.secret.view(), 0, "GET", "/cluster/status", "".bytes())) {
+    if (!signRequest(
+        mut request,
+        borrow loaded.file,
+        loaded.secret.view(),
+        0,
+        "GET",
+        "/cluster/status",
+        "".bytes(),
+        Clock.unixMillis(),
+    )) {
         return Err(NodeFault.OutOfMemory);
     }
     var none = NoBody {};
