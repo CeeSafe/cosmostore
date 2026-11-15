@@ -2498,3 +2498,21 @@ Browser form uploads with a SigV4 POST policy.
   both and repairs them, byte for byte the leader's; then a rolling restart of all three nodes, writes between, each
   caught up before the next, and everything read back. Passed three runs.
 - **M6 item 7 is done.** **Next:** item 8, erasure coding of sealed packs and extents.
+
+### 15 Nov 2026: M6 item 8: erasure-coded extents (ADR-0064)
+
+- **Under the owner's standing go-ahead.** **ADR-0064** (proposed): a cold extent (older than `--code-after-seconds`,
+  a day by default) of a shard with three voters or more becomes k+m Reed-Solomon pieces (2+1 for three voters, 3+2
+  for five) through one committed `Coded` record (type 17); each replica writes its piece from its whole copy and only
+  then removes the copy; a missing piece is rebuilt from k others (`POST /piece-fetch`); a read of a coded extent
+  answers 503 while the node decodes it, and the retry reads it; scrub checks pieces. Segments stay replicated:
+  coding sealed packs is later work.
+- **The code:** `src/storage/erasure/rs.cee`, GF(2^8) under 0x11D, systematic, Cauchy parity, in CeeSafe only.
+- **Checkpoint format 17:** the coded extents after the events.
+- **Found by the fault sweep:** a whole copy that failed to read was taken for none, and removed with no piece
+  written; an I/O error now stops the apply and keeps the copy. Also found on the way: a read of an object of several
+  coded extents asked for one at a time (a retry each); every one is asked for at once now. `upkeepHoldsAreCounted`
+  counts the new checkpoint entry.
+- **Tests:** 277 pass (the codec's, the store's coding test, two fault sweeps); `tools/cluster_ec_smoke.sh` (14
+  checks) passes, and so do the S3 smoke and the cluster, cluster S3 (33), moves (14) and repair (13) smokes.
+- **M6 item 8 is done** for extents. **Next:** item 9, the chaos harness and its linearizability check.

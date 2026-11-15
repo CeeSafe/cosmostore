@@ -1,0 +1,237 @@
+// Coded extents in a cluster shard's store (ADR-0064): a Coded record applied turns the whole copy into this replica's
+// piece; a read then wants the extent decoded; a decoded copy reads again and is swept later; a missing piece is
+// listed, made from a whole copy when there is one, and installed only when it is the record's; scrub finds a damaged
+// piece; the coding survives a checkpoint and a reopen.
+
+fn pieceFileCount(dir: StringView) -> u64 {
+    var path = String.create();
+    path.append(dir)!;
+    path.append("/extents")!;
+    var n = 0u64;
+    match (Directory.list(path.view())) {
+        Ok(names) => {
+            for (name in names) {
+                if (name.view().startsWith("piece-")) { n += 1; }
+            }
+        }
+        Err(_) => {}
+    }
+    return n;
+}
+
+@test
+fn codedExtentsTurnIntoPieces() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("coded-extents");
+    var big = Vector<u8>.create();
+    for (i in 0..300001) { big.push(truncate<u8>(i * 7 + i / 512))!; }
+    var holders = Vector<u32>.create();
+    holders.push(1)!;
+    holders.push(2)!;
+    holders.push(3)!;
+    var ids = Vector<u64>.create();
+    var starts = Vector<u64>.create(); // each extent's offset in the object
+    {
+        var store = ObjectStore.open(dir.view(), raftStoreConfig())!;
+        store.setNodeId(1);
+        store.setLeaderTerm(1);
+        store.appendNoop(1)!;
+        store.persistEntries()!;
+        store.applyEntries(1, 1)!;
+        store.createBucket("bkt")!;
+        store.applyEntries(2, 2)!;
+        let _ = store.putObject("bkt", "big", "application/octet-stream", big.view(), PutCondition.None)!;
+        store.persistEntries()!;
+        store.applyEntries(3, 3)!;
+        // Not cold yet: nothing to code. Cold: every extent of the object.
+        Check.equalU64(0, store.codingCandidates(Clock.unixMillis() - 60000, 16)!.length as u64)?;
+        let candidates = store.codingCandidates(Clock.unixMillis() + 60000, 16)!;
+        Check.isTrue(candidates.length >= 1, "the object's extents are candidates")?;
+        var total = 0u64;
+        for (c in candidates.view()) { total += c.length; }
+        Check.equalU64(300001, total)?;
+        var index = 3u64;
+        for (c in candidates.view()) {
+            // Two voters cannot code; a damaged manifest (its CRC) is refused.
+            Check.isFalse(store.stageCoded(c, holders.view()[0..2])!, "two voters")?;
+            var wrong = c;
+            wrong.crc = wrong.crc ^ 1;
+            Check.isFalse(store.stageCoded(wrong, holders.view())!, "not the manifest's bytes")?;
+            Check.isTrue(store.stageCoded(c, holders.view())!, "staged")?;
+            store.persistEntries()!;
+            index += 1;
+            store.applyEntries(index, index)!;
+            starts.push(
+                if (ids.length == 0) 0 else starts[ids.length - 1] + store.codedOf(ids[ids.length - 1])!!.length,
+            )!;
+            ids.push(c.id)!;
+            Check.isFalse(store.stageCoded(c, holders.view())!, "coded already")?;
+        }
+        Check.equalU64(0, store.codingCandidates(Clock.unixMillis() + 60000, 16)!.length as u64)?;
+        // The whole copies went, this replica's pieces (piece 0, node 1's) came.
+        Check.equalU64(0, extentFileCount(dir.view()))?;
+        Check.equalU64(ids.length as u64, pieceFileCount(dir.view()))?;
+        Check.equalU64(0, store.missingExtents(16)!.length as u64)?;
+        Check.equalU64(0, store.missingPieces(16)!.length as u64)?;
+        // A read wants them decoded.
+        match (store.getObject("bkt", "big")) {
+            Err(StoreError.ExtentWanted) => {}
+            _ => { return Err(TestFailure.create("a read of a coded extent wants it")); }
+        }
+        let wanted = store.takeWanted();
+        Check.equalU64(ids.length as u64, wanted.length as u64)?;
+        Check.equalU64(0, store.takeWanted().length as u64)?;
+        // Decoded from piece 0 (this replica's) and piece 2 (another's, made here from the data).
+        for (x in 0..ids.length) {
+            let id = ids[x];
+            let c = store.codedOf(id)!!;
+            Check.equalU64(2, c.k as u64)?;
+            Check.equalU64(1, c.m as u64)?;
+            Check.equalU64(0, c.pieceOf(1)! as u64)?;
+            let mine = store.pieceBytes(id, 0)!!;
+            Check.isTrue(store.pieceBytes(id, 1)!.isNull(), "node 2's piece is not here")?;
+            let rs = ReedSolomon.create(2, 1)!!;
+            var data = Vector<u8>.create();
+            data.extend(big.view()[starts[x] as usize..(starts[x] + c.length) as usize])!;
+            let parity = rs.piece(data.view(), 2)!;
+            Check.equalU64(c.crcs[2] as u64, Crc32c.of(parity.view()) as u64)?;
+            var indexes = Vector<usize>.create();
+            indexes.push(2)!;
+            indexes.push(0)!;
+            var pieces = Vector<Vector<u8>>.create();
+            pieces.push(parity)!;
+            pieces.push(mine)!;
+            let back = rs.decode(indexes.view(), pieces.view(), c.length)!!;
+            store.installDecoded(id, back.view())!;
+        }
+        Check.equalBytes(big.view(), store.getObject("bkt", "big")!.view())?;
+        Check.equalU64(0, store.missingExtents(16)!.length as u64)?;
+        // Swept an hour later; the read wants it again.
+        Check.equalU64(0, store.sweepDecoded(Clock.unixMillis())! as u64)?;
+        Check.equalU64(ids.length as u64, store.sweepDecoded(Clock.unixMillis() + 7200000)! as u64)?;
+        Check.isTrue(store.getObject("bkt", "big").isErr(), "decoded copy swept")?;
+        let _ = store.takeWanted();
+        Check.isTrue(store.checkpoint()!, "a checkpoint")?;
+    }
+    // Reopened from the checkpoint: the coding is there, and so is this replica's piece.
+    var store = ObjectStore.open(dir.view(), raftStoreConfig())!;
+    store.setNodeId(1);
+    let id = ids[0];
+    let c = store.codedOf(id)!!;
+    Check.equalU64(3, c.holders.length as u64)?;
+    Check.isTrue(store.getObject("bkt", "big").isErr(), "still coded")?;
+    Check.equalU64(0, store.missingPieces(16)!.length as u64)?;
+    // A lost piece: listed; a piece of the wrong bytes is refused, the record's installed.
+    let mine = store.pieceBytes(id, 0)!!;
+    let piece0 = piecePath(store.extentDirectory(), id, 0)!;
+    Fs.unlink(piece0.view())!;
+    let missing = store.missingPieces(16)!;
+    Check.equalU64(1, missing.length as u64)?;
+    Check.equalU64(id, missing[0][0])?;
+    Check.equalU64(0, missing[0][1])?;
+    var wrong = mine.clone()!;
+    wrong[7] = wrong[7] ^ 1;
+    Check.isFalse(store.installPiece(id, 0, wrong.view())!, "another piece's bytes")?;
+    Check.isFalse(store.installPiece(id, 1, mine.view())!, "another index")?;
+    Check.isTrue(store.installPiece(id, 0, mine.view())!, "the piece")?;
+    Check.equalU64(0, store.missingPieces(16)!.length as u64)?;
+    // A damaged piece: scrub finds it; once quarantined it is missing.
+    let none: IndexKey? = null;
+    Check.equalU64(0, store.scrubStep(borrow none, 100)!.damages.length as u64)?;
+    flipByteOf(piece0.view(), 100);
+    let hurt = store.scrubStep(borrow none, 100)!;
+    Check.equalU64(1, hurt.damages.length as u64)?;
+    Check.equalU64(id, hurt.damages[0].id)?;
+    store.quarantineExtent(id);
+    Check.equalU64(1, store.missingPieces(16)!.length as u64)?;
+    // A whole copy (a crash between the record and the piece leaves one) gives the piece back.
+    var data = Vector<u8>.create();
+    data.extend(big.view()[0..c.length as usize])!; // the first extent
+    store.installDecoded(id, data.view())!;
+    Check.equalU64(0, store.missingPieces(16)!.length as u64)?;
+    Check.equalBytes(mine.view(), store.pieceBytes(id, 0)!!.view())?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+// ---- Faults (ADR-0004): a Coded record applied never loses both the whole copy and the piece ----
+
+/// A shard's store with a large object applied and its first extent's Coded record persisted, not applied: the id.
+fn codedSetup(dir: StringView) -> u64 {
+    var store = ObjectStore.open(dir, raftStoreConfig())!;
+    store.setNodeId(1);
+    store.setLeaderTerm(1);
+    store.appendNoop(1)!;
+    store.persistEntries()!;
+    store.applyEntries(1, 1)!;
+    store.createBucket("bkt")!;
+    store.applyEntries(2, 2)!;
+    var big = Vector<u8>.create();
+    for (i in 0..100000) { big.push(truncate<u8>(i * 11 + 5))!; }
+    let _ = store.putObject("bkt", "big", "application/octet-stream", big.view(), PutCondition.None)!;
+    store.persistEntries()!;
+    store.applyEntries(3, 3)!;
+    let candidates = store.codingCandidates(Clock.unixMillis() + 60000, 1)!;
+    var holders = Vector<u32>.create();
+    holders.push(1)!;
+    holders.push(2)!;
+    holders.push(3)!;
+    let _ = store.stageCoded(candidates[0], holders.view())!;
+    store.persistEntries()!;
+    return candidates[0].id;
+}
+
+/// What a replica does with it: opens, applies (the piece written, the whole copy removed), upkeep, a checkpoint.
+/// Stops at the first error.
+fn codedWorkload(dir: StringView) {
+    var store = match (ObjectStore.open(dir, raftStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    store.setNodeId(1);
+    let _ = store.takeRecoveredTerms();
+    if (store.applyEntries(store.appliedIndex() + 1, 4).isErr()) { return; }
+    if (store.missingPieces(16).isErr()) { return; }
+    if (store.sweepDecoded(Clock.unixMillis() + 7200000).isErr()) { return; }
+    let _ = store.checkpoint();
+}
+
+fn sweepCoded(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    let _ = codedSetup(dir.view());
+    Faults.countOperations();
+    codedWorkload(dir.view());
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 4, "the workload does I/O")?;
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        let id = codedSetup(dir.view());
+        armMode(borrow mode, n);
+        codedWorkload(dir.view());
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired().min(1))?;
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        // Recovered: the record applies, and this replica's piece is there or made from the whole copy still here.
+        var store = ObjectStore.open(dir.view(), raftStoreConfig())!;
+        store.setNodeId(1);
+        let _ = store.takeRecoveredTerms();
+        if (store.appliedIndex() < 4) { store.applyEntries(store.appliedIndex() + 1, 4)!; }
+        Check.isTrue(store.codedOf(id)!.isSome(), "the coding was lost")?;
+        Check.equalU64(0, store.missingPieces(16)!.length as u64)?;
+        Check.isTrue(store.pieceBytes(id, 0)!.isSome(), "both the whole copy and the piece were lost")?;
+    }
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn codedFaultsOnce() -> Result<void, TestFailure> => sweepCoded("coded-fault-once", SweepMode.Once);
+
+@test
+fn codedFaultsCrash() -> Result<void, TestFailure> => sweepCoded("coded-fault-crash", SweepMode.Crash);

@@ -1,0 +1,99 @@
+// Reed-Solomon (ADR-0064 §2): the field's arithmetic, and every way of losing m pieces of k+m given back.
+
+@test
+fn gf256Arithmetic() -> Result<void, TestFailure> {
+    let gf = Gf256.create()!;
+    for (v in 1usize..256usize) {
+        let a = truncate<u8>(v);
+        Check.equalU64(1, gf.mul(a, gf.inv(a)) as u64)?;
+        Check.equalU64(a as u64, gf.mul(a, 1) as u64)?;
+        Check.equalU64(0, gf.mul(a, 0) as u64)?;
+    }
+    // Multiplication distributes over addition (XOR), on a sample.
+    for (x in 0usize..40usize) {
+        let a = truncate<u8>(x * 7 + 3);
+        let b = truncate<u8>(x * 13 + 1);
+        let c = truncate<u8>(x * 29 + 5);
+        Check.equalU64((gf.mul(a, b ^ c)) as u64, (gf.mul(a, b) ^ gf.mul(a, c)) as u64)?;
+    }
+    return Ok();
+}
+
+fn sampleData(n: usize, seed: u64) -> Vector<u8> {
+    var rng = SplitMix { state: seed };
+    var out = Vector<u8>.create();
+    for (i in 0..n) { out.push(truncate<u8>(rng.next()))!; }
+    return out;
+}
+
+/// Every choice of k pieces of k+m gives `data` back.
+fn everyChoice(k: usize, m: usize, data: Slice<u8>) -> Result<u64, TestFailure> {
+    let rs = ReedSolomon.create(k, m)!!;
+    let pieces = rs.encode(data)!;
+    Check.equalU64((k + m) as u64, pieces.length as u64)?;
+    let n = k + m;
+    var choices = 0u64;
+    var mask = 0u32;
+    while (mask < (1u32 << truncate<u32>(n))) {
+        var count = 0usize;
+        for (i in 0..n) {
+            if ((mask >> truncate<u32>(i)) & 1 == 1) { count += 1; }
+        }
+        if (count == k) {
+            var indexes = Vector<usize>.create();
+            var chosen = Vector<Vector<u8>>.create();
+            // In a scrambled order: the decoder must not depend on it.
+            var i = n;
+            while (i > 0) {
+                i -= 1;
+                if ((mask >> truncate<u32>(i)) & 1 == 1) {
+                    indexes.push(i)!;
+                    chosen.push(pieces[i].clone()!)!;
+                }
+            }
+            let back = match (rs.decode(indexes.view(), chosen.view(), data.length as u64)!) {
+                Some(b) => b,
+                null => { return Err(TestFailure.create("k pieces did not decode")); }
+            };
+            Check.equalBytes(data, back.view())?;
+            choices += 1;
+        }
+        mask += 1;
+    }
+    return Ok(choices);
+}
+
+@test
+fn reedSolomonGivesBackFromAnyK() -> Result<void, TestFailure> {
+    // 2+1 and 3+2 (the codes of three and five voters), 4+2; lengths that do and do not divide.
+    Check.equalU64(3, everyChoice(2, 1, sampleData(1001, 1).view())?)?;
+    Check.equalU64(10, everyChoice(3, 2, sampleData(30000, 2).view())?)?;
+    Check.equalU64(15, everyChoice(4, 2, sampleData(65537, 3).view())?)?;
+    Check.equalU64(3, everyChoice(2, 1, sampleData(1, 4).view())?)?;
+    // A piece alone, as a replica writes its own, is the encoder's.
+    let rs = ReedSolomon.create(3, 2)!!;
+    let data = sampleData(5000, 5);
+    let all = rs.encode(data.view())!;
+    for (i in 0..5) { Check.equalBytes(all[i].view(), rs.piece(data.view(), i)!.view())?; }
+    // Systematic: the data pieces are the data's slices.
+    Check.equalBytes(data.view()[0..1667], all[0].view())?;
+    // Refused: too few pieces, a piece twice, a piece of the wrong length, a damaged piece gives the wrong data.
+    var two = Vector<usize>.create();
+    two.push(0)!;
+    two.push(1)!;
+    var twoPieces = Vector<Vector<u8>>.create();
+    twoPieces.push(all[0].clone()!)!;
+    twoPieces.push(all[1].clone()!)!;
+    Check.isTrue(rs.decode(two.view(), twoPieces.view(), 5000)!.isNull(), "two of a 3+2 code")?;
+    var dup = Vector<usize>.create();
+    dup.push(0)!;
+    dup.push(0)!;
+    dup.push(4)!;
+    var dupPieces = Vector<Vector<u8>>.create();
+    dupPieces.push(all[0].clone()!)!;
+    dupPieces.push(all[0].clone()!)!;
+    dupPieces.push(all[4].clone()!)!;
+    Check.isTrue(rs.decode(dup.view(), dupPieces.view(), 5000)!.isNull(), "a piece twice")?;
+    Check.isTrue(ReedSolomon.create(0, 1)!.isNull() && ReedSolomon.create(200, 56)!.isNull(), "no such code")?;
+    return Ok();
+}

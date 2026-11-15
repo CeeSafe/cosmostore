@@ -271,6 +271,13 @@ any object by multipart upload, and any object by ranged GETs (the AWS CLI's way
   damaged copy right from another replica; the status's last line is `# scrub <checked> <damaged> <repaired>
   <fetched>`. A log line `scrub: a damaged record no replica could repair` means every copy was damaged: restore
   that object from a backup.
+- **Erasure coding** (ADR-0064): a shard with three voters or more codes a large object's extents once they are a
+  day old (`--code-after-seconds` to change it) into Reed-Solomon pieces, one per voter: 2+1 on three voters, 3+2 on
+  five, so a cold object costs 1.5× its size on three nodes instead of 3×, and still survives a node lost. Its files
+  are `piece-<id>-<index>.cp` beside the extents. The first read of a coded object answers 503 (SlowDown) while a
+  node decodes it from its peers' pieces, and the client's retry reads it; the decoded copy is kept an hour. Let
+  clients retry (the AWS CLI's `AWS_MAX_ATTEMPTS`, 5 or more). With more nodes down than the code survives (two of
+  three), a coded object cannot be read until one comes back.
 - **Rolling restarts and upgrades:** restart one node at a time, the next only once the status shows the first's
   replicas at the others' applied index; a node reads older formats, so upgrade forwards, never back.
 - **Adding and removing nodes** (ADR-0062): put every node that may take part in the cluster file from the start,

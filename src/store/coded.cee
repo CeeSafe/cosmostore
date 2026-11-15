@@ -1,0 +1,86 @@
+// Coded extents (ADR-0064): an extent whose bytes are k+m Reed-Solomon pieces on the nodes of its shard's group, one
+// each, instead of a whole copy on every replica. A `Coded` record (type 17) makes the switch; its meta, and a
+// checkpoint's entry of kind 6, is the coding: u64 extent id, u8 k, u8 m, u64 length, u64 piece length, then per piece
+// u32 the node that holds it and u32 the CRC32C of its bytes. A piece's file is `piece-<16 hex id>-<2 hex index>.cp`
+// in the store's extents directory: the piece's bytes, nothing else (its CRC is the record's).
+
+struct CodedExtent {
+    id: u64;
+    k: u32;
+    m: u32;
+    length: u64;
+    pieceLength: u64;
+    holders: Vector<u32>;
+    crcs: Vector<u32>;
+
+    /// The piece node `node` holds, or null.
+    fn pieceOf(borrow this, node: u32) -> usize? {
+        for (i in 0..this.holders.length) {
+            if (this.holders[i] == node) { return Some(i); }
+        }
+        return null;
+    }
+
+    fn copy(borrow this) -> Result<CodedExtent, AllocError> {
+        return Ok(CodedExtent {
+            id: this.id,
+            k: this.k,
+            m: this.m,
+            length: this.length,
+            pieceLength: this.pieceLength,
+            holders: this.holders.clone()?,
+            crcs: this.crcs.clone()?,
+        });
+    }
+}
+
+fn encodeCoded(out: borrow mut Vector<u8>, c: borrow CodedExtent) -> Result<void, AllocError> {
+    out.pushLE(c.id)?;
+    out.pushLE(truncate<u8>(c.k))?;
+    out.pushLE(truncate<u8>(c.m))?;
+    out.pushLE(c.length)?;
+    out.pushLE(c.pieceLength)?;
+    for (i in 0..c.holders.length) {
+        out.pushLE(c.holders[i])?;
+        out.pushLE(c.crcs[i])?;
+    }
+    return Ok();
+}
+
+fn decodeCoded(b: Slice<u8>) -> CodedExtent? {
+    if (b.length < 26) { return null; }
+    let k = b[8] as u32;
+    let m = b[9] as u32;
+    let n = (k + m) as usize;
+    if (k == 0 || m == 0 || b.length != 26 + n * 8) { return null; }
+    var holders = Vector<u32>.create();
+    var crcs = Vector<u32>.create();
+    for (i in 0..n) {
+        if (holders.push(b.readLE<u32>(26 + i * 8)).isErr() || crcs.push(b.readLE<u32>(30 + i * 8)).isErr()) {
+            return null;
+        }
+    }
+    return Some(CodedExtent {
+        id: b.readLE<u64>(0),
+        k: k,
+        m: m,
+        length: b.readLE<u64>(10),
+        pieceLength: b.readLE<u64>(18),
+        holders: holders,
+        crcs: crcs,
+    });
+}
+
+/// `<dir>/piece-<16 hex id>-<2 hex index>.cp`
+fn piecePath(dir: StringView, id: u64, index: usize) -> Result<String, AllocError> {
+    var s = String.create();
+    s.append(dir)?;
+    s.append("/piece-")?;
+    appendHex16Text(mut s, id)?;
+    s.append("-")?;
+    let digits = "0123456789abcdef".bytes();
+    var two = [digits[(index >> 4) & 0xF], digits[index & 0xF]];
+    s.append(StringView.fromUtf8(two[..])!)?;
+    s.append(".cp")?;
+    return Ok(s);
+}

@@ -15,7 +15,9 @@
 //  56 u32 upload count (format 2; reserved, 0, in format 1)   60 u32 crc32c of bytes 0..60
 // In format 15 (ADR-0058) 16 more header bytes follow: u64 the term of the entry at `lsn` (a cluster shard's Raft log;
 // 0 on a single node), u32 reserved (0), u32 crc32c of those 12. In format 16 (ADR-0062) the reserved u32 is the length
-// of the group's configuration at `lsn` (0 for none), whose bytes follow, and then their u32 crc32c. A Raft log's checkpoint does not seal: `segment` is
+// of the group's configuration at `lsn` (0 for none), whose bytes follow, and then their u32 crc32c. In format 17
+// (ADR-0064) the events are followed by an entry of kind 5, a u32 count, and that many entries of kind 6, each a coded
+// extent as `encodeCoded` writes it. A Raft log's checkpoint does not seal: `segment` is
 // the one holding entry lsn + 1, and recovery skips its records up to `lsn`.
 // Entries, buckets, then objects, then uploads, then events: u8 kind (1 bucket, 2 object, 3 upload, 4 event), u32
 // body length, body.
@@ -45,7 +47,9 @@ const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 16;
+const CHECKPOINT_FORMAT: u16 = 17;
+const CHECKPOINT_CODED_COUNT: u8 = 5;
+const CHECKPOINT_CODED: u8 = 6;
 /// The header's extension in format 15: the term (ADR-0058).
 const CHECKPOINT_EXTENSION_LEN: usize = 16;
 const CHECKPOINT_BUCKET: u8 = 1;
@@ -239,6 +243,8 @@ struct CheckpointJob {
     private uploads: Vector<Vector<u8>>;
     /// The outbox's undelivered events as of the start, written after the uploads (ADR-0048).
     private events: Vector<Vector<u8>>;
+    /// The coded extents as of the start, written after the events (ADR-0064).
+    private coded: Vector<Vector<u8>>;
     private body: Vector<u8>;
     /// A key's version slots, newest first, while its entries are written oldest first.
     private slots: Vector<u32>;
@@ -264,6 +270,10 @@ struct CheckpointJob {
     fn publish(borrow mut this) -> Result<u64, StoreError> {
         for (i in 0..this.uploads.length) { this.writer.add(CHECKPOINT_UPLOAD, this.uploads[i].view())?; }
         for (i in 0..this.events.length) { this.writer.add(CHECKPOINT_EVENT, this.events[i].view())?; }
+        var count = Vector<u8>.create();
+        count.pushLE(truncate<u32>(this.coded.length))?;
+        this.writer.add(CHECKPOINT_CODED_COUNT, count.view())?;
+        for (i in 0..this.coded.length) { this.writer.add(CHECKPOINT_CODED, this.coded[i].view())?; }
         // A snapshot that gave each key at `lsn` exactly once fills the header's count; anything else is a bug, and
         // such a file must never be published.
         if (this.writer.entries != this.expected) { return Err(StoreError.CheckpointCorrupt); }
@@ -296,6 +306,12 @@ fn beginCheckpointJob(
     let _ = Fs.unlink(tmp.view()); // a leftover of an interrupted attempt
     let file = sio(DurableFile.createNew(tmp.view()))?;
     let objects = state.index.versionCount() as u64;
+    var coded = Vector<Vector<u8>>.create();
+    for (i in 0..state.coded.length()) {
+        var entry = Vector<u8>.create();
+        encodeCoded(mut entry, state.coded.valueAt(i))?;
+        coded.push(entry)?;
+    }
     // The events still to be delivered, as of now: at most MAX_OUTBOX_EVENTS.
     var events = Vector<Vector<u8>>.create();
     for (i in state.outbox.head..state.outbox.events.length) {
@@ -403,10 +419,12 @@ fn beginCheckpointJob(
         tmp: tmp,
         done: done,
         writer: w,
-        expected: state.buckets.length() as u64 + objects + state.uploads.length() as u64 + events.length as u64,
+        expected: state.buckets.length() as u64 + objects + state.uploads.length() as u64 + events.length as u64 + 1 +
+            coded.length as u64,
         names: names,
         uploads: uploads,
         events: events,
+        coded: coded,
         body: body,
         slots: Vector<u32>.create(),
         steps: 0,
@@ -795,6 +813,37 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
             state.outbox.events.push(corrupt(decodeEvent(body))?)?;
         }
         entries += 1;
+    }
+    // Format 17: the coded extents (ADR-0064).
+    if (format >= 17) {
+        r.ensure(5)?;
+        let prefix = r.take(5);
+        crc.update(prefix);
+        if (prefix[0] != CHECKPOINT_CODED_COUNT || prefix.readLE<u32>(1) != 4) {
+            return Err(StoreError.CheckpointCorrupt);
+        }
+        r.ensure(4)?;
+        let countBytes = r.take(4);
+        crc.update(countBytes);
+        let count = countBytes.readLE<u32>(0) as u64;
+        entries += 1;
+        var n = 0u64;
+        while (n < count) {
+            r.ensure(5)?;
+            let p = r.take(5);
+            crc.update(p);
+            let length = p.readLE<u32>(1) as usize;
+            if (p[0] != CHECKPOINT_CODED || length > CHECKPOINT_MAX_ENTRY) { return Err(StoreError.CheckpointCorrupt); }
+            r.ensure(length)?;
+            let body = r.take(length);
+            crc.update(body);
+            match (decodeCoded(body)) {
+                Some(c) => { let _ = state.coded.put(c.id, c)?; }
+                null => { return Err(StoreError.CheckpointCorrupt); }
+            }
+            entries += 1;
+            n += 1;
+        }
     }
     r.ensure(CHECKPOINT_TRAILER_LEN)?;
     let t = r.take(CHECKPOINT_TRAILER_LEN);

@@ -1,0 +1,171 @@
+// Reed-Solomon erasure coding over GF(2^8) (ADR-0064 §2): systematic, its parity rows a Cauchy matrix, so that any k of
+// the k+m pieces give the data back. Pieces 0 to k-1 are the data in k slices of `pieceLength` bytes (the last padded
+// with zeros); pieces k to k+m-1 are parity. GF(2^8) is the field of polynomials over GF(2) modulo x^8+x^4+x^3+x^2+1
+// (0x11D), with 2 as its generator.
+
+const GF_POLY: u32 = 0x11D;
+
+struct Gf256 {
+    exp: Vector<u8>; // 512 entries, so exp[log a + log b] needs no reduction
+    log: Vector<u8>;
+
+    fn create() -> Result<Gf256, AllocError> {
+        var exp = Vector<u8>.create();
+        exp.resize(512, 0)?;
+        var log = Vector<u8>.create();
+        log.resize(256, 0)?;
+        var x = 1u32;
+        for (i in 0usize..255usize) {
+            exp[i] = truncate<u8>(x);
+            log[x as usize] = truncate<u8>(i);
+            x = x << 1;
+            if ((x & 0x100) != 0) { x = x ^ GF_POLY; }
+        }
+        for (i in 255usize..512usize) { exp[i] = exp[i - 255]; }
+        return Ok(Gf256 { exp: exp, log: log });
+    }
+
+    fn mul(borrow this, a: u8, b: u8) -> u8 {
+        if (a == 0 || b == 0) { return 0; }
+        return this.exp[(this.log[a as usize] as usize) + (this.log[b as usize] as usize)];
+    }
+
+    /// The inverse of `a` (a ≠ 0).
+    fn inv(borrow this, a: u8) -> u8 => this.exp[255 - (this.log[a as usize] as usize)];
+
+    /// out[i] ^= c * src[i], through the 256 products of c.
+    fn mulAdd(borrow this, out: SliceMut<u8>, src: Slice<u8>, c: u8) {
+        if (c == 0) { return; }
+        var row = [0u8; 256];
+        for (v in 0usize..256usize) { row[v] = this.mul(c, truncate<u8>(v)); }
+        for (i in 0..src.length) { out[i] = out[i] ^ row[src[i] as usize]; }
+    }
+}
+
+struct ReedSolomon {
+    k: usize;
+    m: usize;
+    gf: Gf256;
+    /// The m×k Cauchy matrix of the parity rows: row i, column j is 1 / ((k + i) XOR j).
+    parity: Vector<u8>;
+
+    /// A code of `k` data and `m` parity pieces; null when k or m is 0 or k + m > 255.
+    fn create(k: usize, m: usize) -> Result<ReedSolomon?, AllocError> {
+        if (k == 0 || m == 0 || k + m > 255) { return Ok(null); }
+        let gf = Gf256.create()?;
+        var parity = Vector<u8>.create();
+        for (i in 0..m) {
+            for (j in 0..k) { parity.push(gf.inv(truncate<u8>((k + i) ^ j)))?; }
+        }
+        return Ok(Some(ReedSolomon { k: k, m: m, gf: gf, parity: parity }));
+    }
+
+    /// The length of each piece of `length` bytes of data.
+    fn pieceLength(borrow this, length: u64) -> u64 => (length + (this.k as u64) - 1) / (this.k as u64);
+
+    /// Row `r` of the encoding matrix [I; C], column `j`.
+    fn coefficient(borrow this, r: usize, j: usize) -> u8 {
+        if (r < this.k) { return if (r == j) 1 else 0; }
+        return this.parity[(r - this.k) * this.k + j];
+    }
+
+    /// Data slice `j` of `data`, `p` bytes, the end padded with zeros.
+    fn slice(data: Slice<u8>, j: usize, p: usize, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        out.clear();
+        out.resize(p, 0)?;
+        let start = j * p;
+        if (start < data.length) {
+            let end = if (start + p < data.length) start + p else data.length;
+            out.viewMut()[0..end - start].copyFrom(data[start..end]);
+        }
+        return Ok();
+    }
+
+    /// Piece `i` of `data` alone: what a replica writes from its full copy (ADR-0064 §3).
+    fn piece(borrow this, data: Slice<u8>, i: usize) -> Result<Vector<u8>, AllocError> {
+        let p = this.pieceLength(data.length as u64) as usize;
+        var out = Vector<u8>.create();
+        if (i < this.k) {
+            ReedSolomon.slice(data, i, p, mut out)?;
+            return Ok(out);
+        }
+        out.resize(p, 0)?;
+        var s = Vector<u8>.create();
+        for (j in 0..this.k) {
+            ReedSolomon.slice(data, j, p, mut s)?;
+            this.gf.mulAdd(out.viewMut(), s.view(), this.coefficient(i, j));
+        }
+        return Ok(out);
+    }
+
+    /// Every piece of `data`.
+    fn encode(borrow this, data: Slice<u8>) -> Result<Vector<Vector<u8>>, AllocError> {
+        var out = Vector<Vector<u8>>.create();
+        for (i in 0..this.k + this.m) { out.push(this.piece(data, i)?)?; }
+        return Ok(out);
+    }
+
+    /// The data of `length` bytes from k pieces, `pieces[t]` being piece `indexes[t]`; null when they are not k
+    /// distinct pieces of one length.
+    fn decode(
+        borrow this,
+        indexes: Slice<usize>,
+        pieces: Slice<Vector<u8>>,
+        length: u64,
+    ) -> Result<Vector<u8>?, AllocError> {
+        let k = this.k;
+        if (indexes.length != k || pieces.length != k) { return Ok(null); }
+        let p = this.pieceLength(length) as usize;
+        for (t in 0..k) {
+            if (indexes[t] >= k + this.m || pieces[t].length != p) { return Ok(null); }
+            for (u in 0..t) {
+                if (indexes[u] == indexes[t]) { return Ok(null); }
+            }
+        }
+        // A: the encoding matrix's rows of the pieces given; its inverse by Gauss-Jordan, beside an identity.
+        var a = Vector<u8>.create();
+        var b = Vector<u8>.create();
+        for (t in 0..k) {
+            for (j in 0..k) {
+                a.push(this.coefficient(indexes[t], j))?;
+                b.push(if (t == j) 1u8 else 0u8)?;
+            }
+        }
+        for (col in 0..k) {
+            var pivot = col;
+            while (pivot < k && a[pivot * k + col] == 0) { pivot += 1; }
+            if (pivot == k) { return Ok(null); } // singular: cannot be, for distinct rows of [I; C]
+            if (pivot != col) {
+                for (j in 0..k) {
+                    a.swap(pivot * k + j, col * k + j);
+                    b.swap(pivot * k + j, col * k + j);
+                }
+            }
+            let scale = this.gf.inv(a[col * k + col]);
+            for (j in 0..k) {
+                a[col * k + j] = this.gf.mul(a[col * k + j], scale);
+                b[col * k + j] = this.gf.mul(b[col * k + j], scale);
+            }
+            for (r in 0..k) {
+                if (r == col) { continue; }
+                let f = a[r * k + col];
+                if (f == 0) { continue; }
+                for (j in 0..k) {
+                    a[r * k + j] = a[r * k + j] ^ this.gf.mul(f, a[col * k + j]);
+                    b[r * k + j] = b[r * k + j] ^ this.gf.mul(f, b[col * k + j]);
+                }
+            }
+        }
+        // Data slice j = Σ_t B[j][t] · piece t.
+        var data = Vector<u8>.create();
+        data.resize(p * k, 0)?;
+        for (j in 0..k) {
+            for (t in 0..k) {
+                let c = b[j * k + t];
+                this.gf.mulAdd(mut data.viewMut()[j * p..(j + 1) * p], pieces[t].view(), c);
+            }
+        }
+        data.truncate(length as usize);
+        return Ok(Some(data));
+    }
+}

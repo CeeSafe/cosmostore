@@ -63,6 +63,8 @@ enum StoreError {
     NotLeader,
     /// What a cluster shard cannot replicate yet: extents (ADR-0058 §10, until M6 item 5).
     NotReplicated,
+    /// A coded extent this replica holds only a piece of, noted as wanted for decoding (ADR-0064 §5).
+    ExtentWanted,
     InvalidBucketName,
     InvalidKey,
     NoSuchBucket,
@@ -426,6 +428,11 @@ const UPKEEP_SLOW_MICROS: u64 = 10000;
 const NO_BUCKET: u32 = 0xFFFFFFFF;
 
 /// Everything recovery rebuilds from the journal.
+/// How many index keys a leader's look for extents to code reads at a time (ADR-0064 §1).
+const CODING_SCAN_KEYS: usize = 512;
+/// How long a coded extent's whole copy, decoded for reads, is kept (ADR-0064 §5).
+const DECODED_KEEP_MS: i64 = 3600000;
+
 struct StoreState {
     /// In (bucket, key) order, so a listing seeks to its first key and reads only its page (ADR-0026).
     index: VersionIndex;
@@ -450,6 +457,8 @@ struct StoreState {
     /// A cluster shard's replica: the configuration of the last Config record applied, as its bytes (ADR-0062 §2);
     /// empty before one.
     membership: Vector<u8>;
+    /// The coded extents, by id (ADR-0064).
+    coded: HashMap<u64, CodedExtent>;
 
     fn create() -> StoreState => StoreState {
         index: VersionIndex.create(),
@@ -464,6 +473,7 @@ struct StoreState {
         completions: Vector<Completion>.create(),
         outbox: Outbox.create(),
         membership: Vector<u8>.create(),
+        coded: HashMap<u64, CodedExtent>.create(),
     };
 
     /// Queues the event of a record just applied, if its bucket has a notification rule for it (ADR-0048 §2).
@@ -939,6 +949,13 @@ fn applyRecord(
             state.membership.extend(meta)?;
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
         }
+        RecordType.Coded => {
+            match (decodeCoded(meta)) {
+                Some(c) => { let _ = state.coded.put(c.id, c)?; }
+                null => { return Err(StoreError.BadMeta(segment, offset)); }
+            }
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
+        }
         _ => {
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
         }
@@ -1411,6 +1428,14 @@ struct ObjectStore {
     /// The term of the last applied entry, and of the newest checkpoint's (a Raft log; 0 on a single node).
     private appliedTerm: u64;
     private checkpointTerm: u64;
+    /// A cluster replica's node (whose piece of a coded extent it holds), and the coded extents reads want decoded.
+    private nodeId: u32;
+    private wanted: Channel<u64>;
+    /// The coded extents this replica has a whole copy of (decoded for reads), known without I/O: reads on the
+    /// event loop look here (ADR-0023).
+    private wholeCoded: HashMap<u64, bool>;
+    /// Where the leader's look for extents to code left off (`codingCandidates`).
+    private codingAfter: IndexKey?;
 
     /// Opens the store in `dir`: loads the newest checkpoint, if any, then replays the journal
     /// records after it.
@@ -1558,6 +1583,10 @@ struct ObjectStore {
             recoveredConfigs: recoveredConfigs,
             appliedTerm: startTerm,
             checkpointTerm: startTerm,
+            nodeId: 0,
+            wanted: Channel<u64>.create(256)?,
+            wholeCoded: HashMap<u64, bool>.create(),
+            codingAfter: null,
             counts: StoreCounters {
                 payloadBytes: 0,
                 journalBytesWritten: 0,
@@ -1578,6 +1607,12 @@ struct ObjectStore {
         // orphans (ADR-0061 §4). Upkeep sweeps there, carefully.
         if (!store.raft) { store.sweepOrphanExtents()?; }
         store.measureVolume();
+        // Which coded extents have a whole copy here.
+        for (i in 0..store.state.coded.length()) {
+            let id: u64 = store.state.coded.keyAt(i);
+            let path = extentPath(store.extentDir.view(), id)?;
+            if (ObjectStore.fileExists(path.view())) { let _ = store.wholeCoded.put(id, true)?; }
+        }
         return Ok(store);
     }
 
@@ -1657,6 +1692,348 @@ struct ObjectStore {
     /// Where the store's extent files are.
     fn extentDirectory(borrow this) -> StringView => this.extentDir.view();
 
+    // --- Coded extents (ADR-0064) ---
+
+    /// This replica's node, whose piece of a coded extent it holds.
+    fn setNodeId(borrow mut this, id: u32) { this.nodeId = id; }
+
+    fn codedOf(borrow this, id: u64) -> Result<CodedExtent?, StoreError> {
+        return match (this.state.coded.get(borrow id)) {
+            Some(c) => Ok(Some(c.copy()?)),
+            null => Ok(null),
+        };
+    }
+
+    fn fileExists(path: StringView) -> bool => DurableFile.openRead(path).isOk();
+
+    /// A Coded record applied: this replica writes its piece from its whole copy, synced, and only then removes the
+    /// copy (kept while a read has it pinned, for `sweepDecoded`); without a whole copy it writes nothing, and its
+    /// piece is missing (`missingPieces`).
+    fn convertToPiece(borrow mut this, id: u64) -> Result<void, StoreError> {
+        if (!this.state.coded.contains(borrow id)) { return Ok(); }
+        let _ = this.pieceFromWhole(id)?;
+        if (this.pins.isPinned(id)) {
+            let full = extentPath(this.extentDir.view(), id)?;
+            if (ObjectStore.fileExists(full.view())) { let _ = this.wholeCoded.put(id, true)?; }
+            return Ok();
+        }
+        removeExtent(this.extentDir.view(), id);
+        let _ = this.wholeCoded.remove(borrow id);
+        return Ok();
+    }
+
+    /// Writes this replica's piece of coded extent `id` from its whole copy, when it holds a piece, lacks it, and has
+    /// a whole copy whose piece has the record's CRC. Whether it wrote one; an error when the copy could not be read
+    /// or the piece not written, and then the copy must stay.
+    fn pieceFromWhole(borrow mut this, id: u64) -> Result<bool, StoreError> {
+        let c = match (this.state.coded.get(borrow id)) {
+            Some(c) => c.copy()?,
+            null => { return Ok(false); }
+        };
+        let i = match (c.pieceOf(this.nodeId)) {
+            Some(i) => i,
+            null => { return Ok(false); }
+        };
+        if (this.pieceFileOk(borrow c, i)?) { return Ok(false); }
+        // No whole copy is no piece; a copy that cannot be read is an error, so that the caller keeps it (a copy
+        // removed with no piece written would be the data lost here).
+        let bytes = match (this.extentFileBytes(id)) {
+            Ok(b) => b,
+            Err(StoreError.Io(e)) => {
+                if (e.isNotFound()) { return Ok(false); }
+                return Err(StoreError.Io(e));
+            }
+            Err(e) => { return Err(e); }
+        };
+        if ((bytes.length as u64) != EXTENT_HEADER_LEN + c.length) { return Ok(false); }
+        let rs = match (ReedSolomon.create(c.k as usize, c.m as usize)?) {
+            Some(r) => r,
+            null => { return Ok(false); }
+        };
+        let piece = rs.piece(bytes.view()[EXTENT_HEADER_LEN as usize..bytes.length], i)?;
+        if (Crc32c.of(piece.view()) != c.crcs[i]) { return Ok(false); } // not the bytes the leader coded
+        this.writePiece(id, i, piece.view())?;
+        return Ok(true);
+    }
+
+    /// Whether piece `index` of `c` is here at its length (a stat, no read: its CRC is scrub's to check).
+    fn pieceFileOk(borrow this, c: borrow CodedExtent, index: usize) -> Result<bool, StoreError> {
+        let path = piecePath(this.extentDir.view(), c.id, index)?;
+        return match (DurableFile.openRead(path.view())) {
+            Ok(f) => match (f.size()) {
+                Ok(n) => Ok(n == c.pieceLength),
+                Err(_) => Ok(false),
+            },
+            Err(_) => Ok(false),
+        };
+    }
+
+    /// Whether this replica's piece of coded extent `id` is here but damaged (its length or CRC wrong): scrub's
+    /// check (ADR-0064 §6).
+    fn pieceDamaged(borrow this, id: u64) -> Result<bool, StoreError> {
+        let c = match (this.state.coded.get(borrow id)) {
+            Some(c) => c,
+            null => { return Ok(false); }
+        };
+        let i = match (c.pieceOf(this.nodeId)) {
+            Some(i) => i,
+            null => { return Ok(false); }
+        };
+        let path = piecePath(this.extentDir.view(), id, i)?;
+        if (!ObjectStore.fileExists(path.view())) { return Ok(false); }
+        return Ok(this.pieceBytes(id, i)?.isNull());
+    }
+
+    /// Whether a read of `v` must wait for a coded extent to be decoded here; if so, the extent is noted as wanted
+    /// (ADR-0064 §5).
+    fn wantsDecode(borrow this, v: borrow ObjectVersion) -> bool {
+        var wants = false;
+        for (e in 0..v.extents.length) {
+            let id = v.extents[e].id;
+            if (!this.state.coded.contains(borrow id) || this.wholeCoded.contains(borrow id)) { continue; }
+            // Every one of them, so one retry finds them all.
+            let _ = this.wanted.trySend(id);
+            wants = true;
+        }
+        return wants;
+    }
+
+    fn writePiece(borrow mut this, id: u64, index: usize, bytes: Slice<u8>) -> Result<void, StoreError> {
+        let path = piecePath(this.extentDir.view(), id, index)?;
+        match (Fs.unlink(path.view())) {
+            Ok() => {}
+            Err(e) => {
+                if (!e.isNotFound()) { return Err(StoreError.Io(e)); }
+            }
+        }
+        let file = sio(DurableFile.createNew(path.view()))?;
+        sio(file.writeAt(bytes, 0))?;
+        sio(file.syncData())?;
+        sio(Fs.syncDirectory(this.extentDir.view()))?;
+        return Ok();
+    }
+
+    /// Piece `index` of coded extent `id`, as this replica holds it, checked against the record's CRC.
+    fn pieceBytes(borrow this, id: u64, index: usize) -> Result<Vector<u8>?, StoreError> {
+        let c = match (this.state.coded.get(borrow id)) {
+            Some(c) => c,
+            null => { return Ok(null); }
+        };
+        if (index >= c.crcs.length) { return Ok(null); }
+        let path = piecePath(this.extentDir.view(), id, index)?;
+        let file = match (DurableFile.openRead(path.view())) {
+            Ok(f) => f,
+            Err(_) => { return Ok(null); }
+        };
+        if (sio(file.size())? != c.pieceLength) { return Ok(null); }
+        var out = Vector<u8>.create();
+        out.resize(c.pieceLength as usize, 0)?;
+        sio(file.readExactAt(mut out.viewMut(), 0))?;
+        if (Crc32c.of(out.view()) != c.crcs[index]) { return Ok(null); }
+        return Ok(Some(out));
+    }
+
+    /// Installs piece `index` of coded extent `id`, once checked against the record's CRC (ADR-0064 §4).
+    fn installPiece(borrow mut this, id: u64, index: usize, bytes: Slice<u8>) -> Result<bool, StoreError> {
+        let ok = match (this.state.coded.get(borrow id)) {
+            Some(c) => index < c.crcs.length && (bytes.length as u64) == c.pieceLength && Crc32c.of(
+                bytes,
+            ) == c.crcs[index],
+            null => false,
+        };
+        if (!ok) { return Ok(false); }
+        this.writePiece(id, index, bytes)?;
+        return Ok(true);
+    }
+
+    /// The coded extents whose piece this replica holds but lacks: (id, index), at most `most`. A whole copy here
+    /// gives its piece first (a crash between applying a Coded record and writing the piece leaves one). A damaged
+    /// piece is scrub's to find and remove (ADR-0064 §6), and then it is missing.
+    fn missingPieces(borrow mut this, most: usize) -> Result<Vector<[u64; 2]>, StoreError> {
+        var lacking = Vector<[u64; 2]>.create();
+        for (i in 0..this.state.coded.length()) {
+            if (lacking.length >= most) { break; }
+            let c = this.state.coded.valueAt(i);
+            match (c.pieceOf(this.nodeId)) {
+                Some(p) => {
+                    if (!this.pieceFileOk(c, p)?) { lacking.push([c.id, p as u64])?; }
+                }
+                null => {}
+            }
+        }
+        var out = Vector<[u64; 2]>.create();
+        for (x in lacking.view()) {
+            if (!this.pieceFromWhole(x[0])?) { out.push(x)?; }
+        }
+        return Ok(out);
+    }
+
+    /// The coded extents reads wanted decoded since the last call (ADR-0064 §5).
+    fn takeWanted(borrow this) -> Vector<u64> {
+        var out = Vector<u64>.create();
+        while (true) {
+            match (this.wanted.tryRecv()) {
+                Some(id) => {
+                    var seen = false;
+                    for (x in out.view()) {
+                        if (x == id) { seen = true; }
+                    }
+                    if (!seen && out.push(id).isErr()) { break; }
+                }
+                null => { break; }
+            }
+        }
+        return out;
+    }
+
+    /// A coded extent decoded again (ADR-0064 §5): written as an extent file, with its header, synced.
+    fn installDecoded(borrow mut this, id: u64, data: Slice<u8>) -> Result<void, StoreError> {
+        var bytes = Vector<u8>.create();
+        bytes.resize(EXTENT_HEADER_LEN as usize, 0)?;
+        bytes.viewMut().writeLE(0, EXTENT_MAGIC);
+        bytes.viewMut().writeLE(8, id);
+        bytes.viewMut().writeLE(16, Clock.unixMillis());
+        let crc = Crc32c.of(bytes.view()[0..60]);
+        bytes.viewMut().writeLE(60, crc);
+        bytes.extend(data)?;
+        this.installExtent(id, bytes.view())?;
+        let _ = this.wholeCoded.put(id, true)?;
+        return Ok();
+    }
+
+    /// Extents of live versions, not coded, whose files are older than `before` (Unix ms): what a leader codes, at
+    /// most `most`. Each call looks at up to CODING_SCAN_KEYS keys after the last call's, from the first again at the
+    /// end, so a large index costs a little each time.
+    fn codingCandidates(borrow mut this, before: i64, most: usize) -> Result<Vector<ExtentRef>, StoreError> {
+        var out = Vector<ExtentRef>.create();
+        var cursor = match (this.codingAfter.asBorrow()) {
+            Some(k) => this.state.index.seekAfter(k),
+            null => this.state.index.first(),
+        };
+        var seen = 0usize;
+        var last: IndexKey? = null;
+        while (out.length < most && seen < CODING_SCAN_KEYS) {
+            let i = match (cursor) {
+                Some(c) => c,
+                null => { break; }
+            };
+            cursor = this.state.index.next(i);
+            seen += 1;
+            last = copyIndexKey(this.state.index.keyAt(i))?;
+            var slot = this.state.index.slotAt(i);
+            while (slot != NO_VERSION_SLOT) {
+                let v = this.state.index.versionAt(slot);
+                slot = this.state.index.olderOf(slot);
+                for (e in 0..v.extents.length) {
+                    let ext = v.extents[e];
+                    if (this.state.coded.contains(borrow ext.id) || out.length >= most) { continue; }
+                    var dup = false;
+                    for (o in out.view()) {
+                        if (o.id == ext.id) { dup = true; }
+                    }
+                    if (dup) { continue; }
+                    let path = extentPath(this.extentDir.view(), ext.id)?;
+                    match (Fs.modifiedMillis(path.view())) {
+                        Ok(m) => {
+                            if (m < before) { out.push(ext)?; }
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        this.codingAfter = if (cursor.isNull()) null else last;
+        return Ok(out);
+    }
+
+    /// Stages the Coded record of extent `ext` for the voters `holders` (a leader's, ADR-0064 §3): its whole copy
+    /// read and checked against the manifest, its pieces made for their CRCs. Whether it was staged.
+    fn stageCoded(borrow mut this, ext: ExtentRef, holders: Slice<u32>) -> Result<bool, StoreError> {
+        let id = ext.id;
+        let n = holders.length;
+        if (n < 3 || this.state.coded.contains(borrow id)) { return Ok(false); }
+        let m = (n - 1) / 2;
+        let k = n - m;
+        let bytes = match (this.extentFileBytes(id)) {
+            Ok(b) => b,
+            Err(_) => { return Ok(false); }
+        };
+        let h = bytes.view();
+        if ((h.length as u64) != EXTENT_HEADER_LEN + ext.length || h.readLE<u64>(0) != EXTENT_MAGIC ||
+            h.readLE<u64>(8) != id || Crc32c.of(h[EXTENT_HEADER_LEN as usize..h.length]) != ext.crc) {
+            return Ok(false);
+        }
+        let data = bytes.view()[EXTENT_HEADER_LEN as usize..bytes.length];
+        let rs = match (ReedSolomon.create(k, m)?) {
+            Some(r) => r,
+            null => { return Ok(false); }
+        };
+        var crcs = Vector<u32>.create();
+        for (i in 0..n) { crcs.push(Crc32c.of(rs.piece(data, i)?.view()))?; }
+        var holderIds = Vector<u32>.create();
+        for (x in holders) { holderIds.push(x)?; }
+        let c = CodedExtent {
+            id: id,
+            k: truncate<u32>(k),
+            m: truncate<u32>(m),
+            length: data.length as u64,
+            pieceLength: rs.pieceLength(data.length as u64),
+            holders: holderIds,
+            crcs: crcs,
+        };
+        var meta = Vector<u8>.create();
+        encodeCoded(mut meta, borrow c)?;
+        let empty = Vector<u8>.create();
+        let _ = this.stageRecord(RecordType.Coded, meta.view(), empty.view())?;
+        return Ok(true);
+    }
+
+    /// Removes whole copies of coded extents decoded for reads an hour or more ago (ADR-0064 §5), and ones a crash or
+    /// a pinned read left; this replica's piece is written from the copy first when it lacks it.
+    fn sweepDecoded(borrow mut this, now: i64) -> Result<usize, StoreError> {
+        var gone = Vector<u64>.create();
+        for (i in 0..this.wholeCoded.length()) {
+            let id: u64 = this.wholeCoded.keyAt(i);
+            if (this.pins.isPinned(id)) { continue; }
+            let path = extentPath(this.extentDir.view(), id)?;
+            match (Fs.modifiedMillis(path.view())) {
+                Ok(m) => {
+                    if (m < now - DECODED_KEEP_MS) { gone.push(id)?; }
+                }
+                Err(_) => { gone.push(id)?; }
+            }
+        }
+        for (id in gone.view()) {
+            let _ = this.pieceFromWhole(id)?;
+            removeExtent(this.extentDir.view(), id);
+            let _ = this.wholeCoded.remove(borrow id);
+        }
+        return Ok(gone.length);
+    }
+
+    /// After scrub found coded extent `id` damaged (ADR-0064 §6): its whole copy, a decoded one, removed, and this
+    /// replica's piece when it is the damaged part; fetching rebuilds or decodes what is then missing.
+    fn quarantineCoded(borrow mut this, id: u64) -> Result<void, StoreError> {
+        if (this.pieceDamaged(id)?) {
+            let c = match (this.state.coded.get(borrow id)) {
+                Some(c) => c,
+                null => { return Ok(); }
+            };
+            match (c.pieceOf(this.nodeId)) {
+                Some(i) => {
+                    let path = piecePath(this.extentDir.view(), id, i)?;
+                    let _ = Fs.unlink(path.view());
+                }
+                null => {}
+            }
+        }
+        if (!this.pins.isPinned(id)) {
+            removeExtent(this.extentDir.view(), id);
+            let _ = this.wholeCoded.remove(borrow id);
+        }
+        return Ok();
+    }
+
     // --- Scrub and repair (ADR-0063) ---
 
     /// Checks up to `max` live versions after `after` (from the first when null): an inline version's record read and
@@ -1705,7 +2082,9 @@ struct ObjectStore {
                 }
                 for (e in 0..v.extents.length) {
                     let want = borrow v.extents[e];
-                    let whole = match (this.extentFileBytes(want.id)) {
+                    // A coded extent: this replica's piece checked too (ADR-0064 §6).
+                    let pieceHurt = this.state.coded.contains(borrow want.id) && this.pieceDamaged(want.id)?;
+                    let whole = !pieceHurt && match (this.extentFileBytes(want.id)) {
                         Ok(b) => {
                             let h = b.view();
                             (h.length as u64) == EXTENT_HEADER_LEN + want.length && h.readLE<u64>(0) == EXTENT_MAGIC &&
@@ -1733,7 +2112,13 @@ struct ObjectStore {
     }
 
     /// Removes a damaged extent's file, so that fetching what is missing puts a good copy back (ADR-0063 §2).
-    fn quarantineExtent(borrow mut this, id: u64) { removeExtent(this.extentDir.view(), id); }
+    fn quarantineExtent(borrow mut this, id: u64) {
+        if (this.state.coded.contains(borrow id)) {
+            let _ = this.quarantineCoded(id);
+            return;
+        }
+        removeExtent(this.extentDir.view(), id);
+    }
 
     /// This replica's live record of a version, whole and verified, when it is inline and `length` bytes long: what
     /// another replica asks for to repair its own (ADR-0063 §3).
@@ -1853,6 +2238,8 @@ struct ObjectStore {
                 let v = this.state.index.versionAt(slot);
                 for (k in 0..v.extents.length) {
                     let e = borrow v.extents[k];
+                    // A coded extent is pieces, not a missing file (ADR-0064).
+                    if (this.state.coded.contains(borrow e.id)) { continue; }
                     if (!present.contains(borrow e.id) && !seen.contains(borrow e.id)) {
                         let _ = seen.put(e.id, true)?;
                         missing.push(ExtentRef { id: e.id, length: e.length, crc: e.crc })?;
@@ -2014,6 +2401,14 @@ struct ObjectStore {
         report: borrow mut VerifyReport,
     ) -> Result<void, StoreError> {
         report.objects += 1;
+        // A coded extent's bytes are pieces on several nodes: the cluster's scrub checks them (ADR-0064 §6).
+        for (e in 0..v.extents.length) {
+            if (this.state.coded.contains(
+                borrow v.extents[e].id,
+            ) && !this.wholeCoded.contains(borrow v.extents[e].id)) {
+                return Ok();
+            }
+        }
         var fault: VerifyFault? = null;
         match (this.openVersionUnpinned(v, 0, 0xFFFFFFFFFFFFFFFF)) {
             Ok(reader) => {
@@ -2074,6 +2469,19 @@ struct ObjectStore {
         this.reapAbandoned();
         for (i in 0..this.state.deadExtents.length) {
             let ext = this.state.deadExtents[i];
+            // A coded extent's pieces and coding go with it (ADR-0064).
+            let _ = this.wholeCoded.remove(borrow ext.id);
+            match (this.state.coded.remove(borrow ext.id)) {
+                Some(c) => {
+                    for (p in 0..c.holders.length) {
+                        match (piecePath(this.extentDir.view(), ext.id, p)) {
+                            Ok(path) => { let _ = Fs.unlink(path.view()); }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                null => {}
+            }
             if (!this.pins.isPinned(ext.id)) {
                 removeExtent(this.extentDir.view(), ext.id);
                 continue;
@@ -2284,6 +2692,14 @@ struct ObjectStore {
             )?;
             this.publishedNext = lsn + 1;
             this.appliedTerm = h.term;
+            let coded = match (h.kind) {
+                RecordType.Coded => decodeCoded(record[RECORD_HEADER_LEN..metaEnd]),
+                _ => null,
+            };
+            match (coded) {
+                Some(c) => { this.convertToPiece(c.id)?; }
+                null => {}
+            }
             lsn += 1;
         }
         this.journal.markCommitted(to);
@@ -3206,6 +3622,9 @@ struct ObjectStore {
         let end = if (to > stored) stored else to;
         let start = if (from > end) end else from;
         if (v.extents.length != 0) {
+            // A coded extent with no whole copy here: wanted, decoded by the node, and the client's retry reads it
+            // (ADR-0064 §5).
+            if (this.wantsDecode(v)) { return Err(StoreError.ExtentWanted); }
             var refs = Vector<ExtentRef>.create();
             refs.extend(v.extents.view())?;
             let extents = ExtentReader.create(this.extentDir.view(), refs, start, end)?;
@@ -3269,6 +3688,7 @@ struct ObjectStore {
             bytes.extend(record.view()[payloadStart + start as usize..payloadStart + end as usize])?;
             return Ok(ObjectReader { inline: bytes, inlinePosition: 0, extents: null, pin: null });
         }
+        if (this.wantsDecode(v)) { return Err(StoreError.ExtentWanted); }
         var refs = Vector<ExtentRef>.create();
         refs.extend(v.extents.view())?;
         let reader = ExtentReader.create(this.extentDir.view(), refs, start, end)?;

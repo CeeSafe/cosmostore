@@ -1,0 +1,280 @@
+// Coded extents on a cluster (ADR-0064): the shard's leader codes cold extents (a Coded record, which every replica
+// applies by turning its whole copy into its piece); a replica that lacks its piece rebuilds it from k others; a read
+// that wants a coded extent this replica has no whole copy of gets one decoded from k pieces.
+import web_core;
+import web_http;
+import web_client;
+
+const CODE_EVERY_MS: u64 = 2000;
+
+/// `POST /piece-fetch`: u32 shard, u64 extent id, u32 piece index; the piece, checked, or null.
+async fn pieceFor(shared: borrow NodeShared, body: Slice<u8>) -> Vector<u8>? {
+    if (body.length != 16) { return null; }
+    let shard = body.readLE<u32>(0);
+    let id = body.readLE<u64>(4);
+    let index = body.readLE<u32>(12) as usize;
+    let at = match (slotOf(shared, shard)) {
+        Some(i) => i,
+        null => { return null; }
+    };
+    var storeGuard = match (await shared.slots[at].store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return null; }
+    };
+    let st = storeGuard.data();
+    return match (await Async.blocking(() => st.pieceBytes(id, index))) {
+        Ok(p) => p,
+        Err(_) => null,
+    };
+}
+
+/// k pieces of `c`: this replica's own if it has it, then the other holders', each checked by its holder against the
+/// record's CRC. Null when fewer than k answer.
+async fn gatherPieces(
+    shared: borrow NodeShared,
+    slot: borrow ShardSlot,
+    c: borrow CodedExtent,
+) -> Result<CodedPieces?, NodeFault> {
+    var got = CodedPieces { indexes: Vector<usize>.create(), pieces: Vector<Vector<u8>>.create() };
+    let k = c.k as usize;
+    {
+        var storeGuard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = storeGuard.data();
+        match (c.pieceOf(shared.id)) {
+            Some(i) => {
+                let id = c.id;
+                match (await Async.blocking(() => st.pieceBytes(id, i))) {
+                    Ok(Some(p)) => {
+                        if (got.indexes.push(i).isErr() || got.pieces.push(p).isErr()) {
+                            return Err(NodeFault.OutOfMemory);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            null => {}
+        }
+    }
+    for (i in 0..c.holders.length) {
+        if (got.indexes.length >= k) { break; }
+        let holder = c.holders[i];
+        if (holder == shared.id) { continue; }
+        let url = match (peerUrl(shared, holder, "/piece-fetch")) {
+            Some(u) => u,
+            null => { continue; }
+        };
+        var body = Vector<u8>.create();
+        if (body.pushLE(slot.shard).isErr() || body.pushLE(c.id).isErr() || body.pushLE(truncate<u32>(i)).isErr()) {
+            return Err(NodeFault.OutOfMemory);
+        }
+        let empty = RawMessage.empty();
+        let reply = match (await exchangeRaw(shared, url.view(), borrow empty, Some("/piece-fetch"), body.view())) {
+            Ok(r) => r,
+            Err(_) => { continue; }
+        };
+        if (reply.status != 200 || (reply.body.length as u64) != c.pieceLength || Crc32c.of(
+            reply.body.view(),
+        ) != c.crcs[i]) {
+            continue;
+        }
+        if (got.indexes.push(i).isErr() || got.pieces.push(reply.body).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    if (got.indexes.length < k) { return Ok(null); }
+    return Ok(Some(got));
+}
+
+struct CodedPieces {
+    indexes: Vector<usize>;
+    pieces: Vector<Vector<u8>>;
+}
+
+/// `c`'s bytes, decoded from k pieces; null when they cannot be had.
+async fn decodePieces(
+    shared: borrow NodeShared,
+    slot: borrow ShardSlot,
+    c: borrow CodedExtent,
+) -> Result<Vector<u8>?, NodeFault> {
+    let got = match (await gatherPieces(shared, slot, c)?) {
+        Some(g) => g,
+        null => { return Ok(null); }
+    };
+    let rs = match (ReedSolomon.create(c.k as usize, c.m as usize)) {
+        Ok(Some(r)) => r,
+        _ => { return Ok(null); }
+    };
+    return match (rs.decode(got.indexes.view(), got.pieces.view(), c.length)) {
+        Ok(d) => Ok(d),
+        Err(_) => Err(NodeFault.OutOfMemory),
+    };
+}
+
+/// Part of fetching what is missing (ADR-0064 §4, §5): this replica's missing pieces rebuilt, and the coded extents
+/// reads wanted decoded into whole copies.
+async fn repairCoded(shared: borrow NodeShared, slot: borrow ShardSlot) -> Result<void, NodeFault> {
+    var missing = Vector<[u64; 2]>.create();
+    var wanted = Vector<u64>.create();
+    {
+        var storeGuard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = storeGuard.data();
+        missing = match (await Async.blocking(() => st.missingPieces(16))) {
+            Ok(m) => m,
+            Err(_) => Vector<[u64; 2]>.create(),
+        };
+        wanted = st.takeWanted();
+    }
+    for (k in 0..missing.length) {
+        let id = missing[k][0];
+        let index = missing[k][1] as usize;
+        let c = match (await codedOfSlot(slot, id)?) {
+            Some(c) => c,
+            null => { continue; }
+        };
+        let data = match (await decodePieces(shared, slot, borrow c)?) {
+            Some(d) => d,
+            null => { continue; }
+        };
+        let rs = match (ReedSolomon.create(c.k as usize, c.m as usize)) {
+            Ok(Some(r)) => r,
+            _ => { continue; }
+        };
+        let piece = match (rs.piece(data.view(), index)) {
+            Ok(p) => p,
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        };
+        var storeGuard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = storeGuard.data();
+        let _ = await Async.blocking(() => st.installPiece(id, index, piece.view()));
+    }
+    for (w in 0..wanted.length) {
+        let id = wanted[w];
+        let c = match (await codedOfSlot(slot, id)?) {
+            Some(c) => c,
+            null => { continue; }
+        };
+        let data = match (await decodePieces(shared, slot, borrow c)?) {
+            Some(d) => d,
+            null => { continue; }
+        };
+        var storeGuard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = storeGuard.data();
+        if ((await Async.blocking(() => st.installDecoded(id, data.view()))).isOk()) {
+            let _ = shared.extentsFetched.fetchAdd(1);
+        }
+    }
+    return Ok();
+}
+
+async fn codedOfSlot(slot: borrow ShardSlot, id: u64) -> Result<CodedExtent?, NodeFault> {
+    var storeGuard = match (await slot.store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    return match (storeGuard.data().codedOf(id)) {
+        Ok(c) => Ok(c),
+        Err(_) => Err(NodeFault.OutOfMemory),
+    };
+}
+
+fn stageCodedWrite(
+    r: borrow mut ShardReplica,
+    st: borrow mut ObjectStore,
+    ext: ExtentRef,
+    holders: Slice<u32>,
+) -> Result<u64?, StoreError> {
+    let before = r.beginWrite(st)?;
+    match (st.stageCoded(ext, holders)) {
+        Ok(true) => {}
+        Ok(false) => { return Ok(null); }
+        Err(e) => {
+            let _ = st.truncateEntries(before);
+            return Err(e);
+        }
+    }
+    let index = r.finishWrite(st, before)?;
+    return Ok(index);
+}
+
+/// Every CODE_EVERY_MS, each shard this node leads with three voters or more codes its extents older than
+/// `codeAfterMs`, one Coded record at a time, behind the shard's write gate (ADR-0064 §1, §3).
+async fn codeForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
+    while (true) {
+        if (!(await frontPause(CODE_EVERY_MS))) { return Err(NodeFault.Net); }
+        for (i in 0..shared.slots.length) {
+            let slot = borrow shared.slots[i];
+            if (slot.shard == GROUP0_SHARD || slot.failed.load() != 0) { continue; }
+            let voters = await votersOfSlot(slot)?;
+            if (voters.length < 3 || !(await viewOf(slot))?.leads) { continue; }
+            var candidates = Vector<ExtentRef>.create();
+            {
+                var storeGuard = match (await slot.store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NodeFault.Net); }
+                };
+                let st = storeGuard.data();
+                let before = Clock.unixMillis() - truncate<i64>(shared.codeAfterMs);
+                candidates = match (await Async.blocking(() => st.codingCandidates(before, 4))) {
+                    Ok(c) => c,
+                    Err(_) => Vector<ExtentRef>.create(),
+                };
+            }
+            for (k in 0..candidates.length) {
+                let ext = candidates[k];
+                var gate = match (await slot.gate.lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NodeFault.Net); }
+                };
+                let _held = gate.data();
+                var index = 0u64;
+                var term = 0u64;
+                {
+                    var guard = match (await slot.replica.lock()) {
+                        Ok(g) => g,
+                        Err(_) => { return Err(NodeFault.Net); }
+                    };
+                    let r = guard.data();
+                    if (!r.core.isLeader()) { break; }
+                    term = r.core.term;
+                    var storeGuard = match (await slot.store.get().lock()) {
+                        Ok(g) => g,
+                        Err(_) => { return Err(NodeFault.Net); }
+                    };
+                    let st = storeGuard.data();
+                    let staged = await Async.blocking(() => stageCodedWrite(r, st, ext, voters.view()));
+                    index = match (staged) {
+                        Ok(Some(x)) => x,
+                        _ => { continue; }
+                    };
+                    let drained = await Async.blocking(() => drainOf(r, st));
+                    match (drained) {
+                        Ok(out) => { await enqueue(shared, slot.shard, out)?; }
+                        Err(e) => {
+                            await noteFailure(slot, e);
+                            break;
+                        }
+                    }
+                }
+                // Wait for it, so the next write's checks see it (ADR-0060 §5).
+                var waited = 0u64;
+                while (waited < FRONT_COMMIT_MS) {
+                    let v = await viewOf(slot)?;
+                    if (v.applied >= index || !v.leads || v.term != term) { break; }
+                    if (!(await frontPause(FRONT_POLL_MS))) { break; }
+                    waited += FRONT_POLL_MS;
+                }
+            }
+        }
+    }
+    return Ok();
+}

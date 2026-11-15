@@ -54,6 +54,8 @@ struct NodeShared {
     /// Scrub (ADR-0063): how often a pass starts, and what passes found: versions checked, damage found, records
     /// repaired from a replica, extents fetched (a damaged one removed comes back this way, as a missing one does).
     scrubEveryMs: u64;
+    /// How old an extent must be before its shard's leader codes it (ADR-0064 §1).
+    codeAfterMs: u64;
     scrubChecked: AtomicU64;
     scrubDamaged: AtomicU64;
     scrubRepaired: AtomicU64;
@@ -110,6 +112,7 @@ fn openNode(
     id: u32,
     credentials: Arc<CredentialSets>?,
     scrubEveryMs: u64,
+    codeAfterMs: u64,
 ) -> Result<NodeParts, String> {
     if (file.node(id).isNull()) { return Err(textOf("this node is not in the cluster file")); }
     var slots = Vector<ShardSlot>.create();
@@ -239,6 +242,7 @@ fn openNode(
         ticks: AtomicU64.create(0),
         readIds: AtomicU64.create(0),
         scrubEveryMs: scrubEveryMs,
+        codeAfterMs: codeAfterMs,
         scrubChecked: AtomicU64.create(0),
         scrubDamaged: AtomicU64.create(0),
         scrubRepaired: AtomicU64.create(0),
@@ -604,7 +608,9 @@ impl Handler<NodeApp> for PeerHandler {
         let isActive = request.method() == Method.Post && path == "/cluster/active";
         // A replica's own copy of a record another replica found damaged (ADR-0063 §3).
         let isRecord = request.method() == Method.Post && path == "/record-fetch";
-        if (!isRaft && !isStatus && !isS3 && !isExtent && !isFetch && !isActive && !isRecord) {
+        // A piece of a coded extent another replica needs (ADR-0064 §4, §5).
+        let isPiece = request.method() == Method.Post && path == "/piece-fetch";
+        if (!isRaft && !isStatus && !isS3 && !isExtent && !isFetch && !isActive && !isRecord && !isPiece) {
             return await exchange.send(Status.notFound(), "".bytes());
         }
         // The body, whole: a batch is decoded only once its signature holds.
@@ -647,6 +653,12 @@ impl Handler<NodeApp> for PeerHandler {
         if (checked.isErr()) {
             let _ = shared.refused.fetchAdd(1);
             return await exchange.send(statusOf(403), "".bytes());
+        }
+        if (isPiece) {
+            return match (await pieceFor(shared, body.view())) {
+                Some(bytes) => await exchange.send(Status.ok(), bytes.view()),
+                null => await exchange.send(Status.notFound(), "".bytes()),
+            };
         }
         if (isRecord) {
             return match (await recordFor(shared, body.view())) {
@@ -836,6 +848,7 @@ async fn runNode(
         s.spawn(async () => await fetchForever(node));
         s.spawn(async () => await rebalanceForever(node));
         s.spawn(async () => await scrubForever(node));
+        s.spawn(async () => await codeForever(node));
         for (i in 0..peers) {
             let at = i;
             s.spawn(async move () => await sendForever(node, at));
@@ -899,7 +912,8 @@ fn nodeCommand() -> i32 {
         null => {}
     }
     let scrubMs = (args.scrubSeconds ?? 3600) * 1000;
-    let parts = match (openNode(dir, loaded.file, loaded.secret, id, credentials, scrubMs)) {
+    let codeMs = (args.codeAfterSeconds ?? 86400) * 1000;
+    let parts = match (openNode(dir, loaded.file, loaded.secret, id, credentials, scrubMs, codeMs)) {
         Ok(s) => s,
         Err(message) => {
             Console.writeErrorLine(message.view());
@@ -940,6 +954,9 @@ fn nodeCommand() -> i32 {
     } && match (peerHandler()) {
         Ok(h) => server.router().post("/record-fetch", h).isOk(),
         Err(_) => false,
+    } && match (peerHandler()) {
+        Ok(h) => server.router().post("/piece-fetch", h).isOk(),
+        Err(_) => false,
     };
     if (!routed || !routedS3) { return 1; }
     var front: Server<FrontApp>? = null;
@@ -962,8 +979,9 @@ struct ClusterArguments {
     /// S3 on the node (ADR-0060): where its front listens, and the credentials file.
     listen: String?;
     credentials: String?;
-    /// How often a scrub pass starts (ADR-0063 §1).
+    /// How often a scrub pass starts (ADR-0063 §1); how old an extent is before it is coded (ADR-0064 §1).
     scrubSeconds: u64?;
+    codeAfterSeconds: u64?;
 }
 
 fn clusterArguments(from: usize) -> ClusterArguments? {
@@ -972,6 +990,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var listen: String? = null;
     var credentials: String? = null;
     var scrubSeconds: u64? = null;
+    var codeAfterSeconds: u64? = null;
     var at = from;
     while (true) {
         let option = match (Process.argument(at)) {
@@ -989,6 +1008,9 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             listen = Some(textOf(value));
         } else if (option == "--credentials") {
             credentials = Some(textOf(value));
+        } else if (option == "--code-after-seconds") {
+            codeAfterSeconds = value.parseInt<u64>();
+            if (codeAfterSeconds.isNull()) { return null; }
         } else if (option == "--scrub-seconds") {
             scrubSeconds = value.parseInt<u64>();
             if (scrubSeconds.isNull() || (scrubSeconds ?? 0) == 0) { return null; }
@@ -1005,6 +1027,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 listen: listen,
                 credentials: credentials,
                 scrubSeconds: scrubSeconds,
+                codeAfterSeconds: codeAfterSeconds,
             }),
             null => null,
         },
