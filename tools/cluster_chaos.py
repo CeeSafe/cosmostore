@@ -4,7 +4,7 @@ keys, faults injected (kills, pauses, partitions), and the history checked for l
 
 usage:
   cluster_chaos.py [--binary out/cosmostore] [--nodes 3] [--seconds 60] [--seed N] [--port-base 20100]
-                   [--clients 6] [--keys 4] [--keep] [--disk-loss]
+                   [--clients 6] [--keys 4] [--keep] [--disk-loss | --racks 3]
                    [--nemesis kill,pause,isolate,isolate-leader,split,bridge,skew,lose-disk]
   cluster_chaos.py --self-test          the checker against histories whose answer is known
 
@@ -423,8 +423,11 @@ class Proxy:
 
 
 class Cluster:
-    def __init__(self, binary, work, nodes, base, standby=()):
+    def __init__(self, binary, work, nodes, base, standby=(), racks=0):
         self.standby = set(standby)
+        # With racks, node i is in rack (i - 1) % racks: nodes 1 to `racks` in different ones (group 0's three).
+        self.racks = racks
+        self.extra = []  # more options for every node
         self.skew = {}
         self.binary = binary
         self.work = work
@@ -440,10 +443,17 @@ class Cluster:
         lines = ["cluster 0dd0ee0ff0aa0bb0", "shards 2", "replicas 3", f"secret-file {work}/cluster.key"]
         domains = "abcdefgh"
         for i in range(1, nodes + 1):
-            lines.append(f"node {i} peer=127.0.0.1:{self.proxy_port(i)} domain={domains[i - 1]}"
+            domain = domains[(i - 1) % racks] if racks else domains[i - 1]
+            lines.append(f"node {i} peer=127.0.0.1:{self.proxy_port(i)} domain={domain}"
                          + (" standby" if i in self.standby else ""))
         with open(self.conf, "w") as f:
             f.write("\n".join(lines) + "\n")
+
+    def rack_of(self, i):
+        return (i - 1) % self.racks if self.racks else i - 1
+
+    def rack(self, r):
+        return [i for i in range(1, self.n + 1) if self.rack_of(i) == r]
 
     def proxy_port(self, i):
         return self.base + i
@@ -462,7 +472,7 @@ class Cluster:
             [self.binary, "node", d, "--cluster-file", self.conf, "--node", str(i),
              "--listen", str(self.s3_port(i)), "--credentials", os.path.join(self.work, "credentials"),
              "--peer-listen", str(self.peer_port(i))]
-            + (["--clock-skew-ms", str(self.skew[i])] if self.skew.get(i) else []),
+            + (["--clock-skew-ms", str(self.skew[i])] if self.skew.get(i) else []) + self.extra,
             stdout=log, stderr=log)
         log.close()  # the child has its own; ours would leak a descriptor a start
         self.paused.discard(i)
@@ -570,19 +580,20 @@ def value_of(body):
     return body.split(b"\n", 1)[0].decode(errors="replace")
 
 
-def client(cid, cluster, history, keys, rng, stop, counts):
+def client(cid, cluster, history, keys, rng, stop, counts, large=0.1, cold=()):
     seq = 0
     while not stop.is_set():
         node = rng.randint(1, cluster.n)
         port = cluster.s3_port(node)
-        key = rng.choice(keys)
-        roll = rng.random()
+        key = rng.choice(list(keys) + list(cold))
+        # A cold key is only read: written once at the start, so that its extent is coded and its reads decode.
+        roll = 0.6 if key in cold else rng.random()
         start = history.now()
         if roll < 0.40:
             seq += 1
             tag = f"c{cid}-{seq}"
             body = (tag + "\n").encode()
-            if rng.random() < 0.1:
+            if rng.random() < large:
                 body += os.urandom(300_000)  # an extent's worth (ADR-0061)
             status, _ = s3(port, "PUT", f"/{BUCKET}/{key}", body=body)
             outcome = "ok" if status == 200 else ("fail" if status is not None and 400 <= status < 500 else "unknown")
@@ -614,7 +625,8 @@ def client(cid, cluster, history, keys, rng, stop, counts):
                 counts["lists without an answer"] = counts.get("lists without an answer", 0) + 1
 
 
-NEMESES = ["kill", "pause", "isolate", "isolate-leader", "split", "bridge", "skew", "lose-disk"]
+NEMESES = ["kill", "pause", "isolate", "isolate-leader", "split", "bridge", "skew", "lose-disk", "rack-kill",
+           "rack-isolate"]
 # The default: every fault but the two that need a mode of their own (`--disk-loss`) or that only cut a node off.
 DEFAULT_NEMESES = ["kill", "pause", "isolate", "isolate-leader", "split", "bridge", "skew"]
 
@@ -685,7 +697,25 @@ def faults(cluster, proxy, rng, stop, log, history, kinds, failures):
             kind = "isolate"
         hold = rng.uniform(2.0, 6.0)
         t = history.now()
-        if kind == "kill":
+        if kind in ("rack-kill", "rack-isolate"):
+            # A rack (a failure domain, ADR-0059 §2) at once: its nodes killed, or cut off from the other racks while
+            # they still see each other. Each shard has one replica a rack, so the others keep a majority.
+            r = rng.randrange(cluster.racks or cluster.n)
+            members = cluster.rack(r)
+            if kind == "rack-kill":
+                log.append(f"{t:8.3f} kill rack {r} (nodes {members})")
+                for i in members:
+                    cluster.kill(i)
+                stop.wait(hold)
+                for i in members:
+                    cluster.start(i)
+            else:
+                log.append(f"{t:8.3f} isolate rack {r} (nodes {members})")
+                proxy.partition({frozenset((a, b)) for a in members for b in range(1, cluster.n + 1)
+                                 if b not in members})
+                stop.wait(hold)
+                proxy.partition(set())
+        elif kind == "kill":
             log.append(f"{t:8.3f} kill node {victim}")
             cluster.kill(victim)
             stop.wait(hold)
@@ -757,10 +787,13 @@ def run(args):
     seed = args.seed if args.seed is not None else random.randrange(1 << 30)
     if args.disk_loss:
         args.nodes = max(args.nodes, 4)
+    if args.racks:
+        args.nodes = max(args.nodes, 2 * args.racks)
     print(f"chaos: seed {seed}, {args.nodes} nodes, {args.seconds} s, work {work}")
     rng = random.Random(seed)
     if args.nemesis is None:
-        args.nemesis = ",".join(DEFAULT_NEMESES + (["lose-disk"] if args.disk_loss else []))
+        args.nemesis = ",".join(DEFAULT_NEMESES + (["lose-disk"] if args.disk_loss else [])
+                                + (["rack-kill", "rack-isolate"] if args.racks else []))
     for k in args.nemesis.split(","):
         if k not in NEMESES:
             print(f"chaos: no fault called {k}; there are {', '.join(NEMESES)}")
@@ -768,7 +801,13 @@ def run(args):
     nodes = max(args.nodes, 4) if args.disk_loss else args.nodes
     args.nodes = nodes
     standby = list(range(4, nodes + 1)) if args.disk_loss else []
-    cluster = Cluster(binary, work, nodes, args.port_base, standby)
+    if args.racks and args.disk_loss:
+        print("chaos: --racks and --disk-loss are runs of their own")
+        return False
+    cluster = Cluster(binary, work, nodes, args.port_base, standby, args.racks)
+    if args.code_after_seconds:
+        # Large values coded within seconds (ADR-0064): reads of them decode, under the faults.
+        cluster.extra += ["--code-after-seconds", str(args.code_after_seconds)]
     proxy = Proxy({i: (cluster.proxy_port(i), cluster.peer_port(i)) for i in range(1, args.nodes + 1)})
     proxy.start()
     ok = False
@@ -800,12 +839,27 @@ def run(args):
                 time.sleep(0.5)
         keys = [f"k{i}" for i in range(args.keys)]
         history = History()
+        cold = []
+        if args.code_after_seconds:
+            for c in range(2):
+                key = f"kcold{c}"
+                tag = f"cold-{c}"
+                start = history.now()
+                status, _ = s3(cluster.s3_port(1), "PUT", f"/{BUCKET}/{key}",
+                               body=(tag + "\n").encode() + os.urandom(1_000_000), timeout=30)
+                if status != 200:
+                    print(f"FAIL the cold key {key} could not be written: {status}")
+                    return False
+                history.add(dict(c=-2, n=1, op="put", key=key, value=tag, start=start, end=history.now(),
+                                 outcome="ok", status=status))
+                cold.append(key)
         counts = {}
         failures = []
         stop = threading.Event()
         log = []
         threads = [threading.Thread(target=client,
-                                    args=(c, cluster, history, keys, random.Random(seed * 31 + c), stop, counts))
+                                    args=(c, cluster, history, keys, random.Random(seed * 31 + c), stop, counts,
+                                          0.5 if args.code_after_seconds else 0.1, cold))
                    for c in range(args.clients)]
         threads.append(threading.Thread(target=nemesis, args=(cluster, proxy, rng, stop, log, history, args.nemesis.split(","), failures)))
         for t in threads:
@@ -822,6 +876,7 @@ def run(args):
             cluster.resume(i)
         log.append(f"{history.now():8.3f} all healed")
         unanswered = []
+        keys = keys + cold
         for k in keys:
             for i in range(1, args.nodes + 1):
                 answered = False
@@ -920,6 +975,10 @@ def main():
     p.add_argument("--keys", type=int, default=4)
     p.add_argument("--keep", action="store_true")
     p.add_argument("--nemesis", default=None, help="the faults to choose from, by name, with commas")
+    p.add_argument("--code-after-seconds", type=int, default=0,
+                   help="passed to the nodes: the large values' extents are coded this soon (ADR-0064)")
+    p.add_argument("--racks", type=int, default=0,
+                   help="nodes in this many racks (at least two nodes each), and rack-kill and rack-isolate among the faults")
     p.add_argument("--disk-loss", action="store_true",
                    help="four nodes or more, the fourth on joined from standby, and lose-disk among the faults")
     p.add_argument("--self-test", action="store_true")

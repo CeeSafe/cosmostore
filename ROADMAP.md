@@ -2575,3 +2575,16 @@ Browser form uploads with a SigV4 POST policy.
   sees a loss through.
 - **Next:** M6's exit review.
 
+### 15 Nov 2026: M6's exit review (`docs/m6-exit-review.md`)
+
+- **Rack faults and coded data added to the harness first:** `--racks 3` (six nodes, one replica a rack; `rack-kill`,
+  `rack-isolate`) and `--code-after-seconds` (extents coded within seconds, two cold keys read throughout, decoded
+  under the faults). Linearizable on macOS and in two 5-minute rack runs on binfadel (6 rack kills, 15 rack
+  isolations).
+- **The verdict:** for what M6 built, the exit holds: under node, disk, rack, network and clock failures, alone and
+  together, on three machines and two operating systems, acknowledged writes survived and no read or listing was
+  stale. Known gaps are written down there: group 0 fixed on the first three nodes, an empty-directory restart
+  undetected, sealed packs not coded, listings checked per key, writes not idempotent across a lost answer, one
+  machine per run.
+- **Next:** the owner's call on closing M6 with those gaps, or taking the first two first.
+

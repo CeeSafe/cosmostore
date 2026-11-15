@@ -95,6 +95,11 @@ and b built under the owner's standing go-ahead.
   million, so it never showed there.) It closes what it opens now, keeps accepting through an error, and a crash of
   its fault thread fails the run; under `ulimit -n 1024` on macOS the old one fails as on Linux and the new one
   passes.
+- **Racks and coded data** (for the exit review, `docs/m6-exit-review.md`): `--racks 3` runs six nodes in three
+  racks of two (one replica of each shard a rack, group 0's three in three racks), with `rack-kill` (a rack's nodes
+  killed) and `rack-isolate` (a rack cut off from the rest) among the faults; `--code-after-seconds 2` passes the
+  coding age to the nodes and writes two large keys once, which clients only read, so that reads decode coded
+  extents while the faults go on. Both linearizable, on macOS and on binfadel.
 - **Diagnostics it brought:** `cluster-status` prints `# peer <ticks> <sent> <unsent> <received> <refused>`; a node
   logs a tick that took over a second, with where the time went; a replica stopped fails a run; a final read slow
   to come back saves every node's status and, on macOS, a `sample` of its threads, in the work directory.
