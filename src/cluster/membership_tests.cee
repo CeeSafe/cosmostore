@@ -1,0 +1,361 @@
+// A group changing its members in one process (ADR-0062, M6 item 6 slice b): four replicas, three of them the group;
+// writes go on while the leader adds the fourth as a learner (it catches up, by a snapshot once the leader has
+// compacted), promotes it, and removes a voter. Under the fault sweeps of ADR-0004, after each fault the replicas are
+// opened again from their disks and must elect, hold the configuration that was committed (or the one being
+// committed), agree among the members, and hold every acknowledged write.
+
+fn memberConfig(id: u32, seed: u64) -> ReplicaConfig {
+    var voters = Vector<u32>.create();
+    for (v in 1..4) { voters.push(truncate<u32>(v))!; }
+    var store = storeConfig();
+    store.journal = JournalConfig { segmentTargetBytes: 1024, maxBatchBytes: 65536, shardId: 0, raftLog: true };
+    store.checkpointEveryBytes = 1024;
+    return ReplicaConfig {
+        id: id,
+        voters: voters,
+        electionTicks: 10,
+        heartbeatTicks: 2,
+        maxAppendEntries: 4,
+        seed: seed,
+        store: store,
+    };
+}
+
+struct MemberCluster {
+    replicas: Vector<TestReplica>;
+    net: Vector<RaftMessage>;
+}
+
+fn memberDir(root: StringView, id: u32) -> String {
+    var d = String.create();
+    d.append(root)!;
+    d.append(if (id == 1) "/m1" else if (id == 2) "/m2" else if (id == 3) "/m3" else "/m4")!;
+    return d;
+}
+
+fn memberOpen(root: StringView, seed: u64) -> Result<MemberCluster, StoreError> {
+    var replicas = Vector<TestReplica>.create();
+    for (i in 1..5) {
+        let id = truncate<u32>(i);
+        let dir = memberDir(root, id);
+        sio(Fs.ensureDirectory(dir.view()))?;
+        replicas.push(TestReplica.open(dir.view(), memberConfig(id, seed))?)?;
+    }
+    return Ok(MemberCluster { replicas: replicas, net: Vector<RaftMessage>.create() });
+}
+
+/// Every message delivered, every replica ticked and its upkeep run.
+fn memberStep(c: borrow mut MemberCluster) -> Result<void, StoreError> {
+    var due = replace(mut c.net, Vector<RaftMessage>.create());
+    reverseMessages(mut due);
+    while (true) {
+        let m = match (due.pop()) {
+            Some(m) => m,
+            null => { break; }
+        };
+        let at = (m.to - 1) as usize;
+        if (at >= c.replicas.length) { continue; }
+        c.replicas[at].step(m)?;
+        c.replicas[at].drain(mut c.net)?;
+    }
+    for (i in 0..c.replicas.length) {
+        c.replicas[i].tick()?;
+        c.replicas[i].drain(mut c.net)?;
+        c.replicas[i].maintain()?;
+        c.replicas[i].drain(mut c.net)?;
+    }
+    return Ok();
+}
+
+fn memberLeader(c: borrow MemberCluster) -> usize? {
+    for (i in 0..c.replicas.length) {
+        if (c.replicas[i].isLeader() && c.replicas[i].beginWrite().isOk()) { return Some(i); }
+    }
+    return null;
+}
+
+fn awaitMemberLeader(c: borrow mut MemberCluster) -> Result<usize?, StoreError> {
+    for (round in 0..400) {
+        match (memberLeader(c)) {
+            Some(i) => { return Ok(Some(i)); }
+            null => {}
+        }
+        memberStep(c)?;
+    }
+    return Ok(null);
+}
+
+/// What the workload had acknowledged: the keys' values, the group's voters, and what it was doing when it stopped.
+struct MemberModel {
+    bucket: bool;
+    values: [u64; 5];
+    voters: Vector<u32>;
+    /// A write or a change in flight: either outcome may be found.
+    pendingKey: usize;
+    pendingValue: u64;
+    hasPending: bool;
+    pendingVoters: Vector<u32>?;
+    acked: u64;
+}
+
+fn emptyMemberModel() -> MemberModel {
+    var voters = Vector<u32>.create();
+    for (v in 1..4) { voters.push(truncate<u32>(v))!; }
+    return MemberModel {
+        bucket: false,
+        values: [0u64; 5],
+        voters: voters,
+        pendingKey: 0,
+        pendingValue: 0,
+        hasPending: false,
+        pendingVoters: null,
+        acked: 0,
+    };
+}
+
+fn putPadded(r: borrow mut TestReplica, k: usize, value: u64) -> Result<void, StoreError> {
+    var data = Vector<u8>.create();
+    data.resize(200, 3)?;
+    data.viewMut().writeLE(0, value);
+    let _ = r.store.putObject("bkt", clusterKey(k), "text/plain", data.view(), PutCondition.None)?;
+    return Ok();
+}
+
+/// Waits for `index` to be applied on the replica at `at`; false if it does not come.
+fn awaitApplied(c: borrow mut MemberCluster, at: usize, index: u64) -> Result<bool, StoreError> {
+    for (round in 0..400) {
+        if (c.replicas[at].isApplied(index)) { return Ok(true); }
+        memberStep(c)?;
+    }
+    return Ok(false);
+}
+
+/// Proposes `voters` and `learners` as the group at its leader, and waits for the change to be applied there.
+fn changeGroup(
+    c: borrow mut MemberCluster,
+    model: borrow mut MemberModel,
+    voters: Slice<u32>,
+    learners: Slice<u32>,
+) -> Result<bool, StoreError> {
+    let at = match (awaitMemberLeader(c)?) {
+        Some(i) => i,
+        null => { return Ok(false); }
+    };
+    var m = RaftMembership.of(voters)?;
+    for (i in 0..learners.length) { m.learners.push(learners[i])?; }
+    var v = Vector<u32>.create();
+    for (i in 0..voters.length) { v.push(voters[i])?; }
+    model.pendingVoters = Some(v);
+    let index = match (c.replicas[at].replica.changeMembers(m)?) {
+        Some(i) => i,
+        null => { return Ok(false); }
+    };
+    c.replicas[at].drain(mut c.net)?;
+    if (!(awaitApplied(c, at, index)?)) { return Ok(false); }
+    model.voters.clear();
+    for (i in 0..voters.length) { model.voters.push(voters[i])?; }
+    model.pendingVoters = null;
+    return Ok(true);
+}
+
+fn memberWrite(c: borrow mut MemberCluster, model: borrow mut MemberModel, op: usize) -> Result<bool, StoreError> {
+    let at = match (awaitMemberLeader(c)?) {
+        Some(i) => i,
+        null => { return Ok(false); }
+    };
+    let before = c.replicas[at].beginWrite()?;
+    let k = op % CLUSTER_KEYS;
+    let value = 500 + (op as u64);
+    model.hasPending = true;
+    model.pendingKey = k;
+    model.pendingValue = value;
+    putPadded(mut c.replicas[at], k, value)?;
+    let index = c.replicas[at].finishWrite(before)? ?? before;
+    if (!(awaitApplied(c, at, index)?)) { return Ok(false); }
+    model.values[k] = value;
+    model.hasPending = false;
+    model.acked += 1;
+    return Ok(true);
+}
+
+/// The bucket, eight writes, node 4 added as a learner, caught up and promoted, a voter removed, eight more writes.
+fn runMembership(c: borrow mut MemberCluster, model: borrow mut MemberModel) -> Result<void, StoreError> {
+    let at = match (awaitMemberLeader(c)?) {
+        Some(i) => i,
+        null => { return Ok(); }
+    };
+    let before = c.replicas[at].beginWrite()?;
+    c.replicas[at].store.createBucket("bkt")?;
+    let index = c.replicas[at].finishWrite(before)? ?? before;
+    if (!(awaitApplied(c, at, index)?)) { return Ok(); }
+    model.bucket = true;
+    for (op in 0usize..8usize) {
+        if (!(memberWrite(c, model, op)?)) { return Ok(); }
+    }
+    // Node 4 joins as a learner, and catches up (a snapshot: the leader has compacted).
+    let three = [1u32, 2, 3];
+    let four = [4u32];
+    if (!(changeGroup(c, model, three[..], four[..])?)) { return Ok(); }
+    let leaderAt = match (awaitMemberLeader(c)?) {
+        Some(i) => i,
+        null => { return Ok(); }
+    };
+    let target = c.replicas[leaderAt].store.appliedIndex();
+    if (!(awaitApplied(c, 3, target)?)) { return Ok(); }
+    // Promoted; then the lowest voter that does not lead is removed.
+    let all = [1u32, 2, 3, 4];
+    let none = Vector<u32>.create();
+    if (!(changeGroup(c, model, all[..], none.view())?)) { return Ok(); }
+    let leaderNow = match (awaitMemberLeader(c)?) {
+        Some(i) => truncate<u32>(i + 1),
+        null => { return Ok(); }
+    };
+    var rest = Vector<u32>.create();
+    var removed = false;
+    for (v in all) {
+        if (!removed && v != leaderNow) {
+            removed = true;
+            continue;
+        }
+        rest.push(v)?;
+    }
+    if (!(changeGroup(c, model, rest.view(), none.view())?)) { return Ok(); }
+    for (op in 8usize..16usize) {
+        if (!(memberWrite(c, model, op)?)) { return Ok(); }
+    }
+    return Ok();
+}
+
+/// Returns the snapshots node 4 installed.
+fn membershipWorkload(root: StringView, seed: u64, model: borrow mut MemberModel) -> u64 {
+    var c = match (memberOpen(root, seed)) {
+        Ok(c) => c,
+        Err(_) => { return 0; }
+    };
+    // An error is a fault the sweep injected: the workload stops there, as a power cut would stop it.
+    let _ = runMembership(mut c, model);
+    return c.replicas[3].replica.snapshotsInstalled;
+}
+
+fn sameVoters(a: Slice<u32>, b: Slice<u32>) -> bool {
+    if (a.length != b.length) { return false; }
+    for (x in a) {
+        var found = false;
+        for (y in b) {
+            if (x == y) { found = true; }
+        }
+        if (!found) { return false; }
+    }
+    return true;
+}
+
+fn checkMembership(root: StringView, seed: u64, model: borrow MemberModel) -> Result<void, TestFailure> {
+    var c = match (memberOpen(root, seed + 1)) {
+        Ok(c) => c,
+        Err(_) => { return Err(TestFailure.create("a replica did not open after the fault")); }
+    };
+    let at = match (awaitMemberLeader(mut c)) {
+        Ok(Some(i)) => i,
+        _ => { return Err(TestFailure.create("no leader after the fault")); }
+    };
+    let target = c.replicas[at].store.lastEntry();
+    for (round in 0..400) {
+        var done = true;
+        for (i in 0..c.replicas.length) {
+            let id = truncate<u32>(i + 1);
+            let m = borrow c.replicas[at].replica.core.members;
+            if ((m.isVoter(id) || m.isLearner(id)) && !c.replicas[i].isApplied(target)) { done = false; }
+        }
+        if (done) { break; }
+        match (memberStep(mut c)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("a replica failed while catching up")); }
+        }
+    }
+    let leaderAt = match (memberLeader(borrow c)) {
+        Some(i) => i,
+        null => at,
+    };
+    let members = c.replicas[leaderAt].replica.core.members.copy()!;
+    let ok = sameVoters(members.voters.view(), model.voters.view()) || match (borrow model.pendingVoters) {
+        Some(p) => sameVoters(members.voters.view(), p.view()),
+        null => false,
+    };
+    Check.isTrue(ok, "the group is neither the one committed nor the one being committed")?;
+    // Every member holds the leader's configuration: one told of it in an entry, in a snapshot, or on recovery.
+    for (i in 0..c.replicas.length) {
+        let id = truncate<u32>(i + 1);
+        if (!members.isVoter(id) && !members.isLearner(id)) { continue; }
+        let theirs = borrow c.replicas[i].replica.core.members;
+        Check.isTrue(sameVoters(theirs.voters.view(), members.voters.view()), "a member does not know the group")?;
+    }
+    let bucket = c.replicas[leaderAt].store.bucketExists("bkt")!;
+    Check.isTrue(bucket || !model.bucket, "an acknowledged bucket was lost")?;
+    for (k in 0..CLUSTER_KEYS) {
+        let held = heldValuePadded(borrow c.replicas[leaderAt], k)?;
+        let fine = held == model.values[k] || (model.hasPending && model.pendingKey == k && held == model.pendingValue);
+        Check.isTrue(fine, "the leader holds neither the acknowledged value nor the one being written")?;
+        for (i in 0..c.replicas.length) {
+            let id = truncate<u32>(i + 1);
+            if (!members.isVoter(id) && !members.isLearner(id)) { continue; }
+            Check.equalU64(held, heldValuePadded(borrow c.replicas[i], k)?)?;
+        }
+    }
+    return Ok();
+}
+
+@test
+fn membershipGrowsAndShrinks() -> Result<void, TestFailure> {
+    let root = scratchDirectory("membership-clean");
+    var model = emptyMemberModel();
+    let snapshots = membershipWorkload(root.view(), 11, mut model);
+    Check.equalU64(16, model.acked)?;
+    Check.isTrue(snapshots >= 1, "node 4 caught up from a snapshot")?;
+    Check.equalU64(3, model.voters.length as u64)?;
+    Check.isTrue(
+        model.voters.view()[0] == 4 || model.voters.view()[1] == 4 || model.voters.view()[2] == 4,
+        "node 4 is a voter",
+    )?;
+    checkMembership(root.view(), 11, borrow model)?;
+    removeTree(root.view());
+    return Ok();
+}
+
+fn sweepMembership(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let root = scratchDirectory(name);
+    Faults.countOperations();
+    var clean = emptyMemberModel();
+    let _ = membershipWorkload(root.view(), 11, mut clean);
+    Faults.disarm();
+    Check.equalU64(16, clean.acked)?;
+    let points = Faults.seen();
+    // Every third operation, as the snapshot sweeps do.
+    var n = 1u64;
+    while (n <= points) {
+        removeTree(root.view());
+        Fs.ensureDirectory(root.view())!;
+        armMode(borrow mode, n);
+        var model = emptyMemberModel();
+        let _ = membershipWorkload(root.view(), 11, mut model);
+        Faults.disarm();
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(root.view())!;
+        }
+        checkMembership(root.view(), 11, borrow model)?;
+        n += 3;
+    }
+    removeTree(root.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn membershipFaultsOnce() -> Result<void, TestFailure> => sweepMembership("membership-once", SweepMode.Once);
+
+@test
+fn membershipFaultsTorn() -> Result<void, TestFailure> => sweepMembership("membership-torn", SweepMode.StickyTorn);
+
+@test
+fn membershipFaultsCrash() -> Result<void, TestFailure> => sweepMembership("membership-crash", SweepMode.Crash);

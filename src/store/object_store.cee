@@ -447,6 +447,9 @@ struct StoreState {
     completions: Vector<Completion>;
     /// The events of applied records still to be delivered (ADR-0048).
     outbox: Outbox;
+    /// A cluster shard's replica: the configuration of the last Config record applied, as its bytes (ADR-0062 §2);
+    /// empty before one.
+    membership: Vector<u8>;
 
     fn create() -> StoreState => StoreState {
         index: VersionIndex.create(),
@@ -460,6 +463,7 @@ struct StoreState {
         uploads: HashMap<UploadKey, Upload>.create(),
         completions: Vector<Completion>.create(),
         outbox: Outbox.create(),
+        membership: Vector<u8>.create(),
     };
 
     /// Queues the event of a record just applied, if its bucket has a notification rule for it (ADR-0048 §2).
@@ -930,6 +934,11 @@ fn applyRecord(
             dropBucketUploads(state, name.view())?;
             state.removeBucket(name.view())?;
         }
+        RecordType.Config => {
+            state.membership.clear();
+            state.membership.extend(meta)?;
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
+        }
         _ => {
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
         }
@@ -1203,6 +1212,12 @@ const LIFECYCLE_BATCH: usize = 1000;
 /// Abandoned extents queued between reaps; more are left to the orphan sweep at open.
 const ABANDONED_CAPACITY: usize = 4096;
 
+/// A Config record found unapplied on recovery: its index and membership bytes.
+struct RecoveredConfig {
+    index: u64;
+    membership: Vector<u8>;
+}
+
 /// A snapshot bundle (ADR-0058 §9): u64 magic "CSSNAP01", u64 index, u64 term, u32 file count, then per file u16 name
 /// length, the name, u64 length, u32 CRC32C of the bytes, the bytes.
 const SNAPSHOT_MAGIC: u64 = 0x313050414E535343; // "CSSNAP01" in file order
@@ -1369,8 +1384,10 @@ struct ObjectStore {
     /// persisted when committed to the journal, and applied only when Raft commits them (`applyEntries`).
     private raft: bool;
     private term: u64;
-    /// The terms of the entries recovery found after the checkpoint, unapplied, for the replica's Raft core.
+    /// The terms of the entries recovery found after the checkpoint, unapplied, for the replica's Raft core; and the
+    /// Config records among them, as (index, membership bytes).
     private recoveredTerms: Vector<u64>;
+    private recoveredConfigs: Vector<RecoveredConfig>;
     /// The term of the last applied entry, and of the newest checkpoint's (a Raft log; 0 on a single node).
     private appliedTerm: u64;
     private checkpointTerm: u64;
@@ -1417,6 +1434,7 @@ struct ObjectStore {
         var failure: StoreError? = null;
         let raft = config.journal.raftLog;
         var recoveredTerms = Vector<u64>.create();
+        var recoveredConfigs = Vector<RecoveredConfig>.create();
         let journal = Journal.openFrom(dir, config.journal, start, (segment, offset, header, bytes) => {
             if (failure.isSome()) { return; }
             if (raft) {
@@ -1424,6 +1442,17 @@ struct ObjectStore {
                 match (recoveredTerms.push(header.term)) {
                     Ok() => {}
                     Err(e) => { failure = StoreError.OutOfMemory(e); }
+                }
+                let isConfig = match (header.kind) {
+                    RecordType.Config => true,
+                    _ => false,
+                };
+                if (isConfig) {
+                    var m = Vector<u8>.create();
+                    let metaEnd = RECORD_HEADER_LEN + header.metaLen as usize;
+                    let kept = m.extend(bytes[RECORD_HEADER_LEN..metaEnd]).isOk() &&
+                        recoveredConfigs.push(RecoveredConfig { index: header.lsn, membership: m }).isOk();
+                    if (!kept) { failure = StoreError.OutOfMemory(AllocError.OutOfMemory); }
                 }
                 return;
             }
@@ -1506,6 +1535,7 @@ struct ObjectStore {
             raft: raft,
             term: 0,
             recoveredTerms: recoveredTerms,
+            recoveredConfigs: recoveredConfigs,
             appliedTerm: startTerm,
             checkpointTerm: startTerm,
             counts: StoreCounters {
@@ -2013,6 +2043,21 @@ struct ObjectStore {
 
     /// The terms of the unapplied entries recovery found, once: for the replica's Raft core.
     fn takeRecoveredTerms(borrow mut this) -> Vector<u64> => replace(mut this.recoveredTerms, Vector<u64>.create());
+
+    /// The Config records among them, once (ADR-0062 §2).
+    fn takeRecoveredConfigs(borrow mut this) -> Vector<RecoveredConfig> =>
+        replace(mut this.recoveredConfigs, Vector<RecoveredConfig>.create());
+
+    /// The configuration of the last Config record applied (the checkpoint's, after an open), as its bytes.
+    fn membershipBytes(borrow this) -> Slice<u8> => this.state.membership.view();
+
+    /// A leader's configuration entry, staged as a Config record; `persistEntries` makes it durable.
+    fn appendConfig(borrow mut this, term: u64, membership: Slice<u8>) -> Result<void, StoreError> {
+        this.checkWritable()?;
+        let empty = Vector<u8>.create();
+        let _ = this.journal.stageEntry(RecordType.Config, term, membership, empty.view())?;
+        return Ok();
+    }
 
     /// The index the store's state is at: every entry up to it is applied.
     fn appliedIndex(borrow this) -> u64 => this.publishedNext - 1;

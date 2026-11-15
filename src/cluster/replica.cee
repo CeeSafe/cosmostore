@@ -56,14 +56,20 @@ struct ShardReplica {
         sio(Fs.ensureDirectory(current.view()))?;
         var store = ObjectStore.open(current.view(), storeConfig)?;
         let terms = store.takeRecoveredTerms();
-        // The core starts at the store's checkpoint, which holds every entry up to it.
+        let configs = store.takeRecoveredConfigs();
+        // The core starts at the store's checkpoint, which holds every entry up to it, and its configuration (or,
+        // before any Config record, the group the replica was made with: ADR-0062 §2).
         let snapIndex = store.checkpointIndex();
         let snapTerm = store.checkpointEntryTerm();
-        let core = RaftCore.restore(
+        let base = match (decodeMembership(store.membershipBytes())) {
+            Some(m) => m,
+            null => RaftMembership { voters: config.voters, learners: Vector<u32>.create() },
+        };
+        var core = RaftCore.restore(
             RaftConfig {
                 id: config.id,
-                voters: config.voters,
-                learners: Vector<u32>.create(),
+                voters: base.voters,
+                learners: base.learners,
                 electionTicks: config.electionTicks,
                 heartbeatTicks: config.heartbeatTicks,
                 maxAppendEntries: config.maxAppendEntries,
@@ -74,6 +80,13 @@ struct ShardReplica {
             snapTerm,
             terms,
         )?;
+        // The configuration entries after the checkpoint, in order: the last is in force (ADR-0062 §1).
+        for (k in 0..configs.length) {
+            match (decodeMembership(configs[k].membership.view())) {
+                Some(m) => { core.noteConfig(configs[k].index, m)?; }
+                null => { return Err(StoreError.BadMeta(0, configs[k].index)); }
+            }
+        }
         var d = String.create();
         d.append(dir)?;
         let replica = ShardReplica {
@@ -125,6 +138,11 @@ struct ShardReplica {
         var installed = ObjectStore.open(target.view(), this.storeConfig)?;
         let _ = installed.takeRecoveredTerms();
         if (installed.appliedIndex() != s.index) { return Err(StoreError.CheckpointCorrupt); }
+        // The configuration the snapshot's checkpoint holds.
+        match (decodeMembership(installed.membershipBytes())) {
+            Some(m) => { this.core.installMembership(m)?; }
+            null => {}
+        }
         *store = installed;
         removeStoreDirectory(old.view())?;
         this.snapshotsInstalled += 1;
@@ -132,6 +150,11 @@ struct ShardReplica {
     }
 
     fn isLeader(borrow this) -> bool => this.core.isLeader();
+
+    /// Proposes a change of the group (ADR-0062 §1): its entry's index, or null when the core refuses it.
+    fn changeMembers(borrow mut this, m: RaftMembership) -> Result<u64?, StoreError> {
+        return Ok(this.core.proposeConfig(m)?);
+    }
 
     /// Before a write: the index of the last entry, or NotLeader when this replica does not lead or an earlier write
     /// is not applied yet.
@@ -203,10 +226,18 @@ struct ShardReplica {
                         if (store.entryTerm(e.index)? == e.term) { continue; }
                         store.truncateEntries(e.index - 1)?;
                     }
-                    if (e.data.length == 0) {
+                    if (e.config) {
+                        // The leader's configuration entry, made by its core: a Config record.
+                        store.appendConfig(e.term, e.data.view())?;
+                    } else if (e.data.length == 0) {
                         store.appendNoop(e.term)?;
                     } else {
                         store.appendEntry(e.data.view())?;
+                        // Another leader's Config record: in force once persisted (ADR-0062 §1).
+                        match (configOfRecord(e.data.view())) {
+                            Some(m) => { this.core.noteConfig(e.index, m)?; }
+                            null => {}
+                        }
                     }
                     staged = true;
                 }
@@ -286,4 +317,20 @@ fn reverseMessages(v: borrow mut Vector<RaftMessage>) {
         i += 1;
         j -= 1;
     }
+}
+
+/// The configuration a Config record (whole, as a leader encoded it) holds; null for any other record.
+fn configOfRecord(record: Slice<u8>) -> RaftMembership? {
+    let h = match (decodeHeader(record)) {
+        Ok(h) => h,
+        Err(_) => { return null; }
+    };
+    let isConfig = match (h.kind) {
+        RecordType.Config => true,
+        _ => false,
+    };
+    if (!isConfig) { return null; }
+    let metaEnd = RECORD_HEADER_LEN + h.metaLen as usize;
+    if (metaEnd > record.length) { return null; }
+    return decodeMembership(record[RECORD_HEADER_LEN..metaEnd]);
 }

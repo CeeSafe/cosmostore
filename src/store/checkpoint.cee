@@ -14,7 +14,8 @@
 //  16 u64 lsn   24 u64 segment   32 u64 bucket count   40 u64 object count (versions, in format 6)   48 i64 created ms
 //  56 u32 upload count (format 2; reserved, 0, in format 1)   60 u32 crc32c of bytes 0..60
 // In format 15 (ADR-0058) 16 more header bytes follow: u64 the term of the entry at `lsn` (a cluster shard's Raft log;
-// 0 on a single node), u32 reserved (0), u32 crc32c of those 12. A Raft log's checkpoint does not seal: `segment` is
+// 0 on a single node), u32 reserved (0), u32 crc32c of those 12. In format 16 (ADR-0062) the reserved u32 is the length
+// of the group's configuration at `lsn` (0 for none), whose bytes follow, and then their u32 crc32c. A Raft log's checkpoint does not seal: `segment` is
 // the one holding entry lsn + 1, and recovery skips its records up to `lsn`.
 // Entries, buckets, then objects, then uploads, then events: u8 kind (1 bucket, 2 object, 3 upload, 4 event), u32
 // body length, body.
@@ -44,7 +45,7 @@ const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 15;
+const CHECKPOINT_FORMAT: u16 = 16;
 /// The header's extension in format 15: the term (ADR-0058).
 const CHECKPOINT_EXTENSION_LEN: usize = 16;
 const CHECKPOINT_BUCKET: u8 = 1;
@@ -312,9 +313,15 @@ fn beginCheckpointJob(
     );
     var extension = [0u8; 16];
     extension.writeLE(0, term);
-    extension.writeLE(8, 0u32);
+    extension.writeLE(8, truncate<u32>(state.membership.length));
     let extensionCrc = Crc32c.of(extension[0..12]);
     extension.writeLE(12, extensionCrc);
+    // The configuration, and its CRC (format 16).
+    var members = Vector<u8>.create();
+    if (state.membership.length > 0) {
+        members.extend(state.membership.view())?;
+        members.pushLE(Crc32c.of(state.membership.view()))?;
+    }
     match (file.writeAt(header[..], 0)) {
         Ok() => {}
         Err(e) => {
@@ -329,9 +336,18 @@ fn beginCheckpointJob(
             return Err(StoreError.Io(e));
         }
     }
+    if (members.length > 0) {
+        match (file.writeAt(members.view(), (CHECKPOINT_HEADER_LEN + CHECKPOINT_EXTENSION_LEN) as u64)) {
+            Ok() => {}
+            Err(e) => {
+                let _ = Fs.unlink(tmp.view());
+                return Err(StoreError.Io(e));
+            }
+        }
+    }
     var w = CheckpointWriter {
         file: file,
-        offset: (CHECKPOINT_HEADER_LEN + CHECKPOINT_EXTENSION_LEN) as u64,
+        offset: (CHECKPOINT_HEADER_LEN + CHECKPOINT_EXTENSION_LEN + members.length) as u64,
         buffer: Vector<u8>.create(),
         crc: Crc32c.create(),
         entries: 0,
@@ -671,11 +687,21 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
     let uploads = if (format >= 2) h.readLE<u32>(56) as u64 else 0;
     let events = if (format >= 11) h.readLE<u32>(12) as u64 else 0;
     var term = 0u64;
+    var mlen = 0usize;
+    var membership = Vector<u8>.create();
     if (format >= 15) {
         r.ensure(CHECKPOINT_EXTENSION_LEN)?;
         let x = r.take(CHECKPOINT_EXTENSION_LEN);
         if (x.readLE<u32>(12) != Crc32c.of(x[0..12])) { return Err(StoreError.CheckpointCorrupt); }
         term = x.readLE<u64>(0);
+        mlen = x.readLE<u32>(8) as usize;
+    }
+    if (format >= 16 && mlen > 0) {
+        if (mlen > 4096) { return Err(StoreError.CheckpointCorrupt); }
+        r.ensure(mlen + 4)?;
+        let m = r.take(mlen + 4);
+        if (m.readLE<u32>(mlen) != Crc32c.of(m[0..mlen])) { return Err(StoreError.CheckpointCorrupt); }
+        membership.extend(m[0..mlen])?;
     }
     var state = StoreState.create();
     var crc = Crc32c.create();
@@ -778,5 +804,6 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
         return Err(StoreError.CheckpointCorrupt);
     }
     if (!r.atEnd()) { return Err(StoreError.CheckpointCorrupt); }
+    state.membership = membership;
     return Ok(LoadedCheckpoint { lsn: lsn, term: term, segment: segment, state: state });
 }

@@ -2445,3 +2445,21 @@ Browser form uploads with a SigV4 POST policy.
   two changes at once now fails the faulty simulation on a real safety violation.
 - **Next:** slice b, the `Config` record, checkpoints and snapshots with their membership, a replica added and one
   removed in the in-process sweeps.
+
+### 15 Nov 2026: M6 item 6, slice b: configurations in the journal, checkpoints and snapshots (ADR-0062)
+
+- **The `Config` record** (type 16): its meta the membership. A leader's core makes a configuration entry; its host
+  writes it as a Config record; a follower's host tells its core of a Config record when it persists it; recovery
+  hands the core the Config records after the checkpoint, in order. The store keeps the last applied membership.
+- **Checkpoint format 16:** the header extension's reserved u32 (always 0 in format 15) is the membership's length,
+  which follows with its CRC32C, so a replica starting from a checkpoint, or installing a snapshot, starts in the
+  group's configuration. Formats 1 to 15 load as before.
+- **Tests** (`src/cluster/membership_tests.cee`): four replicas in one process, three the group, with checkpoints and
+  compaction on: writes; node 4 added as a learner, caught up by a snapshot, promoted; a voter removed; writes. After
+  a reopen the members agree with the leader's configuration (the committed one, or the one in flight) and on every
+  key. Sweeps of every third I/O operation, once, torn, crash. Without telling a follower of Config records, the three
+  sweeps fail; with checkpoints written without their membership, all four tests do. (The first run of that check did
+  not compile, on `own`, a reserved word, which a filtered grep hid: the mutants' results only counted once they
+  printed a pass count.)
+- **Next:** slice c, group 0, the placement and the rebalancer, the commands, and a node added to and removed from a
+  running cluster.
