@@ -2558,3 +2558,20 @@ Browser form uploads with a SigV4 POST policy.
 - The owner: "I accept ADRS: ADR-0062 to ADR-0065 as recommended." Membership and placement (0062), scrub, repair
   and rolling restarts (0063), erasure-coded extents (0064) and the chaos harness (0065) are accepted as built.
 
+### 15 Nov 2026: M6 item 9: long chaos runs on Linux (binfadel, alghobashi)
+
+- **Where:** binfadel (Ubuntu 24.04, Xeon E-2236), built there with ceesafec 0.45.0; alghobashi (Debian 13, 8 cores,
+  the owner's production services on it: our binary copied in, nothing installed, run at `nice 10` in a scratch
+  directory). The Mac mini was not available.
+- **First runs found a harness bug, not a cluster one:** every history linearizable, but after a few minutes the whole
+  cluster stopped answering. The proxy never closed its sockets and each node start leaked a log handle; at Linux's
+  1024 descriptors the harness's accept threads ended and its fault thread crashed with a node down. Fixed (it closes
+  what it opens, keeps accepting through errors, fails a run when its fault thread crashes); under `ulimit -n 1024`
+  on macOS the old harness fails the same way and the new one passes.
+- **Then, of commit 9331752 (5 min a run, every fault):** binfadel 5 of 5 three-node runs and 2 of 2 five-node runs,
+  alghobashi 4 of 4 three-node runs, and 4 disk-loss runs (up to nine losses each): every history linearizable,
+  every key answered through every node after the heal; about 3,800 to 4,600 operations and 48 to 93 faults a run.
+  One disk-loss run failed on a loss begun half a second before the run's end, which the harness gave up on: it now
+  sees a loss through.
+- **Next:** M6's exit review.
+

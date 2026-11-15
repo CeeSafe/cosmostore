@@ -88,6 +88,13 @@ and b built under the owner's standing go-ahead.
 - **Slice b:** under clock skew alone (twelve skews from −100 s to +95 s in a minute) and under disk loss (four
   nodes, every fault, node 4's disk lost and recovered from three to nine times a run while it held replicas), the
   histories are linearizable.
+- **On Linux, a bug of the harness's own:** the first runs on binfadel and alghobashi (five-minute runs, 1024
+  descriptors a process) lost the whole cluster's answers after a few minutes, every history still linearizable. The
+  proxy shut its connections down but never closed them, and node logs were opened at each start and never closed;
+  out of descriptors, its accept threads ended and its fault thread crashed with a node left down. (macOS allowed a
+  million, so it never showed there.) It closes what it opens now, keeps accepting through an error, and a crash of
+  its fault thread fails the run; under `ulimit -n 1024` on macOS the old one fails as on Linux and the new one
+  passes.
 - **Diagnostics it brought:** `cluster-status` prints `# peer <ticks> <sent> <unsent> <received> <refused>`; a node
   logs a tick that took over a second, with where the time went; a replica stopped fails a run; a final read slow
   to come back saves every node's status and, on macOS, a `sample` of its threads, in the work directory.

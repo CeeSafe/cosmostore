@@ -274,15 +274,16 @@ def s3(port, method, path, query="", body=b"", timeout=4.0):
     """(status, body), or (None, reason) when no answer came."""
     host = f"127.0.0.1:{port}"
     headers = authorize(method, host, path, query, {}, body)
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
         c.request(method, path + ("?" + query if query else ""), body=body, headers=headers)
         r = c.getresponse()
         data = r.read()
-        c.close()
         return r.status, data
     except (OSError, http.client.HTTPException) as e:
         return None, str(e)
+    finally:
+        c.close()
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -341,7 +342,12 @@ class Proxy:
             try:
                 down, _ = s.accept()
             except OSError:
-                return
+                if self.stopping:
+                    return
+                # Out of descriptors, or a connection reset before it was taken: the port stays open (a proxy that
+                # stopped taking connections would look like a cluster that stopped answering).
+                time.sleep(0.05)
+                continue
             threading.Thread(target=self._serve, args=(down, node, real), daemon=True).start()
 
     def _serve(self, down, node, real):
@@ -376,12 +382,24 @@ class Proxy:
                 up.close()
                 return
             self.conns.append((sender, node, down, up))
+        entry = (sender, node, down, up)
         try:
             up.sendall(head)
         except OSError:
             pass
-        threading.Thread(target=self._pipe, args=(up, down), daemon=True).start()
+        back = threading.Thread(target=self._pipe, args=(up, down), daemon=True)
+        back.start()
         self._pipe(down, up)
+        back.join()
+        # Both ways done: the sockets closed and forgotten, so that a long run does not run out of descriptors.
+        with self.lock:
+            if entry in self.conns:
+                self.conns.remove(entry)
+        for x in (down, up):
+            try:
+                x.close()
+            except OSError:
+                pass
 
     @staticmethod
     def _pipe(a, b):
@@ -446,6 +464,7 @@ class Cluster:
              "--peer-listen", str(self.peer_port(i))]
             + (["--clock-skew-ms", str(self.skew[i])] if self.skew.get(i) else []),
             stdout=log, stderr=log)
+        log.close()  # the child has its own; ours would leak a descriptor a start
         self.paused.discard(i)
 
     def kill(self, i):
@@ -608,8 +627,10 @@ def lose_disk(cluster, victim, stop, log, history):
     cluster.kill(victim)
     if not cluster.operator("cluster-leave", victim):
         log.append(f"{history.now():8.3f}   cluster-leave {victim} did not answer")
+    # A loss begun is seen through, even if the run's time is up meanwhile: a node left half out is the harness's
+    # doing, not the cluster's.
     deadline = time.time() + 90
-    while time.time() < deadline and not stop.is_set() and cluster.holders_of(victim) > 0:
+    while time.time() < deadline and cluster.holders_of(victim) > 0:
         time.sleep(0.5)
     left = cluster.holders_of(victim) == 0
     log.append(f"{history.now():8.3f}   node {victim} {'out of every shard' if left else 'STILL in a shard'}")
@@ -624,13 +645,22 @@ def lose_disk(cluster, victim, stop, log, history):
     log.append(f"{history.now():8.3f}   node {victim} wiped, started again and joined")
     # Shards back on it before anything else happens, so that the next loss loses something.
     deadline = time.time() + 90
-    while time.time() < deadline and not stop.is_set() and cluster.holders_of(victim) == 0:
+    while time.time() < deadline and cluster.holders_of(victim) == 0:
         time.sleep(0.5)
     log.append(f"{history.now():8.3f}   node {victim} holds replicas of {cluster.holders_of(victim)} shards again")
-    return stop.is_set() or cluster.holders_of(victim) > 0
+    return cluster.holders_of(victim) > 0
 
 
 def nemesis(cluster, proxy, rng, stop, log, history, kinds, failures):
+    """The faults, one at a time; a crash of the harness's own is a failure of the run, not a quiet end of faults."""
+    try:
+        faults(cluster, proxy, rng, stop, log, history, kinds, failures)
+    except Exception as e:  # noqa: BLE001 - any failure here must fail the run
+        failures.append(f"the fault thread crashed: {e!r}")
+        proxy.partition(set())
+
+
+def faults(cluster, proxy, rng, stop, log, history, kinds, failures):
     others = lambda i: [j for j in range(1, cluster.n + 1) if j != i]
     while not stop.is_set():
         if stop.wait(rng.uniform(1.0, 3.0)):
