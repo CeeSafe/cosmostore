@@ -57,7 +57,7 @@ status() { "$BIN" cluster-status --cluster-file cluster.conf --node "$1" 2>/dev/
 for n in 1 2 3; do start "$n"; done
 # Every shard has a leader.
 for i in $(seq 1 100); do
-    leaders=$(status 1 | awk '$4 != 0' | wc -l | tr -d ' ')
+    leaders=$(status 1 | awk '$1 != 65535 && $4 != 0' | wc -l | tr -d ' ')
     [ "$leaders" = "8" ] && break
     pause 0.2
 done
@@ -97,7 +97,7 @@ check "the delete seen through node 3" "$(code 3 s3api head-object --bucket alph
 # Large objects: extents pushed to a majority before their records are proposed (ADR-0061). A follower of alpha's shard
 # is down while they are written, so it must fetch them when it comes back.
 md5of() { md5 -q "$1" 2>/dev/null || md5sum "$1" | cut -d' ' -f1; }
-aShard=$(status 1 | sort -k7 -n -r | head -1 | awk '{ print $1 }')
+aShard=$(status 1 | awk '$1 != 65535' | sort -k7 -n -r | head -1 | awk '{ print $1 }')
 aLeader=$(status 1 | awk -v s="$aShard" '$1 == s { print $4 }')
 down=$(( aLeader % 3 + 1 ))
 up=$(( down % 3 + 1 ))
@@ -127,7 +127,7 @@ check "node $down back: it fetched the extents it missed" "$(extents "$down")" "
 
 # The leader of alpha's shard goes down; the others go on.
 # Find alpha's shard by asking every node's status for the shard that has applied the most entries.
-alphaShard=$(status 1 | sort -k7 -n -r | head -1 | awk '{ print $1 }')
+alphaShard=$(status 1 | awk '$1 != 65535' | sort -k7 -n -r | head -1 | awk '{ print $1 }')
 leader=$(status 1 | awk -v s="$alphaShard" '$1 == s { print $4 }')
 kill -9 "${PIDS[$leader]}" 2>/dev/null
 wait "${PIDS[$leader]}" 2>/dev/null

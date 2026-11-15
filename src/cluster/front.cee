@@ -425,10 +425,9 @@ async fn pushExtents(shared: borrow NodeShared, slot: borrow ShardSlot) -> Resul
         }
     }
     if (ids.length == 0) { return Ok(true); }
-    let placed = match (shared.file.placement(slot.shard)) {
-        Ok(p) => p,
-        Err(_) => { return Err(NodeFault.OutOfMemory); }
-    };
+    // The shard's group as it is now (ADR-0062): its voters count for the majority, its learners get them too.
+    let placed = await shardGroupOf(slot)?;
+    let votersOf = await votersOfSlot(slot)?;
     let held = AtomicU64.create(1); // this replica's
     let heldRef = borrow held;
     let shard = slot.shard;
@@ -444,7 +443,37 @@ async fn pushExtents(shared: borrow NodeShared, slot: borrow ShardSlot) -> Resul
             });
         }
     });
-    return Ok(held.load() >= (placed.length as u64) / 2 + 1);
+    // A majority of the voters, this one counting if it votes.
+    return Ok(held.load() >= (votersOf.length as u64) / 2 + 1);
+}
+
+/// The shard's group as this replica knows it: its voters and learners.
+async fn shardGroupOf(slot: borrow ShardSlot) -> Result<Vector<u32>, NodeFault> {
+    var guard = match (await slot.replica.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let m = borrow guard.data().core.members;
+    var out = Vector<u32>.create();
+    for (v in m.voters.view()) {
+        if (out.push(v).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    for (l in m.learners.view()) {
+        if (out.push(l).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    return Ok(out);
+}
+
+async fn votersOfSlot(slot: borrow ShardSlot) -> Result<Vector<u32>, NodeFault> {
+    var guard = match (await slot.replica.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    var out = Vector<u32>.create();
+    for (v in guard.data().core.members.voters.view()) {
+        if (out.push(v).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    return Ok(out);
 }
 
 /// Pushes every extent to node `peer`; whether it took them all.
@@ -530,7 +559,7 @@ async fn fetchForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
 }
 
 async fn fetchExtent(shared: borrow NodeShared, slot: borrow ShardSlot, want: borrow ExtentRef) {
-    let placed = match (shared.file.placement(slot.shard)) {
+    let placed = match (await shardGroupOf(slot)) {
         Ok(p) => p,
         Err(_) => { return; }
     };
@@ -686,6 +715,11 @@ async fn routeRequest(shared: borrow NodeShared, shard: u32, raw: borrow RawMess
                     if (answer.status != 421) { return Ok(answer); }
                 } else if (leader != 0) {
                     target = leader;
+                } else {
+                    // No leader heard of (a replica not in the shard's group): ask the roster's nodes in turn.
+                    let n = borrow shared.file.nodes[turn % shared.file.nodes.length];
+                    turn += 1;
+                    if (n.id != shared.id) { target = n.id; }
                 }
             }
             null => {

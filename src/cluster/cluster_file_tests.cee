@@ -500,3 +500,49 @@ fn peerRequestsAreSignedAndChecked() -> Result<void, TestFailure> {
     )?;
     return Ok();
 }
+
+@test
+fn clusterRosterAndStandby() -> Result<void, TestFailure> {
+    // A standby node is in the roster, not active when the cluster begins, and holds no shard until it is active.
+    let f = parseClusterFile("""
+        cluster 0123456789abcdef
+        shards 8
+        replicas 3
+        secret-file k
+        node 1 peer=127.0.0.1:1 domain=a
+        node 2 peer=127.0.0.1:2 domain=b
+        node 3 peer=127.0.0.1:3 domain=c
+        node 4 peer=127.0.0.1:4 domain=d standby
+        """)!;
+    Check.equalU64(4, f.nodes.length as u64)?;
+    Check.isTrue(f.node(4)!.standby, "node 4 waits")?;
+    let initial = f.initialActive()!;
+    Check.equalU64(3, initial.length as u64)?;
+    for (s in 0u32..8u32) {
+        let p = f.placement(s)!;
+        Check.isTrue(p[0] != 4 && p[1] != 4 && p[2] != 4, "a standby node holds nothing at first")?;
+    }
+    // Once active it takes some shards, and three replicas stay three; a node gone holds none.
+    let all = [1u32, 2, 3, 4];
+    var onFour = 0;
+    for (s in 0u32..8u32) {
+        let p = f.placementAmong(s, all[..])!;
+        Check.equalU64(3, p.length as u64)?;
+        if (p[0] == 4 || p[1] == 4 || p[2] == 4) { onFour += 1; }
+    }
+    Check.isTrue(onFour > 0, "node 4 takes shards when active")?;
+    let without = [2u32, 3, 4];
+    for (s in 0u32..8u32) {
+        let p = f.placementAmong(s, without[..])!;
+        Check.isTrue(p[0] != 1 && p[1] != 1 && p[2] != 1, "a node that left holds nothing")?;
+    }
+    Check.isTrue(
+        faultOf("cluster 0000000000000001\nshards 4\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a standby").isSome(),
+        "no node active",
+    )?;
+    Check.isTrue(
+        faultOf("cluster 0000000000000001\nshards 4\nsecret-file k\nnode 1 peer=127.0.0.1:1 domain=a later").isSome(),
+        "an unknown fifth word",
+    )?;
+    return Ok();
+}

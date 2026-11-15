@@ -267,6 +267,12 @@ any object by multipart upload, and any object by ranged GETs (the AWS CLI's way
   nonce), so a node takes only messages its peers sent, but the traffic itself can be read. Run the peer ports on a
   private network until their TLS comes.
 - **Clocks** must be within a minute of each other: a request more than 60 s off is refused.
+- **Adding and removing nodes** (ADR-0062): put every node that may take part in the cluster file from the start,
+  the ones to add later with the word `standby`, and start them; `cosmostore cluster-join --cluster-file <file>
+  --node <id>` makes one active and shards move onto it, one replica at a time; `cluster-leave` moves every shard
+  off a node, after which it can be stopped. A node removed keeps its data directory; remove it by hand once the
+  status shows it in no shard's voters or learners. The first three nodes active at the start hold group 0 and
+  should stay up.
 
 ## Not yet
 

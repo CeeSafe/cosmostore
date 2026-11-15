@@ -1,0 +1,400 @@
+// Membership and placement on a running cluster (ADR-0062 §3–§5, M6 item 6 slice c, as built). The cluster file is the
+// roster: every node that may take part, with its address. Group 0, a Raft group of its own (shard GROUP0_SHARD), holds
+// which of them are active, as the object `active` of its store's bucket `cosmo-system`; its voters are the first three
+// nodes active when the cluster begins, and every other node of the roster is its learner, so each node holds a copy.
+// A shard's target is the placement rule (ADR-0059 §2) over the active nodes; each shard's leader moves its shard there
+// one change at a time (ADR-0062 §4): a target node not in the group joins as a learner, a learner that has caught up is
+// promoted, and a voter the target leaves out is removed once every target node votes.
+import web_core;
+import web_http;
+import web_client;
+
+const GROUP0_SHARD: u32 = 65535;
+const GROUP0_VOTERS: usize = 3;
+const SYSTEM_BUCKET: StringView = "cosmo-system";
+const ACTIVE_KEY: StringView = "active";
+const REBALANCE_EVERY_MS: u64 = 1000;
+
+/// The configuration a shard (or group 0) begins in, before any Config record.
+fn baseMembers(file: borrow ClusterFile, shard: u32) -> Result<RaftMembership, AllocError> {
+    let active = file.initialActive()?;
+    if (shard != GROUP0_SHARD) { return RaftMembership.of(file.placementAmong(shard, active.view())?.view()); }
+    var voters = Vector<u32>.create();
+    for (i in 0..active.length) {
+        if (voters.length < GROUP0_VOTERS) { voters.push(active[i])?; }
+    }
+    var learners = Vector<u32>.create();
+    for (i in 0..file.nodes.length) {
+        let id = file.nodes[i].id;
+        var voter = false;
+        for (v in voters.view()) {
+            if (v == id) { voter = true; }
+        }
+        if (!voter) { learners.push(id)?; }
+    }
+    return Ok(RaftMembership { voters: voters, learners: learners });
+}
+
+fn encodeIds(ids: Slice<u32>) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    out.pushLE(truncate<u32>(ids.length))?;
+    for (id in ids) { out.pushLE(id)?; }
+    return Ok(out);
+}
+
+fn decodeIds(b: Slice<u8>) -> Vector<u32>? {
+    if (b.length < 4) { return null; }
+    let n = b.readLE<u32>(0) as usize;
+    if (n > 255 || b.length != 4 + n * 4) { return null; }
+    var out = Vector<u32>.create();
+    for (i in 0..n) {
+        if (out.push(b.readLE<u32>(4 + i * 4)).isErr()) { return null; }
+    }
+    return Some(out);
+}
+
+fn contains(ids: Slice<u32>, id: u32) -> bool {
+    for (x in ids) {
+        if (x == id) { return true; }
+    }
+    return false;
+}
+
+/// Group 0's active set as this node's copy has it applied; the cluster file's before group 0 wrote one.
+async fn readActive(shared: borrow NodeShared) -> Result<Vector<u32>, NodeFault> {
+    let initial = match (shared.file.initialActive()) {
+        Ok(a) => a,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    let at = match (slotOf(shared, GROUP0_SHARD)) {
+        Some(i) => i,
+        null => { return Ok(initial); }
+    };
+    var storeGuard = match (await shared.slots[at].store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let st = storeGuard.data();
+    let got = await Async.blocking(() => st.getObject(SYSTEM_BUCKET, ACTIVE_KEY));
+    return match (got) {
+        Ok(bytes) => Ok(decodeIds(bytes.view()) ?? initial),
+        Err(_) => Ok(initial),
+    };
+}
+
+/// One of group 0's writes: the system bucket, or the active set into it (two writes, each committed before the next:
+/// in a Raft log a record is not applied when it is staged, ADR-0058, so a bucket made in a write is not there for it).
+fn writeGroup0Record(
+    r: borrow mut ShardReplica,
+    st: borrow mut ObjectStore,
+    bucket: bool,
+    ids: Slice<u32>,
+) -> Result<u64?, StoreError> {
+    let before = r.beginWrite(st)?;
+    let staged = if (bucket) st.createBucket(SYSTEM_BUCKET) else match (encodeIds(ids)) {
+        Ok(bytes) => match (st.putObject(
+            SYSTEM_BUCKET,
+            ACTIVE_KEY,
+            "application/octet-stream",
+            bytes.view(),
+            PutCondition.None,
+        )) {
+            Ok(_) => Ok(),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(StoreError.OutOfMemory(e)),
+    };
+    match (staged) {
+        Ok() => {}
+        Err(e) => {
+            // Nothing of a failed write may stay in the journal unproposed: the next write would never start.
+            let _ = st.truncateEntries(before);
+            return Err(e);
+        }
+    }
+    return r.finishWrite(st, before);
+}
+
+/// Writes the active set through group 0, as its leader here, and waits for it to be applied: true when it is, in
+/// the term it was proposed in. The system bucket first, if group 0 has none yet.
+async fn writeActive(shared: borrow NodeShared, ids: Slice<u32>) -> Result<bool, NodeFault> {
+    let at = match (slotOf(shared, GROUP0_SHARD)) {
+        Some(i) => i,
+        null => { return Ok(false); }
+    };
+    let slot = borrow shared.slots[at];
+    var gate = match (await slot.gate.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let _held = gate.data();
+    var hasBucket = true;
+    {
+        var storeGuard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        hasBucket = storeGuard.data().bucketExists(SYSTEM_BUCKET).ok() ?? false;
+    }
+    if (!hasBucket && !(await group0Write(shared, slot, true, ids)?)) { return Ok(false); }
+    return await group0Write(shared, slot, false, ids);
+}
+
+async fn group0Write(
+    shared: borrow NodeShared,
+    slot: borrow ShardSlot,
+    bucket: bool,
+    ids: Slice<u32>,
+) -> Result<bool, NodeFault> {
+    var index = 0u64;
+    var term = 0u64;
+    {
+        var guard = match (await slot.replica.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let r = guard.data();
+        if (!r.core.isLeader()) { return Ok(false); }
+        term = r.core.term;
+        var storeGuard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = storeGuard.data();
+        let written = await Async.blocking(() => writeGroup0Record(r, st, bucket, ids));
+        index = match (written) {
+            Ok(Some(i)) => i,
+            _ => { return Ok(false); }
+        };
+        let drained = await Async.blocking(() => drainOf(r, st));
+        match (drained) {
+            Ok(out) => { await enqueue(shared, slot.shard, out)?; }
+            Err(e) => {
+                await noteFailure(slot, e);
+                return Ok(false);
+            }
+        }
+    }
+    var waited = 0u64;
+    while (waited < FRONT_COMMIT_MS) {
+        let v = await viewOf(slot)?;
+        if (v.applied >= index) { return Ok((await entryTermOf(slot, index))? == term); }
+        if (!v.leads) { return Ok(false); }
+        if (!(await frontPause(FRONT_POLL_MS))) { return Ok(false); }
+        waited += FRONT_POLL_MS;
+    }
+    return Ok(false);
+}
+
+/// One step of shard `r` toward `target` (ADR-0062 §4), as its leader: true when a change was proposed.
+fn rebalanceStep(r: borrow mut ShardReplica, target: Slice<u32>) -> Result<bool, StoreError> {
+    if (!r.core.isLeader()) { return Ok(false); }
+    let m = r.core.members.copy()?;
+    // A learner of the target that has caught up becomes a voter.
+    for (l in m.learners.view()) {
+        if (!contains(target, l)) { continue; }
+        let caughtUp = match (r.core.peerAt(l)) {
+            Some(p) => r.core.peers[p].matched >= r.core.commit,
+            null => false,
+        };
+        if (!caughtUp) { return Ok(false); } // wait for it
+        var next = m.copy()?;
+        var k = 0usize;
+        while (k < next.learners.length) {
+            if (next.learners[k] == l) { let _ = next.learners.remove(k); } else { k += 1; }
+        }
+        next.voters.push(l)?;
+        return Ok(r.changeMembers(next)?.isSome());
+    }
+    // A target node not in the group joins as a learner.
+    for (t in target) {
+        if (m.isVoter(t) || m.isLearner(t)) { continue; }
+        var next = m.copy()?;
+        next.learners.push(t)?;
+        return Ok(r.changeMembers(next)?.isSome());
+    }
+    // A learner the target leaves out goes.
+    for (l in m.learners.view()) {
+        if (contains(target, l)) { continue; }
+        var next = m.copy()?;
+        var k = 0usize;
+        while (k < next.learners.length) {
+            if (next.learners[k] == l) { let _ = next.learners.remove(k); } else { k += 1; }
+        }
+        return Ok(r.changeMembers(next)?.isSome());
+    }
+    // Every target node votes: a voter the target leaves out goes (the leader too, which then steps down).
+    for (v in m.voters.view()) {
+        if (contains(target, v)) { continue; }
+        var next = m.copy()?;
+        var k = 0usize;
+        while (k < next.voters.length) {
+            if (next.voters[k] == v) { let _ = next.voters.remove(k); } else { k += 1; }
+        }
+        return Ok(r.changeMembers(next)?.isSome());
+    }
+    return Ok(false);
+}
+
+fn rebalanceAndDrain(
+    r: borrow mut ShardReplica,
+    st: borrow mut ObjectStore,
+    target: Slice<u32>,
+) -> Result<Vector<RaftMessage>, StoreError> {
+    let _ = rebalanceStep(r, target)?;
+    var out = Vector<RaftMessage>.create();
+    r.drain(st, mut out)?;
+    return Ok(out);
+}
+
+/// Every REBALANCE_EVERY_MS: group 0's leader writes the cluster file's active set if group 0 has none yet; each
+/// shard this node leads takes one step toward its target.
+async fn rebalanceForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
+    while (true) {
+        if (!(await frontPause(REBALANCE_EVERY_MS))) { return Err(NodeFault.Net); }
+        let active = await readActive(shared)?;
+        // Group 0's first record: the active set the cluster began with.
+        match (slotOf(shared, GROUP0_SHARD)) {
+            Some(g) => {
+                let leads = (await viewOf(borrow shared.slots[g]))?.leads;
+                if (leads) {
+                    var has = true;
+                    {
+                        var storeGuard = match (await shared.slots[g].store.get().lock()) {
+                            Ok(x) => x,
+                            Err(_) => { return Err(NodeFault.Net); }
+                        };
+                        let st = storeGuard.data();
+                        has = match (st.bucketExists(SYSTEM_BUCKET)) {
+                            Ok(h) => h,
+                            Err(_) => true,
+                        };
+                    }
+                    // The store's lock is released: writeActive takes it again.
+                    if (!has) { let _ = await writeActive(shared, active.view())?; }
+                }
+            }
+            null => {}
+        }
+        for (i in 0..shared.slots.length) {
+            let slot = borrow shared.slots[i];
+            if (slot.shard == GROUP0_SHARD || slot.failed.load() != 0) { continue; }
+            let target = match (shared.file.placementAmong(slot.shard, active.view())) {
+                Ok(t) => t,
+                Err(_) => { return Err(NodeFault.OutOfMemory); }
+            };
+            var guard = match (await slot.replica.lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let r = guard.data();
+            if (!r.core.isLeader()) { continue; }
+            var storeGuard = match (await slot.store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let st = storeGuard.data();
+            let stepped = await Async.blocking(() => rebalanceAndDrain(r, st, target.view()));
+            match (stepped) {
+                Ok(out) => { await enqueue(shared, slot.shard, out)?; }
+                Err(e) => { await noteFailure(slot, e); }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// `POST /cluster/active` (an operator's, signed): u8 1 to make node `id` active, 2 to drain it; u32 the node. 200
+/// once group 0 has applied the new set; 421 when this node does not lead group 0.
+async fn changeActive(shared: borrow NodeShared, body: Slice<u8>) -> Result<u16, NodeFault> {
+    if (body.length != 5) { return Ok(400); }
+    let op = body[0];
+    let id = body.readLE<u32>(1);
+    if (shared.file.node(id).isNull() || (op != 1 && op != 2)) { return Ok(400); }
+    match (slotOf(shared, GROUP0_SHARD)) {
+        Some(g) => {
+            if (!(await viewOf(borrow shared.slots[g]))?.leads) { return Ok(421); }
+        }
+        null => { return Ok(421); }
+    }
+    let current = await readActive(shared)?;
+    var next = Vector<u32>.create();
+    for (a in current.view()) {
+        if (a != id && next.push(a).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    if (op == 1 && next.push(id).isErr()) { return Err(NodeFault.OutOfMemory); }
+    if ((next.length as u64) < (shared.file.replicas as u64)) { return Ok(409); } // not enough left to hold every shard
+    if (await writeActive(shared, next.view())?) { return Ok(200); }
+    return Ok(503);
+}
+
+/// `cosmostore cluster-join` and `cluster-leave --cluster-file <path> --node <id>`: asks each node of the roster in turn
+/// until group 0's leader takes it.
+fn clusterActiveCommand(op: u8) -> i32 {
+    let args = match (clusterArguments(2)) {
+        Some(a) => a,
+        null => { return 2; }
+    };
+    let loaded = match (loadCluster(args.file.view())) {
+        Ok(l) => l,
+        Err(message) => {
+            Console.writeErrorLine(message.view());
+            return 1;
+        }
+    };
+    var body = Vector<u8>.create();
+    if (body.push(op).isErr() || body.pushLE(args.node).isErr()) { return 1; }
+    for (attempt in 0..10) {
+        for (i in 0..loaded.file.nodes.length) {
+            var url = textOf("http://");
+            if (appendPeerAddress(
+                mut url,
+                loaded.file.nodes[i].peer,
+            ).isErr() || url.append("/cluster/active").isErr()) {
+                return 1;
+            }
+            let status = match (Async.run(askActive(borrow loaded, url.view(), body.view()))) {
+                Ok(s) => s,
+                Err(_) => 0u16,
+            };
+            if (status == 200) { return 0; }
+            if (status == 409) {
+                Console.writeErrorLine("cosmostore: too few active nodes would be left to hold every shard");
+                return 1;
+            }
+        }
+    }
+    Console.writeErrorLine("cosmostore: no node took the change (no leader of group 0?)");
+    return 1;
+}
+
+async fn askActive(loaded: borrow LoadedCluster, url: StringView, body: Slice<u8>) -> Result<u16, NodeFault> {
+    var options = ClientOptions.defaults();
+    options.totalMs = 10000;
+    options.retry = RetryPolicy.never();
+    let client = match (Client.create(options, null)) {
+        Ok(c) => c,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    var request = match (ClientRequest.create(Method.Post, url)) {
+        Ok(r) => r,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    if (!signRequest(mut request, borrow loaded.file, loaded.secret.view(), 0, "POST", "/cluster/active", body)) {
+        return Err(NodeFault.OutOfMemory);
+    }
+    var content = match (BytesBody.of(body)) {
+        Ok(b) => b,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    var response = match (await client.send(request, mut content)) {
+        Ok(r) => r,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let status = response.status();
+    var answer = Vector<u8>.create();
+    let _ = await response.readToEnd(mut answer, 65536);
+    let _ = await response.finish(client);
+    await client.shutdown();
+    return Ok(status);
+}

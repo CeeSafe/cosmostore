@@ -1,7 +1,7 @@
 # ADR-0062: Membership changes, group 0, placement and rebalance (M6 item 6)
 
 **Status:** proposed for M6 item 6 (ADR-0056 §5), 15 Nov 2026, started under the owner's standing go-ahead ("From now
-on, I give you permission to commit and push, then start the next"). Slice a is built.
+on, I give you permission to commit and push, then start the next"). Slices a, b and c are built (c narrower than §3 to §5: see As built).
 
 ## Context
 
@@ -52,6 +52,35 @@ on, I give you permission to commit and push, then start the next"). Slice a is 
 | a | the core's configurations, learners and changes (§1), in the simulation | ADR-0057's checker holds over thousands of seeded runs with random changes under faults; mutants of the change rules fail it |
 | b | the `Config` record, checkpoints and snapshots with configurations (§2); a replica added and one removed in the in-process tests | the replica sweeps pass with a group going from three replicas to four and back |
 | c | group 0, the membership, placement and rebalance (§3–§6); the commands | `tools/cluster_s3_smoke.sh` with a fourth node added and one removed during a run, no stale read |
+
+## As built (slices a to c, 15 Nov 2026)
+
+Slices a and b are as decided. Slice c is a narrower §3 to §5, to be widened later:
+
+- **The cluster file stays the roster:** every node that may ever take part is in it, with its address, and a
+  `standby` word keeps a node out when the cluster begins. Group 0 decides which roster nodes are *active*; a node
+  not in the file cannot join, and the file's digest still covers all of it. Addresses that change while the cluster
+  runs are later work.
+- **Group 0 holds the active set only**, as an object of its store (`cosmo-system/active`), written by its leader
+  (the bucket first, then the set: two writes, each committed before the next). Its voters are the first three
+  active nodes when the cluster begins and do not move; every other roster node is its learner and has a copy.
+- **No placement table:** a shard's target is ADR-0059's rule over the active set, and its Raft configuration is its
+  placement. Each shard's leader steps toward its target once a second (`rebalance.cee`): a learner added, promoted
+  once its log matches the commit index, a voter the target leaves out removed once every target node votes.
+- **Every node holds a replica slot of every shard**, idle until its group adds it (a node outside a shard's group
+  never campaigns); extents are pushed to and fetched from a shard's current group, not the file's placement.
+- **A replica removed keeps its directory** (a later item removes it); it goes on as a pre-candidate that no member
+  answers, as Raft's removed servers do, which pre-vote keeps harmless.
+- **Commands:** `cosmostore cluster-join` and `cluster-leave --cluster-file <file> --node <id>` (signed as the
+  operator, tried at each roster node until group 0's leader takes it; refused when fewer active nodes than
+  replicas would be left). The status shows each shard's voters and learners.
+- **Tests:** `tools/cluster_moves_smoke.sh`: four nodes, the fourth a standby; data written, a 5 MB object
+  included; node 4 joins and shards move onto it; node 1 leaves and every shard moves off it; node 1 killed; all of
+  it read back through the others; a background prober writing through one node and reading through the next all
+  along, no stale read.
+- **Found on the way:** group 0's first write made its bucket and put into it in one write, which in a Raft log
+  fails (the bucket is not applied yet) and left a persisted, unproposed entry that blocked every later write. Two
+  writes now, and a failed write cuts what it staged off.
 
 ## Consequences
 

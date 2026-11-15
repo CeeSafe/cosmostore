@@ -4,7 +4,10 @@
 //   shards <1 to 256>
 //   replicas <1 to 7, at most the node count>
 //   secret-file <path>
-//   node <1 to 255> peer=<a.b.c.d:port | [v6]:port> domain=<1 to 64 of A-Z a-z 0-9 . _ ->
+//   node <1 to 255> peer=<a.b.c.d:port | [v6]:port> domain=<1 to 64 of A-Z a-z 0-9 . _ -> [standby]
+//
+// The nodes are the roster (ADR-0062 §3, as built): every node that may take part, with its address. A `standby` node
+// is not active when the cluster begins; `cosmostore cluster-join` makes it active, `cluster-leave` the other way.
 //
 // Every node reads the same file. Its canonical form (each line's words joined by one space, the lines by a newline,
 // comments and blank lines gone) has a SHA-256, the digest, which every request between nodes carries: nodes that
@@ -18,6 +21,8 @@ struct ClusterNode {
     id: u32;
     peer: SocketAddress;
     domain: String;
+    /// In the roster, not active when the cluster begins.
+    standby: bool;
 }
 
 struct ClusterFile {
@@ -36,12 +41,32 @@ struct ClusterFile {
         return null;
     }
 
-    /// The nodes that hold shard `shard`, best first (ADR-0059 §2): by score `SHA-256(name ‖ shard ‖ node)`, one per
-    /// failure domain while there are domains left, then the next best.
+    /// The nodes active when the cluster begins: all but the standby ones, by id.
+    fn initialActive(borrow this) -> Result<Vector<u32>, AllocError> {
+        var out = Vector<u32>.create();
+        for (i in 0..this.nodes.length) {
+            if (!this.nodes[i].standby) { out.push(this.nodes[i].id)?; }
+        }
+        return Ok(out);
+    }
+
+    /// The nodes that hold shard `shard` when the cluster begins (ADR-0059 §2).
     fn placement(borrow this, shard: u32) -> Result<Vector<u32>, AllocError> {
+        let active = this.initialActive()?;
+        return this.placementAmong(shard, active.view());
+    }
+
+    /// The nodes of `active` that hold shard `shard`, best first: by score `SHA-256(name ‖ shard ‖ node)`, one per
+    /// failure domain while there are domains left, then the next best; at most `replicas`.
+    fn placementAmong(borrow this, shard: u32, active: Slice<u32>) -> Result<Vector<u32>, AllocError> {
         var order = Vector<u32>.create(); // indexes into nodes, best score first
         var scores = Vector<u64>.create();
         for (i in 0..this.nodes.length) {
+            var isActive = false;
+            for (a in active) {
+                if (a == this.nodes[i].id) { isActive = true; }
+            }
+            if (!isActive) { continue; }
             var h = Sha256.create();
             h.update(this.name[..]);
             var tail = [0u8; 8];
@@ -64,7 +89,7 @@ struct ClusterFile {
         var chosen = Vector<u32>.create();
         var taken = Vector<bool>.create();
         for (i in 0..order.length) { taken.push(false)?; }
-        let want = this.replicas as usize;
+        let want = if ((this.replicas as usize) < order.length) this.replicas as usize else order.length;
         // First one per domain, then the rest by score.
         for (k in 0..order.length) {
             if (chosen.length == want) { break; }
@@ -233,7 +258,8 @@ fn parseClusterFile(text: StringView) -> Result<ClusterFile, ClusterFileError> {
             if (path.append(words[1]).isErr()) { return clusterError(lineNumber, ClusterFault.OutOfMemory); }
             secretFile = Some(path);
         } else if (head == "node") {
-            if (words.length != 4) { return clusterError(lineNumber, ClusterFault.BadNode); }
+            let standby = words.length == 5 && words[4] == "standby";
+            if (words.length != 4 && !standby) { return clusterError(lineNumber, ClusterFault.BadNode); }
             let id = match (words[1].parseInt<u32>()) {
                 Some(v) => v,
                 null => { return clusterError(lineNumber, ClusterFault.BadNode); }
@@ -254,7 +280,7 @@ fn parseClusterFile(text: StringView) -> Result<ClusterFile, ClusterFileError> {
             var domain = String.create();
             if (domain.append(domainText).isErr()) { return clusterError(lineNumber, ClusterFault.OutOfMemory); }
             if (nodes.length >= MAX_CLUSTER_NODES) { return clusterError(lineNumber, ClusterFault.BadNode); }
-            if (nodes.push(ClusterNode { id: id, peer: peer, domain: domain }).isErr()) {
+            if (nodes.push(ClusterNode { id: id, peer: peer, domain: domain, standby: standby }).isErr()) {
                 return clusterError(lineNumber, ClusterFault.OutOfMemory);
             }
         } else {
@@ -273,9 +299,13 @@ fn parseClusterFile(text: StringView) -> Result<ClusterFile, ClusterFileError> {
         Some(v) => v,
         null => { return clusterError(0, ClusterFault.MissingSecret); }
     };
-    if (nodes.length == 0) { return clusterError(0, ClusterFault.NoNodes); }
-    let r = replicas ?? (if (nodes.length < 3) truncate<u32>(nodes.length) else 3);
-    if ((r as usize) > nodes.length) { return clusterError(0, ClusterFault.TooManyReplicas); }
+    var active = 0usize;
+    for (i in 0..nodes.length) {
+        if (!nodes[i].standby) { active += 1; }
+    }
+    if (active == 0) { return clusterError(0, ClusterFault.NoNodes); }
+    let r = replicas ?? (if (active < 3) truncate<u32>(active) else 3);
+    if ((r as usize) > active) { return clusterError(0, ClusterFault.TooManyReplicas); }
     return Ok(ClusterFile {
         name: n,
         shards: s,

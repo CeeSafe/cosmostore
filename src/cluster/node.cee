@@ -66,7 +66,7 @@ enum NodeFault {
     Store,
 }
 
-fn replicaConfigOf(id: u32, voters: Vector<u32>, shard: u32) -> ReplicaConfig {
+fn replicaConfigOf(id: u32, voters: Vector<u32>, learners: Vector<u32>, shard: u32) -> ReplicaConfig {
     var store = StoreConfig.defaults();
     store.journal.shardId = shard;
     var seed = [0u8; 8];
@@ -74,6 +74,7 @@ fn replicaConfigOf(id: u32, voters: Vector<u32>, shard: u32) -> ReplicaConfig {
     return ReplicaConfig {
         id: id,
         voters: voters,
+        learners: learners,
         electionTicks: 10,
         heartbeatTicks: 1,
         maxAppendEntries: 64,
@@ -105,24 +106,36 @@ fn openNode(
     if (file.node(id).isNull()) { return Err(textOf("this node is not in the cluster file")); }
     var slots = Vector<ShardSlot>.create();
     var internals = Vector<InternalS3>.create();
-    let shards = match (file.shardsOf(id)) {
-        Ok(s) => s,
-        Err(_) => { return Err(textOf("out of memory")); }
-    };
+    // A slot for every shard, and for group 0 (ADR-0062 §3, as built): a node holds a replica of each, idle until its
+    // group adds it, so a shard moving onto it needs nothing made on the fly. A shard begins on its initial placement;
+    // group 0 on the first three active nodes, every other node of the roster its learner.
+    var shards = Vector<u32>.create();
+    var nextShard = 0u32;
+    while (nextShard < file.shards) {
+        if (shards.push(nextShard).isErr()) { return Err(textOf("out of memory")); }
+        nextShard += 1;
+    }
+    if (shards.push(GROUP0_SHARD).isErr()) { return Err(textOf("out of memory")); }
     for (i in 0..shards.length) {
         let shard = shards[i];
-        let voters = match (file.placement(shard)) {
-            Ok(v) => v,
+        let base = match (baseMembers(borrow file, shard)) {
+            Ok(b) => b,
             Err(_) => { return Err(textOf("out of memory")); }
         };
+        let voters = base.voters;
+        let learners = base.learners;
         var path = String.create();
-        let named = path.append(dir).isOk() && path.append("/shard-").isOk() && appendHex2(mut path, shard).isOk();
+        let named = path.append(
+            dir,
+        ).isOk() && (if (shard == GROUP0_SHARD) path.append("/group-0").isOk() else path.append(
+            "/shard-",
+        ).isOk() && appendHex2(mut path, shard).isOk());
         if (!named) { return Err(textOf("out of memory")); }
         match (Fs.ensureDirectory(path.view())) {
             Ok() => {}
             Err(_) => { return Err(textOf("a shard's directory cannot be made")); }
         }
-        let opened = match (ShardReplica.open(path.view(), replicaConfigOf(id, voters, shard))) {
+        let opened = match (ShardReplica.open(path.view(), replicaConfigOf(id, voters, learners, shard))) {
             Ok(r) => r,
             Err(e) => { return Err(storeErrorLine(e)); }
         };
@@ -518,7 +531,7 @@ fn headerCopy(request: borrow Request, name: StringView) -> Vector<u8> {
 /// One line per replica: shard, role, term, leader, last, commit, applied.
 async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> {
     var out = Vector<u8>.create();
-    let ok = out.extend("shard role term leader last commit applied\n".bytes()).isOk();
+    let ok = out.extend("shard role term leader last commit applied voters learners\n".bytes()).isOk();
     if (!ok) { return Err(NodeFault.OutOfMemory); }
     for (i in 0..shared.slots.length) {
         let slot = borrow shared.slots[i];
@@ -543,7 +556,9 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
             out.push(0x20).isOk() && appendDecimal(mut out, r.core.leader as u64).isOk() && out.push(0x20).isOk() &&
             appendDecimal(mut out, r.core.lastIndex()).isOk() && out.push(0x20).isOk() &&
             appendDecimal(mut out, r.core.commit).isOk() && out.push(0x20).isOk() &&
-            appendDecimal(mut out, st.appliedIndex()).isOk() && out.push(0x0A).isOk();
+            appendDecimal(mut out, st.appliedIndex()).isOk() && out.push(0x20).isOk() &&
+            appendIdList(mut out, r.core.members.voters.view()).isOk() && out.push(0x20).isOk() &&
+            appendIdList(mut out, r.core.members.learners.view()).isOk() && out.push(0x0A).isOk();
         if (!line) { return Err(NodeFault.OutOfMemory); }
     }
     return Ok(out);
@@ -565,7 +580,9 @@ impl Handler<NodeApp> for PeerHandler {
         // An extent pushed by a leader, or asked for by a replica that lacks it (ADR-0061 §2, §3).
         let isExtent = request.method() == Method.Post && path == "/extent";
         let isFetch = request.method() == Method.Post && path == "/extent-fetch";
-        if (!isRaft && !isStatus && !isS3 && !isExtent && !isFetch) {
+        // An operator's change of the active nodes (ADR-0062 §5).
+        let isActive = request.method() == Method.Post && path == "/cluster/active";
+        if (!isRaft && !isStatus && !isS3 && !isExtent && !isFetch && !isActive) {
             return await exchange.send(Status.notFound(), "".bytes());
         }
         // The body, whole: a batch is decoded only once its signature holds.
@@ -596,7 +613,7 @@ impl Handler<NodeApp> for PeerHandler {
                 borrow shared.file,
                 shared.secret.view(),
                 shared.id,
-                isStatus,
+                isStatus || isActive,
                 method,
                 path,
                 borrow headers,
@@ -608,6 +625,13 @@ impl Handler<NodeApp> for PeerHandler {
         if (checked.isErr()) {
             let _ = shared.refused.fetchAdd(1);
             return await exchange.send(statusOf(403), "".bytes());
+        }
+        if (isActive) {
+            let status = match (await changeActive(shared, body.view())) {
+                Ok(s) => s,
+                Err(_) => 500u16,
+            };
+            return await exchange.send(statusOf(status), "".bytes());
         }
         if (isStatus) {
             let text = match (await statusText(shared)) {
@@ -782,6 +806,7 @@ async fn runNode(
         }
         s.spawn(async () => await tickForever(node));
         s.spawn(async () => await fetchForever(node));
+        s.spawn(async () => await rebalanceForever(node));
         for (i in 0..peers) {
             let at = i;
             s.spawn(async move () => await sendForever(node, at));
@@ -878,6 +903,9 @@ fn nodeCommand() -> i32 {
         Err(_) => false,
     } && match (peerHandler()) {
         Ok(h) => server.router().post("/extent-fetch", h).isOk(),
+        Err(_) => false,
+    } && match (peerHandler()) {
+        Ok(h) => server.router().post("/cluster/active", h).isOk(),
         Err(_) => false,
     };
     if (!routed || !routedS3) { return 1; }
@@ -1038,4 +1066,14 @@ async fn askStatus(
     let _ = await response.finish(client);
     await client.shutdown();
     return Ok(status);
+}
+
+/// `1,2,3`, or `-` for none.
+fn appendIdList(out: borrow mut Vector<u8>, ids: Slice<u32>) -> Result<void, AllocError> {
+    if (ids.length == 0) { return out.push(0x2D); }
+    for (i in 0..ids.length) {
+        if (i > 0) { out.push(0x2C)?; }
+        appendDecimal(out, ids[i] as u64)?;
+    }
+    return Ok();
 }

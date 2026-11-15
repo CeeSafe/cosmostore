@@ -58,7 +58,7 @@ agreed() {
         all="$all$s"$'\n'
     done
     echo "$all" | awk -v nodes="$#" -v min="$min" '
-        NF == 7 { rows[$1]++; if ($2 == "leader") leaders[$1]++; applied[$1, rows[$1]] = $7; if ($7 < min) low = 1 }
+        NF == 9 { rows[$1]++; if ($2 == "leader") leaders[$1]++; applied[$1, rows[$1]] = $7; if ($7 < min) low = 1 }
         END {
             if (low) exit 1
             for (s in rows) {

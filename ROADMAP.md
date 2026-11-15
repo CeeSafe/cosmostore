@@ -2463,3 +2463,22 @@ Browser form uploads with a SigV4 POST policy.
   printed a pass count.)
 - **Next:** slice c, group 0, the placement and the rebalancer, the commands, and a node added to and removed from a
   running cluster.
+
+### 15 Nov 2026: M6 item 6, slice c: nodes join and leave a running cluster (ADR-0062); item 6 done
+
+- **What it does:** `cosmostore cluster-join` and `cluster-leave` change which roster nodes are active, through group
+  0 (a Raft group of its own whose store holds the active set); each shard's leader moves its shard toward the
+  placement rule over the active nodes, one change at a time (a learner added, promoted once caught up, a voter the
+  target leaves out removed). Every node holds a replica slot of every shard, idle until its group adds it.
+- **Narrower than ADR-0062 §3 to §5** (its As built says so): the cluster file is the roster (nodes to add later
+  marked `standby`), group 0 holds only the active set and stays on the first three nodes, no placement table (each
+  shard's Raft configuration is its placement), a removed replica keeps its directory.
+- **`tools/cluster_moves_smoke.sh`** (14 checks): four nodes; data and a 5 MB object written; node 4 joins and
+  shards move onto it, all of it readable through node 4; node 1 leaves and every shard moves off it; node 1 killed,
+  everything read back through the others, writes going on; a background prober (write through one node, read through
+  the next) across both moves found no stale read. The S3 smoke, the cluster smoke and the cluster S3 smoke pass on the
+  new layout (a slot per shard per node, group 0 on each).
+- **Found on the way:** a bucket made and put into in one write of a Raft log fails, the bucket not yet applied, and
+  the failed write left an entry persisted and unproposed that stopped every later write: group 0 writes twice now,
+  and a failed write cuts what it staged off.
+- **M6 item 6 is done** in that form. **Next:** item 7, health, scrub, repair and rolling upgrades.
