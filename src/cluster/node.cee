@@ -45,10 +45,12 @@ struct NodeShared {
     slots: Vector<ShardSlot>;
     peers: Vector<PeerLink>;
     nonces: AsyncMutex<NonceWindow>;
-    /// Requests refused (ADR-0059 §4), batches that could not be sent, and ticks so far.
+    /// Requests refused (ADR-0059 §4), batches that could not be sent, and ticks so far; batches sent and taken.
     refused: AtomicU64;
     unsent: AtomicU64;
     ticks: AtomicU64;
+    sent: AtomicU64;
+    received: AtomicU64;
     /// The ids of ReadIndex reads (ADR-0060 §6).
     readIds: AtomicU64;
     /// Scrub (ADR-0063): how often a pass starts, and what passes found: versions checked, damage found, records
@@ -73,6 +75,8 @@ enum NodeFault {
     OutOfMemory,
     Net,
     Store,
+    /// A peer refused the connection: nothing was sent.
+    Unreached,
 }
 
 fn replicaConfigOf(id: u32, voters: Vector<u32>, learners: Vector<u32>, shard: u32) -> ReplicaConfig {
@@ -240,6 +244,8 @@ fn openNode(
         refused: AtomicU64.create(0),
         unsent: AtomicU64.create(0),
         ticks: AtomicU64.create(0),
+        sent: AtomicU64.create(0),
+        received: AtomicU64.create(0),
         readIds: AtomicU64.create(0),
         scrubEveryMs: scrubEveryMs,
         codeAfterMs: codeAfterMs,
@@ -389,6 +395,22 @@ async fn deliver(shared: borrow NodeShared, sm: ShardMessage) -> Result<void, No
     return Ok(); // not a shard of this node: a stale sender
 }
 
+/// A tick of one replica that took this long is logged, with where the time went.
+const SLOW_TICK_MS: i64 = 1000;
+
+async fn noteSlowTick(shard: u32, replicaMs: i64, storeMs: i64, workMs: i64) {
+    var line = textOf("cosmostore: a slow tick of shard ");
+    let _ = line.appendNumber(shard as i64);
+    let _ = line.append(": ");
+    let _ = line.appendNumber(replicaMs);
+    let _ = line.append(" ms for its replica's lock, ");
+    let _ = line.appendNumber(storeMs);
+    let _ = line.append(" for its store's, ");
+    let _ = line.appendNumber(workMs);
+    let _ = line.append(" working\n");
+    let _ = await AsyncConsole.writeError(line.view());
+}
+
 /// Ticks every replica every NODE_TICK_MS, and runs their upkeep every NODE_MAINTAIN_TICKS.
 async fn tickForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
     while (true) {
@@ -401,17 +423,22 @@ async fn tickForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
         for (i in 0..shared.slots.length) {
             let slot = borrow shared.slots[i];
             if (slot.failed.load() != 0) { continue; }
+            let t0 = Clock.unixMillis();
             var guard = match (await slot.replica.lock()) {
                 Ok(g) => g,
                 Err(_) => { return Err(NodeFault.Net); }
             };
             let r = guard.data();
+            let t1 = Clock.unixMillis();
             var storeGuard = match (await slot.store.get().lock()) {
                 Ok(g) => g,
                 Err(_) => { return Err(NodeFault.Net); }
             };
             let st = storeGuard.data();
+            let t2 = Clock.unixMillis();
             let ticked = await Async.blocking(() => tickOf(r, st, maintain));
+            let t3 = Clock.unixMillis();
+            if (t3 - t0 > SLOW_TICK_MS) { await noteSlowTick(slot.shard, t1 - t0, t2 - t1, t3 - t2); }
             match (ticked) {
                 Ok(out) => { await enqueue(shared, slot.shard, out)?; }
                 Err(e) => { await noteFailure(slot, e); }
@@ -513,7 +540,9 @@ async fn sendForever(shared: borrow NodeShared, at: usize) -> Result<void, NodeF
         }
         var body = Vector<u8>.create();
         if (encodeBatch(mut body, batch.view()).isErr()) { return Err(NodeFault.OutOfMemory); }
-        if (!(await postBatch(borrow client, shared, link.url.view(), body.view()))) {
+        if (await postBatch(borrow client, shared, link.url.view(), body.view())) {
+            let _ = shared.sent.fetchAdd(1);
+        } else {
             let _ = shared.unsent.fetchAdd(1);
             match (await Timer.sleep(NODE_SEND_RETRY_MS)) {
                 Ok() => {}
@@ -585,6 +614,13 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
         out.push(0x20).isOk() && appendDecimal(mut out, shared.extentsFetched.load()).isOk() &&
         out.push(0x0A).isOk();
     if (!scrub) { return Err(NodeFault.OutOfMemory); }
+    // The peer port's traffic: ticks, batches sent, not sent, taken, requests refused.
+    let peer = out.extend("# peer ".bytes()).isOk() && appendDecimal(mut out, shared.ticks.load()).isOk() &&
+        out.push(0x20).isOk() && appendDecimal(mut out, shared.sent.load()).isOk() && out.push(0x20).isOk() &&
+        appendDecimal(mut out, shared.unsent.load()).isOk() && out.push(0x20).isOk() &&
+        appendDecimal(mut out, shared.received.load()).isOk() && out.push(0x20).isOk() &&
+        appendDecimal(mut out, shared.refused.load()).isOk() && out.push(0x0A).isOk();
+    if (!peer) { return Err(NodeFault.OutOfMemory); }
     return Ok(out);
 }
 
@@ -688,21 +724,30 @@ impl Handler<NodeApp> for PeerHandler {
                 Some(i) => i,
                 null => { return await exchange.send(Status.notFound(), "".bytes()); }
             };
-            var storeGuard = match (await shared.slots[at].store.get().lock()) {
-                Ok(g) => g,
-                Err(_) => { return Err(HandlerError.Internal); }
-            };
-            let st = storeGuard.data();
-            if (isExtent) {
-                let file = body.view()[12..body.length];
-                return match (await Async.blocking(() => st.installExtent(id, file))) {
-                    Ok() => await exchange.send(Status.noContent(), "".bytes()),
-                    Err(_) => await exchange.send(statusOf(500), "".bytes()),
+            // The store's lock only for the store's part: the answer is sent without it, since a slow or cut-off
+            // peer would hold it until the send gave up.
+            var installed = false;
+            var found: Vector<u8>? = null;
+            {
+                var storeGuard = match (await shared.slots[at].store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(HandlerError.Internal); }
                 };
+                let st = storeGuard.data();
+                if (isExtent) {
+                    let file = body.view()[12..body.length];
+                    installed = (await Async.blocking(() => st.installExtent(id, file))).isOk();
+                } else {
+                    found = (await Async.blocking(() => st.extentFileBytes(id))).ok();
+                }
             }
-            return match (await Async.blocking(() => st.extentFileBytes(id))) {
-                Ok(bytes) => await exchange.send(Status.ok(), bytes.view()),
-                Err(_) => await exchange.send(Status.notFound(), "".bytes()),
+            if (isExtent) {
+                if (installed) { return await exchange.send(Status.noContent(), "".bytes()); }
+                return await exchange.send(statusOf(500), "".bytes());
+            }
+            return match (found) {
+                Some(bytes) => await exchange.send(Status.ok(), bytes.view()),
+                null => await exchange.send(Status.notFound(), "".bytes()),
             };
         }
         if (isS3) {
@@ -725,6 +770,7 @@ impl Handler<NodeApp> for PeerHandler {
             Ok(b) => b,
             Err(_) => { return await exchange.send(Status.badRequest(), "".bytes()); }
         };
+        let _ = shared.received.fetchAdd(1);
         reverseShardMessages(mut batch);
         while (true) {
             let sm = match (batch.pop()) {
@@ -873,13 +919,24 @@ fn nodeCommand() -> i32 {
             return 1;
         }
     };
-    let address = match (loaded.file.node(id)) {
+    var address = match (loaded.file.node(id)) {
         Some(n) => n.peer,
         null => {
             Console.writeErrorLine("cosmostore: this node is not in the cluster file");
             return 1;
         }
     };
+    // `--peer-listen`: the peer port listens here instead of at the cluster file's address, which a proxy in front of
+    // it holds (the chaos harness's, ADR-0065).
+    match (borrow args.peerListen) {
+        Some(text) => {
+            address = match (listenAddress(text.view())) {
+                Some(a) => a,
+                null => { return 2; }
+            };
+        }
+        null => {}
+    }
     // S3 on the node (ADR-0060): `--listen` and `--credentials`, both or neither.
     if (args.listen.isSome() != args.credentials.isSome()) { return 2; }
     var credentials: Arc<CredentialSets>? = null;
@@ -982,6 +1039,8 @@ struct ClusterArguments {
     /// How often a scrub pass starts (ADR-0063 §1); how old an extent is before it is coded (ADR-0064 §1).
     scrubSeconds: u64?;
     codeAfterSeconds: u64?;
+    /// Where the peer port listens, when not at the cluster file's address (ADR-0065).
+    peerListen: String?;
 }
 
 fn clusterArguments(from: usize) -> ClusterArguments? {
@@ -991,6 +1050,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var credentials: String? = null;
     var scrubSeconds: u64? = null;
     var codeAfterSeconds: u64? = null;
+    var peerListen: String? = null;
     var at = from;
     while (true) {
         let option = match (Process.argument(at)) {
@@ -1008,6 +1068,8 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             listen = Some(textOf(value));
         } else if (option == "--credentials") {
             credentials = Some(textOf(value));
+        } else if (option == "--peer-listen") {
+            peerListen = Some(textOf(value));
         } else if (option == "--code-after-seconds") {
             codeAfterSeconds = value.parseInt<u64>();
             if (codeAfterSeconds.isNull()) { return null; }
@@ -1028,6 +1090,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 credentials: credentials,
                 scrubSeconds: scrubSeconds,
                 codeAfterSeconds: codeAfterSeconds,
+                peerListen: peerListen,
             }),
             null => null,
         },

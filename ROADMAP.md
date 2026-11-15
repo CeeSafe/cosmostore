@@ -2516,3 +2516,27 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** 277 pass (the codec's, the store's coding test, two fault sweeps); `tools/cluster_ec_smoke.sh` (14
   checks) passes, and so do the S3 smoke and the cluster, cluster S3 (33), moves (14) and repair (13) smokes.
 - **M6 item 8 is done** for extents. **Next:** item 9, the chaos harness and its linearizability check.
+
+### 15 Nov 2026: M6 item 9, slice a: the chaos harness and its linearizability check (ADR-0065)
+
+- **Under the owner's standing go-ahead.** **ADR-0065** (proposed): `tools/cluster_chaos.py` (standard-library Python)
+  runs real nodes behind a proxy of its own (the cluster file's peer addresses are its ports, `node --peer-listen`
+  the nodes'), kills, pauses and partitions them (one isolated, the leader isolated, a split, a bridge) while clients
+  race on a few keys with PUT, GET, DELETE and listings, heals, reads every key through every node, and checks each
+  key's history for linearizability (Wing–Gong–Lowe search with memoization; unknown outcomes open-ended).
+  `tools/cluster_chaos.sh` runs it; `tools/chaos_mutants.sh` checks it catches stale reads (a leader without
+  ReadIndex, and any replica answering: both killed).
+- **It found three bugs in its first runs**, each now fixed:
+  - a forwarded write sent again when the leader's answer was lost, and so done twice, the second time after later
+    writes (a deleted key came back): a write is sent again only when it was certainly not done;
+  - a replica that stopped on "journal corrupt" when a new leader's entry came for the index of its own write still
+    in group-commit flight: the journal reads what it wrote, synced or not, and a cut syncs the batch in flight
+    first (`raftLogCutsABatchInFlight`);
+  - a deposed leader stuck for over a minute after a heal: reads waiting on ReadIndex held the replica's lock across
+    their pauses and starved the tick; no lock but the write gate is held across a pause or a send now.
+- **And one of its own:** its pruning of unknown writes no GET saw hid ones a listing could have seen; it keeps them
+  now, in two tiers to keep the search small.
+- **Diagnostics:** `cluster-status`'s `# peer` line, a log of slow ticks, a stopped replica failing a run, and each
+  node's status and thread sample saved when the cluster is slow to answer after a heal.
+- **Next:** more runs on the Mac mini and binfadel, clock skew and disk loss (ADR-0065 §7), then M6's exit.
+

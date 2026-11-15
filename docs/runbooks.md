@@ -278,6 +278,13 @@ any object by multipart upload, and any object by ranged GETs (the AWS CLI's way
   node decodes it from its peers' pieces, and the client's retry reads it; the decoded copy is kept an hour. Let
   clients retry (the AWS CLI's `AWS_MAX_ATTEMPTS`, 5 or more). With more nodes down than the code survives (two of
   three), a coded object cannot be read until one comes back.
+- **A write answered 503 through a node that is not its shard's leader** may have been done: the node lost its
+  exchange with the leader and does not send it again (ADR-0065). A client's retry is a write of its own; S3 clients
+  retry 503s, which is what an S3 PUT allows.
+- **Testing a build against faults** (ADR-0065): `tools/cluster_chaos.sh` runs three nodes on one machine behind a
+  proxy of its own (no firewall rule), kills, pauses and partitions them for a minute while clients race, and checks
+  what the clients saw for linearizability (`RUNS`, `SECONDS_EACH`, `NODES=5`). `tools/chaos_mutants.sh` checks that
+  it still catches stale reads.
 - **Rolling restarts and upgrades:** restart one node at a time, the next only once the status shows the first's
   replicas at the others' applied index; a node reads older formats, so upgrade forwards, never back.
 - **Adding and removing nodes** (ADR-0062): put every node that may take part in the cluster file from the start,

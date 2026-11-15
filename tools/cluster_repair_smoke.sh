@@ -53,7 +53,7 @@ start() {
 }
 on() { local n="$1"; shift; aws --no-cli-pager --endpoint-url "http://127.0.0.1:$((BASE + 10 + n))" "$@"; }
 status() { "$BIN" cluster-status --cluster-file cluster.conf --node "$1" 2>/dev/null | tail -n +2; }
-scrubOf() { status "$1" | awk '$1 == "#" { print $4, $5, $6 }'; }  # damaged repaired fetched
+scrubOf() { status "$1" | awk '$1 == "#" && $2 == "scrub" { print $4, $5, $6 }'; }  # damaged repaired fetched
 
 for n in 1 2 3; do start "$n"; done
 for i in $(seq 1 100); do

@@ -484,7 +484,11 @@ struct Journal {
         if (this.failed) { return Err(JournalError.Failed); }
         if (!this.config.raftLog) { return Err(JournalError.WrongMode(this.segmentId)); }
         if (lsn + 1 >= this.nextLsn) { return Ok(); }
-        if (this.pendingCount > 0 || this.inflight) { return Err(JournalError.OutOfOrder(this.nextLsn)); }
+        if (this.pendingCount > 0) { return Err(JournalError.OutOfOrder(this.nextLsn)); }
+        // A batch in flight (a deposed leader's write, its sync running without the store's lock): made durable
+        // first, so the cut below starts from a synced end; its ticket's late sync then finds it is not this
+        // journal's batch (`finishSync`), and it is never published.
+        if (this.inflight) { this.commit()?; }
         if (lsn < this.committedLsn) { panic("journal: cutting off a committed entry"); }
         let at = this.entryAt(lsn + 1)?;
         if (at.segment != this.segmentId) { panic("journal: an uncommitted entry in a sealed segment"); }
@@ -719,10 +723,12 @@ struct Journal {
         return Ok();
     }
 
-    /// Reads committed bytes of a segment: `into.length` bytes at `offset`.
+    /// Reads written bytes of a segment: `into.length` bytes at `offset`. In the active segment that includes a batch
+    /// in flight (written, its sync not done): a Raft log's entries are read there, by their index, whether or not
+    /// they are durable yet (ADR-0065: a new leader's entry for the index of one in flight is compared with it).
     fn readAt(borrow this, segmentId: u64, offset: u64, into: SliceMut<u8>) -> Result<void, JournalError> {
         if (segmentId == this.segmentId) {
-            if (offset + into.length as u64 > this.writeOffset) { return Err(JournalError.Corrupt(segmentId, offset)); }
+            if (offset + into.length as u64 > this.writtenEnd) { return Err(JournalError.Corrupt(segmentId, offset)); }
             return Ok(this.file.readExactAt(into, offset)?);
         }
         match (this.sealedFiles.get(borrow segmentId)) {

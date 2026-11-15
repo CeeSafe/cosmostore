@@ -225,6 +225,8 @@ async fn exchangeRaw(
     };
     var response = match (await client.send(request, mut content)) {
         Ok(r) => r,
+        // Refused at connect: nothing was sent (a client of its own, which never retries), so a write was not done.
+        Err(ClientError.Net(NetError.Io(IoError.ConnectionRefused))) => { return Err(NodeFault.Unreached); }
         Err(_) => { return Err(NodeFault.Net); }
     };
     var out = RawMessage.empty();
@@ -612,34 +614,39 @@ async fn leadRead(shared: borrow NodeShared, at: usize, raw: borrow RawMessage) 
     let slot = borrow shared.slots[at];
     let id = shared.readIds.fetchAdd(1) + 1;
     var waited = 0u64;
-    // Asked of the core until it takes it: a new leader takes reads once its first entry is committed.
+    // Asked of the core until it takes it: a new leader takes reads once its first entry is committed. The replica's
+    // lock is let go before each pause: held across it, reads waiting here starve the tick that would let the core
+    // step down or commit (ADR-0065: the chaos harness found a deposed leader stuck so for over a minute).
     while (true) {
-        var guard = match (await slot.replica.lock()) {
-            Ok(g) => g,
-            Err(_) => { return Err(NodeFault.Net); }
-        };
-        let r = guard.data();
-        if (!r.core.isLeader()) { return Ok(statusOnly(421)); }
-        let taken = match (r.core.readIndex(id)) {
-            Ok(t) => t,
-            Err(_) => { return Err(NodeFault.OutOfMemory); }
-        };
-        if (taken) {
-            var storeGuard = match (await slot.store.get().lock()) {
+        var taken = false;
+        {
+            var guard = match (await slot.replica.lock()) {
                 Ok(g) => g,
                 Err(_) => { return Err(NodeFault.Net); }
             };
-            let st = storeGuard.data();
-            let drained = await Async.blocking(() => drainOf(r, st));
-            match (drained) {
-                Ok(out) => { await enqueue(shared, slot.shard, out)?; }
-                Err(e) => {
-                    await noteFailure(slot, e);
-                    return Ok(statusOnly(503));
+            let r = guard.data();
+            if (!r.core.isLeader()) { return Ok(statusOnly(421)); }
+            taken = match (r.core.readIndex(id)) {
+                Ok(t) => t,
+                Err(_) => { return Err(NodeFault.OutOfMemory); }
+            };
+            if (taken) {
+                var storeGuard = match (await slot.store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NodeFault.Net); }
+                };
+                let st = storeGuard.data();
+                let drained = await Async.blocking(() => drainOf(r, st));
+                match (drained) {
+                    Ok(out) => { await enqueue(shared, slot.shard, out)?; }
+                    Err(e) => {
+                        await noteFailure(slot, e);
+                        return Ok(statusOnly(503));
+                    }
                 }
             }
-            break;
         }
+        if (taken) { break; }
         if (waited >= FRONT_WAIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(statusOnly(503)); }
         waited += FRONT_POLL_MS;
     }
@@ -709,6 +716,7 @@ async fn routeRequest(shared: borrow NodeShared, shard: u32, raw: borrow RawMess
         Ok(p) => p,
         Err(_) => { return Err(NodeFault.OutOfMemory); }
     };
+    let write = isWriteMethod(raw.method.view());
     var turn = 0usize;
     while (true) {
         var target = 0u32;
@@ -749,9 +757,16 @@ async fn routeRequest(shared: borrow NodeShared, shard: u32, raw: borrow RawMess
                                     Err(_) => { return Ok(statusOnly(502)); }
                                 }
                             }
-                            // 421: not the leader any more; anything else, try again too.
+                            // 421: not the leader, refused before anything was staged; a read tries again on
+                            // anything. A write that reached a leader may have been done: sent again, it would be
+                            // done twice, the second time after writes that came between (ADR-0065: the chaos
+                            // harness found it). Its outcome is the client's to find out.
+                            if (write && reply.status != 421 && reply.status != 403) { return Ok(statusOnly(503)); }
                         }
-                        Err(_) => {}
+                        Err(NodeFault.Unreached) => {}
+                        Err(_) => {
+                            if (write) { return Ok(statusOnly(503)); }
+                        }
                     }
                 }
                 null => {}

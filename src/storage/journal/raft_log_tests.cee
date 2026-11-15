@@ -279,3 +279,37 @@ fn raftLogFaultsTorn() -> Result<void, TestFailure> => sweepRaftLog("raft-fault-
 
 @test
 fn raftLogFaultsCrash() -> Result<void, TestFailure> => sweepRaftLog("raft-fault-crash", SweepMode.Crash);
+
+/// A leader's write in flight (written, its sync not done: group commit, ADR-0022) when a new leader's entry for the
+/// same index arrives (the chaos harness found it, ADR-0065): its term reads, the cut makes the batch durable first
+/// and then removes it, and the ticket's late sync changes nothing.
+@test
+fn raftLogCutsABatchInFlight() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("raft-cut-inflight");
+    {
+        var j = Journal.open(dir.view(), raftJournalConfig(), (s, o, h, b) => {})!;
+        for (lsn in 1u64..6u64) { let _ = j.appendEncoded(entryRecord(lsn, 1).view())!; }
+        j.commit()!;
+        var payload = Vector<u8>.create();
+        payloadFor(6, mut payload);
+        let _ = j.stageEntry(RecordType.PutInline, 2, "bucket\0key".bytes(), payload.view())!;
+        let ticket = j.writeStaged()!!;
+        // In flight: written, not synced. Its term and bytes read all the same.
+        Check.equalU64(6, j.lastLsn())?;
+        Check.equalU64(2, j.entryAt(6)!.header.term)?;
+        Check.isTrue(j.entryBytes(6)!.length > 0, "its bytes")?;
+        // The new leader's entry 6: the old one is cut off and the new one taken.
+        j.truncateAfter(5)!;
+        Check.equalU64(5, j.lastLsn())?;
+        Check.equalU64(1, j.entryAt(5)!.header.term)?;
+        let _ = j.appendEncoded(entryRecord(6, 3).view())!;
+        j.commit()!;
+        // The old batch's sync, late: not this journal's batch any more.
+        Check.isFalse(j.finishSync(ticket.lastLsn, ticket.sync())!, "the cut batch is not published")?;
+        Check.equalU64(3, j.entryAt(6)!.header.term)?;
+    }
+    let log = raftReplay(dir.view(), JournalStart.beginning())!;
+    Check.equalU64(6, log.length as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}

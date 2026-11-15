@@ -54,7 +54,7 @@ start() {
 stop() { kill "${PIDS[$1]}" 2>/dev/null; wait "${PIDS[$1]}" 2>/dev/null; PIDS[$1]=; }
 on() { local n="$1"; shift; aws --no-cli-pager --endpoint-url "http://127.0.0.1:$((BASE + 10 + n))" "$@"; }
 status() { "$BIN" cluster-status --cluster-file cluster.conf --node "$1" 2>/dev/null | tail -n +2; }
-scrubOf() { status "$1" | awk '$1 == "#" { print $4, $5, $6 }'; }  # damaged repaired fetched
+scrubOf() { status "$1" | awk '$1 == "#" && $2 == "scrub" { print $4, $5, $6 }'; }  # damaged repaired fetched
 extentsOf() { ls d$1/shard-0$shard/store-*/extents/ext-*.ce 2>/dev/null | wc -l | tr -d ' '; }
 piecesOf() { ls d$1/shard-0$shard/store-*/extents/piece-*.cp 2>/dev/null | wc -l | tr -d ' '; }
 pieceOf() { ls d$1/shard-0$shard/store-*/extents/piece-*.cp 2>/dev/null | head -1; }
