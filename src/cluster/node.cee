@@ -84,9 +84,20 @@ enum NodeFault {
     Unreached,
 }
 
-fn replicaConfigOf(id: u32, voters: Vector<u32>, learners: Vector<u32>, shard: u32) -> ReplicaConfig {
+fn replicaConfigOf(
+    id: u32,
+    voters: Vector<u32>,
+    learners: Vector<u32>,
+    shard: u32,
+    segmentBytes: u64,
+) -> ReplicaConfig {
     var store = StoreConfig.defaults();
     store.journal.shardId = shard;
+    // Smaller segments, checkpoints as often: a sealed segment is covered (and may be coded) soon after (ADR-0070).
+    if (segmentBytes > 0) {
+        store.journal.segmentTargetBytes = segmentBytes;
+        if (segmentBytes < store.checkpointEveryBytes) { store.checkpointEveryBytes = segmentBytes; }
+    }
     var seed = [0u8; 8];
     let _ = Random.fill(mut seed[..]);
     return ReplicaConfig {
@@ -124,6 +135,7 @@ fn openNode(
     codeAfterMs: u64,
     clockSkewMs: i64,
     joined: bool,
+    segmentBytes: u64,
 ) -> Result<NodeParts, String> {
     if (file.node(id).isNull()) { return Err(textOf("this node is not in the cluster file")); }
     var slots = Vector<ShardSlot>.create();
@@ -160,7 +172,10 @@ fn openNode(
             Ok() => {}
             Err(_) => { return Err(textOf("a shard's directory cannot be made")); }
         }
-        let opened = match (ShardReplica.open(path.view(), replicaConfigOf(id, voters, learners, shard))) {
+        let opened = match (ShardReplica.open(
+            path.view(),
+            replicaConfigOf(id, voters, learners, shard, segmentBytes),
+        )) {
             Ok(r) => r,
             Err(e) => { return Err(storeErrorLine(e)); }
         };
@@ -1054,6 +1069,7 @@ fn nodeCommand() -> i32 {
         codeMs,
         args.clockSkewMs ?? 0,
         joined,
+        (args.segmentMb ?? 0) * 1048576,
     )) {
         Ok(s) => s,
         Err(message) => {
@@ -1127,6 +1143,8 @@ struct ClusterArguments {
     peerListen: String?;
     /// How far off the machine's clock this node signs and checks peer requests (testing only, ADR-0065 §7).
     clockSkewMs: i64?;
+    /// The size a shard's journal segments are sealed at, in MiB (0: the default, 128).
+    segmentMb: u64?;
     /// How an empty directory starts (ADR-0066): the cluster's formation, or joining it.
     init: bool;
     join: bool;
@@ -1141,6 +1159,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var codeAfterSeconds: u64? = null;
     var peerListen: String? = null;
     var clockSkewMs: i64? = null;
+    var segmentMb: u64? = null;
     var init = false;
     var join = false;
     var at = from;
@@ -1168,6 +1187,9 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             credentials = Some(textOf(value));
         } else if (option == "--peer-listen") {
             peerListen = Some(textOf(value));
+        } else if (option == "--segment-mb") {
+            segmentMb = value.parseInt<u64>();
+            if (segmentMb.isNull() || (segmentMb ?? 0) == 0) { return null; }
         } else if (option == "--clock-skew-ms") {
             clockSkewMs = value.parseInt<i64>();
             if (clockSkewMs.isNull()) { return null; }
@@ -1193,6 +1215,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 codeAfterSeconds: codeAfterSeconds,
                 peerListen: peerListen,
                 clockSkewMs: clockSkewMs,
+                segmentMb: segmentMb,
                 init: init,
                 join: join,
             }),

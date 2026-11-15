@@ -187,14 +187,32 @@ async fn codedOfSlot(slot: borrow ShardSlot, id: u64) -> Result<CodedExtent?, No
     };
 }
 
+/// A Coded record to propose: an extent coded (`ext`), or a coded one re-homed (`recode`, its new holders).
+struct CodingWrite {
+    ext: ExtentRef?;
+    recode: RecodeCandidate?;
+    /// A sealed segment coded (ADR-0070).
+    segment: u64?;
+}
+
 fn stageCodedWrite(
     r: borrow mut ShardReplica,
     st: borrow mut ObjectStore,
-    ext: ExtentRef,
+    w: borrow CodingWrite,
     holders: Slice<u32>,
 ) -> Result<u64?, StoreError> {
     let before = r.beginWrite(st)?;
-    match (st.stageCoded(ext, holders)) {
+    let staged = match (w.ext) {
+        Some(ext) => st.stageCoded(ext, holders),
+        null => match (w.recode.asBorrow()) {
+            Some(c) => st.stageRecode(c.id, c.holders.view()),
+            null => match (w.segment) {
+                Some(seg) => st.stageCodedSegment(seg, holders),
+                null => Ok(false),
+            },
+        },
+    };
+    match (staged) {
         Ok(true) => {}
         Ok(false) => { return Ok(null); }
         Err(e) => {
@@ -216,21 +234,52 @@ async fn codeForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
             if (slot.shard == GROUP0_SHARD || slot.failed.load() != 0) { continue; }
             let voters = await votersOfSlot(slot)?;
             if (voters.length < 3 || !(await viewOf(slot))?.leads) { continue; }
-            var candidates = Vector<ExtentRef>.create();
+            // First the coded extents whose holders left (the exit review's F1), then extents to code.
+            var candidates = Vector<CodingWrite>.create();
             {
                 var storeGuard = match (await slot.store.get().lock()) {
                     Ok(g) => g,
                     Err(_) => { return Err(NodeFault.Net); }
                 };
                 let st = storeGuard.data();
+                let rehome = match (await Async.blocking(() => st.recodeCandidates(voters.view(), 4))) {
+                    Ok(c) => c,
+                    Err(_) => Vector<RecodeCandidate>.create(),
+                };
+                var moving = rehome;
+                while (true) {
+                    match (moving.pop()) {
+                        Some(c) => {
+                            if (candidates.push(CodingWrite { ext: null, recode: Some(c), segment: null }).isErr()) {
+                                return Err(NodeFault.OutOfMemory);
+                            }
+                        }
+                        null => { break; }
+                    }
+                }
                 let before = Clock.unixMillis() - truncate<i64>(shared.codeAfterMs);
-                candidates = match (await Async.blocking(() => st.codingCandidates(before, 4))) {
+                let cold = match (await Async.blocking(() => st.codingCandidates(before, 4))) {
                     Ok(c) => c,
                     Err(_) => Vector<ExtentRef>.create(),
                 };
+                for (e in cold.view()) {
+                    if (candidates.push(CodingWrite { ext: Some(e), recode: null, segment: null }).isErr()) {
+                        return Err(NodeFault.OutOfMemory);
+                    }
+                }
+                // Sealed segments, cold and mostly live (ADR-0070 §1).
+                let segments = match (await Async.blocking(() => st.segmentCodingCandidates(before, 2))) {
+                    Ok(c) => c,
+                    Err(_) => Vector<u64>.create(),
+                };
+                for (g in segments.view()) {
+                    if (candidates.push(CodingWrite { ext: null, recode: null, segment: Some(g) }).isErr()) {
+                        return Err(NodeFault.OutOfMemory);
+                    }
+                }
             }
             for (k in 0..candidates.length) {
-                let ext = candidates[k];
+                let w = borrow candidates[k];
                 var gate = match (await slot.gate.lock()) {
                     Ok(g) => g,
                     Err(_) => { return Err(NodeFault.Net); }
@@ -251,7 +300,7 @@ async fn codeForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
                         Err(_) => { return Err(NodeFault.Net); }
                     };
                     let st = storeGuard.data();
-                    let staged = await Async.blocking(() => stageCodedWrite(r, st, ext, voters.view()));
+                    let staged = await Async.blocking(() => stageCodedWrite(r, st, w, voters.view()));
                     index = match (staged) {
                         Ok(Some(x)) => x,
                         _ => { continue; }

@@ -235,3 +235,104 @@ fn codedFaultsOnce() -> Result<void, TestFailure> => sweepCoded("coded-fault-onc
 
 @test
 fn codedFaultsCrash() -> Result<void, TestFailure> => sweepCoded("coded-fault-crash", SweepMode.Crash);
+
+// ---- Coded segments (ADR-0070) ----
+
+fn segmentStoreConfig() -> StoreConfig {
+    var c = storeConfig();
+    c.journal = JournalConfig { segmentTargetBytes: 1200000, maxBatchBytes: 1048576, shardId: 0, raftLog: true };
+    return c;
+}
+
+fn segmentPath0(dir: StringView, id: u64) -> String {
+    var p = String.create();
+    p.append(dir)!;
+    p.append("/seg-")!;
+    appendHex16Text(mut p, id)!;
+    p.append(".cj")!;
+    return p;
+}
+
+@test
+fn sealedSegmentsAreCoded() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("coded-segments");
+    var holders = Vector<u32>.create();
+    holders.push(1)!;
+    holders.push(2)!;
+    holders.push(3)!;
+    var value = Vector<u8>.create();
+    for (i in 0..2000) { value.push(truncate<u8>(i * 3 + 1))!; }
+    var whole = Vector<u8>.create();
+    {
+        var store = ObjectStore.open(dir.view(), segmentStoreConfig())!;
+        store.setNodeId(1);
+        store.setLeaderTerm(1);
+        store.appendNoop(1)!;
+        store.persistEntries()!;
+        store.applyEntries(1, 1)!;
+        store.createBucket("bkt")!;
+        store.applyEntries(2, 2)!;
+        // Inline objects past a segment's size, each its own entry, applied.
+        var index = 2u64;
+        for (k in 0..700) {
+            var key = String.create();
+            key.append("k")!;
+            key.appendNumber(k as i64)!;
+            let _ = store.putObject("bkt", key.view(), "application/octet-stream", value.view(), PutCondition.None)!;
+            store.persistEntries()!;
+            index += 1;
+            store.applyEntries(index, index)!;
+        }
+        Check.isTrue(store.checkpoint()!, "a checkpoint")?;
+        Check.isTrue(store.checkpointStart() > 1, "segment 1 is sealed and covered")?;
+        let candidates = store.segmentCodingCandidates(Clock.unixMillis() + 60000, 4)!;
+        Check.isTrue(candidates.length >= 1 && candidates[0] == 1, "segment 1 is a candidate")?;
+        Check.equalU64(0, store.segmentCodingCandidates(Clock.unixMillis() - 60000, 4)!.length as u64)?;
+        let path = segmentPath0(dir.view(), 1);
+        let f = DurableFile.openRead(path.view())!;
+        whole.resize(f.size()! as usize, 0)!;
+        f.readExactAt(mut whole.viewMut(), 0)!;
+        Check.isTrue(store.stageCodedSegment(1, holders.view())!, "staged")?;
+        store.persistEntries()!;
+        index += 1;
+        store.applyEntries(index, index)!;
+        // Its file is gone, its piece here; a read of an object in it wants it decoded.
+        Check.isFalse(DurableFile.openRead(path.view()).isOk(), "the whole copy went")?;
+        let id = segmentCodedId(1);
+        Check.isTrue(store.pieceBytes(id, 0)!.isSome(), "the piece is here")?;
+        Check.equalU64(0, store.missingPieces(16)!.length as u64)?;
+        match (store.getObject("bkt", "k0")) {
+            Err(StoreError.ExtentWanted) => {}
+            _ => { return Err(TestFailure.create("a read in a coded segment wants it")); }
+        }
+        let wanted = store.takeWanted();
+        Check.equalU64(1, wanted.length as u64)?;
+        Check.equalU64(id, wanted[0])?;
+        // Decoded from piece 0 and piece 2 (made here from the bytes it was): reads come back.
+        let c = store.codedOf(id)!!;
+        let rs = ReedSolomon.create(2, 1)!!;
+        var indexes = Vector<usize>.create();
+        indexes.push(0)!;
+        indexes.push(2)!;
+        var pieces = Vector<Vector<u8>>.create();
+        pieces.push(store.pieceBytes(id, 0)!!)!;
+        pieces.push(rs.piece(whole.view(), 2)!)!;
+        let back = rs.decode(indexes.view(), pieces.view(), c.length)!!;
+        Check.equalBytes(whole.view(), back.view())?;
+        store.installDecoded(id, back.view())!;
+        Check.equalBytes(value.view(), store.getObject("bkt", "k0")!.view())?;
+        // Swept an hour later.
+        Check.equalU64(1, store.sweepDecoded(Clock.unixMillis() + 7200000)! as u64)?;
+        Check.isTrue(store.getObject("bkt", "k0").isErr(), "coded again")?;
+        Check.isTrue(store.checkpoint()!, "another checkpoint")?;
+    }
+    // Reopened: the coding is there; the newest objects (in later segments) read as before.
+    var store = ObjectStore.open(dir.view(), segmentStoreConfig())!;
+    store.setNodeId(1);
+    let _ = store.takeRecoveredTerms();
+    Check.isTrue(store.codedOf(segmentCodedId(1))!.isSome(), "still coded")?;
+    Check.isTrue(store.getObject("bkt", "k0").isErr(), "an old object wants decoding")?;
+    Check.equalBytes(value.view(), store.getObject("bkt", "k699")!.view())?;
+    removeTree(dir.view());
+    return Ok();
+}

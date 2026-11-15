@@ -79,22 +79,23 @@ fn raftLogEntriesInOrder() -> Result<void, TestFailure> {
         lsn += 1;
     }
     j.commit()!;
-    // Nothing is committed, so the log stays in one segment past its target.
-    Check.equalU64(1, j.activeSegment())?;
+    // Past its target the log rotates where its records say, committed or not (ADR-0070 §1).
+    Check.isTrue(j.activeSegment() > 1, "rotated")?;
     for (k in 2..21) {
         let index = truncate<u64>(k);
         let expected = entryRecord(index, 3);
         let got = j.entryBytes(index)!;
         Check.equalBytes(expected.view(), got.view())?;
     }
-    // Committed through the end: the full segment is sealed.
+    // A commit mark rotates nothing.
+    let active = j.activeSegment();
     j.markCommitted(20);
-    Check.equalU64(2, j.activeSegment())?;
+    Check.equalU64(active, j.activeSegment())?;
     let more = j.stageEntry(RecordType.PutInline, 3, "m".bytes(), "p".bytes())!;
     Check.equalU64(21, more.lsn)?;
     j.commit()!;
     Check.equalU64(21, j.entryAt(21)!.header.lsn)?;
-    Check.equalU64(2, j.entryAt(21)!.segment)?;
+    Check.equalU64(j.activeSegment(), j.entryAt(21)!.segment)?;
     let terms = raftReplay(dir.view(), JournalStart.beginning())!;
     Check.equalU64(21, terms.length as u64)?;
     Check.equalU64(2, terms[0])?;
@@ -287,7 +288,10 @@ fn raftLogFaultsCrash() -> Result<void, TestFailure> => sweepRaftLog("raft-fault
 fn raftLogCutsABatchInFlight() -> Result<void, TestFailure> {
     let dir = scratchDirectory("raft-cut-inflight");
     {
-        var j = Journal.open(dir.view(), raftJournalConfig(), (s, o, h, b) => {})!;
+        // A segment large enough for the whole test: a batch that would seal one is committed, not sent in flight.
+        var big = raftJournalConfig();
+        big.segmentTargetBytes = 1048576;
+        var j = Journal.open(dir.view(), big, (s, o, h, b) => {})!;
         for (lsn in 1u64..6u64) { let _ = j.appendEncoded(entryRecord(lsn, 1).view())!; }
         j.commit()!;
         var payload = Vector<u8>.create();
@@ -310,6 +314,78 @@ fn raftLogCutsABatchInFlight() -> Result<void, TestFailure> {
     }
     let log = raftReplay(dir.view(), JournalStart.beginning())!;
     Check.equalU64(6, log.length as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// Every replica's segments hold the same entries (ADR-0070 §1): two logs given the same entries, one in batches of
+/// one and committed at once, the other in batches of five and committed late, have the same segment files, byte for
+/// byte.
+@test
+fn raftLogSegmentsAreTheSameOnEveryReplica() -> Result<void, TestFailure> {
+    let a = scratchDirectory("raft-same-a");
+    let b = scratchDirectory("raft-same-b");
+    {
+        var ja = Journal.open(a.view(), raftJournalConfig(), (s, o, h, r) => {})!;
+        var jb = Journal.open(b.view(), raftJournalConfig(), (s, o, h, r) => {})!;
+        for (lsn in 1u64..61u64) {
+            let _ = ja.appendEncoded(entryRecord(lsn, 1).view())!;
+            ja.commit()!;
+            ja.markCommitted(lsn);
+            let _ = jb.appendEncoded(entryRecord(lsn, 1).view())!;
+            if (lsn % 5 == 0) { jb.commit()!; }
+            if (lsn % 7 == 0) { jb.markCommitted(lsn - 3); }
+        }
+        jb.commit()!;
+        Check.isTrue(ja.activeSegment() > 3, "several segments")?;
+        Check.equalU64(ja.activeSegment(), jb.activeSegment())?;
+    }
+    let ids = listSegmentIds(a.view())!;
+    Check.equalU64(ids.length as u64, listSegmentIds(b.view())!.length as u64)?;
+    for (k in 0..ids.length) {
+        var pa = String.create();
+        pa.append(a.view())!;
+        var pb = String.create();
+        pb.append(b.view())!;
+        let name = segmentName(ids[k])!;
+        pa.append("/")!;
+        pa.append(name.view())!;
+        pb.append("/")!;
+        pb.append(name.view())!;
+        Check.equalBytes(readWhole(pa.view()).view(), readWhole(pb.view()).view())?;
+    }
+    removeTree(a.view());
+    removeTree(b.view());
+    return Ok();
+}
+
+/// A cut that starts in a sealed segment (a log rotates where its records say, ADR-0070 §1): the newer segments go,
+/// the one it starts in is active again, and the log goes on from the cut, after a reopen too.
+@test
+fn raftLogCutsAcrossSegments() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("raft-cut-across");
+    {
+        var j = Journal.open(dir.view(), raftJournalConfig(), (s, o, h, r) => {})!;
+        for (lsn in 1u64..41u64) {
+            let _ = j.appendEncoded(entryRecord(lsn, 1).view())!;
+            j.commit()!;
+        }
+        j.markCommitted(10);
+        let cutIn = j.entryAt(12)!.segment;
+        Check.isTrue(j.activeSegment() > cutIn, "the cut starts in a sealed segment")?;
+        j.truncateAfter(11)!;
+        Check.equalU64(cutIn, j.activeSegment())?;
+        Check.equalU64(11, j.lastLsn())?;
+        for (lsn in 12u64..16u64) {
+            let _ = j.appendEncoded(entryRecord(lsn, 2).view())!;
+            j.commit()!;
+        }
+        Check.equalU64(2, j.entryAt(15)!.header.term)?;
+    }
+    let terms = raftReplay(dir.view(), JournalStart.beginning())!;
+    Check.equalU64(15, terms.length as u64)?;
+    Check.equalU64(1, terms[10])?;
+    Check.equalU64(2, terms[11])?;
     removeTree(dir.view());
     return Ok();
 }

@@ -12,6 +12,8 @@ struct CodedExtent {
     pieceLength: u64;
     holders: Vector<u32>;
     crcs: Vector<u32>;
+    /// A sealed segment's coding, not an extent's (ADR-0070): the top bit of the record's m byte.
+    segment: bool;
 
     /// The piece node `node` holds, or null.
     fn pieceOf(borrow this, node: u32) -> usize? {
@@ -30,14 +32,32 @@ struct CodedExtent {
             pieceLength: this.pieceLength,
             holders: this.holders.clone()?,
             crcs: this.crcs.clone()?,
+            segment: this.segment,
         });
     }
+}
+
+/// A coded segment's key among the coded extents' (ADR-0070): the segment's id with the top bit set, so that it is
+/// not a small number an extent could have. What a coding is says its record (`segment`), never the key: extent ids
+/// are random, and half have that bit set.
+const SEGMENT_CODED_TAG: u64 = 0x8000000000000000;
+/// A segment smaller than this is not worth coding.
+const SEGMENT_CODE_MIN_BYTES: u64 = 1048576;
+
+fn segmentCodedId(segment: u64) -> u64 => segment | SEGMENT_CODED_TAG;
+
+fn segmentOfCoded(id: u64) -> u64 => id ^ SEGMENT_CODED_TAG;
+
+/// A coded extent to re-home, and the holders it should have.
+struct RecodeCandidate {
+    id: u64;
+    holders: Vector<u32>;
 }
 
 fn encodeCoded(out: borrow mut Vector<u8>, c: borrow CodedExtent) -> Result<void, AllocError> {
     out.pushLE(c.id)?;
     out.pushLE(truncate<u8>(c.k))?;
-    out.pushLE(truncate<u8>(c.m))?;
+    out.pushLE(truncate<u8>(c.m) | (if (c.segment) 0x80u8 else 0u8))?;
     out.pushLE(c.length)?;
     out.pushLE(c.pieceLength)?;
     for (i in 0..c.holders.length) {
@@ -50,7 +70,8 @@ fn encodeCoded(out: borrow mut Vector<u8>, c: borrow CodedExtent) -> Result<void
 fn decodeCoded(b: Slice<u8>) -> CodedExtent? {
     if (b.length < 26) { return null; }
     let k = b[8] as u32;
-    let m = b[9] as u32;
+    let m = (b[9] & 0x7F) as u32;
+    let segment = (b[9] & 0x80) != 0;
     let n = (k + m) as usize;
     if (k == 0 || m == 0 || b.length != 26 + n * 8) { return null; }
     var holders = Vector<u32>.create();
@@ -68,6 +89,7 @@ fn decodeCoded(b: Slice<u8>) -> CodedExtent? {
         pieceLength: b.readLE<u64>(18),
         holders: holders,
         crcs: crcs,
+        segment: segment,
     });
 }
 

@@ -501,8 +501,47 @@ class Proxy:
 # The cluster.
 
 
+class RemoteProc:
+    """A node on another machine (ADR-0069 §2), started over SSH: what the harness asks of a local process."""
+
+    def __init__(self, host, pid):
+        self.host = host
+        self.pid = pid
+        self.dead = False
+        self.checked = 0.0
+
+    def ssh(self, command):
+        return subprocess.run(["ssh", "-o", "BatchMode=yes", self.host, command], capture_output=True, text=True,
+                              timeout=30)
+
+    def poll(self):
+        if self.dead:
+            return 1
+        if time.time() - self.checked < 1.0:
+            return None
+        self.checked = time.time()
+        if self.ssh(f"kill -0 {self.pid}").returncode != 0:
+            self.dead = True
+            return 1
+        return None
+
+    def send_signal(self, sig):
+        # By name: the numbers differ between macOS and Linux (SIGSTOP is 17 on one, 19 on the other).
+        self.ssh(f"kill -{signal.Signals(sig).name[3:]} {self.pid}")
+
+    def kill(self):
+        self.ssh(f"kill -9 {self.pid}")
+        self.dead = True
+
+    def wait(self):
+        return 0
+
+
 class Cluster:
-    def __init__(self, binary, work, nodes, base, standby=(), racks=0):
+    def __init__(self, binary, work, nodes, base, standby=(), racks=0, hosts=None):
+        # Where each node runs (ADR-0069 §2): None on this machine, or (user@host, binary there).
+        self.hosts = hosts or [None] * nodes
+        self.tunnels = []
         self.standby = set(standby)
         # With racks, node i is in rack (i - 1) % racks: nodes 1 to `racks` in different ones (group 0's three).
         self.racks = racks
@@ -522,7 +561,9 @@ class Cluster:
             f.write(f"{ACCESS} {SECRET}\n")
         with open(os.path.join(work, "cluster.key"), "w") as f:
             f.write(__import__("base64").b64encode(os.urandom(32)).decode() + "\n")
-        lines = ["cluster 0dd0ee0ff0aa0bb0", "shards 2", "replicas 3", f"secret-file {work}/cluster.key"]
+        # The secret file by a relative name: the cluster file must be the same on every machine (its digest signs every
+        # request between nodes), and every node runs in its own work directory.
+        lines = ["cluster 0dd0ee0ff0aa0bb0", "shards 2", "replicas 3", "secret-file cluster.key"]
         domains = "abcdefgh"
         for i in range(1, nodes + 1):
             domain = domains[(i - 1) % racks] if racks else domains[i - 1]
@@ -546,16 +587,69 @@ class Cluster:
     def peer_port(self, i):
         return self.base + 40 + i
 
+    def remote_work(self, i):
+        host, binary = self.hosts[i - 1]
+        return os.path.join(os.path.dirname(binary), "run-" + os.path.basename(self.work))
+
+    def node_args(self, i, binary, work):
+        return ([binary, "node", os.path.join(work, f"d{i}"), "--cluster-file", os.path.join(work, "cluster.conf"),
+                 "--node", str(i), self.start_mode.get(i, "--init"), "--listen", str(self.s3_port(i)),
+                 "--credentials", os.path.join(work, "credentials"), "--peer-listen", str(self.peer_port(i))]
+                + (["--clock-skew-ms", str(self.skew[i])] if self.skew.get(i) else []) + self.extra)
+
+    def setup_remote(self):
+        """Each remote node's directory, files and tunnel: its peer and S3 ports to this machine (`-L`), every node's
+        proxy port to it (`-R`). Nothing listens on any host's network."""
+        for i in range(1, self.n + 1):
+            if self.hosts[i - 1] is None:
+                continue
+            host, binary = self.hosts[i - 1]
+            w = self.remote_work(i)
+            subprocess.run(["ssh", "-o", "BatchMode=yes", host, f"mkdir -p {w}"], check=True, timeout=30)
+            subprocess.run(["scp", "-q", self.conf, os.path.join(self.work, "cluster.key"),
+                            os.path.join(self.work, "credentials"), f"{host}:{w}/"], check=True, timeout=60)
+            forwards = []
+            for j in range(1, self.n + 1):
+                forwards += ["-R", f"{self.proxy_port(j)}:127.0.0.1:{self.proxy_port(j)}"]
+            forwards += ["-L", f"{self.peer_port(i)}:127.0.0.1:{self.peer_port(i)}",
+                         "-L", f"{self.s3_port(i)}:127.0.0.1:{self.s3_port(i)}"]
+            self.tunnels.append(subprocess.Popen(
+                ["ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=5"]
+                + forwards + [host], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        time.sleep(2 if self.tunnels else 0)
+
+    def finish_remote(self, keep):
+        """The remote nodes' logs into this run's work directory; their directories removed unless kept."""
+        for i in range(1, self.n + 1):
+            if self.hosts[i - 1] is None:
+                continue
+            host, _ = self.hosts[i - 1]
+            w = self.remote_work(i)
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, f"cat {w}/log{i}"], capture_output=True,
+                               timeout=60)
+            with open(os.path.join(self.work, f"log{i}"), "ab") as f:
+                f.write(r.stdout)
+            if not keep:
+                subprocess.run(["ssh", "-o", "BatchMode=yes", host, f"rm -rf {w}"], timeout=60)
+        for t in self.tunnels:
+            t.kill()
+
     def start(self, i):
+        if self.hosts[i - 1] is not None:
+            host, binary = self.hosts[i - 1]
+            w = self.remote_work(i)
+            command = " ".join(self.node_args(i, binary, w))
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", host,
+                                f"cd {w} && mkdir -p d{i} && (nohup nice -n 10 {command} >> {w}/log{i} 2>&1 < /dev/null & echo $!)"],
+                               capture_output=True, text=True, timeout=30)
+            self.procs[i] = RemoteProc(host, int(r.stdout.strip() or "0"))
+            self.paused.discard(i)
+            return
         d = os.path.join(self.work, f"d{i}")
         os.makedirs(d, exist_ok=True)
         log = open(os.path.join(self.work, f"log{i}"), "ab")
-        self.procs[i] = subprocess.Popen(
-            [self.binary, "node", d, "--cluster-file", self.conf, "--node", str(i), self.start_mode.get(i, "--init"),
-             "--listen", str(self.s3_port(i)), "--credentials", os.path.join(self.work, "credentials"),
-             "--peer-listen", str(self.peer_port(i))]
-            + (["--clock-skew-ms", str(self.skew[i])] if self.skew.get(i) else []) + self.extra,
-            stdout=log, stderr=log)
+        self.procs[i] = subprocess.Popen(self.node_args(i, self.binary, self.work), stdout=log, stderr=log,
+                                         cwd=self.work)
         log.close()  # the child has its own; ours would leak a descriptor a start
         self.paused.discard(i)
 
@@ -587,7 +681,7 @@ class Cluster:
     def status_text(self, i):
         try:
             return subprocess.run([self.binary, "cluster-status", "--cluster-file", self.conf, "--node", str(i)],
-                                  capture_output=True, text=True, timeout=5).stdout
+                                  capture_output=True, text=True, timeout=5, cwd=self.work).stdout
         except subprocess.TimeoutExpired:
             return "(no answer in 5 s)\n"
 
@@ -595,7 +689,7 @@ class Cluster:
         """[(shard, role, term, leader, last, commit, applied)] as node i reports them, or []."""
         try:
             out = subprocess.run([self.binary, "cluster-status", "--cluster-file", self.conf, "--node", str(i)],
-                                 capture_output=True, text=True, timeout=5).stdout
+                                 capture_output=True, text=True, timeout=5, cwd=self.work).stdout
         except subprocess.TimeoutExpired:
             return []
         rows = []
@@ -609,7 +703,7 @@ class Cluster:
         """`cluster-join` or `cluster-leave` of node i: (whether it answered 0, what it said on stderr)."""
         try:
             r = subprocess.run([self.binary, command, "--cluster-file", self.conf, "--node", str(i)],
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, timeout=60, cwd=self.work)
             return r.returncode == 0, r.stderr.strip()
         except subprocess.TimeoutExpired:
             return False, "no answer in 60 s"
@@ -634,7 +728,11 @@ class Cluster:
                    or (s == "65535" and str(i) in r[7].split(",")))
 
     def wipe(self, i):
-        shutil.rmtree(os.path.join(self.work, f"d{i}"), ignore_errors=True)
+        if self.hosts[i - 1] is not None:
+            host, _ = self.hosts[i - 1]
+            subprocess.run(["ssh", "-o", "BatchMode=yes", host, f"rm -rf {self.remote_work(i)}/d{i}"], timeout=60)
+        else:
+            shutil.rmtree(os.path.join(self.work, f"d{i}"), ignore_errors=True)
         self.start_mode[i] = "--join"
 
     def leaders(self):
@@ -933,7 +1031,20 @@ def run(args):
     if args.racks and args.disk_loss:
         print("chaos: --racks and --disk-loss are runs of their own")
         return False
-    cluster = Cluster(binary, work, nodes, args.port_base, standby, args.racks)
+    hosts = None
+    if args.hosts:
+        # local, or user@host:/path/to/cosmostore there (ADR-0069 §2).
+        hosts = []
+        for h in args.hosts.split(","):
+            if h == "local":
+                hosts.append(None)
+            else:
+                host, _, path = h.partition(":")
+                hosts.append((host, path))
+        if len(hosts) != nodes:
+            print(f"chaos: --hosts names {len(hosts)} machines for {nodes} nodes")
+            return False
+    cluster = Cluster(binary, work, nodes, args.port_base, standby, args.racks, hosts)
     if args.code_after_seconds:
         # Large values coded within seconds (ADR-0064): reads of them decode, under the faults.
         cluster.extra += ["--code-after-seconds", str(args.code_after_seconds)]
@@ -941,6 +1052,7 @@ def run(args):
     proxy.start()
     ok = False
     try:
+        cluster.setup_remote()
         for i in range(1, args.nodes + 1):
             cluster.start(i)
         deadline = time.time() + 30
@@ -1025,7 +1137,7 @@ def run(args):
                         if shutil.which("sample"):
                             for j in range(1, args.nodes + 1):
                                 p = cluster.procs.get(j)
-                                if p and p.poll() is None:
+                                if p and not isinstance(p, RemoteProc) and p.poll() is None:
                                     subprocess.run(["sample", str(p.pid), "1", "-file",
                                                     os.path.join(work, f"sample-node{j}.txt")],
                                                    capture_output=True, timeout=30)
@@ -1061,7 +1173,10 @@ def run(args):
         if unanswered:
             print("FAIL after the heal, no answer for: " + ", ".join(unanswered))
             ok = False
-        # A replica that stopped itself (a journal it found corrupt, a failed write) is a failure of its own.
+        # A replica that stopped itself (a journal it found corrupt, a failed write) is a failure of its own. The
+        # remote nodes' logs first (ADR-0069 §2).
+        cluster.stop_all()
+        cluster.finish_remote(keep=True)
         for i in range(1, args.nodes + 1):
             with open(os.path.join(work, f"log{i}"), errors="replace") as f:
                 for line in f:
@@ -1100,6 +1215,14 @@ def run(args):
     finally:
         proxy.stop()
         cluster.stop_all()
+        if cluster.tunnels:
+            for i in range(1, cluster.n + 1):
+                if cluster.hosts[i - 1] is not None and (ok and not args.keep):
+                    host, _ = cluster.hosts[i - 1]
+                    subprocess.run(["ssh", "-o", "BatchMode=yes", host, f"rm -rf {cluster.remote_work(i)}"],
+                                   timeout=60)
+            for t in cluster.tunnels:
+                t.kill()
         if ok and not args.keep:
             shutil.rmtree(work, ignore_errors=True)
         else:
@@ -1117,6 +1240,8 @@ def main():
     p.add_argument("--keys", type=int, default=4)
     p.add_argument("--keep", action="store_true")
     p.add_argument("--nemesis", default=None, help="the faults to choose from, by name, with commas")
+    p.add_argument("--hosts", default=None,
+                   help="where each node runs, with commas: local, or user@host:/path/to/cosmostore (ADR-0069)")
     p.add_argument("--code-after-seconds", type=int, default=0,
                    help="passed to the nodes: the large values' extents are coded this soon (ADR-0064)")
     p.add_argument("--racks", type=int, default=0,

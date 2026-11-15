@@ -1623,7 +1623,7 @@ struct ObjectStore {
         // Which coded extents have a whole copy here.
         for (i in 0..store.state.coded.length()) {
             let id: u64 = store.state.coded.keyAt(i);
-            let path = extentPath(store.extentDir.view(), id)?;
+            let path = store.wholePathOf(id)?;
             if (ObjectStore.fileExists(path.view())) { let _ = store.wholeCoded.put(id, true)?; }
         }
         return Ok(store);
@@ -1734,18 +1734,210 @@ struct ObjectStore {
 
     fn fileExists(path: StringView) -> bool => DurableFile.openRead(path).isOk();
 
+    // A coded thing's whole copy (ADR-0070): an extent's file, or a segment's.
+
+    fn wholePathOf(borrow this, id: u64) -> Result<String, StoreError> {
+        if (this.codedIsSegment(id)) { return Ok(this.journal.segmentFile(segmentOfCoded(id))?); }
+        return Ok(extentPath(this.extentDir.view(), id)?);
+    }
+
+    /// The coded bytes of `id`'s whole copy, `length` of them; null when there is none here or it is not that long.
+    fn wholeDataOf(borrow this, id: u64, length: u64) -> Result<Vector<u8>?, StoreError> {
+        if (this.codedIsSegment(id)) {
+            let path = this.wholePathOf(id)?;
+            let file = match (DurableFile.openRead(path.view())) {
+                Ok(f) => f,
+                Err(e) => {
+                    if (e.isNotFound()) { return Ok(null); }
+                    return Err(StoreError.Io(e));
+                }
+            };
+            if (sio(file.size())? != length) { return Ok(null); }
+            var out = Vector<u8>.create();
+            out.resize(length as usize, 0)?;
+            sio(file.readExactAt(mut out.viewMut(), 0))?;
+            return Ok(Some(out));
+        }
+        let bytes = match (this.extentFileBytes(id)) {
+            Ok(b) => b,
+            Err(StoreError.Io(e)) => {
+                if (e.isNotFound()) { return Ok(null); }
+                return Err(StoreError.Io(e));
+            }
+            Err(e) => { return Err(e); }
+        };
+        if ((bytes.length as u64) != EXTENT_HEADER_LEN + length) { return Ok(null); }
+        var out = Vector<u8>.create();
+        out.extend(bytes.view()[EXTENT_HEADER_LEN as usize..bytes.length])?;
+        return Ok(Some(out));
+    }
+
+    fn removeWholeOf(borrow mut this, id: u64) -> Result<void, StoreError> {
+        if (this.codedIsSegment(id)) {
+            match (this.journal.removeSegment(segmentOfCoded(id))) {
+                Ok() => {}
+                Err(JournalError.Io(e)) => {
+                    if (!e.isNotFound()) { return Err(StoreError.Journal(JournalError.Io(e))); }
+                }
+                Err(e) => { return Err(StoreError.Journal(e)); }
+            }
+            sio(Fs.syncDirectory(this.dir.view()))?;
+            return Ok();
+        }
+        removeExtent(this.extentDir.view(), id);
+        return Ok();
+    }
+
+    /// Whether coding `id` is a sealed segment's (ADR-0070): as its record says.
+    fn codedIsSegment(borrow this, id: u64) -> bool => match (this.state.coded.get(borrow id)) {
+        Some(c) => c.segment,
+        null => false,
+    };
+
+    /// Whether sealed segment `segment` is coded (ADR-0070).
+    fn segmentIsCoded(borrow this, segment: u64) -> bool {
+        let id = segmentCodedId(segment);
+        return this.state.coded.contains(borrow id);
+    }
+
+    /// Whether `id`'s whole copy here is the bytes its coding was made of (its first piece's CRC, a slice of it); true
+    /// when there is none (nothing to keep).
+    fn wholeMatches(borrow this, id: u64) -> Result<bool, StoreError> {
+        let c = match (this.state.coded.get(borrow id)) {
+            Some(c) => c.copy()?,
+            null => { return Ok(true); }
+        };
+        let data = match (this.wholeDataOf(id, c.length)?) {
+            Some(d) => d,
+            null => {
+                // A file of another length is not it either.
+                let path = this.wholePathOf(id)?;
+                return Ok(!ObjectStore.fileExists(path.view()));
+            }
+        };
+        let rs = match (ReedSolomon.create(c.k as usize, c.m as usize)?) {
+            Some(r) => r,
+            null => { return Ok(false); }
+        };
+        return Ok(Crc32c.of(rs.piece(data.view(), 0)?.view()) == c.crcs[0]);
+    }
+
+    /// Whether a read holds `id`'s whole copy open.
+    fn wholePinned(borrow this, id: u64) -> bool =>
+        if (this.codedIsSegment(id)) this.segmentPins.isPinned(segmentOfCoded(id)) else this.pins.isPinned(id);
+
+    /// Sealed segments a leader codes (ADR-0070 §1): wholly before the checkpoint's segment, at least
+    /// SEGMENT_CODE_MIN_BYTES, mostly live (compaction would not take them), not coded, not pinned, their files older
+    /// than `before`. At most `most`.
+    fn segmentCodingCandidates(borrow this, before: i64, most: usize) -> Result<Vector<u64>, StoreError> {
+        var out = Vector<u64>.create();
+        for (i in 0..this.state.segments.length()) {
+            if (out.length >= most) { break; }
+            let id: u64 = this.state.segments.keyAt(i);
+            let u = this.state.segments.valueAt(i);
+            if (id >= this.checkpointSegment || this.segmentIsCoded(id)) { continue; }
+            if (u.liveBytes == 0 || u.liveBytes * 100 < u.totalBytes * this.config.compactBelowLivePercent) {
+                continue;
+            }
+            if (this.segmentPins.isPinned(id)) { continue; }
+            let path = this.journal.segmentFile(id)?;
+            let file = match (DurableFile.openRead(path.view())) {
+                Ok(f) => f,
+                Err(_) => { continue; }
+            };
+            if (sio(file.size())? < SEGMENT_CODE_MIN_BYTES) { continue; }
+            match (Fs.modifiedMillis(path.view())) {
+                Ok(m) => {
+                    if (m < before) { out.push(id)?; }
+                }
+                Err(_) => {}
+            }
+        }
+        return Ok(out);
+    }
+
+    /// Stages the Coded record of sealed segment `segment` for the voters `holders` (ADR-0070 §2): its file read whole,
+    /// its pieces made for their CRCs. Whether it was staged.
+    fn stageCodedSegment(borrow mut this, segment: u64, holders: Slice<u32>) -> Result<bool, StoreError> {
+        let id = segmentCodedId(segment);
+        let n = holders.length;
+        if (n < 3 || this.state.coded.contains(borrow id) || segment >= this.checkpointSegment) { return Ok(false); }
+        let path = this.journal.segmentFile(segment)?;
+        let file = match (DurableFile.openRead(path.view())) {
+            Ok(f) => f,
+            Err(_) => { return Ok(false); }
+        };
+        let size = sio(file.size())?;
+        var data = Vector<u8>.create();
+        data.resize(size as usize, 0)?;
+        sio(file.readExactAt(mut data.viewMut(), 0))?;
+        let m = (n - 1) / 2;
+        let k = n - m;
+        let rs = match (ReedSolomon.create(k, m)?) {
+            Some(r) => r,
+            null => { return Ok(false); }
+        };
+        var crcs = Vector<u32>.create();
+        for (i in 0..n) { crcs.push(Crc32c.of(rs.piece(data.view(), i)?.view()))?; }
+        var holderIds = Vector<u32>.create();
+        for (x in holders) { holderIds.push(x)?; }
+        let c = CodedExtent {
+            id: id,
+            k: truncate<u32>(k),
+            m: truncate<u32>(m),
+            length: size,
+            pieceLength: rs.pieceLength(size),
+            holders: holderIds,
+            crcs: crcs,
+            segment: true,
+        };
+        var meta = Vector<u8>.create();
+        encodeCoded(mut meta, borrow c)?;
+        let empty = Vector<u8>.create();
+        let _ = this.stageRecord(RecordType.Coded, meta.view(), empty.view())?;
+        return Ok(true);
+    }
+
+    /// A coded segment with nothing live left: its pieces and coding go (it has no file to remove).
+    fn dropCodedSegment(borrow mut this, segment: u64) -> Result<void, StoreError> {
+        let id = segmentCodedId(segment);
+        // Its whole copy, if a read had it decoded, while the coding still says it is a segment's.
+        this.removeWholeOf(id)?;
+        match (this.state.coded.remove(borrow id)) {
+            Some(c) => {
+                for (p in 0..c.holders.length) {
+                    match (piecePath(this.extentDir.view(), id, p)) {
+                        Ok(path) => { let _ = Fs.unlink(path.view()); }
+                        Err(_) => {}
+                    }
+                }
+            }
+            null => {}
+        }
+        let _ = this.wholeCoded.remove(borrow id);
+        return Ok();
+    }
+
     /// A Coded record applied: this replica writes its piece from its whole copy, synced, and only then removes the
     /// copy (kept while a read has it pinned, for `sweepDecoded`); without a whole copy it writes nothing, and its
     /// piece is missing (`missingPieces`).
     fn convertToPiece(borrow mut this, id: u64) -> Result<void, StoreError> {
         if (!this.state.coded.contains(borrow id)) { return Ok(); }
         let _ = this.pieceFromWhole(id)?;
-        if (this.pins.isPinned(id)) {
-            let full = extentPath(this.extentDir.view(), id)?;
+        // A segment whose file is not the bytes the leader coded stays whole (ADR-0070 §4): its records' places are
+        // this replica's, and only its own copy has them there. (Segments are the same on every replica, so this is a
+        // guard, not a path taken.)
+        if (this.codedIsSegment(id) && !this.wholeMatches(id)?) {
+            let full = this.wholePathOf(id)?;
             if (ObjectStore.fileExists(full.view())) { let _ = this.wholeCoded.put(id, true)?; }
             return Ok();
         }
-        removeExtent(this.extentDir.view(), id);
+        if (this.wholePinned(id)) {
+            let full = this.wholePathOf(id)?;
+            if (ObjectStore.fileExists(full.view())) { let _ = this.wholeCoded.put(id, true)?; }
+            return Ok();
+        }
+        this.removeWholeOf(id)?;
         let _ = this.wholeCoded.remove(borrow id);
         return Ok();
     }
@@ -1765,20 +1957,15 @@ struct ObjectStore {
         if (this.pieceFileOk(borrow c, i)?) { return Ok(false); }
         // No whole copy is no piece; a copy that cannot be read is an error, so that the caller keeps it (a copy
         // removed with no piece written would be the data lost here).
-        let bytes = match (this.extentFileBytes(id)) {
-            Ok(b) => b,
-            Err(StoreError.Io(e)) => {
-                if (e.isNotFound()) { return Ok(false); }
-                return Err(StoreError.Io(e));
-            }
-            Err(e) => { return Err(e); }
+        let data = match (this.wholeDataOf(id, c.length)?) {
+            Some(d) => d,
+            null => { return Ok(false); }
         };
-        if ((bytes.length as u64) != EXTENT_HEADER_LEN + c.length) { return Ok(false); }
         let rs = match (ReedSolomon.create(c.k as usize, c.m as usize)?) {
             Some(r) => r,
             null => { return Ok(false); }
         };
-        let piece = rs.piece(bytes.view()[EXTENT_HEADER_LEN as usize..bytes.length], i)?;
+        let piece = rs.piece(data.view(), i)?;
         if (Crc32c.of(piece.view()) != c.crcs[i]) { return Ok(false); } // not the bytes the leader coded
         this.writePiece(id, i, piece.view())?;
         return Ok(true);
@@ -1815,6 +2002,13 @@ struct ObjectStore {
     /// Whether a read of `v` must wait for a coded extent to be decoded here; if so, the extent is noted as wanted
     /// (ADR-0064 §5).
     fn wantsDecode(borrow this, v: borrow ObjectVersion) -> bool {
+        // An inline version in a coded segment (ADR-0070 §3).
+        if (v.extents.length == 0) {
+            let id = segmentCodedId(v.recordSegment);
+            if (!this.state.coded.contains(borrow id) || this.wholeCoded.contains(borrow id)) { return false; }
+            let _ = this.wanted.trySend(id);
+            return true;
+        }
         var wants = false;
         for (e in 0..v.extents.length) {
             let id = v.extents[e].id;
@@ -1916,6 +2110,17 @@ struct ObjectStore {
 
     /// A coded extent decoded again (ADR-0064 §5): written as an extent file, with its header, synced.
     fn installDecoded(borrow mut this, id: u64, data: Slice<u8>) -> Result<void, StoreError> {
+        if (this.codedIsSegment(id)) {
+            // A segment's whole copy is its file again, as it was before it was coded (synced, its directory synced).
+            let path = this.wholePathOf(id)?;
+            let _ = Fs.unlink(path.view());
+            let file = sio(DurableFile.createNew(path.view()))?;
+            sio(file.writeAt(data, 0))?;
+            sio(file.syncData())?;
+            sio(Fs.syncDirectory(this.dir.view()))?;
+            let _ = this.wholeCoded.put(id, true)?;
+            return Ok();
+        }
         var bytes = Vector<u8>.create();
         bytes.resize(EXTENT_HEADER_LEN as usize, 0)?;
         bytes.viewMut().writeLE(0, EXTENT_MAGIC);
@@ -2008,7 +2213,65 @@ struct ObjectStore {
             pieceLength: rs.pieceLength(data.length as u64),
             holders: holderIds,
             crcs: crcs,
+            segment: false,
         };
+        var meta = Vector<u8>.create();
+        encodeCoded(mut meta, borrow c)?;
+        let empty = Vector<u8>.create();
+        let _ = this.stageRecord(RecordType.Coded, meta.view(), empty.view())?;
+        return Ok(true);
+    }
+
+    /// Coded extents with a holder that no longer votes in the shard (it left, ADR-0062), each with the holders it
+    /// should have: the departed replaced by a voter that holds no piece of it. At most `most`; none when no voter is
+    /// free to take one (the M6 exit review's F1: a piece whose holder left was never made again).
+    fn recodeCandidates(borrow this, voters: Slice<u32>, most: usize) -> Result<Vector<RecodeCandidate>, StoreError> {
+        var out = Vector<RecodeCandidate>.create();
+        for (i in 0..this.state.coded.length()) {
+            if (out.length >= most) { break; }
+            let c = this.state.coded.valueAt(i);
+            var holders = c.holders.clone()?;
+            var changed = false;
+            for (h in 0..holders.length) {
+                var votes = false;
+                for (v in voters) {
+                    if (v == holders[h]) { votes = true; }
+                }
+                if (votes) { continue; }
+                // The first voter that holds no piece of it.
+                var free: u32? = null;
+                for (v in voters) {
+                    var holds = false;
+                    for (x in holders.view()) {
+                        if (x == v) { holds = true; }
+                    }
+                    if (!holds && free.isNull()) { free = Some(v); }
+                }
+                match (free) {
+                    Some(f) => {
+                        holders[h] = f;
+                        changed = true;
+                    }
+                    null => {}
+                }
+            }
+            if (changed) { out.push(RecodeCandidate { id: c.id, holders: holders })?; }
+        }
+        return Ok(out);
+    }
+
+    /// Stages the Coded record of extent `id` with new `holders` (ADR-0064, as re-homed by the exit review's F1): its
+    /// coding as it is, the pieces' holders changed. Whether it was staged: not when it is not coded, or the holders
+    /// are not as many.
+    fn stageRecode(borrow mut this, id: u64, holders: Slice<u32>) -> Result<bool, StoreError> {
+        let old = match (this.state.coded.get(borrow id)) {
+            Some(c) => c.copy()?,
+            null => { return Ok(false); }
+        };
+        if (holders.length != old.holders.length) { return Ok(false); }
+        var c = old;
+        c.holders.clear();
+        for (h in holders) { c.holders.push(h)?; }
         var meta = Vector<u8>.create();
         encodeCoded(mut meta, borrow c)?;
         let empty = Vector<u8>.create();
@@ -2022,8 +2285,8 @@ struct ObjectStore {
         var gone = Vector<u64>.create();
         for (i in 0..this.wholeCoded.length()) {
             let id: u64 = this.wholeCoded.keyAt(i);
-            if (this.pins.isPinned(id)) { continue; }
-            let path = extentPath(this.extentDir.view(), id)?;
+            if (this.wholePinned(id)) { continue; }
+            let path = this.wholePathOf(id)?;
             match (Fs.modifiedMillis(path.view())) {
                 Ok(m) => {
                     if (m < now - DECODED_KEEP_MS) { gone.push(id)?; }
@@ -2033,7 +2296,7 @@ struct ObjectStore {
         }
         for (id in gone.view()) {
             let _ = this.pieceFromWhole(id)?;
-            removeExtent(this.extentDir.view(), id);
+            this.removeWholeOf(id)?;
             let _ = this.wholeCoded.remove(borrow id);
         }
         return Ok(gone.length);
@@ -2436,6 +2699,12 @@ struct ObjectStore {
             ) && !this.wholeCoded.contains(borrow v.extents[e].id)) {
                 return Ok();
             }
+        }
+        let segment = segmentCodedId(v.recordSegment);
+        if (v.extents.length == 0 && this.state.coded.contains(
+            borrow segment,
+        ) && !this.wholeCoded.contains(borrow segment)) {
+            return Ok();
         }
         var fault: VerifyFault? = null;
         match (this.openVersionUnpinned(v, 0, 0xFFFFFFFFFFFFFFFF)) {
@@ -3662,6 +3931,8 @@ struct ObjectStore {
                 record: null,
             });
         }
+        // In a coded segment with no whole copy here: wanted, as a coded extent is (ADR-0070 §3).
+        if (this.wantsDecode(v)) { return Err(StoreError.ExtentWanted); }
         let payloadStart = v.recordLength as usize - RECORD_TRAILER_LEN - v.payload.length as usize;
         let path = match (this.journal.segmentFile(v.recordSegment)) {
             Ok(p) => p,
@@ -4851,6 +5122,8 @@ struct ObjectStore {
             let id: u64 = this.state.segments.keyAt(i);
             let u = this.state.segments.valueAt(i);
             if (id >= this.checkpointSegment) { continue; }
+            // A coded segment is not copied out of (its file is pieces); it goes when nothing in it is live.
+            if (this.segmentIsCoded(id) && u.liveBytes != 0) { continue; }
             if (u.liveBytes == 0 || u.liveBytes * 100 < u.totalBytes * this.config.compactBelowLivePercent) {
                 candidates.push(SegmentFile { id: id, size: u.liveBytes })?;
             }
@@ -4969,7 +5242,11 @@ struct ObjectStore {
             let usage = this.segmentUsage(id);
             if (usage.liveBytes != 0) { continue; }
             if (this.segmentPins.isPinned(id)) { continue; }
-            this.journal.removeSegment(id)?;
+            if (this.segmentIsCoded(id)) {
+                this.dropCodedSegment(id)?;
+            } else {
+                this.journal.removeSegment(id)?;
+            }
             let _ = this.state.segments.remove(borrow id);
             stats.segmentsRemoved += 1;
             this.counts.segmentsCompacted += 1;
@@ -4992,7 +5269,11 @@ struct ObjectStore {
             let id = dead[k];
             if (this.segmentPins.isPinned(id)) { continue; }
             let usage = this.segmentUsage(id);
-            this.journal.removeSegment(id)?;
+            if (this.segmentIsCoded(id)) {
+                this.dropCodedSegment(id)?;
+            } else {
+                this.journal.removeSegment(id)?;
+            }
             let _ = this.state.segments.remove(borrow id);
             stats.segmentsRemoved += 1;
             this.counts.segmentsCompacted += 1;
@@ -5055,6 +5336,7 @@ struct ObjectStore {
 
     /// The verified record that holds an inline version's payload.
     fn readLiveRecord(borrow this, v: borrow ObjectVersion) -> Result<Vector<u8>, StoreError> {
+        if (v.extents.length == 0 && this.wantsDecode(v)) { return Err(StoreError.ExtentWanted); }
         let offset = v.payload.offset + v.payload.length as u64 + RECORD_TRAILER_LEN as u64 - v.recordLength as u64;
         return match (this.journal.readRecord(v.recordSegment, offset, v.recordLength)) {
             Ok(bytes) => Ok(bytes),

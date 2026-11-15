@@ -17,9 +17,11 @@
 //   until it is reopened, because after a failed fsync the OS may have dropped dirty pages.
 //
 // A Raft log (ADR-0058, `raftLog`): every record is an entry, its LSN its Raft index and its term at least 1;
-// segment headers carry flag bit 0, and opening refuses a segment of the other kind. A segment is sealed only once
-// its last entry is committed (`markCommitted`), so an uncommitted suffix is always in the active segment, where
-// `truncateAfter` cuts it off. Terms never go down along the log.
+// segment headers carry flag bit 0, and opening refuses a segment of the other kind. A segment is sealed before the
+// record that would start at or past its target, wherever batches fall and whatever is committed
+// (`commitAcrossSegments`), and its header has no time: every replica's segments are the same bytes (ADR-0070 §1). An
+// uncommitted suffix may so start in a sealed segment; `truncateAfter` removes the newer segments and cuts there.
+// Terms never go down along the log.
 
 const SEGMENT_MAGIC: u64 = 0x31304745534A5343; // "CSJSEG01" in file order
 const SEGMENT_HEADER_LEN: usize = 64;
@@ -466,7 +468,10 @@ struct Journal {
 
     /// Whether the active segment may be sealed: a single node's always; a Raft log's once every entry in it is
     /// committed (ADR-0058 §4).
-    fn mayRotate(borrow this) -> bool => !this.config.raftLog || this.committedLsn + 1 >= this.nextLsn;
+    /// Whether a commit may rotate: a single node's journal after any batch. A Raft log rotates in `commitRaft`, before
+    /// the record that reaches its target, wherever batches fall, so that every replica's segments hold the same
+    /// entries (ADR-0070 §1: a coded segment is the same bytes on every replica).
+    fn mayRotate(borrow this) -> bool => !this.config.raftLog;
 
     /// A Raft log's entries through `lsn` are committed; a full segment whose entries all are is sealed now.
     fn markCommitted(borrow mut this, lsn: u64) {
@@ -478,8 +483,7 @@ struct Journal {
     }
 
     /// Cuts a Raft log's entries after `lsn` off, durably, before any other entry is staged (ADR-0058 §4): the
-    /// suffix a new leader does not have. Nothing may be staged or in flight. They are uncommitted, so all in the
-    /// active segment; cutting a committed entry is a bug.
+    /// suffix a new leader does not have. Nothing may be staged or in flight. Cutting a committed entry is a bug.
     fn truncateAfter(borrow mut this, lsn: u64) -> Result<void, JournalError> {
         if (this.failed) { return Err(JournalError.Failed); }
         if (!this.config.raftLog) { return Err(JournalError.WrongMode(this.segmentId)); }
@@ -491,7 +495,36 @@ struct Journal {
         if (this.inflight) { this.commit()?; }
         if (lsn < this.committedLsn) { panic("journal: cutting off a committed entry"); }
         let at = this.entryAt(lsn + 1)?;
-        if (at.segment != this.segmentId) { panic("journal: an uncommitted entry in a sealed segment"); }
+        // The cut may start in a sealed segment: a Raft log rotates where its entries say, committed or not
+        // (`commitAcrossSegments`). The newer segments go first, newest first and the directory synced, so that a crash
+        // leaves a log without a gap (at worst the uncommitted entries still there, cut again after it restarts);
+        // then the segment the cut starts in is the active one again.
+        if (at.segment != this.segmentId) {
+            var id = this.segmentId;
+            while (id > at.segment) {
+                let path = segmentPath(this.dir.view(), id)?;
+                let _ = this.sealedFiles.remove(borrow id);
+                match (Fs.unlink(path.view())) {
+                    Ok() => {}
+                    Err(e) => {
+                        if (!e.isNotFound()) { return this.fail(e); }
+                    }
+                }
+                match (Fs.syncDirectory(this.dir.view())) {
+                    Ok() => {}
+                    Err(e) => { return this.fail(e); }
+                }
+                id -= 1;
+            }
+            let path = segmentPath(this.dir.view(), at.segment)?;
+            let file = match (DurableFile.openReadWrite(path.view())) {
+                Ok(f) => f,
+                Err(e) => { return this.fail(e); }
+            };
+            let _ = this.sealedFiles.remove(borrow at.segment);
+            this.file = file;
+            this.segmentId = at.segment;
+        }
         match (this.file.truncateTo(at.offset)) {
             Ok() => {}
             Err(e) => { return this.fail(e); }
@@ -553,6 +586,7 @@ struct Journal {
     fn commit(borrow mut this) -> Result<void, JournalError> {
         if (this.failed) { return Err(JournalError.Failed); }
         if (this.pendingCount == 0 && !this.inflight) { return Ok(); }
+        if (this.config.raftLog && this.crossesTarget()) { return this.commitAcrossSegments(); }
         match (this.file.writeAt(this.pending.view(), this.writtenEnd)) {
             Ok() => {}
             Err(e) => { return this.fail(e); }
@@ -578,6 +612,75 @@ struct Journal {
         return Ok();
     }
 
+    /// Whether a Raft log's staged batch has a record that starts at or past the segment's target (after the header):
+    /// the segment is sealed before it (`commitAcrossSegments`).
+    fn crossesTarget(borrow this) -> bool {
+        var at = 0usize;
+        while (at < this.pending.length) {
+            let start = this.writtenEnd + at as u64;
+            if (start >= this.config.segmentTargetBytes && start > SEGMENT_HEADER_LEN as u64) { return true; }
+            at += this.pending.view().readLE<u32>(at + 8) as usize;
+        }
+        return false;
+    }
+
+    /// A Raft log's commit of a batch that reaches the segment's target (ADR-0070 §1): the records before the one that
+    /// starts at or past it are written and synced, the segment sealed, and the rest go on in the next, as often as it
+    /// takes. Where it cuts depends only on the records, so every replica cuts at the same entry. The batch's entries
+    /// are indexed where they landed. A failed rotation fails the journal: a segment grown past its target would not
+    /// be its replicas'.
+    fn commitAcrossSegments(borrow mut this) -> Result<void, JournalError> {
+        let first = this.nextLsn - this.pendingCount as u64;
+        while (this.entryIndex.length > 0 && this.entryIndex[this.entryIndex.length - 1].lsn >= first) {
+            let _ = this.entryIndex.pop();
+        }
+        var run = 0usize; // where this segment's part of the batch starts
+        var at = 0usize;
+        var lsn = first;
+        while (at <= this.pending.length) {
+            let ends = at == this.pending.length;
+            let start = this.writtenEnd + (at - run) as u64;
+            let cut = !ends && start >= this.config.segmentTargetBytes && start > SEGMENT_HEADER_LEN as u64;
+            if (cut || ends) {
+                if (at > run) {
+                    match (this.file.writeAt(this.pending.view()[run..at], this.writtenEnd)) {
+                        Ok() => {}
+                        Err(e) => { return this.fail(e); }
+                    }
+                    match (this.file.syncData()) {
+                        Ok() => {}
+                        Err(e) => { return this.fail(e); }
+                    }
+                    this.syncs += 1;
+                    this.writtenEnd += (at - run) as u64;
+                    this.writeOffset = this.writtenEnd;
+                }
+                if (ends) { break; }
+                this.inflight = false;
+                match (this.rotateAt(lsn)) {
+                    Ok() => {}
+                    Err(e) => {
+                        this.failed = true;
+                        return Err(e);
+                    }
+                }
+                run = at;
+                continue;
+            }
+            let position = RecordPosition { segmentId: this.segmentId, offset: start, lsn: lsn };
+            this.noteEntry(borrow position)?;
+            at += this.pending.view().readLE<u32>(at + 8) as usize;
+            lsn += 1;
+        }
+        this.durable = this.nextLsn - 1;
+        this.committed += this.pendingCount as u64;
+        if (this.inflight) { this.committed += this.inflightCount as u64; }
+        this.inflight = false;
+        this.pending.clear();
+        this.pendingCount = 0;
+        return Ok();
+    }
+
     /// Group commit, first half (ADR-0022): writes the staged batch without syncing it, and
     /// returns a ticket whose `sync` makes it durable. The sync runs without the caller's lock,
     /// while later records are staged; `finishSync` then records its result. Returns null when
@@ -587,6 +690,8 @@ struct Journal {
     fn writeStaged(borrow mut this) -> Result<SyncTicket?, JournalError> {
         if (this.failed) { return Err(JournalError.Failed); }
         if (this.pendingCount == 0 || this.inflight) { return Ok(null); }
+        // A Raft log's batch that seals the segment is committed whole by `commit` (it rotates).
+        if (this.config.raftLog && this.crossesTarget()) { return Ok(null); }
         let path = segmentPath(this.dir.view(), this.segmentId)?;
         let handle = match (DurableFile.openReadWrite(path.view())) {
             Ok(f) => f,
@@ -665,7 +770,10 @@ struct Journal {
     /// a later commit rotates (ADR-0039), unless a file was left that cannot be removed: a crash could then find it as
     /// the newest segment with this one sealed behind it, and a torn batch here would read as corruption (ADR-0001).
     /// Then the journal fails.
-    fn rotate(borrow mut this) -> Result<void, JournalError> {
+    fn rotate(borrow mut this) -> Result<void, JournalError> => this.rotateAt(this.nextLsn);
+
+    /// Starts the next segment, its first entry `firstLsn`.
+    fn rotateAt(borrow mut this, firstLsn: u64) -> Result<void, JournalError> {
         let id = this.segmentId + 1;
         let path = segmentPath(this.dir.view(), id)?;
         let file = match (DurableFile.createNew(path.view())) {
@@ -684,7 +792,7 @@ struct Journal {
             borrow file,
             this.dir.view(),
             id,
-            this.nextLsn,
+            firstLsn,
             this.config.shardId,
             this.config.raftLog,
         )) {
@@ -897,7 +1005,9 @@ fn writeSegmentHeader(
     h.writeLE(16, id);
     h.writeLE(24, firstLsn);
     h.writeLE(32, shardId);
-    h.writeLE(40, Clock.unixMillis());
+    // When it was made, for a single node's log; 0 in a Raft log, whose segments are the same bytes on every replica
+    // (ADR-0070 §1).
+    h.writeLE(40, if (raft) 0i64 else Clock.unixMillis());
     let crc = Crc32c.of(h[0..60]);
     h.writeLE(60, crc);
     file.writeAt(h[..], 0)?;

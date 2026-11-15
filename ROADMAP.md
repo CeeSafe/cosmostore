@@ -2625,3 +2625,25 @@ Browser form uploads with a SigV4 POST policy.
 - **Next:** E's second part (nodes on several machines), then F: coded pieces re-homed when a holder leaves (a hole
   in item 8 found while planning F), and sealed segments coded.
 
+### 15 Nov 2026: M6 exit gaps E (second part) and F: nodes on several machines; coded segments, re-homed pieces (ADR-0069, ADR-0070)
+
+- **E, second part (ADR-0069, proposed):** `tools/cluster_chaos.py --hosts` runs node i on the i-th host (`local` or
+  `user@host:/path/to/cosmostore`), every node on its host's loopback, SSH tunnels carrying the peer and S3 ports to
+  the harness and the proxy's ports to each host: nothing listens on any host's network. Two 300 s runs with a node
+  each on this Mac, binfadel and alghobashi: linearizable per key and across keys.
+- **F1, pieces re-homed (ADR-0070 §4, proposed):** a hole in item 8 found while planning F: a coded extent's piece left
+  with a holder that left its shard. The coding loop now proposes the coding again with that holder replaced by a
+  voter with no piece, which rebuilds it. `tools/cluster_ec_smoke.sh` (now 20 checks): node 4 rebuilds the piece node 1
+  held, byte for byte, and the object decodes with nodes 1 and 2 down.
+- **F2, sealed segments coded (ADR-0070 §1 to §3, proposed):** found first: a Raft log's segments were not the same on
+  every replica (sealed after a batch, once committed), so coding "segment N" threw a follower's records away (a smoke
+  test's reads failed). A Raft log now seals before the record that would start past the target, at the write of its
+  batch, whatever is committed, its headers without a time, and `truncateAfter` cuts across segments
+  (`raftLogSegmentsAreTheSameOnEveryReplica`, `raftLogCutsAcrossSegments`, the fault sweeps). Then sealed segments
+  wholly before the checkpoint, mostly live and cold are coded as extents are; reads decode; compaction leaves them
+  until dead. Also found: a segment's coding was told from an extent's by the key's top bit, which half of all random
+  extent ids have; the record says which now. `node --segment-mb`; `tools/cluster_ec_segments_smoke.sh`.
+- **Tests:** 284 pass; every smoke; the sessions check; the Raft and chaos mutants killed; chaos runs default, coded,
+  disk-loss and racks linearizable. (Two of those runs once printed nothing, no summary, and passed when run again.)
+- **Next:** the exit review brought up to date, and the owner's word on ADR-0066 to ADR-0070.
+

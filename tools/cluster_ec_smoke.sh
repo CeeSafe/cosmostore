@@ -43,6 +43,7 @@ secret-file $WORK/cluster.key
 node 1 peer=127.0.0.1:$((BASE + 1)) domain=a
 node 2 peer=127.0.0.1:$((BASE + 2)) domain=b
 node 3 peer=127.0.0.1:$((BASE + 3)) domain=c
+node 4 peer=127.0.0.1:$((BASE + 4)) domain=d standby
 EOF
 
 start() {
@@ -129,6 +130,30 @@ check "and it is rebuilt, byte for byte" "$([ -f "$hurt" ] && md5of "$hurt")" "$
 on 1 s3api delete-object --bucket coded --key big > /dev/null 2>&1
 for i in $(seq 1 150); do [ "$(piecesOf 1)$(piecesOf 2)$(piecesOf 3)" = "000" ] && break; pause 0.2; done
 check "the deleted object's pieces are reaped" "$(piecesOf 1)$(piecesOf 2)$(piecesOf 3)" "000"
+
+# A holder leaves (the M6 exit review's F1): its piece is made again on the node that takes its place, byte for byte,
+# and the object outlives the loss of another holder.
+head -c 6000000 /dev/urandom > big2.bin
+on 2 s3api put-object --bucket coded --key big2 --body big2.bin > /dev/null 2>&1
+for i in $(seq 1 100); do
+    [ "$(piecesOf 1)$(piecesOf 2)$(piecesOf 3)" = "111" ] && [ "$(extentsOf 1)$(extentsOf 2)$(extentsOf 3)" = "000" ] && break
+    pause 0.2
+done
+check "the second object is coded, a piece on each node" "$(piecesOf 1)$(piecesOf 2)$(piecesOf 3)" "111"
+md5of "$(pieceOf 1)" > left.md5
+start 4
+"$BIN" cluster-join --cluster-file cluster.conf --node 4 > /dev/null 2>&1
+check "node 4 joined" "$?" "0"
+"$BIN" cluster-leave --cluster-file cluster.conf --node 1 > /dev/null 2>&1
+check "node 1 left" "$?" "0"
+for i in $(seq 1 300); do [ "$(piecesOf 4)" = "1" ] && break; pause 0.2; done
+check "node 4 holds the piece node 1 held" "$(piecesOf 4)" "1"
+check "rebuilt byte for byte" "$([ -n "$(pieceOf 4)" ] && md5of "$(pieceOf 4)")" "$(cat left.md5)"
+stop 1
+stop 2
+rm -f big2.got
+on 4 s3api get-object --bucket coded --key big2 big2.got > /dev/null 2>&1
+check "with nodes 1 and 2 down, the object decodes from node 3's and node 4's pieces" "$(md5of big2.got 2>/dev/null)" "$(md5of big2.bin)"
 
 echo "cluster ec smoke: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]
