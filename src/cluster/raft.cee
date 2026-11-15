@@ -33,10 +33,93 @@ struct RaftEntry {
     term: u64;
     index: u64;
     data: Vector<u8>;
+    /// A configuration entry the leader's core made (ADR-0062 §1): its data is the membership (`encodeMembership`),
+    /// which the host writes as a Config record. Entries that came from another replica carry their record instead,
+    /// and their host tells the core of a configuration (`noteConfig`).
+    config: bool;
 
     fn copy(borrow this) -> Result<RaftEntry, AllocError> {
-        return Ok(RaftEntry { term: this.term, index: this.index, data: this.data.clone()? });
+        return Ok(RaftEntry { term: this.term, index: this.index, data: this.data.clone()?, config: this.config });
     }
+}
+
+/// A group's configuration (ADR-0062 §1): the voters, and the learners, which get the log and count for nothing.
+struct RaftMembership {
+    voters: Vector<u32>;
+    learners: Vector<u32>;
+
+    fn of(voters: Slice<u32>) -> Result<RaftMembership, AllocError> {
+        var v = Vector<u32>.create();
+        for (i in 0..voters.length) { v.push(voters[i])?; }
+        return Ok(RaftMembership { voters: v, learners: Vector<u32>.create() });
+    }
+
+    fn copy(borrow this) -> Result<RaftMembership, AllocError> {
+        var v = Vector<u32>.create();
+        var l = Vector<u32>.create();
+        for (i in 0..this.voters.length) { v.push(this.voters[i])?; }
+        for (i in 0..this.learners.length) { l.push(this.learners[i])?; }
+        return Ok(RaftMembership { voters: v, learners: l });
+    }
+
+    fn isVoter(borrow this, id: u32) -> bool {
+        for (i in 0..this.voters.length) {
+            if (this.voters[i] == id) { return true; }
+        }
+        return false;
+    }
+
+    fn isLearner(borrow this, id: u32) -> bool {
+        for (i in 0..this.learners.length) {
+            if (this.learners[i] == id) { return true; }
+        }
+        return false;
+    }
+
+    /// The voters one of the sets has and the other has not, counted both ways.
+    fn voterChanges(borrow this, other: borrow RaftMembership) -> usize {
+        var n = 0usize;
+        for (i in 0..this.voters.length) {
+            if (!other.isVoter(this.voters[i])) { n += 1; }
+        }
+        for (i in 0..other.voters.length) {
+            if (!this.isVoter(other.voters[i])) { n += 1; }
+        }
+        return n;
+    }
+}
+
+/// A membership as bytes: u32 voter count, the voters, u32 learner count, the learners (little-endian).
+fn encodeMembership(out: borrow mut Vector<u8>, m: borrow RaftMembership) -> Result<void, AllocError> {
+    out.pushLE(truncate<u32>(m.voters.length))?;
+    for (i in 0..m.voters.length) { out.pushLE(m.voters[i])?; }
+    out.pushLE(truncate<u32>(m.learners.length))?;
+    for (i in 0..m.learners.length) { out.pushLE(m.learners[i])?; }
+    return Ok();
+}
+
+fn decodeMembership(b: Slice<u8>) -> RaftMembership? {
+    if (b.length < 8) { return null; }
+    let nv = b.readLE<u32>(0) as usize;
+    if (nv > 255 || b.length < 4 + nv * 4 + 4) { return null; }
+    var voters = Vector<u32>.create();
+    for (i in 0..nv) {
+        if (voters.push(b.readLE<u32>(4 + i * 4)).isErr()) { return null; }
+    }
+    let at = 4 + nv * 4;
+    let nl = b.readLE<u32>(at) as usize;
+    if (nl > 255 || b.length != at + 4 + nl * 4) { return null; }
+    var learners = Vector<u32>.create();
+    for (i in 0..nl) {
+        if (learners.push(b.readLE<u32>(at + 4 + i * 4)).isErr()) { return null; }
+    }
+    return Some(RaftMembership { voters: voters, learners: learners });
+}
+
+/// The configuration of a configuration entry at `index`.
+struct RaftConfigAt {
+    index: u64;
+    membership: RaftMembership;
 }
 
 /// A message between two replicas. Which fields mean what depends on `kind`:
@@ -121,8 +204,10 @@ struct RaftReady {
 /// The settings of one replica.
 struct RaftConfig {
     id: u32;
-    /// Every voter of the group, this one included.
+    /// The group's configuration at the snapshot the replica starts from (or as it begins): its voters, and learners
+    /// (ADR-0062). Configuration entries after it the host tells the core of (`noteConfig`).
     voters: Vector<u32>;
+    learners: Vector<u32>;
     /// Ticks without a leader before a replica campaigns; each campaign waits a random time between this and twice
     /// it.
     electionTicks: u32;
@@ -137,6 +222,8 @@ struct RaftConfig {
 /// The leader's view of one other voter.
 struct RaftPeer {
     id: u32;
+    /// A voter (counts for quorums), or a learner (ADR-0062).
+    voter: bool;
     /// The next entry to send, and the last one known to match the leader's.
     next: u64;
     matched: u64;
@@ -176,7 +263,11 @@ struct SplitMix {
 
 struct RaftCore {
     id: u32;
-    voters: Vector<u32>;
+    /// The configuration in force: the latest configuration entry's, or the snapshot's (ADR-0062 §1).
+    members: RaftMembership;
+    /// The configuration at the snapshot, and those of the configuration entries after it, ascending.
+    baseMembers: RaftMembership;
+    configs: Vector<RaftConfigAt>;
     electionTicks: u32;
     heartbeatTicks: u32;
     maxAppendEntries: usize;
@@ -228,27 +319,14 @@ struct RaftCore {
         snapTerm: u64,
         terms: Vector<u64>,
     ) -> Result<RaftCore, AllocError> {
-        var peers = Vector<RaftPeer>.create();
-        for (i in 0..config.voters.length) {
-            let v = config.voters[i];
-            if (v != config.id) {
-                peers.push(RaftPeer {
-                    id: v,
-                    next: 1,
-                    matched: 0,
-                    inflight: false,
-                    recent: false,
-                    granted: false,
-                    refused: false,
-                    round: 0,
-                })?;
-            }
-        }
+        let base = RaftMembership { voters: config.voters, learners: config.learners };
         let last = snapIndex + (terms.length as u64);
         let commit = if (hard.commit < snapIndex) snapIndex else if (hard.commit > last) last else hard.commit;
         var core = RaftCore {
             id: config.id,
-            voters: config.voters,
+            members: base.copy()?,
+            baseMembers: base,
+            configs: Vector<RaftConfigAt>.create(),
             electionTicks: config.electionTicks,
             heartbeatTicks: config.heartbeatTicks,
             maxAppendEntries: config.maxAppendEntries,
@@ -267,7 +345,7 @@ struct RaftCore {
             elapsed: 0,
             timeout: 0,
             heartbeatElapsed: 0,
-            peers: peers,
+            peers: Vector<RaftPeer>.create(),
             round: 0,
             pendingReads: Vector<RaftPendingRead>.create(),
             readyReads: Vector<RaftReadState>.create(),
@@ -277,8 +355,122 @@ struct RaftCore {
             savedVote: hard.vote,
             savedCommit: hard.commit,
         };
+        core.rebuildPeers()?;
         core.resetTimeout();
         return Ok(core);
+    }
+
+    // --- Configurations (ADR-0062 §1) ---
+
+    fn isVoter(borrow this) -> bool => this.members.isVoter(this.id);
+
+    /// The configuration in force: the latest entry's, or the snapshot's.
+    fn membership(borrow this) -> borrow(this) RaftMembership {
+        if (this.configs.length > 0) { return borrow this.configs[this.configs.length - 1].membership; }
+        return borrow this.baseMembers;
+    }
+
+    /// The index of the latest configuration entry (0: none after the snapshot).
+    fn lastConfigIndex(borrow this) -> u64 =>
+        if (this.configs.length > 0) this.configs[this.configs.length - 1].index else 0;
+
+    /// Puts the configuration in force, and the leader's peers to it: one per other voter and learner, keeping what
+    /// it knew of those it had.
+    fn useMembership(borrow mut this) -> Result<void, AllocError> {
+        this.members = this.membership().copy()?;
+        return this.rebuildPeers();
+    }
+
+    fn rebuildPeers(borrow mut this) -> Result<void, AllocError> {
+        var old = replace(mut this.peers, Vector<RaftPeer>.create());
+        let next = this.lastIndex() + 1;
+        var ids = Vector<u32>.create();
+        for (i in 0..this.members.voters.length) { ids.push(this.members.voters[i])?; }
+        for (i in 0..this.members.learners.length) { ids.push(this.members.learners[i])?; }
+        for (k in 0..ids.length) {
+            let id = ids[k];
+            if (id == this.id) { continue; }
+            let voter = this.members.isVoter(id);
+            var found: usize? = null;
+            for (i in 0..old.length) {
+                if (old[i].id == id) { found = Some(i); }
+            }
+            match (found) {
+                Some(i) => {
+                    var p = old.swapRemove(i);
+                    p.voter = voter;
+                    this.peers.push(p)?;
+                }
+                null => {
+                    this.peers.push(RaftPeer {
+                        id: id,
+                        voter: voter,
+                        next: next,
+                        matched: 0,
+                        inflight: false,
+                        recent: true,
+                        granted: false,
+                        refused: false,
+                        round: 0,
+                    })?;
+                }
+            }
+        }
+        return Ok();
+    }
+
+    /// The host persisted a configuration entry at `index` (one another replica sent, or one found on recovery):
+    /// its configuration is in force from now on, committed or not.
+    fn noteConfig(borrow mut this, index: u64, m: RaftMembership) -> Result<void, AllocError> {
+        while (this.configs.length > 0 && this.configs[this.configs.length - 1].index >= index) {
+            let _ = this.configs.pop();
+        }
+        this.configs.push(RaftConfigAt { index: index, membership: m })?;
+        return this.useMembership();
+    }
+
+    /// The configuration a snapshot just installed holds (the host's, from the snapshot's checkpoint).
+    fn installMembership(borrow mut this, m: RaftMembership) -> Result<void, AllocError> {
+        this.configs.clear();
+        this.baseMembers = m;
+        return this.useMembership();
+    }
+
+    /// Entries from `index` on were cut off: so are their configurations.
+    fn dropConfigsFrom(borrow mut this, index: u64) -> Result<void, AllocError> {
+        var dropped = false;
+        while (this.configs.length > 0 && this.configs[this.configs.length - 1].index >= index) {
+            let _ = this.configs.pop();
+            dropped = true;
+        }
+        if (dropped) { return this.useMembership(); }
+        return Ok();
+    }
+
+    /// Proposes `m` as the group's configuration (ADR-0062 §1): the entry's index, or null when this replica does not
+    /// lead, an earlier change is not committed, the leader has not committed an entry of its term, or `m` changes
+    /// more than one voter (or makes a node both).
+    fn proposeConfig(borrow mut this, m: RaftMembership) -> Result<u64?, AllocError> {
+        if (this.role != RAFT_LEADER) { return Ok(null); }
+        if (this.lastConfigIndex() > this.commit) { return Ok(null); }
+        if ((this.termAt(this.commit) ?? 0) != this.term) { return Ok(null); }
+        if (m.voters.length == 0 || this.members.voterChanges(borrow m) > 1) { return Ok(null); }
+        for (i in 0..m.learners.length) {
+            if (m.isVoter(m.learners[i])) { return Ok(null); }
+        }
+        var data = Vector<u8>.create();
+        encodeMembership(mut data, borrow m)?;
+        let index = this.lastIndex() + 1;
+        this.terms.push(this.term)?;
+        this.unstable.push(RaftEntry { term: this.term, index: index, data: data, config: true })?;
+        this.markUnstable(index);
+        this.configs.push(RaftConfigAt { index: index, membership: m })?;
+        this.useMembership()?;
+        if (this.quorum() == 1) { this.maybeCommit(); }
+        for (i in 0..this.peers.length) {
+            if (!this.peers[i].inflight) { this.sendAppend(i)?; }
+        }
+        return Ok(Some(index));
     }
 
     fn isLeader(borrow this) -> bool => this.role == RAFT_LEADER;
@@ -294,7 +486,7 @@ struct RaftCore {
 
     fn lastTerm(borrow this) -> u64 => this.termAt(this.lastIndex()) ?? 0;
 
-    fn quorum(borrow this) -> usize => this.voters.length / 2 + 1;
+    fn quorum(borrow this) -> usize => this.members.voters.length / 2 + 1;
 
     fn resetTimeout(borrow mut this) {
         let e = this.electionTicks as u64;
@@ -349,7 +541,7 @@ struct RaftCore {
             this.peers[i].granted = false;
             this.peers[i].refused = false;
         }
-        if (this.quorum() == 1) {
+        if (this.quorum() == 1 && this.isVoter()) {
             if (pre) { return this.campaign(false); }
             return this.becomeLeader();
         }
@@ -358,6 +550,7 @@ struct RaftCore {
         let lastIndex = this.lastIndex();
         let lastTerm = this.lastTerm();
         for (i in 0..this.peers.length) {
+            if (!this.peers[i].voter) { continue; }
             var m = this.message(kind, this.peers[i].id);
             m.term = term;
             m.index = lastIndex;
@@ -387,7 +580,7 @@ struct RaftCore {
     fn appendOwn(borrow mut this, data: Vector<u8>) -> Result<u64, AllocError> {
         let index = this.lastIndex() + 1;
         this.terms.push(this.term)?;
-        this.unstable.push(RaftEntry { term: this.term, index: index, data: data })?;
+        this.unstable.push(RaftEntry { term: this.term, index: index, data: data, config: false })?;
         this.markUnstable(index);
         if (this.quorum() == 1) { this.maybeCommit(); }
         return Ok(index);
@@ -403,7 +596,14 @@ struct RaftCore {
     fn tick(borrow mut this) -> Result<void, AllocError> {
         if (this.role != RAFT_LEADER) {
             this.elapsed = this.elapsed + 1;
-            if (this.elapsed >= this.timeout) { return this.campaign(true); }
+            // A learner, or a replica the group has removed, never campaigns (ADR-0062 §1).
+            if (this.elapsed >= this.timeout) {
+                if (!this.isVoter()) {
+                    this.resetTimeout();
+                    return Ok();
+                }
+                return this.campaign(true);
+            }
             return Ok();
         }
         this.heartbeatElapsed = this.heartbeatElapsed + 1;
@@ -412,9 +612,9 @@ struct RaftCore {
             this.elapsed = 0;
             // Raft §6.2: a leader that has not heard from a quorum in an election timeout steps down, and stops
             // taking requests it cannot commit (reads are kept safe by their quorum round, not by this).
-            var heard = 1usize;
+            var heard: usize = if (this.isVoter()) 1 else 0;
             for (i in 0..this.peers.length) {
-                if (this.peers[i].recent) { heard = heard + 1; }
+                if (this.peers[i].recent && this.peers[i].voter) { heard = heard + 1; }
                 this.peers[i].recent = false;
             }
             if (heard < this.quorum()) {
@@ -447,7 +647,7 @@ struct RaftCore {
         // Its commit index covers every entry committed before it was leader only once an entry of its own term is
         // committed (Raft §6.4).
         if ((this.termAt(this.commit) ?? 0) != this.term) { return Ok(false); }
-        if (this.quorum() == 1) {
+        if (this.quorum() == 1 && this.isVoter()) {
             this.readyReads.push(RaftReadState { id: id, index: this.commit })?;
             return Ok(true);
         }
@@ -551,6 +751,7 @@ struct RaftCore {
         var yes = 1usize;
         var no = 0usize;
         for (i in 0..this.peers.length) {
+            if (!this.peers[i].voter) { continue; }
             if (this.peers[i].granted) { yes = yes + 1; }
             if (this.peers[i].refused) { no = no + 1; }
         }
@@ -623,6 +824,7 @@ struct RaftCore {
                 while (this.unstable.length > 0 && this.unstable[this.unstable.length - 1].index >= e.index) {
                     let _ = this.unstable.pop();
                 }
+                this.dropConfigsFrom(e.index)?;
             }
             let index = e.index;
             this.terms.push(e.term)?;
@@ -660,9 +862,11 @@ struct RaftCore {
             reply.index = m.index;
             return this.send(reply);
         }
-        // Everything we hold disagrees with it or is older: the snapshot replaces it all.
+        // Everything we hold disagrees with it or is older: the snapshot replaces it all, its configuration with it,
+        // which the host tells the core of once it has installed it (`installMembership`).
         this.terms.clear();
         this.unstable.clear();
+        this.configs.clear();
         this.snapIndex = m.index;
         this.snapTerm = m.logTerm;
         this.commit = m.index;
@@ -706,11 +910,13 @@ struct RaftCore {
     /// its host has persisted.
     fn maybeCommit(borrow mut this) {
         var matched = Vector<u64>.create();
-        if (matched.reserve(this.voters.length).isErr()) { return; }
-        if (matched.push(this.stable).isErr()) { return; }
+        if (matched.reserve(this.members.voters.length).isErr()) { return; }
+        if (this.isVoter() && matched.push(this.stable).isErr()) { return; }
         for (i in 0..this.peers.length) {
+            if (!this.peers[i].voter) { continue; }
             if (matched.push(this.peers[i].matched).isErr()) { return; }
         }
+        if (matched.length < this.quorum()) { return; }
         // The quorum-th largest: sort descending, a few voters, so insertion.
         for (i in 1..matched.length) {
             var j = i;
@@ -721,14 +927,18 @@ struct RaftCore {
         }
         let n = matched[this.quorum() - 1];
         if (n > this.commit && (this.termAt(n) ?? 0) == this.term) { this.commit = n; }
+        // A leader the committed configuration leaves out steps down (ADR-0062 §1); it never campaigns again.
+        if (this.role == RAFT_LEADER && !this.isVoter() && this.lastConfigIndex() <= this.commit) {
+            this.becomeFollower(this.term, RAFT_NO_NODE);
+        }
     }
 
     fn releaseReads(borrow mut this) -> Result<void, AllocError> {
         while (this.pendingReads.length > 0) {
             let round = this.pendingReads[0].round;
-            var acks = 1usize;
+            var acks: usize = if (this.isVoter()) 1 else 0;
             for (i in 0..this.peers.length) {
-                if (this.peers[i].round >= round) { acks = acks + 1; }
+                if (this.peers[i].voter && this.peers[i].round >= round) { acks = acks + 1; }
             }
             if (acks < this.quorum()) { return Ok(); }
             let read = this.pendingReads.remove(0);
@@ -789,6 +999,11 @@ struct RaftCore {
         this.terms.truncate(kept);
         this.snapIndex = index;
         this.snapTerm = term;
+        // The configuration at the new snapshot becomes the base.
+        while (this.configs.length > 0 && this.configs[0].index <= index) {
+            let c = this.configs.remove(0);
+            this.baseMembers = c.membership;
+        }
     }
 }
 

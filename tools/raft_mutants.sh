@@ -38,7 +38,12 @@ mutant "no-up-to-date-check" 's/(fn isUpToDate\(borrow this, index: u64, term: u
 mutant "two-votes-a-term" 's/\(this\.vote == RAFT_NO_NODE \|\| this\.vote == m\.from\) && //'
 mutant "read-before-own-commit" 's/if \(\(this\.termAt\(this\.commit\) \?\? 0\) != this\.term\) \{ return Ok\(false\); \}//'
 mutant "commit-past-what-was-sent" 's/let commit = if \(leaderCommit < last\) leaderCommit else last;/let commit = leaderCommit.min(this.lastIndex());/'
-mutant "read-unconfirmed" 's/if \(this\.quorum\(\) == 1\) \{\n(\s*)this\.readyReads/if (true) {\n$1this.readyReads/'
+mutant "read-unconfirmed" 's/if \(this\.quorum\(\) == 1 && this\.isVoter\(\)\) \{\n(\s*)this\.readyReads/if (true) {\n$1this.readyReads/'
+# Membership changes (ADR-0062 §1).
+mutant "two-changes-at-once" 's/        if \(this\.lastConfigIndex\(\) > this\.commit\) \{ return Ok\(null\); \}\n//'
+mutant "change-before-own-commit" 's/(if \(this\.lastConfigIndex\(\) > this\.commit\) \{ return Ok\(null\); \}\n)\s*if \(\(this\.termAt\(this\.commit\) \?\? 0\) != this\.term\) \{ return Ok\(null\); \}\n/$1/'
+mutant "learners-count" 's/(        for \(i in 0\.\.this\.peers\.length\) \{\n)            if \(!this\.peers\[i\]\.voter\) \{ continue; \}\n(            if \(matched\.push)/$1$2/'
+mutant "two-voters-at-once" 's/this\.members\.voterChanges\(borrow m\) > 1/this.members.voterChanges(borrow m) > 2/'
 mutant "read-on-one-answer" 's/if \(acks < this\.quorum\(\)\) \{ return Ok\(\); \}//'
 mutant "snapshot-drops-a-matching-log" 's/if \(\(this\.termAt\(m\.index\) \?\? 0\) == m\.logTerm && this\.termAt\(m\.index\)\.isSome\(\)\)/if (false)/'
 

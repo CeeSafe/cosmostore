@@ -2424,3 +2424,24 @@ Browser form uploads with a SigV4 POST policy.
   loss both objects read whole. Passed three runs.
 - **Not yet:** streaming past 64 MiB a request; copies between two shards' buckets. **Next:** item 6, group 0,
   membership changes, placement and rebalance.
+
+### 15 Nov 2026: M6 item 6, slice a: membership changes in the Raft core (ADR-0062)
+
+- **Started under the owner's standing go-ahead** (15 Nov: "From now on, I give you permission to commit and push, then
+  start the next"). **ADR-0062** (proposed): single-server changes and learners in the core; a `Config` record;
+  group 0 holding membership and placement; a rebalancer moving one replica at a time; three slices.
+- **The core** (`raft.cee`): `RaftMembership` (voters, learners); the configuration of the snapshot and of each
+  configuration entry after it, the latest in force, the one before restored when entries are cut off; learners are
+  replicated to and count for nothing; only voters campaign, vote and make quorums; `proposeConfig` refuses while a
+  change is uncommitted, before the leader's own-term commit, and for more than one voter at a time; a leader the
+  committed configuration leaves out steps down; `noteConfig` and `installMembership` for the host.
+- **The simulation:** a pool of five, three voters at first; the leader changes the group (adds a learner, promotes one
+  that caught up, removes a voter, itself too) and now and then tries two voters at once, under every fault; snapshots
+  carry their membership; restarts rebuild it from the disk. 200 seeds; at the end every member holds everything. A
+  directed test of the change rules.
+- **Mutants:** thirteen in `tools/raft_mutants.sh`, all killed. The first membership run killed two of four: two
+  changes at once and two voters at once survived, the change generator being too polite (one voter, one change in
+  thirty ticks). Proposing a change in one tick in six, trying two-voter changes, and the directed test killed them;
+  two changes at once now fails the faulty simulation on a real safety violation.
+- **Next:** slice b, the `Config` record, checkpoints and snapshots with their membership, a replica added and one
+  removed in the in-process sweeps.

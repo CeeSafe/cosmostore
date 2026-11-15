@@ -1,6 +1,8 @@
 // The Raft core under a seeded simulation (ADR-0057 §4): replicas that crash and lose what they had not persisted,
 // a network that drops, duplicates, delays, reorders and partitions, clients that propose and read. A checker
 // watches every step for Raft's safety properties; a run ends healed, and then must make progress.
+// With `changes` (ADR-0062), the leader also changes the group one server at a time: a node of the pool joins as a
+// learner, a learner that caught up becomes a voter, a voter (the leader too) is removed.
 
 /// One replica's disk: what survives its crash.
 struct SimDisk {
@@ -9,8 +11,9 @@ struct SimDisk {
     commit: u64;
     snapIndex: u64;
     snapTerm: u64;
-    /// The state machine at the snapshot.
+    /// The state machine at the snapshot, and the group's configuration there.
     snapState: Vector<u64>;
+    snapMembers: RaftMembership;
     log: Vector<RaftEntry>;
 }
 
@@ -76,18 +79,32 @@ struct Sim {
     snapshotsSent: u64;
     snapshotsInstalled: u64;
     crashes: u64;
+    /// The group's first voters (1 to `voters`), and whether the leader changes the group; configuration entries
+    /// applied anywhere.
+    voters: u32;
+    changes: bool;
+    configsApplied: u64;
+    /// Changes of two voters at once the core took (it must take none).
+    unsafeChanges: u64;
 }
 
-fn simConfig(id: u32, count: u32, seed: u64) -> RaftConfig {
+fn simFirstMembers(count: u32) -> RaftMembership {
     var voters = Vector<u32>.create();
     var v = 1u32;
     while (v <= count) {
         voters.push(v)!;
         v = v + 1;
     }
+    return RaftMembership { voters: voters, learners: Vector<u32>.create() };
+}
+
+fn simConfig(id: u32, count: u32, seed: u64) -> RaftConfig => simConfigOf(id, simFirstMembers(count), seed);
+
+fn simConfigOf(id: u32, m: RaftMembership, seed: u64) -> RaftConfig {
     return RaftConfig {
         id: id,
-        voters: voters,
+        voters: m.voters,
+        learners: m.learners,
         electionTicks: 10,
         heartbeatTicks: 2,
         maxAppendEntries: 3,
@@ -95,7 +112,7 @@ fn simConfig(id: u32, count: u32, seed: u64) -> RaftConfig {
     };
 }
 
-fn simEmptyDisk() -> SimDisk {
+fn simEmptyDisk(members: RaftMembership) -> SimDisk {
     return SimDisk {
         term: 0,
         vote: 0,
@@ -103,8 +120,20 @@ fn simEmptyDisk() -> SimDisk {
         snapIndex: 0,
         snapTerm: 0,
         snapState: Vector<u64>.create(),
+        snapMembers: members,
         log: Vector<RaftEntry>.create(),
     };
+}
+
+/// A snapshot's data: u32 length of the membership's bytes, the membership, the state's values.
+fn simEncodeSnapshot(members: borrow RaftMembership, state: Slice<u64>) -> Vector<u8> {
+    var m = Vector<u8>.create();
+    encodeMembership(mut m, members)!;
+    var out = Vector<u8>.create();
+    out.pushLE(truncate<u32>(m.length))!;
+    out.extend(m.view())!;
+    out.extend(simEncodeState(state).view())!;
+    return out;
 }
 
 fn simValueOf(data: Slice<u8>) -> u64 {
@@ -151,17 +180,20 @@ fn simCopyValues(from: Slice<u64>) -> Vector<u64> {
     return out;
 }
 
-fn simCreate(count: u32, seed: u64, faults: SimFaults) -> Sim {
+fn simCreate(count: u32, seed: u64, faults: SimFaults) -> Sim => simCreateWith(count, count, seed, faults, false);
+
+/// `pool` nodes, the first `voters` of them the group; the others wait to be added (`changes`).
+fn simCreateWith(pool: u32, voters: u32, seed: u64, faults: SimFaults, changes: bool) -> Sim {
     var nodes = Vector<SimNode>.create();
     var id = 1u32;
-    while (id <= count) {
+    while (id <= pool) {
         nodes.push(SimNode {
             id: id,
             up: true,
             downFor: 0,
             pausedFor: 0,
-            core: RaftCore.create(simConfig(id, count, seed))!,
-            disk: simEmptyDisk(),
+            core: RaftCore.create(simConfig(id, voters, seed))!,
+            disk: simEmptyDisk(simFirstMembers(voters)),
             state: Vector<u64>.create(),
             side: 0,
         })!;
@@ -183,6 +215,10 @@ fn simCreate(count: u32, seed: u64, faults: SimFaults) -> Sim {
         snapshotsSent: 0,
         snapshotsInstalled: 0,
         crashes: 0,
+        voters: voters,
+        changes: changes,
+        configsApplied: 0,
+        unsafeChanges: 0,
     };
 }
 
@@ -207,7 +243,11 @@ fn simDrain(sim: borrow mut Sim, at: usize) -> Result<void, TestFailure> {
         // 1. The snapshot replaces the state machine and the log.
         match (replace(mut ready.snapshot, null)) {
             Some(s) => {
-                let state = simDecodeState(s.data.view());
+                let mlen = s.data.view().readLE<u32>(0) as usize;
+                let members = decodeMembership(s.data.view()[4..4 + mlen]) ?? simFirstMembers(sim.voters);
+                let state = simDecodeState(s.data.view()[4 + mlen..s.data.length]);
+                sim.nodes[at].core.installMembership(members.copy()!)!;
+                sim.nodes[at].disk.snapMembers = members;
                 if ((state.length as u64) != s.index) { return Check.fail("a snapshot's state is not its length"); }
                 for (k in 0..state.length) { simCheckApplied(sim, (k as u64) + 1, state[k])?; }
                 sim.nodes[at].disk.snapIndex = s.index;
@@ -231,7 +271,14 @@ fn simDrain(sim: borrow mut Sim, at: usize) -> Result<void, TestFailure> {
             reverseEntries(mut entries);
             while (true) {
                 match (entries.pop()) {
-                    Some(e) => { sim.nodes[at].disk.log.push(e)!; }
+                    Some(e) => {
+                        // A configuration entry is in force once persisted (ADR-0062 §1): the host tells the core.
+                        if (e.config) {
+                            let m = decodeMembership(e.data.view()) ?? simFirstMembers(sim.voters);
+                            sim.nodes[at].core.noteConfig(e.index, m)!;
+                        }
+                        sim.nodes[at].disk.log.push(e)!;
+                    }
                     null => { break; }
                 }
             }
@@ -264,7 +311,7 @@ fn simDrain(sim: borrow mut Sim, at: usize) -> Result<void, TestFailure> {
             };
             if (m.kind == RAFT_SNAPSHOT) {
                 if (sim.nodes[at].disk.snapIndex != m.index) { return Check.fail("a snapshot that is not the disk's"); }
-                m.data = simEncodeState(sim.nodes[at].disk.snapState.view());
+                m.data = simEncodeSnapshot(borrow sim.nodes[at].disk.snapMembers, sim.nodes[at].disk.snapState.view());
                 sim.snapshotsSent = sim.snapshotsSent + 1;
             }
             if (m.kind == RAFT_APPEND) {
@@ -284,6 +331,7 @@ fn simDrain(sim: borrow mut Sim, at: usize) -> Result<void, TestFailure> {
             let expected = (sim.nodes[at].state.length as u64) + 1;
             if (applying != expected) { return Check.fail("an entry applied out of order"); }
             let entry = simDiskEntry(sim, at, applying)?;
+            if (entry.config) { sim.configsApplied = sim.configsApplied + 1; }
             let value = simValueOf(entry.data.view());
             simCheckApplied(sim, applying, value)?;
             sim.nodes[at].state.push(value)!;
@@ -348,6 +396,7 @@ fn simDrain(sim: borrow mut Sim, at: usize) -> Result<void, TestFailure> {
             sim.nodes[at].disk.snapIndex = index;
             sim.nodes[at].disk.snapTerm = term;
             sim.nodes[at].disk.snapState = simCopyValues(sim.nodes[at].state[0..(index as usize)]);
+            sim.nodes[at].disk.snapMembers = sim.nodes[at].core.baseMembers.copy()!;
         }
     }
     return Ok();
@@ -385,13 +434,22 @@ fn simRestart(sim: borrow mut Sim, at: usize, count: u32, seed: u64) {
         commit: sim.nodes[at].disk.commit,
     };
     let entries = simTermsOf(sim.nodes[at].disk.log.view());
-    let core = RaftCore.restore(
-        simConfig(id, count, seed + sim.now),
+    var core = RaftCore.restore(
+        simConfigOf(id, sim.nodes[at].disk.snapMembers.copy()!, seed + sim.now),
         hard,
         sim.nodes[at].disk.snapIndex,
         sim.nodes[at].disk.snapTerm,
         entries,
     )!;
+    // The configuration entries of its log, in order: the last is in force.
+    for (k in 0..sim.nodes[at].disk.log.length) {
+        let e = borrow sim.nodes[at].disk.log[k];
+        if (e.config) {
+            let m = decodeMembership(e.data.view()) ?? simFirstMembers(sim.voters);
+            core.noteConfig(e.index, m)!;
+        }
+    }
+    let _ = count;
     sim.nodes[at].core = core;
     sim.nodes[at].state = simCopyValues(sim.nodes[at].disk.snapState.view());
     sim.nodes[at].up = true;
@@ -476,6 +534,11 @@ fn simStep(sim: borrow mut Sim, count: u32, seed: u64, faulty: bool) -> Result<v
             simDrain(sim, i)?;
         }
         if (!sim.nodes[i].up || !sim.nodes[i].core.isLeader()) { continue; }
+        if (sim.changes && sim.rng.below(6) == 0) {
+            simChangeMembers(sim, i);
+            simDrain(sim, i)?;
+        }
+        if (!sim.nodes[i].up || !sim.nodes[i].core.isLeader()) { continue; }
         if (sim.rng.below(5) == 0) {
             let id = sim.nextRead;
             let least = simHighest(sim);
@@ -502,10 +565,76 @@ fn simStep(sim: borrow mut Sim, count: u32, seed: u64, faulty: bool) -> Result<v
     return Ok();
 }
 
+/// One change of the group at the leader `at`, one server at a time (ADR-0062 §1): a pool node joins as a learner, a
+/// learner that has caught up becomes a voter, or a voter (perhaps the leader) is removed; the core may refuse it.
+fn simChangeMembers(sim: borrow mut Sim, at: usize) {
+    var m = sim.nodes[at].core.members.copy()!;
+    let choice = sim.rng.below(4);
+    if (choice == 3) {
+        // Two voters at once, which the core must refuse: a pool node and a learner both made voters, or two removed.
+        if (m.voters.length > 3 && sim.rng.below(2) == 0) {
+            let _ = m.voters.remove(0);
+            let _ = m.voters.remove(0);
+        } else {
+            var added = 0;
+            for (k in 0..sim.nodes.length) {
+                let id = sim.nodes[k].id;
+                if (added < 2 && !m.isVoter(id)) {
+                    var l = 0usize;
+                    while (l < m.learners.length) {
+                        if (m.learners[l] == id) { let _ = m.learners.remove(l); } else { l += 1; }
+                    }
+                    m.voters.push(id)!;
+                    added += 1;
+                }
+            }
+            if (added < 2) { return; }
+        }
+        let refused = sim.nodes[at].core.proposeConfig(m)!;
+        if (refused.isSome()) { sim.unsafeChanges = sim.unsafeChanges + 1; }
+        return;
+    }
+    if (choice == 0 && m.voters.length + m.learners.length < sim.nodes.length) {
+        for (k in 0..sim.nodes.length) {
+            let id = sim.nodes[k].id;
+            if (!m.isVoter(id) && !m.isLearner(id)) {
+                m.learners.push(id)!;
+                break;
+            }
+        }
+    } else if (choice == 1 && m.learners.length > 0) {
+        let id = m.learners[0];
+        let caughtUp = match (sim.nodes[at].core.peerAt(id)) {
+            Some(p) => sim.nodes[at].core.peers[p].matched + 2 >= sim.nodes[at].core.commit,
+            null => false,
+        };
+        if (!caughtUp) { return; }
+        let _ = m.learners.remove(0);
+        m.voters.push(id)!;
+    } else if (choice == 2 && m.voters.length > 3) {
+        let pick = sim.rng.below(m.voters.length as u64) as usize;
+        let _ = m.voters.remove(pick);
+    } else {
+        return;
+    }
+    let _ = sim.nodes[at].core.proposeConfig(m)!;
+}
+
 /// A whole run: `ticks` of faults, then healed (everyone up, one side, nothing lost), and then it must elect a
 /// leader, commit a last value and bring every replica to the same state.
-fn simRun(count: u32, seed: u64, ticks: u64, faults: SimFaults) -> Result<Sim, TestFailure> {
-    var sim = simCreate(count, seed, faults);
+fn simRun(count: u32, seed: u64, ticks: u64, faults: SimFaults) -> Result<Sim, TestFailure> =>
+    simRunWith(count, count, seed, ticks, faults, false);
+
+fn simRunWith(
+    pool: u32,
+    voters: u32,
+    seed: u64,
+    ticks: u64,
+    faults: SimFaults,
+    changes: bool,
+) -> Result<Sim, TestFailure> {
+    let count = pool;
+    var sim = simCreateWith(pool, voters, seed, faults, changes);
     while (sim.now < ticks) { simStep(mut sim, count, seed, true)?; }
     sim.faults.loss = 0;
     sim.faults.duplicate = 0;
@@ -575,8 +704,19 @@ fn simRun(count: u32, seed: u64, ticks: u64, faults: SimFaults) -> Result<Sim, T
     }
     let total = simHighest(sim);
     if (total == 0) { return Err(TestFailure.create("nothing was ever committed")); }
+    // The group as its leader has it: every member holds everything; a node the group removed may lag for good.
+    var leaderAt: usize? = null;
+    for (i in 0..sim.nodes.length) {
+        if (sim.nodes[i].core.isLeader()) { leaderAt = Some(i); }
+    }
+    let members = match (leaderAt) {
+        Some(l) => sim.nodes[l].core.members.copy()!,
+        null => { return Err(TestFailure.create("no leader once settled")); }
+    };
     for (i in 0..sim.nodes.length) {
         if (!sim.nodes[i].up) { return Err(TestFailure.create("a replica still down after healing")); }
+        let id = sim.nodes[i].id;
+        if (!members.isVoter(id) && !members.isLearner(id)) { continue; }
         if ((sim.nodes[i].state.length as u64) != total) {
             return Err(TestFailure.create("a replica behind after settling"));
         }
@@ -653,7 +793,7 @@ fn raftAConflictingSuffixIsReplaced() -> Result<void, TestFailure> {
     for (i in 1..4) {
         var data = Vector<u8>.create();
         data.pushLE(truncate<u64>(i))!;
-        append.entries.push(RaftEntry { term: 1, index: truncate<u64>(i), data: data })!;
+        append.entries.push(RaftEntry { term: 1, index: truncate<u64>(i), data: data, config: false })!;
     }
     append.commit = 1;
     core.step(append)!;
@@ -670,7 +810,7 @@ fn raftAConflictingSuffixIsReplaced() -> Result<void, TestFailure> {
     next.commit = 2;
     var data = Vector<u8>.create();
     data.pushLE(99u64)!;
-    next.entries.push(RaftEntry { term: 2, index: 2, data: data })!;
+    next.entries.push(RaftEntry { term: 2, index: 2, data: data, config: false })!;
     core.step(next)!;
     let second = core.ready()!;
     Check.equalU64(1, second.entries.length as u64)?; // persist from 2 on: the old 2 and 3 are gone
@@ -749,7 +889,7 @@ fn raftAStaleSnapshotKeepsTheLog() -> Result<void, TestFailure> {
     for (i in 1..6) {
         var data = Vector<u8>.create();
         data.pushLE(truncate<u64>(i))!;
-        append.entries.push(RaftEntry { term: 1, index: truncate<u64>(i), data: data })!;
+        append.entries.push(RaftEntry { term: 1, index: truncate<u64>(i), data: data, config: false })!;
     }
     append.commit = 2;
     core.step(append)!;
@@ -810,5 +950,83 @@ fn raftReadsWaitForAQuorum() -> Result<void, TestFailure> {
     Check.equalU64(1, released.reads.length as u64)?;
     Check.equalU64(42, released.reads[0].id)?;
     Check.equalU64(1, released.reads[0].index)?;
+    return Ok();
+}
+
+@test
+fn raftMembershipChangesUnderFaults() -> Result<void, TestFailure> {
+    // A pool of five, three voters at first; the leader changes the group one server at a time, under every fault.
+    var configs = 0u64;
+    var elections = 0u64;
+    var seed = 2000u64;
+    while (seed < 2200) {
+        let sim = simRunWith(5, 3, seed, 1500, simHarsh(), true)?;
+        configs = configs + sim.configsApplied;
+        elections = elections + (sim.leaderTerms.length as u64);
+        if (sim.unsafeChanges > 0) { return Check.fail("the core took a change of two voters at once"); }
+        seed = seed + 1;
+    }
+    Check.isTrue(configs > 400, "the group changed, many times")?;
+    Check.isTrue(elections > 300, "and leaders came and went")?;
+    return Ok();
+}
+
+@test
+fn raftConfigChangesOneAtATime() -> Result<void, TestFailure> {
+    // A leader of three, its first entry committed: one change is taken; another while it is uncommitted is not;
+    // nor, once it is committed, a change of two voters at once.
+    var core = RaftCore.create(simConfig(1, 3, 9))!;
+    var ticks = 0;
+    while (core.role != RAFT_PRE_CANDIDATE && ticks < 40) {
+        core.tick()!;
+        let _ = simDiscard(mut core)?;
+        ticks = ticks + 1;
+    }
+    core.step(simReply(RAFT_PRE_VOTE_REPLY, 2, 1))!;
+    let _ = simDiscard(mut core)?;
+    core.step(simReply(RAFT_VOTE_REPLY, 2, 1))!;
+    let _ = simDiscard(mut core)?;
+    Check.isTrue(core.isLeader(), "elected")?;
+    // Before its own entry is committed, no change.
+    var addFour = core.members.copy()!;
+    addFour.learners.push(4)!;
+    Check.isTrue(core.proposeConfig(addFour.copy()!)!.isNull(), "a change before the leader's first commit")?;
+    var ack = simReply(RAFT_APPEND_REPLY, 2, 1);
+    ack.index = 1;
+    core.step(ack)!;
+    let _ = simDiscard(mut core)?;
+    Check.equalU64(1, core.commit)?;
+    let at = core.proposeConfig(addFour.copy()!)!;
+    Check.isTrue(at.isSome(), "a learner added")?;
+    Check.isTrue(core.members.isLearner(4), "in force before it commits")?;
+    let _ = simDiscard(mut core)?;
+    var addFive = core.members.copy()!;
+    addFive.learners.push(5)!;
+    Check.isTrue(core.proposeConfig(addFive.copy()!)!.isNull(), "a second change before the first commits")?;
+    // The change commits (voter 2 has it): now two voters at once is refused, one is taken.
+    var ack2 = simReply(RAFT_APPEND_REPLY, 2, 1);
+    ack2.index = at ?? 0;
+    core.step(ack2)!;
+    let _ = simDiscard(mut core)?;
+    Check.equalU64(at ?? 0, core.commit)?;
+    var twoVoters = core.members.copy()!;
+    let _ = twoVoters.learners.remove(0);
+    twoVoters.voters.push(4)!;
+    twoVoters.voters.push(5)!;
+    Check.isTrue(core.proposeConfig(twoVoters)!.isNull(), "two voters at once")?;
+    var promote = core.members.copy()!;
+    let _ = promote.learners.remove(0);
+    promote.voters.push(4)!;
+    Check.isTrue(core.proposeConfig(promote)!.isSome(), "one voter at a time")?;
+    Check.equalU64(4, core.members.voters.length as u64)?;
+    Check.equalU64(3, core.quorum() as u64)?;
+    return Ok();
+}
+
+@test
+fn raftMembershipChangesWithoutFaults() -> Result<void, TestFailure> {
+    let sim = simRunWith(5, 3, 77, 1500, simQuiet(), true)?;
+    Check.isTrue(sim.configsApplied > 5, "the group changed")?;
+    Check.equalU64(0, sim.unsafeChanges)?;
     return Ok();
 }
