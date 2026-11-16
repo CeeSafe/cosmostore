@@ -2728,3 +2728,17 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** `accessPointsStoredAndFound`, `accessPointPolicies`; the S3 smoke drives `aws s3control` and reads,
   writes and lists by alias and ARN, with the access point's Deny, its block and its deletion.
 
+### 16 Nov 2026: M7 item 6, replication, part 1: destinations on this server (ADR-0077)
+
+- **Scope chosen by the owner** (16 Nov 2026): replicas that keep their source's version id and ETag, destinations on
+  this server first, other S3 endpoints next. **ADR-0077** (proposed): Put/Get/DeleteBucketReplication (a
+  `BucketConfig` of kind 16, checkpoint format 23); each matching rule is one more target of a write's outbox event
+  (ADR-0048), so replication is as durable as the write; a replica is the source version's stored bytes, metadata and
+  envelope, put by the new `ObjectStore.putReplica` with the source's version id, MD5 and part count (the part count
+  after a put record's extras section), once however often it is delivered; delete markers too; status derived, not
+  stored. Suspending a source's versioning is InvalidBucketState.
+- **Tests:** `replicasKeepTheirSourcesIdAndEtag`, the fault sweep `replicaFaults{Once,Sticky,Torn,Crash}`,
+  `replicationConfigurationXml`; the S3 smoke replicates a small, a multipart and an SSE-S3 object (ids, ETags,
+  bytes, `REPLICA`, `COMPLETED`), a delete marker, both ways without echo.
+- **Next:** part 2, destinations on other S3 endpoints.
+

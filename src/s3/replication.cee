@@ -1,0 +1,372 @@
+// Bucket replication (ADR-0077): the configuration's XML, and the replica copy the outbox's delivery runs for a
+// replication target: the source version's stored bytes, id, ETag, metadata and envelope, to a bucket on this server.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+const REPLICA_FIELD: StringView = "x-amz-replication-status";
+/// A replica's bytes are copied in pieces of this size.
+const REPLICA_COPY_BYTES: usize = 1048576;
+
+// ---- The configuration ----
+
+fn parseReplication(xml: Slice<u8>) -> Result<Vector<ReplicationRule>, S3Fail> {
+    if (findBytes(xml, "<ReplicationConfiguration".bytes(), 0).isNull()) {
+        return Err(S3Fail.Code(S3Code.MalformedXML));
+    }
+    var rules = Vector<ReplicationRule>.create();
+    var at: usize = 0;
+    while (true) {
+        let r = match (nextElement(xml, "Rule", mut at)?) {
+            Some(r) => r,
+            null => { break; }
+        };
+        if (rules.length >= MAX_REPLICATION_RULES) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        // Tags, existing objects, replica modifications, replication time and metrics are NotImplemented.
+        let unsupported = [
+            "<Tag>", "<And>", "<ExistingObjectReplication>", "<SourceSelectionCriteria>",
+            "<ReplicationTime>", "<Metrics>", "<AccessControlTranslation>", "<EncryptionConfiguration>", "<Account>",
+        ];
+        for (u in unsupported) {
+            if (findBytes(r, u.bytes(), 0).isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        }
+        var rule = ReplicationRule {
+            id: Vector<u8>.create(),
+            priority: 0,
+            enabled: false,
+            prefix: Vector<u8>.create(),
+            deleteMarkers: false,
+            destination: Vector<u8>.create(),
+        };
+        let _ = rawElement(r, "ID", mut rule.id)?;
+        if (rule.id.length == 0) {
+            appendDecimal(mut rule.id, rules.length as u64 + 1)?;
+        }
+        if (rule.id.length > 255) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        var text = Vector<u8>.create();
+        if (rawElement(r, "Priority", mut text)?) {
+            rule.priority = match (parseDecimal(trimBlank(text.view()))) {
+                Some(n) => truncate<u32>(n.min(4294967295)),
+                null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+            };
+        }
+        // The rule's own Status, before any nested one (DeleteMarkerReplication's).
+        let marker = findBytes(r, "<DeleteMarkerReplication>".bytes(), 0);
+        let head = match (marker) {
+            Some(m) => r[0..m],
+            null => r,
+        };
+        text.clear();
+        let _ = rawElement(head, "Status", mut text)?;
+        let status = trimBlank(text.view());
+        if (status == "Enabled".bytes()) {
+            rule.enabled = true;
+        } else if (status != "Disabled".bytes()) {
+            return Err(S3Fail.Code(S3Code.MalformedXML));
+        }
+        match (marker) {
+            Some(m) => {
+                text.clear();
+                let _ = rawElement(r[m..], "Status", mut text)?;
+                rule.deleteMarkers = trimBlank(text.view()) == "Enabled".bytes();
+            }
+            null => {}
+        }
+        // A Filter's Prefix, or the older rule-level Prefix.
+        let _ = rawElement(r, "Prefix", mut rule.prefix)?;
+        var arn = Vector<u8>.create();
+        var dat: usize = 0;
+        let destination = match (nextElement(r, "Destination", mut dat)?) {
+            Some(d) => d,
+            null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        };
+        let _ = rawElement(destination, "Bucket", mut arn)?;
+        let arnPrefix = "arn:aws:s3:::".bytes();
+        let bare = trimBlank(arn.view());
+        if (!startsWithBytes(bare, arnPrefix) || bare.length == arnPrefix.length) {
+            return Err(S3Fail.Code(S3Code.InvalidArgument));
+        }
+        rule.destination.extend(bare[arnPrefix.length..])?;
+        for (i in 0..rules.length) {
+            if (rules[i].id.view() == rule.id.view()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        }
+        rules.push(rule)?;
+    }
+    if (rules.length == 0) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    return Ok(rules);
+}
+
+fn replicationXml(rules: Slice<ReplicationRule>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    xmlHead(out, "ReplicationConfiguration")?;
+    out.extend("<Role>arn:aws:iam::000000000000:role/cosmostore-replication</Role>".bytes())?;
+    for (i in 0..rules.length) {
+        let r = borrow rules[i];
+        out.extend("<Rule>".bytes())?;
+        xmlTextElement(out, "ID", r.id.view())?;
+        var n = Vector<u8>.create();
+        appendDecimal(mut n, r.priority as u64)?;
+        xmlTextElement(out, "Priority", n.view())?;
+        out.extend("<Filter>".bytes())?;
+        xmlTextElement(out, "Prefix", r.prefix.view())?;
+        out.extend("</Filter>".bytes())?;
+        xmlTextElement(out, "Status", if (r.enabled) "Enabled".bytes() else "Disabled".bytes())?;
+        out.extend("<DeleteMarkerReplication><Status>".bytes())?;
+        out.extend(if (r.deleteMarkers) "Enabled".bytes() else "Disabled".bytes())?;
+        out.extend("</Status></DeleteMarkerReplication><Destination><Bucket>arn:aws:s3:::".bytes())?;
+        appendXmlEscaped(out, r.destination.view())?;
+        out.extend("</Bucket></Destination></Rule>".bytes())?;
+    }
+    out.extend("</ReplicationConfiguration>".bytes())?;
+    return Ok();
+}
+
+async fn getBucketReplication(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let stored = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_REPLICATION)?;
+    if (stored.length == 0) { return Err(S3Fail.Code(S3Code.ReplicationConfigurationNotFoundError)); }
+    let rules = match (decodeReplication(stored.view())) {
+        Ok(r) => r,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    var body = Vector<u8>.create();
+    replicationXml(rules.view(), mut body)?;
+    return await sendXml(exchange, borrow body);
+}
+
+/// PutBucketReplication (ADR-0077 §1): the source's and every destination's versioning must be enabled.
+async fn putBucketReplication(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    if (app.cluster) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    let xml = await readSmallBody(auth, exchange, 1048576)?;
+    verifySmallBody(req, xml.view(), true)?;
+    let rules = parseReplication(xml.view())?;
+    var stored = Vector<u8>.create();
+    encodeReplication(rules.view(), mut stored)?;
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let source = req.bucket.view();
+        match (store.versioningState(source)) {
+            Ok(v) => {
+                if (v != VERSIONING_ENABLED) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            }
+            Err(e) => { return Err(storeFail(e, 0)); }
+        }
+        for (i in 0..rules.length) {
+            let name = StringView.fromUtf8(rules[i].destination.view()) ?? "";
+            if (rules[i].destination.view() == source.bytes()) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            match (store.versioningState(name)) {
+                Ok(v) => {
+                    if (v != VERSIONING_ENABLED) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+                }
+                Err(_) => { return Err(S3Fail.Code(S3Code.InvalidRequest)); } // no such destination
+            }
+        }
+        let value = stored.view();
+        match (await Async.blocking(() => store.setBucketConfig(source, BUCKET_CONFIG_REPLICATION, value))) {
+            Ok() => {}
+            Err(e) => { return Err(storeFail(e, 0)); }
+        }
+        app.replicationBuckets.store(store.replicationBucketCount());
+    }
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn deleteBucketReplication(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_REPLICATION, "".bytes())?;
+    {
+        var guard = await lockStore(app)?;
+        app.replicationBuckets.store(guard.data().replicationBucketCount());
+    }
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}
+
+/// Whether a bucket's versioning may be suspended: not while it has replication rules (ADR-0077 §1).
+async fn replicationAllowsSuspend(app: borrow S3App, bucket: StringView) -> Result<bool, S3Fail> {
+    if (app.replicationBuckets.load() == 0) { return Ok(true); }
+    let stored = await storeBucketConfig(app, bucket, BUCKET_CONFIG_REPLICATION)?;
+    return Ok(stored.length == 0);
+}
+
+/// `x-amz-replication-status` of a source version a rule takes (ADR-0077 §4); a replica's is its stored field.
+async fn replicationStatusHeader(
+    app: borrow S3App,
+    bucket: StringView,
+    key: StringView,
+    info: borrow ObjectInfo,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    if (app.replicationBuckets.load() == 0) { return Ok(); }
+    var status = REPLICATION_NONE;
+    {
+        var guard = await lockStore(app)?;
+        status = match (guard.data().replicationStatusOf(
+            bucket.bytes(),
+            key.bytes(),
+            info.versionId,
+            info.generation,
+        )) {
+            Ok(s) => s,
+            Err(_) => REPLICATION_NONE,
+        };
+    }
+    let text = match (status) {
+        REPLICATION_PENDING => "PENDING",
+        REPLICATION_COMPLETED => "COMPLETED",
+        REPLICATION_FAILED => "FAILED",
+        _ => "",
+    };
+    if (text.length > 0) { exchange.header(REPLICA_FIELD, text.bytes())?; }
+    return Ok();
+}
+
+// ---- The replica copy ----
+
+/// The stored bytes of a prepared reader, through a writer: on a worker thread.
+fn copyStored(
+    prepared: borrow mut PreparedReader,
+    writer: borrow mut ObjectWriter,
+) -> Result<FinishedObject, StoreError> {
+    var reader = prepared.open()?;
+    var buf = Vector<u8>.create();
+    buf.resize(REPLICA_COPY_BYTES, 0)?;
+    while (true) {
+        let n = reader.read(buf.viewMut())?;
+        if (n == 0) { break; }
+        match (writer.write(buf.view()[0..n])) {
+            Ok() => {}
+            Err(e) => { return Err(StoreError.Io(e)); }
+        }
+    }
+    return match (writer.finish()) {
+        Ok(o) => Ok(o),
+        Err(e) => Err(StoreError.Io(e)),
+    };
+}
+
+/// Whether a failed replication may succeed if tried again: the store's own trouble (I/O, space), not the
+/// destination's refusal (gone, unversioned, a key it does not take).
+fn replicationRetries(e: borrow StoreError) -> bool => match (e) {
+    StoreError.NoSuchBucket => false,
+    StoreError.InvalidKey => false,
+    StoreError.EntityTooLarge => false,
+    StoreError.MetadataTooLarge => false,
+    StoreError.QuotaExceeded => false,
+    _ => true,
+};
+
+/// What a replica is made from: the source version's facts, a pinned reader of its bytes, a writer, its metadata.
+struct ReplicaSource {
+    info: ObjectInfo;
+    prepared: PreparedReader;
+    writer: ObjectWriter;
+    metadata: Vector<u8>;
+}
+
+/// Under the store's lock, no I/O: null when there is nothing to replicate (the version is gone, or is a replica).
+fn prepareReplica(
+    s: borrow mut ObjectStore,
+    src: StringView,
+    key: StringView,
+    id: [u8; 16],
+) -> Result<ReplicaSource?, StoreError> {
+    let info = match (s.headObjectOf(src, key, Some(id))) {
+        Ok(i) => i,
+        Err(_) => { return Ok(null); }
+    };
+    if (metadataFind(info.metadata.view(), REPLICA_FIELD.bytes()).isSome()) { return Ok(null); }
+    // Everything stored, which for a sealed version is longer than its size (ADR-0046 §2): the reader stops there.
+    let prepared = match (s.prepareReaderOf(src, key, Some(id), 0, 0xFFFFFFFFFFFFFFFF)) {
+        Ok(p) => p,
+        Err(_) => { return Ok(null); }
+    };
+    let writer = s.newWriter()?;
+    var metadata = copyBytes(info.metadata.view())?;
+    metadataAdd(mut metadata, REPLICA_FIELD.bytes(), "REPLICA".bytes())?;
+    return Ok(Some(ReplicaSource { info: info, prepared: prepared, writer: writer, metadata: metadata }));
+}
+
+/// Replicates one event to `destination` (ADR-0077 §3). True when done or not to be done (the version is gone, is
+/// a replica, or the destination refuses it: logged); false to try again later.
+async fn replicateEvent(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    e: borrow OutboxEvent,
+    destination: Slice<u8>,
+) -> Result<bool, NetError> {
+    let src = StringView.fromUtf8(e.bucket.view()) ?? "";
+    let key = StringView.fromUtf8(e.key.view()) ?? "";
+    let dst = StringView.fromUtf8(destination) ?? "";
+    let id = e.versionId;
+    var source: ReplicaSource? = null;
+    {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(err) => { return Err(NetErrors.fromAsync(err)); }
+        };
+        let s = guard.data();
+        if (e.kind == EVENT_MARKER) {
+            let marked = await Async.blocking(() => s.putReplicaMarker(dst, key, id));
+            return Ok(await replicationOutcome(marked, e));
+        }
+        source = match (prepareReplica(s, src, key, id)) {
+            Ok(Some(r)) => Some(r),
+            Ok(null) => { return Ok(true); }
+            Err(_) => { return Ok(false); }
+        };
+    }
+    var r = match (source) {
+        Some(r) => r,
+        null => { return Ok(true); }
+    };
+    // The bytes are read without the store's lock: the reader's pins keep them (ADR-0024).
+    let copied = await Async.blocking(() => copyStored(mut r.prepared, mut r.writer));
+    var finished = match (copied) {
+        Ok(f) => f,
+        Err(_) => { return Ok(false); }
+    };
+    // The version's size is its plaintext's, as the source's is (ADR-0046 §2).
+    finished.size = r.info.size;
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(err) => { return Err(NetErrors.fromAsync(err)); }
+    };
+    let t = guard.data();
+    let contentType = StringView.fromUtf8(r.info.contentType.view()) ?? "";
+    let meta = r.metadata.view();
+    let extras = r.info.extras.view();
+    let md5 = r.info.md5;
+    let parts = r.info.parts;
+    let put = await Async.blocking(
+        () => t.putReplica(dst, key, id, md5, parts, contentType, meta, extras, borrow finished),
+    );
+    return Ok(await replicationOutcome(put, e));
+}
+
+async fn replicationOutcome(r: Result<bool, StoreError>, e: borrow OutboxEvent) -> bool {
+    return match (r) {
+        Ok(_) => true,
+        Err(err) => {
+            if (replicationRetries(borrow err)) { return false; }
+            let _ = await AsyncConsole.writeError("cosmostore: a replica was refused by its destination: ");
+            let _ = await AsyncConsole.writeError(StringView.fromUtf8(e.bucket.view()) ?? "");
+            let _ = await AsyncConsole.writeError("/");
+            let _ = await AsyncConsole.writeError(StringView.fromUtf8(e.key.view()) ?? "");
+            let _ = await AsyncConsole.writeError("\n");
+            true
+        }
+    };
+}

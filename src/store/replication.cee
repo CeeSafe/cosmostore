@@ -1,0 +1,91 @@
+// A bucket's replication rules (ADR-0077) as the store keeps them; the S3 layer reads and writes them as XML, and
+// the outbox's delivery writes the replicas (`src/s3/replication.cee`).
+
+/// A bucket's replication rules, in the compact form below; empty for none.
+const BUCKET_CONFIG_REPLICATION: u8 = 16;
+const MAX_REPLICATION_RULES: usize = 1000;
+/// An outbox target that is a replication destination, not a webhook: this byte, then the destination bucket.
+const REPLICATION_TARGET: u8 = 0;
+
+/// A source version's status (ADR-0077 §4).
+const REPLICATION_NONE: u8 = 0;
+const REPLICATION_PENDING: u8 = 1;
+const REPLICATION_COMPLETED: u8 = 2;
+const REPLICATION_FAILED: u8 = 3;
+
+struct ReplicationRule {
+    id: Vector<u8>;
+    priority: u32;
+    enabled: bool;
+    prefix: Vector<u8>;
+    deleteMarkers: bool;
+    /// The destination bucket's name (its ARN's last part).
+    destination: Vector<u8>;
+}
+
+/// Replication v1: u8 version, u16 count, then per rule the id, u32 priority, u8 flags (1: enabled, 2: delete
+/// markers), the prefix and the destination (each text u16+bytes).
+fn encodeReplication(rules: Slice<ReplicationRule>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (rules.length == 0) { return Ok(); }
+    out.push(1)?;
+    out.pushLE(truncate<u16>(rules.length))?;
+    for (i in 0..rules.length) {
+        let r = borrow rules[i];
+        pushText16(out, r.id.view())?;
+        out.pushLE(r.priority)?;
+        out.push((if (r.enabled) 1u8 else 0u8) | (if (r.deleteMarkers) 2u8 else 0u8))?;
+        pushText16(out, r.prefix.view())?;
+        pushText16(out, r.destination.view())?;
+    }
+    return Ok();
+}
+
+fn decodeReplication(b: Slice<u8>) -> Result<Vector<ReplicationRule>, MetaFault> {
+    var out = Vector<ReplicationRule>.create();
+    if (b.length == 0) { return Ok(out); }
+    if (b[0] != 1) { return Err(MetaFault.BadVersion); }
+    need(b, 1, 2)?;
+    let n = b.readLE<u16>(1) as usize;
+    if (n == 0 || n > MAX_REPLICATION_RULES) { return Err(MetaFault.TooLong); }
+    var at: usize = 3;
+    for (i in 0..n) {
+        let id = readText16(b, mut at)?;
+        need(b, at, 5)?;
+        let priority = b.readLE<u32>(at);
+        let flags = b[at + 4];
+        at += 5;
+        let prefix = readText16(b, mut at)?;
+        let destination = readText16(b, mut at)?;
+        if (destination.length == 0) { return Err(MetaFault.TooLong); }
+        out.push(ReplicationRule {
+            id: id,
+            priority: priority,
+            enabled: (flags & 1) != 0,
+            prefix: prefix,
+            deleteMarkers: (flags & 2) != 0,
+            destination: destination,
+        })?;
+    }
+    if (at != b.length) { return Err(MetaFault.TooLong); }
+    return Ok(out);
+}
+
+fn isReplicationValue(value: Slice<u8>) -> bool => decodeReplication(value).isOk();
+
+/// Whether a rule replicates an event of `kind` for `key` (ADR-0077 §2): new objects and completed uploads, delete
+/// markers if it says so, never a version's removal.
+fn replicationTakes(r: borrow ReplicationRule, kind: u8, key: Slice<u8>) -> bool {
+    if (!r.enabled || !startsWithBytes(key, r.prefix.view())) { return false; }
+    if (kind == EVENT_PUT || kind == EVENT_COMPLETE) { return true; }
+    return kind == EVENT_MARKER && r.deleteMarkers;
+}
+
+/// The outbox target of a destination: REPLICATION_TARGET, then its name.
+fn replicationTarget(destination: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var t = Vector<u8>.create();
+    t.push(REPLICATION_TARGET)?;
+    t.extend(destination)?;
+    return Ok(t);
+}
+
+fn isReplicationTarget(target: Slice<u8>) -> bool => target.length > 1 && target[0] == REPLICATION_TARGET;

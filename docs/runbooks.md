@@ -253,6 +253,20 @@ alias; requests through it use the alias as the bucket, or the ARN `arn:aws:s3:u
 - **Through it** only objects, listings, uploads and batch deletes; bucket configuration goes to the bucket. Not on a
   cluster yet.
 
+## Replication
+
+`aws s3api put-bucket-replication --bucket photos --replication-configuration
+'{"Role":"arn:aws:iam::000000000000:role/r","Rules":[{"ID":"all","Priority":1,"Status":"Enabled","Filter":{"Prefix":""},"DeleteMarkerReplication":{"Status":"Enabled"},"Destination":{"Bucket":"arn:aws:s3:::photos-backup"}}]}'`
+copies new versions of `photos` to `photos-backup` on the same server (ADR-0077); both need versioning enabled.
+
+- **Replicas keep their source's version id, ETag, metadata and encryption**, and say `x-amz-replication-status:
+  REPLICA`; a source version says `PENDING`, `COMPLETED` or `FAILED` on HEAD and GET.
+- **Replication rides the notifications' outbox:** it is at least once and in order, and a backlog there (a webhook
+  that is down) holds replication too. `FAILED` means the destination refused the replica (it was deleted, or lost
+  its versioning): see the server's log; such versions are not retried.
+- **Not replicated:** objects that were there before the rule, version removals, replicas themselves. Destinations on
+  other servers, tag filters and a cluster's S3 port are not done yet.
+
 ## Rate limits
 
 `--rate-limit-address <n>` and `--rate-limit-key <n>` set the most requests a second from one address and by one

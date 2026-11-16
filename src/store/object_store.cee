@@ -148,6 +148,8 @@ struct BucketInfo {
     inventory: Vector<u8>;
     /// Its access points (ADR-0076), as stored; empty for none.
     accessPoints: Vector<u8>;
+    /// Its replication rules (ADR-0077), as stored; empty for none.
+    replication: Vector<u8>;
     /// The bucket's tags (canonical, as object tags are) and lifecycle rules (`encodeLifecycle`); empty for none
     /// (ADR-0020).
     tags: Vector<u8>;
@@ -504,14 +506,23 @@ struct StoreState {
     ) -> Result<void, StoreError> {
         if (this.outbox.buckets == 0 || lsn <= this.outbox.cursor) { return Ok(); }
         let k = BucketKey { name: copyBytes(bucket)? };
-        let blob = match (this.buckets.get(borrow k)) {
-            Some(b) => copyBytes(b.notification.view())?,
+        var blob = Vector<u8>.create();
+        var replicationBlob = Vector<u8>.create();
+        match (this.buckets.get(borrow k)) {
+            Some(b) => {
+                blob = copyBytes(b.notification.view())?;
+                replicationBlob = copyBytes(b.replication.view())?;
+            }
             null => { return Ok(); }
-        };
-        if (blob.length == 0) { return Ok(); }
+        }
+        if (blob.length == 0 && replicationBlob.length == 0) { return Ok(); }
         let rules = match (decodeNotification(blob.view())) {
             Ok(r) => r,
-            Err(_) => { return Ok(); }
+            Err(_) => Vector<NotificationRule>.create(),
+        };
+        let replication = match (decodeReplication(replicationBlob.view())) {
+            Ok(r) => r,
+            Err(_) => Vector<ReplicationRule>.create(),
         };
         var e = OutboxEvent {
             lsn: lsn,
@@ -530,6 +541,18 @@ struct StoreState {
             if (!ruleTakesEvent(borrow rules[i], kind, key)) { continue; }
             e.ruleIds.push(copyBytes(rules[i].id.view())?)?;
             e.targets.push(copyBytes(rules[i].target.view())?)?;
+        }
+        // Each destination once, however many rules name it (ADR-0077 §2).
+        for (i in 0..replication.length) {
+            if (!replicationTakes(borrow replication[i], kind, key)) { continue; }
+            let target = replicationTarget(replication[i].destination.view())?;
+            var seen = false;
+            for (t in 0..e.targets.length) {
+                if (e.targets[t].view() == target.view()) { seen = true; }
+            }
+            if (seen) { continue; }
+            e.ruleIds.push(copyBytes(replication[i].id.view())?)?;
+            e.targets.push(target)?;
         }
         if (e.targets.length > 0) { this.outbox.add(e)?; }
         return Ok();
@@ -566,8 +589,8 @@ struct StoreState {
             }
             null => {}
         }
-        if (this.nextBucket == NO_BUCKET) { return Err(StoreError.InsufficientStorage); } // 4 billion creations
-        if (entry.notification.length > 0) { this.outbox.buckets += 1; }                  // from a checkpoint
+        if (this.nextBucket == NO_BUCKET) { return Err(StoreError.InsufficientStorage); }                // 4 billion creations
+        if (entry.notification.length > 0 || entry.replication.length > 0) { this.outbox.buckets += 1; } // from a checkpoint
         entry.number = this.nextBucket;
         // If the second put fails, the name stays under a number no bucket has, and the next add reuses the number.
         this.bucketNames.put(entry.number, name)?;
@@ -581,7 +604,8 @@ struct StoreState {
         let k = BucketKey { name: copyBytes(name)? };
         match (this.buckets.remove(borrow k)) {
             Some(b) => {
-                if (b.notification.length > 0 && this.outbox.buckets > 0) { this.outbox.buckets -= 1; }
+                let had = b.notification.length > 0 || b.replication.length > 0;
+                if (had && this.outbox.buckets > 0) { this.outbox.buckets -= 1; }
                 let _ = this.bucketNames.remove(borrow b.number);
             }
             null => {}
@@ -711,7 +735,8 @@ fn applyRecord(
             _ => Vector<ExtentRef>.create(),
         };
         state.extentBytes += extentRefBytes(extents.view());
-        return applyPut(state, m, extents, 0, lsn, segment, offset, totalLen, meta.length, payloadLen);
+        let parts = m.parts;
+        return applyPut(state, m, extents, parts, lsn, segment, offset, totalLen, meta.length, payloadLen);
     }
     match (kind) {
         RecordType.UploadComplete => {
@@ -857,6 +882,7 @@ fn applyRecord(
                 website: Vector<u8>.create(),
                 inventory: Vector<u8>.create(),
                 accessPoints: Vector<u8>.create(),
+                replication: Vector<u8>.create(),
                 tags: Vector<u8>.create(),
                 lifecycle: Vector<u8>.create(),
                 versioning: VERSIONING_OFF,
@@ -883,9 +909,14 @@ fn applyRecord(
             var lost = false;
             match (state.buckets.getMut(borrow k)) {
                 Some(b) => {
-                    if (configKind == BUCKET_CONFIG_NOTIFICATION) {
-                        gained = b.notification.length == 0 && value.length > 0;
-                        lost = b.notification.length > 0 && value.length == 0;
+                    // A bucket has rules while it has notification rules or replication rules (ADR-0077 §2).
+                    if (configKind == BUCKET_CONFIG_NOTIFICATION || configKind == BUCKET_CONFIG_REPLICATION) {
+                        let before = b.notification.length > 0 || b.replication.length > 0;
+                        let other = if (configKind == BUCKET_CONFIG_NOTIFICATION) b.replication.length > 0
+                            else b.notification.length > 0;
+                        let after = other || value.length > 0;
+                        gained = !before && after;
+                        lost = before && !after;
                     }
                     if (configKind == BUCKET_CONFIG_TAGS) {
                         b.tags = value;
@@ -915,6 +946,8 @@ fn applyRecord(
                         b.inventory = value;
                     } else if (configKind == BUCKET_CONFIG_ACCESS_POINTS) {
                         b.accessPoints = value;
+                    } else if (configKind == BUCKET_CONFIG_REPLICATION) {
+                        b.replication = value;
                     } else {
                         b.versioning = value[0]; // one valid byte: `decodeBucketConfigMeta` checked it
                     }
@@ -3529,6 +3562,50 @@ struct ObjectStore {
         return Ok(out);
     }
 
+    fn replicationBucketCount(borrow this) -> u64 {
+        var n: u64 = 0;
+        for (i in 0..this.state.buckets.length()) {
+            if (this.state.buckets.valueAt(i).replication.length > 0) { n += 1; }
+        }
+        return n;
+    }
+
+    /// A source version's replication status (ADR-0077 §4): REPLICATION_NONE when no rule takes the key;
+    /// COMPLETED when every destination has its id; PENDING while its event waits; else FAILED.
+    fn replicationStatusOf(
+        borrow this,
+        bucket: Slice<u8>,
+        key: Slice<u8>,
+        versionId: [u8; 16],
+        lsn: u64,
+    ) -> Result<u8, StoreError> {
+        let k = BucketKey { name: copyBytes(bucket)? };
+        let blob = match (this.state.buckets.get(borrow k)) {
+            Some(b) => copyBytes(b.replication.view())?,
+            null => { return Ok(REPLICATION_NONE); }
+        };
+        let rules = match (decodeReplication(blob.view())) {
+            Ok(r) => r,
+            Err(_) => { return Ok(REPLICATION_NONE); }
+        };
+        var taken = false;
+        var missing = false;
+        for (i in 0..rules.length) {
+            if (!replicationTakes(borrow rules[i], EVENT_PUT, key)) { continue; }
+            taken = true;
+            let destination = rules[i].destination.view();
+            if (!this.state.hasBucket(destination)?) {
+                missing = true;
+                continue;
+            }
+            let dk = this.state.keyFor(destination, key)?;
+            if (this.state.index.slotOf(borrow dk, versionId) == NO_VERSION_SLOT) { missing = true; }
+        }
+        if (!taken) { return Ok(REPLICATION_NONE); }
+        if (!missing) { return Ok(REPLICATION_COMPLETED); }
+        return Ok(if (lsn > this.state.outbox.cursor) REPLICATION_PENDING else REPLICATION_FAILED);
+    }
+
     fn accessPointBucketCount(borrow this) -> u64 {
         var n: u64 = 0;
         for (i in 0..this.state.buckets.length()) {
@@ -3695,6 +3772,81 @@ struct ObjectStore {
             if (!isNullVersionId(id) && this.state.index.slotOf(borrow k, id) == NO_VERSION_SLOT) { break; }
         }
         return Ok(id);
+    }
+
+    /// A replica (ADR-0077 §3): `obj`, the source version's stored bytes, as a version of `key` with the source's
+    /// version id, MD5 and part count, so its ETag and id are the source's. Its bucket's versioning must be enabled.
+    /// False, with nothing written, when the key already has a version with that id: delivery is at least once, so a
+    /// replica may be asked for again.
+    fn putReplica(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        versionId: [u8; 16],
+        md5: [u8; 16],
+        parts: u32,
+        contentType: StringView,
+        metadata: Slice<u8>,
+        extras: Slice<u8>,
+        obj: borrow FinishedObject,
+    ) -> Result<bool, StoreError> {
+        match (this.commitStaged()) {
+            Ok(_) => {}
+            Err(e) => {
+                this.discardFinished(obj);
+                return Err(e);
+            }
+        }
+        let refused = metadata.length > MAX_METADATA_BYTES || isNullVersionId(versionId) || parts > 10000;
+        if (refused || this.versioningOf(bucket.bytes())? != VERSIONING_ENABLED) {
+            this.discardFinished(obj);
+            return Err(StoreError.InvalidKey);
+        }
+        match (this.checkPut(bucket, key, contentType, obj, PutCondition.None)) {
+            Ok() => {}
+            Err(e) => {
+                this.discardFinished(obj);
+                return Err(e);
+            }
+        }
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
+        if (this.state.index.slotOf(borrow k, versionId) != NO_VERSION_SLOT) {
+            this.discardFinished(obj);
+            return Ok(false);
+        }
+        let rec = encodeReplicaPut(bucket, key, contentType, metadata, extras, versionId, md5, parts, obj)?;
+        if (this.mustCommitBefore(borrow rec, obj)) { this.commitStaged()?; }
+        let _ = this.stageEncoded(rec, obj)?;
+        this.commitStaged()?;
+        return Ok(true);
+    }
+
+    /// A replicated delete marker (ADR-0077 §3): a marker on `key` with its source's id; false, with nothing written,
+    /// when the key already has a version with that id.
+    fn putReplicaMarker(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        versionId: [u8; 16],
+    ) -> Result<bool, StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        ObjectStore.checkKey(key)?;
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        if (isNullVersionId(versionId) || this.versioningOf(bucket.bytes())? != VERSIONING_ENABLED) {
+            return Err(StoreError.InvalidKey);
+        }
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
+        if (this.state.index.slotOf(borrow k, versionId) != NO_VERSION_SLOT) { return Ok(false); }
+        let _ = this.stageDeleteRecord(
+            RecordType.DeleteMarker,
+            bucket.bytes(),
+            key.bytes(),
+            versionId,
+            Clock.unixMillis(),
+        )?;
+        this.commitStaged()?;
+        return Ok(true);
     }
 
     /// Whether a record must wait for a commit: it would overflow the segment, or the segment is due to rotate.
@@ -5516,7 +5668,8 @@ struct ObjectStore {
         if (kind == BUCKET_CONFIG_WEBSITE && !isWebsiteValue(value)) { return Err(StoreError.InvalidKey); }
         if (kind == BUCKET_CONFIG_INVENTORY && !isInventoryValue(value)) { return Err(StoreError.InvalidKey); }
         if (kind == BUCKET_CONFIG_ACCESS_POINTS && !isAccessPointsValue(value)) { return Err(StoreError.InvalidKey); }
-        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_ACCESS_POINTS) { return Err(StoreError.InvalidKey); }
+        if (kind == BUCKET_CONFIG_REPLICATION && !isReplicationValue(value)) { return Err(StoreError.InvalidKey); }
+        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_REPLICATION) { return Err(StoreError.InvalidKey); }
         // Object lock needs versioning enabled, keeps it so, and is never taken off a bucket (ADR-0047 §1).
         let locks = this.lockConfigOf(bucket.bytes())?.length > 0;
         if (kind == BUCKET_CONFIG_OBJECT_LOCK) {
@@ -5557,6 +5710,7 @@ struct ObjectStore {
                 if (kind == BUCKET_CONFIG_WEBSITE) { return Ok(copyBytes(b.website.view())?); }
                 if (kind == BUCKET_CONFIG_INVENTORY) { return Ok(copyBytes(b.inventory.view())?); }
                 if (kind == BUCKET_CONFIG_ACCESS_POINTS) { return Ok(copyBytes(b.accessPoints.view())?); }
+                if (kind == BUCKET_CONFIG_REPLICATION) { return Ok(copyBytes(b.replication.view())?); }
                 Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?)
             }
             null => Err(StoreError.NoSuchBucket),
@@ -5929,6 +6083,44 @@ struct EncodedPut {
     kind: RecordType;
     meta: Vector<u8>;
     manifest: Vector<u8>;
+}
+
+/// A replica's put record (ADR-0077 §3): `encodePut`'s, with the source's MD5, and its part count after the extras
+/// section when it has parts.
+fn encodeReplicaPut(
+    bucket: StringView,
+    key: StringView,
+    contentType: StringView,
+    metadata: Slice<u8>,
+    extras: Slice<u8>,
+    versionId: [u8; 16],
+    md5: [u8; 16],
+    parts: u32,
+    obj: borrow FinishedObject,
+) -> Result<EncodedPut, StoreError> {
+    var meta = Vector<u8>.create();
+    encodePutMeta(
+        mut meta,
+        bucket.bytes(),
+        key.bytes(),
+        versionId,
+        Clock.unixMillis(),
+        obj.size,
+        md5,
+        contentType.bytes(),
+        metadata,
+    )?;
+    appendExtrasSection(mut meta, extras)?;
+    if (parts > 0) { meta.pushLE(parts)?; }
+    var manifest = Vector<u8>.create();
+    let kind = match (borrow obj.body) {
+        ObjectBody.Inline(_) => RecordType.PutInline,
+        ObjectBody.Extents(extents) => {
+            encodeManifest(mut manifest, extents.view())?;
+            RecordType.PutExtent
+        }
+    };
+    return Ok(EncodedPut { kind: kind, meta: meta, manifest: manifest });
 }
 
 fn encodePut(

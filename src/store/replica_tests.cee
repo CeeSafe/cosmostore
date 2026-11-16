@@ -1,0 +1,221 @@
+// Replicas (ADR-0077 §3): a version written with its source's id, MD5 and part count, once, durably.
+
+fn replicaBuckets(s: borrow mut ObjectStore) -> Result<void, StoreError> {
+    s.createBucket("src")?;
+    s.createBucket("dst")?;
+    var on = [0u8; 1];
+    on[0] = VERSIONING_ENABLED;
+    s.setBucketConfig("src", BUCKET_CONFIG_VERSIONING, on[..])?;
+    s.setBucketConfig("dst", BUCKET_CONFIG_VERSIONING, on[..])?;
+    return Ok();
+}
+
+/// Writes `bytes` to `src/key`, then its replica to `dst/key` with `parts`; the source's version id and MD5.
+fn putAndReplicate(s: borrow mut ObjectStore, key: StringView, bytes: Slice<u8>, parts: u32) -> VersionEntry {
+    var w = s.newWriter()!;
+    w.write(bytes)!;
+    let obj = w.finish()!;
+    let _ = s.putFinishedWith("src", key, "text/plain", "".bytes(), "".bytes(), borrow obj, PutCondition.None)!;
+    let source = s.versionsOf("src", key)!;
+    let v = VersionEntry {
+        versionId: source[0].versionId,
+        generation: source[0].generation,
+        deleteMarker: false,
+        size: source[0].size,
+        mtimeMillis: source[0].mtimeMillis,
+        md5: source[0].md5,
+        parts: parts,
+    };
+    var r = s.newWriter()!;
+    r.write(bytes)!;
+    let copy = r.finish()!;
+    let _ = s.putReplica("dst", key, v.versionId, v.md5, parts, "text/plain", "".bytes(), "".bytes(), borrow copy)!;
+    return v;
+}
+
+@test
+fn replicasKeepTheirSourcesIdAndEtag() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("replicas");
+    let big = patterned(70000, 3);
+    var made = Vector<VersionEntry>.create();
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        replicaBuckets(mut s)!;
+        made.push(putAndReplicate(mut s, "small", "tiny".bytes(), 0))!;
+        made.push(putAndReplicate(mut s, "big", big.view(), 3))!;
+        // Asked again: nothing more is written.
+        var w = s.newWriter()!;
+        w.write("tiny".bytes())!;
+        let again = w.finish()!;
+        Check.isTrue(
+            !s.putReplica("dst", "small", made[0].versionId, made[0].md5, 0, "", "".bytes(), "".bytes(), borrow again)!,
+            "a replica twice",
+        )?;
+        Check.equalU64(1, s.versionsOf("dst", "small")!.length as u64)?;
+        // Not to a bucket without versioning, nor with the null id.
+        s.createBucket("plain")!;
+        var w2 = s.newWriter()!;
+        w2.write("x".bytes())!;
+        let refused = w2.finish()!;
+        Check.isTrue(
+            s.putReplica("plain", "x", made[0].versionId, made[0].md5, 0, "", "".bytes(), "".bytes(), borrow refused)
+                .isErr(),
+            "no versioning",
+        )?;
+        Check.equalU64(0, s.verify()!.problems.length as u64)?;
+    }
+    // Reopened from the journal, then from a checkpoint.
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        let names = ["small", "big"];
+        for (i in 0..2) {
+            let replica = s.versionsOf("dst", names[i])!;
+            Check.equalU64(1, replica.length as u64)?;
+            Check.isTrue(replica[0].versionId[..] == made[i].versionId[..], "the source's version id")?;
+            Check.isTrue(replica[0].md5[..] == made[i].md5[..], "the source's MD5")?;
+            Check.equalU64(made[i].parts as u64, replica[0].parts as u64)?;
+        }
+        Check.equalBytes(big.view(), s.getObjectVersion("dst", "big", made[1].versionId)!.view())?;
+        Check.equalBytes("tiny".bytes(), s.getObjectVersion("dst", "small", made[0].versionId)!.view())?;
+        if (round == 0) { let _ = s.checkpoint()!; }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// What each step of the replica workload did: R_ABSENT, R_MAYBE, R_ACKED.
+const R_ABSENT: u8 = 0;
+const R_MAYBE: u8 = 1;
+const R_ACKED: u8 = 2;
+
+struct ReplicaModel {
+    /// The two sources and their two replicas.
+    wrote: [u8; 4];
+    ids: [[u8; 16]; 2];
+}
+
+fn noteReplica(m: borrow mut ReplicaModel, step: usize, r: Result<bool, StoreError>) {
+    match (r) {
+        Ok(_) => { m.wrote[step] = R_ACKED; }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.wrote[step] = R_MAYBE; }
+        }
+    }
+}
+
+/// An inline source, then one in an extent.
+fn replicaSeed(i: usize) -> u64 => if (i == 0) 1 else 2;
+
+fn replicaWorkload(dir: StringView, m: borrow mut ReplicaModel) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    if (replicaBuckets(mut s).isErr()) { return; }
+    let keys = ["a", "b"];
+    for (i in 0..2) {
+        let bytes = patterned(seedSize(replicaSeed(i)), replicaSeed(i));
+        var w = match (s.newWriter()) {
+            Ok(made) => made,
+            Err(_) => { return; }
+        };
+        if (w.write(bytes.view()).isErr()) { return; }
+        let obj = match (w.finish()) {
+            Ok(o) => o,
+            Err(_) => { return; }
+        };
+        match (s.putFinishedWith("src", keys[i], "", "".bytes(), "".bytes(), borrow obj, PutCondition.None)) {
+            Ok(o) => {
+                m.wrote[i] = R_ACKED;
+                m.ids[i] = o.versionId;
+            }
+            Err(e) => {
+                if (mayBeDurable(borrow e)) { m.wrote[i] = R_MAYBE; }
+                return;
+            }
+        }
+        let md5 = Md5.of(bytes.view());
+        var r = match (s.newWriter()) {
+            Ok(made) => made,
+            Err(_) => { return; }
+        };
+        if (r.write(bytes.view()).isErr()) { return; }
+        let copy = match (r.finish()) {
+            Ok(o) => o,
+            Err(_) => { return; }
+        };
+        noteReplica(m, 2 + i, s.putReplica("dst", keys[i], m.ids[i], md5, 2, "", "".bytes(), "".bytes(), borrow copy));
+        if (m.wrote[2 + i] != R_ACKED) { return; }
+    }
+}
+
+fn checkReplicas(s: borrow ObjectStore, m: borrow ReplicaModel) -> Result<void, TestFailure> {
+    if (!s.bucketExists("dst")!) { return Ok(); }
+    let keys = ["a", "b"];
+    for (i in 0..2) {
+        let replicas = s.versionsOf("dst", keys[i])!;
+        Check.isTrue(replicas.length <= 1, "one replica at most")?;
+        if (m.wrote[2 + i] == R_ACKED) { Check.equalU64(1, replicas.length as u64)?; }
+        if (m.wrote[2 + i] == R_ABSENT) { Check.equalU64(0, replicas.length as u64)?; }
+        if (replicas.length == 1) {
+            Check.isTrue(replicas[0].versionId[..] == m.ids[i][..], "the source's version id")?;
+            Check.equalU64(2, replicas[0].parts as u64)?;
+            let bytes = patterned(seedSize(replicaSeed(i)), replicaSeed(i));
+            Check.isTrue(replicas[0].md5[..] == Md5.of(bytes.view())[..], "the source's MD5")?;
+            Check.equalBytes(bytes.view(), s.getObjectVersion("dst", keys[i], m.ids[i])!.view())?;
+        }
+    }
+    return Ok();
+}
+
+fn sweepReplicas(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    var clean = ReplicaModel { wrote: [0u8; 4], ids: [[0u8; 16]; 2] };
+    Faults.countOperations();
+    replicaWorkload(dir.view(), mut clean);
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 20, "the workload performs I/O")?;
+    for (i in 0..4) { Check.equalU64(R_ACKED as u64, clean.wrote[i] as u64)?; }
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        var m = ReplicaModel { wrote: [0u8; 4], ids: [[0u8; 16]; 2] };
+        armMode(borrow mode, n);
+        replicaWorkload(dir.view(), mut m);
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired().min(1))?;
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        {
+            var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+            checkReplicas(borrow s, borrow m)?;
+            let report = s.verify()!;
+            Check.equalU64(0, report.orphanExtents as u64)?;
+            Check.equalU64(0, report.problems.length as u64)?;
+            let _ = s.compact(1073741824)!;
+            let _ = s.checkpoint()!;
+        }
+        let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        checkReplicas(borrow s, borrow m)?;
+        Check.equalU64(0, s.verify()!.problems.length as u64)?;
+    }
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn replicaFaultsOnce() -> Result<void, TestFailure> => sweepReplicas("rfault-once", SweepMode.Once);
+
+@test
+fn replicaFaultsSticky() -> Result<void, TestFailure> => sweepReplicas("rfault-sticky", SweepMode.Sticky);
+
+@test
+fn replicaFaultsTorn() -> Result<void, TestFailure> => sweepReplicas("rfault-torn", SweepMode.StickyTorn);
+
+@test
+fn replicaFaultsCrash() -> Result<void, TestFailure> => sweepReplicas("rfault-crash", SweepMode.Crash);

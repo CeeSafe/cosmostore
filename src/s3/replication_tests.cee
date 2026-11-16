@@ -1,0 +1,47 @@
+// Bucket replication (ADR-0077): the configuration's XML and which events a rule takes.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+@test
+fn replicationConfigurationXml() -> Result<void, TestFailure> {
+    let xml =
+        "<ReplicationConfiguration><Role>arn:aws:iam::1:role/r</Role><Rule><ID>logs</ID><Priority>2</Priority><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication></Rule><Rule><ID>all</ID><Priority>1</Priority><Filter><Prefix></Prefix></Filter><Status>Disabled</Status><Destination><Bucket>arn:aws:s3:::other</Bucket></Destination><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication></Rule></ReplicationConfiguration>";
+    let rules = parseReplication(xml.bytes())!;
+    Check.equalU64(2, rules.length as u64)?;
+    Check.equalBytes("backup".bytes(), rules[0].destination.view())?;
+    Check.isTrue(rules[0].enabled && !rules[0].deleteMarkers, "the first rule")?;
+    Check.isTrue(!rules[1].enabled && rules[1].deleteMarkers, "the second rule")?;
+    var stored = Vector<u8>.create();
+    encodeReplication(rules.view(), mut stored)!;
+    let back = decodeReplication(stored.view())!;
+    var out = Vector<u8>.create();
+    replicationXml(back.view(), mut out)!;
+    let again = parseReplication(out.view())!;
+    Check.equalBytes("logs/".bytes(), again[0].prefix.view())?;
+    Check.equalU64(2, again[0].priority as u64)?;
+    // What a rule takes: new objects and uploads under its prefix; markers if it says so; never a removal.
+    Check.isTrue(replicationTakes(borrow back[0], EVENT_PUT, "logs/a".bytes()), "a put")?;
+    Check.isTrue(replicationTakes(borrow back[0], EVENT_COMPLETE, "logs/a".bytes()), "an upload")?;
+    Check.isTrue(!replicationTakes(borrow back[0], EVENT_PUT, "img/a".bytes()), "another prefix")?;
+    Check.isTrue(!replicationTakes(borrow back[0], EVENT_MARKER, "logs/a".bytes()), "no markers")?;
+    Check.isTrue(!replicationTakes(borrow back[0], EVENT_DELETE, "logs/a".bytes()), "no removals")?;
+    Check.isTrue(!replicationTakes(borrow back[1], EVENT_PUT, "x".bytes()), "disabled")?;
+    let target = replicationTarget("backup".bytes())!;
+    Check.isTrue(isReplicationTarget(target.view()) && !isReplicationTarget("hook".bytes()), "targets")?;
+    // Tags and existing objects are NotImplemented; a rule needs a destination ARN.
+    Check.isTrue(
+        parseReplication(
+            "<ReplicationConfiguration><Rule><Status>Enabled</Status><Filter><Tag><Key>a</Key><Value>b</Value></Tag></Filter><Destination><Bucket>arn:aws:s3:::b</Bucket></Destination></Rule></ReplicationConfiguration>".bytes(),
+        ).isErr(),
+        "tags",
+    )?;
+    Check.isTrue(
+        parseReplication(
+            "<ReplicationConfiguration><Rule><Status>Enabled</Status><Destination><Bucket>b</Bucket></Destination></Rule></ReplicationConfiguration>".bytes(),
+        ).isErr(),
+        "no ARN",
+    )?;
+    return Ok();
+}

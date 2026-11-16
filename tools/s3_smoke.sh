@@ -924,6 +924,62 @@ check "the access point deleted" "$(apcode s3control get-access-point --account-
 check "and its alias with it" "$(code s3api list-objects-v2 --bucket "$alias")" NoSuchBucket
 aws s3 rm --recursive s3://smoke/ap/ > /dev/null 2>&1
 
+# Replication (ADR-0077): new versions of rsrc go to rdst with their version ids and ETags.
+for b in rsrc rdst rplain; do aws s3api create-bucket --bucket $b > /dev/null 2>&1; done
+for b in rsrc rdst; do aws s3api put-bucket-versioning --bucket $b --versioning-configuration Status=Enabled > /dev/null 2>&1; done
+rconf='{"Role":"arn:aws:iam::000000000000:role/r","Rules":[{"ID":"all","Priority":1,"Status":"Enabled","Filter":{"Prefix":""},"DeleteMarkerReplication":{"Status":"Enabled"},"Destination":{"Bucket":"arn:aws:s3:::rdst"}}]}'
+check "a destination without versioning" "$(code s3api put-bucket-replication --bucket rsrc --replication-configuration "${rconf/rdst/rplain}")" InvalidRequest
+aws s3api put-bucket-replication --bucket rsrc --replication-configuration "$rconf" > /dev/null 2>&1 && pass "put-bucket-replication" || fail "put-bucket-replication"
+check "get-bucket-replication" "$(aws s3api get-bucket-replication --bucket rsrc --query 'ReplicationConfiguration.Rules[0].Destination.Bucket' --output text 2>&1)" "arn:aws:s3:::rdst"
+check "a source keeps its versioning" "$(code s3api put-bucket-versioning --bucket rsrc --versioning-configuration Status=Suspended)" InvalidBucketState
+printf 'replicate me' > r1.txt
+head -c 9437184 /dev/urandom > r2.bin
+aws s3api put-object --bucket rsrc --key r/small.txt --body r1.txt > /dev/null 2>&1
+aws s3 cp r2.bin s3://rsrc/r/multi.bin > /dev/null 2>&1
+aws s3api put-object --bucket rsrc --key r/sealed.txt --body r1.txt --server-side-encryption AES256 > /dev/null 2>&1
+replicated() {
+    for i in $(seq 1 80); do
+        [ "$(aws s3api head-object --bucket rsrc --key "$1" --query ReplicationStatus --output text 2>/dev/null)" = COMPLETED ] && return 0
+        sleep 0.25
+    done
+    return 1
+}
+for k in r/small.txt r/multi.bin r/sealed.txt; do
+    replicated "$k" && pass "$k replicated" || fail "$k replicated"
+    sv=$(aws s3api head-object --bucket rsrc --key "$k" --query '[VersionId,ETag]' --output text 2>&1)
+    dv=$(aws s3api head-object --bucket rdst --key "$k" --query '[VersionId,ETag]' --output text 2>&1)
+    check "$k keeps its version id and ETag" "$dv" "$sv"
+    check "$k is a replica" "$(aws s3api head-object --bucket rdst --key "$k" --query ReplicationStatus --output text 2>&1)" REPLICA
+done
+check "a multipart ETag" "$(aws s3api head-object --bucket rdst --key r/multi.bin --query ETag --output text 2>&1 | grep -c -- '-2"')" 1
+check "the multipart replica's bytes" "$(aws s3 cp s3://rdst/r/multi.bin - 2>/dev/null | cmp -s - r2.bin && echo same)" same
+check "the sealed replica reads" "$(aws s3 cp s3://rdst/r/sealed.txt - 2>&1)" "replicate me"
+check "and is sealed" "$(aws s3api head-object --bucket rdst --key r/sealed.txt --query ServerSideEncryption --output text 2>&1)" AES256
+marker=$(aws s3api delete-object --bucket rsrc --key r/small.txt --query VersionId --output text 2>&1)
+for i in $(seq 1 40); do
+    got=$(aws s3api list-object-versions --bucket rdst --prefix r/small.txt --query 'DeleteMarkers[0].VersionId' --output text 2>/dev/null)
+    [ "$got" = "$marker" ] && break
+    sleep 0.25
+done
+check "a delete marker replicated with its id" "$got" "$marker"
+aws s3api put-bucket-replication --bucket rdst --replication-configuration "${rconf//rdst/rsrc}" > /dev/null 2>&1
+aws s3api put-object --bucket rsrc --key r/once.txt --body r1.txt > /dev/null 2>&1
+replicated r/once.txt && pass "both ways: replicated" || fail "both ways: replicated"
+sleep 1
+check "a replica is not replicated back" "$(aws s3api list-object-versions --bucket rsrc --prefix r/once.txt --query 'length(Versions)' --output text 2>&1)" 1
+aws s3api delete-bucket-replication --bucket rdst > /dev/null 2>&1
+aws s3api delete-bucket-replication --bucket rsrc > /dev/null 2>&1
+check "delete-bucket-replication" "$(code s3api get-bucket-replication --bucket rsrc)" ReplicationConfigurationNotFoundError
+for b in rsrc rdst; do
+    for kind in Versions DeleteMarkers; do
+        aws s3api list-object-versions --bucket $b --query "$kind[].[Key,VersionId]" --output text | while read -r k v; do
+            [ "$k" = None ] && continue
+            aws s3api delete-object --bucket $b --key "$k" --version-id "$v" > /dev/null 2>&1
+        done
+    done
+done
+for b in rsrc rdst rplain; do aws s3api delete-bucket --bucket $b > /dev/null 2>&1; done
+
 # Inventory reports (ADR-0074): a "day" of 3 seconds here; a report of the smoke bucket into smokelogs.
 check "inventory to a bucket that is not there" "$(code s3api put-bucket-inventory-configuration --bucket smoke --id daily --inventory-configuration '{"Id":"daily","IsEnabled":true,"Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::nobucket","Format":"CSV"}},"Schedule":{"Frequency":"Daily"},"IncludedObjectVersions":"Current"}')" InvalidArgument
 check "parquet is not done" "$(code s3api put-bucket-inventory-configuration --bucket smoke --id daily --inventory-configuration '{"Id":"daily","IsEnabled":true,"Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::smokelogs","Format":"Parquet"}},"Schedule":{"Frequency":"Daily"},"IncludedObjectVersions":"Current"}')" NotImplemented
