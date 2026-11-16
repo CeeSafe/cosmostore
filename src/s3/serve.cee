@@ -832,6 +832,8 @@ fn serve() -> i32 {
     var websiteDomain = Vector<u8>.create();
     var sseKeysAt: usize = 0;
     var kmsKeysAt: usize = 0;
+    var stsKeysAt: usize = 0;
+    var rolesAt: usize = 0;
     var perAddress: u64 = 0;
     var perKey: u64 = 0;
     var storeConfig = StoreConfig.defaults();
@@ -899,6 +901,10 @@ fn serve() -> i32 {
             sseKeysAt = at + 1;
         } else if (option == "--kms-key-file") {
             kmsKeysAt = at + 1;
+        } else if (option == "--sts-key-file") {
+            stsKeysAt = at + 1;
+        } else if (option == "--roles-file") {
+            rolesAt = at + 1;
         } else if (option == "--rate-limit-address" || option == "--rate-limit-key") {
             match (value.parseInt<u64>()) {
                 Some(n) => {
@@ -989,6 +995,35 @@ fn serve() -> i32 {
             Err(message) => { die(message.view()); }
         };
     }
+    // STS's token keys and its roles (ADR-0075).
+    var stsKeys = Vector<MasterKey>.create();
+    if (stsKeysAt != 0) {
+        stsKeys = match (readSseKeys(Process.argument(stsKeysAt) ?? "")) {
+            Ok(k) => k,
+            Err(message) => { die(message.view()); }
+        };
+    }
+    var roles = Vector<StsRole>.create();
+    if (rolesAt != 0) {
+        let text = match (readSmallFile(Process.argument(rolesAt) ?? "", "roles file")) {
+            Ok(t) => t,
+            Err(message) => { die(message.view()); }
+        };
+        roles = match (parseRolesFile(text.view())) {
+            Ok(r) => r,
+            Err(fault) => {
+                die(match (fault) {
+                    RolesFault.BadLine => "a line of the roles file is not `<name> <max seconds> <policy JSON>`",
+                    RolesFault.BadName => "a role name of the roles file is not 1 to 64 of A-Z a-z 0-9 +=,.@_-",
+                    RolesFault.BadSeconds => "a role's max session seconds is not 900 to 43200",
+                    RolesFault.BadPolicy => "a role's policy is not an identity policy CosmoStore takes",
+                    RolesFault.Duplicate => "two roles of the roles file have one name",
+                    RolesFault.OutOfMemory => "out of memory",
+                });
+            }
+        };
+        if (stsKeysAt == 0) { die("--roles-file needs --sts-key-file"); }
+    }
     // TLS before the store opens, so a bad certificate costs no recovery.
     var tls: TlsConfig? = null;
     if (certAt > 0) {
@@ -1068,6 +1103,8 @@ fn serve() -> i32 {
         secure: tls.isSome(),
         notifyTargets: notifyTargets,
         sseKeys: sseKeys,
+        stsKeys: stsKeys,
+        roles: roles,
         kmsKeys: kmsKeys,
         corsBuckets: AtomicU64.create(corsBuckets),
         accessLog: Some(AccessLog { lines: accessLines, dropped: AtomicU64.create(0) }),

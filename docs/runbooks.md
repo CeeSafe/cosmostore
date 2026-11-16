@@ -224,6 +224,21 @@ writes a report of `photos` to `reports` under `inv/photos/daily/` every day (AD
   their space as the CSV's.
 - **Not on a cluster yet.**
 
+## Temporary credentials (STS)
+
+`serve --sts-key-file sts.keys --roles-file roles` turns on `aws sts get-session-token` and `aws sts assume-role` on the
+S3 port (ADR-0075). `sts.keys` holds `<id> <base64 of 32 bytes>` lines (`printf 'sts1 %s\n' "$(head -c 32 /dev/urandom
+| base64)"`); keep it like the credentials file. `roles` holds a role a line:
+`reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::photos","arn:aws:s3:::photos/*"]}]}`.
+
+- **Any key may assume any role**; a role only narrows what its session may do. `ListBuckets` needs
+  `s3:ListAllMyBuckets` with `"Resource":"*"`, `CreateBucket` `s3:CreateBucket`.
+- **Revoking:** a session lasts until it expires, unless its key leaves the credentials file (its sessions stop at
+  once) or its role leaves the roles file (at the next start).
+- **Rotating the token key:** put the new key first and keep the old one until the longest session has expired
+  (36 hours at most).
+- **Errors:** `InvalidToken` (a token another key sealed, or changed), `ExpiredToken`. Not on a cluster yet.
+
 ## Rate limits
 
 `--rate-limit-address <n>` and `--rate-limit-key <n>` set the most requests a second from one address and by one

@@ -1,0 +1,480 @@
+// STS (ADR-0075): temporary credentials. `GetSessionToken` gives the calling key's own rights for a while;
+// `AssumeRole` gives them narrowed by a role's policy (and a session policy). The session token is the session itself,
+// sealed with AES-256-GCM under a key of `serve --sts-key-file`: nothing is stored, and any server with the key and
+// the credentials checks it.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+const STS_XMLNS: StringView = "https://sts.amazonaws.com/doc/2011-06-15/";
+/// The token's sealed form: its version, then which key sealed it.
+const STS_TOKEN_VERSION: u8 = 1;
+const STS_MAX_POLICY_BYTES: usize = 2048;
+const STS_MAX_ROLE_SECONDS: u64 = 43200;
+
+/// A session: who it is, what it may do, until when. `secret` is wiped once the request's signing key is made.
+struct StsSession {
+    /// `ASIA` and 16 letters and digits.
+    accessKey: Vector<u8>;
+    secret: Vector<u8>;
+    /// The long-term key that asked for it.
+    parent: Vector<u8>;
+    /// The role it assumed, empty for `GetSessionToken`'s; the session's name; its session policy (JSON, maybe empty).
+    role: Vector<u8>;
+    name: Vector<u8>;
+    policy: Vector<u8>;
+    expiresMs: i64;
+}
+
+/// A role of `--roles-file`: `<name> <max session seconds> <policy JSON on one line>`.
+struct StsRole {
+    name: Vector<u8>;
+    maxSeconds: u64;
+    policy: BucketPolicy;
+}
+
+// ---- The token ----
+
+fn stsAad(out: borrow mut Vector<u8>, keyId: Slice<u8>) -> Result<void, AllocError> {
+    out.extend("cosmostore-sts-1 ".bytes())?;
+    return out.extend(keyId);
+}
+
+/// The session as a token: base64 of u8 version, u8 key id length, the key id, a 12-byte nonce, the sealed session and
+/// its 16-byte tag. Sealed under the first key; null without one.
+fn sealStsToken(keys: Slice<MasterKey>, s: borrow StsSession, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    if (keys.length == 0) { return Ok(false); }
+    let key = borrow keys[0];
+    let cipher = match (Aes256Gcm.create(key.key[..])) {
+        Some(c) => c,
+        null => { return Ok(false); }
+    };
+    var plain = Vector<u8>.create();
+    plain.pushLE(s.expiresMs)?;
+    pushText16(mut plain, s.accessKey.view())?;
+    pushText16(mut plain, s.secret.view())?;
+    pushText16(mut plain, s.parent.view())?;
+    pushText16(mut plain, s.role.view())?;
+    pushText16(mut plain, s.name.view())?;
+    pushText16(mut plain, s.policy.view())?;
+    var nonce = [0u8; 12];
+    if (Random.fill(mut nonce[..]).isErr()) { return Ok(false); }
+    var aad = Vector<u8>.create();
+    stsAad(mut aad, key.id.view())?;
+    let tag = cipher.seal(nonce, aad.view(), mut plain.viewMut());
+    var sealed = Vector<u8>.create();
+    sealed.push(STS_TOKEN_VERSION)?;
+    sealed.push(truncate<u8>(key.id.length))?;
+    sealed.extend(key.id.view())?;
+    sealed.extend(nonce[..])?;
+    sealed.extend(plain.view())?;
+    sealed.extend(tag[..])?;
+    appendBase64(out, sealed.view())?;
+    return Ok(true);
+}
+
+/// The session a token holds; null for one these keys did not seal, or that was changed.
+fn openStsToken(keys: Slice<MasterKey>, token: Slice<u8>) -> Result<StsSession?, AllocError> {
+    var raw = Vector<u8>.create();
+    if (token.length > 8192 || !decodeBase64(token, mut raw)?) { return Ok(null); }
+    let b = raw.view();
+    if (b.length < 2 || b[0] != STS_TOKEN_VERSION) { return Ok(null); }
+    let idLength = b[1] as usize;
+    let head = 2 + idLength + 12;
+    if (b.length < head + 8 + 16) { return Ok(null); }
+    let id = b[2..2 + idLength];
+    var at = keys.length;
+    for (i in 0..keys.length) {
+        if (keys[i].id.view() == id) { at = i; }
+    }
+    if (at == keys.length) { return Ok(null); }
+    let cipher = match (Aes256Gcm.create(keys[at].key[..])) {
+        Some(c) => c,
+        null => { return Ok(null); }
+    };
+    var nonce = [0u8; 12];
+    for (i in 0..12) { nonce[i] = b[2 + idLength + i]; }
+    var tag = [0u8; 16];
+    for (i in 0..16) { tag[i] = b[b.length - 16 + i]; }
+    var plain = copyBytes(b[head..b.length - 16])?;
+    var aad = Vector<u8>.create();
+    stsAad(mut aad, id)?;
+    if (!cipher.open(nonce, aad.view(), mut plain.viewMut(), tag)) { return Ok(null); }
+    let p = plain.view();
+    let expiresMs = p.readLE<i64>(0);
+    var pos: usize = 8;
+    let fields = stsFields(p, mut pos);
+    if (pos != p.length) { return Ok(null); }
+    return Ok(match (fields) {
+        Ok(f) => Some(StsSession {
+            accessKey: f.accessKey,
+            secret: f.secret,
+            parent: f.parent,
+            role: f.role,
+            name: f.name,
+            policy: f.policy,
+            expiresMs: expiresMs,
+        }),
+        Err(_) => null,
+    });
+}
+
+fn stsFields(p: Slice<u8>, at: borrow mut usize) -> Result<StsSession, MetaFault> => Ok(StsSession {
+    accessKey: readText16(p, at)?,
+    secret: readText16(p, at)?,
+    parent: readText16(p, at)?,
+    role: readText16(p, at)?,
+    name: readText16(p, at)?,
+    policy: readText16(p, at)?,
+    expiresMs: 0,
+});
+
+// ---- Roles ----
+
+enum RolesFault {
+    BadLine,
+    BadName,
+    BadSeconds,
+    BadPolicy,
+    Duplicate,
+    OutOfMemory,
+}
+
+fn roleNameOk(name: Slice<u8>) -> bool {
+    if (name.length == 0 || name.length > 64) { return false; }
+    for (c in name) {
+        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '+' || c == '=' ||
+            c == ',' || c == '.' || c == '@' || c == '_' || c == '-';
+        if (!ok) { return false; }
+    }
+    return true;
+}
+
+/// A roles file (ADR-0075 §2): a role a line, `<name> <max session seconds, 900 to 43200> <identity policy JSON>`;
+/// `#` starts a comment line.
+fn parseRolesFile(text: Slice<u8>) -> Result<Vector<StsRole>, RolesFault> {
+    var out = Vector<StsRole>.create();
+    var at: usize = 0;
+    while (at < text.length) {
+        let end = pieceEnd(text, at, '\n');
+        let raw = trimSpaces(text[at..end]);
+        at = end + 1;
+        let line = if (raw.length > 0 && raw[raw.length - 1] == '\r') raw[0..raw.length - 1] else raw;
+        if (line.length == 0 || line[0] == '#') { continue; }
+        let space = pieceEnd(line, 0, ' ');
+        if (space == line.length) { return Err(RolesFault.BadLine); }
+        let name = line[0..space];
+        let rest = trimSpaces(line[space + 1..]);
+        let space2 = pieceEnd(rest, 0, ' ');
+        if (space2 == rest.length) { return Err(RolesFault.BadLine); }
+        if (!roleNameOk(name)) { return Err(RolesFault.BadName); }
+        let seconds = match (parseDecimal(rest[0..space2])) {
+            Some(n) => n,
+            null => { return Err(RolesFault.BadSeconds); }
+        };
+        if (seconds < 900 || seconds > STS_MAX_ROLE_SECONDS) { return Err(RolesFault.BadSeconds); }
+        let policy = match (parseIdentityPolicy(trimSpaces(rest[space2 + 1..]))) {
+            Ok(p) => p,
+            Err(S3Fail.OutOfMemory(_)) => { return Err(RolesFault.OutOfMemory); }
+            Err(_) => { return Err(RolesFault.BadPolicy); }
+        };
+        for (i in 0..out.length) {
+            if (out[i].name.view() == name) { return Err(RolesFault.Duplicate); }
+        }
+        let named = match (copyBytes(name)) {
+            Ok(n) => n,
+            Err(_) => { return Err(RolesFault.OutOfMemory); }
+        };
+        if (out.push(StsRole { name: named, maxSeconds: seconds, policy: policy }).isErr()) {
+            return Err(RolesFault.OutOfMemory);
+        }
+    }
+    return Ok(out);
+}
+
+fn roleAt(app: borrow S3App, name: Slice<u8>) -> usize? {
+    for (i in 0..app.roles.length) {
+        if (app.roles[i].name.view() == name) { return Some(i); }
+    }
+    return null;
+}
+
+/// The requester a session's request is (ADR-0075 §3): its role, which must still be configured, and its session
+/// policy; InvalidToken for a role no longer there.
+fn sessionRequester(
+    app: borrow S3App,
+    key: usize?,
+    peer: SocketAddress?,
+    session: borrow StsSession,
+) -> Result<Requester, S3Fail> {
+    var who = requesterOf(key, peer);
+    who.session = true;
+    if (session.role.length == 0) { return Ok(who); }
+    who.role = match (roleAt(app, session.role.view())) {
+        Some(r) => Some(r),
+        null => { return Err(S3Fail.Code(S3Code.InvalidToken)); }
+    };
+    if (session.policy.length > 0) {
+        who.sessionPolicy = match (parseIdentityPolicy(session.policy.view())) {
+            Ok(p) => Some(p),
+            Err(S3Fail.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
+            Err(_) => { return Err(S3Fail.Code(S3Code.InvalidToken)); }
+        };
+    }
+    return Ok(who);
+}
+
+// ---- The calls ----
+
+/// One parameter of a form body (`application/x-www-form-urlencoded`), decoded.
+fn formValue(body: Slice<u8>, name: StringView, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    var at: usize = 0;
+    while (at <= body.length) {
+        let end = pieceEnd(body, at, '&');
+        let pair = body[at..end];
+        let eq = pieceEnd(pair, 0, '=');
+        var decoded = Vector<u8>.create();
+        if (percentDecodeInto(mut decoded, pair[0..eq], true)? && decoded.view() == name.bytes()) {
+            out.clear();
+            let value = if (eq < pair.length) pair[eq + 1..] else "".bytes();
+            return percentDecodeInto(out, value, true);
+        }
+        at = end + 1;
+    }
+    return Ok(false);
+}
+
+/// `ASIA` and 16 of A-Z and 2-7, as AWS's temporary keys look.
+fn temporaryKeyId(out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    var random = [0u8; 16];
+    if (Random.fill(mut random[..]).isErr()) { return Ok(false); }
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".bytes();
+    out.extend("ASIA".bytes())?;
+    for (b in random) { out.push(alphabet[(b & 31) as usize])?; }
+    return Ok(true);
+}
+
+/// An STS error, in STS's XML (the query protocol's `ErrorResponse`), which its clients read.
+async fn stsError(
+    exchange: borrow mut Exchange,
+    status: u16,
+    code: StringView,
+    message: StringView,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    var body = Vector<u8>.create();
+    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ErrorResponse xmlns=\"".bytes())?;
+    body.extend(STS_XMLNS.bytes())?;
+    body.extend("\"><Error><Type>Sender</Type><Code>".bytes())?;
+    body.extend(code.bytes())?;
+    body.extend("</Code><Message>".bytes())?;
+    appendXmlEscaped(mut body, message.bytes())?;
+    body.extend("</Message></Error><RequestId>".bytes())?;
+    body.extend(requestId)?;
+    body.extend("</RequestId></ErrorResponse>".bytes())?;
+    exchange.header("content-type", "text/xml".bytes())?;
+    await exchange.send(statusOf(status), body.view())?;
+    return Ok();
+}
+
+/// The S3 code of a failed authentication, as STS names it.
+fn stsCodeOf(code: S3Code) -> StringView => match (code) {
+    S3Code.SignatureDoesNotMatch => "SignatureDoesNotMatch",
+    S3Code.InvalidAccessKeyId => "InvalidClientTokenId",
+    S3Code.InvalidToken => "InvalidClientTokenId",
+    S3Code.ExpiredToken => "ExpiredToken",
+    S3Code.RequestTimeTooSkewed => "RequestExpired",
+    _ => "AccessDenied",
+};
+
+/// `POST /` with an STS form body (ADR-0075 §1): authenticated as an `sts` call over the body's hash, then
+/// `GetSessionToken` or `AssumeRole`. Every error is STS's XML.
+async fn serveSts(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    let unsigned = Authenticated { payload: PayloadMode.Unsigned, signer: null, key: null, session: null };
+    let body = await readSmallBody(unsigned, exchange, 65536)?;
+    var hash = Vector<u8>.create();
+    appendHexBytes(mut hash, Sha256.of(body.view())[..])?;
+    if (req.isAnonymous()) {
+        return await stsError(
+            exchange,
+            403,
+            "MissingAuthenticationToken",
+            "Request is missing a signature.",
+            requestId,
+        );
+    }
+    let now = Clock.unixMillis() / 1000;
+    let auth = match (req.authenticate(
+        app.credentials.get().view(),
+        app.stsKeys.view(),
+        now,
+        "sts",
+        Some(hash.view()),
+    )) {
+        Ok(a) => a,
+        Err(code) => { return await stsError(exchange, 403, stsCodeOf(code), s3Message(code), requestId); }
+    };
+    let parent = match (auth.key) {
+        Some(k) => k,
+        null => { return await stsError(exchange, 403, "AccessDenied", "Access denied.", requestId); }
+    };
+    var action = Vector<u8>.create();
+    let _ = formValue(body.view(), "Action", mut action)?;
+    let isSession = action.view() == "GetSessionToken".bytes();
+    let isRole = action.view() == "AssumeRole".bytes();
+    if (!isSession && !isRole) {
+        return await stsError(exchange, 400, "InvalidAction", "This STS action is not implemented.", requestId);
+    }
+    if (app.stsKeys.length == 0) {
+        return await stsError(exchange, 501, "NotImplemented", "STS needs serve --sts-key-file.", requestId);
+    }
+    // Temporary credentials do not make more (ADR-0075 §1).
+    if (auth.session.isSome()) {
+        return await stsError(exchange, 403, "AccessDenied", "Temporary credentials cannot call STS.", requestId);
+    }
+    let credentials = app.credentials.get().view();
+    var session = StsSession {
+        accessKey: Vector<u8>.create(),
+        secret: Vector<u8>.create(),
+        parent: copyBytes(credentials[parent].accessKey.view())?,
+        role: Vector<u8>.create(),
+        name: Vector<u8>.create(),
+        policy: Vector<u8>.create(),
+        expiresMs: 0,
+    };
+    var text = Vector<u8>.create();
+    var maxSeconds: u64 = 129600;
+    var seconds: u64 = 43200;
+    if (isRole) {
+        let _ = formValue(body.view(), "RoleArn", mut text)?;
+        let arn = text.view();
+        let marker = findBytes(arn, ":role/".bytes(), 0);
+        if (!startsWithBytes(arn, "arn:aws:iam::".bytes()) || marker.isNull()) {
+            return await stsError(exchange, 400, "ValidationError", "RoleArn is not a role's ARN.", requestId);
+        }
+        // A role with a path (`role/path/name`) is named by its last part.
+        var name = arn[(marker ?? 0) + 6..];
+        var slash = name.length;
+        for (i in 0..name.length) {
+            if (name[i] == '/') { slash = i; }
+        }
+        if (slash < name.length) { name = name[slash + 1..]; }
+        let role = match (roleAt(app, name)) {
+            Some(r) => r,
+            null => {
+                return await stsError(
+                    exchange,
+                    403,
+                    "AccessDenied",
+                    "No such role, or not authorized to assume it.",
+                    requestId,
+                );
+            }
+        };
+        session.role.extend(name)?;
+        maxSeconds = app.roles[role].maxSeconds;
+        seconds = 3600;
+        if (!formValue(body.view(), "RoleSessionName", mut session.name)? || session.name.length < 2 ||
+            !roleNameOk(session.name.view())) {
+            return await stsError(
+                exchange,
+                400,
+                "ValidationError",
+                "RoleSessionName is 2 to 64 of \\w+=,.@-.",
+                requestId,
+            );
+        }
+        if (formValue(body.view(), "Policy", mut session.policy)?) {
+            if (session.policy.length > STS_MAX_POLICY_BYTES) {
+                return await stsError(
+                    exchange,
+                    400,
+                    "PackedPolicyTooLarge",
+                    "The session policy is too large.",
+                    requestId,
+                );
+            }
+            match (parseIdentityPolicy(session.policy.view())) {
+                Ok(_) => {}
+                Err(S3Fail.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
+                Err(_) => {
+                    return await stsError(
+                        exchange,
+                        400,
+                        "MalformedPolicyDocument",
+                        "The session policy is not one CosmoStore takes.",
+                        requestId,
+                    );
+                }
+            }
+        }
+    }
+    if (formValue(body.view(), "DurationSeconds", mut text)?) {
+        seconds = match (parseDecimal(text.view())) {
+            Some(n) => n,
+            null => {
+                return await stsError(exchange, 400, "ValidationError", "DurationSeconds is a number.", requestId);
+            }
+        };
+    }
+    if (seconds < 900 || seconds > maxSeconds) {
+        return await stsError(exchange, 400, "ValidationError", "DurationSeconds is out of range.", requestId);
+    }
+    session.expiresMs = Clock.unixMillis() + truncate<i64>(seconds * 1000);
+    var random = [0u8; 30];
+    if (!temporaryKeyId(mut session.accessKey)? || Random.fill(mut random[..]).isErr()) {
+        return Err(S3Fail.Code(S3Code.InternalError));
+    }
+    appendBase64(mut session.secret, random[..])?;
+    for (i in 0..30) { random[i] = 0; }
+    var token = Vector<u8>.create();
+    if (!sealStsToken(
+        app.stsKeys.view(),
+        borrow session,
+        mut token,
+    )?) { return Err(S3Fail.Code(S3Code.InternalError)); }
+    let element = if (isRole) "AssumeRole" else "GetSessionToken";
+    var out = Vector<u8>.create();
+    out.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<".bytes())?;
+    out.extend(element.bytes())?;
+    out.extend("Response xmlns=\"".bytes())?;
+    out.extend(STS_XMLNS.bytes())?;
+    out.extend("\"><".bytes())?;
+    out.extend(element.bytes())?;
+    out.extend("Result><Credentials>".bytes())?;
+    xmlTextElement(mut out, "AccessKeyId", session.accessKey.view())?;
+    xmlTextElement(mut out, "SecretAccessKey", session.secret.view())?;
+    xmlTextElement(mut out, "SessionToken", token.view())?;
+    out.extend("<Expiration>".bytes())?;
+    appendIso8601(mut out, session.expiresMs)?;
+    out.extend("</Expiration></Credentials>".bytes())?;
+    if (isRole) {
+        out.extend("<AssumedRoleUser><AssumedRoleId>".bytes())?;
+        appendXmlEscaped(mut out, session.role.view())?;
+        out.push(':')?;
+        appendXmlEscaped(mut out, session.name.view())?;
+        out.extend("</AssumedRoleId><Arn>arn:aws:sts::000000000000:assumed-role/".bytes())?;
+        appendXmlEscaped(mut out, session.role.view())?;
+        out.push('/')?;
+        appendXmlEscaped(mut out, session.name.view())?;
+        out.extend("</Arn></AssumedRoleUser>".bytes())?;
+    }
+    out.extend("</".bytes())?;
+    out.extend(element.bytes())?;
+    out.extend("Result><ResponseMetadata><RequestId>".bytes())?;
+    out.extend(requestId)?;
+    out.extend("</RequestId></ResponseMetadata></".bytes())?;
+    out.extend(element.bytes())?;
+    out.extend("Response>".bytes())?;
+    for (i in 0..session.secret.length) { session.secret[i] = 0; }
+    exchange.header("content-type", "text/xml".bytes())?;
+    await exchange.send(Status.ok(), out.view())?;
+    for (i in 0..out.length) { out[i] = 0; }
+    return Ok();
+}

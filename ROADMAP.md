@@ -2706,3 +2706,15 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** `inventoryConfigurationXml`, `gzipOfStoredBlocks`, `inventoryRows`; the S3 smoke opens a report with
   Python's `gzip` and finds a row per object.
 
+### 16 Nov 2026: M7 item 4, STS (ADR-0075)
+
+- **Under the owner's standing go-ahead.** **ADR-0075** (proposed): `GetSessionToken` and `AssumeRole` on the S3 port
+  (STS's form body and XML, SigV4 for `sts` over the body's hash); session tokens are the session sealed with
+  AES-256-GCM under `serve --sts-key-file` (rotatable, nothing stored); roles from `serve --roles-file` with identity
+  policies (a bucket policy's grammar without `Principal`). A role session is its key narrowed: the role's policy and
+  the session policy must allow each call, checked in `gateDecision`, ahead of the keys' fast path, and in front of
+  `ListBuckets`, `CreateBucket` and the admin API. Not on a cluster yet.
+- **Tests:** `stsTokens`, `stsRolesAndIdentityPolicies`, `stsFormBodies`; the S3 smoke signs with what `aws sts`
+  returns: 23 checks, refusals of writes, deletes, batch deletes, copies, other buckets, `ListBuckets`,
+  `CreateBucket`, STS and the admin API from sessions; presigned URLs; session policies.
+

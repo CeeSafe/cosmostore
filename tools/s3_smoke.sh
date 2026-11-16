@@ -25,10 +25,16 @@ start_hook
 printf 'hook http://127.0.0.1:%s/events\n# a comment\n' "$hookport" > "$work/targets"
 # The master keys of SSE-S3 (ADR-0046 §4): the first seals, the second only opens.
 printf '# master keys\nk2 %s\nk1 %s\n' "$(head -c 32 /dev/urandom | base64)" "$(head -c 32 /dev/urandom | base64)" > "$work/sse.keys"
+# STS (ADR-0075): the keys that seal session tokens, and a role that reads the smoke bucket.
+printf 'sts1 %s\n' "$(head -c 32 /dev/urandom | base64)" > "$work/sts.keys"
+cat > "$work/roles" <<'ROLES'
+# name, max session seconds, policy
+reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::smoke","arn:aws:s3:::smoke/*"]}]}
+ROLES
 # SSE-KMS's keys (ADR-0055): the first is the default.
 printf 'app-default %s\norders %s\n' "$(head -c 32 /dev/urandom | base64)" "$(head -c 32 /dev/urandom | base64)" > "$work/kms.keys"
 start_server() {
-    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 --website-domain web.localhost --inventory-day-seconds 3 2>> "$work/server.log" &
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 --website-domain web.localhost --inventory-day-seconds 3 --sts-key-file "$work/sts.keys" --roles-file "$work/roles" 2>> "$work/server.log" &
     server=$!
     sleep 1
 }
@@ -853,6 +859,40 @@ check "it has the PUT's line" "$(cat logs.got/* | grep -c '^cosmostore smoke \[.
 check "and the missing key's, with its error" "$(cat logs.got/* | grep -c 'REST.GET.OBJECT not-here .* 404 NoSuchKey ')" 1
 aws s3api put-bucket-logging --bucket smoke --bucket-logging-status '{}' > /dev/null 2>&1
 check "logging off" "$(aws s3api get-bucket-logging --bucket smoke --output text 2>&1)" ""
+
+# STS (ADR-0075): temporary credentials sign S3 requests with their session token.
+printf 'from a session' > sts.txt
+aws s3api put-object --bucket smoke --key sts/sts.txt --body sts.txt > /dev/null 2>&1
+as_session() { AWS_ACCESS_KEY_ID="$1" AWS_SECRET_ACCESS_KEY="$2" AWS_SESSION_TOKEN="$3" "${@:4}"; }
+read -r sk ss st <<< "$(aws sts get-session-token --duration-seconds 900 --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
+check "get-session-token gives an ASIA key" "${sk:0:4}" ASIA
+check "the session reads" "$(as_session "$sk" "$ss" "$st" aws s3 cp s3://smoke/sts/sts.txt - 2>&1)" "$(cat sts.txt)"
+as_session "$sk" "$ss" "$st" aws s3api put-object --bucket smoke --key sts/by-session.txt --body sts.txt > /dev/null 2>&1 && pass "the session writes, as its key" || fail "the session writes, as its key"
+check "a session token changed" "$(as_session "$sk" "$ss" "${st%????}AAAA" code s3api list-buckets)" InvalidToken
+check "the wrong secret for the token" "$(as_session "$sk" "wrong" "$st" code s3api list-buckets)" SignatureDoesNotMatch
+check "a session makes no sessions" "$(as_session "$sk" "$ss" "$st" code sts get-session-token)" AccessDenied
+check "a session is no admin" "$(as_session "$sk" "$ss" "$st" code s3api get-object --bucket _cosmostore --key stats /dev/null)" AccessDenied
+check "out of range" "$(code sts get-session-token --duration-seconds 200000)" ValidationError
+read -r rk rs rt <<< "$(aws sts assume-role --role-arn arn:aws:iam::000000000000:role/reader --role-session-name smoke --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
+check "assume-role gives an ASIA key" "${rk:0:4}" ASIA
+check "the role reads" "$(as_session "$rk" "$rs" "$rt" aws s3 cp s3://smoke/sts/sts.txt - 2>&1)" "$(cat sts.txt)"
+check "the role lists" "$(as_session "$rk" "$rs" "$rt" aws s3api list-objects-v2 --bucket smoke --prefix sts/ --query 'length(Contents)' --output text 2>&1)" 2
+check "the role does not write" "$(as_session "$rk" "$rs" "$rt" code s3api put-object --bucket smoke --key sts/no --body sts.txt)" AccessDenied
+check "the role does not delete" "$(as_session "$rk" "$rs" "$rt" code s3api delete-object --bucket smoke --key sts/sts.txt)" AccessDenied
+check "nor delete in a batch" "$(as_session "$rk" "$rs" "$rt" aws s3api delete-objects --bucket smoke --delete '{"Objects":[{"Key":"sts/sts.txt"}]}' --query 'Errors[0].Code' --output text 2>&1)" AccessDenied
+check "nor list the buckets" "$(as_session "$rk" "$rs" "$rt" code s3api list-buckets)" AccessDenied
+check "nor make one" "$(as_session "$rk" "$rs" "$rt" code s3api create-bucket --bucket sts-made)" AccessDenied
+check "nor read another bucket" "$(as_session "$rk" "$rs" "$rt" code s3api list-objects-v2 --bucket smokelogs)" AccessDenied
+check "nor copy out of it" "$(as_session "$rk" "$rs" "$rt" code s3api copy-object --bucket smoke --key sts/copy --copy-source smoke/sts/sts.txt)" AccessDenied
+url=$(as_session "$rk" "$rs" "$rt" aws s3 presign s3://smoke/sts/sts.txt --expires-in 300 2>&1)
+check "a presigned URL of the role" "$(curl -s "$url")" "$(cat sts.txt)"
+check "a role that is not there" "$(code sts assume-role --role-arn arn:aws:iam::000000000000:role/nobody --role-session-name smoke)" AccessDenied
+check "longer than the role allows" "$(code sts assume-role --role-arn arn:aws:iam::000000000000:role/reader --role-session-name smoke --duration-seconds 7200)" ValidationError
+read -r pk ps pt <<< "$(aws sts assume-role --role-arn arn:aws:iam::000000000000:role/reader --role-session-name narrow --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::smoke/*"}]}' --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
+check "a session policy narrows the role: it reads" "$(as_session "$pk" "$ps" "$pt" aws s3 cp s3://smoke/sts/sts.txt - 2>&1)" "$(cat sts.txt)"
+check "but does not list" "$(as_session "$pk" "$ps" "$pt" code s3api list-objects-v2 --bucket smoke)" AccessDenied
+check "a session policy with a principal" "$(code sts assume-role --role-arn arn:aws:iam::000000000000:role/reader --role-session-name bad --policy '{"Statement":{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}}')" MalformedPolicyDocument
+aws s3 rm --recursive s3://smoke/sts/ > /dev/null 2>&1
 
 # Inventory reports (ADR-0074): a "day" of 3 seconds here; a report of the smoke bucket into smokelogs.
 check "inventory to a bucket that is not there" "$(code s3api put-bucket-inventory-configuration --bucket smoke --id daily --inventory-configuration '{"Id":"daily","IsEnabled":true,"Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::nobucket","Format":"CSV"}},"Schedule":{"Frequency":"Daily"},"IncludedObjectVersions":"Current"}')" InvalidArgument

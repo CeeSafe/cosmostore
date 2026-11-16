@@ -1,0 +1,138 @@
+// STS (ADR-0075): session tokens, roles, identity policies, the form body.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+fn stsKey(id: StringView, fill: u8) -> MasterKey => MasterKey { id: copyBytes(id.bytes())!, key: [fill; 32] };
+
+fn testSession() -> StsSession => StsSession {
+    accessKey: copyBytes("ASIAABCDEFGHIJKLMNOP".bytes())!,
+    secret: copyBytes("s3cr3t".bytes())!,
+    parent: copyBytes("cosmo".bytes())!,
+    role: copyBytes("reader".bytes())!,
+    name: copyBytes("ci".bytes())!,
+    policy: copyBytes("{}".bytes())!,
+    expiresMs: 1234567890123,
+};
+
+@test
+fn stsTokens() -> Result<void, TestFailure> {
+    var keys = Vector<MasterKey>.create();
+    keys.push(stsKey("new", 1))!;
+    keys.push(stsKey("old", 2))!;
+    let s = testSession();
+    var token = Vector<u8>.create();
+    Check.isTrue(sealStsToken(keys.view(), borrow s, mut token)!, "sealed")?;
+    let back = openStsToken(keys.view(), token.view())!!;
+    Check.equalBytes(s.accessKey.view(), back.accessKey.view())?;
+    Check.equalBytes("s3cr3t".bytes(), back.secret.view())?;
+    Check.equalBytes("cosmo".bytes(), back.parent.view())?;
+    Check.equalBytes("reader".bytes(), back.role.view())?;
+    Check.equalBytes("ci".bytes(), back.name.view())?;
+    Check.equalBytes("{}".bytes(), back.policy.view())?;
+    Check.equalU64(1234567890123, truncate<u64>(back.expiresMs))?;
+    // Sealed by the first key: the second alone opens nothing; without keys, nothing is sealed.
+    var older = Vector<MasterKey>.create();
+    older.push(stsKey("old", 2))!;
+    Check.isTrue(openStsToken(older.view(), token.view())!.isNull(), "another key")?;
+    var same = Vector<MasterKey>.create();
+    same.push(stsKey("new", 9))!;
+    Check.isTrue(openStsToken(same.view(), token.view())!.isNull(), "another key with the same id")?;
+    var none = Vector<u8>.create();
+    Check.isTrue(!sealStsToken(Vector<MasterKey>.create().view(), borrow s, mut none)!, "no key")?;
+    // A changed byte anywhere, and things that are not tokens.
+    var raw = Vector<u8>.create();
+    Check.isTrue(decodeBase64(token.view(), mut raw)!, "base64")?;
+    for (at in [5usize, 20, raw.length - 3]) {
+        var changed = copyBytes(raw.view())!;
+        changed[at] = changed[at] ^ 1;
+        var text = Vector<u8>.create();
+        appendBase64(mut text, changed.view())!;
+        Check.isTrue(openStsToken(keys.view(), text.view())!.isNull(), "a changed byte")?;
+    }
+    Check.isTrue(openStsToken(keys.view(), "".bytes())!.isNull(), "empty")?;
+    Check.isTrue(openStsToken(keys.view(), "not base64!".bytes())!.isNull(), "not base64")?;
+    Check.isTrue(openStsToken(keys.view(), "AQ==".bytes())!.isNull(), "short")?;
+    return Ok();
+}
+
+@test
+fn stsRolesAndIdentityPolicies() -> Result<void, TestFailure> {
+    let text = """
+        # Roles: name, max session seconds, policy.
+        reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::photos","arn:aws:s3:::photos/*"]},{"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/private/*"}]}
+        admin 43200 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"*","Resource":"*"}}
+        """;
+    let roles = parseRolesFile(text.bytes())!;
+    Check.equalU64(2, roles.length as u64)?;
+    Check.equalBytes("reader".bytes(), roles[0].name.view())?;
+    Check.equalU64(3600, roles[0].maxSeconds)?;
+    let facts = plainFacts();
+    let reader = borrow roles[0].policy;
+    Check.equalBytes("allow".bytes(), decide(reader, "", "s3:GetObject", "photos/a.jpg", borrow facts).view())?;
+    Check.equalBytes("allow".bytes(), decide(reader, "", "s3:ListBucket", "photos", borrow facts).view())?;
+    Check.equalBytes("deny".bytes(), decide(reader, "", "s3:GetObject", "photos/private/x", borrow facts).view())?;
+    Check.equalBytes("neither".bytes(), decide(reader, "", "s3:PutObject", "photos/a.jpg", borrow facts).view())?;
+    Check.equalBytes("neither".bytes(), decide(reader, "", "s3:GetObject", "other/a.jpg", borrow facts).view())?;
+    Check.equalBytes("neither".bytes(), decide(reader, "", "s3:ListAllMyBuckets", "", borrow facts).view())?;
+    let admin = borrow roles[1].policy;
+    Check.equalBytes("allow".bytes(), decide(admin, "", "s3:ListAllMyBuckets", "", borrow facts).view())?;
+    Check.equalBytes("allow".bytes(), decide(admin, "", "s3:CreateBucket", "new", borrow facts).view())?;
+    // An identity policy names no principal; a bucket policy must.
+    Check.isTrue(
+        parseIdentityPolicy(
+            "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"*\",\"Resource\":\"*\"}}".bytes(),
+        ).isErr(),
+        "a principal",
+    )?;
+    Check.isTrue(
+        parseIdentityPolicy(
+            "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"photos\"}}".bytes(),
+        ).isErr(),
+        "not an ARN",
+    )?;
+    Check.isTrue(
+        parseBucketPolicy(
+            "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"arn:aws:s3:::b/*\"}}".bytes(),
+            "b".bytes(),
+            policyKeys().view(),
+            false,
+        ).isErr(),
+        "no principal",
+    )?;
+    // Bad lines stop the file.
+    Check.isTrue(
+        parseRolesFile(
+            "r 899 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}}".bytes(),
+        ).isErr(),
+        "too short",
+    )?;
+    Check.isTrue(parseRolesFile("bad/name 900 {}".bytes()).isErr(), "a bad name")?;
+    Check.isTrue(parseRolesFile("r 900".bytes()).isErr(), "no policy")?;
+    let twice =
+        "r 900 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}}\nr 900 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}}";
+    Check.isTrue(parseRolesFile(twice.bytes()).isErr(), "a name twice")?;
+    return Ok();
+}
+
+@test
+fn stsFormBodies() -> Result<void, TestFailure> {
+    let body =
+        "Action=AssumeRole&Version=2011-06-15&RoleArn=arn%3Aaws%3Aiam%3A%3A000000000000%3Arole%2Freader&RoleSessionName=a+b&Policy=";
+    var v = Vector<u8>.create();
+    Check.isTrue(formValue(body.bytes(), "Action", mut v)!, "Action")?;
+    Check.equalBytes("AssumeRole".bytes(), v.view())?;
+    Check.isTrue(formValue(body.bytes(), "RoleArn", mut v)!, "RoleArn")?;
+    Check.equalBytes("arn:aws:iam::000000000000:role/reader".bytes(), v.view())?;
+    Check.isTrue(formValue(body.bytes(), "RoleSessionName", mut v)!, "a plus")?;
+    Check.equalBytes("a b".bytes(), v.view())?;
+    Check.isTrue(formValue(body.bytes(), "Policy", mut v)!, "empty")?;
+    Check.equalU64(0, v.length as u64)?;
+    Check.isTrue(!formValue(body.bytes(), "DurationSeconds", mut v)!, "absent")?;
+    var id = Vector<u8>.create();
+    Check.isTrue(temporaryKeyId(mut id)!, "an id")?;
+    Check.equalU64(20, id.length as u64)?;
+    Check.equalBytes("ASIA".bytes(), id.view()[0..4])?;
+    return Ok();
+}

@@ -81,6 +81,11 @@ struct S3App {
     /// The KMS keys of SSE-KMS (`serve --kms-key-file`, ADR-0055): named keys a request picks by id, the first by
     /// default; empty without the option, when SSE-KMS is NotImplemented.
     kmsKeys: Vector<MasterKey>;
+    /// The keys that seal STS session tokens (`serve --sts-key-file`, ADR-0075): the first seals, any opens; empty
+    /// without the option, when STS is NotImplemented and every token is InvalidToken.
+    stsKeys: Vector<MasterKey>;
+    /// The roles `AssumeRole` takes (`serve --roles-file`, ADR-0075 §2).
+    roles: Vector<StsRole>;
     /// A cluster shard's S3 server (ADR-0060 §2): its store is a replica's, which other leaders' writes reach without
     /// passing here, so the bucket counts above stay at "some" and every request reads what they would let it skip.
     cluster: bool;
@@ -237,6 +242,7 @@ async fn respond(
             kind,
             peer,
             facts,
+            requestId,
         );
         match (served) {
             Ok() => { return Ok(); }
@@ -320,6 +326,7 @@ async fn serveS3(
     kind: borrow mut u8,
     peer: SocketAddress?,
     facts: borrow mut AuditFacts,
+    requestId: Slice<u8>,
 ) -> Result<void, S3Fail> {
     facts.requester.push('-')?;
     // The address's rate limit first (ADR-0053): before anything is parsed or a signature is checked.
@@ -356,8 +363,18 @@ async fn serveS3(
     }
     // A browser form upload is authenticated by its form's policy signature, not its headers (ADR-0018).
     if (isPostObject(borrow req)) { return await postObject(app, borrow req, exchange, peer); }
+    // STS (ADR-0075): a POST to the service, which S3 has none of; its answers and errors are STS's.
+    if (isMethod(req.method, Method.Post) && req.bucket.length == 0) {
+        return await serveSts(app, borrow req, exchange, requestId);
+    }
     let now = Clock.unixMillis() / 1000;
-    let attempt = if (req.isAnonymous()) req.anonymous() else req.authenticate(app.credentials.get().view(), now);
+    let attempt = if (req.isAnonymous()) req.anonymous() else req.authenticate(
+        app.credentials.get().view(),
+        app.stsKeys.view(),
+        now,
+        "s3",
+        null,
+    );
     let auth = match (attempt) {
         Ok(a) => a,
         Err(code) => { return Err(S3Fail.Code(code)); }
@@ -378,7 +395,11 @@ async fn serveS3(
         }
         null => {}
     }
-    let who = Requester { key: auth.key, peer: peer };
+    // A session's request is its key's, narrowed by its role (ADR-0075 §3).
+    let who = match (borrow auth.session) {
+        Some(s) => sessionRequester(app, auth.key, peer, s)?,
+        null => requesterOf(auth.key, peer),
+    };
     // Who the request is, for its line in the audit log (ADR-0051) and the bucket's access log (ADR-0072).
     if (logging && auth.key.isSome()) {
         facts.access.authType = if (headerOf(
@@ -389,9 +410,14 @@ async fn serveS3(
     if (app.audit.isSome() || logging) {
         facts.requester.clear();
         let credentials = app.credentials.get().view();
-        match (auth.key) {
-            Some(i) => { facts.requester.extend(credentials[i].accessKey.view())?; }
-            null => { facts.requester.extend("anonymous".bytes())?; }
+        match (borrow auth.session) {
+            Some(s) => { facts.requester.extend(s.accessKey.view())?; }
+            null => {
+                match (auth.key) {
+                    Some(i) => { facts.requester.extend(credentials[i].accessKey.view())?; }
+                    null => { facts.requester.extend("anonymous".bytes())?; }
+                }
+            }
         }
     }
     let m = req.method;
@@ -402,11 +428,16 @@ async fn serveS3(
         (isMethod(m, Method.Put) && req.key.length == 0 && req.query.length == 0))) {
         return Err(S3Fail.Code(S3Code.AccessDenied));
     }
+    // The stats and the admin API are for long-term keys (ADR-0075 §3).
+    if (who.session && bucket == STATS_BUCKET) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
     if (bucket == STATS_BUCKET) { return await serveStats(app, borrow req, exchange); } // ADR-0021
     if (req.bucket.length == 0) {
         if (isMethod(m, Method.Get) || isMethod(m, Method.Head)) {
             if (!req.onlyParams("max-buckets,continuation-token,prefix")) {
                 return Err(S3Fail.Code(S3Code.NotImplemented));
+            }
+            if (!sessionAllows(app, borrow req, borrow who, "s3:ListAllMyBuckets", "".bytes())?) {
+                return Err(S3Fail.Code(S3Code.AccessDenied));
             }
             return await listBuckets(app, borrow req, exchange);
         }
@@ -618,6 +649,9 @@ async fn serveS3(
                 return await putBucketVersioning(app, borrow req, auth, exchange);
             }
             if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            if (!sessionAllows(app, borrow req, borrow who, "s3:CreateBucket", bucket.bytes())?) {
+                return Err(S3Fail.Code(S3Code.AccessDenied));
+            }
             return await createBucket(app, borrow req, exchange);
         }
         if (isMethod(m, Method.Head)) {

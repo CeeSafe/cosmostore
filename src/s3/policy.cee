@@ -424,6 +424,7 @@ fn parseStatement<region a>(
     bucket: Slice<u8>,
     credentials: Slice<Credential>,
     checkKeys: bool,
+    identity: bool,
 ) -> Result<PolicyStatement, S3Fail> {
     var st = PolicyStatement {
         allow: false,
@@ -470,6 +471,8 @@ fn parseStatement<region a>(
                 return Err(malformedPolicy());
             }
         } else if (field == 2 || field == 3) {
+            // An identity policy (a role's, a session's: ADR-0075) is its holder's: it names no principal.
+            if (identity) { return Err(malformedPolicy()); }
             // `Allow` with `NotPrincipal` grants to everyone else, anonymous requests too: S3 refuses it.
             if (field == 3 && st.allow) { return Err(malformedPolicy()); }
             st.notPrincipal = field == 3;
@@ -483,7 +486,13 @@ fn parseStatement<region a>(
             st.notResource = field == 7;
             var raw = Vector<Vector<u8>>.create();
             policyStrings(r, mut raw)?;
-            for (i in 0..raw.length) { st.resources.push(resourcePattern(raw[i].view(), bucket)?)?; }
+            for (i in 0..raw.length) {
+                let pattern = if (identity) identityResourcePattern(raw[i].view())? else resourcePattern(
+                    raw[i].view(),
+                    bucket,
+                )?;
+                st.resources.push(pattern)?;
+            }
         } else {
             parseCondition(r, mut st.tests)?;
         }
@@ -491,10 +500,15 @@ fn parseStatement<region a>(
         if (r.take('}')) { break; }
         return Err(malformedPolicy());
     }
-    // An Effect, and exactly one of each pair: a bucket policy names its principals.
+    // An Effect, and exactly one of each pair: a bucket policy names its principals; an identity policy's are
+    // whoever holds it.
     let pairs = [12u32, 48u32, 192u32];
     if ((seen & 2) == 0 || (st.allow && st.notPrincipal)) { return Err(malformedPolicy()); }
     for (p in pairs) {
+        if (identity && p == 12) {
+            st.anyone = true;
+            continue;
+        }
         if ((seen & p) == 0 || (seen & p) == p) { return Err(malformedPolicy()); }
     }
     return Ok(st);
@@ -507,6 +521,29 @@ fn parseBucketPolicy(
     bucket: Slice<u8>,
     credentials: Slice<Credential>,
     checkKeys: bool,
+) -> Result<BucketPolicy, S3Fail> => parsePolicyDocument(json, bucket, credentials, checkKeys, false);
+
+/// An identity policy's JSON (ADR-0075 §2): a role's, or a session's; no `Principal`, resources in any bucket.
+fn parseIdentityPolicy(json: Slice<u8>) -> Result<BucketPolicy, S3Fail> {
+    let none = Vector<Credential>.create();
+    return parsePolicyDocument(json, "".bytes(), none.view(), false, true);
+}
+
+/// A resource of an identity policy: `*`, or `arn:aws:s3:::` and a bucket or objects pattern, kept after the prefix.
+fn identityResourcePattern(text: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
+    if (text == "*".bytes()) { return Ok(copyBytes(text)?); }
+    let arn = POLICY_S3_ARN.bytes();
+    if (!startsWithBytes(text, arn) || text.length == arn.length) { return Err(malformedPolicy()); }
+    if (findBytes(text, "${".bytes(), 0).isSome()) { return Err(notImplemented()); } // policy variables
+    return Ok(copyBytes(text[arn.length..])?);
+}
+
+fn parsePolicyDocument(
+    json: Slice<u8>,
+    bucket: Slice<u8>,
+    credentials: Slice<Credential>,
+    checkKeys: bool,
+    identity: bool,
 ) -> Result<BucketPolicy, S3Fail> {
     var policy = BucketPolicy { statements: Vector<PolicyStatement>.create(), denies: false };
     if (json.length == 0 || json.length > MAX_POLICY_BYTES) { return Err(malformedPolicy()); }
@@ -536,13 +573,13 @@ fn parseBucketPolicy(
             let _ = r.take('[');
             if (r.take(']')) { return Err(malformedPolicy()); }
             while (true) {
-                policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys)?)?;
+                policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys, identity)?)?;
                 if (r.take(',')) { continue; }
                 if (r.take(']')) { break; }
                 return Err(malformedPolicy());
             }
         } else {
-            policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys)?)?;
+            policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys, identity)?)?;
         }
         if (r.take(',')) { continue; }
         if (r.take('}')) { break; }
@@ -1000,6 +1037,47 @@ fn publicAccessHas(block: Slice<u8>, bit: u8) -> bool => block.length == 1 && (b
 struct Requester {
     key: usize?;
     peer: SocketAddress?;
+    /// Temporary credentials (ADR-0075): a session's request. With a role, the role's place in `S3App.roles`, and
+    /// its session policy: what the key may do is narrowed to what both allow.
+    session: bool;
+    role: usize?;
+    sessionPolicy: BucketPolicy?;
+}
+
+/// A requester with a long-term key, or none.
+fn requesterOf(key: usize?, peer: SocketAddress?) -> Requester =>
+    Requester { key: key, peer: peer, session: false, role: null, sessionPolicy: null };
+
+/// Whether a role session's policies let it do `action` on `resource` (`bucket`, `bucket/key`, or empty for the
+/// service): the role's policy and the session policy must each allow it, and neither deny it (ADR-0075 §3). A
+/// requester without a role is not narrowed.
+fn sessionAllows(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    action: StringView,
+    resource: Slice<u8>,
+) -> Result<bool, AllocError> {
+    let role = match (who.role) {
+        Some(r) => r,
+        null => { return Ok(true); }
+    };
+    if (role >= app.roles.length) { return Ok(false); }
+    let facts = policyFacts(req, isListingAction(action), app.secure, who.peer)?;
+    match (decidePolicy(borrow app.roles[role].policy, null, action, resource, borrow facts)) {
+        PolicyDecision.Allow => {}
+        _ => { return Ok(false); }
+    }
+    match (borrow who.sessionPolicy) {
+        Some(p) => {
+            match (decidePolicy(p, null, action, resource, borrow facts)) {
+                PolicyDecision.Allow => {}
+                _ => { return Ok(false); }
+            }
+        }
+        null => {}
+    }
+    return Ok(true);
 }
 
 /// The policy calls, which a key is never refused and an anonymous request always is (ADR-0043 §4).
@@ -1094,6 +1172,15 @@ fn gateDecision(
     key: Slice<u8>,
 ) -> Result<PolicyDecision, AllocError> {
     let anonymous = who.key.isNull();
+    // A role session first: it may do only what its policies allow, whatever the bucket's say (ADR-0075 §3).
+    if (who.role.isSome()) {
+        var target = copyBytes(bucket.bytes())?;
+        if (key.length > 0) {
+            target.push('/')?;
+            target.extend(key)?;
+        }
+        if (!sessionAllows(app, req, who, action, target.view())?) { return Ok(PolicyDecision.Deny); }
+    }
     if (isPolicyAction(action)) { return Ok(if (anonymous) PolicyDecision.Deny else PolicyDecision.Allow); }
     match (borrow gate.policy) {
         PolicyGate.Open => { return Ok(PolicyDecision.Allow); }
@@ -1160,7 +1247,9 @@ async fn authorizeVersion(
     key: Slice<u8>,
     versionId: [u8; 16]?,
 ) -> Result<void, S3Fail> {
-    if (who.key.isSome() && (app.denyBuckets.load() == 0 || isPolicyAction(action))) { return Ok(); }
+    if (who.key.isSome() && who.role.isNull() && (app.denyBuckets.load() == 0 || isPolicyAction(action))) {
+        return Ok();
+    }
     let gate = await policyGate(app, who, bucket)?;
     match (gateDecision(app, borrow gate, req, who, action, bucket, key)?) {
         PolicyDecision.Allow => { return Ok(); }
