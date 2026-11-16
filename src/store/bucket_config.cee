@@ -82,6 +82,8 @@ fn decodeBucketConfigMeta(bytes: Slice<u8>) -> Result<BucketConfigMeta, MetaFaul
         if (!isQuotaValue(value.view())) { return Err(MetaFault.TooLong); }
     } else if (kind == BUCKET_CONFIG_ENCRYPTION) {
         if (!isEncryptionValue(value.view())) { return Err(MetaFault.TooLong); }
+    } else if (kind == BUCKET_CONFIG_LOGGING) {
+        if (!isLoggingValue(value.view())) { return Err(MetaFault.TooLong); }
     } else if (kind != BUCKET_CONFIG_TAGS && kind != BUCKET_CONFIG_LIFECYCLE) {
         return Err(MetaFault.TooLong);
     }
@@ -160,6 +162,41 @@ const BUCKET_CONFIG_QUOTA: u8 = 10;
 /// A bucket's default encryption (ADR-0046 §5, ADR-0055) for the objects written without fields of their own:
 /// `AES256` (SSE-S3), `aws:kms`, or `aws:kms <key id>`; empty for none.
 const BUCKET_CONFIG_ENCRYPTION: u8 = 11;
+
+/// A bucket's server access logging (ADR-0072): empty for none, or v1: u8 1, u16+bytes the target bucket, u16+bytes
+/// the prefix of the log objects' keys.
+const BUCKET_CONFIG_LOGGING: u8 = 12;
+
+/// Where a bucket's access log goes.
+struct LoggingTarget {
+    bucket: Vector<u8>;
+    prefix: Vector<u8>;
+}
+
+fn encodeLogging(target: borrow LoggingTarget, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.push(1)?;
+    pushText16(out, target.bucket.view())?;
+    pushText16(out, target.prefix.view())?;
+    return Ok();
+}
+
+/// The target of a stored value; null for none or not one.
+fn decodeLogging(value: Slice<u8>) -> LoggingTarget? {
+    if (value.length == 0 || value[0] != 1) { return null; }
+    var at: usize = 1;
+    let bucket = match (readText16(value, mut at)) {
+        Ok(b) => b,
+        Err(_) => { return null; }
+    };
+    let prefix = match (readText16(value, mut at)) {
+        Ok(p) => p,
+        Err(_) => { return null; }
+    };
+    if (at != value.length || bucket.length == 0 || bucket.length > 63 || prefix.length > 1024) { return null; }
+    return Some(LoggingTarget { bucket: bucket, prefix: prefix });
+}
+
+fn isLoggingValue(value: Slice<u8>) -> bool => value.length == 0 || decodeLogging(value).isSome();
 
 fn isEncryptionValue(value: Slice<u8>) -> bool {
     if (value.length == 0 || value == "AES256".bytes() || value == "aws:kms".bytes()) { return true; }

@@ -28,7 +28,7 @@ printf '# master keys\nk2 %s\nk1 %s\n' "$(head -c 32 /dev/urandom | base64)" "$(
 # SSE-KMS's keys (ADR-0055): the first is the default.
 printf 'app-default %s\norders %s\n' "$(head -c 32 /dev/urandom | base64)" "$(head -c 32 /dev/urandom | base64)" > "$work/kms.keys"
 start_server() {
-    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" 2>> "$work/server.log" &
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 2>> "$work/server.log" &
     server=$!
     sleep 1
 }
@@ -834,6 +834,25 @@ check "where the requests came from" "$(audit 'sorted({l["remote"] for l in line
 check "a query's names" "$(audit 'len([l for l in lines if l["query"] == "versionId" and l["method"] == "DELETE"]) > 0')" True
 check "no value of a presigned URL" "$(grep -c 'X-Amz-Signature=' audit.log) $(audit 'len([l for l in lines if "X-Amz-Signature" in l["query"]]) > 0')" "0 True"
 check "no line dropped" "$(stat auditLinesDropped)" 0
+
+# Server access logs (ADR-0072): a bucket's requests delivered as log objects into its target bucket.
+aws s3api create-bucket --bucket smokelogs > /dev/null 2>&1
+check "logging to a bucket that is not there" "$(code s3api put-bucket-logging --bucket smoke --bucket-logging-status '{"LoggingEnabled":{"TargetBucket":"nologs","TargetPrefix":"x/"}}')" InvalidTargetBucketForLogging
+aws s3api put-bucket-logging --bucket smoke --bucket-logging-status '{"LoggingEnabled":{"TargetBucket":"smokelogs","TargetPrefix":"access/"}}' > /dev/null 2>&1 && pass "put-bucket-logging" || fail "put-bucket-logging"
+check "get-bucket-logging" "$(aws s3api get-bucket-logging --bucket smoke --query LoggingEnabled.[TargetBucket,TargetPrefix] --output text 2>&1)" "smokelogs	access/"
+printf 'logged' > logged.txt
+aws s3api put-object --bucket smoke --key logged.txt --body logged.txt > /dev/null 2>&1
+code s3api get-object --bucket smoke --key not-here notthere.out > /dev/null
+for i in $(seq 1 40); do
+    [ "$(aws s3api list-objects-v2 --bucket smokelogs --prefix access/ --query 'length(Contents)' --output text 2>/dev/null)" -ge 1 ] 2>/dev/null && break
+    sleep 0.25
+done
+rm -rf logs.got && mkdir logs.got && aws s3 cp --recursive s3://smokelogs/access/ logs.got/ > /dev/null 2>&1
+check "the log object is delivered" "$(ls logs.got | wc -l | tr -d ' ' | awk '{ print ($1 >= 1) ? "yes" : "no" }')" yes
+check "it has the PUT's line" "$(cat logs.got/* | grep -c '^cosmostore smoke \[.*REST.PUT.OBJECT logged.txt "PUT /smoke/logged.txt HTTP/1.1" 200 ')" 1
+check "and the missing key's, with its error" "$(cat logs.got/* | grep -c 'REST.GET.OBJECT not-here .* 404 NoSuchKey ')" 1
+aws s3api put-bucket-logging --bucket smoke --bucket-logging-status '{}' > /dev/null 2>&1
+check "logging off" "$(aws s3api get-bucket-logging --bucket smoke --output text 2>&1)" ""
 
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1

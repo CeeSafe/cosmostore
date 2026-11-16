@@ -1,0 +1,443 @@
+// Server access logs (ADR-0072): a bucket's requests, as lines of S3's server access log format, delivered as objects
+// into the bucket its logging names.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+/// Lines waiting to be delivered: past this, a request's line is dropped and counted (a request is never held).
+const ACCESS_LOG_QUEUE: usize = 8192;
+/// A target's lines are delivered as one object once there are this many bytes, or `everyMs` after the first.
+const ACCESS_LOG_OBJECT_BYTES: usize = 1048576;
+
+/// A request's line, and where it goes.
+struct AccessLogEntry {
+    target: Vector<u8>;
+    prefix: Vector<u8>;
+    line: Vector<u8>;
+}
+
+/// The queue, as requests see it.
+struct AccessLog {
+    lines: Channel<AccessLogEntry>;
+    dropped: AtomicU64;
+}
+
+/// The queue, as the delivery task sees it: every `everyMs` (`serve --access-log-seconds`), each target's lines so far
+/// become an object.
+struct AccessLogWriter {
+    lines: Channel<AccessLogEntry>;
+    everyMs: u64;
+}
+
+/// One target's lines not yet delivered.
+struct AccessLogBatch {
+    target: Vector<u8>;
+    prefix: Vector<u8>;
+    bytes: Vector<u8>;
+    since: i64;
+}
+
+// --- The configuration (PutBucketLogging, GetBucketLogging) ---
+
+/// A `<BucketLoggingStatus>`: its target, or null when it has no `<LoggingEnabled>` (logging off). Grants and
+/// partitioned key formats are NotImplemented, never ignored (ADR-0072 §1).
+fn parseLogging(xml: Slice<u8>) -> Result<LoggingTarget?, S3Fail> {
+    if (findBytes(xml, "<BucketLoggingStatus".bytes(), 0).isNull()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    var at: usize = 0;
+    let enabled = match (nextElement(xml, "LoggingEnabled", mut at)?) {
+        Some(e) => e,
+        null => { return Ok(null); }
+    };
+    if (findBytes(enabled, "<TargetGrants".bytes(), 0).isSome() ||
+        findBytes(enabled, "<PartitionedPrefix".bytes(), 0).isSome()) {
+        return Err(S3Fail.Code(S3Code.NotImplemented));
+    }
+    var bucket = Vector<u8>.create();
+    var prefix = Vector<u8>.create();
+    if (!rawElement(enabled, "TargetBucket", mut bucket)? || bucket.length == 0) {
+        return Err(S3Fail.Code(S3Code.MalformedXML));
+    }
+    let _ = rawElement(enabled, "TargetPrefix", mut prefix)?;
+    let target = LoggingTarget { bucket: copyBytes(trimBlank(bucket.view()))?, prefix: prefix };
+    if (target.bucket.length > 63 || target.prefix.length > 1024) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    return Ok(Some(target));
+}
+
+fn loggingXml(target: borrow (LoggingTarget?), out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    xmlHead(out, "BucketLoggingStatus")?;
+    match (target.asBorrow()) {
+        Some(t) => {
+            out.extend("<LoggingEnabled><TargetBucket>".bytes())?;
+            appendXmlEscaped(out, t.bucket.view())?;
+            out.extend("</TargetBucket><TargetPrefix>".bytes())?;
+            appendXmlEscaped(out, t.prefix.view())?;
+            out.extend("</TargetPrefix></LoggingEnabled>".bytes())?;
+        }
+        null => {}
+    }
+    out.extend("</BucketLoggingStatus>".bytes())?;
+    return Ok();
+}
+
+async fn recountLogging(app: borrow S3App) -> Result<void, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    app.loggingBuckets.store(store.loggingBucketCount());
+    return Ok();
+}
+
+async fn getBucketLogging(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let stored = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_LOGGING)?;
+    let target = decodeLogging(stored.view());
+    var body = Vector<u8>.create();
+    loggingXml(borrow target, mut body)?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn putBucketLogging(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    // A cluster's S3 port delivers no access logs yet (ADR-0072 §4), as it keeps no audit log.
+    if (app.cluster) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    verifySmallBody(req, xml.view(), true)?;
+    var stored = Vector<u8>.create();
+    match (parseLogging(xml.view())?) {
+        Some(t) => {
+            // The target bucket must be there (S3 also wants it in the same region and owner; one owner here).
+            var exists = false;
+            {
+                var guard = await lockStore(app)?;
+                let store = guard.data();
+                let name = StringView.fromUtf8(t.bucket.view()) ?? "";
+                exists = store.bucketExists(name).ok() ?? false;
+            }
+            if (!exists) { return Err(S3Fail.Code(S3Code.InvalidTargetBucketForLogging)); }
+            encodeLogging(borrow t, mut stored)?;
+        }
+        null => {}
+    }
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_LOGGING, stored.view())?;
+    await recountLogging(app)?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+// --- The line ---
+
+/// `[06/Feb/2019:00:00:38 +0000]`
+fn appendLogTime(out: borrow mut Vector<u8>, millis: i64) -> Result<void, AllocError> {
+    let c = civilOf(millis / 1000);
+    out.push('[')?;
+    appendTwo(out, truncate<u64>(c.day))?;
+    out.push('/')?;
+    let m = (truncate<usize>(c.month) - 1) * 3;
+    out.extend(MONTHS.bytes()[m..m + 3])?; // encode.cee's month names
+    out.push('/')?;
+    appendDecimal(out, truncate<u64>(c.year))?;
+    out.push(':')?;
+    appendTwo(out, truncate<u64>(c.hour))?;
+    out.push(':')?;
+    appendTwo(out, truncate<u64>(c.minute))?;
+    out.push(':')?;
+    appendTwo(out, truncate<u64>(c.second))?;
+    out.extend(" +0000]".bytes())?;
+    return Ok();
+}
+
+fn appendTwo(out: borrow mut Vector<u8>, n: u64) -> Result<void, AllocError> {
+    if (n < 10) { out.push('0')?; }
+    return appendDecimal(out, n);
+}
+
+/// A field: its bytes, or `-` for none; spaces and quotes would split or end it, and are written `%20` and `%22`.
+fn appendField(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    if (bytes.length == 0) { return out.push('-'); }
+    for (b in bytes) {
+        if (b == ' ') {
+            out.extend("%20".bytes())?;
+        } else if (b == '"') {
+            out.extend("%22".bytes())?;
+        } else if (b < 0x20 || b == 0x7F) {
+            out.extend("%3F".bytes())?;
+        } else {
+            out.push(b)?;
+        }
+    }
+    return Ok();
+}
+
+fn appendQuoted(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    out.push('"')?;
+    appendField(out, bytes)?;
+    return out.push('"');
+}
+
+/// S3's operation name: `REST.<METHOD>.<what>`, what being the subresource asked for (`LOGGING_STATUS`, `ACL`,
+/// `TAGGING`, ...), or `OBJECT`, or `BUCKET` for a bucket's listing.
+fn appendOperation(
+    out: borrow mut Vector<u8>,
+    method: Slice<u8>,
+    hasKey: bool,
+    query: Slice<u8>,
+) -> Result<void, AllocError> {
+    out.extend("REST.".bytes())?;
+    out.extend(method)?;
+    out.push('.')?;
+    let first = query[0..pieceEnd(query, 0, '&')];
+    let name = first[0..pieceEnd(first, 0, '=')];
+    let subresources = [
+        "acl", "tagging", "versioning", "policy", "cors", "lifecycle", "logging", "notification",
+        "encryption", "object-lock", "retention", "legal-hold", "uploads", "uploadId", "versions", "location",
+    ];
+    var sub: StringView? = null;
+    for (s in subresources) {
+        if (name == s.bytes()) { sub = Some(s); }
+    }
+    match (sub) {
+        Some(s) => {
+            if (s == "logging") {
+                out.extend("LOGGING_STATUS".bytes())?;
+            } else if (s == "uploadId") {
+                out.extend("UPLOAD".bytes())?;
+            } else {
+                if (hasKey && s != "uploads") { out.extend("OBJECT_".bytes())?; }
+                for (b in s.bytes()) { out.push(if (b == '-') '_' else asciiUpper(b))?; }
+            }
+        }
+        null => { out.extend(if (hasKey) "OBJECT".bytes() else "BUCKET".bytes())?; }
+    }
+    return Ok();
+}
+
+fn asciiUpper(b: u8) -> u8 => if (b >= 'a' && b <= 'z') b - 32 else b;
+
+const ACCESS_AUTH_HEADER: u8 = 1;
+const ACCESS_AUTH_QUERY: u8 = 2;
+
+/// What a request's access log line needs that its handling knows (ADR-0072 §2).
+struct AccessFacts {
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    referrer: Vector<u8>;
+    userAgent: Vector<u8>;
+    host: Vector<u8>;
+    /// ACCESS_AUTH_HEADER, ACCESS_AUTH_QUERY, or 0 for an anonymous request.
+    authType: u8;
+}
+
+/// A request's line in S3's server access log format: owner, bucket, time, remote IP, requester, request ID,
+/// operation, key, request-URI, status, error code, bytes sent, object size, total time, turn-around time, referrer,
+/// user agent, version ID, host ID, signature version, cipher suite, authentication type, host header, TLS version,
+/// access point ARN, ACL required. The request-URI gives its query's names, never their values (ADR-0051 §2: a
+/// presigned URL's values are its credentials).
+fn accessLogLine(
+    out: borrow mut Vector<u8>,
+    millis: i64,
+    access: borrow AccessFacts,
+    audit: borrow AuditFacts,
+    peer: SocketAddress?,
+    requestId: Slice<u8>,
+    method: Slice<u8>,
+    path: Slice<u8>,
+    query: Slice<u8>,
+    status: u16,
+    micros: u64,
+) -> Result<void, AllocError> {
+    out.extend("cosmostore ".bytes())?;
+    appendField(out, access.bucket.view())?;
+    out.push(' ')?;
+    appendLogTime(out, millis)?;
+    out.push(' ')?;
+    appendAddress(out, peer)?;
+    out.push(' ')?;
+    appendField(out, if (audit.requester.view() == "anonymous".bytes()) "".bytes() else audit.requester.view())?;
+    out.push(' ')?;
+    appendField(out, requestId)?;
+    out.push(' ')?;
+    appendOperation(out, method, access.key.length > 0, query)?;
+    out.push(' ')?;
+    appendField(out, access.key.view())?;
+    out.extend(" \"".bytes())?;
+    appendField(out, method)?;
+    out.push(' ')?;
+    appendField(out, path)?;
+    if (query.length > 0) {
+        out.push('?')?;
+        var names = Vector<u8>.create();
+        appendQueryNames(mut names, query)?;
+        appendField(out, names.view())?;
+    }
+    out.extend(" HTTP/1.1\" ".bytes())?;
+    appendDecimal(out, status as u64)?;
+    out.push(' ')?;
+    match (audit.code) {
+        Some(c) => { out.extend(s3CodeName(c).bytes())?; }
+        null => { out.push('-')?; }
+    }
+    out.extend(" - - ".bytes())?; // bytes sent, object size: not known here
+    appendDecimal(out, micros / 1000)?;
+    out.extend(" - ".bytes())?;
+    appendQuoted(out, access.referrer.view())?;
+    out.push(' ')?;
+    appendQuoted(out, access.userAgent.view())?;
+    out.extend(" - - ".bytes())?; // version ID, host ID
+    out.extend(match (access.authType) {
+        ACCESS_AUTH_HEADER => "SigV4 - AuthHeader".bytes(),
+        ACCESS_AUTH_QUERY => "SigV4 - QueryString".bytes(),
+        _ => "- - -".bytes(),
+    })?;
+    out.push(' ')?;
+    appendField(out, access.host.view())?;
+    out.extend(" - - -\n".bytes())?; // TLS version, access point ARN, ACL required
+    return Ok();
+}
+
+/// Queues a request's line for its bucket's target, if the bucket logs (ADR-0072 §2).
+async fn queueAccessLine(
+    app: borrow S3App,
+    log: borrow AccessLog,
+    facts: borrow AuditFacts,
+    peer: SocketAddress?,
+    requestId: Slice<u8>,
+    method: Slice<u8>,
+    path: Slice<u8>,
+    query: Slice<u8>,
+    status: u16,
+    micros: u64,
+) {
+    var stored = Vector<u8>.create();
+    {
+        var guard = match (await lockStore(app)) {
+            Ok(g) => g,
+            Err(_) => { return; }
+        };
+        let name = StringView.fromUtf8(facts.access.bucket.view()) ?? "";
+        // An index lookup and a copy: on the event loop.
+        stored = guard.data().bucketConfig(name, BUCKET_CONFIG_LOGGING).ok() ?? Vector<u8>.create();
+    }
+    let target = match (decodeLogging(stored.view())) {
+        Some(t) => t,
+        null => { return; }
+    };
+    var line = Vector<u8>.create();
+    let made = accessLogLine(
+        mut line,
+        Clock.unixMillis(),
+        borrow facts.access,
+        facts,
+        peer,
+        requestId,
+        method,
+        path,
+        query,
+        status,
+        micros,
+    );
+    if (made.isErr() || log.lines.trySend(
+        AccessLogEntry { target: target.bucket, prefix: target.prefix, line: line },
+    ).isErr()) {
+        let _ = log.dropped.fetchAdd(1);
+    }
+}
+
+// --- Delivery ---
+
+/// The key of a log object: the prefix, the time it is delivered (`YYYY-mm-DD-HH-MM-SS`), a random part.
+fn logObjectKey(prefix: Slice<u8>, millis: i64, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.extend(prefix)?;
+    let c = civilOf(millis / 1000);
+    appendDecimal(out, truncate<u64>(c.year))?;
+    out.push('-')?;
+    appendTwo(out, truncate<u64>(c.month))?;
+    out.push('-')?;
+    appendTwo(out, truncate<u64>(c.day))?;
+    out.push('-')?;
+    appendTwo(out, truncate<u64>(c.hour))?;
+    out.push('-')?;
+    appendTwo(out, truncate<u64>(c.minute))?;
+    out.push('-')?;
+    appendTwo(out, truncate<u64>(c.second))?;
+    out.push('-')?;
+    var random = [0u8; 8];
+    let _ = Random.fill(mut random[..]);
+    appendHexBytes(out, random[..])?;
+    return Ok();
+}
+
+/// Writes one target's lines as an object of its bucket; false when the bucket is gone or the write failed.
+fn deliverLogObject(store: borrow mut ObjectStore, batch: borrow AccessLogBatch, millis: i64) -> bool {
+    var key = Vector<u8>.create();
+    if (logObjectKey(batch.prefix.view(), millis, mut key).isErr()) { return false; }
+    let bucket = StringView.fromUtf8(batch.target.view()) ?? "";
+    let name = StringView.fromUtf8(key.view()) ?? "";
+    return store.putObject(bucket, name, "text/plain", batch.bytes.view(), PutCondition.None).isOk();
+}
+
+/// Every second: the lines queued since, into their targets' batches; a batch `everyMs` old, or of
+/// ACCESS_LOG_OBJECT_BYTES, delivered as one object (ADR-0072 §3). A delivery that fails loses its lines, said once
+/// on stderr until one succeeds again.
+async fn accessLogForever(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    w: borrow AccessLogWriter,
+) -> Result<ServerReport, NetError> {
+    var batches = Vector<AccessLogBatch>.create();
+    var failing = false;
+    while (true) {
+        await deliveryPause(1000)?;
+        let now = Clock.unixMillis();
+        while (true) {
+            let e = match (w.lines.tryRecv()) {
+                Some(e) => e,
+                null => { break; }
+            };
+            var at = batches.length;
+            for (i in 0..batches.length) {
+                if (batches[i].target.view() == e.target.view() && batches[i].prefix.view() == e.prefix.view()) {
+                    at = i;
+                }
+            }
+            if (at == batches.length) {
+                let made = batches.push(
+                    AccessLogBatch { target: e.target, prefix: e.prefix, bytes: Vector<u8>.create(), since: now },
+                );
+                if (made.isErr()) { continue; }
+            }
+            let _ = batches[at].bytes.extend(e.line.view());
+        }
+        var k = 0usize;
+        while (k < batches.length) {
+            let due = batches[k].bytes.length >= ACCESS_LOG_OBJECT_BYTES ||
+                (now - batches[k].since) >= truncate<i64>(w.everyMs);
+            if (!due) {
+                k += 1;
+                continue;
+            }
+            let batch = batches.swapRemove(k);
+            var done = false;
+            {
+                var guard = match (await store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NetError.Closed); }
+                };
+                let st = guard.data();
+                done = await Async.blocking(() => deliverLogObject(st, borrow batch, now));
+            }
+            if (!done && !failing) {
+                let _ = await AsyncConsole.writeError(
+                    "cosmostore: an access log could not be delivered to its target bucket; its lines are lost\n",
+                );
+            }
+            failing = !done;
+        }
+    }
+    return Err(NetError.Closed);
+}

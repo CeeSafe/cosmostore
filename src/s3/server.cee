@@ -61,6 +61,10 @@ struct S3App {
     rates: RateLimiter;
     /// The audit log's queue (`serve --audit-log`, ADR-0051); null without one.
     audit: AuditLog?;
+    /// Server access logs (ADR-0072): the queue of lines to deliver, and how many buckets log (while 0 a request
+    /// looks nothing up). Null on a cluster's S3 port.
+    accessLog: AccessLog?;
+    loggingBuckets: AtomicU64;
     /// Buckets with CORS rules (ADR-0049 §4): while 0, a request's `Origin` is not looked at.
     corsBuckets: AtomicU64;
     /// Buckets with a default encryption (ADR-0046 §5): while 0, a write without encryption fields reads none, and
@@ -142,7 +146,19 @@ impl Handler<S3App> for S3Handler {
         let started = Clock.monotonicNanos();
         var kind = LATENCY_OTHER;
         let peer = ctx.connection().peerAddress();
-        var facts = AuditFacts { requester: Vector<u8>.create(), code: null, aborted: false };
+        var facts = AuditFacts {
+            access: AccessFacts {
+                bucket: Vector<u8>.create(),
+                key: Vector<u8>.create(),
+                referrer: Vector<u8>.create(),
+                userAgent: Vector<u8>.create(),
+                host: Vector<u8>.create(),
+                authType: 0,
+            },
+            requester: Vector<u8>.create(),
+            code: null,
+            aborted: false,
+        };
         let done = await respond(app, request, exchange, mut kind, requestId.view(), peer, mut facts);
         let micros = (Clock.monotonicNanos() - started) / 1000;
         app.latencies.record(kind, micros);
@@ -169,6 +185,30 @@ impl Handler<S3App> for S3Handler {
                 if (made.isErr() || audit.lines.trySend(line).isErr()) { let _ = audit.dropped.fetchAdd(1); }
             }
             null => {}
+        }
+        // The bucket's access log line (ADR-0072), if it logs: queued, or dropped and counted.
+        if (facts.access.bucket.length > 0) {
+            match (borrow app.accessLog) {
+                Some(log) => {
+                    let query = match (request.query()) {
+                        Some(q) => q.bytes(),
+                        null => "".bytes(),
+                    };
+                    await queueAccessLine(
+                        app,
+                        log,
+                        borrow facts,
+                        peer,
+                        requestId.view(),
+                        request.methodToken(),
+                        request.path().bytes(),
+                        query,
+                        exchange.status().code(),
+                        micros,
+                    );
+                }
+                null => {}
+            }
         }
         return done;
     }
@@ -274,6 +314,24 @@ async fn serveS3(
     if (!app.rates.admitAddress(peer, second)) { return Err(slowDown(exchange)); }
     let req = S3Request.of(request, app.domain.view())?;
     kind = latencyClass(borrow req);
+    // What the bucket's access log line needs (ADR-0072), while some bucket logs.
+    let logging = app.loggingBuckets.load() > 0 && req.bucket.length > 0;
+    if (logging) {
+        facts.access.bucket.extend(req.bucket.bytes())?;
+        facts.access.key.extend(req.key.bytes())?;
+        match (headerOf(borrow req, "referer")) {
+            Some(v) => { facts.access.referrer.extend(trimBlank(v))?; }
+            null => {}
+        }
+        match (headerOf(borrow req, "user-agent")) {
+            Some(v) => { facts.access.userAgent.extend(trimBlank(v))?; }
+            null => {}
+        }
+        match (headerOf(borrow req, "host")) {
+            Some(v) => { facts.access.host.extend(trimBlank(v))?; }
+            null => {}
+        }
+    }
     // CORS (ADR-0049): a preflight is answered here, unsigned; a request that names its origin gets a matching
     // rule's fields on whatever its answer is.
     if (isMethod(req.method, Method.Options)) { return await preflight(app, borrow req, exchange); }
@@ -308,8 +366,14 @@ async fn serveS3(
         null => {}
     }
     let who = Requester { key: auth.key, peer: peer };
-    // Who the request is, for its line in the audit log (ADR-0051).
-    if (app.audit.isSome()) {
+    // Who the request is, for its line in the audit log (ADR-0051) and the bucket's access log (ADR-0072).
+    if (logging && auth.key.isSome()) {
+        facts.access.authType = if (headerOf(
+            borrow req,
+            "authorization",
+        ).isSome()) ACCESS_AUTH_HEADER else ACCESS_AUTH_QUERY;
+    }
+    if (app.audit.isSome() || logging) {
         facts.requester.clear();
         let credentials = app.credentials.get().view();
         match (auth.key) {
@@ -384,6 +448,19 @@ async fn serveS3(
             if (isMethod(m, Method.Delete)) {
                 await authorize(app, borrow req, borrow who, "s3:PutEncryptionConfiguration", bucket, none)?;
                 return await deleteBucketEncryption(app, borrow req, exchange);
+            }
+            return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+        }
+        // A bucket's server access logging (ADR-0072).
+        if (req.hasParam("logging")) {
+            if (!req.onlyParams("logging")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            if (isMethod(m, Method.Get)) {
+                await authorize(app, borrow req, borrow who, "s3:GetBucketLogging", bucket, none)?;
+                return await getBucketLogging(app, borrow req, exchange);
+            }
+            if (isMethod(m, Method.Put)) {
+                await authorize(app, borrow req, borrow who, "s3:PutBucketLogging", bucket, none)?;
+                return await putBucketLogging(app, borrow req, auth, exchange);
             }
             return Err(S3Fail.Code(S3Code.MethodNotAllowed));
         }

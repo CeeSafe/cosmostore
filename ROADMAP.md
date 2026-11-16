@@ -2669,3 +2669,18 @@ Browser form uploads with a SigV4 POST policy.
 - **M6 (the distributed cluster) is closed:** its exit holds for what it built (`docs/m6-exit-review.md`), the gaps
   of the first review closed, ADR-0056 to ADR-0070 accepted. What is not covered is listed there.
 
+### 16 Nov 2026: M7 started; item 1, server access logs (ADR-0071, ADR-0072)
+
+- **The owner:** "Go ahead start M7". **ADR-0071** (proposed) plans it: access logs, website hosting, inventory, STS,
+  Access Points, replication, in that order, each its own ADR with a support matrix, single node first; directory
+  buckets and Tables not in M7.
+- **Item 1, server access logs (ADR-0072, proposed):** `PutBucketLogging`/`GetBucketLogging` (a `BucketConfig` of kind
+  12, checkpoint format 19); a line per request to a bucket that logs, in S3's access log format, with the query's
+  names only (never a presigned URL's values); delivered every `--access-log-seconds` (300) or at 1 MiB as an object
+  of the target bucket; grants and partitioned keys `NotImplemented`; a cluster's S3 port refuses it for now.
+- **Toolchain:** `../../CeeSafe.Web` (a shared checkout) is now on a branch that needs ceesafec 0.53 or later, so the
+  0.45 compiler no longer checks CosmoStore; the installed 0.54.0 does, and is used locally. CI's pins
+  (`CEESAFE_WEB_REF`, ceesafec 0.45) are unchanged: the owner's call.
+- **Tests:** `loggingConfigurationXml`, `accessLogLineFormat`; the S3 smoke delivers a log object with the PUT's line
+  and a missing key's `NoSuchKey`.
+

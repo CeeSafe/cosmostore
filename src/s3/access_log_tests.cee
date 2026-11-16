@@ -1,0 +1,87 @@
+// Server access logs (ADR-0072): the configuration's XML, a request's line, the operation names, a log object's key.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+@test
+fn loggingConfigurationXml() -> Result<void, TestFailure> {
+    let on =
+        "<BucketLoggingStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LoggingEnabled><TargetBucket>logs</TargetBucket><TargetPrefix>web/</TargetPrefix></LoggingEnabled></BucketLoggingStatus>";
+    let t = parseLogging(on.bytes())!!;
+    Check.equalBytes("logs".bytes(), t.bucket.view())?;
+    Check.equalBytes("web/".bytes(), t.prefix.view())?;
+    // Stored and read back.
+    var stored = Vector<u8>.create();
+    encodeLogging(borrow t, mut stored)!;
+    let back = decodeLogging(stored.view())!;
+    Check.equalBytes("web/".bytes(), back.prefix.view())?;
+    var xml = Vector<u8>.create();
+    let some: LoggingTarget? = Some(back);
+    loggingXml(borrow some, mut xml)!;
+    Check.isTrue(
+        findBytes(xml.view(), "<TargetBucket>logs</TargetBucket><TargetPrefix>web/</TargetPrefix>".bytes(), 0).isSome(),
+        "written back",
+    )?;
+    // Off: no LoggingEnabled.
+    Check.isTrue(parseLogging("<BucketLoggingStatus/>".bytes())!.isNull(), "off")?;
+    // Grants and partitioned keys are NotImplemented, a document without its element MalformedXML.
+    let grants =
+        "<BucketLoggingStatus><LoggingEnabled><TargetBucket>l</TargetBucket><TargetGrants></TargetGrants></LoggingEnabled></BucketLoggingStatus>";
+    Check.isTrue(parseLogging(grants.bytes()).isErr(), "grants")?;
+    Check.isTrue(parseLogging("<Other/>".bytes()).isErr(), "not one")?;
+    Check.isTrue(decodeLogging("".bytes()).isNull() && isLoggingValue("".bytes()), "none")?;
+    return Ok();
+}
+
+fn operationOf(method: StringView, hasKey: bool, query: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    appendOperation(mut out, method.bytes(), hasKey, query.bytes())!;
+    return out;
+}
+
+@test
+fn accessLogLineFormat() -> Result<void, TestFailure> {
+    Check.equalBytes("REST.GET.OBJECT".bytes(), operationOf("GET", true, "").view())?;
+    Check.equalBytes("REST.GET.BUCKET".bytes(), operationOf("GET", false, "list-type=2&prefix=a").view())?;
+    Check.equalBytes("REST.PUT.LOGGING_STATUS".bytes(), operationOf("PUT", false, "logging").view())?;
+    Check.equalBytes("REST.GET.OBJECT_TAGGING".bytes(), operationOf("GET", true, "tagging").view())?;
+    Check.equalBytes("REST.POST.UPLOADS".bytes(), operationOf("POST", true, "uploads").view())?;
+    Check.equalBytes("REST.PUT.OBJECT_LEGAL_HOLD".bytes(), operationOf("PUT", true, "legal-hold").view())?;
+    var facts = AuditFacts {
+        access: AccessFacts {
+            bucket: copyBytes("site".bytes())!,
+            key: copyBytes("a b.txt".bytes())!,
+            referrer: Vector<u8>.create(),
+            userAgent: copyBytes("aws-cli/2.15 \"x\"".bytes())!,
+            host: copyBytes("127.0.0.1:9000".bytes())!,
+            authType: ACCESS_AUTH_QUERY,
+        },
+        requester: copyBytes("AKIAEXAMPLE".bytes())!,
+        code: Some(S3Code.NoSuchKey),
+        aborted: false,
+    };
+    var line = Vector<u8>.create();
+    accessLogLine(
+        mut line,
+        1549411238000, // 06 Feb 2019 00:00:38 UTC
+        borrow facts.access,
+        borrow facts,
+        SocketAddress.V4([192u8, 0, 2, 3], 5555),
+        "3E57427F3E".bytes(),
+        "GET".bytes(),
+        "/site/a%20b.txt".bytes(),
+        "versionId=1&X-Amz-Signature=secret".bytes(),
+        404,
+        7300,
+    )!;
+    Check.equalBytes(
+        "cosmostore site [06/Feb/2019:00:00:38 +0000] 192.0.2.3 AKIAEXAMPLE 3E57427F3E REST.GET.OBJECT a%20b.txt \"GET /site/a%20b.txt?versionId&X-Amz-Signature HTTP/1.1\" 404 NoSuchKey - - 7 - \"-\" \"aws-cli/2.15%20%22x%22\" - - SigV4 - QueryString 127.0.0.1:9000 - - -\n".bytes(),
+        line.view(),
+    )?;
+    // A log object's key: the prefix, the time, a random part.
+    var key = Vector<u8>.create();
+    logObjectKey("web/".bytes(), 1549411238000, mut key)!;
+    Check.isTrue(startsWithBytes(key.view(), "web/2019-02-06-00-00-38-".bytes()) && key.length == 24 + 16, "key")?;
+    return Ok();
+}

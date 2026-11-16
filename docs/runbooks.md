@@ -183,6 +183,20 @@ was not authenticated), `method`, `path`, `query` (the parameters' names only), 
   full; `the audit log could not be written` on stderr says the writes are failing.
 - **It holds no secret,** but it holds every key name and address: protect it as such.
 
+## Server access logs
+
+A bucket owner's view, per bucket, in S3's access log format (ADR-0072): `aws s3api put-bucket-logging --bucket
+photos --bucket-logging-status '{"LoggingEnabled":{"TargetBucket":"logs","TargetPrefix":"photos/"}}'`, and the
+bucket's requests arrive as objects `photos/YYYY-mm-DD-HH-MM-SS-<random>` in `logs`, every five minutes
+(`serve --access-log-seconds` to change it). Tools that read S3's access logs read these.
+
+- **It is best effort,** as S3's: a crash loses the lines not yet delivered, and a full queue drops lines. If the
+  target bucket is deleted, deliveries fail (`an access log could not be delivered` on stderr) until logging is
+  turned off or the bucket is made again.
+- **Query values are not logged,** only the parameters' names: a presigned URL's signature never lands in a bucket.
+- **Not on a cluster yet:** its S3 port answers `NotImplemented`.
+- **Bytes sent and object size are `-`.**
+
 ## Rate limits
 
 `--rate-limit-address <n>` and `--rate-limit-key <n>` set the most requests a second from one address and by one
