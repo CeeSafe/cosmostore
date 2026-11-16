@@ -1,6 +1,6 @@
 # ADR-0078: M7 on a cluster
 
-**Status:** proposed, 16 Nov 2026, after M7 (ADR-0071 to ADR-0077, accepted), on the owner's "continue". §2 and §3 are built; §4 is designed.
+**Status:** proposed, 16 Nov 2026, after M7 (ADR-0071 to ADR-0077, accepted), on the owner's "continue". §2 and §3 are built; §4 is built for event notifications (steps 1 and 2), designed for the rest.
 
 ## Context
 
@@ -49,6 +49,11 @@
      is written by `putReplica` (ADR-0077 §3), so a cluster-local replica, and a replica sent to another CosmoStore,
      keeps its source's id and ETag. The front already strips `x-cosmo-` fields from clients' requests; the shard's S3
      server takes them only from a signed long-term key.
+   - **Built so far:** step 1, the record (`OutboxDelivered`, type 19; a raft replica's cursor at open derived from
+     its checkpoint, so no new checkpoint format); step 2, webhooks: `cosmostore node --notify-targets` (its shards'
+     S3 servers take rules naming them), and a delivery loop on every node that, for each shard it leads, delivers a
+     batch, stages and proposes the record behind the shard's gate, and waits for it to be applied before the next
+     batch (else it would find the same events still waiting and send them again).
    - **Status** on a cluster reads the cursor the shard's records moved, so it is the same on every replica.
    - **Tests:** a store fault sweep of the new record and the checkpoint's cursor; the cluster smoke delivering a
      webhook, an access log, an inventory report and replicas (same shard, another shard) through every node; the
@@ -58,6 +63,9 @@
 
 ## Consequences
 
+- Slice c, steps 1 and 2: `outboxDeliveredOnEveryReplica`, `clusterOutboxFaults{Once,Sticky,Torn,Crash}`; the
+  cluster smoke sets a notification rule through one node, writes through all three, gets each event once, in order,
+  kills the bucket's shard's leader, and gets the next event from the new leader with none lost.
 - Slice b: the cluster smoke configures a site through node 2 (its objects and policy through others) and gets its
   index through each of the three nodes, and its error document.
 - Slice a: the cluster smoke gets a session token through node 1 and writes with it through node 2, assumes a role

@@ -1,0 +1,218 @@
+// The outbox on a cluster (ADR-0078 §4): every replica queues the same events; the leader's OutboxDelivered record
+// drops them on every replica, and a replica reopened from its disk still agrees.
+
+fn hookRules() -> Result<Vector<u8>, AllocError> {
+    var rules = Vector<NotificationRule>.create();
+    rules.push(NotificationRule {
+        id: copyBytes("all".bytes())?,
+        target: copyBytes("hook".bytes())?,
+        events: EVENT_ALL,
+        prefix: Vector<u8>.create(),
+        suffix: Vector<u8>.create(),
+    })?;
+    var blob = Vector<u8>.create();
+    encodeNotification(rules.view(), mut blob)?;
+    return Ok(blob);
+}
+
+/// One write on the leader, acknowledged once applied there: its last index, or null if it got nowhere.
+fn leaderWrite(c: borrow mut Cluster, step: usize, value: u64) -> Result<u64?, StoreError> {
+    let at = match (awaitLeader(c)?) {
+        Some(i) => i,
+        null => { return Ok(null); }
+    };
+    let before = c.replicas[at].beginWrite()?;
+    if (step == 0) {
+        c.replicas[at].store.createBucket("bkt")?;
+    } else if (step == 1) {
+        let rules = hookRules()?;
+        c.replicas[at].store.setBucketConfig("bkt", BUCKET_CONFIG_NOTIFICATION, rules.view())?;
+    } else if (step == 99) {
+        // The leader delivered the events up to `value`.
+        c.replicas[at].store.eventsNoted(value, false)?;
+    } else {
+        var data = Vector<u8>.create();
+        data.pushLE(value)?;
+        let _ = c.replicas[at].store.putObject(
+            "bkt",
+            clusterKey(step % CLUSTER_KEYS),
+            "",
+            data.view(),
+            PutCondition.None,
+        )?;
+    }
+    let index = c.replicas[at].finishWrite(before)? ?? before;
+    for (round in 0..300) {
+        if (c.replicas[at].isApplied(index)) { return Ok(Some(index)); }
+        clusterStep(c)?;
+    }
+    return Ok(null);
+}
+
+/// Steps until every replica has applied `index`.
+fn settle(c: borrow mut Cluster, index: u64) -> Result<void, StoreError> {
+    for (round in 0..300) {
+        var all = true;
+        for (i in 0..c.replicas.length) {
+            if (!c.replicas[i].isApplied(index)) { all = false; }
+        }
+        if (all) { return Ok(); }
+        clusterStep(c)?;
+    }
+    return Ok();
+}
+
+fn eventLsns(r: borrow TestReplica) -> Vector<u64> {
+    var out = Vector<u64>.create();
+    let events = r.store.pendingEvents(100).ok() ?? Vector<OutboxEvent>.create();
+    for (i in 0..events.length) { let _ = out.push(events[i].lsn); }
+    return out;
+}
+
+@test
+fn outboxDeliveredOnEveryReplica() -> Result<void, TestFailure> {
+    let root = scratchDirectory("cluster-outbox");
+    var last = 0u64;
+    var first2 = 0u64;
+    {
+        var c = clusterOpen(root.view(), 7)!;
+        for (step in 0..6) { last = leaderWrite(mut c, step, 100 + step as u64)!!; }
+        settle(mut c, last)!;
+        // Four puts after the rule: four events, the same on every replica.
+        let first = eventLsns(borrow c.replicas[0]);
+        Check.equalU64(4, first.length as u64)?;
+        for (i in 1..3) { Check.isTrue(eventLsns(borrow c.replicas[i]).view() == first.view(), "the same events")?; }
+        // The leader delivered the first two: its record drops them on every replica.
+        let noted = leaderWrite(mut c, 99, first[1])!!;
+        settle(mut c, noted)!;
+        for (i in 0..3) {
+            let left = eventLsns(borrow c.replicas[i]);
+            Check.equalU64(2, left.length as u64)?;
+            Check.equalU64(first[2], left[0])?;
+        }
+        first2 = first[2];
+        // One replica checkpoints; the others will replay their logs.
+        let _ = c.replicas[1].store.checkpoint()!;
+        last = noted;
+    }
+    {
+        // A replica applies its log again once a leader commits in the new term: after the next write, every replica
+        // holds the two events still waiting and the new one, and not the two delivered.
+        var c = clusterOpen(root.view(), 8)!;
+        let more = leaderWrite(mut c, 7, 200)!!;
+        settle(mut c, more)!;
+        for (i in 0..3) {
+            let left = eventLsns(borrow c.replicas[i]);
+            Check.equalU64(3, left.length as u64)?;
+            Check.equalU64(first2, left[0])?;
+        }
+    }
+    removeTree(root.view());
+    return Ok();
+}
+
+/// What the outbox workload had done: puts after the rule acknowledged and tried, and whether the leader's
+/// OutboxDelivered record (of the first two events) was acknowledged or may have been written.
+struct OutboxModel {
+    putsAcked: u64;
+    putsTried: u64;
+    delivered: u64;
+    deliveredAcked: bool;
+    deliveredMaybe: bool;
+}
+
+fn clusterOutboxWorkload(root: StringView, model: borrow mut OutboxModel) {
+    var c = match (clusterOpen(root, 3)) {
+        Ok(c) => c,
+        Err(_) => { return; }
+    };
+    for (step in 0..6) {
+        if (step >= 2) { model.putsTried += 1; }
+        match (leaderWrite(mut c, step, 100 + step as u64)) {
+            Ok(Some(_)) => {
+                if (step >= 2) { model.putsAcked += 1; }
+            }
+            _ => { return; }
+        }
+    }
+    let events = eventLsns(borrow c.replicas[clusterLeader(borrow c) ?? 0]);
+    if (events.length < 2) { return; }
+    model.delivered = events[1];
+    model.deliveredMaybe = true;
+    match (leaderWrite(mut c, 99, events[1])) {
+        Ok(Some(_)) => { model.deliveredAcked = true; }
+        _ => { return; }
+    }
+    model.putsTried += 1;
+    match (leaderWrite(mut c, 7, 200)) {
+        Ok(Some(_)) => { model.putsAcked += 1; }
+        _ => {}
+    }
+}
+
+fn checkOutbox(root: StringView, model: borrow OutboxModel) -> Result<void, TestFailure> {
+    var c = match (clusterOpen(root, 4)) {
+        Ok(c) => c,
+        Err(_) => { return Err(TestFailure.create("a replica did not open after the fault")); }
+    };
+    let at = match (awaitLeader(mut c)) {
+        Ok(Some(i)) => i,
+        _ => { return Err(TestFailure.create("no leader after the fault")); }
+    };
+    let target = c.replicas[at].store.lastEntry();
+    settle(mut c, target)!;
+    let events = eventLsns(borrow c.replicas[0]);
+    for (i in 1..3) { Check.isTrue(eventLsns(borrow c.replicas[i]).view() == events.view(), "the replicas agree")?; }
+    if (model.deliveredAcked) {
+        for (i in 0..events.length) { Check.isTrue(events[i] > model.delivered, "a delivered event came back")?; }
+    }
+    let gone: u64 = if (model.deliveredMaybe) 2 else 0;
+    Check.isTrue(events.length as u64 + gone >= model.putsAcked, "an acknowledged put's event was lost")?;
+    Check.isTrue(events.length as u64 <= model.putsTried, "an event no put made")?;
+    return Ok();
+}
+
+fn sweepOutboxCluster(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let root = scratchDirectory(name);
+    Faults.countOperations();
+    var clean = OutboxModel { putsAcked: 0, putsTried: 0, delivered: 0, deliveredAcked: false, deliveredMaybe: false };
+    clusterOutboxWorkload(root.view(), mut clean);
+    Faults.disarm();
+    Check.isTrue(clean.deliveredAcked && clean.putsAcked == 5, "the workload runs through without faults")?;
+    let points = Faults.seen();
+    for (n in 1..points + 1) {
+        removeTree(root.view());
+        Fs.ensureDirectory(root.view())!;
+        armMode(borrow mode, n);
+        var model = OutboxModel {
+            putsAcked: 0,
+            putsTried: 0,
+            delivered: 0,
+            deliveredAcked: false,
+            deliveredMaybe: false,
+        };
+        clusterOutboxWorkload(root.view(), mut model);
+        Faults.disarm();
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(root.view())!;
+        }
+        checkOutbox(root.view(), borrow model)?;
+    }
+    removeTree(root.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn clusterOutboxFaultsOnce() -> Result<void, TestFailure> => sweepOutboxCluster("coutbox-once", SweepMode.Once);
+
+@test
+fn clusterOutboxFaultsCrash() -> Result<void, TestFailure> => sweepOutboxCluster("coutbox-crash", SweepMode.Crash);
+
+@test
+fn clusterOutboxFaultsSticky() -> Result<void, TestFailure> => sweepOutboxCluster("coutbox-sticky", SweepMode.Sticky);
+
+@test
+fn clusterOutboxFaultsTorn() -> Result<void, TestFailure> => sweepOutboxCluster("coutbox-torn", SweepMode.StickyTorn);

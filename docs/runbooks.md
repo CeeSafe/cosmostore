@@ -154,6 +154,10 @@ Rules live on the bucket (`put-bucket-notification-configuration`, queue configu
 `arn:cosmostore:sqs::<id>:webhook`); the webhooks they may name are the lines `<id> <url>` of the file given to
 `--notify-targets`, read at start (ADR-0048).
 
+- **On a cluster:** give every `cosmostore node` the same `--notify-targets` file; each shard's leader delivers its
+  events, and a new leader goes on where the last delivery it knows of stopped (ADR-0078 §4), so a leader's loss can
+  deliver a few events again.
+
 - **Delivery is at least once, in order.** A webhook must answer 2xx; anything else is tried again after 1 s,
   doubling to 60 s. Consumers must accept an event twice, and order events of a key by `sequencer`.
 - **A webhook is down:** `eventsPending` grows and `eventDeliveryFailures` rises. Nothing is lost while fewer

@@ -19,6 +19,18 @@ failed=0
 
 cleanup() {
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+    # Ten seconds to go; then a process still there is named and killed, so a run never hangs here (one once did,
+    # 11 hours, on a node TERM had not stopped).
+    for i in $(seq 1 50); do
+        alive=""
+        for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+        [ -z "$alive" ] && break
+        perl -e 'select(undef, undef, undef, 0.2)'
+    done
+    if [ -n "$alive" ]; then
+        echo "cluster smoke: still running after TERM:$alive; killed" >&2
+        for p in $alive; do kill -9 "$p" 2>/dev/null; done
+    fi
     wait 2>/dev/null
     rm -rf "$WORK"
 }
@@ -44,6 +56,12 @@ node 2 peer=127.0.0.1:$((BASE + 2)) domain=b
 node 3 peer=127.0.0.1:$((BASE + 3)) domain=c
 EOF
 
+# Event notifications (ADR-0078 §4): a webhook the shards' leaders deliver to.
+hookport=$((BASE + 40))
+: > hook.out
+python3 -I "$OLDPWD/tools/webhook.py" "$hookport" "$WORK/hook.out" &
+PIDS[9]=$!
+printf 'hook http://127.0.0.1:%s/events\n' "$hookport" > targets
 # STS (ADR-0078 §2): the same token keys and roles on every node.
 printf 'sts1 %s\n' "$(head -c 32 /dev/urandom | base64)" > sts.keys
 cat > roles <<'ROLES'
@@ -51,7 +69,7 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --notify-targets targets >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -183,6 +201,25 @@ for n in 1 2 3; do
     check "the site through node $n" "$(curl -s -w ' %{http_code}' -H "Host: site.web.localhost:$port" "http://127.0.0.1:$port/")" "home 200"
 done
 check "its error document" "$(curl -s -w ' %{http_code}' -H "Host: site.web.localhost:$((BASE + 13))" "http://127.0.0.1:$((BASE + 13))/nothing")" "oops 404"
+
+# Event notifications on a cluster (ADR-0078 §4): the shard's leader delivers, and a new one goes on.
+keys() { python3 -c 'import json,sys
+print(" ".join(json.loads(l)["Records"][0]["s3"]["object"]["key"] for l in open(sys.argv[1]) if l.strip()))' hook.out; }
+on 1 s3api create-bucket --bucket events > /dev/null 2>&1
+on 2 s3api put-bucket-notification-configuration --bucket events --notification-configuration '{"QueueConfigurations":[{"Id":"all","QueueArn":"arn:cosmostore:sqs::hook:webhook","Events":["s3:ObjectCreated:*"]}]}' > /dev/null 2>&1 && pass "a notification rule through node 2" || fail "a notification rule through node 2"
+for n in 1 2 3; do on "$n" s3api put-object --bucket events --key "e$n" --body one.txt > /dev/null 2>&1; done
+for i in $(seq 1 50); do [ "$(keys)" = "e1 e2 e3" ] && break; pause 0.2; done
+check "three writes through three nodes, delivered in order" "$(keys)" "e1 e2 e3"
+eventsShard=$(python3 -c 'import hashlib; d=hashlib.sha256(bytes.fromhex("00c1a55e5e0c1a55")+b"events").digest(); print(int.from_bytes(d[:8],"big") % 8)')
+eventsLeader=$(status 1 | awk -v s="$eventsShard" '$1 == s { print $4 }')
+kill -9 "${PIDS[$eventsLeader]}" 2>/dev/null
+wait "${PIDS[$eventsLeader]}" 2>/dev/null
+PIDS[$eventsLeader]=""
+survivor=$(( eventsLeader % 3 + 1 ))
+for i in $(seq 1 25); do on "$survivor" s3api put-object --bucket events --key e4 --body one.txt > /dev/null 2>&1 && break; pause 0.4; done
+for i in $(seq 1 100); do keys | grep -q "e4$" && break; pause 0.2; done
+check "its leader (node $eventsLeader) killed: the next leader delivers" "$(keys | tr ' ' '\n' | tail -1)" e4
+check "and nothing delivered before is lost" "$(keys | tr ' ' '\n' | sort -u | tr '\n' ' ')" "e1 e2 e3 e4 "
 
 echo "cluster s3 smoke: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]

@@ -2770,4 +2770,13 @@ Browser form uploads with a SigV4 POST policy.
 - **Slice b, website hosting:** `cosmostore node --website-domain`; the front routes `<bucket>.<domain>` requests by
   their host to the bucket's shard, whose S3 server serves the website; PutBucketWebsite allowed on a cluster. The
   cluster smoke (44 checks) serves a site through every node.
+- **Slice c, step 1 (the store):** an `OutboxDelivered` record (type 19, a Raft log only): a raft store's
+  `eventsDelivered` stages it for the leader to propose, and its apply drops the events on every replica; a raft
+  replica's cursor at open is derived from its checkpoint (before its first held event, or its LSN), so no format
+  change. Tests: `outboxDeliveredOnEveryReplica` (three replicas agree, one reopened from a checkpoint, two from
+  their logs) and `clusterOutboxFaults{Once,Sticky,Torn,Crash}`. Next: the delivery task on each shard's leader.
+- **Slice c, step 2 (webhooks on a cluster):** `cosmostore node --notify-targets`; a delivery loop on every node
+  delivers each shard it leads, then proposes `OutboxDelivered` behind the shard's gate and waits for it to apply
+  (without that wait the first smoke run got each event two to four times). The cluster smoke (48 checks): events
+  written through three nodes delivered once each, in order; the shard's leader killed, the next one delivers.
 

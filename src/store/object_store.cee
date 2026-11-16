@@ -1017,6 +1017,12 @@ fn applyRecord(
             }
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
         }
+        RecordType.OutboxDelivered => {
+            // A shard's leader delivered the events up to an LSN (ADR-0078 §4): every replica drops them.
+            if (meta.length != 8) { return Err(StoreError.BadMeta(segment, offset)); }
+            state.outbox.deliveredTo(meta.readLE<u64>(0));
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
+        }
         RecordType.Session => {
             // A write's request id and answer (ADR-0068): `manifest` is the payload here.
             if (meta.length != 17) { return Err(StoreError.BadMeta(segment, offset)); }
@@ -1544,7 +1550,15 @@ struct ObjectStore {
         }
         // The outbox: the checkpoint's events the cursor is not past, then those of the records replayed
         // (ADR-0048 §3).
-        let delivered = readOutboxCursor(dir)?;
+        var delivered = readOutboxCursor(dir)?;
+        // A Raft log's replicas have no cursor file: their records say what was delivered (ADR-0078 §4). The
+        // checkpoint holds every event undelivered when it was written, so everything before its first one, or before
+        // its LSN when it holds none, was delivered; the records replayed say the rest.
+        if (config.journal.raftLog) {
+            delivered =
+                if (state.outbox.head < state.outbox.events.length) state.outbox.events[state.outbox.head].lsn - 1
+                    else start.lsn;
+        }
         state.outbox.deliveredTo(delivered);
         state.outbox.delivered = 0;
         var failure: StoreError? = null;
@@ -3684,8 +3698,16 @@ struct ObjectStore {
     }
 
     /// Every event up to `lsn` is delivered: they leave the outbox, and the cursor file says so, durably, before
-    /// this returns. A crash before it delivers them again.
+    /// this returns. A crash before it delivers them again. On a Raft log an `OutboxDelivered` record is staged
+    /// instead, for the shard's leader to propose; applied on every replica, it drops them (ADR-0078 §4).
     fn eventsDelivered(borrow mut this, lsn: u64) -> Result<void, StoreError> {
+        if (this.raft) {
+            var meta = Vector<u8>.create();
+            meta.pushLE(lsn)?;
+            let _ = this.stageMetaRecord(RecordType.OutboxDelivered, meta)?;
+            this.commitStaged()?;
+            return Ok();
+        }
         // The cursor first: if it cannot be written the events stay, in memory and in the next checkpoint, and
         // are delivered again. Dropped first, a checkpoint could leave them out while the disk still asks for them.
         writeOutboxCursor(this.dir.view(), lsn)?;
@@ -4494,6 +4516,25 @@ struct ObjectStore {
         let id = this.versionIdFor(bucket, key)?;
         let lsn = this.stageDeleteRecord(RecordType.DeleteMarker, bucket, key, id, now)?;
         return Ok(StagedDelete { lsn: lsn, versionId: id });
+    }
+
+    /// Stages a record that is all meta and returns its LSN; a full batch, or a full segment, is committed first.
+    fn stageMetaRecord(borrow mut this, kind: RecordType, meta: Vector<u8>) -> Result<u64, StoreError> {
+        let empty = [0u8; 1];
+        if (this.journal.wouldOverflow(meta.length, 0) || this.journal.needsRotation()) { this.commitStaged()?; }
+        this.pendingApplies.reserve(1)?;
+        let pos = this.stageRecord(kind, meta.view(), empty[0..0])?;
+        this.pendingApplies.push(PendingApply {
+            kind: kind,
+            lsn: pos.lsn,
+            segment: pos.segmentId,
+            offset: pos.offset,
+            total: truncate<u32>(recordLength(meta.length, 0)),
+            meta: meta,
+            payloadLen: 0,
+            manifest: Vector<u8>.create(),
+        })?;
+        return Ok(pos.lsn);
     }
 
     /// Stages a DeleteVersion or DeleteMarker record of `key` and returns its LSN; a full batch, or a full segment,

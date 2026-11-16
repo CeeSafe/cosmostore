@@ -1,0 +1,125 @@
+// The outbox on a cluster (ADR-0078 §4): each shard whose replica on this node leads delivers its events, in order,
+// as `serve` does, then proposes an OutboxDelivered record behind the shard's gate, so every replica drops them and a
+// new leader goes on from there.
+import web_core;
+import web_transport;
+import web_http;
+import web_client;
+
+/// Delivers one batch of a shard's events, if this node's replica leads it: the LSN of the last one delivered (0:
+/// none), and whether one failed.
+async fn deliverShard(
+    shared: borrow NodeShared,
+    slot: borrow ShardSlot,
+    client: borrow Client,
+) -> Result<DeliveredBatch, NodeFault> {
+    var batch = DeliveredBatch { last: 0, failed: false };
+    {
+        var guard = match (await slot.replica.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        if (!guard.data().core.isLeader()) { return Ok(batch); }
+    }
+    var events = Vector<OutboxEvent>.create();
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        // Copies out of memory: on the event loop.
+        events = match (guard.data().pendingEvents(DELIVERY_BATCH)) {
+            Ok(e) => e,
+            Err(_) => { return Ok(batch); }
+        };
+    }
+    for (i in 0..events.length) {
+        let e = borrow events[i];
+        for (t in 0..e.targets.length) {
+            // Replication is refused on a cluster until its step (ADR-0078 §4): no event has such a target yet.
+            if (isReplicationTarget(e.targets[t].view())) { continue; }
+            let url = match (targetUrl(shared.notifyTargets.view(), e.targets[t].view())) {
+                Some(u) => u,
+                null => { continue; } // a target the file no longer has
+            };
+            var json = Vector<u8>.create();
+            if (eventJson(e, t, mut json).isErr() || !(await postEvent(client, url, json.view()))) {
+                batch.failed = true;
+                break;
+            }
+        }
+        if (batch.failed) { break; }
+        batch.last = e.lsn;
+    }
+    if (batch.last == 0) { return Ok(batch); }
+    // Where it stopped, as a record of the shard's log, behind the gate the leader's writes pass (ADR-0060 §5).
+    var gate = match (await slot.gate.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let _held = gate.data();
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let last = batch.last;
+        // The record is written to the journal: on a worker thread.
+        if ((await Async.blocking(() => st.eventsNoted(last, false))).isErr()) {
+            batch.last = 0;
+            return Ok(batch);
+        }
+    }
+    // Not leading any more: the record is cut off with the rest, and the next leader delivers them again.
+    let proposed = match (await proposeStaged(shared, slot, null, "".bytes())?) {
+        Some(p) => p,
+        null => { return Ok(batch); }
+    };
+    // Applied before the next batch, which would otherwise find the same events still waiting here and send them
+    // again; as a write waits for its entries (ADR-0060 §5).
+    var waited = 0u64;
+    while (true) {
+        let v = await viewOf(slot)?;
+        if (v.applied >= proposed.last || !v.leads || v.term != proposed.term) { break; }
+        if (waited >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { break; }
+        waited += FRONT_POLL_MS;
+    }
+    return Ok(batch);
+}
+
+struct DeliveredBatch {
+    last: u64;
+    failed: bool;
+}
+
+/// Every shard this node leads, delivered in turn; a failure waits 1 s, doubling to 60 s, as on `serve` (ADR-0048).
+async fn deliverClusterForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
+    var options = ClientOptions.defaults();
+    options.totalMs = 60000;
+    options.retry = RetryPolicy.never();
+    let client = match (Client.create(options, deliveryConnector())) {
+        Ok(c) => c,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    var wait = DELIVERY_RETRY_MS;
+    while (true) {
+        var failed = false;
+        var any = false;
+        for (i in 0..shared.slots.length) {
+            let slot = borrow shared.slots[i];
+            if (slot.failed.load() != 0) { continue; }
+            let batch = await deliverShard(shared, slot, borrow client)?;
+            if (batch.failed) { failed = true; }
+            if (batch.last > 0) { any = true; }
+        }
+        if (failed) {
+            if (!(await frontPause(wait))) { return Err(NodeFault.Net); }
+            wait = if (wait * 2 > DELIVERY_RETRY_MOST_MS) DELIVERY_RETRY_MOST_MS else wait * 2;
+        } else {
+            wait = DELIVERY_RETRY_MS;
+            if (!any && !(await frontPause(DELIVERY_IDLE_MS))) { return Err(NodeFault.Net); }
+        }
+    }
+    return Err(NodeFault.Net);
+}

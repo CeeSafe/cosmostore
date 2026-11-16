@@ -60,6 +60,8 @@ struct NodeShared {
     requests: AtomicU64;
     /// `--website-domain` (ADR-0078 §3): a request to `<bucket>.<domain>` is that bucket's website.
     websiteDomain: Vector<u8>;
+    /// `--notify-targets` (ADR-0078 §4): the webhooks this node's leaders deliver to.
+    notifyTargets: Vector<NotifyTarget>;
     /// Scrub (ADR-0063): how often a pass starts, and what passes found: versions checked, damage found, records
     /// repaired from a replica, extents fetched (a damaged one removed comes back this way, as a missing one does).
     scrubEveryMs: u64;
@@ -280,6 +282,10 @@ fn openNode(
         websiteDomain: match (copyBytes(sts.websiteDomain.view())) {
             Ok(d) => d,
             Err(_) => { return Err(textOf("out of memory")); }
+        },
+        notifyTargets: match (parseTargets(sts.notifyTargetsText.view())) {
+            Ok(Some(t)) => t,
+            _ => { return Err(textOf("the notification targets file needs lines of `<id> <http or https url>`")); }
         },
         requests: AtomicU64.create(0),
         scrubEveryMs: scrubEveryMs,
@@ -948,6 +954,7 @@ async fn runNode(
         s.spawn(async () => await fetchForever(node));
         s.spawn(async () => await rebalanceForever(node));
         s.spawn(async () => await scrubForever(node));
+        s.spawn(async () => await deliverClusterForever(node));
         s.spawn(async () => await codeForever(node));
         for (i in 0..peers) {
             let at = i;
@@ -1071,7 +1078,29 @@ fn nodeCommand() -> i32 {
         keys: Vector<MasterKey>.create(),
         rolesText: Vector<u8>.create(),
         websiteDomain: Vector<u8>.create(),
+        notifyTargetsText: Vector<u8>.create(),
     };
+    match (borrow args.notifyTargets) {
+        Some(path) => {
+            sts.notifyTargetsText = match (readSmallFile(path.view(), "notification targets file")) {
+                Ok(t) => t,
+                Err(message) => {
+                    Console.writeErrorLine(message.view());
+                    return 1;
+                }
+            };
+            match (parseTargets(sts.notifyTargetsText.view())) {
+                Ok(Some(_)) => {}
+                _ => {
+                    Console.writeErrorLine(
+                        "cosmostore: the notification targets file needs lines of `<id> <http or https url>`, each id once",
+                    );
+                    return 1;
+                }
+            }
+        }
+        null => {}
+    }
     match (borrow args.websiteDomain) {
         Some(d) => {
             for (c in d.view().bytes()) {
@@ -1206,6 +1235,8 @@ struct ClusterArguments {
     roles: String?;
     /// Website hosting on the node's S3 port (ADR-0078 §3).
     websiteDomain: String?;
+    /// The webhooks event notifications go to (ADR-0078 §4).
+    notifyTargets: String?;
     /// How an empty directory starts (ADR-0066): the cluster's formation, or joining it.
     init: bool;
     join: bool;
@@ -1224,6 +1255,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var stsKeys: String? = null;
     var roles: String? = null;
     var websiteDomain: String? = null;
+    var notifyTargets: String? = null;
     var init = false;
     var join = false;
     var at = from;
@@ -1266,6 +1298,8 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             roles = Some(textOf(value));
         } else if (option == "--website-domain") {
             websiteDomain = Some(textOf(value));
+        } else if (option == "--notify-targets") {
+            notifyTargets = Some(textOf(value));
         } else if (option == "--scrub-seconds") {
             scrubSeconds = value.parseInt<u64>();
             if (scrubSeconds.isNull() || (scrubSeconds ?? 0) == 0) { return null; }
@@ -1289,6 +1323,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 stsKeys: stsKeys,
                 roles: roles,
                 websiteDomain: websiteDomain,
+                notifyTargets: notifyTargets,
                 init: init,
                 join: join,
             }),
