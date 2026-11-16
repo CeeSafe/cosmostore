@@ -2695,3 +2695,14 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** `websiteConfigurationXml`, `websiteHostNames`; the S3 smoke serves a site: index, folder redirect,
   folder index, error document, a routing rule, an object's redirect, 405, and no site after its deletion.
 
+### 16 Nov 2026: M7 item 3, inventory reports (ADR-0074)
+
+- **Under the owner's standing go-ahead.** **ADR-0074** (proposed): Put/Get/List/DeleteBucketInventoryConfiguration (a
+  `BucketConfig` of kind 14, checkpoint format 21, up to 1,000); daily or weekly reports of current or all versions,
+  filter prefix, optional `Size`, `LastModifiedDate`, `ETag`, `StorageClass`, `IsMultipartUploaded` (others, ORC and
+  Parquet `NotImplemented`); gzip CSV data files and `manifest.json` with `manifest.checksum` under
+  `<prefix>/<source>/<id>/`; due times read back from the destination, so a restart neither repeats nor skips one.
+- **gzip of stored blocks:** lib/std has no deflate (CEESAFE_GAPS **G35**, logged): valid gzip, as large as its CSV.
+- **Tests:** `inventoryConfigurationXml`, `gzipOfStoredBlocks`, `inventoryRows`; the S3 smoke opens a report with
+  Python's `gzip` and finds a row per object.
+

@@ -211,6 +211,19 @@ way).
 - **A custom domain** must take the `<bucket>.<website domain>` form, or go through a proxy that sets that `Host`.
 - **HTTPS** is whatever `serve` listens with; not on a cluster yet (`NotImplemented`).
 
+## Inventory reports
+
+`aws s3api put-bucket-inventory-configuration --bucket photos --id daily --inventory-configuration
+'{"Id":"daily","IsEnabled":true,"Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::reports","Format":"CSV","Prefix":"inv"}},"Schedule":{"Frequency":"Daily"},"IncludedObjectVersions":"Current","OptionalFields":["Size","ETag"]}'`
+writes a report of `photos` to `reports` under `inv/photos/daily/` every day (ADR-0074): gzip CSV data files and a
+`manifest.json` in a folder named for its time, as S3's reports are laid out.
+
+- **The first report** comes within a minute of the configuration; then one a day (or a week). After a restart the
+  next is due a day after the newest one in the destination.
+- **CSV only** (ORC and Parquet are `NotImplemented`), and the gzip files are not compressed (CEESAFE_GAPS G35): plan
+  their space as the CSV's.
+- **Not on a cluster yet.**
+
 ## Rate limits
 
 `--rate-limit-address <n>` and `--rate-limit-key <n>` set the most requests a second from one address and by one

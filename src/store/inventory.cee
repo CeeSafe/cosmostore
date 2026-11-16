@@ -1,0 +1,87 @@
+// A bucket's inventory configurations (ADR-0074) as the store keeps them; the S3 layer reads and writes them as XML
+// and writes the reports (`src/s3/inventory.cee`).
+
+/// A bucket's inventory configurations, in the compact form below; empty for none.
+const BUCKET_CONFIG_INVENTORY: u8 = 14;
+const MAX_INVENTORY_CONFIGS: usize = 1000;
+/// Optional fields, as bits.
+const INVENTORY_SIZE: u8 = 1;
+const INVENTORY_LAST_MODIFIED: u8 = 2;
+const INVENTORY_ETAG: u8 = 4;
+const INVENTORY_STORAGE_CLASS: u8 = 8;
+const INVENTORY_MULTIPART: u8 = 16;
+
+struct InventoryConfig {
+    id: Vector<u8>;
+    enabled: bool;
+    /// The destination bucket's name (its ARN's last part) and the prefix of the report's keys.
+    destination: Vector<u8>;
+    prefix: Vector<u8>;
+    /// 1 for daily, 7 for weekly.
+    days: u8;
+    /// Every version, or the current ones only.
+    allVersions: bool;
+    filter: Vector<u8>;
+    fields: u8;
+}
+
+/// Inventory v1: u8 version, u16 count, then per configuration the id, u8 enabled, the destination, the prefix, u8
+/// days, u8 all versions, the filter prefix (each text u16+bytes), u8 optional fields.
+fn encodeInventory(configs: Slice<InventoryConfig>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (configs.length == 0) { return Ok(); }
+    out.push(1)?;
+    out.pushLE(truncate<u16>(configs.length))?;
+    for (i in 0..configs.length) {
+        let c = borrow configs[i];
+        pushText16(out, c.id.view())?;
+        out.push(if (c.enabled) 1u8 else 0u8)?;
+        pushText16(out, c.destination.view())?;
+        pushText16(out, c.prefix.view())?;
+        out.push(c.days)?;
+        out.push(if (c.allVersions) 1u8 else 0u8)?;
+        pushText16(out, c.filter.view())?;
+        out.push(c.fields)?;
+    }
+    return Ok();
+}
+
+fn decodeInventory(b: Slice<u8>) -> Result<Vector<InventoryConfig>, MetaFault> {
+    var out = Vector<InventoryConfig>.create();
+    if (b.length == 0) { return Ok(out); }
+    if (b[0] != 1) { return Err(MetaFault.BadVersion); }
+    need(b, 1, 2)?;
+    let n = b.readLE<u16>(1) as usize;
+    if (n == 0 || n > MAX_INVENTORY_CONFIGS) { return Err(MetaFault.TooLong); }
+    var at: usize = 3;
+    for (i in 0..n) {
+        let id = readText16(b, mut at)?;
+        need(b, at, 1)?;
+        let enabled = b[at] == 1;
+        at += 1;
+        let destination = readText16(b, mut at)?;
+        let prefix = readText16(b, mut at)?;
+        need(b, at, 2)?;
+        let days = b[at];
+        let allVersions = b[at + 1] == 1;
+        at += 2;
+        let filter = readText16(b, mut at)?;
+        need(b, at, 1)?;
+        let fields = b[at];
+        at += 1;
+        if ((days != 1 && days != 7) || id.length == 0 || destination.length == 0) { return Err(MetaFault.TooLong); }
+        out.push(InventoryConfig {
+            id: id,
+            enabled: enabled,
+            destination: destination,
+            prefix: prefix,
+            days: days,
+            allVersions: allVersions,
+            filter: filter,
+            fields: fields,
+        })?;
+    }
+    if (at != b.length) { return Err(MetaFault.TooLong); }
+    return Ok(out);
+}
+
+fn isInventoryValue(value: Slice<u8>) -> bool => decodeInventory(value).isOk();

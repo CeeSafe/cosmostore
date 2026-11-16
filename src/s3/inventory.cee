@@ -1,0 +1,548 @@
+// Inventory reports (ADR-0074): a bucket's inventory configurations as XML, and the task that writes their reports
+// (gzip CSV files and a manifest) into the destination bucket, daily or weekly.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+/// How often the task looks for reports that are due.
+const INVENTORY_CHECK_MS: u64 = 60000;
+/// A report's data file is cut at this many bytes of CSV.
+const INVENTORY_FILE_BYTES: usize = 33554432;
+
+/// The task's settings: how long a "day" is, in ms (`serve --inventory-day-seconds`, for tests; a day by default).
+struct InventoryWriter {
+    dayMs: u64;
+}
+
+// --- The configuration's XML ---
+
+fn inventoryFieldBit(name: Slice<u8>) -> u8 {
+    if (name == "Size".bytes()) { return INVENTORY_SIZE; }
+    if (name == "LastModifiedDate".bytes()) { return INVENTORY_LAST_MODIFIED; }
+    if (name == "ETag".bytes()) { return INVENTORY_ETAG; }
+    if (name == "StorageClass".bytes()) { return INVENTORY_STORAGE_CLASS; }
+    if (name == "IsMultipartUploaded".bytes()) { return INVENTORY_MULTIPART; }
+    return 0;
+}
+
+/// One `<InventoryConfiguration>`. CSV only; ORC, Parquet, the destination's encryption and optional fields other
+/// than Size, LastModifiedDate, ETag, StorageClass and IsMultipartUploaded are NotImplemented (ADR-0074 §1).
+fn parseInventory(xml: Slice<u8>) -> Result<InventoryConfig, S3Fail> {
+    if (findBytes(xml, "<InventoryConfiguration".bytes(), 0).isNull()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    var c = InventoryConfig {
+        id: Vector<u8>.create(),
+        enabled: false,
+        destination: Vector<u8>.create(),
+        prefix: Vector<u8>.create(),
+        days: 0,
+        allVersions: false,
+        filter: Vector<u8>.create(),
+        fields: 0,
+    };
+    if (!rawElement(xml, "Id", mut c.id)? || c.id.length == 0 || c.id.length > 64) {
+        return Err(S3Fail.Code(S3Code.InvalidArgument));
+    }
+    var enabled = Vector<u8>.create();
+    let _ = rawElement(xml, "IsEnabled", mut enabled)?;
+    c.enabled = trimBlank(enabled.view()) == "true".bytes();
+    var at: usize = 0;
+    match (nextElement(xml, "Filter", mut at)?) {
+        Some(f) => { let _ = rawElement(f, "Prefix", mut c.filter)?; }
+        null => {}
+    }
+    at = 0;
+    let dest = match (nextElement(xml, "S3BucketDestination", mut at)?) {
+        Some(d) => d,
+        null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    };
+    if (findBytes(dest, "<Encryption".bytes(), 0).isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    var format = Vector<u8>.create();
+    let _ = rawElement(dest, "Format", mut format)?;
+    if (trimBlank(format.view()) != "CSV".bytes()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    var arn = Vector<u8>.create();
+    let _ = rawElement(dest, "Bucket", mut arn)?;
+    let arnPrefix = "arn:aws:s3:::".bytes();
+    let bare = trimBlank(arn.view());
+    if (!startsWithBytes(bare, arnPrefix) || bare.length == arnPrefix.length) {
+        return Err(S3Fail.Code(S3Code.InvalidArgument));
+    }
+    c.destination.extend(bare[arnPrefix.length..bare.length])?;
+    let _ = rawElement(dest, "Prefix", mut c.prefix)?;
+    var frequency = Vector<u8>.create();
+    let _ = rawElement(xml, "Frequency", mut frequency)?;
+    c.days = if (trimBlank(
+        frequency.view(),
+    ) == "Daily".bytes()) 1u8 else if (trimBlank(frequency.view()) == "Weekly".bytes()) 7u8 else {
+        return Err(S3Fail.Code(S3Code.InvalidArgument));
+    };
+    var versions = Vector<u8>.create();
+    let _ = rawElement(xml, "IncludedObjectVersions", mut versions)?;
+    let v = trimBlank(versions.view());
+    if (v == "All".bytes()) {
+        c.allVersions = true;
+    } else if (v != "Current".bytes()) {
+        return Err(S3Fail.Code(S3Code.InvalidArgument));
+    }
+    at = 0;
+    match (nextElement(xml, "OptionalFields", mut at)?) {
+        Some(fields) => {
+            var fat: usize = 0;
+            while (true) {
+                let f = match (nextElement(fields, "Field", mut fat)?) {
+                    Some(f) => f,
+                    null => { break; }
+                };
+                let bit = inventoryFieldBit(trimBlank(f));
+                if (bit == 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+                c.fields = c.fields | bit;
+            }
+        }
+        null => {}
+    }
+    return Ok(c);
+}
+
+fn inventoryXml(c: borrow InventoryConfig, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.extend("<InventoryConfiguration>".bytes())?;
+    xmlTextElement(out, "Id", c.id.view())?;
+    xmlTextElement(out, "IsEnabled", if (c.enabled) "true".bytes() else "false".bytes())?;
+    if (c.filter.length > 0) {
+        out.extend("<Filter>".bytes())?;
+        xmlTextElement(out, "Prefix", c.filter.view())?;
+        out.extend("</Filter>".bytes())?;
+    }
+    out.extend("<Destination><S3BucketDestination><Bucket>arn:aws:s3:::".bytes())?;
+    appendXmlEscaped(out, c.destination.view())?;
+    out.extend("</Bucket><Format>CSV</Format>".bytes())?;
+    if (c.prefix.length > 0) { xmlTextElement(out, "Prefix", c.prefix.view())?; }
+    out.extend("</S3BucketDestination></Destination>".bytes())?;
+    out.extend("<Schedule><Frequency>".bytes())?;
+    out.extend(if (c.days == 1) "Daily".bytes() else "Weekly".bytes())?;
+    out.extend("</Frequency></Schedule><IncludedObjectVersions>".bytes())?;
+    out.extend(if (c.allVersions) "All".bytes() else "Current".bytes())?;
+    out.extend("</IncludedObjectVersions>".bytes())?;
+    if (c.fields != 0) {
+        out.extend("<OptionalFields>".bytes())?;
+        let names = ["Size", "LastModifiedDate", "ETag", "StorageClass", "IsMultipartUploaded"];
+        let bits = [
+            INVENTORY_SIZE,
+            INVENTORY_LAST_MODIFIED,
+            INVENTORY_ETAG,
+            INVENTORY_STORAGE_CLASS,
+            INVENTORY_MULTIPART,
+        ];
+        for (i in 0..5) {
+            if ((c.fields & bits[i]) != 0) { xmlTextElement(out, "Field", names[i].bytes())?; }
+        }
+        out.extend("</OptionalFields>".bytes())?;
+    }
+    out.extend("</InventoryConfiguration>".bytes())?;
+    return Ok();
+}
+
+async fn inventoryOf(app: borrow S3App, bucket: StringView) -> Result<Vector<InventoryConfig>, S3Fail> {
+    let stored = await storeBucketConfig(app, bucket, BUCKET_CONFIG_INVENTORY)?;
+    return match (decodeInventory(stored.view())) {
+        Ok(c) => Ok(c),
+        Err(_) => Err(S3Fail.Code(S3Code.InternalError)),
+    };
+}
+
+/// `?inventory` with an `id`: Get, Put or Delete one configuration; without one, a GET lists them.
+async fn serveInventory(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let configs = await inventoryOf(app, req.bucket.view())?;
+    let id = match (paramOf(req, "id")) {
+        Some(i) => copyBytes(i)?,
+        null => {
+            if (!isMethod(req.method, Method.Get)) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            var body = Vector<u8>.create();
+            xmlHead(mut body, "ListInventoryConfigurationsResult")?;
+            for (i in 0..configs.length) { inventoryXml(borrow configs[i], mut body)?; }
+            body.extend("<IsTruncated>false</IsTruncated></ListInventoryConfigurationsResult>".bytes())?;
+            return await sendXml(exchange, borrow body);
+        }
+    };
+    var at = configs.length;
+    for (i in 0..configs.length) {
+        if (configs[i].id.view() == id.view()) { at = i; }
+    }
+    if (isMethod(req.method, Method.Get)) {
+        if (at == configs.length) { return Err(S3Fail.Code(S3Code.NoSuchConfiguration)); }
+        var body = Vector<u8>.create();
+        body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n".bytes())?;
+        inventoryXml(borrow configs[at], mut body)?;
+        return await sendXml(exchange, borrow body);
+    }
+    var next = configs;
+    if (isMethod(req.method, Method.Delete)) {
+        if (at == next.length) { return Err(S3Fail.Code(S3Code.NoSuchConfiguration)); }
+        let _ = next.remove(at);
+    } else if (isMethod(req.method, Method.Put)) {
+        // A cluster's S3 port writes no reports yet (ADR-0074 §4).
+        if (app.cluster) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        let xml = await readSmallBody(auth, exchange, 65536)?;
+        verifySmallBody(req, xml.view(), true)?;
+        let c = parseInventory(xml.view())?;
+        if (c.id.view() != id.view()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        if (!(await bucketThere(app, c.destination.view()))) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        if (at == next.length) {
+            if (next.length >= MAX_INVENTORY_CONFIGS) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            next.push(c)?;
+        } else {
+            next[at] = c;
+        }
+    } else {
+        return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+    }
+    var stored = Vector<u8>.create();
+    encodeInventory(next.view(), mut stored)?;
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_INVENTORY, stored.view())?;
+    await exchange.send(if (isMethod(req.method, Method.Delete)) Status.noContent() else Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn bucketThere(app: borrow S3App, name: Slice<u8>) -> bool {
+    var guard = match (await lockStore(app)) {
+        Ok(g) => g,
+        Err(_) => { return false; }
+    };
+    let bucket = StringView.fromUtf8(name) ?? "";
+    return guard.data().bucketExists(bucket).ok() ?? false;
+}
+
+// --- gzip, with stored blocks ---
+
+/// The CRC-32 of gzip (IEEE 802.3, reflected, polynomial 0xEDB88320).
+fn crc32Ieee(data: Slice<u8>) -> u32 {
+    var table = [0u32; 256];
+    for (n in 0usize..256usize) {
+        var c = truncate<u32>(n);
+        for (k in 0..8) { c = if ((c & 1) != 0) 0xEDB88320 ^ (c >> 1) else c >> 1; }
+        table[n] = c;
+    }
+    var crc = 0xFFFFFFFFu32;
+    for (b in data) { crc = table[((crc ^ (b as u32)) & 0xFF) as usize] ^ (crc >> 8); }
+    return crc ^ 0xFFFFFFFF;
+}
+
+/// `data` as a gzip file (RFC 1952) of stored, uncompressed deflate blocks (RFC 1951 §3.2.4): every reader opens it;
+/// it is no smaller (lib/std has no deflate yet, CEESAFE_GAPS G35).
+fn gzipStored(data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.extend([0x1Fu8, 0x8B, 8, 0, 0, 0, 0, 0, 0, 0xFF][..])?;
+    var at: usize = 0;
+    while (true) {
+        let n = if (data.length - at > 65535) 65535 else data.length - at;
+        let last = at + n == data.length;
+        out.push(if (last) 1u8 else 0u8)?;
+        out.pushLE(truncate<u16>(n))?;
+        out.pushLE(truncate<u16>(n) ^ 0xFFFF)?;
+        out.extend(data[at..at + n])?;
+        at += n;
+        if (last) { break; }
+    }
+    out.pushLE(crc32Ieee(data))?;
+    out.pushLE(truncate<u32>(data.length))?;
+    return Ok();
+}
+
+// --- The report ---
+
+fn csvField(out: borrow mut Vector<u8>, value: Slice<u8>, first: bool) -> Result<void, AllocError> {
+    if (!first) { out.push(',')?; }
+    out.push('"')?;
+    for (b in value) {
+        if (b == '"') { out.push('"')?; }
+        out.push(b)?;
+    }
+    return out.push('"');
+}
+
+/// The CSV columns, as the manifest's `fileSchema` names them.
+fn inventorySchema(c: borrow InventoryConfig, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.extend("Bucket, Key".bytes())?;
+    if (c.allVersions) { out.extend(", VersionId, IsLatest, IsDeleteMarker".bytes())?; }
+    if ((c.fields & INVENTORY_SIZE) != 0) { out.extend(", Size".bytes())?; }
+    if ((c.fields & INVENTORY_LAST_MODIFIED) != 0) { out.extend(", LastModifiedDate".bytes())?; }
+    if ((c.fields & INVENTORY_ETAG) != 0) { out.extend(", ETag".bytes())?; }
+    if ((c.fields & INVENTORY_STORAGE_CLASS) != 0) { out.extend(", StorageClass".bytes())?; }
+    if ((c.fields & INVENTORY_MULTIPART) != 0) { out.extend(", IsMultipartUploaded".bytes())?; }
+    return Ok();
+}
+
+/// One version's row: the key URL-encoded, as S3's reports have it.
+fn inventoryRow(
+    out: borrow mut Vector<u8>,
+    bucket: Slice<u8>,
+    c: borrow InventoryConfig,
+    v: borrow ListedVersion,
+) -> Result<void, AllocError> {
+    csvField(out, bucket, true)?;
+    var key = Vector<u8>.create();
+    appendUriEncoded(mut key, v.key.view(), true)?;
+    csvField(out, key.view(), false)?;
+    if (c.allVersions) {
+        var id = Vector<u8>.create();
+        if (v.versionId[..] != [0u8; 16][..]) { appendVersionId(mut id, v.versionId)?; }
+        csvField(out, id.view(), false)?;
+        csvField(out, if (v.latest) "true".bytes() else "false".bytes(), false)?;
+        csvField(out, if (v.deleteMarker) "true".bytes() else "false".bytes(), false)?;
+    }
+    if ((c.fields & INVENTORY_SIZE) != 0) {
+        var n = Vector<u8>.create();
+        if (!v.deleteMarker) { appendDecimal(mut n, v.size)?; }
+        csvField(out, n.view(), false)?;
+    }
+    if ((c.fields & INVENTORY_LAST_MODIFIED) != 0) {
+        var t = Vector<u8>.create();
+        appendIso8601(mut t, v.mtimeMillis)?;
+        csvField(out, t.view(), false)?;
+    }
+    if ((c.fields & INVENTORY_ETAG) != 0) {
+        var e = Vector<u8>.create();
+        if (!v.deleteMarker) {
+            appendHexBytes(mut e, v.md5[..])?;
+            if (v.parts > 0) {
+                e.push('-')?;
+                appendDecimal(mut e, v.parts as u64)?;
+            }
+        }
+        csvField(out, e.view(), false)?;
+    }
+    if ((c.fields & INVENTORY_STORAGE_CLASS) != 0) { csvField(out, "STANDARD".bytes(), false)?; }
+    if ((c.fields & INVENTORY_MULTIPART) != 0) {
+        csvField(out, if (v.parts > 0) "true".bytes() else "false".bytes(), false)?;
+    }
+    return out.push('\n');
+}
+
+/// `<prefix>/<source>/<id>/`, the prefix left out when it is empty.
+fn inventoryBase(c: borrow InventoryConfig, source: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (c.prefix.length > 0) {
+        out.extend(c.prefix.view())?;
+        if (c.prefix[c.prefix.length - 1] != '/') { out.push('/')?; }
+    }
+    out.extend(source)?;
+    out.push('/')?;
+    out.extend(c.id.view())?;
+    out.push('/')?;
+    return Ok();
+}
+
+/// `YYYY-MM-DDTHH-MMZ`, a report's folder.
+fn appendReportTime(out: borrow mut Vector<u8>, millis: i64) -> Result<void, AllocError> {
+    let c = civilOf(millis / 1000);
+    appendDecimal(out, truncate<u64>(c.year))?;
+    out.push('-')?;
+    appendTwo(out, truncate<u64>(c.month))?;
+    out.push('-')?;
+    appendTwo(out, truncate<u64>(c.day))?;
+    out.push('T')?;
+    appendTwo(out, truncate<u64>(c.hour))?;
+    out.push('-')?;
+    appendTwo(out, truncate<u64>(c.minute))?;
+    out.push('Z')?;
+    return Ok();
+}
+
+/// When the newest report under `base` in `destination` was made (its folder's time), 0 for none.
+fn newestReport(store: borrow ObjectStore, destination: StringView, base: Slice<u8>) -> i64 {
+    let prefix = StringView.fromUtf8(base) ?? "";
+    var newest = Vector<u8>.create();
+    var marker = Vector<u8>.create();
+    while (true) {
+        let page = match (store.listObjects(destination, prefix, "/", marker.view(), marker.length > 0, 1000)) {
+            Ok(p) => p,
+            Err(_) => { break; }
+        };
+        for (i in 0..page.commonPrefixes.length) {
+            let p = page.commonPrefixes[i].view();
+            if (p.length > base.length && p[base.length] >= '0' && p[base.length] <= '9' && compareBytes(
+                p,
+                newest.view(),
+            ) > 0) {
+                newest.clear();
+                if (newest.extend(p).isErr()) { return 0; }
+            }
+        }
+        if (!page.truncated) { break; }
+        marker.clear();
+        if (marker.extend(page.nextMarker.view()).isErr()) { break; }
+    }
+    if (newest.length < base.length + 17) { return 0; }
+    let t = newest.view()[base.length..base.length + 17]; // YYYY-MM-DDTHH-MMZ
+    var iso = Vector<u8>.create();
+    if (iso.extend(t[0..13]).isErr() || iso.push(':').isErr() || iso.extend(t[14..16]).isErr() ||
+        iso.extend(":00Z".bytes()).isErr()) {
+        return 0;
+    }
+    return match (parseAmzDate(iso.view())) {
+        Some(ms) => ms,
+        null => 0,
+    };
+}
+
+/// Writes one configuration's report now: its data files, then its manifest and the manifest's checksum (ADR-0074 §3).
+/// Whether it was written.
+fn writeReport(
+    store: borrow mut ObjectStore,
+    source: Slice<u8>,
+    c: borrow InventoryConfig,
+    now: i64,
+) -> Result<bool, StoreError> {
+    let bucket = StringView.fromUtf8(source) ?? "";
+    let destination = StringView.fromUtf8(c.destination.view()) ?? "";
+    if (!store.bucketExists(destination)? || !store.bucketExists(bucket)?) { return Ok(false); }
+    var base = Vector<u8>.create();
+    inventoryBase(c, source, mut base)?;
+    var files = Vector<u8>.create(); // the manifest's `files`, as JSON
+    var csv = Vector<u8>.create();
+    var keyMarker = Vector<u8>.create();
+    var versionMarker: [u8; 16]? = null;
+    var count = 0usize;
+    let filter = StringView.fromUtf8(c.filter.view()) ?? "";
+    while (true) {
+        let page = store.listVersions(bucket, filter, "", keyMarker.view(), false, versionMarker, 1000)?;
+        for (i in 0..page.versions.length) {
+            let v = borrow page.versions[i];
+            if (!c.allVersions && (!v.latest || v.deleteMarker)) { continue; }
+            inventoryRow(mut csv, source, c, v)?;
+        }
+        let last = !page.truncated;
+        if (csv.length >= INVENTORY_FILE_BYTES || (last && (csv.length > 0 || count == 0))) {
+            var gz = Vector<u8>.create();
+            gzipStored(csv.view(), mut gz)?;
+            var key = copyBytes(base.view())?;
+            key.extend("data/".bytes())?;
+            var random = [0u8; 16];
+            let _ = Random.fill(mut random[..]);
+            appendHexBytes(mut key, random[..])?;
+            key.extend(".csv.gz".bytes())?;
+            let keyText = StringView.fromUtf8(key.view()) ?? "";
+            let _ = store.putObject(destination, keyText, "application/gzip", gz.view(), PutCondition.None)?;
+            if (count > 0) { files.push(',')?; }
+            files.extend("{\"key\":\"".bytes())?;
+            appendJsonText(mut files, key.view())?;
+            files.extend("\",\"size\":".bytes())?;
+            appendDecimal(mut files, gz.length as u64)?;
+            files.extend(",\"MD5checksum\":\"".bytes())?;
+            appendHexBytes(mut files, Md5.of(gz.view())[..])?;
+            files.extend("\"}".bytes())?;
+            count += 1;
+            csv.clear();
+        }
+        if (last) { break; }
+        keyMarker.clear();
+        keyMarker.extend(page.nextKey.view())?;
+        versionMarker = page.nextVersionId;
+    }
+    var manifest = Vector<u8>.create();
+    manifest.extend("{\"sourceBucket\":\"".bytes())?;
+    appendJsonText(mut manifest, source)?;
+    manifest.extend("\",\"destinationBucket\":\"arn:aws:s3:::".bytes())?;
+    appendJsonText(mut manifest, c.destination.view())?;
+    manifest.extend("\",\"version\":\"2016-11-30\",\"creationTimestamp\":\"".bytes())?;
+    appendDecimal(mut manifest, truncate<u64>(now))?;
+    manifest.extend("\",\"fileFormat\":\"CSV\",\"fileSchema\":\"".bytes())?;
+    inventorySchema(c, mut manifest)?;
+    manifest.extend("\",\"files\":[".bytes())?;
+    manifest.extend(files.view())?;
+    manifest.extend("]}".bytes())?;
+    var folder = copyBytes(base.view())?;
+    appendReportTime(mut folder, now)?;
+    folder.push('/')?;
+    var manifestKey = copyBytes(folder.view())?;
+    manifestKey.extend("manifest.json".bytes())?;
+    let manifestName = StringView.fromUtf8(manifestKey.view()) ?? "";
+    let _ = store.putObject(destination, manifestName, "application/json", manifest.view(), PutCondition.None)?;
+    var checksum = Vector<u8>.create();
+    appendHexBytes(mut checksum, Md5.of(manifest.view())[..])?;
+    var checksumKey = copyBytes(folder.view())?;
+    checksumKey.extend("manifest.checksum".bytes())?;
+    let checksumName = StringView.fromUtf8(checksumKey.view()) ?? "";
+    let _ = store.putObject(destination, checksumName, "text/plain", checksum.view(), PutCondition.None)?;
+    return Ok(true);
+}
+
+/// When each configuration's report was last written: read back from its destination the first time it is looked at,
+/// so that a restart neither repeats one nor skips one.
+struct InventoryRun {
+    source: Vector<u8>;
+    id: Vector<u8>;
+    lastMs: i64;
+}
+
+/// Every INVENTORY_CHECK_MS (or a tenth of a test's day): each enabled configuration whose report is a day (or a week)
+/// old, or that has none, gets one (ADR-0074 §3).
+async fn inventoryForever(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    w: borrow InventoryWriter,
+) -> Result<ServerReport, NetError> {
+    var runs = Vector<InventoryRun>.create();
+    let every =
+        if (w.dayMs / 10 < INVENTORY_CHECK_MS) (if (w.dayMs / 10 > 0) w.dayMs / 10 else 1) else INVENTORY_CHECK_MS;
+    while (true) {
+        await deliveryPause(every)?;
+        var buckets = BucketPolicies { names: Vector<Vector<u8>>.create(), documents: Vector<Vector<u8>>.create() };
+        {
+            var guard = match (await store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NetError.Closed); }
+            };
+            buckets = match (guard.data().inventoryBuckets()) {
+                Ok(b) => b,
+                Err(_) => { continue; }
+            };
+        }
+        for (b in 0..buckets.names.length) {
+            let configs = match (decodeInventory(buckets.documents[b].view())) {
+                Ok(c) => c,
+                Err(_) => { continue; }
+            };
+            for (k in 0..configs.length) {
+                let c = borrow configs[k];
+                if (!c.enabled) { continue; }
+                let source = buckets.names[b].view();
+                var at = runs.length;
+                for (r in 0..runs.length) {
+                    if (runs[r].source.view() == source && runs[r].id.view() == c.id.view()) { at = r; }
+                }
+                var guard = match (await store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NetError.Closed); }
+                };
+                let st = guard.data();
+                if (at == runs.length) {
+                    var base = Vector<u8>.create();
+                    if (inventoryBase(c, source, mut base).isErr()) { continue; }
+                    let destination = StringView.fromUtf8(c.destination.view()) ?? "";
+                    let baseView = base.view();
+                    let last = await Async.blocking(() => newestReport(st, destination, baseView));
+                    let made = runs.push(InventoryRun {
+                        source: copyBytes(source).ok() ?? Vector<u8>.create(),
+                        id: copyBytes(c.id.view()).ok() ?? Vector<u8>.create(),
+                        lastMs: last,
+                    });
+                    if (made.isErr()) { continue; }
+                }
+                let now = Clock.unixMillis();
+                let period = truncate<i64>(w.dayMs * (c.days as u64));
+                if (runs[at].lastMs > 0 && now - runs[at].lastMs < period) { continue; }
+                let written = await Async.blocking(() => writeReport(st, source, c, now));
+                match (written) {
+                    Ok(true) => { runs[at].lastMs = now; }
+                    _ => {
+                        let _ = await AsyncConsole.writeError("cosmostore: an inventory report could not be written\n");
+                        runs[at].lastMs = now; // tried: not again until its next period
+                    }
+                }
+            }
+        }
+    }
+    return Err(NetError.Closed);
+}

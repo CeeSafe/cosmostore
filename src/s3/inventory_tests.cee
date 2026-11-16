@@ -1,0 +1,94 @@
+// Inventory reports (ADR-0074): the configuration's XML, gzip's CRC-32 and stored blocks, a report's rows.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+@test
+fn inventoryConfigurationXml() -> Result<void, TestFailure> {
+    let xml =
+        "<InventoryConfiguration><Id>weekly</Id><IsEnabled>true</IsEnabled><Filter><Prefix>photos/</Prefix></Filter><Destination><S3BucketDestination><Bucket>arn:aws:s3:::reports</Bucket><Format>CSV</Format><Prefix>inv</Prefix></S3BucketDestination></Destination><Schedule><Frequency>Weekly</Frequency></Schedule><IncludedObjectVersions>All</IncludedObjectVersions><OptionalFields><Field>Size</Field><Field>ETag</Field></OptionalFields></InventoryConfiguration>";
+    let c = parseInventory(xml.bytes())!;
+    Check.equalBytes("reports".bytes(), c.destination.view())?;
+    Check.equalU64(7, c.days as u64)?;
+    Check.isTrue(c.allVersions && c.enabled, "all versions, enabled")?;
+    Check.equalU64((INVENTORY_SIZE | INVENTORY_ETAG) as u64, c.fields as u64)?;
+    var configs = Vector<InventoryConfig>.create();
+    configs.push(c)!;
+    var stored = Vector<u8>.create();
+    encodeInventory(configs.view(), mut stored)!;
+    let back = decodeInventory(stored.view())!;
+    var out = Vector<u8>.create();
+    inventoryXml(borrow back[0], mut out)!;
+    Check.isTrue(
+        findBytes(out.view(), "<Bucket>arn:aws:s3:::reports</Bucket>".bytes(), 0).isSome(),
+        "destination back",
+    )?;
+    Check.isTrue(findBytes(out.view(), "<Field>Size</Field><Field>ETag</Field>".bytes(), 0).isSome(), "fields back")?;
+    // Parquet, an unknown field and the destination's encryption are NotImplemented.
+    let parquet =
+        "<InventoryConfiguration><Id>x</Id><Destination><S3BucketDestination><Bucket>arn:aws:s3:::r</Bucket><Format>Parquet</Format></S3BucketDestination></Destination><Schedule><Frequency>Daily</Frequency></Schedule><IncludedObjectVersions>Current</IncludedObjectVersions></InventoryConfiguration>";
+    Check.isTrue(parseInventory(parquet.bytes()).isErr(), "parquet")?;
+    return Ok();
+}
+
+@test
+fn gzipOfStoredBlocks() -> Result<void, TestFailure> {
+    // The CRC-32 check value (RFC 1952's, of "123456789").
+    Check.equalU64(0xCBF43926, crc32Ieee("123456789".bytes()) as u64)?;
+    var gz = Vector<u8>.create();
+    gzipStored("hello".bytes(), mut gz)!;
+    Check.equalU64(10 + 5 + 5 + 8, gz.length as u64)?;
+    Check.equalU64(0x1F, gz[0] as u64)?;
+    Check.equalU64(0x8B, gz[1] as u64)?;
+    Check.equalU64(1, gz[10] as u64)?; // the final, stored block
+    Check.equalU64(5, gz.view().readLE<u16>(11) as u64)?;
+    Check.equalBytes("hello".bytes(), gz.view()[15..20])?;
+    Check.equalU64(5, gz.view().readLE<u32>(24) as u64)?;
+    // More than a block's worth: two blocks, the first not final.
+    var big = Vector<u8>.create();
+    big.resize(70000, 7)!;
+    var gz2 = Vector<u8>.create();
+    gzipStored(big.view(), mut gz2)!;
+    Check.equalU64(0, gz2[10] as u64)?;
+    Check.equalU64(10 + 5 + 65535 + 5 + (70000 - 65535) + 8, gz2.length as u64)?;
+    return Ok();
+}
+
+@test
+fn inventoryRows() -> Result<void, TestFailure> {
+    var c = InventoryConfig {
+        id: copyBytes("d".bytes())!,
+        enabled: true,
+        destination: copyBytes("r".bytes())!,
+        prefix: Vector<u8>.create(),
+        days: 1,
+        allVersions: false,
+        filter: Vector<u8>.create(),
+        fields: INVENTORY_SIZE | INVENTORY_ETAG | INVENTORY_MULTIPART,
+    };
+    let v = ListedVersion {
+        key: copyBytes("a b/c\"d".bytes())!,
+        versionId: [0u8; 16],
+        latest: true,
+        deleteMarker: false,
+        size: 42,
+        mtimeMillis: 0,
+        md5: [0xABu8; 16],
+        parts: 3,
+    };
+    var row = Vector<u8>.create();
+    inventoryRow(mut row, "src".bytes(), borrow c, borrow v)!;
+    Check.equalBytes(
+        "\"src\",\"a%20b/c%22d\",\"42\",\"abababababababababababababababab-3\",\"true\"\n".bytes(),
+        row.view(),
+    )?;
+    var schema = Vector<u8>.create();
+    inventorySchema(borrow c, mut schema)!;
+    Check.equalBytes("Bucket, Key, Size, ETag, IsMultipartUploaded".bytes(), schema.view())?;
+    var base = Vector<u8>.create();
+    c.prefix.extend("inv".bytes())!;
+    inventoryBase(borrow c, "src".bytes(), mut base)!;
+    Check.equalBytes("inv/src/d/".bytes(), base.view())?;
+    return Ok();
+}

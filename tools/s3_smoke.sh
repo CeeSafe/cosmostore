@@ -28,7 +28,7 @@ printf '# master keys\nk2 %s\nk1 %s\n' "$(head -c 32 /dev/urandom | base64)" "$(
 # SSE-KMS's keys (ADR-0055): the first is the default.
 printf 'app-default %s\norders %s\n' "$(head -c 32 /dev/urandom | base64)" "$(head -c 32 /dev/urandom | base64)" > "$work/kms.keys"
 start_server() {
-    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 --website-domain web.localhost 2>> "$work/server.log" &
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 --website-domain web.localhost --inventory-day-seconds 3 2>> "$work/server.log" &
     server=$!
     sleep 1
 }
@@ -853,6 +853,29 @@ check "it has the PUT's line" "$(cat logs.got/* | grep -c '^cosmostore smoke \[.
 check "and the missing key's, with its error" "$(cat logs.got/* | grep -c 'REST.GET.OBJECT not-here .* 404 NoSuchKey ')" 1
 aws s3api put-bucket-logging --bucket smoke --bucket-logging-status '{}' > /dev/null 2>&1
 check "logging off" "$(aws s3api get-bucket-logging --bucket smoke --output text 2>&1)" ""
+
+# Inventory reports (ADR-0074): a "day" of 3 seconds here; a report of the smoke bucket into smokelogs.
+check "inventory to a bucket that is not there" "$(code s3api put-bucket-inventory-configuration --bucket smoke --id daily --inventory-configuration '{"Id":"daily","IsEnabled":true,"Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::nobucket","Format":"CSV"}},"Schedule":{"Frequency":"Daily"},"IncludedObjectVersions":"Current"}')" InvalidArgument
+check "parquet is not done" "$(code s3api put-bucket-inventory-configuration --bucket smoke --id daily --inventory-configuration '{"Id":"daily","IsEnabled":true,"Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::smokelogs","Format":"Parquet"}},"Schedule":{"Frequency":"Daily"},"IncludedObjectVersions":"Current"}')" NotImplemented
+aws s3api put-bucket-inventory-configuration --bucket smoke --id daily --inventory-configuration '{"Id":"daily","IsEnabled":true,"Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::smokelogs","Format":"CSV","Prefix":"inv"}},"Schedule":{"Frequency":"Daily"},"IncludedObjectVersions":"Current","OptionalFields":["Size","ETag"]}' > /dev/null 2>&1 && pass "put-bucket-inventory-configuration" || fail "put-bucket-inventory-configuration"
+check "get-bucket-inventory-configuration" "$(aws s3api get-bucket-inventory-configuration --bucket smoke --id daily --query InventoryConfiguration.Destination.S3BucketDestination.Prefix --output text 2>&1)" inv
+check "list-bucket-inventory-configurations" "$(aws s3api list-bucket-inventory-configurations --bucket smoke --query 'length(InventoryConfigurationList)' --output text 2>&1)" 1
+for i in $(seq 1 60); do
+    m=$(aws s3api list-objects-v2 --bucket smokelogs --prefix inv/smoke/daily/ --query "Contents[?ends_with(Key, 'manifest.json')].Key | [0]" --output text 2>/dev/null)
+    [ -n "$m" ] && [ "$m" != "None" ] && break
+    sleep 0.25
+done
+check "a report is written" "$([ -n "$m" ] && [ "$m" != "None" ] && echo yes)" yes
+aws s3 cp "s3://smokelogs/$m" manifest.json > /dev/null 2>&1
+aws s3 cp "s3://smokelogs/${m%manifest.json}manifest.checksum" manifest.checksum > /dev/null 2>&1
+check "its manifest's checksum" "$(cat manifest.checksum)" "$(python3 -c 'import hashlib; print(hashlib.md5(open("manifest.json","rb").read()).hexdigest())')"
+data=$(python3 -c 'import json,sys; print(json.load(open("manifest.json"))["files"][0]["key"])')
+aws s3 cp "s3://smokelogs/$data" data.csv.gz > /dev/null 2>&1
+rows=$(python3 -c 'import gzip; print(len(gzip.open("data.csv.gz").read().decode().splitlines()))')
+check "its CSV, gzip, a row per object" "$rows" "$(aws s3api list-objects-v2 --bucket smoke --query 'length(Contents)' --output text)"
+check "rows name the bucket, the key, the size and the ETag" "$(python3 -c 'import gzip,csv; r=list(csv.reader(gzip.open("data.csv.gz","rt"))); print(len(r[0]), r[0][0])')" "4 smoke"
+aws s3api delete-bucket-inventory-configuration --bucket smoke --id daily > /dev/null 2>&1
+check "deleted" "$(code s3api get-bucket-inventory-configuration --bucket smoke --id daily)" NoSuchConfiguration
 
 # Static website hosting (ADR-0073): <bucket>.web.localhost is the bucket's website, anonymous, GET and HEAD.
 aws s3api create-bucket --bucket site > /dev/null 2>&1

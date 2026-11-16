@@ -510,6 +510,23 @@ read after the fact (a core dump, a later bug), not storage.
 **Suggested.** A `drop` on `HmacSha256` that zeroes `outerKey` and the inner `Sha256`'s state, as `Aes256Gcm`'s
 does; or a `wipe()` callers can use. No API change.
 
+### G35: no deflate or gzip in lib/std (P2)
+
+**Evidence.** lib/std (ceesafec 0.54.0) has CRC32C, MD5, SHA-256 and AES-GCM but no deflate (RFC 1951), gzip
+(RFC 1952) or the IEEE CRC-32 gzip uses. CeeSafe.Web's `web_ws` has a `Deflater` and an inflater, but for
+WebSocket's permessage-deflate (one fixed-Huffman block, the sync flush's tail removed), not a finished stream, and
+in a package CosmoStore's store has no business importing.
+
+**Why it matters.** S3 inventory reports are gzip-compressed CSV (`*.csv.gz`, ADR-0074), and the tools that read them
+expect gzip. CosmoStore writes valid gzip files of stored, uncompressed blocks (`gzipStored`, with its own CRC-32),
+which every reader opens but which are as large as the CSV. Gzip `Content-Encoding` for responses, compressed
+access logs and Parquet's codecs would want the same.
+
+**Repro.** Look for `Deflate`, `Gzip`, `Crc32` (IEEE) in lib/std's API: none.
+
+**Suggested.** `Deflate.compress(level)` / `Inflate` streams in lib/std (or `lib/compress`), with `Gzip` framing and
+`Crc32` beside `Crc32c`; `web_ws` could then use it too.
+
 ## Not gaps (checked)
 
 Things that worked well and are worth keeping:
