@@ -894,6 +894,36 @@ check "but does not list" "$(as_session "$pk" "$ps" "$pt" code s3api list-object
 check "a session policy with a principal" "$(code sts assume-role --role-arn arn:aws:iam::000000000000:role/reader --role-session-name bad --policy '{"Statement":{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}}')" MalformedPolicyDocument
 aws s3 rm --recursive s3://smoke/sts/ > /dev/null 2>&1
 
+# Access Points (ADR-0076): the S3 Control calls through the CLI, then requests by alias and by ARN.
+ctl() { AWS_ENDPOINT_URL="http://localhost:$port" aws s3control "$@" --account-id 000000000000; }
+apl() { AWS_ENDPOINT_URL="http://localhost:$port" aws "$@"; }
+apcode() { AWS_ENDPOINT_URL="http://localhost:$port" aws "$@" 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9]*\)).*/\1/p' | head -1; }
+printf 'through a door' > ap.txt
+alias=$(ctl create-access-point --name smoke-ap --bucket smoke --query Alias --output text 2>&1)
+check "create-access-point gives an alias" "${alias: -8}" "-s3alias"
+check "get-access-point" "$(ctl get-access-point --name smoke-ap --query '[Bucket,NetworkOrigin,PublicAccessBlockConfiguration.RestrictPublicBuckets]' --output text 2>&1)" "smoke	Internet	True"
+check "list-access-points" "$(ctl list-access-points --bucket smoke --query 'AccessPointList[0].Alias' --output text 2>&1)" "$alias"
+check "a name twice" "$(apcode s3control create-access-point --account-id 000000000000 --name smoke-ap --bucket smoke)" AccessPointAlreadyOwnedByYou
+check "a bucket that is not there" "$(apcode s3control create-access-point --account-id 000000000000 --name nowhere --bucket nobucket)" NoSuchBucket
+aws s3api put-object --bucket "$alias" --key ap/door.txt --body ap.txt > /dev/null 2>&1 && pass "a write by its alias" || fail "a write by its alias"
+check "lands in its bucket" "$(aws s3 cp s3://smoke/ap/door.txt - 2>&1)" "through a door"
+check "a read by its alias" "$(aws s3 cp "s3://$alias/ap/door.txt" - 2>&1)" "through a door"
+check "a listing by its alias" "$(aws s3api list-objects-v2 --bucket "$alias" --prefix ap/ --query 'Contents[0].Key' --output text 2>&1)" ap/door.txt
+check "a read by its ARN" "$(apl s3api get-object --bucket arn:aws:s3:us-east-1:000000000000:accesspoint/smoke-ap --key ap/door.txt ap.out > /dev/null 2>&1; cat ap.out)" "through a door"
+check "no bucket configuration through it" "$(code s3api get-bucket-policy --bucket "$alias")" InvalidRequest
+check "no anonymous reads through it" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/$alias/ap/door.txt")" 403
+ctl put-access-point-policy --name smoke-ap --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam:::user/'"$AWS_ACCESS_KEY_ID"'"},"Action":"s3:PutObject","Resource":"arn:aws:s3:us-east-1:000000000000:accesspoint/smoke-ap/object/*"}]}' > /dev/null 2>&1 && pass "put-access-point-policy" || fail "put-access-point-policy"
+check "get-access-point-policy" "$(ctl get-access-point-policy --name smoke-ap --query Policy --output text 2>&1 | grep -c '"Deny"')" 1
+check "its policy denies a write through it" "$(code s3api put-object --bucket "$alias" --key ap/no.txt --body ap.txt)" AccessDenied
+aws s3api put-object --bucket smoke --key ap/direct.txt --body ap.txt > /dev/null 2>&1 && pass "but not to the bucket itself" || fail "but not to the bucket itself"
+check "a public policy under its block" "$(apcode s3control put-access-point-policy --account-id 000000000000 --name smoke-ap --policy '{"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:us-east-1:000000000000:accesspoint/smoke-ap/object/*"}}')" AccessDenied
+ctl delete-access-point-policy --name smoke-ap > /dev/null 2>&1
+check "the policy deleted" "$(apcode s3control get-access-point-policy --account-id 000000000000 --name smoke-ap)" NoSuchAccessPointPolicy
+ctl delete-access-point --name smoke-ap > /dev/null 2>&1
+check "the access point deleted" "$(apcode s3control get-access-point --account-id 000000000000 --name smoke-ap)" NoSuchAccessPoint
+check "and its alias with it" "$(code s3api list-objects-v2 --bucket "$alias")" NoSuchBucket
+aws s3 rm --recursive s3://smoke/ap/ > /dev/null 2>&1
+
 # Inventory reports (ADR-0074): a "day" of 3 seconds here; a report of the smoke bucket into smokelogs.
 check "inventory to a bucket that is not there" "$(code s3api put-bucket-inventory-configuration --bucket smoke --id daily --inventory-configuration '{"Id":"daily","IsEnabled":true,"Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::nobucket","Format":"CSV"}},"Schedule":{"Frequency":"Daily"},"IncludedObjectVersions":"Current"}')" InvalidArgument
 check "parquet is not done" "$(code s3api put-bucket-inventory-configuration --bucket smoke --id daily --inventory-configuration '{"Id":"daily","IsEnabled":true,"Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::smokelogs","Format":"Parquet"}},"Schedule":{"Frequency":"Daily"},"IncludedObjectVersions":"Current"}')" NotImplemented

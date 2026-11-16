@@ -1,0 +1,383 @@
+// Access Points (ADR-0076): named ways into a bucket, each with its own policy and public-access block. The S3
+// Control calls (`/v20180820/accesspoint/...`) make and read them; a request names one by its alias as the bucket, or
+// by its ARN, which clients turn into the host `<name>-<account>.<domain>`.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+const S3_CONTROL_XMLNS: StringView = "http://awss3control.amazonaws.com/doc/2018-08-20/";
+const ACCESS_POINT_REGION: StringView = "us-east-1";
+/// Every setting on, as an access point is made without a `PublicAccessBlockConfiguration` (AWS's default).
+const ACCESS_POINT_BLOCK_ALL: u8 = 15;
+
+/// An access point a request names, and its bucket.
+struct AccessPointHit {
+    bucket: Vector<u8>;
+    point: AccessPoint;
+}
+
+fn accessPointNameOk(name: Slice<u8>) -> bool {
+    if (name.length < 3 || name.length > 50 || name[0] == '-' || name[name.length - 1] == '-') { return false; }
+    for (c in name) {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) { return false; }
+    }
+    return true;
+}
+
+/// Whether a bucket name could be an access point's: an alias (`…-s3alias`), or `<name>-<12 digits>` from its ARN's host.
+fn accountSuffixed(name: Slice<u8>) -> bool {
+    if (name.length < 3 + 13) { return false; }
+    let at = name.length - 13;
+    if (name[at] != '-') { return false; }
+    for (c in name[at + 1..]) {
+        if (c < '0' || c > '9') { return false; }
+    }
+    return true;
+}
+
+fn mayNameAccessPoint(name: Slice<u8>) -> bool {
+    let alias = "-s3alias".bytes();
+    return (name.length > alias.length && name[name.length - alias.length..] == alias) || accountSuffixed(name);
+}
+
+/// The access point `name` means, by its alias or as `<name>-<account>`; null for none.
+fn findAccessPoint(all: borrow BucketPolicies, name: Slice<u8>, byName: bool) -> Result<AccessPointHit?, AllocError> {
+    let suffixed = accountSuffixed(name);
+    for (b in 0..all.names.length) {
+        let points = match (decodeAccessPoints(all.documents[b].view())) {
+            Ok(p) => p,
+            Err(_) => { continue; }
+        };
+        for (i in 0..points.length) {
+            let p = borrow points[i];
+            let hit = if (byName) p.name.view() == name else p.alias.view() == name ||
+                (suffixed && p.name.view() == name[0..name.length - 13]);
+            if (hit) {
+                return Ok(Some(AccessPointHit {
+                    bucket: copyBytes(all.names[b].view())?,
+                    point: AccessPoint {
+                        name: copyBytes(p.name.view())?,
+                        alias: copyBytes(p.alias.view())?,
+                        block: p.block,
+                        createdMs: p.createdMs,
+                        policy: copyBytes(p.policy.view())?,
+                    },
+                }));
+            }
+        }
+    }
+    return Ok(null);
+}
+
+/// The access point a request's bucket names (ADR-0076 §2), if any access point is configured and it could be one.
+async fn resolveAccessPoint(app: borrow S3App, bucket: Slice<u8>) -> Result<AccessPointHit?, S3Fail> {
+    if (app.accessPointBuckets.load() == 0 || !mayNameAccessPoint(bucket)) { return Ok(null); }
+    var guard = await lockStore(app)?;
+    let all = match (guard.data().accessPointBuckets()) {
+        Ok(a) => a,
+        Err(e) => { return Err(storeFail(e, 0)); }
+    };
+    return Ok(findAccessPoint(borrow all, bucket, false)?);
+}
+
+/// The requester through `hit`: its policy and block.
+fn throughAccessPoint(
+    app: borrow S3App,
+    who: borrow mut Requester,
+    hit: borrow AccessPointHit,
+) -> Result<void, S3Fail> {
+    who.accessPoint = true;
+    who.accessPointBlock = hit.point.block;
+    if (hit.point.policy.length == 0) { return Ok(); }
+    who.accessPointPolicy = match (parseAccessPointPolicy(
+        hit.point.policy.view(),
+        hit.point.name.view(),
+        hit.bucket.view(),
+        app.credentials.get().view(),
+        false,
+    )) {
+        Ok(p) => Some(p),
+        Err(S3Fail.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
+        Err(_) => { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    };
+    return Ok();
+}
+
+/// What a request through an access point may do to its bucket itself (ADR-0076 §2): list it, head it, find it,
+/// list its uploads, delete objects in a batch; nothing that reads or changes the bucket's configuration.
+fn accessPointBucketCall(req: borrow S3Request) -> bool {
+    if (isMethod(req.method, Method.Head)) { return req.query.length == 0; }
+    if (isMethod(req.method, Method.Post)) { return req.hasParam("delete") && req.onlyParams("delete"); }
+    if (!isMethod(req.method, Method.Get)) { return false; }
+    return req.onlyParams(
+        "list-type,prefix,delimiter,max-keys,continuation-token,start-after,fetch-owner,encoding-type,marker,versions,key-marker,version-id-marker,uploads,upload-id-marker,max-uploads,location",
+    );
+}
+
+// ---- S3 Control ----
+
+fn accessPointArn(out: borrow mut Vector<u8>, account: Slice<u8>, name: Slice<u8>) -> Result<void, AllocError> {
+    out.extend("arn:aws:s3:".bytes())?;
+    out.extend(ACCESS_POINT_REGION.bytes())?;
+    out.push(':')?;
+    out.extend(account)?;
+    out.extend(":accesspoint/".bytes())?;
+    return out.extend(name);
+}
+
+fn controlHead(out: borrow mut Vector<u8>, element: StringView) -> Result<void, AllocError> {
+    out.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<".bytes())?;
+    out.extend(element.bytes())?;
+    out.extend(" xmlns=\"".bytes())?;
+    out.extend(S3_CONTROL_XMLNS.bytes())?;
+    return out.extend("\">".bytes());
+}
+
+fn accessPointAlias(name: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    var random = [0u8; 20];
+    if (Random.fill(mut random[..]).isErr()) { return Ok(false); }
+    let alphabet = "abcdefghijklmnopqrstuvwxyz234567".bytes();
+    let head = if (name.length > 30) name[0..30] else name;
+    out.extend(head)?;
+    if (head[head.length - 1] != '-') { out.push('-')?; }
+    for (b in random) { out.push(alphabet[(b & 31) as usize])?; }
+    out.extend("-s3alias".bytes())?;
+    return Ok(true);
+}
+
+fn accessPointXml(
+    out: borrow mut Vector<u8>,
+    account: Slice<u8>,
+    bucket: Slice<u8>,
+    p: borrow AccessPoint,
+    full: bool,
+) -> Result<void, AllocError> {
+    xmlTextElement(out, "Name", p.name.view())?;
+    out.extend("<NetworkOrigin>Internet</NetworkOrigin>".bytes())?;
+    xmlTextElement(out, "Bucket", bucket)?;
+    if (full) {
+        out.extend("<PublicAccessBlockConfiguration>".bytes())?;
+        let names = ["BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"];
+        for (i in 0..names.length) {
+            let on = (p.block & (1u8 << truncate<u8>(i))) != 0;
+            xmlTextElement(out, names[i], if (on) "true".bytes() else "false".bytes())?;
+        }
+        out.extend("</PublicAccessBlockConfiguration><CreationDate>".bytes())?;
+        appendIso8601(out, p.createdMs)?;
+        out.extend("</CreationDate>".bytes())?;
+    }
+    xmlTextElement(out, "Alias", p.alias.view())?;
+    var arn = Vector<u8>.create();
+    accessPointArn(mut arn, account, p.name.view())?;
+    xmlTextElement(out, "AccessPointArn", arn.view())?;
+    xmlTextElement(out, "BucketAccountId", account)?;
+    return Ok();
+}
+
+/// The bucket's access points with `name` changed by `change` (made, replaced or removed), stored under the store's
+/// lock, which the caller holds from the look-up on, so two calls cannot make one name twice.
+fn storeAccessPoints(
+    store: borrow mut ObjectStore,
+    bucket: Slice<u8>,
+    points: Slice<AccessPoint>,
+) -> Result<void, S3Fail> {
+    var stored = Vector<u8>.create();
+    encodeAccessPoints(points, mut stored)?;
+    let name = StringView.fromUtf8(bucket) ?? "";
+    return match (store.setBucketConfig(name, BUCKET_CONFIG_ACCESS_POINTS, stored.view())) {
+        Ok() => Ok(),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+fn pointsOf(store: borrow ObjectStore, bucket: Slice<u8>) -> Result<Vector<AccessPoint>, S3Fail> {
+    let name = StringView.fromUtf8(bucket) ?? "";
+    let stored = match (store.bucketConfig(name, BUCKET_CONFIG_ACCESS_POINTS)) {
+        Ok(s) => s,
+        Err(e) => { return Err(storeFail(e, 0)); }
+    };
+    return match (decodeAccessPoints(stored.view())) {
+        Ok(p) => Ok(p),
+        Err(_) => Err(S3Fail.Code(S3Code.InternalError)),
+    };
+}
+
+/// `/v20180820/accesspoint[/<name>[/policy]]` with `x-amz-account-id` (ADR-0076 §1). Long-term keys and their
+/// `GetSessionToken` sessions only; not on a cluster yet.
+async fn serveControl(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    who: borrow Requester,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    if (who.key.isNull() || who.role.isSome()) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    if (app.cluster) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    let account = trimBlank(headerOf(req, "x-amz-account-id") ?? "".bytes());
+    if (account.length != 12) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    for (c in account) {
+        if (c < '0' || c > '9') { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    }
+    let path = req.rawPath.view();
+    let base = "/v20180820/accesspoint".bytes();
+    if (!startsWithBytes(path, base)) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    let rest = path[base.length..];
+    let m = req.method;
+    // ListAccessPoints: every one, or a bucket's.
+    if (rest.length == 0) {
+        if (!isMethod(m, Method.Get)) { return Err(S3Fail.Code(S3Code.MethodNotAllowed)); }
+        let only = paramOf(req, "bucket");
+        var body = Vector<u8>.create();
+        controlHead(mut body, "ListAccessPointsResult")?;
+        body.extend("<AccessPointList>".bytes())?;
+        {
+            var guard = await lockStore(app)?;
+            let all = match (guard.data().accessPointBuckets()) {
+                Ok(a) => a,
+                Err(e) => { return Err(storeFail(e, 0)); }
+            };
+            for (b in 0..all.names.length) {
+                match (only) {
+                    Some(o) => {
+                        if (all.names[b].view() != o) { continue; }
+                    }
+                    null => {}
+                }
+                let points = match (decodeAccessPoints(all.documents[b].view())) {
+                    Ok(p) => p,
+                    Err(_) => { continue; }
+                };
+                for (i in 0..points.length) {
+                    body.extend("<AccessPoint>".bytes())?;
+                    accessPointXml(mut body, account, all.names[b].view(), borrow points[i], false)?;
+                    body.extend("</AccessPoint>".bytes())?;
+                }
+            }
+        }
+        body.extend("</AccessPointList></ListAccessPointsResult>".bytes())?;
+        return await sendXml(exchange, borrow body);
+    }
+    if (rest[0] != '/') { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    let tail = rest[1..];
+    let slash = pieceEnd(tail, 0, '/');
+    let name = tail[0..slash];
+    let policyCall = slash < tail.length;
+    if (policyCall && tail[slash..] != "/policy".bytes()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    if (!accessPointNameOk(name)) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    // CreateAccessPoint.
+    if (!policyCall && isMethod(m, Method.Put)) {
+        let xml = await readSmallBody(auth, exchange, 65536)?;
+        var bucket = Vector<u8>.create();
+        if (!rawElement(xml.view(), "Bucket", mut bucket)? || bucket.length == 0) {
+            return Err(S3Fail.Code(S3Code.MalformedXML));
+        }
+        if (findBytes(xml.view(), "<VpcConfiguration".bytes(), 0).isSome()) {
+            return Err(S3Fail.Code(S3Code.NotImplemented));
+        }
+        let block = if (findBytes(
+            xml.view(),
+            "<PublicAccessBlockConfiguration".bytes(),
+            0,
+        ).isSome()) parsePublicAccessBlock(xml.view())? else ACCESS_POINT_BLOCK_ALL;
+        var point = AccessPoint {
+            name: copyBytes(name)?,
+            alias: Vector<u8>.create(),
+            block: block,
+            createdMs: Clock.unixMillis(),
+            policy: Vector<u8>.create(),
+        };
+        if (!accessPointAlias(name, mut point.alias)?) { return Err(S3Fail.Code(S3Code.InternalError)); }
+        var body = Vector<u8>.create();
+        controlHead(mut body, "CreateAccessPointResult")?;
+        var arn = Vector<u8>.create();
+        accessPointArn(mut arn, account, name)?;
+        xmlTextElement(mut body, "AccessPointArn", arn.view())?;
+        xmlTextElement(mut body, "Alias", point.alias.view())?;
+        body.extend("</CreateAccessPointResult>".bytes())?;
+        {
+            var guard = await lockStore(app)?;
+            let store = guard.data();
+            let bucketName = StringView.fromUtf8(bucket.view()) ?? "";
+            if (!(store.bucketExists(bucketName).ok() ?? false)) { return Err(S3Fail.Code(S3Code.NoSuchBucket)); }
+            let all = match (store.accessPointBuckets()) {
+                Ok(a) => a,
+                Err(e) => { return Err(storeFail(e, 0)); }
+            };
+            if (findAccessPoint(borrow all, name, true)?.isSome()) {
+                return Err(S3Fail.Code(S3Code.AccessPointAlreadyOwnedByYou));
+            }
+            var points = pointsOf(store, bucket.view())?;
+            if (points.length >= MAX_ACCESS_POINTS) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            points.push(point)?;
+            let bucketView = bucket.view();
+            let pointsView = points.view();
+            await Async.blocking(() => storeAccessPoints(store, bucketView, pointsView))?;
+            app.accessPointBuckets.store(store.accessPointBucketCount());
+        }
+        return await sendXml(exchange, borrow body);
+    }
+    // The others name one that is there.
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    let all = match (store.accessPointBuckets()) {
+        Ok(a) => a,
+        Err(e) => { return Err(storeFail(e, 0)); }
+    };
+    let hit = match (findAccessPoint(borrow all, name, true)?) {
+        Some(h) => h,
+        null => { return Err(S3Fail.Code(S3Code.NoSuchAccessPoint)); }
+    };
+    if (!policyCall && isMethod(m, Method.Get)) {
+        var body = Vector<u8>.create();
+        controlHead(mut body, "GetAccessPointResult")?;
+        accessPointXml(mut body, account, hit.bucket.view(), borrow hit.point, true)?;
+        body.extend("</GetAccessPointResult>".bytes())?;
+        return await sendXml(exchange, borrow body);
+    }
+    if (policyCall && isMethod(m, Method.Get)) {
+        if (hit.point.policy.length == 0) { return Err(S3Fail.Code(S3Code.NoSuchAccessPointPolicy)); }
+        var body = Vector<u8>.create();
+        controlHead(mut body, "GetAccessPointPolicyResult")?;
+        xmlTextElement(mut body, "Policy", hit.point.policy.view())?;
+        body.extend("</GetAccessPointPolicyResult>".bytes())?;
+        return await sendXml(exchange, borrow body);
+    }
+    var points = pointsOf(store, hit.bucket.view())?;
+    var at = points.length;
+    for (i in 0..points.length) {
+        if (points[i].name.view() == name) { at = i; }
+    }
+    if (at == points.length) { return Err(S3Fail.Code(S3Code.NoSuchAccessPoint)); }
+    if (!policyCall && isMethod(m, Method.Delete)) {
+        let _ = points.remove(at);
+    } else if (policyCall && isMethod(m, Method.Delete)) {
+        points[at].policy.clear();
+    } else if (policyCall && isMethod(m, Method.Put)) {
+        let xml = await readSmallBody(auth, exchange, 65536)?;
+        var policy = Vector<u8>.create();
+        if (!rawElement(xml.view(), "Policy", mut policy)? || policy.length == 0) {
+            return Err(S3Fail.Code(S3Code.MalformedXML));
+        }
+        let parsed = parseAccessPointPolicy(
+            policy.view(),
+            name,
+            hit.bucket.view(),
+            app.credentials.get().view(),
+            true,
+        )?;
+        // BlockPublicPolicy refuses a public policy, as it does a bucket's (ADR-0044 §2).
+        if (publicAccessHas([hit.point.block][..], PUBLIC_ACCESS_BLOCK_POLICY) && policyIsPublic(borrow parsed)) {
+            return Err(S3Fail.Code(S3Code.AccessDenied));
+        }
+        points[at].policy = policy;
+    } else {
+        return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+    }
+    let bucketView = hit.bucket.view();
+    let pointsView = points.view();
+    await Async.blocking(() => storeAccessPoints(store, bucketView, pointsView))?;
+    app.accessPointBuckets.store(store.accessPointBucketCount());
+    await exchange.send(if (isMethod(m, Method.Delete)) Status.noContent() else Status.ok(), "".bytes())?;
+    return Ok();
+}

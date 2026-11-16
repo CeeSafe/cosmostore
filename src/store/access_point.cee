@@ -1,0 +1,64 @@
+// A bucket's access points (ADR-0076) as the store keeps them: each with its name, alias, public-access block and
+// policy. The S3 layer serves the S3 Control calls and resolves requests made through them (`src/s3/access_points.cee`).
+
+/// A bucket's access points, in the compact form below; empty for none.
+const BUCKET_CONFIG_ACCESS_POINTS: u8 = 15;
+const MAX_ACCESS_POINTS: usize = 1000;
+
+struct AccessPoint {
+    name: Vector<u8>;
+    /// `<name, up to 30>-<20 of a-z 2-7>-s3alias`: a bucket name that means this access point.
+    alias: Vector<u8>;
+    /// Its public-access block, in the bits of a bucket's (`PUBLIC_ACCESS_*`).
+    block: u8;
+    createdMs: i64;
+    /// Its policy (JSON), empty for none.
+    policy: Vector<u8>;
+}
+
+/// Access points v1: u8 version, u16 count, then per access point the name, the alias (each u16+bytes), u8 block,
+/// i64 creation time, u32 policy length and the policy.
+fn encodeAccessPoints(points: Slice<AccessPoint>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (points.length == 0) { return Ok(); }
+    out.push(1)?;
+    out.pushLE(truncate<u16>(points.length))?;
+    for (i in 0..points.length) {
+        let p = borrow points[i];
+        pushText16(out, p.name.view())?;
+        pushText16(out, p.alias.view())?;
+        out.push(p.block)?;
+        out.pushLE(p.createdMs)?;
+        out.pushLE(truncate<u32>(p.policy.length))?;
+        out.extend(p.policy.view())?;
+    }
+    return Ok();
+}
+
+fn decodeAccessPoints(b: Slice<u8>) -> Result<Vector<AccessPoint>, MetaFault> {
+    var out = Vector<AccessPoint>.create();
+    if (b.length == 0) { return Ok(out); }
+    if (b[0] != 1) { return Err(MetaFault.BadVersion); }
+    need(b, 1, 2)?;
+    let n = b.readLE<u16>(1) as usize;
+    if (n == 0 || n > MAX_ACCESS_POINTS) { return Err(MetaFault.TooLong); }
+    var at: usize = 3;
+    for (i in 0..n) {
+        let name = readText16(b, mut at)?;
+        let alias = readText16(b, mut at)?;
+        need(b, at, 13)?;
+        let block = b[at];
+        let createdMs = b.readLE<i64>(at + 1);
+        let length = b.readLE<u32>(at + 9) as usize;
+        at += 13;
+        need(b, at, length)?;
+        var policy = Vector<u8>.create();
+        policy.extend(b[at..at + length])?;
+        at += length;
+        if (name.length == 0 || alias.length == 0) { return Err(MetaFault.TooLong); }
+        out.push(AccessPoint { name: name, alias: alias, block: block, createdMs: createdMs, policy: policy })?;
+    }
+    if (at != b.length) { return Err(MetaFault.TooLong); }
+    return Ok(out);
+}
+
+fn isAccessPointsValue(value: Slice<u8>) -> bool => decodeAccessPoints(value).isOk();

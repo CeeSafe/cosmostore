@@ -2718,3 +2718,13 @@ Browser form uploads with a SigV4 POST policy.
   returns: 23 checks, refusals of writes, deletes, batch deletes, copies, other buckets, `ListBuckets`,
   `CreateBucket`, STS and the admin API from sessions; presigned URLs; session policies.
 
+### 16 Nov 2026: M7 item 5, Access Points (ADR-0076)
+
+- **Under the owner's standing go-ahead.** **ADR-0076** (proposed): S3 Control's Create/Get/List/DeleteAccessPoint
+  and Put/Get/DeleteAccessPointPolicy on the S3 port (a `BucketConfig` of kind 15, checkpoint format 22); requests by
+  alias or by ARN (`<name>-<account>.<domain>`) resolve to the bucket before anything reads them; the access point's
+  policy (its ARN's resources read as the bucket's) and public-access block are checked in `gateDecision` and ahead of
+  the keys' fast path; through one only objects, listings, uploads and batch deletes. Not on a cluster yet.
+- **Tests:** `accessPointsStoredAndFound`, `accessPointPolicies`; the S3 smoke drives `aws s3control` and reads,
+  writes and lists by alias and ARN, with the access point's Deny, its block and its deletion.
+

@@ -1,0 +1,91 @@
+// Access Points (ADR-0076): their stored form, the names that mean one, and their policies.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+fn testPoint(name: StringView, alias: StringView, policy: StringView) -> AccessPoint => AccessPoint {
+    name: copyBytes(name.bytes())!,
+    alias: copyBytes(alias.bytes())!,
+    block: ACCESS_POINT_BLOCK_ALL,
+    createdMs: 1700000000000,
+    policy: copyBytes(policy.bytes())!,
+};
+
+@test
+fn accessPointsStoredAndFound() -> Result<void, TestFailure> {
+    var points = Vector<AccessPoint>.create();
+    points.push(testPoint("reports", "reports-abcdefghijklmnopqrst-s3alias", ""))!;
+    points.push(testPoint("uploads", "uploads-bcdefghijklmnopqrstu-s3alias", "{\"x\":1}"))!;
+    var stored = Vector<u8>.create();
+    encodeAccessPoints(points.view(), mut stored)!;
+    let back = decodeAccessPoints(stored.view())!;
+    Check.equalU64(2, back.length as u64)?;
+    Check.equalBytes("uploads".bytes(), back[1].name.view())?;
+    Check.equalBytes("{\"x\":1}".bytes(), back[1].policy.view())?;
+    Check.equalU64(15, back[0].block as u64)?;
+    Check.isTrue(decodeAccessPoints(stored.view()[0..stored.length - 1]).isErr(), "cut short")?;
+    var all = BucketPolicies { names: Vector<Vector<u8>>.create(), documents: Vector<Vector<u8>>.create() };
+    all.names.push(copyBytes("photos".bytes())!)!;
+    all.documents.push(stored)!;
+    let byAlias = findAccessPoint(borrow all, "uploads-bcdefghijklmnopqrstu-s3alias".bytes(), false)!!;
+    Check.equalBytes("photos".bytes(), byAlias.bucket.view())?;
+    Check.equalBytes("uploads".bytes(), byAlias.point.name.view())?;
+    let byHost = findAccessPoint(borrow all, "reports-000000000000".bytes(), false)!!;
+    Check.equalBytes("reports".bytes(), byHost.point.name.view())?;
+    Check.isTrue(findAccessPoint(borrow all, "reports".bytes(), false)!.isNull(), "a bare name is a bucket")?;
+    Check.isTrue(findAccessPoint(borrow all, "reports".bytes(), true)!.isSome(), "by name")?;
+    Check.isTrue(findAccessPoint(borrow all, "other-000000000000".bytes(), false)!.isNull(), "no such one")?;
+    // What could be one, and names.
+    Check.isTrue(mayNameAccessPoint("x-abc-s3alias".bytes()), "an alias")?;
+    Check.isTrue(mayNameAccessPoint("ap1-123456789012".bytes()), "a host")?;
+    Check.isTrue(!mayNameAccessPoint("photos".bytes()), "a bucket")?;
+    Check.isTrue(!mayNameAccessPoint("123456789012".bytes()), "an account alone")?;
+    Check.isTrue(accessPointNameOk("ap-1".bytes()) && !accessPointNameOk("Ap1".bytes()) &&
+        !accessPointNameOk("-ap".bytes()) && !accessPointNameOk("ap".bytes()), "names")?;
+    var alias = Vector<u8>.create();
+    Check.isTrue(accessPointAlias("a-very-long-access-point-name-that-goes-on".bytes(), mut alias)!, "alias")?;
+    Check.isTrue(alias.length <= 63 && mayNameAccessPoint(alias.view()), "an alias's form")?;
+    return Ok();
+}
+
+@test
+fn accessPointPolicies() -> Result<void, TestFailure> {
+    let json =
+        "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:us-east-1:000000000000:accesspoint/pub/object/public/*\"},{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam:::user/KEY1\"},\"Action\":\"s3:ListBucket\",\"Resource\":\"arn:aws:s3:*:*:accesspoint/pub\"}]}";
+    let p = parseAccessPointPolicy(json.bytes(), "pub".bytes(), "photos".bytes(), policyKeys().view(), false)!;
+    let facts = plainFacts();
+    Check.equalBytes("allow".bytes(), decide(borrow p, "", "s3:GetObject", "photos/public/a", borrow facts).view())?;
+    Check.equalBytes("neither".bytes(), decide(borrow p, "", "s3:GetObject", "photos/private/a", borrow facts).view())?;
+    Check.equalBytes("deny".bytes(), decide(borrow p, "KEY1", "s3:ListBucket", "photos", borrow facts).view())?;
+    Check.isTrue(policyIsPublic(borrow p), "public")?;
+    // Another access point's ARN, a bucket's, or an ARN with no region and account are not its resources.
+    let other =
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"*\",\"Resource\":\"arn:aws:s3:us-east-1:000000000000:accesspoint/other/object/*\"}}";
+    Check.isTrue(
+        parseAccessPointPolicy(other.bytes(), "pub".bytes(), "photos".bytes(), policyKeys().view(), false).isErr(),
+        "another",
+    )?;
+    let bucket =
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"*\",\"Resource\":\"arn:aws:s3:::photos/*\"}}";
+    Check.isTrue(
+        parseAccessPointPolicy(bucket.bytes(), "pub".bytes(), "photos".bytes(), policyKeys().view(), false).isErr(),
+        "a bucket's",
+    )?;
+    var target = Vector<u8>.create();
+    target = accessPointResourcePattern(
+        "arn:aws:s3:eu-west-1:111122223333:accesspoint/pub/object/a/*".bytes(),
+        "pub".bytes(),
+        "photos".bytes(),
+    )!;
+    Check.equalBytes("photos/a/*".bytes(), target.view())?;
+    Check.isTrue(
+        accessPointResourcePattern("arn:aws:s3:x:accesspoint/pub".bytes(), "pub".bytes(), "photos".bytes()).isErr(),
+        "fields",
+    )?;
+    Check.isTrue(
+        accessPointResourcePattern("arn:aws:s3:r:a:accesspoint/pubx".bytes(), "pub".bytes(), "photos".bytes()).isErr(),
+        "a longer name",
+    )?;
+    return Ok();
+}

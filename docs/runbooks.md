@@ -239,6 +239,20 @@ S3 port (ADR-0075). `sts.keys` holds `<id> <base64 of 32 bytes>` lines (`printf 
   (36 hours at most).
 - **Errors:** `InvalidToken` (a token another key sealed, or changed), `ExpiredToken`. Not on a cluster yet.
 
+## Access points
+
+`aws s3control create-access-point --account-id 000000000000 --name analytics --bucket photos` (any 12-digit
+account id; with the endpoint as `http://<domain>:<port>`, since the CLI sends to `<account>.<domain>`) gives an
+alias; requests through it use the alias as the bucket, or the ARN `arn:aws:s3:us-east-1:<account>:accesspoint/analytics`
+(ADR-0076).
+
+- **Its policy** (`put-access-point-policy`) names resources as `arn:aws:s3:us-east-1:<account>:accesspoint/analytics`
+  and `.../object/<key pattern>`; a Deny there refuses requests through it, not to the bucket itself.
+- **Anonymous reads through it** need its policy and the bucket's to allow them, and its public-access block off
+  (`--public-access-block-configuration` at creation: it is all on otherwise, and cannot change later).
+- **Through it** only objects, listings, uploads and batch deletes; bucket configuration goes to the bucket. Not on a
+  cluster yet.
+
 ## Rate limits
 
 `--rate-limit-address <n>` and `--rate-limit-key <n>` set the most requests a second from one address and by one

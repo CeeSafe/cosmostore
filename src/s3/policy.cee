@@ -425,6 +425,7 @@ fn parseStatement<region a>(
     credentials: Slice<Credential>,
     checkKeys: bool,
     identity: bool,
+    accessPoint: Slice<u8>,
 ) -> Result<PolicyStatement, S3Fail> {
     var st = PolicyStatement {
         allow: false,
@@ -487,10 +488,13 @@ fn parseStatement<region a>(
             var raw = Vector<Vector<u8>>.create();
             policyStrings(r, mut raw)?;
             for (i in 0..raw.length) {
-                let pattern = if (identity) identityResourcePattern(raw[i].view())? else resourcePattern(
+                let pattern = if (identity) identityResourcePattern(
                     raw[i].view(),
+                )? else if (accessPoint.length > 0) accessPointResourcePattern(
+                    raw[i].view(),
+                    accessPoint,
                     bucket,
-                )?;
+                )? else resourcePattern(raw[i].view(), bucket)?;
                 st.resources.push(pattern)?;
             }
         } else {
@@ -521,12 +525,48 @@ fn parseBucketPolicy(
     bucket: Slice<u8>,
     credentials: Slice<Credential>,
     checkKeys: bool,
-) -> Result<BucketPolicy, S3Fail> => parsePolicyDocument(json, bucket, credentials, checkKeys, false);
+) -> Result<BucketPolicy, S3Fail> => parsePolicyDocument(json, bucket, credentials, checkKeys, false, "".bytes());
 
 /// An identity policy's JSON (ADR-0075 §2): a role's, or a session's; no `Principal`, resources in any bucket.
 fn parseIdentityPolicy(json: Slice<u8>) -> Result<BucketPolicy, S3Fail> {
     let none = Vector<Credential>.create();
-    return parsePolicyDocument(json, "".bytes(), none.view(), false, true);
+    return parsePolicyDocument(json, "".bytes(), none.view(), false, true, "".bytes());
+}
+
+/// An access point's policy (ADR-0076 §3): a bucket policy's grammar, its resources the access point's ARN
+/// (`arn:aws:s3:<region>:<account>:accesspoint/<name>`) and its objects' (`…/object/<key pattern>`), read as the
+/// bucket's and its objects'.
+fn parseAccessPointPolicy(
+    json: Slice<u8>,
+    name: Slice<u8>,
+    bucket: Slice<u8>,
+    credentials: Slice<Credential>,
+    checkKeys: bool,
+) -> Result<BucketPolicy, S3Fail> => parsePolicyDocument(json, bucket, credentials, checkKeys, false, name);
+
+/// An access point policy's resource as a bucket policy's: `<bucket>` or `<bucket>/<key pattern>`.
+fn accessPointResourcePattern(text: Slice<u8>, name: Slice<u8>, bucket: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
+    let arn = "arn:aws:s3:".bytes();
+    if (!startsWithBytes(text, arn)) { return Err(malformedPolicy()); }
+    // The region and the account: any, as CosmoStore has one of each.
+    var at = arn.length;
+    for (field in 0..2) {
+        let colon = pieceEnd(text, at, ':');
+        if (colon == text.length) { return Err(malformedPolicy()); }
+        at = colon + 1;
+    }
+    let rest = text[at..];
+    var ours = copyBytes("accesspoint/".bytes())?;
+    ours.extend(name)?;
+    if (!startsWithBytes(rest, ours.view())) { return Err(malformedPolicy()); }
+    let tail = rest[ours.length..];
+    var out = copyBytes(bucket)?;
+    if (tail.length == 0) { return Ok(out); }
+    let objects = "/object/".bytes();
+    if (!startsWithBytes(tail, objects)) { return Err(malformedPolicy()); }
+    out.push('/')?;
+    out.extend(tail[objects.length..])?;
+    return Ok(out);
 }
 
 /// A resource of an identity policy: `*`, or `arn:aws:s3:::` and a bucket or objects pattern, kept after the prefix.
@@ -544,6 +584,7 @@ fn parsePolicyDocument(
     credentials: Slice<Credential>,
     checkKeys: bool,
     identity: bool,
+    accessPoint: Slice<u8>,
 ) -> Result<BucketPolicy, S3Fail> {
     var policy = BucketPolicy { statements: Vector<PolicyStatement>.create(), denies: false };
     if (json.length == 0 || json.length > MAX_POLICY_BYTES) { return Err(malformedPolicy()); }
@@ -573,13 +614,13 @@ fn parsePolicyDocument(
             let _ = r.take('[');
             if (r.take(']')) { return Err(malformedPolicy()); }
             while (true) {
-                policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys, identity)?)?;
+                policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys, identity, accessPoint)?)?;
                 if (r.take(',')) { continue; }
                 if (r.take(']')) { break; }
                 return Err(malformedPolicy());
             }
         } else {
-            policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys, identity)?)?;
+            policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys, identity, accessPoint)?)?;
         }
         if (r.take(',')) { continue; }
         if (r.take('}')) { break; }
@@ -1042,11 +1083,24 @@ struct Requester {
     session: bool;
     role: usize?;
     sessionPolicy: BucketPolicy?;
+    /// A request through an access point (ADR-0076 §3): its policy, read as the bucket's, and its public-access block.
+    accessPoint: bool;
+    accessPointPolicy: BucketPolicy?;
+    accessPointBlock: u8;
 }
 
 /// A requester with a long-term key, or none.
 fn requesterOf(key: usize?, peer: SocketAddress?) -> Requester =>
-    Requester { key: key, peer: peer, session: false, role: null, sessionPolicy: null };
+    Requester {
+        key: key,
+        peer: peer,
+        session: false,
+        role: null,
+        sessionPolicy: null,
+        accessPoint: false,
+        accessPointPolicy: null,
+        accessPointBlock: 0,
+    };
 
 /// Whether a role session's policies let it do `action` on `resource` (`bucket`, `bucket/key`, or empty for the
 /// service): the role's policy and the session policy must each allow it, and neither deny it (ADR-0075 §3). A
@@ -1181,6 +1235,39 @@ fn gateDecision(
         }
         if (!sessionAllows(app, req, who, action, target.view())?) { return Ok(PolicyDecision.Deny); }
     }
+    // Through an access point (ADR-0076 §3): its policy's Deny refuses; an anonymous request needs its Allow, which
+    // a public policy under RestrictPublicBuckets does not give; then the bucket's say, as without one.
+    if (who.accessPoint) {
+        var allowed = false;
+        match (borrow who.accessPointPolicy) {
+            Some(p) => {
+                var target = copyBytes(bucket.bytes())?;
+                if (key.length > 0) {
+                    target.push('/')?;
+                    target.extend(key)?;
+                }
+                let facts = policyFacts(req, isListingAction(action), app.secure, who.peer)?;
+                let credentials = app.credentials.get().view();
+                let principal = match (who.key) {
+                    Some(i) => if (i < credentials.length) Some(credentials[i].accessKey.view()) else null,
+                    null => null,
+                };
+                match (decidePolicy(p, principal, action, target.view(), borrow facts)) {
+                    PolicyDecision.Deny => { return Ok(PolicyDecision.Deny); }
+                    PolicyDecision.Allow => {
+                        allowed = !anonymous || !publicAccessHas(
+                            [who.accessPointBlock][..],
+                            PUBLIC_ACCESS_RESTRICT_BUCKETS,
+                        ) ||
+                            !policyIsPublic(p);
+                    }
+                    PolicyDecision.Neither => {}
+                }
+            }
+            null => {}
+        }
+        if (anonymous && !allowed) { return Ok(PolicyDecision.Deny); }
+    }
     if (isPolicyAction(action)) { return Ok(if (anonymous) PolicyDecision.Deny else PolicyDecision.Allow); }
     match (borrow gate.policy) {
         PolicyGate.Open => { return Ok(PolicyDecision.Allow); }
@@ -1207,7 +1294,10 @@ fn gateDecision(
         }
     }
     // No statement applies: a key may, and an anonymous request may do what the bucket's ACL grants everyone.
-    if (!anonymous || aclGrants(gate.acl[ACL_ALL_USERS], bucketAclNeed(action))) { return Ok(PolicyDecision.Allow); }
+    let aclsIgnored = who.accessPoint && publicAccessHas([who.accessPointBlock][..], PUBLIC_ACCESS_IGNORE_ACLS);
+    if (!anonymous || (!aclsIgnored && aclGrants(gate.acl[ACL_ALL_USERS], bucketAclNeed(action)))) {
+        return Ok(PolicyDecision.Allow);
+    }
     return Ok(PolicyDecision.Neither);
 }
 
@@ -1247,7 +1337,8 @@ async fn authorizeVersion(
     key: Slice<u8>,
     versionId: [u8; 16]?,
 ) -> Result<void, S3Fail> {
-    if (who.key.isSome() && who.role.isNull() && (app.denyBuckets.load() == 0 || isPolicyAction(action))) {
+    if (who.key.isSome() && who.role.isNull() && !who.accessPoint &&
+        (app.denyBuckets.load() == 0 || isPolicyAction(action))) {
         return Ok();
     }
     let gate = await policyGate(app, who, bucket)?;
@@ -1257,7 +1348,8 @@ async fn authorizeVersion(
         PolicyDecision.Neither => {}
     }
     let need = objectAclNeed(action);
-    if (need != 0 && key.length > 0 && !gate.ignoreAcls) {
+    let aclsIgnored = who.accessPoint && publicAccessHas([who.accessPointBlock][..], PUBLIC_ACCESS_IGNORE_ACLS);
+    if (need != 0 && key.length > 0 && !gate.ignoreAcls && !aclsIgnored) {
         match (await storeObjectAcl(app, bucket, key, versionId)?) {
             Some(acl) => {
                 if (aclGrants(acl[ACL_ALL_USERS], need)) { return Ok(); }

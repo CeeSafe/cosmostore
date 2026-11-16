@@ -68,6 +68,8 @@ struct S3App {
     /// looks nothing up). Null on a cluster's S3 port.
     accessLog: AccessLog?;
     loggingBuckets: AtomicU64;
+    /// How many buckets have access points (ADR-0076): none, and no request is looked up as one.
+    accessPointBuckets: AtomicU64;
     /// Buckets with CORS rules (ADR-0049 §4): while 0, a request's `Origin` is not looked at.
     corsBuckets: AtomicU64;
     /// Buckets with a default encryption (ADR-0046 §5): while 0, a write without encryption fields reads none, and
@@ -332,7 +334,16 @@ async fn serveS3(
     // The address's rate limit first (ADR-0053): before anything is parsed or a signature is checked.
     let second = truncate<u64>(Clock.unixMillis() / 1000);
     if (!app.rates.admitAddress(peer, second)) { return Err(slowDown(exchange)); }
-    let req = S3Request.of(request, app.domain.view())?;
+    var req = S3Request.of(request, app.domain.view())?;
+    // An access point's alias, or `<name>-<account>` from its ARN's host, is its bucket (ADR-0076 §2).
+    let through = await resolveAccessPoint(app, req.bucket.bytes())?;
+    match (borrow through) {
+        Some(h) => {
+            req.bucket = String.create();
+            appendUtf8(mut req.bucket, h.bucket.view())?;
+        }
+        null => {}
+    }
     kind = latencyClass(borrow req);
     // What the bucket's access log line needs (ADR-0072), while some bucket logs.
     let logging = app.loggingBuckets.load() > 0 && req.bucket.length > 0;
@@ -396,10 +407,24 @@ async fn serveS3(
         null => {}
     }
     // A session's request is its key's, narrowed by its role (ADR-0075 §3).
-    let who = match (borrow auth.session) {
+    var who = match (borrow auth.session) {
         Some(s) => sessionRequester(app, auth.key, peer, s)?,
         null => requesterOf(auth.key, peer),
     };
+    match (borrow through) {
+        Some(h) => {
+            throughAccessPoint(app, mut who, h)?;
+            if (req.key.length == 0 && !accessPointBucketCall(borrow req)) {
+                return Err(S3Fail.Code(S3Code.InvalidRequest));
+            }
+        }
+        null => {}
+    }
+    // S3 Control's access point calls (ADR-0076 §1).
+    if (through.isNull() && startsWithBytes(req.rawPath.view(), "/v20180820/".bytes()) &&
+        headerOf(borrow req, "x-amz-account-id").isSome()) {
+        return await serveControl(app, borrow req, auth, borrow who, exchange);
+    }
     // Who the request is, for its line in the audit log (ADR-0051) and the bucket's access log (ADR-0072).
     if (logging && auth.key.isSome()) {
         facts.access.authType = if (headerOf(
