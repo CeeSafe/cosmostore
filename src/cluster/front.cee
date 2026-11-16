@@ -117,12 +117,23 @@ fn shardOfBucket(file: borrow ClusterFile, bucket: Slice<u8>) -> u32 {
     return truncate<u32>(d[..].readBE<u64>(0) % (file.shards as u64));
 }
 
-/// What a shard's S3 server needs that the node gives it: its store, the node's credentials.
+/// STS's keys and the roles file's text, read once by the node (ADR-0078 §2).
+struct StsSetup {
+    keys: Vector<MasterKey>;
+    rolesText: Vector<u8>;
+}
+
+/// What a shard's S3 server needs that the node gives it: its store, the node's credentials, STS's keys and roles.
 fn clusterS3App(
     store: Arc<AsyncMutex<ObjectStore>>,
     writers: WriterFactory,
     credentials: Arc<CredentialSets>,
+    sts: borrow StsSetup,
 ) -> Result<S3App, AllocError> {
+    let roles = match (parseRolesFile(sts.rolesText.view())) {
+        Ok(r) => r,
+        Err(_) => Vector<StsRole>.create(), // checked when the node started
+    };
     var barriers = Vector<AsyncMutex<u8>>.create();
     for (i in 0..BARRIERS) { barriers.push(AsyncMutex<u8>.create(0)?)?; }
     return Ok(S3App {
@@ -148,8 +159,8 @@ fn clusterS3App(
         secure: false,
         notifyTargets: Vector<NotifyTarget>.create(),
         sseKeys: Vector<MasterKey>.create(),
-        stsKeys: Vector<MasterKey>.create(),
-        roles: Vector<StsRole>.create(),
+        stsKeys: copyKeys(sts.keys.view())?,
+        roles: roles,
         kmsKeys: Vector<MasterKey>.create(),
         corsBuckets: AtomicU64.create(1),
         encryptedBuckets: AtomicU64.create(1),
@@ -1021,10 +1032,18 @@ impl Handler<FrontApp> for FrontHandler {
                 return await relay(exchange, frontError("NotImplemented", 501), false);
             }
         }
+        // STS (ADR-0078 §2): a POST to the service, answered by any shard's S3 server (shard 0's), since a session
+        // token is sealed, not stored.
+        let method = Methods.parse(raw.method.view());
         let answered = if (bucket.length == 0) {
-            if (Methods.parse(raw.method.view()) == Method.Get) await listAllBuckets(shared, borrow raw) else Ok(
-                frontError("NotImplemented", 501),
-            )
+            if (method == Method.Get) await listAllBuckets(
+                shared,
+                borrow raw,
+            ) else if (method == Method.Post) await routeRequest(
+                shared,
+                0,
+                borrow raw,
+            ) else Ok(frontError("NotImplemented", 501))
         } else await routeRequest(shared, shardOfBucket(borrow shared.file, bucket), borrow raw);
         let answer = match (answered) {
             Ok(a) => a,

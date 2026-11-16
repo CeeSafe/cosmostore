@@ -44,9 +44,14 @@ node 2 peer=127.0.0.1:$((BASE + 2)) domain=b
 node 3 peer=127.0.0.1:$((BASE + 3)) domain=c
 EOF
 
+# STS (ADR-0078 §2): the same token keys and roles on every node.
+printf 'sts1 %s\n' "$(head -c 32 /dev/urandom | base64)" > sts.keys
+cat > roles <<'ROLES'
+reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::alpha","arn:aws:s3:::alpha/*"]}]}
+ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -155,6 +160,16 @@ for i in $(seq 1 50); do
     pause 0.2
 done
 check "node $leader back: it serves the write made while it was down" "$got" "16"
+
+# STS on a cluster (ADR-0078 §2): a session made through one node signs through the others, and a role narrows it.
+read -r sk ss st <<< "$(on 1 sts get-session-token --duration-seconds 900 --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
+check "get-session-token through node 1" "${sk:0:4}" ASIA
+check "its session writes through node 2" "$(AWS_ACCESS_KEY_ID="$sk" AWS_SECRET_ACCESS_KEY="$ss" AWS_SESSION_TOKEN="$st" on 2 s3api put-object --bucket beta --key by-session --body one.txt --query ETag --output text 2>&1 | wc -c | tr -d ' ')" 35
+read -r rk rs rt <<< "$(on 3 sts assume-role --role-arn arn:aws:iam::000000000000:role/reader --role-session-name smoke --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
+check "assume-role through node 3" "${rk:0:4}" ASIA
+check "the role reads through node 1" "$(AWS_ACCESS_KEY_ID="$rk" AWS_SECRET_ACCESS_KEY="$rs" AWS_SESSION_TOKEN="$rt" on 1 s3api head-object --bucket alpha --key k/three --query ContentLength --output text 2>&1)" 16
+check "but does not write through node 2" "$(AWS_ACCESS_KEY_ID="$rk" AWS_SECRET_ACCESS_KEY="$rs" AWS_SESSION_TOKEN="$rt" code 2 s3api put-object --bucket alpha --key no --body one.txt)" AccessDenied
+check "nor read beta" "$(AWS_ACCESS_KEY_ID="$rk" AWS_SECRET_ACCESS_KEY="$rs" AWS_SESSION_TOKEN="$rt" code 1 s3api head-object --bucket beta --key by-session)" 403
 
 echo "cluster s3 smoke: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]

@@ -237,7 +237,9 @@ S3 port (ADR-0075). `sts.keys` holds `<id> <base64 of 32 bytes>` lines (`printf 
   once) or its role leaves the roles file (at the next start).
 - **Rotating the token key:** put the new key first and keep the old one until the longest session has expired
   (36 hours at most).
-- **Errors:** `InvalidToken` (a token another key sealed, or changed), `ExpiredToken`. Not on a cluster yet.
+- **Errors:** `InvalidToken` (a token another key sealed, or changed), `ExpiredToken`.
+- **On a cluster:** give every `cosmostore node` the same `--sts-key-file` and `--roles-file` (ADR-0078 §2); a token
+  made through one node works through all of them.
 
 ## Access points
 

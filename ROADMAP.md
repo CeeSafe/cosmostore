@@ -2759,3 +2759,12 @@ Browser form uploads with a SigV4 POST policy.
 - The owner: "Yes, accept ADR-0071 to 0077". M7 (access logs, website hosting, inventory, STS, Access Points,
   replication here and to other endpoints) is accepted as built; its cluster support is later work.
 
+### 16 Nov 2026: M7 on a cluster, slice a: STS (ADR-0078)
+
+- **On the owner's "continue".** **ADR-0078** (proposed) plans M7's features on a cluster's S3 port in four slices:
+  STS; website hosting; the outbox delivered by each shard's leader (notifications, access logs, inventory,
+  replication); Access Points (names unique across shards through group 0).
+- **Slice a, STS:** `cosmostore node --sts-key-file --roles-file` (the same files on every node); every shard's S3
+  server holds the keys and roles; the front routes STS's POST to shard 0's leader. The cluster smoke (39 checks)
+  mints a session through one node, uses it through another, and narrows a role on every node.
+
