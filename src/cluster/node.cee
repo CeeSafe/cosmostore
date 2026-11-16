@@ -58,6 +58,8 @@ struct NodeShared {
     /// Write request ids (ADR-0068 §1): the node's id and a random number picked at start, then a count.
     requestPrefix: u64;
     requests: AtomicU64;
+    /// `--website-domain` (ADR-0078 §3): a request to `<bucket>.<domain>` is that bucket's website.
+    websiteDomain: Vector<u8>;
     /// Scrub (ADR-0063): how often a pass starts, and what passes found: versions checked, damage found, records
     /// repaired from a replica, extents fetched (a damaged one removed comes back this way, as a missing one does).
     scrubEveryMs: u64;
@@ -131,7 +133,7 @@ fn openNode(
     secret: Vector<u8>,
     id: u32,
     credentials: Arc<CredentialSets>?,
-    sts: borrow StsSetup,
+    sts: borrow NodeS3Setup,
     scrubEveryMs: u64,
     codeAfterMs: u64,
     clockSkewMs: i64,
@@ -275,6 +277,10 @@ fn openNode(
         readIds: AtomicU64.create(0),
         clockSkewMs: clockSkewMs,
         requestPrefix: requestPrefixOf(id),
+        websiteDomain: match (copyBytes(sts.websiteDomain.view())) {
+            Ok(d) => d,
+            Err(_) => { return Err(textOf("out of memory")); }
+        },
         requests: AtomicU64.create(0),
         scrubEveryMs: scrubEveryMs,
         codeAfterMs: codeAfterMs,
@@ -1061,7 +1067,19 @@ fn nodeCommand() -> i32 {
     let scrubMs = (args.scrubSeconds ?? 3600) * 1000;
     let codeMs = (args.codeAfterSeconds ?? 86400) * 1000;
     // STS (ADR-0078 §2): read and checked before any shard opens; each shard's S3 server takes its own copy.
-    var sts = StsSetup { keys: Vector<MasterKey>.create(), rolesText: Vector<u8>.create() };
+    var sts = NodeS3Setup {
+        keys: Vector<MasterKey>.create(),
+        rolesText: Vector<u8>.create(),
+        websiteDomain: Vector<u8>.create(),
+    };
+    match (borrow args.websiteDomain) {
+        Some(d) => {
+            for (c in d.view().bytes()) {
+                if (sts.websiteDomain.push(if (c >= 'A' && c <= 'Z') c + 32 else c).isErr()) { return 1; }
+            }
+        }
+        null => {}
+    }
     match (borrow args.stsKeys) {
         Some(path) => {
             sts.keys = match (readSseKeys(path.view())) {
@@ -1186,6 +1204,8 @@ struct ClusterArguments {
     /// STS on the node's S3 port (ADR-0078 §2): the token keys and the roles, the same files on every node.
     stsKeys: String?;
     roles: String?;
+    /// Website hosting on the node's S3 port (ADR-0078 §3).
+    websiteDomain: String?;
     /// How an empty directory starts (ADR-0066): the cluster's formation, or joining it.
     init: bool;
     join: bool;
@@ -1203,6 +1223,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var segmentMb: u64? = null;
     var stsKeys: String? = null;
     var roles: String? = null;
+    var websiteDomain: String? = null;
     var init = false;
     var join = false;
     var at = from;
@@ -1243,6 +1264,8 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             stsKeys = Some(textOf(value));
         } else if (option == "--roles-file") {
             roles = Some(textOf(value));
+        } else if (option == "--website-domain") {
+            websiteDomain = Some(textOf(value));
         } else if (option == "--scrub-seconds") {
             scrubSeconds = value.parseInt<u64>();
             if (scrubSeconds.isNull() || (scrubSeconds ?? 0) == 0) { return null; }
@@ -1265,6 +1288,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 segmentMb: segmentMb,
                 stsKeys: stsKeys,
                 roles: roles,
+                websiteDomain: websiteDomain,
                 init: init,
                 join: join,
             }),

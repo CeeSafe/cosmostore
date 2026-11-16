@@ -51,7 +51,7 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -170,6 +170,19 @@ check "assume-role through node 3" "${rk:0:4}" ASIA
 check "the role reads through node 1" "$(AWS_ACCESS_KEY_ID="$rk" AWS_SECRET_ACCESS_KEY="$rs" AWS_SESSION_TOKEN="$rt" on 1 s3api head-object --bucket alpha --key k/three --query ContentLength --output text 2>&1)" 16
 check "but does not write through node 2" "$(AWS_ACCESS_KEY_ID="$rk" AWS_SECRET_ACCESS_KEY="$rs" AWS_SESSION_TOKEN="$rt" code 2 s3api put-object --bucket alpha --key no --body one.txt)" AccessDenied
 check "nor read beta" "$(AWS_ACCESS_KEY_ID="$rk" AWS_SECRET_ACCESS_KEY="$rs" AWS_SESSION_TOKEN="$rt" code 1 s3api head-object --bucket beta --key by-session)" 403
+
+# A bucket's website on a cluster (ADR-0078 §3): configured through one node, served by every one.
+on 1 s3api create-bucket --bucket site > /dev/null 2>&1
+printf 'home' > home.html; printf 'oops' > oops.html
+on 1 s3 cp home.html s3://site/index.html > /dev/null 2>&1
+on 2 s3 cp oops.html s3://site/error.html > /dev/null 2>&1
+on 3 s3api put-bucket-policy --bucket site --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::site/*"}]}' > /dev/null 2>&1
+on 2 s3api put-bucket-website --bucket site --website-configuration '{"IndexDocument":{"Suffix":"index.html"},"ErrorDocument":{"Key":"error.html"}}' > /dev/null 2>&1 && pass "put-bucket-website through node 2" || fail "put-bucket-website through node 2"
+for n in 1 2 3; do
+    port=$((BASE + 10 + n))
+    check "the site through node $n" "$(curl -s -w ' %{http_code}' -H "Host: site.web.localhost:$port" "http://127.0.0.1:$port/")" "home 200"
+done
+check "its error document" "$(curl -s -w ' %{http_code}' -H "Host: site.web.localhost:$((BASE + 13))" "http://127.0.0.1:$((BASE + 13))/nothing")" "oops 404"
 
 echo "cluster s3 smoke: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]

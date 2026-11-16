@@ -2767,4 +2767,7 @@ Browser form uploads with a SigV4 POST policy.
 - **Slice a, STS:** `cosmostore node --sts-key-file --roles-file` (the same files on every node); every shard's S3
   server holds the keys and roles; the front routes STS's POST to shard 0's leader. The cluster smoke (39 checks)
   mints a session through one node, uses it through another, and narrows a role on every node.
+- **Slice b, website hosting:** `cosmostore node --website-domain`; the front routes `<bucket>.<domain>` requests by
+  their host to the bucket's shard, whose S3 server serves the website; PutBucketWebsite allowed on a cluster. The
+  cluster smoke (44 checks) serves a site through every node.
 

@@ -117,10 +117,12 @@ fn shardOfBucket(file: borrow ClusterFile, bucket: Slice<u8>) -> u32 {
     return truncate<u32>(d[..].readBE<u64>(0) % (file.shards as u64));
 }
 
-/// STS's keys and the roles file's text, read once by the node (ADR-0078 §2).
-struct StsSetup {
+/// What the node reads once for its shards' S3 servers: STS's keys and the roles file's text (ADR-0078 §2), the
+/// website domain (§3).
+struct NodeS3Setup {
     keys: Vector<MasterKey>;
     rolesText: Vector<u8>;
+    websiteDomain: Vector<u8>;
 }
 
 /// What a shard's S3 server needs that the node gives it: its store, the node's credentials, STS's keys and roles.
@@ -128,7 +130,7 @@ fn clusterS3App(
     store: Arc<AsyncMutex<ObjectStore>>,
     writers: WriterFactory,
     credentials: Arc<CredentialSets>,
-    sts: borrow StsSetup,
+    sts: borrow NodeS3Setup,
 ) -> Result<S3App, AllocError> {
     let roles = match (parseRolesFile(sts.rolesText.view())) {
         Ok(r) => r,
@@ -141,7 +143,7 @@ fn clusterS3App(
         credentials: credentials,
         requests: AtomicU64.create(0),
         domain: Vector<u8>.create(),
-        websiteDomain: Vector<u8>.create(),
+        websiteDomain: copyBytes(sts.websiteDomain.view())?,
         commitTurn: AsyncMutex<u8>.create(0)?,
         published: AtomicU64.create(0),
         syncing: AtomicBool.create(false),
@@ -1019,7 +1021,18 @@ impl Handler<FrontApp> for FrontHandler {
             }
             if (raw.body.extend(buf.view()[0..n]).isErr()) { return Err(HandlerError.Internal); }
         }
-        let bucket = bucketOfTarget(raw.target.view());
+        // A website request (ADR-0078 §3) names its bucket by its host, `<bucket>.<website domain>`.
+        var site = Vector<u8>.create();
+        for (i in 0..raw.names.length) {
+            if (!Ascii.equalsIgnoringCase(raw.names[i].view(), "host")) { continue; }
+            match (websiteBucketOf(raw.values[i].view(), shared.websiteDomain.view())) {
+                Some(b) => {
+                    if (site.extend(b).isErr()) { return Err(HandlerError.Internal); }
+                }
+                null => {}
+            }
+        }
+        let bucket = if (site.length > 0) site.view() else bucketOfTarget(raw.target.view());
         let head = Methods.parse(raw.method.view()) == Method.Head;
         // A copy reads its source from its own shard's store: a source in another shard's bucket is not there.
         for (i in 0..raw.names.length) {

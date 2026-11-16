@@ -209,7 +209,9 @@ way).
   `/folder` redirected to `/folder/`, the error document with a 404 or 403, routing rules, an object's
   `x-amz-website-redirect-location`, or `RedirectAllRequestsTo`.
 - **A custom domain** must take the `<bucket>.<website domain>` form, or go through a proxy that sets that `Host`.
-- **HTTPS** is whatever `serve` listens with; not on a cluster yet (`NotImplemented`).
+- **HTTPS** is whatever `serve` listens with.
+- **On a cluster:** give every `cosmostore node` the same `--website-domain` (ADR-0078 §3), and point the wildcard
+  name at all of them.
 
 ## Inventory reports
 

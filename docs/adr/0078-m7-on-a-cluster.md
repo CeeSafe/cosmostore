@@ -1,6 +1,6 @@
 # ADR-0078: M7 on a cluster
 
-**Status:** proposed, 16 Nov 2026, after M7 (ADR-0071 to ADR-0077, accepted), on the owner's "continue". §2 is built.
+**Status:** proposed, 16 Nov 2026, after M7 (ADR-0071 to ADR-0077, accepted), on the owner's "continue". §2 and §3 are built.
 
 ## Context
 
@@ -27,9 +27,16 @@
    A POST to the service is STS's: the front routes it to shard 0's leader, any shard's server being able to answer,
    since a session token is sealed, not stored (ADR-0075 §4). A token made through one node signs requests through
    any other, and a role session is narrowed on every shard as on `serve` (the check is in the shared S3 layer).
-3. **Until its slice**, a feature keeps refusing on a cluster as it does now.
+3. **Website hosting on a cluster (slice b, built).** `cosmostore node --website-domain <domain>`: the front takes a
+   request whose `Host` is `<bucket>.<domain>` as that bucket's, routes it to the bucket's shard as any request (a
+   GET or HEAD, so a ReadIndex read on its leader, ADR-0060 §6), and the shard's S3 server, which has the domain too,
+   serves it as a website (ADR-0073). `PutBucketWebsite` is no longer refused on a cluster: its configuration is a
+   record of the shard's log already.
+4. **Until its slice**, a feature keeps refusing on a cluster as it does now.
 
 ## Consequences
 
+- Slice b: the cluster smoke configures a site through node 2 (its objects and policy through others) and gets its
+  index through each of the three nodes, and its error document.
 - Slice a: the cluster smoke gets a session token through node 1 and writes with it through node 2, assumes a role
   through node 3, reads with it through node 1, and is refused a write and another bucket.
