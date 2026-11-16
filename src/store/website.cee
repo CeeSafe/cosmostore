@@ -1,0 +1,102 @@
+// A bucket's website configuration (ADR-0073) as the store keeps it. The S3 layer reads and writes it as XML and
+// serves the website endpoint (`src/s3/website.cee`).
+
+/// A bucket's website configuration, in the compact form below; empty for none.
+const BUCKET_CONFIG_WEBSITE: u8 = 13;
+const MAX_ROUTING_RULES: usize = 50;
+
+/// A routing rule: a condition (a key prefix, an error code, or both) and where it redirects.
+struct RoutingRule {
+    prefix: Vector<u8>;
+    /// The HTTP error code the rule is for; 0 for any (a rule on the key alone).
+    errorCode: u16;
+    host: Vector<u8>;
+    protocol: Vector<u8>;
+    replacePrefix: Vector<u8>;
+    replaceKey: Vector<u8>;
+    /// Which of the replacements it has: `ReplaceKeyPrefixWith` or `ReplaceKeyWith` (either may be empty text).
+    hasReplacePrefix: bool;
+    hasReplaceKey: bool;
+    /// 0 for the default (301).
+    httpCode: u16;
+}
+
+struct WebsiteConfig {
+    index: Vector<u8>;
+    errorKey: Vector<u8>;
+    /// Every request redirected to this host (`RedirectAllRequestsTo`); empty for none.
+    redirectHost: Vector<u8>;
+    redirectProtocol: Vector<u8>;
+    rules: Vector<RoutingRule>;
+}
+
+/// Website v1: u8 version, the index suffix, the error key, the redirect-all host and protocol (each u16+bytes), u16
+/// rule count, then per rule the prefix, u16 error code, host, protocol, key prefix replacement, key replacement (each
+/// u16+bytes but the code), u8 flags (1: replaces the prefix, 2: replaces the key), u16 redirect code.
+fn encodeWebsite(c: borrow WebsiteConfig, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.push(1)?;
+    pushText16(out, c.index.view())?;
+    pushText16(out, c.errorKey.view())?;
+    pushText16(out, c.redirectHost.view())?;
+    pushText16(out, c.redirectProtocol.view())?;
+    out.pushLE(truncate<u16>(c.rules.length))?;
+    for (i in 0..c.rules.length) {
+        let r = borrow c.rules[i];
+        pushText16(out, r.prefix.view())?;
+        out.pushLE(r.errorCode)?;
+        pushText16(out, r.host.view())?;
+        pushText16(out, r.protocol.view())?;
+        pushText16(out, r.replacePrefix.view())?;
+        pushText16(out, r.replaceKey.view())?;
+        out.push((if (r.hasReplacePrefix) 1u8 else 0u8) | (if (r.hasReplaceKey) 2u8 else 0u8))?;
+        out.pushLE(r.httpCode)?;
+    }
+    return Ok();
+}
+
+fn decodeWebsite(b: Slice<u8>) -> Result<WebsiteConfig, MetaFault> {
+    if (b.length == 0 || b[0] != 1) { return Err(MetaFault.BadVersion); }
+    var at: usize = 1;
+    var c = WebsiteConfig {
+        index: readText16(b, mut at)?,
+        errorKey: readText16(b, mut at)?,
+        redirectHost: readText16(b, mut at)?,
+        redirectProtocol: readText16(b, mut at)?,
+        rules: Vector<RoutingRule>.create(),
+    };
+    need(b, at, 2)?;
+    let n = b.readLE<u16>(at) as usize;
+    at += 2;
+    if (n > MAX_ROUTING_RULES) { return Err(MetaFault.TooLong); }
+    for (i in 0..n) {
+        let prefix = readText16(b, mut at)?;
+        need(b, at, 2)?;
+        let errorCode = b.readLE<u16>(at);
+        at += 2;
+        let host = readText16(b, mut at)?;
+        let protocol = readText16(b, mut at)?;
+        let replacePrefix = readText16(b, mut at)?;
+        let replaceKey = readText16(b, mut at)?;
+        need(b, at, 3)?;
+        let flags = b[at];
+        let httpCode = b.readLE<u16>(at + 1);
+        at += 3;
+        c.rules.push(RoutingRule {
+            prefix: prefix,
+            errorCode: errorCode,
+            host: host,
+            protocol: protocol,
+            replacePrefix: replacePrefix,
+            replaceKey: replaceKey,
+            hasReplacePrefix: (flags & 1) != 0,
+            hasReplaceKey: (flags & 2) != 0,
+            httpCode: httpCode,
+        })?;
+    }
+    if (at != b.length) { return Err(MetaFault.TooLong); }
+    // An index document or a redirect of everything: one of the two (S3's rule).
+    if ((c.index.length == 0) == (c.redirectHost.length == 0)) { return Err(MetaFault.TooLong); }
+    return Ok(c);
+}
+
+fn isWebsiteValue(value: Slice<u8>) -> bool => value.length == 0 || decodeWebsite(value).isOk();

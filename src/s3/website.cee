@@ -1,0 +1,487 @@
+// Static website hosting (ADR-0073): a bucket's website configuration as XML, and the website endpoint, a host name
+// `<bucket>.<website domain>` on the S3 port whose requests are anonymous browsers'.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+/// A `<WebsiteConfiguration>`: an index document (and maybe an error document and routing rules), or a redirect of
+/// every request.
+fn parseWebsite(xml: Slice<u8>) -> Result<WebsiteConfig, S3Fail> {
+    if (findBytes(xml, "<WebsiteConfiguration".bytes(), 0).isNull()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    var c = WebsiteConfig {
+        index: Vector<u8>.create(),
+        errorKey: Vector<u8>.create(),
+        redirectHost: Vector<u8>.create(),
+        redirectProtocol: Vector<u8>.create(),
+        rules: Vector<RoutingRule>.create(),
+    };
+    var at: usize = 0;
+    match (nextElement(xml, "IndexDocument", mut at)?) {
+        Some(e) => {
+            let _ = rawElement(e, "Suffix", mut c.index)?;
+            // S3: a suffix that is empty or holds a slash is refused.
+            if (c.index.length == 0 || findBytes(c.index.view(), "/".bytes(), 0).isSome()) {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
+        }
+        null => {}
+    }
+    at = 0;
+    match (nextElement(xml, "ErrorDocument", mut at)?) {
+        Some(e) => { let _ = rawElement(e, "Key", mut c.errorKey)?; }
+        null => {}
+    }
+    at = 0;
+    match (nextElement(xml, "RedirectAllRequestsTo", mut at)?) {
+        Some(e) => {
+            let _ = rawElement(e, "HostName", mut c.redirectHost)?;
+            let _ = rawElement(e, "Protocol", mut c.redirectProtocol)?;
+            if (c.redirectHost.length == 0) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            checkProtocol(c.redirectProtocol.view())?;
+        }
+        null => {}
+    }
+    // One or the other (S3's rule): an index document, or a redirect of everything with nothing else.
+    if ((c.index.length == 0) == (c.redirectHost.length == 0)) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    if (c.redirectHost.length > 0 && (c.errorKey.length > 0 || findBytes(xml, "<RoutingRule>".bytes(), 0).isSome())) {
+        return Err(S3Fail.Code(S3Code.InvalidArgument));
+    }
+    at = 0;
+    while (true) {
+        let rule = match (nextElement(xml, "RoutingRule", mut at)?) {
+            Some(r) => r,
+            null => { break; }
+        };
+        if (c.rules.length >= MAX_ROUTING_RULES) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        var r = RoutingRule {
+            prefix: Vector<u8>.create(),
+            errorCode: 0,
+            host: Vector<u8>.create(),
+            protocol: Vector<u8>.create(),
+            replacePrefix: Vector<u8>.create(),
+            replaceKey: Vector<u8>.create(),
+            hasReplacePrefix: false,
+            hasReplaceKey: false,
+            httpCode: 0,
+        };
+        var cat: usize = 0;
+        match (nextElement(rule, "Condition", mut cat)?) {
+            Some(cond) => {
+                let _ = rawElement(cond, "KeyPrefixEquals", mut r.prefix)?;
+                var code = Vector<u8>.create();
+                if (rawElement(cond, "HttpErrorCodeReturnedEquals", mut code)?) {
+                    r.errorCode = match (parseU64Bytes(trimBlank(code.view()))) {
+                        Some(n) => if (n >= 400 && n <= 599) truncate<u16>(n) else {
+                            return Err(S3Fail.Code(S3Code.InvalidArgument));
+                        },
+                        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                    };
+                }
+            }
+            null => {}
+        }
+        var rat: usize = 0;
+        let redirect = match (nextElement(rule, "Redirect", mut rat)?) {
+            Some(d) => d,
+            null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        };
+        let _ = rawElement(redirect, "HostName", mut r.host)?;
+        let _ = rawElement(redirect, "Protocol", mut r.protocol)?;
+        checkProtocol(r.protocol.view())?;
+        r.hasReplacePrefix = rawElement(redirect, "ReplaceKeyPrefixWith", mut r.replacePrefix)?;
+        r.hasReplaceKey = rawElement(redirect, "ReplaceKeyWith", mut r.replaceKey)?;
+        if (r.hasReplacePrefix && r.hasReplaceKey) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        var code = Vector<u8>.create();
+        if (rawElement(redirect, "HttpRedirectCode", mut code)?) {
+            r.httpCode = match (parseU64Bytes(trimBlank(code.view()))) {
+                Some(n) => if (n >= 300 && n <= 399) truncate<u16>(n) else {
+                    return Err(S3Fail.Code(S3Code.InvalidArgument));
+                },
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            };
+        }
+        c.rules.push(r)?;
+    }
+    return Ok(c);
+}
+
+fn checkProtocol(p: Slice<u8>) -> Result<void, S3Fail> {
+    if (p.length == 0 || p == "http".bytes() || p == "https".bytes()) { return Ok(); }
+    return Err(S3Fail.Code(S3Code.InvalidArgument));
+}
+
+fn parseU64Bytes(b: Slice<u8>) -> u64? => match (StringView.fromUtf8(b)) {
+    Some(t) => t.parseInt<u64>(),
+    null => null,
+};
+
+fn xmlTextElement(out: borrow mut Vector<u8>, name: StringView, value: Slice<u8>) -> Result<void, AllocError> {
+    out.push('<')?;
+    out.extend(name.bytes())?;
+    out.push('>')?;
+    appendXmlEscaped(out, value)?;
+    out.extend("</".bytes())?;
+    out.extend(name.bytes())?;
+    out.push('>')?;
+    return Ok();
+}
+
+fn websiteXml(c: borrow WebsiteConfig, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    xmlHead(out, "WebsiteConfiguration")?;
+    if (c.redirectHost.length > 0) {
+        out.extend("<RedirectAllRequestsTo>".bytes())?;
+        xmlTextElement(out, "HostName", c.redirectHost.view())?;
+        if (c.redirectProtocol.length > 0) { xmlTextElement(out, "Protocol", c.redirectProtocol.view())?; }
+        out.extend("</RedirectAllRequestsTo>".bytes())?;
+    } else {
+        out.extend("<IndexDocument>".bytes())?;
+        xmlTextElement(out, "Suffix", c.index.view())?;
+        out.extend("</IndexDocument>".bytes())?;
+        if (c.errorKey.length > 0) {
+            out.extend("<ErrorDocument>".bytes())?;
+            xmlTextElement(out, "Key", c.errorKey.view())?;
+            out.extend("</ErrorDocument>".bytes())?;
+        }
+    }
+    if (c.rules.length > 0) {
+        out.extend("<RoutingRules>".bytes())?;
+        for (i in 0..c.rules.length) {
+            let r = borrow c.rules[i];
+            out.extend("<RoutingRule>".bytes())?;
+            if (r.prefix.length > 0 || r.errorCode != 0) {
+                out.extend("<Condition>".bytes())?;
+                if (r.prefix.length > 0) { xmlTextElement(out, "KeyPrefixEquals", r.prefix.view())?; }
+                if (r.errorCode != 0) { xmlDecimal(out, "HttpErrorCodeReturnedEquals", r.errorCode as u64)?; }
+                out.extend("</Condition>".bytes())?;
+            }
+            out.extend("<Redirect>".bytes())?;
+            if (r.host.length > 0) { xmlTextElement(out, "HostName", r.host.view())?; }
+            if (r.protocol.length > 0) { xmlTextElement(out, "Protocol", r.protocol.view())?; }
+            if (r.hasReplacePrefix) { xmlTextElement(out, "ReplaceKeyPrefixWith", r.replacePrefix.view())?; }
+            if (r.hasReplaceKey) { xmlTextElement(out, "ReplaceKeyWith", r.replaceKey.view())?; }
+            if (r.httpCode != 0) { xmlDecimal(out, "HttpRedirectCode", r.httpCode as u64)?; }
+            out.extend("</Redirect></RoutingRule>".bytes())?;
+        }
+        out.extend("</RoutingRules>".bytes())?;
+    }
+    out.extend("</WebsiteConfiguration>".bytes())?;
+    return Ok();
+}
+
+async fn getBucketWebsite(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let stored = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_WEBSITE)?;
+    if (stored.length == 0) { return Err(S3Fail.Code(S3Code.NoSuchWebsiteConfiguration)); }
+    let c = match (decodeWebsite(stored.view())) {
+        Ok(c) => c,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
+    var body = Vector<u8>.create();
+    websiteXml(borrow c, mut body)?;
+    return await sendXml(exchange, borrow body);
+}
+
+async fn putBucketWebsite(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    // A cluster's S3 port has no website endpoint yet (ADR-0073 §3).
+    if (app.cluster) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    let xml = await readSmallBody(auth, exchange, 131072)?;
+    verifySmallBody(req, xml.view(), true)?;
+    let c = parseWebsite(xml.view())?;
+    var stored = Vector<u8>.create();
+    encodeWebsite(borrow c, mut stored)?;
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_WEBSITE, stored.view())?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+async fn deleteBucketWebsite(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_WEBSITE, "".bytes())?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}
+
+// --- The website endpoint ---
+
+/// Whether `host` (a `Host` field, port and all) names a bucket's website under `domain`: `<bucket>.<domain>`.
+fn websiteBucketOf<region a>(host: Slice<a, u8>, domain: Slice<u8>) -> Slice<a, u8>? {
+    if (domain.length == 0) { return null; }
+    var end = host.length;
+    for (i in 0..host.length) {
+        if (host[i] == ':') { end = i; }
+    }
+    let name = host[0..end];
+    if (name.length <= domain.length + 1) { return null; }
+    let suffixAt = name.length - domain.length;
+    if (name[suffixAt - 1] != '.' || !sameIgnoringCase(name[suffixAt..name.length], domain)) { return null; }
+    return Some(name[0..suffixAt - 1]);
+}
+
+fn sameIgnoringCase(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) { return false; }
+    for (i in 0..a.length) {
+        if (lowerAscii(a[i]) != lowerAscii(b[i])) { return false; }
+    }
+    return true;
+}
+
+/// The `Host` field of a request, as it came.
+fn hostOf<region r>(request: borrow(r) Request) -> Slice<r, u8> {
+    let fields = request.headers();
+    for (i in 0..fields.count()) {
+        if (sameIgnoringCase(fields.nameBytes(i), "host".bytes())) { return fields.value(i); }
+    }
+    return "".bytes();
+}
+
+/// A website's small HTML answer for an error (S3's form, which browsers show).
+async fn websiteError(
+    exchange: borrow mut Exchange,
+    status: u16,
+    code: StringView,
+    key: Slice<u8>,
+    requestId: Slice<u8>,
+    head: bool,
+) -> Result<void, S3Fail> {
+    var body = Vector<u8>.create();
+    let title =
+        if (status == 404) "404 Not Found"
+            else if (status == 403) "403 Forbidden"
+            else if (status == 405) "405 Method Not Allowed"
+            else "Error";
+    body.extend("<html>\n<head><title>".bytes())?;
+    body.extend(title.bytes())?;
+    body.extend("</title></head>\n<body>\n<h1>".bytes())?;
+    body.extend(title.bytes())?;
+    body.extend("</h1>\n<ul>\n<li>Code: ".bytes())?;
+    body.extend(code.bytes())?;
+    if (key.length > 0) {
+        body.extend("</li>\n<li>Key: ".bytes())?;
+        appendXmlEscaped(mut body, key)?;
+    }
+    body.extend("</li>\n<li>RequestId: ".bytes())?;
+    body.extend(requestId)?;
+    body.extend("</li>\n</ul>\n</body>\n</html>\n".bytes())?;
+    exchange.header("content-type", "text/html; charset=utf-8".bytes())?;
+    if (head) {
+        exchange.setContentLength(body.length as u64);
+        await exchange.send(statusOf(status), "".bytes())?;
+    } else {
+        await exchange.send(statusOf(status), body.view())?;
+    }
+    return Ok();
+}
+
+/// A redirect to `location`.
+async fn websiteRedirect(exchange: borrow mut Exchange, status: u16, location: Slice<u8>) -> Result<void, S3Fail> {
+    exchange.header("location", location)?;
+    await exchange.send(statusOf(status), "".bytes())?;
+    return Ok();
+}
+
+/// Where a routing rule sends `key`: its protocol and host (this request's when it names none), the key replaced or
+/// its prefix replaced.
+fn ruleLocation(
+    r: borrow RoutingRule,
+    key: Slice<u8>,
+    host: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.extend(if (r.protocol.length > 0) r.protocol.view() else "http".bytes())?;
+    out.extend("://".bytes())?;
+    out.extend(if (r.host.length > 0) r.host.view() else host)?;
+    out.push('/')?;
+    if (r.hasReplaceKey) {
+        out.extend(r.replaceKey.view())?;
+    } else if (r.hasReplacePrefix) {
+        out.extend(r.replacePrefix.view())?;
+        out.extend(key[r.prefix.length..key.length])?;
+    } else {
+        out.extend(key)?;
+    }
+    return Ok();
+}
+
+/// The first rule for `key` and `errorCode` (0: before anything is read, a rule on the key alone).
+fn ruleFor(c: borrow WebsiteConfig, key: Slice<u8>, errorCode: u16) -> usize? {
+    for (i in 0..c.rules.length) {
+        let r = borrow c.rules[i];
+        if (r.errorCode != errorCode) { continue; }
+        if (r.prefix.length > 0 && !startsWithBytes(key, r.prefix.view())) { continue; }
+        return Some(i);
+    }
+    return null;
+}
+
+/// A request to a bucket's website (ADR-0073 §2): anonymous, GET or HEAD, answered with the object, a redirect, the
+/// error document or a small HTML page.
+async fn serveWebsite(
+    app: borrow S3App,
+    request: borrow Request,
+    exchange: borrow mut Exchange,
+    peer: SocketAddress?,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    var req = S3Request.of(request, app.websiteDomain.view())?;
+    let head = isMethod(req.method, Method.Head);
+    if (!head && !isMethod(req.method, Method.Get)) {
+        return await websiteError(exchange, 405, "MethodNotAllowed", "".bytes(), requestId, false);
+    }
+    let hostField = copyBytes(headerOf(borrow req, "host") ?? "".bytes())?;
+    let host = hostField.view();
+    let stored = match (await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_WEBSITE)) {
+        Ok(s) => s,
+        Err(_) => { return await websiteError(exchange, 404, "NoSuchBucket", "".bytes(), requestId, head); }
+    };
+    let c = match (decodeWebsite(stored.view())) {
+        Ok(c) => c,
+        Err(_) => {
+            return await websiteError(exchange, 404, "NoSuchWebsiteConfiguration", "".bytes(), requestId, head);
+        }
+    };
+    let key = copyBytes(req.key.bytes())?;
+    if (c.redirectHost.length > 0) {
+        var to = Vector<u8>.create();
+        to.extend(if (c.redirectProtocol.length > 0) c.redirectProtocol.view() else "http".bytes())?;
+        to.extend("://".bytes())?;
+        to.extend(c.redirectHost.view())?;
+        to.push('/')?;
+        to.extend(key.view())?;
+        return await websiteRedirect(exchange, 301, to.view());
+    }
+    // A rule on the key alone, before anything is read.
+    match (ruleFor(borrow c, key.view(), 0)) {
+        Some(i) => {
+            var to = Vector<u8>.create();
+            ruleLocation(borrow c.rules[i], key.view(), host, mut to)?;
+            return await websiteRedirect(
+                exchange,
+                if (c.rules[i].httpCode != 0) c.rules[i].httpCode else 301,
+                to.view(),
+            );
+        }
+        null => {}
+    }
+    var wanted = copyBytes(key.view())?;
+    if (wanted.length == 0 || wanted[wanted.length - 1] == '/') { wanted.extend(c.index.view())?; }
+    let who = Requester { key: null, peer: peer };
+    let failed = match (await websiteObject(app, mut req, wanted.view(), borrow who, exchange)) {
+        Ok() => { return Ok(); }
+        Err(S3Fail.Code(code)) => code,
+        Err(e) => { return Err(e); }
+    };
+    let status = s3Status(failed);
+    // A folder without its slash: its index document is there.
+    if (failed == S3Code.NoSuchKey && key.length > 0 && key[key.length - 1] != '/') {
+        var folder = copyBytes(key.view())?;
+        folder.push('/')?;
+        folder.extend(c.index.view())?;
+        if (await websiteHas(app, req.bucket.view(), folder.view())) {
+            var to = Vector<u8>.create();
+            to.push('/')?;
+            to.extend(key.view())?;
+            to.push('/')?;
+            return await websiteRedirect(exchange, 302, to.view());
+        }
+    }
+    match (ruleFor(borrow c, key.view(), status)) {
+        Some(i) => {
+            var to = Vector<u8>.create();
+            ruleLocation(borrow c.rules[i], key.view(), host, mut to)?;
+            return await websiteRedirect(
+                exchange,
+                if (c.rules[i].httpCode != 0) c.rules[i].httpCode else 301,
+                to.view(),
+            );
+        }
+        null => {}
+    }
+    // The error document, with the error's status, when there is one anyone may read.
+    if (c.errorKey.length > 0 && (status == 404 || status == 403)) {
+        let name = StringView.fromUtf8(c.errorKey.view()) ?? "";
+        var page: Vector<u8>? = null;
+        var allowed = false;
+        {
+            let original = replace(mut req.key, textOf(name));
+            allowed = (await authorizeObject(
+                app,
+                borrow req,
+                borrow who,
+                "s3:GetObject",
+                "s3:GetObjectVersion",
+            )).isOk();
+            req.key = original;
+        }
+        if (allowed) {
+            var guard = await lockStore(app)?;
+            let store = guard.data();
+            let bucketName = req.bucket.view();
+            // The error document read whole: I/O, on a worker.
+            page = (await Async.blocking(() => store.getObject(bucketName, name))).ok();
+        }
+        match (page) {
+            Some(p) => {
+                exchange.header("content-type", "text/html; charset=utf-8".bytes())?;
+                if (head) {
+                    exchange.setContentLength(p.length as u64);
+                    await exchange.send(statusOf(status), "".bytes())?;
+                } else {
+                    await exchange.send(statusOf(status), p.view())?;
+                }
+                return Ok();
+            }
+            null => {}
+        }
+    }
+    return await websiteError(exchange, status, s3CodeName(failed), key.view(), requestId, head);
+}
+
+/// Serves `key` of the website's bucket as an anonymous GET (or HEAD) would be, or follows its
+/// `x-amz-website-redirect-location`; an error before any of the answer was given otherwise.
+async fn websiteObject(
+    app: borrow S3App,
+    req: borrow mut S3Request,
+    key: Slice<u8>,
+    who: borrow Requester,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    req.key = textOf(StringView.fromUtf8(key) ?? "");
+    await authorizeObject(app, req, who, "s3:GetObject", "s3:GetObjectVersion")?;
+    var redirect = Vector<u8>.create();
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        match (store.headObject(req.bucket.view(), req.key.view())) {
+            Ok(info) => {
+                match (metadataFind(info.metadata.view(), "x-amz-website-redirect-location".bytes())) {
+                    Some(to) => { redirect.extend(to)?; }
+                    null => {}
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    if (redirect.length > 0) { return await websiteRedirect(exchange, 301, redirect.view()); }
+    return await getObject(app, req, exchange);
+}
+
+async fn websiteHas(app: borrow S3App, bucket: StringView, key: Slice<u8>) -> bool {
+    var guard = match (await lockStore(app)) {
+        Ok(g) => g,
+        Err(_) => { return false; }
+    };
+    let name = StringView.fromUtf8(key) ?? "";
+    return guard.data().headObject(bucket, name).isOk();
+}

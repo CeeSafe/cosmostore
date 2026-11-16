@@ -28,7 +28,7 @@ printf '# master keys\nk2 %s\nk1 %s\n' "$(head -c 32 /dev/urandom | base64)" "$(
 # SSE-KMS's keys (ADR-0055): the first is the default.
 printf 'app-default %s\norders %s\n' "$(head -c 32 /dev/urandom | base64)" "$(head -c 32 /dev/urandom | base64)" > "$work/kms.keys"
 start_server() {
-    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 2>> "$work/server.log" &
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 --website-domain web.localhost 2>> "$work/server.log" &
     server=$!
     sleep 1
 }
@@ -853,6 +853,31 @@ check "it has the PUT's line" "$(cat logs.got/* | grep -c '^cosmostore smoke \[.
 check "and the missing key's, with its error" "$(cat logs.got/* | grep -c 'REST.GET.OBJECT not-here .* 404 NoSuchKey ')" 1
 aws s3api put-bucket-logging --bucket smoke --bucket-logging-status '{}' > /dev/null 2>&1
 check "logging off" "$(aws s3api get-bucket-logging --bucket smoke --output text 2>&1)" ""
+
+# Static website hosting (ADR-0073): <bucket>.web.localhost is the bucket's website, anonymous, GET and HEAD.
+aws s3api create-bucket --bucket site > /dev/null 2>&1
+printf 'home' > home.html; printf 'docs' > docs.html; printf 'oops' > oops.html; printf 'plain' > plain.txt
+aws s3 cp home.html s3://site/index.html > /dev/null 2>&1
+aws s3 cp docs.html s3://site/docs/index.html > /dev/null 2>&1
+aws s3 cp oops.html s3://site/error.html > /dev/null 2>&1
+aws s3 cp plain.txt s3://site/plain.txt > /dev/null 2>&1
+aws s3api put-object --bucket site --key moved --website-redirect-location /plain.txt > /dev/null 2>&1
+aws s3api put-bucket-policy --bucket site --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::site/*"}]}' > /dev/null 2>&1
+aws s3api put-bucket-website --bucket site --website-configuration '{"IndexDocument":{"Suffix":"index.html"},"ErrorDocument":{"Key":"error.html"},"RoutingRules":[{"Condition":{"KeyPrefixEquals":"old/"},"Redirect":{"ReplaceKeyPrefixWith":"docs/"}}]}' > /dev/null 2>&1 && pass "put-bucket-website" || fail "put-bucket-website"
+check "get-bucket-website" "$(aws s3api get-bucket-website --bucket site --query IndexDocument.Suffix --output text 2>&1)" index.html
+web="http://127.0.0.1:$port"
+site() { curl -s -o site.body -w '%{http_code} %{redirect_url}' -H "Host: site.web.localhost:$port" "$@"; }
+check "the site's index" "$(site "$web/") $(cat site.body)" "200  home"
+check "a folder without its slash" "$(site "$web/docs")" "302 $web/docs/"
+check "a folder's index" "$(site "$web/docs/") $(cat site.body)" "200  docs"
+check "the error document" "$(site "$web/nothing") $(cat site.body)" "404  oops"
+check "a routing rule" "$(site "$web/old/index.html")" "301 http://site.web.localhost:$port/docs/index.html"
+check "an object's own redirect" "$(site "$web/moved")" "301 $web/plain.txt"
+check "only GET and HEAD" "$(site -X DELETE "$web/plain.txt")" "405 "
+check "the object is still there" "$(site "$web/plain.txt") $(cat site.body)" "200  plain"
+aws s3api delete-bucket-website --bucket site > /dev/null 2>&1
+check "no website after its deletion" "$(site "$web/" ; grep -c NoSuchWebsiteConfiguration site.body)" "404 1"
+aws s3 rm --recursive s3://site/ > /dev/null 2>&1
 
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1

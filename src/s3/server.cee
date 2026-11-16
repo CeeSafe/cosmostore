@@ -30,6 +30,9 @@ struct S3App {
     /// With virtual-host addressing, the domain under which `<bucket>.<domain>` names a bucket (empty: path-style
     /// only). ADR-0011.
     domain: Vector<u8>;
+    /// The website endpoint's domain (`serve --website-domain`, ADR-0073): `<bucket>.<it>` is a bucket's website;
+    /// empty for none.
+    websiteDomain: Vector<u8>;
     /// The commit turn of group commit (ADR-0022): its holder is the leader that syncs the journal.
     commitTurn: AsyncMutex<u8>;
     /// Every record with a lower LSN is published, as the last leader saw it: followers check it without the
@@ -225,7 +228,17 @@ async fn respond(
     facts: borrow mut AuditFacts,
 ) -> Result<void, HandlerError> {
     {
-        match (await serveS3(app, request, exchange, kind, peer, facts)) {
+        // A bucket's website (ADR-0073): its own requests, by their host.
+        let site = websiteBucketOf(hostOf(request), app.websiteDomain.view()).isSome();
+        let served = if (site) await serveWebsite(app, request, exchange, peer, requestId) else await serveS3(
+            app,
+            request,
+            exchange,
+            kind,
+            peer,
+            facts,
+        );
+        match (served) {
             Ok() => { return Ok(); }
             Err(S3Fail.Http(e)) => {
                 facts.aborted = true;
@@ -448,6 +461,23 @@ async fn serveS3(
             if (isMethod(m, Method.Delete)) {
                 await authorize(app, borrow req, borrow who, "s3:PutEncryptionConfiguration", bucket, none)?;
                 return await deleteBucketEncryption(app, borrow req, exchange);
+            }
+            return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+        }
+        // A bucket's website configuration (ADR-0073).
+        if (req.hasParam("website")) {
+            if (!req.onlyParams("website")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            if (isMethod(m, Method.Get)) {
+                await authorize(app, borrow req, borrow who, "s3:GetBucketWebsite", bucket, none)?;
+                return await getBucketWebsite(app, borrow req, exchange);
+            }
+            if (isMethod(m, Method.Put)) {
+                await authorize(app, borrow req, borrow who, "s3:PutBucketWebsite", bucket, none)?;
+                return await putBucketWebsite(app, borrow req, auth, exchange);
+            }
+            if (isMethod(m, Method.Delete)) {
+                await authorize(app, borrow req, borrow who, "s3:DeleteBucketWebsite", bucket, none)?;
+                return await deleteBucketWebsite(app, borrow req, exchange);
             }
             return Err(S3Fail.Code(S3Code.MethodNotAllowed));
         }

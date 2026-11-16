@@ -2684,3 +2684,14 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** `loggingConfigurationXml`, `accessLogLineFormat`; the S3 smoke delivers a log object with the PUT's line
   and a missing key's `NoSuchKey`.
 
+### 16 Nov 2026: M7 item 2, static website hosting (ADR-0073)
+
+- **Under the owner's standing go-ahead.** **ADR-0073** (proposed): Put/Get/DeleteBucketWebsite (a `BucketConfig` of
+  kind 13, checkpoint format 20): index and error documents, `RedirectAllRequestsTo`, up to 50 routing rules (a key
+  prefix or an error code; host, protocol, key or prefix replacement, redirect code). `serve --website-domain`
+  makes `<bucket>.<domain>` a bucket's website on the S3 port: anonymous, GET and HEAD, HTML errors, index documents,
+  the folder redirect, the error document, rules, and `x-amz-website-redirect-location` (now kept with an object).
+  Not on a cluster yet.
+- **Tests:** `websiteConfigurationXml`, `websiteHostNames`; the S3 smoke serves a site: index, folder redirect,
+  folder index, error document, a routing rule, an object's redirect, 405, and no site after its deletion.
+

@@ -197,6 +197,20 @@ bucket's requests arrive as objects `photos/YYYY-mm-DD-HH-MM-SS-<random>` in `lo
 - **Not on a cluster yet:** its S3 port answers `NotImplemented`.
 - **Bytes sent and object size are `-`.**
 
+## Static websites
+
+`serve --website-domain web.example.org` makes `<bucket>.web.example.org` a bucket's website on the S3 port
+(ADR-0073): point a wildcard DNS name at it. A bucket becomes a website with `aws s3api put-bucket-website --bucket
+site --website-configuration '{"IndexDocument":{"Suffix":"index.html"},"ErrorDocument":{"Key":"error.html"}}'` and a
+policy that lets anyone read it (`"Principal":"*"`, `"Action":"s3:GetObject"`, and no public-access block in the
+way).
+
+- **Visitors are anonymous,** whatever they send: GET and HEAD only, HTML errors, a folder's `index.html`, a
+  `/folder` redirected to `/folder/`, the error document with a 404 or 403, routing rules, an object's
+  `x-amz-website-redirect-location`, or `RedirectAllRequestsTo`.
+- **A custom domain** must take the `<bucket>.<website domain>` form, or go through a proxy that sets that `Host`.
+- **HTTPS** is whatever `serve` listens with; not on a cluster yet (`NotImplemented`).
+
 ## Rate limits
 
 `--rate-limit-address <n>` and `--rate-limit-key <n>` set the most requests a second from one address and by one

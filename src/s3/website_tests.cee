@@ -1,0 +1,58 @@
+// Static website hosting (ADR-0073): the configuration's XML, the website host names, where rules redirect.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+@test
+fn websiteConfigurationXml() -> Result<void, TestFailure> {
+    let xml =
+        "<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument><ErrorDocument><Key>error.html</Key></ErrorDocument><RoutingRules><RoutingRule><Condition><KeyPrefixEquals>old/</KeyPrefixEquals></Condition><Redirect><ReplaceKeyPrefixWith>new/</ReplaceKeyPrefixWith></Redirect></RoutingRule><RoutingRule><Condition><HttpErrorCodeReturnedEquals>404</HttpErrorCodeReturnedEquals></Condition><Redirect><HostName>other.example</HostName><Protocol>https</Protocol><ReplaceKeyWith>gone.html</ReplaceKeyWith><HttpRedirectCode>302</HttpRedirectCode></Redirect></RoutingRule></RoutingRules></WebsiteConfiguration>";
+    let c = parseWebsite(xml.bytes())!;
+    Check.equalBytes("index.html".bytes(), c.index.view())?;
+    Check.equalU64(2, c.rules.length as u64)?;
+    var stored = Vector<u8>.create();
+    encodeWebsite(borrow c, mut stored)!;
+    let back = decodeWebsite(stored.view())!;
+    var out = Vector<u8>.create();
+    websiteXml(borrow back, mut out)!;
+    Check.isTrue(
+        findBytes(out.view(), "<ReplaceKeyPrefixWith>new/</ReplaceKeyPrefixWith>".bytes(), 0).isSome(),
+        "rules back",
+    )?;
+    Check.isTrue(findBytes(out.view(), "<HttpRedirectCode>302</HttpRedirectCode>".bytes(), 0).isSome(), "code back")?;
+    // Rules: one on the key alone first; one for an error code after the read.
+    Check.equalU64(0, ruleFor(borrow back, "old/a.html".bytes(), 0)! as u64)?;
+    Check.isTrue(ruleFor(borrow back, "other".bytes(), 0).isNull(), "no rule")?;
+    Check.equalU64(1, ruleFor(borrow back, "x".bytes(), 404)! as u64)?;
+    var to = Vector<u8>.create();
+    ruleLocation(borrow back.rules[0], "old/a.html".bytes(), "site.web.local:9000".bytes(), mut to)!;
+    Check.equalBytes("http://site.web.local:9000/new/a.html".bytes(), to.view())?;
+    var to2 = Vector<u8>.create();
+    ruleLocation(borrow back.rules[1], "x".bytes(), "h".bytes(), mut to2)!;
+    Check.equalBytes("https://other.example/gone.html".bytes(), to2.view())?;
+    // An index and a redirect of everything are one or the other; a suffix with a slash is refused.
+    Check.isTrue(parseWebsite("<WebsiteConfiguration/>".bytes()).isErr(), "neither")?;
+    Check.isTrue(
+        parseWebsite(
+            "<WebsiteConfiguration><IndexDocument><Suffix>a/b</Suffix></IndexDocument></WebsiteConfiguration>".bytes(),
+        ).isErr(),
+        "a slash",
+    )?;
+    let all = parseWebsite(
+        "<WebsiteConfiguration><RedirectAllRequestsTo><HostName>x.example</HostName></RedirectAllRequestsTo></WebsiteConfiguration>".bytes(),
+    )!;
+    Check.equalBytes("x.example".bytes(), all.redirectHost.view())?;
+    return Ok();
+}
+
+@test
+fn websiteHostNames() -> Result<void, TestFailure> {
+    Check.equalBytes("site".bytes(), websiteBucketOf("site.web.local:9000".bytes(), "web.local".bytes())!)?;
+    Check.equalBytes("A.B".bytes(), websiteBucketOf("A.B.WEB.local".bytes(), "web.local".bytes())!)?;
+    Check.isTrue(websiteBucketOf("web.local".bytes(), "web.local".bytes()).isNull(), "the domain alone")?;
+    Check.isTrue(websiteBucketOf("site.other.local".bytes(), "web.local".bytes()).isNull(), "another domain")?;
+    Check.isTrue(websiteBucketOf("siteweb.local".bytes(), "web.local".bytes()).isNull(), "no dot")?;
+    Check.isTrue(websiteBucketOf("site.web.local".bytes(), "".bytes()).isNull(), "no website domain")?;
+    return Ok();
+}
