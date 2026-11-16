@@ -527,6 +527,23 @@ access logs and Parquet's codecs would want the same.
 **Suggested.** `Deflate.compress(level)` / `Inflate` streams in lib/std (or `lib/compress`), with `Gzip` framing and
 `Crc32` beside `Crc32c`; `web_ws` could then use it too.
 
+### G36: the generated test runner nests each test a level deeper (P1)
+
+**Evidence.** `ceesafec test` (0.54.0 and 0.56.0) emits one C function, `ceeF_ceesafeTestMain`, in which each test's
+dispatch sits inside the previous one's block: its bracket depth grows with the number of tests. CosmoStore's 303
+tests reach 258. Clang's default `-fbracket-depth` is 256, so on GitHub's macos-15 runner the test program does not
+compile: `main.c:412327:1045: fatal error: bracket nesting level exceeded maximum of 256`. Apple clang 21 locally
+takes more, so it passed here. CosmoStore's CI has failed on it since 14 Nov (`708c2e8`, about 260 tests).
+
+**Why it matters.** A package's tests stop compiling, on some C compilers, once it has about 250 of them. This has
+nothing to do with what the tests do.
+
+**Repro.** A package with 300 trivial `@test` functions: `ceesafec test --cflag -fbracket-depth=256` fails in the C
+compiler; `--cflag -fbracket-depth=1024` passes.
+
+**Suggested.** Emit the runner flat: one block per test in sequence (or a table of test functions and a loop), so its
+depth is constant. CosmoStore's CI passes `--cflag -fbracket-depth=1024` until then.
+
 ## Not gaps (checked)
 
 Things that worked well and are worth keeping:
