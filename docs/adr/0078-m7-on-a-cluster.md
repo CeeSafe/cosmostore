@@ -1,6 +1,6 @@
 # ADR-0078: M7 on a cluster
 
-**Status:** proposed, 16 Nov 2026, after M7 (ADR-0071 to ADR-0077, accepted), on the owner's "continue". §2 and §3 are built.
+**Status:** proposed, 16 Nov 2026, after M7 (ADR-0071 to ADR-0077, accepted), on the owner's "continue". §2 and §3 are built; §4 is designed.
 
 ## Context
 
@@ -32,7 +32,29 @@
    GET or HEAD, so a ReadIndex read on its leader, ADR-0060 §6), and the shard's S3 server, which has the domain too,
    serves it as a website (ADR-0073). `PutBucketWebsite` is no longer refused on a cluster: its configuration is a
    record of the shard's log already.
-4. **Until its slice**, a feature keeps refusing on a cluster as it does now.
+4. **The outbox on a cluster (slice c, designed).** Every replica of a shard applies the same records, so every
+   replica's outbox (ADR-0048 §2) queues the same events, in the same order. Only the shard's leader delivers them.
+   - **Where it stops is a record:** after a batch is delivered, the leader stages an `OutboxDelivered` record (the
+     LSN of the last event delivered) and proposes it as a write's entries are (ADR-0060 §5), behind the shard's
+     gate. Applied on every replica, it drops those events and moves the cursor, which checkpoints and snapshots
+     then carry (a new checkpoint format) instead of `serve`'s `outbox.cursor` file. A new leader goes on from the
+     last such record: at least once, as on `serve`; what a deposed leader delivered after its last record is
+     delivered again.
+   - **Writes into buckets go through the cluster:** an access log object, an inventory report and a replica to a
+     bucket of the same cluster may belong to another shard, so the delivery task sends them as signed S3 requests to
+     its node's own front (with the first key of the node's credentials), which routes, forwards and commits them
+     like any client's. Webhooks and remote replication targets are as on `serve`.
+   - **A replica keeps its version id across shards:** a PUT (or a completed upload) with
+     `x-cosmo-replica-version: <id>` and `x-cosmo-replica-md5: <hex>`, signed by a long-term key of the credentials,
+     is written by `putReplica` (ADR-0077 §3), so a cluster-local replica, and a replica sent to another CosmoStore,
+     keeps its source's id and ETag. The front already strips `x-cosmo-` fields from clients' requests; the shard's S3
+     server takes them only from a signed long-term key.
+   - **Status** on a cluster reads the cursor the shard's records moved, so it is the same on every replica.
+   - **Tests:** a store fault sweep of the new record and the checkpoint's cursor; the cluster smoke delivering a
+     webhook, an access log, an inventory report and replicas (same shard, another shard) through every node; the
+     chaos harness with webhooks and replication on, killing leaders mid-delivery: every event delivered at least
+     once, in order per shard.
+5. **Until its slice**, a feature keeps refusing on a cluster as it does now.
 
 ## Consequences
 
