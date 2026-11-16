@@ -1,6 +1,6 @@
 # ADR-0078: M7 on a cluster
 
-**Status:** proposed, 16 Nov 2026, after M7 (ADR-0071 to ADR-0077, accepted), on the owner's "continue". §2 and §3 are built; §4 is built for event notifications and replication (steps 1 to 3), designed for access logs and inventory.
+**Status:** accepted by the owner, 17 Nov 2026 (proposed 16 Nov 2026, after M7, on the owner's "continue"). §2 and §3 are built; §4 is built for event notifications and replication (steps 1 to 3), to be built for access logs and inventory; §1's slice d (Access Points) is to be built.
 
 ## Context
 

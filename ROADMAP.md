@@ -2787,4 +2787,6 @@ Browser form uploads with a SigV4 POST policy.
   every status; it now stays at "some", as the policy counts do. The cluster smoke (64 checks): replicas in another
   shard with their ids, ETags and part numbers, a delete marker, another endpoint, COMPLETED and FAILED through every
   node.
+- **ADR-0078 accepted** by the owner (17 Nov 2026), with slices a and b and slice c's steps 1 to 3 built; access logs
+  and inventory on a cluster, the chaos-harness run, and slice d (Access Points) are next.
 
