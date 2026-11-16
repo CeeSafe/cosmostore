@@ -2742,3 +2742,20 @@ Browser form uploads with a SigV4 POST policy.
   bytes, `REPLICA`, `COMPLETED`), a delete marker, both ways without echo.
 - **Next:** part 2, destinations on other S3 endpoints.
 
+### 16 Nov 2026: M7 item 6, replication, part 2: other S3 endpoints (ADR-0077 §6, §7)
+
+- `serve --replication-targets` (`<id> <url> <access key> <secret key> [region]`, wiped once read); a rule's
+  destination `arn:cosmostore:s3::<id>:<bucket>`. A replica is SigV4 requests with an unsigned payload streamed from
+  the stored bytes (a `BodySource`): one PUT, or a multipart upload with the source's part sizes so the ETag is kept;
+  SSE-S3 and SSE-KMS versions opened here and sealed there by SSE-S3; SSE-C refused; delete markers as DELETEs;
+  `REPLICA` kept by a CosmoStore destination, so nothing echoes. Refusals noted as a `BucketConfig` of kind 17
+  (checkpoint format 24): `FAILED` survives a restart.
+- **Tests:** `replicationToOtherEndpoints`; the S3 smoke runs a second server as the endpoint. The smoke's inventory
+  check no longer races a second report in the same minute's folder.
+- **M7 is built** (items 1 to 6, ADR-0071 to ADR-0077 proposed); none of it on a cluster's S3 port yet.
+
+### 16 Nov 2026: ADR-0071 to ADR-0077 accepted
+
+- The owner: "Yes, accept ADR-0071 to 0077". M7 (access logs, website hosting, inventory, STS, Access Points,
+  replication here and to other endpoints) is accepted as built; its cluster support is later work.
+

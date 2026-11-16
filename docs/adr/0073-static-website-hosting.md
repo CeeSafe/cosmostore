@@ -1,6 +1,6 @@
 # ADR-0073: Static website hosting (M7 item 2)
 
-**Status:** proposed, 16 Nov 2026, for M7 item 2 (ADR-0071), under the owner's standing go-ahead.
+**Status:** accepted, 16 Nov 2026 (the owner: "Yes, accept ADR-0071 to 0077"); proposed the same day for M7 item 2 (ADR-0071), under the owner's standing go-ahead.
 
 ## Context
 

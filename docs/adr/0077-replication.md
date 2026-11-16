@@ -1,6 +1,6 @@
 # ADR-0077: Bucket replication (M7 item 6)
 
-**Status:** proposed, 16 Nov 2026, for M7 item 6 (ADR-0071). The scope (replicas that keep their source's version id
+**Status:** accepted, 16 Nov 2026 (the owner: "Yes, accept ADR-0071 to 0077"); proposed the same day for M7 item 6 (ADR-0071); §6 and §7 (other endpoints) added the same day. The scope (replicas that keep their source's version id
 and ETag; destinations on this server first, other S3 endpoints in a second slice) was chosen by the owner,
 16 Nov 2026.
 
@@ -39,6 +39,23 @@ and ETag; destinations on this server first, other S3 endpoints in a second slic
    or refused the replica: the event is then passed over and the failure counted and logged, so one bad destination
    does not hold the outbox). The replica's `REPLICA` is its stored field.
 5. **A cluster's S3 port** refuses `PutBucketReplication` for now (its outbox is not delivered there yet).
+6. **Other endpoints** (part 2): `serve --replication-targets` names them, a line each: `<id> <http or https url>
+   <access key> <secret key> [region]` (the file's text is wiped once read). A rule's destination
+   `arn:cosmostore:s3::<id>:<bucket>` (kept as `<id>:<bucket>`) replicates there; an id the file does not have is
+   InvalidArgument. A replica is sent as SigV4 requests with an unsigned payload: one PUT of the version's plaintext,
+   or, for a multipart version, a multipart upload with its parts' sizes, so its ETag is the source's (except under
+   SSE-KMS, whose ETag is not an MD5); its content type, user metadata, stored headers and
+   `x-amz-replication-status: REPLICA` go with it, and `x-amz-server-side-encryption: AES256` when the source was
+   sealed (SSE-S3 and SSE-KMS versions are opened here with the master keys and sent in the clear over the
+   connection, so use https; SSE-C versions cannot be, and are refused). A delete marker is a DELETE there. The
+   version id there is the endpoint's own: S3 has no way to set one. A CosmoStore destination keeps a PUT's
+   `x-amz-replication-status: REPLICA`, so a replica is not replicated again. An answer of 2xx is done; no answer, 5xx,
+   408 and 429 are tried again with the outbox's back-off; any other is a refusal.
+7. **Refusals are noted:** a remote destination's refusal is passed over and its key and version id kept in a
+   `BucketConfig` of kind 17 on the source bucket (its newest 1,000; checkpoint format 24), so the version reads
+   `FAILED`, after a restart too; a remote destination's version reads `PENDING` while its event waits, then
+   `COMPLETED`.
+
 
 ## Consequences
 
@@ -49,6 +66,10 @@ and ETag; destinations on this server first, other S3 endpoints in a second slic
 - The S3 smoke replicates a small object, a 9 MiB multipart object and an SSE-S3 object between two buckets and
   compares version ids, ETags (`-2` for the multipart one) and bytes, reads `COMPLETED` and `REPLICA`, replicates a
   delete marker with its id, and with rules both ways checks a replica is not sent back.
+- `replicationToOtherEndpoints` (the targets file, remote ARNs, the failure list); the S3 smoke starts a second server
+  as an endpoint and replicates a small object with metadata, a 9 MiB multipart object (ETag `-2` kept) and an
+  SSE-KMS object (its plaintext, sealed there by SSE-S3) to it, a delete marker, a rule to a bucket it does not have
+  (`FAILED`, also after a restart), and reads `COMPLETED` after a restart.
 - A sealed version's size is its plaintext's while its stored bytes are longer (ADR-0046 §2): the copy reads to the
   end of what is stored and the replica takes the source's size.
 

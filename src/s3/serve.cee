@@ -833,6 +833,7 @@ fn serve() -> i32 {
     var sseKeysAt: usize = 0;
     var kmsKeysAt: usize = 0;
     var stsKeysAt: usize = 0;
+    var replicationTargetsAt: usize = 0;
     var rolesAt: usize = 0;
     var perAddress: u64 = 0;
     var perKey: u64 = 0;
@@ -903,6 +904,8 @@ fn serve() -> i32 {
             kmsKeysAt = at + 1;
         } else if (option == "--sts-key-file") {
             stsKeysAt = at + 1;
+        } else if (option == "--replication-targets") {
+            replicationTargetsAt = at + 1;
         } else if (option == "--roles-file") {
             rolesAt = at + 1;
         } else if (option == "--rate-limit-address" || option == "--rate-limit-key") {
@@ -966,12 +969,17 @@ fn serve() -> i32 {
         Ok(c) => c,
         Err(_) => { die("out of memory"); }
     };
-    let auditWriter = AuditWriter {
+    var auditWriter = AuditWriter {
         lines: auditLines.clone(),
         path: textOf(Process.argument(auditAt) ?? ""),
         enabled: auditAt != 0,
         access: AccessLogWriter { lines: accessLines.clone(), everyMs: accessLogSeconds * 1000 },
         inventory: InventoryWriter { dayMs: inventoryDaySeconds * 1000 },
+        replication: ReplicaContext {
+            targets: Vector<ReplicationTarget>.create(),
+            sseKeys: Vector<MasterKey>.create(),
+            kmsKeys: Vector<MasterKey>.create(),
+        },
     };
     if (auditAt != 0) {
         // Before the store opens: a log that cannot be written stops `serve`.
@@ -995,6 +1003,42 @@ fn serve() -> i32 {
             Err(message) => { die(message.view()); }
         };
     }
+    // The endpoints replication may send to (ADR-0077 §6), and the keys that open what it sends; the file's text,
+    // which holds secrets, is wiped once parsed.
+    var replicationTargetIds = Vector<Vector<u8>>.create();
+    if (replicationTargetsAt != 0) {
+        var text = match (readSmallFile(Process.argument(replicationTargetsAt) ?? "", "replication targets file")) {
+            Ok(t) => t,
+            Err(message) => { die(message.view()); }
+        };
+        let parsed = parseReplicationTargets(text.view());
+        for (i in 0..text.length) { text[i] = 0; }
+        auditWriter.replication.targets = match (parsed) {
+            Ok(Some(t)) => t,
+            Ok(null) => {
+                die(
+                    "the replication targets file needs lines of `<id> <http or https url> <access key> <secret key> [region]`, each id once",
+                );
+            }
+            Err(_) => { die("out of memory"); }
+        };
+        for (i in 0..auditWriter.replication.targets.length) {
+            match (copyBytes(auditWriter.replication.targets[i].id.view())) {
+                Ok(id) => {
+                    if (replicationTargetIds.push(id).isErr()) { die("out of memory"); }
+                }
+                Err(_) => { die("out of memory"); }
+            }
+        }
+    }
+    auditWriter.replication.sseKeys = match (copyKeys(sseKeys.view())) {
+        Ok(k) => k,
+        Err(_) => { die("out of memory"); }
+    };
+    auditWriter.replication.kmsKeys = match (copyKeys(kmsKeys.view())) {
+        Ok(k) => k,
+        Err(_) => { die("out of memory"); }
+    };
     // STS's token keys and its roles (ADR-0075).
     var stsKeys = Vector<MasterKey>.create();
     if (stsKeysAt != 0) {
@@ -1106,6 +1150,7 @@ fn serve() -> i32 {
         notifyTargets: notifyTargets,
         sseKeys: sseKeys,
         stsKeys: stsKeys,
+        replicationTargetIds: replicationTargetIds,
         roles: roles,
         kmsKeys: kmsKeys,
         corsBuckets: AtomicU64.create(corsBuckets),

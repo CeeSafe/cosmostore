@@ -45,3 +45,55 @@ fn replicationConfigurationXml() -> Result<void, TestFailure> {
     )?;
     return Ok();
 }
+
+@test
+fn replicationToOtherEndpoints() -> Result<void, TestFailure> {
+    let file =
+        "# id url access secret [region]\nbackup https://s3.example.com/ AKIAX secret/key eu-west-1\nlocal http://127.0.0.1:9001 a b\n";
+    let targets = parseReplicationTargets(file.bytes())!!;
+    Check.equalU64(2, targets.length as u64)?;
+    Check.equalBytes("https://s3.example.com".bytes(), targets[0].url.view())?;
+    Check.equalBytes("eu-west-1".bytes(), targets[0].region.view())?;
+    Check.equalBytes("us-east-1".bytes(), targets[1].region.view())?;
+    Check.isTrue(parseReplicationTargets("x ftp://h a b".bytes())!.isNull(), "a scheme")?;
+    Check.isTrue(parseReplicationTargets("x http://h a".bytes())!.isNull(), "no secret")?;
+    Check.isTrue(parseReplicationTargets("x http://h a b\nx http://h a b".bytes())!.isNull(), "an id twice")?;
+    // A remote destination's ARN, kept as `<target>:<bucket>` and given back.
+    let xml =
+        "<ReplicationConfiguration><Rule><Status>Enabled</Status><Destination><Bucket>arn:cosmostore:s3::backup:photos</Bucket></Destination></Rule></ReplicationConfiguration>";
+    let rules = parseReplication(xml.bytes())!;
+    Check.equalBytes("backup:photos".bytes(), rules[0].destination.view())?;
+    Check.isTrue(isRemoteDestination(rules[0].destination.view()) && !isRemoteDestination("photos".bytes()), "remote")?;
+    var out = Vector<u8>.create();
+    replicationXml(rules.view(), mut out)!;
+    Check.isTrue(findBytes(out.view(), "arn:cosmostore:s3::backup:photos".bytes(), 0).isSome(), "given back")?;
+    Check.isTrue(
+        parseReplication(
+            "<ReplicationConfiguration><Rule><Status>Enabled</Status><Destination><Bucket>arn:cosmostore:s3::backup</Bucket></Destination></Rule></ReplicationConfiguration>".bytes(),
+        ).isErr(),
+        "no bucket",
+    )?;
+    // Failures: noted once each, the newest kept.
+    var a = Vector<u8>.create();
+    failuresWith("".bytes(), "k".bytes(), [1u8; 16], mut a)!;
+    var b = Vector<u8>.create();
+    failuresWith(a.view(), "k".bytes(), [1u8; 16], mut b)!;
+    Check.equalBytes(a.view(), b.view())?;
+    Check.isTrue(
+        failuresHave(b.view(), "k".bytes(), [1u8; 16]) && !failuresHave(b.view(), "k".bytes(), [2u8; 16]),
+        "have",
+    )?;
+    Check.isTrue(isFailuresValue(b.view()) && !isFailuresValue(b.view()[0..b.length - 1]), "valid")?;
+    var many = Vector<u8>.create();
+    for (i in 0..1005) {
+        var id = [0u8; 16];
+        id[0] = truncate<u8>(i);
+        id[1] = truncate<u8>(i / 256);
+        var next = Vector<u8>.create();
+        failuresWith(many.view(), "k".bytes(), id, mut next)!;
+        many = next;
+    }
+    Check.equalU64(1000, many.view().readLE<u16>(1) as u64)?;
+    Check.isTrue(!failuresHave(many.view(), "k".bytes(), [0u8; 16]), "the oldest dropped")?;
+    return Ok();
+}

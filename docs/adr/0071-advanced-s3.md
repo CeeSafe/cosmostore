@@ -1,6 +1,6 @@
 # ADR-0071: Advanced S3, the plan of M7
 
-**Status:** proposed, 16 Nov 2026, for M7, which the owner started ("Go ahead start M7").
+**Status:** accepted, 16 Nov 2026 (the owner: "Yes, accept ADR-0071 to 0077"); proposed the same day for M7, which the owner started ("Go ahead start M7").
 
 ## Context
 

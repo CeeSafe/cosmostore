@@ -265,7 +265,14 @@ copies new versions of `photos` to `photos-backup` on the same server (ADR-0077)
   that is down) holds replication too. `FAILED` means the destination refused the replica (it was deleted, or lost
   its versioning): see the server's log; such versions are not retried.
 - **Not replicated:** objects that were there before the rule, version removals, replicas themselves. Destinations on
-  other servers, tag filters and a cluster's S3 port are not done yet.
+  other servers are in the next paragraph; tag filters and a cluster's S3 port are not done yet.
+
+**To another S3 endpoint:** `serve --replication-targets targets` with lines of `<id> <url> <access key> <secret key>
+[region]` (keep the file like the credentials file), and a rule's destination
+`arn:cosmostore:s3::<id>:<bucket>`. Replicas go there as PUTs or multipart uploads with the same parts, so ETags
+match (not for SSE-KMS); SSE-S3 and SSE-KMS objects are sent decrypted and sealed there with SSE-S3, so use an
+`https://` URL; SSE-C objects are refused. The replica gets that endpoint's own version id. A refusal (403, 404...)
+marks the version `FAILED` and shows in the log; an unreachable endpoint holds the outbox until it is back.
 
 ## Rate limits
 

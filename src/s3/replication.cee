@@ -82,12 +82,26 @@ fn parseReplication(xml: Slice<u8>) -> Result<Vector<ReplicationRule>, S3Fail> {
             null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
         };
         let _ = rawElement(destination, "Bucket", mut arn)?;
+        // A bucket here (`arn:aws:s3:::<bucket>`), or on another endpoint of `--replication-targets`
+        // (`arn:cosmostore:s3::<target>:<bucket>`, kept as `<target>:<bucket>`, ADR-0077 §6).
         let arnPrefix = "arn:aws:s3:::".bytes();
+        let remotePrefix = "arn:cosmostore:s3::".bytes();
         let bare = trimBlank(arn.view());
-        if (!startsWithBytes(bare, arnPrefix) || bare.length == arnPrefix.length) {
+        if (startsWithBytes(bare, arnPrefix) && bare.length > arnPrefix.length) {
+            let name = bare[arnPrefix.length..];
+            if (isRemoteDestination(name)) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            rule.destination.extend(name)?;
+        } else if (startsWithBytes(bare, remotePrefix)) {
+            let rest = bare[remotePrefix.length..];
+            let colon = pieceEnd(rest, 0, ':');
+            if (colon == 0 || colon + 1 >= rest.length || !targetIdOk(rest[0..colon]) ||
+                isRemoteDestination(rest[colon + 1..])) {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
+            rule.destination.extend(rest)?;
+        } else {
             return Err(S3Fail.Code(S3Code.InvalidArgument));
         }
-        rule.destination.extend(bare[arnPrefix.length..])?;
         for (i in 0..rules.length) {
             if (rules[i].id.view() == rule.id.view()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
         }
@@ -113,7 +127,10 @@ fn replicationXml(rules: Slice<ReplicationRule>, out: borrow mut Vector<u8>) -> 
         xmlTextElement(out, "Status", if (r.enabled) "Enabled".bytes() else "Disabled".bytes())?;
         out.extend("<DeleteMarkerReplication><Status>".bytes())?;
         out.extend(if (r.deleteMarkers) "Enabled".bytes() else "Disabled".bytes())?;
-        out.extend("</Status></DeleteMarkerReplication><Destination><Bucket>arn:aws:s3:::".bytes())?;
+        out.extend("</Status></DeleteMarkerReplication><Destination><Bucket>".bytes())?;
+        out.extend(
+            if (isRemoteDestination(r.destination.view())) "arn:cosmostore:s3::".bytes() else "arn:aws:s3:::".bytes(),
+        )?;
         appendXmlEscaped(out, r.destination.view())?;
         out.extend("</Bucket></Destination></Rule>".bytes())?;
     }
@@ -162,6 +179,17 @@ async fn putBucketReplication(
         }
         for (i in 0..rules.length) {
             let name = StringView.fromUtf8(rules[i].destination.view()) ?? "";
+            // Another endpoint's: its target must be one `serve` was given (ADR-0077 §6).
+            if (isRemoteDestination(rules[i].destination.view())) {
+                let d = rules[i].destination.view();
+                let id = d[0..pieceEnd(d, 0, ':')];
+                var known = false;
+                for (t in 0..app.replicationTargetIds.length) {
+                    if (app.replicationTargetIds[t].view() == id) { known = true; }
+                }
+                if (!known) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                continue;
+            }
             if (rules[i].destination.view() == source.bytes()) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
             match (store.versioningState(name)) {
                 Ok(v) => {

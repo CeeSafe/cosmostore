@@ -89,3 +89,87 @@ fn replicationTarget(destination: Slice<u8>) -> Result<Vector<u8>, AllocError> {
 }
 
 fn isReplicationTarget(target: Slice<u8>) -> bool => target.length > 1 && target[0] == REPLICATION_TARGET;
+
+/// A source bucket's replications that a remote destination refused (ADR-0077 §7): its newest 1,000, each its key
+/// and version id, so that their status is FAILED, also after a restart.
+const BUCKET_CONFIG_REPLICATION_FAILURES: u8 = 17;
+const MAX_REPLICATION_FAILURES: usize = 1000;
+
+/// Whether a destination is on another endpoint: `<target id>:<bucket>` (a bucket's name has no `:`).
+fn isRemoteDestination(destination: Slice<u8>) -> bool {
+    for (c in destination) {
+        if (c == ':') { return true; }
+    }
+    return false;
+}
+
+/// Failures v1: u8 version, u16 count, then per failure the key (u16+bytes) and the 16-byte version id.
+fn failuresWith(
+    stored: Slice<u8>,
+    key: Slice<u8>,
+    versionId: [u8; 16],
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    var keys = Vector<Vector<u8>>.create();
+    var ids = Vector<[u8; 16]>.create();
+    if (stored.length >= 3 && stored[0] == 1) {
+        let n = stored.readLE<u16>(1) as usize;
+        var at: usize = 3;
+        for (i in 0..n) {
+            let k = match (readText16(stored, mut at)) {
+                Ok(k) => k,
+                Err(_) => { break; }
+            };
+            if (at + 16 > stored.length) { break; }
+            var id = [0u8; 16];
+            for (j in 0..16) { id[j] = stored[at + j]; }
+            at += 16;
+            if (k.view() == key && id[..] == versionId[..]) { continue; }
+            keys.push(k)?;
+            ids.push(id)?;
+        }
+    }
+    keys.push(copyBytes(key)?)?;
+    ids.push(versionId)?;
+    let from = if (keys.length > MAX_REPLICATION_FAILURES) keys.length - MAX_REPLICATION_FAILURES else 0;
+    out.push(1)?;
+    out.pushLE(truncate<u16>(keys.length - from))?;
+    for (i in from..keys.length) {
+        pushText16(out, keys[i].view())?;
+        out.extend(ids[i][..])?;
+    }
+    return Ok();
+}
+
+fn failuresHave(stored: Slice<u8>, key: Slice<u8>, versionId: [u8; 16]) -> bool {
+    if (stored.length < 3 || stored[0] != 1) { return false; }
+    let n = stored.readLE<u16>(1) as usize;
+    var at: usize = 3;
+    for (i in 0..n) {
+        let k = match (readText16(stored, mut at)) {
+            Ok(k) => k,
+            Err(_) => { return false; }
+        };
+        if (at + 16 > stored.length) { return false; }
+        if (k.view() == key && stored[at..at + 16] == versionId[..]) { return true; }
+        at += 16;
+    }
+    return false;
+}
+
+fn isFailuresValue(value: Slice<u8>) -> bool {
+    if (value.length == 0) { return true; }
+    if (value.length < 3 || value[0] != 1) { return false; }
+    let n = value.readLE<u16>(1) as usize;
+    if (n > MAX_REPLICATION_FAILURES) { return false; }
+    var at: usize = 3;
+    for (i in 0..n) {
+        match (readText16(value, mut at)) {
+            Ok(_) => {}
+            Err(_) => { return false; }
+        }
+        if (at + 16 > value.length) { return false; }
+        at += 16;
+    }
+    return at == value.length;
+}

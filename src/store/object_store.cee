@@ -150,6 +150,8 @@ struct BucketInfo {
     accessPoints: Vector<u8>;
     /// Its replication rules (ADR-0077), as stored; empty for none.
     replication: Vector<u8>;
+    /// The replications a remote destination refused (ADR-0077 §7), as stored; empty for none.
+    replicationFailures: Vector<u8>;
     /// The bucket's tags (canonical, as object tags are) and lifecycle rules (`encodeLifecycle`); empty for none
     /// (ADR-0020).
     tags: Vector<u8>;
@@ -883,6 +885,7 @@ fn applyRecord(
                 inventory: Vector<u8>.create(),
                 accessPoints: Vector<u8>.create(),
                 replication: Vector<u8>.create(),
+                replicationFailures: Vector<u8>.create(),
                 tags: Vector<u8>.create(),
                 lifecycle: Vector<u8>.create(),
                 versioning: VERSIONING_OFF,
@@ -948,6 +951,8 @@ fn applyRecord(
                         b.accessPoints = value;
                     } else if (configKind == BUCKET_CONFIG_REPLICATION) {
                         b.replication = value;
+                    } else if (configKind == BUCKET_CONFIG_REPLICATION_FAILURES) {
+                        b.replicationFailures = value;
                     } else {
                         b.versioning = value[0]; // one valid byte: `decodeBucketConfigMeta` checked it
                     }
@@ -3580,10 +3585,15 @@ struct ObjectStore {
         lsn: u64,
     ) -> Result<u8, StoreError> {
         let k = BucketKey { name: copyBytes(bucket)? };
-        let blob = match (this.state.buckets.get(borrow k)) {
-            Some(b) => copyBytes(b.replication.view())?,
+        var blob = Vector<u8>.create();
+        var failures = Vector<u8>.create();
+        match (this.state.buckets.get(borrow k)) {
+            Some(b) => {
+                blob = copyBytes(b.replication.view())?;
+                failures = copyBytes(b.replicationFailures.view())?;
+            }
             null => { return Ok(REPLICATION_NONE); }
-        };
+        }
         let rules = match (decodeReplication(blob.view())) {
             Ok(r) => r,
             Err(_) => { return Ok(REPLICATION_NONE); }
@@ -3594,6 +3604,12 @@ struct ObjectStore {
             if (!replicationTakes(borrow rules[i], EVENT_PUT, key)) { continue; }
             taken = true;
             let destination = rules[i].destination.view();
+            // Another endpoint's: done unless refused, which is noted (ADR-0077 §7).
+            if (isRemoteDestination(destination)) {
+                if (failuresHave(failures.view(), key, versionId)) { return Ok(REPLICATION_FAILED); }
+                if (lsn > this.state.outbox.cursor) { missing = true; }
+                continue;
+            }
             if (!this.state.hasBucket(destination)?) {
                 missing = true;
                 continue;
@@ -3604,6 +3620,19 @@ struct ObjectStore {
         if (!taken) { return Ok(REPLICATION_NONE); }
         if (!missing) { return Ok(REPLICATION_COMPLETED); }
         return Ok(if (lsn > this.state.outbox.cursor) REPLICATION_PENDING else REPLICATION_FAILED);
+    }
+
+    /// Notes that a remote destination refused a version's replica (ADR-0077 §7).
+    fn noteReplicationFailure(
+        borrow mut this,
+        bucket: StringView,
+        key: Slice<u8>,
+        versionId: [u8; 16],
+    ) -> Result<void, StoreError> {
+        let stored = this.bucketConfig(bucket, BUCKET_CONFIG_REPLICATION_FAILURES)?;
+        var next = Vector<u8>.create();
+        failuresWith(stored.view(), key, versionId, mut next)?;
+        return this.setBucketConfig(bucket, BUCKET_CONFIG_REPLICATION_FAILURES, next.view());
     }
 
     fn accessPointBucketCount(borrow this) -> u64 {
@@ -5669,7 +5698,12 @@ struct ObjectStore {
         if (kind == BUCKET_CONFIG_INVENTORY && !isInventoryValue(value)) { return Err(StoreError.InvalidKey); }
         if (kind == BUCKET_CONFIG_ACCESS_POINTS && !isAccessPointsValue(value)) { return Err(StoreError.InvalidKey); }
         if (kind == BUCKET_CONFIG_REPLICATION && !isReplicationValue(value)) { return Err(StoreError.InvalidKey); }
-        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_REPLICATION) { return Err(StoreError.InvalidKey); }
+        if (kind == BUCKET_CONFIG_REPLICATION_FAILURES && !isFailuresValue(value)) {
+            return Err(StoreError.InvalidKey);
+        }
+        if (kind < BUCKET_CONFIG_TAGS || kind > BUCKET_CONFIG_REPLICATION_FAILURES) {
+            return Err(StoreError.InvalidKey);
+        }
         // Object lock needs versioning enabled, keeps it so, and is never taken off a bucket (ADR-0047 §1).
         let locks = this.lockConfigOf(bucket.bytes())?.length > 0;
         if (kind == BUCKET_CONFIG_OBJECT_LOCK) {
@@ -5711,6 +5745,7 @@ struct ObjectStore {
                 if (kind == BUCKET_CONFIG_INVENTORY) { return Ok(copyBytes(b.inventory.view())?); }
                 if (kind == BUCKET_CONFIG_ACCESS_POINTS) { return Ok(copyBytes(b.accessPoints.view())?); }
                 if (kind == BUCKET_CONFIG_REPLICATION) { return Ok(copyBytes(b.replication.view())?); }
+                if (kind == BUCKET_CONFIG_REPLICATION_FAILURES) { return Ok(copyBytes(b.replicationFailures.view())?); }
                 Ok(copyBytes(if (kind == BUCKET_CONFIG_TAGS) b.tags.view() else b.lifecycle.view())?)
             }
             null => Err(StoreError.NoSuchBucket),

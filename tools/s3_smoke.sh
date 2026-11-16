@@ -8,7 +8,7 @@ bin=$(cd "$(dirname "${1:-out/cosmostore}")" && pwd)/$(basename "${1:-out/cosmos
 port=${2:-9311}
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
-trap 'kill "$server" "$hook" "${limited:-}" 2>/dev/null; rm -rf "$work"' EXIT
+trap 'kill "$server" "$hook" "${limited:-}" "${remote:-}" 2>/dev/null; rm -rf "$work"' EXIT
 
 export AWS_ACCESS_KEY_ID=AKIASMOKETEST0000001
 export AWS_SECRET_ACCESS_KEY=smoke/secret/0123456789abcdefghijkl
@@ -33,8 +33,12 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 # SSE-KMS's keys (ADR-0055): the first is the default.
 printf 'app-default %s\norders %s\n' "$(head -c 32 /dev/urandom | base64)" "$(head -c 32 /dev/urandom | base64)" > "$work/kms.keys"
+# Replication to another endpoint (ADR-0077 §6): a second server, with keys of its own, as `far`.
+remoteport=$((port + 3))
+echo "AKIAFARSERVER0000001 far/secret/0123456789abcdefghij" > "$work/far.credentials"
+printf 'far http://127.0.0.1:%s AKIAFARSERVER0000001 far/secret/0123456789abcdefghij\n' "$remoteport" > "$work/replication.targets"
 start_server() {
-    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 --website-domain web.localhost --inventory-day-seconds 3 --sts-key-file "$work/sts.keys" --roles-file "$work/roles" 2>> "$work/server.log" &
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 --website-domain web.localhost --inventory-day-seconds 3 --sts-key-file "$work/sts.keys" --roles-file "$work/roles" --replication-targets "$work/replication.targets" 2>> "$work/server.log" &
     server=$!
     sleep 1
 }
@@ -970,6 +974,48 @@ check "a replica is not replicated back" "$(aws s3api list-object-versions --buc
 aws s3api delete-bucket-replication --bucket rdst > /dev/null 2>&1
 aws s3api delete-bucket-replication --bucket rsrc > /dev/null 2>&1
 check "delete-bucket-replication" "$(code s3api get-bucket-replication --bucket rsrc)" ReplicationConfigurationNotFoundError
+# To the second server: plaintext and ETags, as a PUT or a multipart upload with the source's parts.
+printf 'far1 %s\n' "$(head -c 32 /dev/urandom | base64)" > "$work/far.keys"
+"$bin" serve "$work/far" "$remoteport" "$work/far.credentials" --sse-key-file "$work/far.keys" 2>> "$work/far.log" &
+remote=$!
+sleep 1
+far() { AWS_ACCESS_KEY_ID=AKIAFARSERVER0000001 AWS_SECRET_ACCESS_KEY=far/secret/0123456789abcdefghij AWS_ENDPOINT_URL="http://127.0.0.1:$remoteport" aws "$@"; }
+far s3api create-bucket --bucket faraway > /dev/null 2>&1
+far s3api put-bucket-versioning --bucket faraway --versioning-configuration Status=Enabled > /dev/null 2>&1
+check "an unknown target" "$(code s3api put-bucket-replication --bucket rsrc --replication-configuration '{"Role":"r","Rules":[{"ID":"far","Priority":1,"Status":"Enabled","Filter":{"Prefix":""},"DeleteMarkerReplication":{"Status":"Enabled"},"Destination":{"Bucket":"arn:cosmostore:s3::nobody:faraway"}}]}')" InvalidArgument
+aws s3api put-bucket-replication --bucket rsrc --replication-configuration '{"Role":"r","Rules":[{"ID":"far","Priority":1,"Status":"Enabled","Filter":{"Prefix":"f/"},"DeleteMarkerReplication":{"Status":"Enabled"},"Destination":{"Bucket":"arn:cosmostore:s3::far:faraway"}},{"ID":"lost","Priority":2,"Status":"Enabled","Filter":{"Prefix":"lost/"},"DeleteMarkerReplication":{"Status":"Disabled"},"Destination":{"Bucket":"arn:cosmostore:s3::far:nobucket"}}]}' > /dev/null 2>&1 && pass "put-bucket-replication to another endpoint" || fail "put-bucket-replication to another endpoint"
+aws s3api put-object --bucket rsrc --key f/small.txt --body r1.txt --metadata colour=blue > /dev/null 2>&1
+aws s3 cp r2.bin s3://rsrc/f/multi.bin > /dev/null 2>&1
+aws s3api put-object --bucket rsrc --key f/sealed.txt --body r1.txt --server-side-encryption aws:kms > /dev/null 2>&1
+for k in f/small.txt f/multi.bin f/sealed.txt; do
+    replicated "$k" && pass "$k replicated far" || fail "$k replicated far"
+    # SSE-KMS's ETag is not its plaintext's MD5, which the copy sealed there by SSE-S3 has (ADR-0077 §6).
+    [ "$k" != f/sealed.txt ] && check "$k's ETag there" "$(far s3api head-object --bucket faraway --key "$k" --query ETag --output text 2>&1)" "$(aws s3api head-object --bucket rsrc --key "$k" --query ETag --output text 2>&1)"
+    check "$k is a replica there" "$(far s3api head-object --bucket faraway --key "$k" --query ReplicationStatus --output text 2>&1)" REPLICA
+done
+check "its metadata there" "$(far s3api head-object --bucket faraway --key f/small.txt --query Metadata.colour --output text 2>&1)" blue
+check "the multipart replica's bytes there" "$(far s3 cp s3://faraway/f/multi.bin - 2>/dev/null | cmp -s - r2.bin && echo same)" same
+check "the sealed one's plaintext there" "$(far s3 cp s3://faraway/f/sealed.txt - 2>&1)" "replicate me"
+check "sealed there by its own keys" "$(far s3api head-object --bucket faraway --key f/sealed.txt --query ServerSideEncryption --output text 2>&1)" AES256
+aws s3api delete-object --bucket rsrc --key f/small.txt > /dev/null 2>&1
+for i in $(seq 1 40); do
+    got=$(far s3api list-object-versions --bucket faraway --prefix f/small.txt --query 'length(DeleteMarkers)' --output text 2>/dev/null)
+    [ "$got" = 1 ] && break
+    sleep 0.25
+done
+check "a delete marker there" "$got" 1
+aws s3api put-object --bucket rsrc --key lost/x.txt --body r1.txt > /dev/null 2>&1
+for i in $(seq 1 40); do
+    st=$(aws s3api head-object --bucket rsrc --key lost/x.txt --query ReplicationStatus --output text 2>/dev/null)
+    [ "$st" = FAILED ] && break
+    sleep 0.25
+done
+check "a destination that refuses: FAILED" "$st" FAILED
+kill "$server"; wait "$server" 2>/dev/null; start_server
+check "FAILED after a restart" "$(aws s3api head-object --bucket rsrc --key lost/x.txt --query ReplicationStatus --output text 2>&1)" FAILED
+check "COMPLETED after a restart" "$(aws s3api head-object --bucket rsrc --key f/multi.bin --query ReplicationStatus --output text 2>&1)" COMPLETED
+aws s3api delete-bucket-replication --bucket rsrc > /dev/null 2>&1
+kill "$remote"
 for b in rsrc rdst; do
     for kind in Versions DeleteMarkers; do
         aws s3api list-object-versions --bucket $b --query "$kind[].[Key,VersionId]" --output text | while read -r k v; do
@@ -992,6 +1038,9 @@ for i in $(seq 1 60); do
     sleep 0.25
 done
 check "a report is written" "$([ -n "$m" ] && [ "$m" != "None" ] && echo yes)" yes
+# No more reports while this one is read: with a 3-second day, the next would land in the same minute's folder.
+aws s3api delete-bucket-inventory-configuration --bucket smoke --id daily > /dev/null 2>&1
+sleep 1
 aws s3 cp "s3://smokelogs/$m" manifest.json > /dev/null 2>&1
 aws s3 cp "s3://smokelogs/${m%manifest.json}manifest.checksum" manifest.checksum > /dev/null 2>&1
 check "its manifest's checksum" "$(cat manifest.checksum)" "$(python3 -c 'import hashlib; print(hashlib.md5(open("manifest.json","rb").read()).hexdigest())')"
@@ -1000,7 +1049,6 @@ aws s3 cp "s3://smokelogs/$data" data.csv.gz > /dev/null 2>&1
 rows=$(python3 -c 'import gzip; print(len(gzip.open("data.csv.gz").read().decode().splitlines()))')
 check "its CSV, gzip, a row per object" "$rows" "$(aws s3api list-objects-v2 --bucket smoke --query 'length(Contents)' --output text)"
 check "rows name the bucket, the key, the size and the ETag" "$(python3 -c 'import gzip,csv; r=list(csv.reader(gzip.open("data.csv.gz","rt"))); print(len(r[0]), r[0][0])')" "4 smoke"
-aws s3api delete-bucket-inventory-configuration --bucket smoke --id daily > /dev/null 2>&1
 check "deleted" "$(code s3api get-bucket-inventory-configuration --bucket smoke --id daily)" NoSuchConfiguration
 
 # Static website hosting (ADR-0073): <bucket>.web.localhost is the bucket's website, anonymous, GET and HEAD.
