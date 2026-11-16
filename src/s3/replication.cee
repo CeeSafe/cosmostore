@@ -161,7 +161,6 @@ async fn putBucketReplication(
     auth: Authenticated,
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
-    if (app.cluster) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
     let xml = await readSmallBody(auth, exchange, 1048576)?;
     verifySmallBody(req, xml.view(), true)?;
     let rules = parseReplication(xml.view())?;
@@ -195,6 +194,11 @@ async fn putBucketReplication(
                 Ok(v) => {
                     if (v != VERSIONING_ENABLED) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
                 }
+                // On a cluster, a bucket of another shard: its replicas are refused there, if it is not one, and the
+                // versions read FAILED (ADR-0078 §4).
+                Err(StoreError.NoSuchBucket) => {
+                    if (!app.cluster) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+                }
                 Err(_) => { return Err(S3Fail.Code(S3Code.InvalidRequest)); } // no such destination
             }
         }
@@ -203,7 +207,9 @@ async fn putBucketReplication(
             Ok() => {}
             Err(e) => { return Err(storeFail(e, 0)); }
         }
-        app.replicationBuckets.store(store.replicationBucketCount());
+        // On a cluster the count stays at "some": the record is applied later, and another leader's writes reach the
+        // store without passing here (ADR-0060).
+        if (!app.cluster) { app.replicationBuckets.store(store.replicationBucketCount()); }
     }
     await exchange.send(Status.ok(), "".bytes())?;
     return Ok();
@@ -217,7 +223,7 @@ async fn deleteBucketReplication(
     await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_REPLICATION, "".bytes())?;
     {
         var guard = await lockStore(app)?;
-        app.replicationBuckets.store(guard.data().replicationBucketCount());
+        if (!app.cluster) { app.replicationBuckets.store(guard.data().replicationBucketCount()); }
     }
     await exchange.send(Status.noContent(), "".bytes())?;
     return Ok();

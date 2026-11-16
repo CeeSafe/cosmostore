@@ -319,6 +319,38 @@ fn replicaHeaders(
     return Ok();
 }
 
+fn pushPair(out: borrow mut Vector<HeaderPair>, name: Slice<u8>, value: Slice<u8>) -> bool => match (remotePair(
+    name,
+    value,
+)) {
+    Ok(p) => out.push(p).isOk(),
+    Err(_) => false,
+};
+
+/// A replica PUT's own fields (ADR-0078 §4): the source's version id, MD5, part count, and its extras when they are
+/// short enough for a header.
+fn fidelityHeaders(v: borrow ObjectInfo, out: borrow mut Vector<HeaderPair>) -> bool {
+    var id = Vector<u8>.create();
+    var md5 = Vector<u8>.create();
+    var parts = Vector<u8>.create();
+    var extras = Vector<u8>.create();
+    let made = appendVersionId(mut id, v.versionId).isOk() && appendHexBytes(mut md5, v.md5[..]).isOk() &&
+        appendDecimal(mut parts, v.parts as u64).isOk() && appendBase64(mut extras, v.extras.view()).isOk();
+    if (!made) { return false; }
+    if (!pushPair(
+        out,
+        REPLICA_VERSION_FIELD.bytes(),
+        id.view(),
+    ) || !pushPair(out, REPLICA_MD5_FIELD.bytes(), md5.view()) ||
+        !pushPair(out, REPLICA_PARTS_FIELD.bytes(), parts.view())) {
+        return false;
+    }
+    if (extras.length > 0 && extras.length <= REPLICA_EXTRAS_MOST) {
+        return pushPair(out, REPLICA_EXTRAS_FIELD.bytes(), extras.view());
+    }
+    return true;
+}
+
 /// Replicates one event to `<target>:<bucket>` on another endpoint (ADR-0077 §6). True when done or refused for
 /// good (then noted, so the version reads FAILED); false to try again later.
 async fn replicateRemote(
@@ -338,7 +370,7 @@ async fn replicateRemote(
     let src = StringView.fromUtf8(e.bucket.view()) ?? "";
     let key = StringView.fromUtf8(e.key.view()) ?? "";
     let outcome = match (target) {
-        Some(i) => await sendRemote(store, ctx, client, borrow ctx.targets[i], e, src, key, bucket),
+        Some(i) => await sendRemote(store, ctx, client, borrow ctx.targets[i], e, src, key, bucket, false),
         null => RemoteOutcome.Refused, // a target the file no longer has
     };
     return match (outcome) {
@@ -373,13 +405,23 @@ async fn sendRemote(
     src: StringView,
     key: StringView,
     bucket: Slice<u8>,
+    fidelity: bool,
 ) -> RemoteOutcome {
     var path = Vector<u8>.create();
     if (remotePath(bucket, key.bytes(), mut path).isErr()) { return RemoteOutcome.Again; }
-    // A delete marker: a DELETE, which makes one there.
+    // A delete marker: a DELETE, which makes one there; with fidelity, one with the source marker's id.
     if (e.kind == EVENT_MARKER) {
         var none = NoBody {};
-        let extra = Vector<HeaderPair>.create();
+        var extra = Vector<HeaderPair>.create();
+        if (fidelity) {
+            var id = Vector<u8>.create();
+            let added = appendVersionId(mut id, e.versionId).isOk() && pushPair(
+                mut extra,
+                REPLICA_VERSION_FIELD.bytes(),
+                id.view(),
+            );
+            if (!added) { return RemoteOutcome.Again; }
+        }
         return match (await remoteCall(client, t, Method.Delete, path.view(), "".bytes(), extra.view(), mut none)) {
             Ok(a) => outcomeOf(a.status),
             Err(_) => RemoteOutcome.Again,
@@ -458,6 +500,16 @@ async fn sendRemote(
     };
     var headers = Vector<HeaderPair>.create();
     if (replicaHeaders(borrow v, sealed, mut headers).isErr()) { return RemoteOutcome.Again; }
+    // With fidelity (a CosmoStore that takes them, ADR-0078 §4): one PUT with the source's id, MD5, parts and
+    // extras, written as the source version is.
+    if (fidelity) {
+        if (!fidelityHeaders(borrow v, mut headers)) { return RemoteOutcome.Again; }
+        body.left = v.size;
+        return match (await remoteCall(client, t, Method.Put, path.view(), "".bytes(), headers.view(), mut body)) {
+            Ok(a) => if (body.broken) RemoteOutcome.Again else outcomeOf(a.status),
+            Err(_) => RemoteOutcome.Again,
+        };
+    }
     // One PUT, or a multipart upload with the source's parts, so the ETag is the source's.
     if (v.parts == 0 || extras.partSizes.length != v.parts as usize) {
         body.left = v.size;

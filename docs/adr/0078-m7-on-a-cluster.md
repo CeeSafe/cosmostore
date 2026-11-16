@@ -1,6 +1,6 @@
 # ADR-0078: M7 on a cluster
 
-**Status:** proposed, 16 Nov 2026, after M7 (ADR-0071 to ADR-0077, accepted), on the owner's "continue". §2 and §3 are built; §4 is built for event notifications (steps 1 and 2), designed for the rest.
+**Status:** proposed, 16 Nov 2026, after M7 (ADR-0071 to ADR-0077, accepted), on the owner's "continue". §2 and §3 are built; §4 is built for event notifications and replication (steps 1 to 3), designed for access logs and inventory.
 
 ## Context
 
@@ -44,17 +44,30 @@
      bucket of the same cluster may belong to another shard, so the delivery task sends them as signed S3 requests to
      its node's own front (with the first key of the node's credentials), which routes, forwards and commits them
      like any client's. Webhooks and remote replication targets are as on `serve`.
-   - **A replica keeps its version id across shards:** a PUT (or a completed upload) with
-     `x-cosmo-replica-version: <id>` and `x-cosmo-replica-md5: <hex>`, signed by a long-term key of the credentials,
-     is written by `putReplica` (ADR-0077 §3), so a cluster-local replica, and a replica sent to another CosmoStore,
-     keeps its source's id and ETag. The front already strips `x-cosmo-` fields from clients' requests; the shard's S3
-     server takes them only from a signed long-term key.
+   - **A replica keeps its version id across shards:** a PUT with `x-cosmo-replica-version: <id>`,
+     `x-cosmo-replica-md5: <hex>`, `x-cosmo-replica-parts: <n>` and, when its base64 is at most 8 KiB,
+     `x-cosmo-replica-extras` (the source's checksums and part sizes), is written by `putReplica` (ADR-0077 §3); a
+     DELETE with `x-cosmo-replica-version` by `putReplicaMarker`. The shard's S3 server takes these fields only when
+     they are among the request's signed headers and a long-term key signed it (not a session's, never anonymous):
+     AccessDenied otherwise. The front strips every other `x-cosmo-` field from clients' requests and lets these
+     through. A single PUT's body must have the MD5 it names (BadDigest). A multipart source goes as one PUT: its
+     ETag and parts are the source's, and with its extras so are its part numbers; one over 5 GiB is refused, so it
+     reads FAILED. Its body is a client's, unsealed: a destination that seals is refused (a cluster has no SSE keys,
+     and SSE-C sources cannot be opened by the delivery task, so they read FAILED).
    - **Built so far:** step 1, the record (`OutboxDelivered`, type 19; a raft replica's cursor at open derived from
      its checkpoint, so no new checkpoint format); step 2, webhooks: `cosmostore node --notify-targets` (its shards'
      S3 servers take rules naming them), and a delivery loop on every node that, for each shard it leads, delivers a
      batch, stages and proposes the record behind the shard's gate, and waits for it to be applied before the next
-     batch (else it would find the same events still waiting and send them again).
-   - **Status** on a cluster reads the cursor the shard's records moved, so it is the same on every replica.
+     batch (else it would find the same events still waiting and send them again); step 3, replication:
+     `cosmostore node --replication-targets` as `serve`'s; a replica into a bucket of the cluster goes to the node's
+     own front (its listening address, loopback for an unspecified one), signed with the current first key that is
+     not revoked; another endpoint's as on `serve`. A replica refused for good, by either, is noted behind the
+     shard's gate, so the version reads FAILED. PutBucketReplication on a cluster cannot see a destination of another
+     shard: it is taken, and refused at delivery if it is not a bucket with versioning.
+   - **Status** on a cluster reads the cursor the shard's records moved, so it is the same on every replica. A
+     destination of another shard counts as another endpoint's does: COMPLETED once delivered, FAILED if noted.
+     The S3 server's count of buckets with replication stays at "some" on a cluster, as the policy counts do: the
+     configuration's record is applied after the response, so a count taken then was 0 and hid every status.
    - **Tests:** a store fault sweep of the new record and the checkpoint's cursor; the cluster smoke delivering a
      webhook, an access log, an inventory report and replicas (same shard, another shard) through every node; the
      chaos harness with webhooks and replication on, killing leaders mid-delivery: every event delivered at least
@@ -62,6 +75,11 @@
 5. **Until its slice**, a feature keeps refusing on a cluster as it does now.
 
 ## Consequences
+
+- Slice c, step 3: `replicaFieldsOnlySignedByAKey`; the cluster smoke replicates a PUT and a two-part upload to a
+  bucket of another shard (id, ETag, bytes, part 2 by number, REPLICA), a delete marker with its id, a PUT to
+  "another endpoint" (node 1's front) with its ETag and metadata, reads COMPLETED through every node, and FAILED
+  through every node for a destination that refuses.
 
 - Slice c, steps 1 and 2: `outboxDeliveredOnEveryReplica`, `clusterOutboxFaults{Once,Sticky,Torn,Crash}`; the
   cluster smoke sets a notification rule through one node, writes through all three, gets each event once, in order,

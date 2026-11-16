@@ -1,0 +1,49 @@
+// A replica's fields (ADR-0078 §4) are taken only signed, from a long-term key.
+
+fn replicaRequest(signed: StringView) -> S3Request {
+    var req = bareRequest();
+    var auth = textOf("AWS4-HMAC-SHA256 Credential=AKIA/20261117/us-east-1/s3/aws4_request, SignedHeaders=");
+    let _ = auth.append(signed);
+    let _ = auth.append(", Signature=00");
+    req.headers.push(policyHeader("authorization", auth.view()))!;
+    req.headers.push(policyHeader(REPLICA_VERSION_FIELD, "00000000000000000000000000000001"))!;
+    req.headers.push(policyHeader(REPLICA_MD5_FIELD, "0123456789abcdef0123456789ABCDEF"))!;
+    return req;
+}
+
+fn keyed(key: usize?) -> Authenticated =>
+    Authenticated { payload: PayloadMode.Unsigned, signer: null, key: key, session: null };
+
+fn denied(r: Result<ReplicaAsk?, S3Fail>) -> bool => match (r) {
+    Err(S3Fail.Code(S3Code.AccessDenied)) => true,
+    _ => false,
+};
+
+@test
+fn replicaFieldsOnlySignedByAKey() -> Result<void, TestFailure> {
+    let key = keyed(Some(0));
+    let anonymous = keyed(null);
+    let both = "host;x-amz-date;x-cosmo-replica-md5;x-cosmo-replica-version";
+    // Signed, by a key: the source's id and MD5.
+    let req = replicaRequest(both);
+    let asked = replicaAsked(borrow req, borrow key)!!;
+    Check.equalU64(0, asked.parts as u64)?;
+    Check.equalU64(0x01, asked.md5[0] as u64)?;
+    Check.equalU64(0xEF, asked.md5[15] as u64)?;
+    Check.isTrue(asked.extras.isNull(), "no extras sent")?;
+    // Anonymous: refused, never a client's PUT.
+    Check.isTrue(denied(replicaAsked(borrow req, borrow anonymous)), "anonymous")?;
+    // A field the signature does not cover could have been added on the way.
+    let unsigned = replicaRequest("host;x-amz-date;x-cosmo-replica-md5");
+    Check.isTrue(denied(replicaAsked(borrow unsigned, borrow key)), "the version not signed")?;
+    let noMd5 = replicaRequest("host;x-amz-date;x-cosmo-replica-version");
+    Check.isTrue(denied(replicaAsked(borrow noMd5, borrow key)), "the MD5 not signed")?;
+    // A name only part of a signed one is not it.
+    let prefix = replicaRequest("host;x-cosmo-replica-md5;x-cosmo-replica-versions");
+    Check.isTrue(denied(replicaAsked(borrow prefix, borrow key)), "a longer name")?;
+    // Without the field, a client's PUT.
+    var plain = bareRequest();
+    plain.headers.push(policyHeader("authorization", "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=00"))!;
+    Check.isTrue(replicaAsked(borrow plain, borrow key)!.isNull(), "not a replica")?;
+    return Ok();
+}

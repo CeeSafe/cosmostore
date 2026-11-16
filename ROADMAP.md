@@ -2779,4 +2779,12 @@ Browser form uploads with a SigV4 POST policy.
   delivers each shard it leads, then proposes `OutboxDelivered` behind the shard's gate and waits for it to apply
   (without that wait the first smoke run got each event two to four times). The cluster smoke (48 checks): events
   written through three nodes delivered once each, in order; the shard's leader killed, the next one delivers.
+- **Slice c, step 3 (replication on a cluster):** `cosmostore node --replication-targets`; a replica into a bucket of
+  the cluster goes through the node's own front as a signed PUT (or DELETE, for a marker) with
+  `x-cosmo-replica-version`/`-md5`/`-parts`/`-extras`, which a shard's S3 server takes only signed by a long-term key,
+  and writes with `putReplica`; another endpoint's as on `serve`. Found by the smoke: the S3 server's count of
+  buckets with replication was taken before the configuration's record applied, so it was 0 on a cluster and hid
+  every status; it now stays at "some", as the policy counts do. The cluster smoke (64 checks): replicas in another
+  shard with their ids, ETags and part numbers, a delete marker, another endpoint, COMPLETED and FAILED through every
+  node.
 

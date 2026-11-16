@@ -273,7 +273,7 @@ copies new versions of `photos` to `photos-backup` on the same server (ADR-0077)
   that is down) holds replication too. `FAILED` means the destination refused the replica (it was deleted, or lost
   its versioning): see the server's log; such versions are not retried.
 - **Not replicated:** objects that were there before the rule, version removals, replicas themselves. Destinations on
-  other servers are in the next paragraph; tag filters and a cluster's S3 port are not done yet.
+  other servers are in the next paragraph; tag filters are not done yet.
 
 **To another S3 endpoint:** `serve --replication-targets targets` with lines of `<id> <url> <access key> <secret key>
 [region]` (keep the file like the credentials file), and a rule's destination
@@ -281,6 +281,12 @@ copies new versions of `photos` to `photos-backup` on the same server (ADR-0077)
 match (not for SSE-KMS); SSE-S3 and SSE-KMS objects are sent decrypted and sealed there with SSE-S3, so use an
 `https://` URL; SSE-C objects are refused. The replica gets that endpoint's own version id. A refusal (403, 404...)
 marks the version `FAILED` and shows in the log; an unreachable endpoint holds the outbox until it is back.
+
+**On a cluster** (ADR-0078 §4): give every `cosmostore node` the same `--replication-targets` file (or none). Each
+shard's leader sends its replicas; one into a bucket of the cluster goes through that node's own S3 port, signed with
+the first key of the credentials file, so keep that key there and not revoked. Replicas keep their source's id and
+ETag across shards. A destination in another shard is not checked when the rule is put: a wrong one shows as `FAILED`.
+Objects over 5 GiB, and SSE-C objects, are not replicated within a cluster (`FAILED`).
 
 ## Rate limits
 

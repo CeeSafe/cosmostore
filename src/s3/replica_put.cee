@@ -1,0 +1,202 @@
+// A replica written with its source's version id and ETag (ADR-0078 §4): a PUT, or a DELETE for a delete marker,
+// with `x-cosmo-replica-version`, signed by a long-term key. A cluster's delivery task sends these to its node's own
+// front, so a replica in another shard keeps its id as one on the same server does (ADR-0077 §3).
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+/// The source version's id, as S3 writes a version id.
+const REPLICA_VERSION_FIELD: StringView = "x-cosmo-replica-version";
+/// Its MD5, 32 hex digits: the whole body's for a single PUT, the parts' digest for a multipart upload.
+const REPLICA_MD5_FIELD: StringView = "x-cosmo-replica-md5";
+/// Its part count, 0 for a single PUT.
+const REPLICA_PARTS_FIELD: StringView = "x-cosmo-replica-parts";
+/// Its stored extras (checksums, part sizes), base64; left out when longer than this, and then the replica's are a
+/// single PUT's (its id and ETag are still the source's).
+const REPLICA_EXTRAS_FIELD: StringView = "x-cosmo-replica-extras";
+const REPLICA_EXTRAS_MOST: usize = 8192;
+
+/// What a replica PUT asks for.
+struct ReplicaAsk {
+    versionId: [u8; 16];
+    md5: [u8; 16];
+    parts: u32;
+    extras: Vector<u8>?;
+}
+
+/// 32 hex digits as 16 bytes.
+fn hex16(text: Slice<u8>) -> [u8; 16]? {
+    if (text.length != 32) { return null; }
+    var out = [0u8; 16];
+    for (i in 0..16) {
+        let high = hexValue(text[2 * i]) ?? 0xFF;
+        let low = hexValue(text[2 * i + 1]) ?? 0xFF;
+        if (high == 0xFF || low == 0xFF) { return null; }
+        out[i] = high * 16 + low;
+    }
+    return Some(out);
+}
+
+/// Whether the request's SigV4 Authorization header lists `name` among its signed headers: a field that is not signed
+/// could have been added on the way.
+fn headerSigned(req: borrow S3Request, name: StringView) -> bool {
+    let auth = match (headerOf(req, "authorization")) {
+        Some(a) => a,
+        null => { return false; }
+    };
+    let marker = "SignedHeaders=".bytes();
+    let at = match (findBytes(auth, marker, 0)) {
+        Some(a) => a + marker.length,
+        null => { return false; }
+    };
+    var end = at;
+    while (end < auth.length && auth[end] != ',' && auth[end] != ' ') { end += 1; }
+    let list = auth[at..end];
+    var p: usize = 0;
+    while (p <= list.length) {
+        let q = pieceEnd(list, p, ';');
+        if (list[p..q] == name.bytes()) { return true; }
+        p = q + 1;
+    }
+    return false;
+}
+
+/// The replica's version id, if the request carries one: only from a long-term key (not a session's), and signed;
+/// AccessDenied otherwise, never a write as a client's.
+fn replicaVersionAsked(req: borrow S3Request, auth: borrow Authenticated) -> Result<[u8; 16]?, S3Fail> {
+    let text = match (headerOf(req, REPLICA_VERSION_FIELD)) {
+        Some(t) => t,
+        null => { return Ok(null); }
+    };
+    if (auth.key.isNull() || auth.session.isSome() || !headerSigned(req, REPLICA_VERSION_FIELD)) {
+        return Err(S3Fail.Code(S3Code.AccessDenied));
+    }
+    return match (parseVersionId(trimSpaces(text))) {
+        Some(id) => Ok(Some(id)),
+        null => Err(S3Fail.Code(S3Code.InvalidArgument)),
+    };
+}
+
+/// A replica PUT's fields, or null for a client's PUT.
+fn replicaAsked(req: borrow S3Request, auth: borrow Authenticated) -> Result<ReplicaAsk?, S3Fail> {
+    let id = match (replicaVersionAsked(req, auth)?) {
+        Some(i) => i,
+        null => { return Ok(null); }
+    };
+    if (!headerSigned(req, REPLICA_MD5_FIELD)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    let md5 = match (hex16(trimSpaces(headerOf(req, REPLICA_MD5_FIELD) ?? "".bytes()))) {
+        Some(m) => m,
+        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    };
+    var parts = 0u32;
+    match (headerOf(req, REPLICA_PARTS_FIELD)) {
+        Some(t) => {
+            if (!headerSigned(req, REPLICA_PARTS_FIELD)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+            let n = parseDecimal(trimSpaces(t)) ?? 0xFFFFFFFF;
+            if (n > 10000) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            parts = truncate<u32>(n);
+        }
+        null => {}
+    }
+    var extras: Vector<u8>? = null;
+    match (headerOf(req, REPLICA_EXTRAS_FIELD)) {
+        Some(t) => {
+            if (!headerSigned(req, REPLICA_EXTRAS_FIELD)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+            var raw = Vector<u8>.create();
+            if (!decodeBase64(trimSpaces(t), mut raw)? || decodeExtras(raw.view()).isErr()) {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
+            extras = Some(raw);
+        }
+        null => {}
+    }
+    return Ok(Some(ReplicaAsk { versionId: id, md5: md5, parts: parts, extras: extras }));
+}
+
+/// Writes a replica PUT with `putReplica` (ADR-0077 §3): its body as a client's, unsealed (it is a sealed source's
+/// plaintext, and a bucket that seals refuses it), its metadata the request's, its id, MD5 and parts the source's.
+/// A version with that id already there is answered as written.
+async fn putReplicaObject(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    ask: ReplicaAsk,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    match (await sseAskedFor(app, req)?) {
+        SseRequest.None => {}
+        _ => { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    }
+    var spec = bodySpec(req, borrow auth)?;
+    var contentType = String.create();
+    contentTypeOf(req, mut contentType)?;
+    let metadata = metadataOf(req)?;
+    let writer = await startPutObject(app, req.bucket.view(), spec.size)?;
+    let storeAs = match (spec.checksumKind) {
+        ChecksumAlgorithm.None => ChecksumAlgorithm.Crc64Nvme,
+        _ => spec.checksumKind,
+    };
+    let body = await receiveBody(app, auth, mut spec, writer, exchange, storeAs, null)?;
+    // A single PUT's MD5 is its body's: one that differs is not the source's bytes.
+    if (ask.parts == 0 && body.finished.md5 != ask.md5) {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let refused = borrow body.finished;
+        // Its extents are removed: on a worker thread.
+        await Async.blocking(() => store.discardFinished(refused));
+        return Err(S3Fail.Code(S3Code.BadDigest));
+    }
+    var extras = Vector<u8>.create();
+    match (borrow ask.extras) {
+        Some(x) => { extras.extend(x.view())?; }
+        null => { singlePartExtras(body.storedAlgorithm, body.stored.view(), mut extras)?; }
+    }
+    let bucket = req.bucket.view();
+    let key = req.key.view();
+    let id = ask.versionId;
+    let md5 = ask.md5;
+    let parts = ask.parts;
+    let ct = contentType.view();
+    let meta = metadata.view();
+    let x = extras.view();
+    let finished = borrow body.finished;
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        match (await Async.blocking(() => store.putReplica(bucket, key, id, md5, parts, ct, meta, x, finished))) {
+            Ok(_) => {}
+            Err(e) => { return Err(storeFail(e, key.length)); }
+        }
+    }
+    versionHeader(exchange, "x-amz-version-id", id)?;
+    var etag = Vector<u8>.create();
+    appendEtag(mut etag, borrow md5, parts)?;
+    exchange.header("etag", etag.view())?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+/// A replicated delete marker: a DELETE with the source marker's id makes one with that id (ADR-0077 §3).
+async fn deleteReplica(
+    app: borrow S3App,
+    req: borrow S3Request,
+    id: [u8; 16],
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    if (req.hasParam("versionId")) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    let bucket = req.bucket.view();
+    let key = req.key.view();
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        match (await Async.blocking(() => store.putReplicaMarker(bucket, key, id))) {
+            Ok(_) => {}
+            Err(e) => { return Err(storeFail(e, key.length)); }
+        }
+    }
+    versionHeader(exchange, "x-amz-version-id", id)?;
+    exchange.header("x-amz-delete-marker", "true".bytes())?;
+    await exchange.send(Status.noContent(), "".bytes())?;
+    return Ok();
+}

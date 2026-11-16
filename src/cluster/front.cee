@@ -125,6 +125,10 @@ struct NodeS3Setup {
     websiteDomain: Vector<u8>;
     /// The notification targets file's text (ADR-0078 §4).
     notifyTargetsText: Vector<u8>;
+    /// The replication targets file's text (ADR-0078 §4), wiped once the node has opened: it holds secrets.
+    replicationTargetsText: Vector<u8>;
+    /// The node's own front, `http://<address>`: where its delivery task sends replicas into the cluster's buckets.
+    frontUrl: Vector<u8>;
 }
 
 /// What a shard's S3 server needs that the node gives it: its store, the node's credentials, STS's keys and roles.
@@ -175,11 +179,24 @@ fn clusterS3App(
         accessLog: null,
         loggingBuckets: AtomicU64.create(0),
         accessPointBuckets: AtomicU64.create(0),
-        replicationBuckets: AtomicU64.create(0),
-        replicationTargetIds: Vector<Vector<u8>>.create(),
+        // "Some", for good, as policies are.
+        replicationBuckets: AtomicU64.create(1),
+        replicationTargetIds: replicationTargetIdsOf(sts.replicationTargetsText.view())?,
         rates: RateLimiter.create(0, 0)?,
         cluster: true,
     });
+}
+
+/// The ids of a replication targets file's endpoints (checked when the node started).
+fn replicationTargetIdsOf(text: Slice<u8>) -> Result<Vector<Vector<u8>>, AllocError> {
+    var ids = Vector<Vector<u8>>.create();
+    match (parseReplicationTargets(text)?) {
+        Some(targets) => {
+            for (i in 0..targets.length) { ids.push(copyBytes(targets[i].id.view())?)?; }
+        }
+        null => {}
+    }
+    return Ok(ids);
 }
 
 async fn frontPause(ms: u64) -> bool {
@@ -998,9 +1015,11 @@ impl Handler<FrontApp> for FrontHandler {
         }
         let fields = request.headers();
         for (i in 0..fields.count()) {
-            // The cluster's own headers are the nodes' to set: a client's go (ADR-0068 §1).
+            // The cluster's own headers are the nodes' to set: a client's go (ADR-0068 §1). A replica's fields pass:
+            // the shard's S3 server takes them only signed, by a long-term key (ADR-0078 §4).
             let name = fields.nameBytes(i);
-            if (name.length >= 8 && Ascii.equalsIgnoringCase(name[0..8], "x-cosmo-")) { continue; }
+            let replicaField = name.length >= 16 && Ascii.equalsIgnoringCase(name[0..16], "x-cosmo-replica-");
+            if (!replicaField && name.length >= 8 && Ascii.equalsIgnoringCase(name[0..8], "x-cosmo-")) { continue; }
             if (raw.addHeader(name, fields.value(i)).isErr()) { return Err(HandlerError.Internal); }
         }
         // A write's request id (ADR-0068 §1): the node's prefix, then its count of requests.

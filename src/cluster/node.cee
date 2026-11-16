@@ -62,6 +62,13 @@ struct NodeShared {
     websiteDomain: Vector<u8>;
     /// `--notify-targets` (ADR-0078 §4): the webhooks this node's leaders deliver to.
     notifyTargets: Vector<NotifyTarget>;
+    /// `--replication-targets` (ADR-0078 §4): the other endpoints replicas go to (no SSE keys: a cluster seals
+    /// nothing).
+    replication: ReplicaContext;
+    /// The node's front and its credentials: a replica into a bucket of the cluster goes through the front, signed
+    /// with the current first key, as a client's write.
+    frontUrl: Vector<u8>;
+    credentials: Arc<CredentialSets>?;
     /// Scrub (ADR-0063): how often a pass starts, and what passes found: versions checked, damage found, records
     /// repaired from a replica, extents fetched (a damaged one removed comes back this way, as a missing one does).
     scrubEveryMs: u64;
@@ -287,6 +294,19 @@ fn openNode(
             Ok(Some(t)) => t,
             _ => { return Err(textOf("the notification targets file needs lines of `<id> <http or https url>`")); }
         },
+        replication: ReplicaContext {
+            targets: match (parseReplicationTargets(sts.replicationTargetsText.view())) {
+                Ok(Some(t)) => t,
+                _ => { return Err(textOf("the replication targets file cannot be read again")); }
+            },
+            sseKeys: Vector<MasterKey>.create(),
+            kmsKeys: Vector<MasterKey>.create(),
+        },
+        frontUrl: match (copyBytes(sts.frontUrl.view())) {
+            Ok(u) => u,
+            Err(_) => { return Err(textOf("out of memory")); }
+        },
+        credentials: credentials,
         requests: AtomicU64.create(0),
         scrubEveryMs: scrubEveryMs,
         codeAfterMs: codeAfterMs,
@@ -303,6 +323,25 @@ fn appendHex2(s: borrow mut String, v: u32) -> Result<void, AllocError> {
     var b = [digits[((v >> 4) & 0xF) as usize], digits[(v & 0xF) as usize]];
     s.append(StringView.fromUtf8(b[..])!)?;
     return Ok();
+}
+
+/// Where this node reaches its own front: its listening address, or loopback for one that listens on every address.
+fn ownFrontAddress(a: SocketAddress) -> SocketAddress {
+    return match (a) {
+        SocketAddress.V4(ip, port) => if (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0) SocketAddress.V4(
+            [127u8, 0, 0, 1],
+            port,
+        ) else a,
+        SocketAddress.V6(ip, port, scope) => {
+            var any = true;
+            for (i in 0..16) {
+                if (ip[i] != 0) { any = false; }
+            }
+            var loopback = [0u8; 16];
+            loopback[15] = 1;
+            if (any) SocketAddress.V6(loopback, port, scope) else a
+        }
+    };
 }
 
 /// `a.b.c.d:port` or `[v6]:port`.
@@ -1079,7 +1118,38 @@ fn nodeCommand() -> i32 {
         rolesText: Vector<u8>.create(),
         websiteDomain: Vector<u8>.create(),
         notifyTargetsText: Vector<u8>.create(),
+        replicationTargetsText: Vector<u8>.create(),
+        frontUrl: Vector<u8>.create(),
     };
+    {
+        var url = textOf("http://");
+        if (appendPeerAddress(mut url, ownFrontAddress(frontAddress)).isErr() || sts.frontUrl.extend(
+            url.view().bytes(),
+        ).isErr()) {
+            return 1;
+        }
+    }
+    match (borrow args.replicationTargets) {
+        Some(path) => {
+            sts.replicationTargetsText = match (readSmallFile(path.view(), "replication targets file")) {
+                Ok(t) => t,
+                Err(message) => {
+                    Console.writeErrorLine(message.view());
+                    return 1;
+                }
+            };
+            match (parseReplicationTargets(sts.replicationTargetsText.view())) {
+                Ok(Some(_)) => {}
+                _ => {
+                    Console.writeErrorLine(
+                        "cosmostore: the replication targets file needs lines of `<id> <http or https url> <access key> <secret key> [region]`, each id once",
+                    );
+                    return 1;
+                }
+            }
+        }
+        null => {}
+    }
     match (borrow args.notifyTargets) {
         Some(path) => {
             sts.notifyTargetsText = match (readSmallFile(path.view(), "notification targets file")) {
@@ -1162,6 +1232,8 @@ fn nodeCommand() -> i32 {
             return 1;
         }
     };
+    // The replication targets' secrets: parsed, so the text goes.
+    for (i in 0..sts.replicationTargetsText.length) { sts.replicationTargetsText[i] = 0; }
     let withS3 = parts.internals.length > 0;
     let arc = match (Arc<NodeShared>.create(parts.shared)) {
         Ok(a) => a,
@@ -1237,6 +1309,8 @@ struct ClusterArguments {
     websiteDomain: String?;
     /// The webhooks event notifications go to (ADR-0078 §4).
     notifyTargets: String?;
+    /// The other endpoints replication goes to (ADR-0078 §4).
+    replicationTargets: String?;
     /// How an empty directory starts (ADR-0066): the cluster's formation, or joining it.
     init: bool;
     join: bool;
@@ -1256,6 +1330,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var roles: String? = null;
     var websiteDomain: String? = null;
     var notifyTargets: String? = null;
+    var replicationTargets: String? = null;
     var init = false;
     var join = false;
     var at = from;
@@ -1300,6 +1375,8 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             websiteDomain = Some(textOf(value));
         } else if (option == "--notify-targets") {
             notifyTargets = Some(textOf(value));
+        } else if (option == "--replication-targets") {
+            replicationTargets = Some(textOf(value));
         } else if (option == "--scrub-seconds") {
             scrubSeconds = value.parseInt<u64>();
             if (scrubSeconds.isNull() || (scrubSeconds ?? 0) == 0) { return null; }
@@ -1324,6 +1401,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 roles: roles,
                 websiteDomain: websiteDomain,
                 notifyTargets: notifyTargets,
+                replicationTargets: replicationTargets,
                 init: init,
                 join: join,
             }),

@@ -36,8 +36,13 @@ async fn deliverShard(
     for (i in 0..events.length) {
         let e = borrow events[i];
         for (t in 0..e.targets.length) {
-            // Replication is refused on a cluster until its step (ADR-0078 §4): no event has such a target yet.
-            if (isReplicationTarget(e.targets[t].view())) { continue; }
+            if (isReplicationTarget(e.targets[t].view())) {
+                if (!(await replicateOnCluster(shared, slot, client, e, e.targets[t].view()[1..])?)) {
+                    batch.failed = true;
+                    break;
+                }
+                continue;
+            }
             let url = match (targetUrl(shared.notifyTargets.view(), e.targets[t].view())) {
                 Some(u) => u,
                 null => { continue; } // a target the file no longer has
@@ -86,6 +91,108 @@ async fn deliverShard(
         waited += FRONT_POLL_MS;
     }
     return Ok(batch);
+}
+
+/// Where a replica into a bucket of the cluster goes: the node's own front, signed with the current first key that is
+/// not revoked. Null without credentials (no S3 on this node, so no events either).
+fn selfTarget(shared: borrow NodeShared) -> Result<ReplicationTarget?, AllocError> {
+    let sets = match (borrow shared.credentials) {
+        Some(c) => c,
+        null => { return Ok(null); }
+    };
+    let keys = sets.get().view();
+    for (i in 0..keys.length) {
+        if (keys[i].revoked) { continue; }
+        return Ok(Some(ReplicationTarget {
+            id: copyBytes("self".bytes())?,
+            url: copyBytes(shared.frontUrl.view())?,
+            accessKey: copyBytes(keys[i].accessKey.view())?,
+            secret: copyBytes(keys[i].secret.view())?,
+            region: copyBytes("us-east-1".bytes())?,
+        }));
+    }
+    return Ok(null);
+}
+
+/// One replication target of an event (ADR-0078 §4): a bucket of the cluster, through the node's own front with the
+/// source's id and ETag (the bucket may be another shard's); another endpoint, as on `serve` (ADR-0077 §6). True when
+/// done, or refused for good (then noted behind the shard's gate, so the version reads FAILED); false to try again.
+async fn replicateOnCluster(
+    shared: borrow NodeShared,
+    slot: borrow ShardSlot,
+    client: borrow Client,
+    e: borrow OutboxEvent,
+    destination: Slice<u8>,
+) -> Result<bool, NodeFault> {
+    let src = StringView.fromUtf8(e.bucket.view()) ?? "";
+    let key = StringView.fromUtf8(e.key.view()) ?? "";
+    var outcome = RemoteOutcome.Refused; // a target the file no longer has
+    if (isRemoteDestination(destination)) {
+        let colon = pieceEnd(destination, 0, ':');
+        let targetId = destination[0..colon];
+        let bucket = destination[colon + 1..];
+        for (i in 0..shared.replication.targets.length) {
+            if (shared.replication.targets[i].id.view() != targetId) { continue; }
+            outcome = await sendRemote(
+                borrow slot.store,
+                borrow shared.replication,
+                client,
+                borrow shared.replication.targets[i],
+                e,
+                src,
+                key,
+                bucket,
+                false,
+            );
+        }
+    } else {
+        let front = match (selfTarget(shared)) {
+            Ok(t) => t,
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        };
+        match (front) {
+            Some(t) => {
+                outcome = await sendRemote(
+                    borrow slot.store,
+                    borrow shared.replication,
+                    client,
+                    borrow t,
+                    e,
+                    src,
+                    key,
+                    destination,
+                    true,
+                );
+            }
+            null => {}
+        }
+    }
+    match (outcome) {
+        RemoteOutcome.Done => { return Ok(true); }
+        RemoteOutcome.Again => { return Ok(false); }
+        RemoteOutcome.Refused => {}
+    }
+    let _ = await AsyncConsole.writeError("cosmostore: a replica was refused by its destination: ");
+    let _ = await AsyncConsole.writeError(src);
+    let _ = await AsyncConsole.writeError("/");
+    let _ = await AsyncConsole.writeError(key);
+    let _ = await AsyncConsole.writeError("\n");
+    // A record of the shard's log, as the delivery record is: behind the gate the leader's writes pass, and proposed
+    // with that record (or the next write).
+    var gate = match (await slot.gate.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let _held = gate.data();
+    var guard = match (await slot.store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let st = guard.data();
+    let id = e.versionId;
+    let k = e.key.view();
+    // Not noted (the journal failed): tried again, rather than reported done.
+    return Ok((await Async.blocking(() => st.noteReplicationFailure(src, k, id))).isOk());
 }
 
 struct DeliveredBatch {

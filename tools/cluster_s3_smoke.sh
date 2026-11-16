@@ -62,6 +62,8 @@ hookport=$((BASE + 40))
 python3 -I "$OLDPWD/tools/webhook.py" "$hookport" "$WORK/hook.out" &
 PIDS[9]=$!
 printf 'hook http://127.0.0.1:%s/events\n' "$hookport" > targets
+# Replication to "another endpoint" (ADR-0078 §4): node 1's own front stands in for one.
+printf 'far http://127.0.0.1:%s %s %s\n' "$((BASE + 11))" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" > reptargets
 # STS (ADR-0078 §2): the same token keys and roles on every node.
 printf 'sts1 %s\n' "$(head -c 32 /dev/urandom | base64)" > sts.keys
 cat > roles <<'ROLES'
@@ -69,7 +71,7 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --notify-targets targets >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --notify-targets targets --replication-targets reptargets >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -201,6 +203,52 @@ for n in 1 2 3; do
     check "the site through node $n" "$(curl -s -w ' %{http_code}' -H "Host: site.web.localhost:$port" "http://127.0.0.1:$port/")" "home 200"
 done
 check "its error document" "$(curl -s -w ' %{http_code}' -H "Host: site.web.localhost:$((BASE + 13))" "http://127.0.0.1:$((BASE + 13))/nothing")" "oops 404"
+
+# Replication on a cluster (ADR-0078 §4): the source's shard's leader sends each replica through its node's front, to
+# a bucket of another shard, with the source's version id and ETag; or to another endpoint.
+shardOf() { python3 -c 'import hashlib,sys; d=hashlib.sha256(bytes.fromhex("00c1a55e5e0c1a55")+sys.argv[1].encode()).digest(); print(int.from_bytes(d[:8],"big") % 8)' "$1"; }
+rdst=""
+for c in rdst rdst1 rdst2 rdst3 rdst4 rdst5 rdst6 rdst7; do [ "$(shardOf "$c")" != "$(shardOf rsrc)" ] && { rdst=$c; break; }; done
+on 1 s3api create-bucket --bucket rsrc > /dev/null 2>&1
+on 2 s3api create-bucket --bucket "$rdst" > /dev/null 2>&1
+on 3 s3api create-bucket --bucket faraway > /dev/null 2>&1
+n=1
+for b in rsrc "$rdst" faraway; do on "$n" s3api put-bucket-versioning --bucket "$b" --versioning-configuration Status=Enabled > /dev/null 2>&1; n=$((n % 3 + 1)); done
+rconf='{"Role":"r","Rules":[{"ID":"here","Priority":1,"Status":"Enabled","Filter":{"Prefix":"r/"},"DeleteMarkerReplication":{"Status":"Enabled"},"Destination":{"Bucket":"arn:aws:s3:::RDST"}},{"ID":"far","Priority":2,"Status":"Enabled","Filter":{"Prefix":"f/"},"DeleteMarkerReplication":{"Status":"Enabled"},"Destination":{"Bucket":"arn:cosmostore:s3::far:faraway"}},{"ID":"lost","Priority":3,"Status":"Enabled","Filter":{"Prefix":"lost/"},"DeleteMarkerReplication":{"Status":"Disabled"},"Destination":{"Bucket":"arn:cosmostore:s3::far:nobucket"}}]}'
+on 3 s3api put-bucket-replication --bucket rsrc --replication-configuration "${rconf/RDST/$rdst}" > /dev/null 2>&1 && pass "put-bucket-replication through node 3 (to $rdst, shard $(shardOf "$rdst"); the source's is $(shardOf rsrc))" || fail "put-bucket-replication through node 3"
+printf 'replicate me' > r1.txt
+head -c 9437184 /dev/urandom > r2.bin
+on 1 s3api put-object --bucket rsrc --key r/small.txt --body r1.txt > /dev/null 2>&1
+on 2 s3 cp r2.bin s3://rsrc/r/multi.bin > /dev/null 2>&1
+on 3 s3api put-object --bucket rsrc --key f/small.txt --body r1.txt --metadata colour=blue > /dev/null 2>&1
+on 1 s3api put-object --bucket rsrc --key lost/x.txt --body r1.txt > /dev/null 2>&1
+status_of() { on "$1" s3api head-object --bucket rsrc --key "$2" --query ReplicationStatus --output text 2>/dev/null; }
+replicated() {
+    for i in $(seq 1 80); do [ "$(status_of 3 "$1")" = COMPLETED ] && return 0; pause 0.25; done
+    return 1
+}
+for k in r/small.txt r/multi.bin; do
+    replicated "$k" && pass "$k replicated" || fail "$k replicated: $(status_of 3 "$k")"
+    sv=$(on 1 s3api head-object --bucket rsrc --key "$k" --query '[VersionId,ETag]' --output text 2>&1)
+    check "$k keeps its version id and ETag, read through node 2" "$(on 2 s3api head-object --bucket "$rdst" --key "$k" --query '[VersionId,ETag]' --output text 2>&1)" "$sv"
+    check "$k is a replica" "$(on 3 s3api head-object --bucket "$rdst" --key "$k" --query ReplicationStatus --output text 2>&1)" REPLICA
+done
+check "the same status through every node" "$(status_of 1 r/multi.bin) $(status_of 2 r/multi.bin)" "COMPLETED COMPLETED"
+check "a multipart ETag" "$(on 1 s3api head-object --bucket "$rdst" --key r/multi.bin --query ETag --output text 2>&1 | grep -c -- '-2"')" 1
+check "the multipart replica's bytes" "$(on 3 s3 cp "s3://$rdst/r/multi.bin" - 2>/dev/null | cmp -s - r2.bin && echo same)" same
+check "its second part, by number" "$(on 2 s3api head-object --bucket "$rdst" --key r/multi.bin --part-number 2 --query ContentLength --output text 2>&1)" 1048576
+marker=$(on 2 s3api delete-object --bucket rsrc --key r/small.txt --query VersionId --output text 2>&1)
+for i in $(seq 1 40); do
+    got=$(on 3 s3api list-object-versions --bucket "$rdst" --prefix r/small.txt --query 'DeleteMarkers[0].VersionId' --output text 2>/dev/null)
+    [ "$got" = "$marker" ] && break
+    pause 0.25
+done
+check "a delete marker replicated with its id" "$got" "$marker"
+replicated f/small.txt && pass "to another endpoint: replicated" || fail "to another endpoint: replicated: $(status_of 3 f/small.txt)"
+check "its ETag there" "$(on 2 s3api head-object --bucket faraway --key f/small.txt --query ETag --output text 2>&1)" "$(on 1 s3api head-object --bucket rsrc --key f/small.txt --query ETag --output text 2>&1)"
+check "its metadata there" "$(on 2 s3api head-object --bucket faraway --key f/small.txt --query Metadata.colour --output text 2>&1)" blue
+for i in $(seq 1 60); do [ "$(status_of 2 lost/x.txt)" = FAILED ] && break; pause 0.25; done
+check "a destination that refuses: FAILED, through every node" "$(status_of 1 lost/x.txt) $(status_of 2 lost/x.txt) $(status_of 3 lost/x.txt)" "FAILED FAILED FAILED"
 
 # Event notifications on a cluster (ADR-0078 §4): the shard's leader delivers, and a new one goes on.
 keys() { python3 -c 'import json,sys
