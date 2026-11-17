@@ -236,6 +236,10 @@ for k in r/small.txt r/multi.bin r/large.bin; do
     check "$k keeps its version id and ETag, read through node 2" "$(on 2 s3api head-object --bucket "$rdst" --key "$k" --query '[VersionId,ETag]' --output text 2>&1)" "$sv"
     check "$k is a replica" "$(on 3 s3api head-object --bucket "$rdst" --key "$k" --query ReplicationStatus --output text 2>&1)" REPLICA
 done
+# A client's replica fields (the M7 review's B2): only this node's own delivery may send them (its stamp); a client's
+# never reach the shard, so its signature over them fails, and no version takes the id it names.
+forged=$(python3 -I "$OLDPWD/tools/s3_raw.py" put-with "http://127.0.0.1:$((BASE + 12))" "$rdst" forged.txt "forged" x-cosmo-replica-version:0123456789abcdef0123456789abcdef x-cosmo-replica-md5:0123456789abcdef0123456789abcdef 2>&1)
+check "a client's replica fields are not taken" "$(echo "$forged" | awk '{print ($1 >= 400 || $2 != "0123456789abcdef0123456789abcdef") ? "refused" : "taken: " $0}')" refused
 check "the same status through every node" "$(status_of 1 r/multi.bin) $(status_of 2 r/multi.bin)" "COMPLETED COMPLETED"
 check "a multipart ETag" "$(on 1 s3api head-object --bucket "$rdst" --key r/multi.bin --query ETag --output text 2>&1 | grep -c -- '-2"')" 1
 check "the multipart replica's bytes" "$(on 3 s3 cp "s3://$rdst/r/multi.bin" - 2>/dev/null | cmp -s - r2.bin && echo same)" same

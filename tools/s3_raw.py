@@ -5,6 +5,9 @@ usage:
   s3_raw.py chunked-put  ENDPOINT BUCKET KEY FILE [CHUNK]   signed aws-chunked PUT (STREAMING-AWS4-HMAC-SHA256-PAYLOAD)
   s3_raw.py bad-chunk    ENDPOINT BUCKET KEY FILE           the same with one data byte changed: expects 403
   s3_raw.py abort-get    ENDPOINT BUCKET KEY BYTES          reads BYTES of a GET, then drops the connection
+  s3_raw.py put-with     ENDPOINT BUCKET KEY TEXT NAME:VALUE...
+                                                            a PUT of TEXT with these fields, signed: prints its status
+                                                            and version id (`-` for none)
   s3_raw.py presign      ENDPOINT METHOD BUCKET KEY SECONDS [SUBRESOURCE]
                                                             prints a presigned URL (query auth, ADR-0011), with
                                                             `?SUBRESOURCE` if one is given (`quota`, ADR-0052)
@@ -158,6 +161,20 @@ def presign(endpoint, method, bucket, key, seconds, subresource=None):
     return f"{endpoint}{path}?{query}&X-Amz-Signature={signature}"
 
 
+def put_with(endpoint, bucket, key, text, fields):
+    body = text.encode()
+    s, host = connect(endpoint)
+    path = f"/{bucket}/{urllib.parse.quote(key)}"
+    extra = dict(f.split(":", 1) for f in fields)
+    headers, *_ = authorize("PUT", host, path, extra, hashlib.sha256(body).hexdigest())
+    headers["content-length"] = str(len(body))
+    s.sendall((f"PUT {path} HTTP/1.1\r\n" + "".join(f"{n}: {v}\r\n" for n, v in headers.items())
+               + "connection: close\r\n\r\n").encode() + body)
+    status, got, _ = read_response(s)
+    s.close()
+    return status, got.get("x-amz-version-id", "-")
+
+
 def main():
     cmd = sys.argv[1]
     if cmd in ("chunked-put", "bad-chunk"):
@@ -168,6 +185,9 @@ def main():
             print(rest.decode(errors="replace"))
     elif cmd == "presign":
         print(presign(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], int(sys.argv[6]), sys.argv[7] if len(sys.argv) > 7 else None))
+    elif cmd == "put-with":
+        status, version = put_with(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:])
+        print(status, version)
     elif cmd == "abort-get":
         print(abort_get(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])))
     else:

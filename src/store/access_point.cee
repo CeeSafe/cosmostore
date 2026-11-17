@@ -14,13 +14,15 @@ struct AccessPoint {
     createdMs: i64;
     /// Its policy (JSON), empty for none.
     policy: Vector<u8>;
+    /// The account it was made under (`x-amz-account-id`); empty for one made before v2 (the M7 review's A5).
+    account: Vector<u8>;
 }
 
-/// Access points v1: u8 version, u16 count, then per access point the name, the alias (each u16+bytes), u8 block,
-/// i64 creation time, u32 policy length and the policy.
+/// Access points v2: u8 version, u16 count, then per access point the name, the alias (each u16+bytes), u8 block,
+/// i64 creation time, u32 policy length and the policy, and its account (u16+bytes; not in v1, which is still read).
 fn encodeAccessPoints(points: Slice<AccessPoint>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
     if (points.length == 0) { return Ok(); }
-    out.push(1)?;
+    out.push(2)?;
     out.pushLE(truncate<u16>(points.length))?;
     for (i in 0..points.length) {
         let p = borrow points[i];
@@ -30,6 +32,7 @@ fn encodeAccessPoints(points: Slice<AccessPoint>, out: borrow mut Vector<u8>) ->
         out.pushLE(p.createdMs)?;
         out.pushLE(truncate<u32>(p.policy.length))?;
         out.extend(p.policy.view())?;
+        pushText16(out, p.account.view())?;
     }
     return Ok();
 }
@@ -37,7 +40,9 @@ fn encodeAccessPoints(points: Slice<AccessPoint>, out: borrow mut Vector<u8>) ->
 fn decodeAccessPoints(b: Slice<u8>) -> Result<Vector<AccessPoint>, MetaFault> {
     var out = Vector<AccessPoint>.create();
     if (b.length == 0) { return Ok(out); }
-    if (b[0] != 1) { return Err(MetaFault.BadVersion); }
+    // v1 as first built; v2 adds each one's account.
+    let version = b[0];
+    if (version != 1 && version != 2) { return Err(MetaFault.BadVersion); }
     need(b, 1, 2)?;
     let n = b.readLE<u16>(1) as usize;
     if (n == 0 || n > MAX_ACCESS_POINTS) { return Err(MetaFault.TooLong); }
@@ -54,8 +59,16 @@ fn decodeAccessPoints(b: Slice<u8>) -> Result<Vector<AccessPoint>, MetaFault> {
         var policy = Vector<u8>.create();
         policy.extend(b[at..at + length])?;
         at += length;
+        let account = if (version >= 2) readText16(b, mut at)? else Vector<u8>.create();
         if (name.length == 0 || alias.length == 0) { return Err(MetaFault.TooLong); }
-        out.push(AccessPoint { name: name, alias: alias, block: block, createdMs: createdMs, policy: policy })?;
+        out.push(AccessPoint {
+            name: name,
+            alias: alias,
+            block: block,
+            createdMs: createdMs,
+            policy: policy,
+            account: account,
+        })?;
     }
     if (at != b.length) { return Err(MetaFault.TooLong); }
     return Ok(out);

@@ -26,25 +26,27 @@ fn replicaFieldsOnlySignedByAKey() -> Result<void, TestFailure> {
     let both = "host;x-amz-date;x-cosmo-replica-md5;x-cosmo-replica-version";
     // Signed, by a key: the source's id and MD5.
     let req = replicaRequest(both);
-    let asked = replicaAsked(borrow req, borrow key)!!;
+    let asked = replicaAsked(borrow req, borrow key, true)!!;
     Check.equalU64(0, asked.parts as u64)?;
     Check.equalU64(0x01, asked.md5[0] as u64)?;
     Check.equalU64(0xEF, asked.md5[15] as u64)?;
     Check.isTrue(asked.extras.isNull(), "no extras sent")?;
     // Anonymous: refused, never a client's PUT.
-    Check.isTrue(denied(replicaAsked(borrow req, borrow anonymous)), "anonymous")?;
+    Check.isTrue(denied(replicaAsked(borrow req, borrow anonymous, true)), "anonymous")?;
     // A field the signature does not cover could have been added on the way.
     let unsigned = replicaRequest("host;x-amz-date;x-cosmo-replica-md5");
-    Check.isTrue(denied(replicaAsked(borrow unsigned, borrow key)), "the version not signed")?;
+    Check.isTrue(denied(replicaAsked(borrow unsigned, borrow key, true)), "the version not signed")?;
     let noMd5 = replicaRequest("host;x-amz-date;x-cosmo-replica-version");
-    Check.isTrue(denied(replicaAsked(borrow noMd5, borrow key)), "the MD5 not signed")?;
+    Check.isTrue(denied(replicaAsked(borrow noMd5, borrow key, true)), "the MD5 not signed")?;
     // A name only part of a signed one is not it.
     let prefix = replicaRequest("host;x-cosmo-replica-md5;x-cosmo-replica-versions");
-    Check.isTrue(denied(replicaAsked(borrow prefix, borrow key)), "a longer name")?;
+    Check.isTrue(denied(replicaAsked(borrow prefix, borrow key, true)), "a longer name")?;
     // Without the field, a client's PUT.
     var plain = bareRequest();
     plain.headers.push(policyHeader("authorization", "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=00"))!;
-    Check.isTrue(replicaAsked(borrow plain, borrow key)!.isNull(), "not a replica")?;
+    Check.isTrue(replicaAsked(borrow plain, borrow key, true)!.isNull(), "not a replica")?;
+    // On `serve` no delivery sends them: refused, however signed (the M7 review's B2).
+    Check.isTrue(denied(replicaAsked(borrow req, borrow key, false)), "on serve")?;
     return Ok();
 }
 
@@ -55,12 +57,35 @@ fn logDeliveryOnlySignedByAKey() -> Result<void, TestFailure> {
     let anonymous = keyed(null);
     var signed = replicaRequest("host;x-amz-date;x-cosmo-log-delivery");
     signed.headers.push(policyHeader(LOG_DELIVERY_FIELD, "1"))!;
-    Check.isTrue(isLogDelivery(borrow signed, borrow key), "signed by a key")?;
-    Check.isTrue(!isLogDelivery(borrow signed, borrow anonymous), "anonymous")?;
+    Check.isTrue(isLogDelivery(borrow signed, borrow key, true), "signed by a key")?;
+    Check.isTrue(!isLogDelivery(borrow signed, borrow anonymous, true), "anonymous")?;
     var unsigned = replicaRequest("host;x-amz-date");
     unsigned.headers.push(policyHeader(LOG_DELIVERY_FIELD, "1"))!;
-    Check.isTrue(!isLogDelivery(borrow unsigned, borrow key), "not signed")?;
+    Check.isTrue(!isLogDelivery(borrow unsigned, borrow key, true), "not signed")?;
     let none = replicaRequest("host;x-amz-date;x-cosmo-log-delivery");
-    Check.isTrue(!isLogDelivery(borrow none, borrow key), "no field")?;
+    Check.isTrue(!isLogDelivery(borrow none, borrow key, true), "no field")?;
+    Check.isTrue(!isLogDelivery(borrow signed, borrow key, false), "on serve")?;
+    return Ok();
+}
+
+/// The stamp a node's delivery puts on its requests to its front: of the method, path, query and date, under the
+/// cluster's secret.
+@test
+fn internalStampsDiffer() -> Result<void, TestFailure> {
+    let k = "a cluster secret of some length".bytes();
+    let a = internalStamp(k, "PUT".bytes(), "/b/k".bytes(), "".bytes(), "20261117T120000Z".bytes())!;
+    Check.equalU64(64, a.length as u64)?;
+    let s1 = internalStamp(k, "PUT".bytes(), "/b/k".bytes(), "".bytes(), "20261117T120000Z".bytes())!;
+    Check.isTrue(a.view() == s1.view(), "the same")?;
+    let s2 = internalStamp(k, "PUT".bytes(), "/b/k2".bytes(), "".bytes(), "20261117T120000Z".bytes())!;
+    Check.isTrue(a.view() != s2.view(), "path")?;
+    let s3 = internalStamp(k, "DELETE".bytes(), "/b/k".bytes(), "".bytes(), "20261117T120000Z".bytes())!;
+    Check.isTrue(a.view() != s3.view(), "method")?;
+    let s4 = internalStamp(k, "PUT".bytes(), "/b/k".bytes(), "uploads=".bytes(), "20261117T120000Z".bytes())!;
+    Check.isTrue(a.view() != s4.view(), "query")?;
+    let s5 = internalStamp(k, "PUT".bytes(), "/b/k".bytes(), "".bytes(), "20261117T120001Z".bytes())!;
+    Check.isTrue(a.view() != s5.view(), "date")?;
+    let s6 = internalStamp("another".bytes(), "PUT".bytes(), "/b/k".bytes(), "".bytes(), "20261117T120000Z".bytes())!;
+    Check.isTrue(a.view() != s6.view(), "key")?;
     return Ok();
 }

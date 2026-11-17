@@ -13,7 +13,9 @@
 
 1. **The configurations** are a `BucketConfig` of kind 14 (checkpoint format 21), up to 1,000 a bucket:
    `PutBucketInventoryConfiguration`, `Get…`, `List…` and `Delete…` (`?inventory&id=`; `NoSuchConfiguration`). The
-   destination bucket must exist (InvalidArgument). **CSV only:** ORC, Parquet, the destination's encryption, and
+   destination bucket must exist (InvalidArgument); a destination's `AccountId` is NotImplemented (no accounts to
+   check it against), and `IsEnabled` is `true` or `false` (MalformedXML). **CSV only:** ORC, Parquet, the
+   destination's encryption, and
    optional fields other than `Size`, `LastModifiedDate`, `ETag`, `StorageClass` and `IsMultipartUploaded` are
    `NotImplemented`.
 2. **A report:** the source's versions under the filter (the current ones, or all with `VersionId`, `IsLatest`,

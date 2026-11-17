@@ -2821,3 +2821,9 @@ Browser form uploads with a SigV4 POST policy.
   in ADR-0078's code, the worst an access point's claim let go while it exists (B1 to B6); CI runs no cluster smoke.
   The review recommends fixing them before closing M7. The M7 ADRs' "refused on a cluster" lines now point to
   ADR-0078; the chaos checker reports a per-key search too large instead of stopping.
+- **The review's findings closed** (the owner: "continue"): STS refuses what it does not do (`PolicyArns` and the
+  rest); replication's `Priority` decides as AWS's and `StorageClass` is refused; inventory's `AccountId` refused and
+  `IsEnabled` strict; access points keep their account (v2). Access point claims are pending until made, confirmed
+  or abandoned by their create's token; the front lets replica and log-delivery fields through only on its node's
+  stamped requests (refused on `serve`); alias-shaped names cost no peer request; CI runs the cluster smoke. Tests:
+  319; the cluster smoke 98 checks. M7 can close on the owner's word.

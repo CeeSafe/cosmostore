@@ -245,6 +245,28 @@ fn formValue(body: Slice<u8>, name: StringView, out: borrow mut Vector<u8>) -> R
     return Ok(false);
 }
 
+/// The first parameter of a form body that the call does not take: AWS acts on `PolicyArns`, `Tags`,
+/// `TransitiveTagKeys`, `ExternalId`, `SerialNumber`, `TokenCode`, `SourceIdentity` and `ProvidedContexts`, which
+/// CosmoStore does not, so they are refused (NotImplemented), never taken and dropped: a session narrowed by
+/// `PolicyArns` would otherwise have its role's whole rights (the M7 review's A1). Null when every one is taken.
+fn stsParameterNotTaken(body: Slice<u8>, isRole: bool) -> Result<Vector<u8>?, AllocError> {
+    var at: usize = 0;
+    while (at < body.length) {
+        let end = pieceEnd(body, at, '&');
+        let pair = body[at..end];
+        let eq = pieceEnd(pair, 0, '=');
+        var name = Vector<u8>.create();
+        let _ = percentDecodeInto(mut name, pair[0..eq], true)?;
+        let n = name.view();
+        let taken = n.length == 0 || n == "Action".bytes() || n == "Version".bytes() ||
+            n == "DurationSeconds".bytes() || (isRole && (n == "RoleArn".bytes() ||
+            n == "RoleSessionName".bytes() || n == "Policy".bytes()));
+        if (!taken) { return Ok(Some(name)); }
+        at = end + 1;
+    }
+    return Ok(null);
+}
+
 /// `ASIA` and 16 of A-Z and 2-7, as AWS's temporary keys look.
 fn temporaryKeyId(out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
     var random = [0u8; 16];
@@ -333,6 +355,15 @@ async fn serveSts(
     }
     if (app.stsKeys.length == 0) {
         return await stsError(exchange, 501, "NotImplemented", "STS needs serve --sts-key-file.", requestId);
+    }
+    if ((stsParameterNotTaken(body.view(), isRole)?).isSome()) {
+        return await stsError(
+            exchange,
+            501,
+            "NotImplemented",
+            "A parameter of this call is not implemented (PolicyArns, Tags, ExternalId, MFA, SourceIdentity).",
+            requestId,
+        );
     }
     // Temporary credentials do not make more (ADR-0075 §1).
     if (auth.session.isSome()) {

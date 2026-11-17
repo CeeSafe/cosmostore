@@ -1060,12 +1060,40 @@ impl Handler<FrontApp> for FrontHandler {
             null => {}
         }
         let fields = request.headers();
+        // A request of this node's own delivery task (ADR-0078 §4) carries its stamp, under the cluster's secret: only
+        // then do a replica's fields and a log delivery's pass (the M7 review's B2, B3); the shard's S3 server takes
+        // them only signed by a long-term key as well.
+        var stampSent = Vector<u8>.create();
+        var amzDate = Vector<u8>.create();
         for (i in 0..fields.count()) {
-            // The cluster's own headers are the nodes' to set: a client's go (ADR-0068 §1). A replica's fields and a
-            // log delivery's pass: the shard's S3 server takes them only signed, by a long-term key (ADR-0078 §4).
             let name = fields.nameBytes(i);
-            let signedField = (name.length >= 16 && Ascii.equalsIgnoringCase(name[0..16], "x-cosmo-replica-")) ||
-                Ascii.equalsIgnoringCase(name, LOG_DELIVERY_FIELD);
+            if (Ascii.equalsIgnoringCase(name, INTERNAL_FIELD) && stampSent.extend(fields.value(i)).isErr()) {
+                return Err(HandlerError.Internal);
+            }
+            if (Ascii.equalsIgnoringCase(name, "x-amz-date") && amzDate.extend(fields.value(i)).isErr()) {
+                return Err(HandlerError.Internal);
+            }
+        }
+        var stamped = false;
+        if (stampSent.length > 0 && amzDate.length > 0) {
+            let t = raw.target.view();
+            let q = indexOfFrom(t, "?".bytes(), 0) ?? t.length;
+            let query = if (q < t.length) t[q + 1..] else t[t.length..];
+            stamped = match (internalStamp(shared.secret.view(), raw.method.view(), t[0..q], query, amzDate.view())) {
+                Ok(expected) => expected.length == stampSent.length && ConstantTime.equal(
+                    expected.view(),
+                    stampSent.view(),
+                ),
+                Err(_) => false,
+            };
+        }
+        for (i in 0..fields.count()) {
+            // The cluster's own headers are the nodes' to set: a client's go (ADR-0068 §1).
+            let name = fields.nameBytes(i);
+            let signedField = stamped && ((name.length >= 16 && Ascii.equalsIgnoringCase(
+                name[0..16],
+                "x-cosmo-replica-",
+            )) || Ascii.equalsIgnoringCase(name, LOG_DELIVERY_FIELD));
             if (!signedField && name.length >= 8 && Ascii.equalsIgnoringCase(name[0..8], "x-cosmo-")) { continue; }
             if (raw.addHeader(name, fields.value(i)).isErr()) { return Err(HandlerError.Internal); }
         }
@@ -1137,7 +1165,7 @@ impl Handler<FrontApp> for FrontHandler {
         // request goes as it came; the shard's S3 server finds the access point in its own store.
         var through = Vector<u8>.create();
         if (site.length == 0 && mayNameAccessPoint(bucket)) {
-            match (await findClaim(shared, bucket, false)) {
+            match (await findClaim(shared, bucket, false, false)) {
                 Ok(Some(c)) => { through = c.bucket; }
                 Ok(null) => {}
                 Err(_) => { return await relay(exchange, frontError("InternalError", 500), false); }
@@ -1176,7 +1204,7 @@ impl Handler<FrontApp> for FrontHandler {
         // A bucket deleted takes its access points with it: their names are let go (ADR-0078 §5).
         let bucketGone = method == Method.Delete && answer.status == 204 && through.length == 0 && bucket.length > 0 &&
             site.length == 0 && namesBucketItself(raw.target.view(), hosted.length > 0);
-        if (bucketGone && (await releaseBucketClaims(shared, bucket)).isErr()) {
+        if (bucketGone && (await releaseBucketClaims(shared, bucket, Clock.unixMillis())).isErr()) {
             let _ = await AsyncConsole.writeError(
                 "cosmostore: a deleted bucket's access point names were not let go\n",
             );

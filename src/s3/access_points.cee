@@ -65,6 +65,7 @@ fn findAccessPoint(all: borrow BucketPolicies, name: Slice<u8>, byName: bool) ->
                         block: p.block,
                         createdMs: p.createdMs,
                         policy: copyBytes(p.policy.view())?,
+                        account: copyBytes(p.account.view())?,
                     },
                 }));
             }
@@ -171,10 +172,12 @@ fn accessPointXml(
         out.extend("</CreationDate>".bytes())?;
     }
     xmlTextElement(out, "Alias", p.alias.view())?;
+    // The account it was made under; the asking one for an access point made before it was kept.
+    let owner = if (p.account.length > 0) p.account.view() else account;
     var arn = Vector<u8>.create();
-    accessPointArn(mut arn, account, p.name.view())?;
+    accessPointArn(mut arn, owner, p.name.view())?;
     xmlTextElement(out, "AccessPointArn", arn.view())?;
-    xmlTextElement(out, "BucketAccountId", account)?;
+    xmlTextElement(out, "BucketAccountId", owner)?;
     return Ok();
 }
 
@@ -231,6 +234,10 @@ async fn serveControl(
     if (rest.length == 0) {
         if (!isMethod(m, Method.Get)) { return Err(S3Fail.Code(S3Code.MethodNotAllowed)); }
         let only = paramOf(req, "bucket");
+        // One answer holds every one (ADR-0076 §4): pages asked for are not done, not taken and dropped.
+        if (paramOf(req, "maxResults").isSome() || paramOf(req, "nextToken").isSome()) {
+            return Err(S3Fail.Code(S3Code.NotImplemented));
+        }
         var body = Vector<u8>.create();
         controlHead(mut body, "ListAccessPointsResult")?;
         body.extend("<AccessPointList>".bytes())?;
@@ -252,6 +259,8 @@ async fn serveControl(
                     Err(_) => { continue; }
                 };
                 for (i in 0..points.length) {
+                    // Another account's are not this one's to list.
+                    if (points[i].account.length > 0 && points[i].account.view() != account) { continue; }
                     body.extend("<AccessPoint>".bytes())?;
                     accessPointXml(mut body, account, all.names[b].view(), borrow points[i], false)?;
                     body.extend("</AccessPoint>".bytes())?;
@@ -278,6 +287,15 @@ async fn serveControl(
         if (findBytes(xml.view(), "<VpcConfiguration".bytes(), 0).isSome()) {
             return Err(S3Fail.Code(S3Code.NotImplemented));
         }
+        // A bucket of another account (cross-account access points) is not done.
+        var bucketAccount = Vector<u8>.create();
+        if (rawElement(
+            xml.view(),
+            "BucketAccountId",
+            mut bucketAccount,
+        )? && trimBlank(bucketAccount.view()) != account) {
+            return Err(S3Fail.Code(S3Code.NotImplemented));
+        }
         let block = if (findBytes(
             xml.view(),
             "<PublicAccessBlockConfiguration".bytes(),
@@ -289,6 +307,7 @@ async fn serveControl(
             block: block,
             createdMs: Clock.unixMillis(),
             policy: Vector<u8>.create(),
+            account: copyBytes(account)?,
         };
         if (app.cluster) {
             let given = trimBlank(headerOf(req, ACCESS_POINT_ALIAS_FIELD) ?? "".bytes());
@@ -338,6 +357,10 @@ async fn serveControl(
         Some(h) => h,
         null => { return Err(S3Fail.Code(S3Code.NoSuchAccessPoint)); }
     };
+    // Made under another account: not this one's (the M7 review's A5).
+    if (hit.point.account.length > 0 && hit.point.account.view() != account) {
+        return Err(S3Fail.Code(S3Code.NoSuchAccessPoint));
+    }
     if (!policyCall && isMethod(m, Method.Get)) {
         var body = Vector<u8>.create();
         controlHead(mut body, "GetAccessPointResult")?;

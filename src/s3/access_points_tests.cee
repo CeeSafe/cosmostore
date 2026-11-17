@@ -10,6 +10,7 @@ fn testPoint(name: StringView, alias: StringView, policy: StringView) -> AccessP
     block: ACCESS_POINT_BLOCK_ALL,
     createdMs: 1700000000000,
     policy: copyBytes(policy.bytes())!,
+    account: copyBytes("000000000000".bytes())!,
 };
 
 @test
@@ -86,6 +87,45 @@ fn accessPointPolicies() -> Result<void, TestFailure> {
     Check.isTrue(
         accessPointResourcePattern("arn:aws:s3:r:a:accesspoint/pubx".bytes(), "pub".bytes(), "photos".bytes()).isErr(),
         "a longer name",
+    )?;
+    return Ok();
+}
+
+/// An access point keeps the account it was made under (v2); one stored by v1 is still read, with none (the M7
+/// review's A5).
+@test
+fn accessPointsKeepTheirAccount() -> Result<void, TestFailure> {
+    var points = Vector<AccessPoint>.create();
+    points.push(testPoint("door", "door-abcdefghijklmnopqrst-s3alias", ""))!;
+    var stored = Vector<u8>.create();
+    encodeAccessPoints(points.view(), mut stored)!;
+    Check.equalU64(2, stored[0] as u64)?;
+    let back = decodeAccessPoints(stored.view())!;
+    Check.equalBytes("000000000000".bytes(), back[0].account.view())?;
+    // v1, as first built: the same without the account.
+    var v1 = Vector<u8>.create();
+    v1.push(1)!;
+    v1.pushLE(1u16)!;
+    pushText16(mut v1, "door".bytes())!;
+    pushText16(mut v1, "door-abcdefghijklmnopqrst-s3alias".bytes())!;
+    v1.push(ACCESS_POINT_BLOCK_ALL)!;
+    v1.pushLE(1700000000000i64)!;
+    v1.pushLE(0u32)!;
+    let old = decodeAccessPoints(v1.view())!;
+    Check.equalBytes("door".bytes(), old[0].name.view())?;
+    Check.equalU64(0, old[0].account.length as u64)?;
+    // Its ARN and owner are its own account's, whatever account asks (an old one's, the asker's).
+    var xml = Vector<u8>.create();
+    accessPointXml(mut xml, "111111111111".bytes(), "apa".bytes(), borrow back[0], false)!;
+    Check.isTrue(
+        findBytes(xml.view(), "<BucketAccountId>000000000000</BucketAccountId>".bytes(), 0).isSome(),
+        "its own",
+    )?;
+    xml.clear();
+    accessPointXml(mut xml, "111111111111".bytes(), "apa".bytes(), borrow old[0], false)!;
+    Check.isTrue(
+        findBytes(xml.view(), "<BucketAccountId>111111111111</BucketAccountId>".bytes(), 0).isSome(),
+        "an old one",
     )?;
     return Ok();
 }

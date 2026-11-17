@@ -64,12 +64,18 @@ fn headerSigned(req: borrow S3Request, name: StringView) -> bool {
 
 /// The replica's version id, if the request carries one: only from a long-term key (not a session's), and signed;
 /// AccessDenied otherwise, never a write as a client's.
-fn replicaVersionAsked(req: borrow S3Request, auth: borrow Authenticated) -> Result<[u8; 16]?, S3Fail> {
+fn replicaVersionAsked(
+    req: borrow S3Request,
+    auth: borrow Authenticated,
+    cluster: bool,
+) -> Result<[u8; 16]?, S3Fail> {
     let text = match (headerOf(req, REPLICA_VERSION_FIELD)) {
         Some(t) => t,
         null => { return Ok(null); }
     };
-    if (auth.key.isNull() || auth.session.isSome() || !headerSigned(req, REPLICA_VERSION_FIELD)) {
+    // Only a cluster's own delivery sends them, and its front lets them through only with the node's stamp
+    // (`internalStamp`): on `serve`, or from a session or anonymous, they are refused (the M7 review's B2).
+    if (!cluster || auth.key.isNull() || auth.session.isSome() || !headerSigned(req, REPLICA_VERSION_FIELD)) {
         return Err(S3Fail.Code(S3Code.AccessDenied));
     }
     return match (parseVersionId(trimSpaces(text))) {
@@ -79,8 +85,8 @@ fn replicaVersionAsked(req: borrow S3Request, auth: borrow Authenticated) -> Res
 }
 
 /// A replica PUT's fields, or null for a client's PUT.
-fn replicaAsked(req: borrow S3Request, auth: borrow Authenticated) -> Result<ReplicaAsk?, S3Fail> {
-    let id = match (replicaVersionAsked(req, auth)?) {
+fn replicaAsked(req: borrow S3Request, auth: borrow Authenticated, cluster: bool) -> Result<ReplicaAsk?, S3Fail> {
+    let id = match (replicaVersionAsked(req, auth, cluster)?) {
         Some(i) => i,
         null => { return Ok(null); }
     };
@@ -217,6 +223,38 @@ fn forwardedPeer(request: borrow Request) -> SocketAddress? {
 /// or a bucket that logs into itself would never stop.
 const LOG_DELIVERY_FIELD: StringView = "x-cosmo-log-delivery";
 
-fn isLogDelivery(req: borrow S3Request, auth: borrow Authenticated) -> bool =>
-    headerOf(req, LOG_DELIVERY_FIELD).isSome() && auth.key.isSome() && auth.session.isNull() &&
+/// Only on a cluster, whose front lets the field through only with the node's stamp (the M7 review's B3): on `serve`
+/// a log is delivered into the store directly, and the field means nothing.
+fn isLogDelivery(req: borrow S3Request, auth: borrow Authenticated, cluster: bool) -> bool =>
+    cluster && headerOf(req, LOG_DELIVERY_FIELD).isSome() && auth.key.isSome() && auth.session.isNull() &&
         headerSigned(req, LOG_DELIVERY_FIELD);
+
+/// The field a node's own delivery task stamps its requests to its front with (ADR-0078 §4, the M7 review's B2 and
+/// B3): only with it does the front let a request's replica and log delivery fields through.
+const INTERNAL_FIELD: StringView = "x-cosmo-internal";
+
+/// The stamp: HMAC-SHA256, under the cluster's secret, of the method, path, query and `x-amz-date` (which the request's
+/// signature covers and the shard checks the age of), in hex.
+fn internalStamp(
+    key: Slice<u8>,
+    method: Slice<u8>,
+    path: Slice<u8>,
+    query: Slice<u8>,
+    amzDate: Slice<u8>,
+) -> Result<Vector<u8>, AllocError> {
+    var text = Vector<u8>.create();
+    text.extend("cosmo-internal\n".bytes())?;
+    text.extend(method)?;
+    text.push('\n')?;
+    text.extend(path)?;
+    text.push('\n')?;
+    text.extend(query)?;
+    text.push('\n')?;
+    text.extend(amzDate)?;
+    var mac = HmacSha256.create(key);
+    mac.update(text.view());
+    let d = mac.finish();
+    var hex = Vector<u8>.create();
+    appendHexBytes(mut hex, d[..])?;
+    return Ok(hex);
+}

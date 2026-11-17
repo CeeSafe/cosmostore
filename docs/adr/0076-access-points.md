@@ -17,10 +17,13 @@
    `Put/Get/DeleteAccessPointPolicy`. A request with `x-amz-account-id` and a path under `/v20180820/` is one,
    path-style or under `<account>.<domain>`. Names are 3 to 50 of a-z, 0-9 and `-`, one per server
    (`AccessPointAlreadyOwnedByYou`); the look-up and the write hold the store's lock together. Any 12-digit account
-   id is taken and given back in ARNs (`arn:aws:s3:us-east-1:<account>:accesspoint/<name>`). Long-term keys and
+   id is taken, kept with the access point and given back in ARNs (`arn:aws:s3:us-east-1:<account>:accesspoint/<name>`);
+   another account does not see it (NoSuchAccessPoint), and a `BucketAccountId` other than the account is
+   NotImplemented (the M7 review's A5). Long-term keys and
    their `GetSessionToken` sessions only. On a cluster: ADR-0078 §5.
 2. **Stored** as a `BucketConfig` of kind 15 on the access point's bucket (checkpoint format 22): name, alias
-   (`<name, up to 30>-<20 of a-z 2-7>-s3alias`), block, creation time, policy. Deleting the bucket deletes them.
+   (`<name, up to 30>-<20 of a-z 2-7>-s3alias`), block, creation time, policy, and (v2) the account; v1's are read
+   with none. Deleting the bucket deletes them.
 3. **A request through one:** a bucket name that is an alias, or `<name>-<12 digits>` (from the ARN's host), and
    that some access point has, is that access point's bucket, before anything else reads the request; while no
    bucket has access points nothing is looked up. Through an access point a request may do what it may to objects,
@@ -33,7 +36,8 @@
    check is in `gateDecision` and ahead of the keys' fast path, as a role session's (ADR-0075 §3), so copies,
    DeleteObjects and governance bypass meet it too.
 4. **Not done:** a copy's source named by an alias (NoSuchBucket), `GetAccessPointPolicyStatus`, Object Lambda and
-   multi-Region access points, `ListAccessPoints` paging (every one in one answer).
+   multi-Region access points, `ListAccessPoints` paging (every one in one answer; `maxResults` and `nextToken` are
+   NotImplemented).
 
 ## Consequences
 

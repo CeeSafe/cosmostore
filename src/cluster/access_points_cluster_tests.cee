@@ -70,3 +70,68 @@ fn accessPointClaimRequestsAndTargets() -> Result<void, TestFailure> {
     Check.isTrue(targetParam("/x?buckets=1".bytes(), "bucket").isNull(), "another parameter")?;
     return Ok();
 }
+
+fn pendingClaim(bucket: StringView, madeMs: i64) -> AccessPointClaim {
+    var c = claimOf("door".bytes(), bucket.bytes(), "door-abcdefghijklmnopqrst-s3alias".bytes())!;
+    c.confirmed = false;
+    c.token = copyBytes("00112233445566778899aabbccddeeff".bytes())!;
+    c.madeMs = madeMs;
+    return c;
+}
+
+@test
+fn accessPointClaimsPendingThenConfirmed() -> Result<void, TestFailure> {
+    // A claim's value round-trips, pending and confirmed; the first form (bucket and alias) reads as confirmed.
+    let p = pendingClaim("apa", 1700000000123);
+    let back = decodeClaim("door".bytes(), encodeClaim(borrow p)!.view())!!;
+    Check.isTrue(!back.confirmed, "pending")?;
+    Check.equalText("apa", StringView.fromUtf8(back.bucket.view()) ?? "")?;
+    Check.equalText("00112233445566778899aabbccddeeff", StringView.fromUtf8(back.token.view()) ?? "")?;
+    Check.equalU64(1700000000123, checkedTruncate<u64>(back.madeMs) ?? 0)?;
+    let old = decodeClaim("door".bytes(), "apa\ndoor-abcdefghijklmnopqrst-s3alias".bytes())!!;
+    Check.isTrue(old.confirmed && old.madeMs == 0, "the first form is confirmed")?;
+    Check.isTrue(decodeClaim("door".bytes(), "apa".bytes())!.isNull(), "one piece is no claim")?;
+    // A take: none, or a stale pending, is made; a fresh pending makes any other wait, its own bucket's too (the
+    // anonymous create racing a real one, the M7 review's B1); confirmed, the bucket's is answered, another's refused.
+    let none: AccessPointClaim? = null;
+    Check.equalU64(201, takeDecision(none, "apa".bytes(), 5000) as u64)?;
+    let fresh: AccessPointClaim? = Some(pendingClaim("apa", 5000));
+    Check.equalU64(503, takeDecision(fresh, "apa".bytes(), 5000 + CLAIM_PENDING_MS - 1) as u64)?;
+    Check.equalU64(503, takeDecision(fresh, "apb".bytes(), 6000) as u64)?;
+    Check.equalU64(201, takeDecision(fresh, "apb".bytes(), 5000 + CLAIM_PENDING_MS) as u64)?;
+    var done = pendingClaim("apa", 5000);
+    done.confirmed = true;
+    let confirmed: AccessPointClaim? = Some(done);
+    Check.equalU64(200, takeDecision(confirmed, "apa".bytes(), 6000) as u64)?;
+    Check.equalU64(409, takeDecision(confirmed, "apb".bytes(), 999999999) as u64)?;
+    return Ok();
+}
+
+@test
+fn accessPointFrontChecks() -> Result<void, TestFailure> {
+    // A presigned DeleteBucket names the bucket itself; a sub-resource does not.
+    Check.isTrue(
+        namesBucketItself("/apa?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=ab".bytes(), false),
+        "presigned",
+    )?;
+    Check.isTrue(!namesBucketItself("/apa?X-Amz-Signature=ab&versioning".bytes(), false), "presigned sub-resource")?;
+    Check.isTrue(namesBucketItself("/?x-amz-date=1".bytes(), true), "presigned, hosted")?;
+    // A body's bucket S3 would take, before anything is claimed for it.
+    Check.isTrue(bucketNameOk("apa".bytes()) && bucketNameOk("a.b-c9".bytes()), "good names")?;
+    Check.isTrue(
+        !bucketNameOk("ab".bytes()) && !bucketNameOk("Apa".bytes()) && !bucketNameOk("a\nb".bytes()),
+        "bad names",
+    )?;
+    var long = Vector<u8>.create();
+    for (i in 0..64) { long.push('a')!; }
+    Check.isTrue(!bucketNameOk(long.view()), "64 letters")?;
+    // A field over 65,535 bytes goes empty, not cut to its length's low bits.
+    var huge = Vector<u8>.create();
+    huge.resize(65536 + 5, 'x')!;
+    let body = claimRequest(CLAIM_TAKE, "door".bytes(), huge.view(), "alias".bytes())!;
+    var at = 1usize;
+    let _ = claimField(body.view(), mut at)!;
+    Check.equalU64(0, claimField(body.view(), mut at)!.length as u64)?;
+    Check.equalText("alias", StringView.fromUtf8(claimField(body.view(), mut at)!) ?? "")?;
+    return Ok();
+}

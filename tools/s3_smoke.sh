@@ -895,6 +895,8 @@ check "longer than the role allows" "$(code sts assume-role --role-arn arn:aws:i
 read -r pk ps pt <<< "$(aws sts assume-role --role-arn arn:aws:iam::000000000000:role/reader --role-session-name narrow --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::smoke/*"}]}' --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
 check "a session policy narrows the role: it reads" "$(as_session "$pk" "$ps" "$pt" aws s3 cp s3://smoke/sts/sts.txt - 2>&1)" "$(cat sts.txt)"
 check "but does not list" "$(as_session "$pk" "$ps" "$pt" code s3api list-objects-v2 --bucket smoke)" AccessDenied
+check "a client's replica fields are refused (M7 review B2)" "$(python3 -I "$here/s3_raw.py" put-with "$AWS_ENDPOINT_URL" smoke forged.txt forged x-cosmo-replica-version:0123456789abcdef0123456789abcdef x-cosmo-replica-md5:0123456789abcdef0123456789abcdef | cut -d' ' -f1)" 403
+check "policy ARNs are not done, not dropped" "$(code sts assume-role --role-arn arn:aws:iam::000000000000:role/reader --role-session-name arns --policy-arns arn=arn:aws:iam::aws:policy/ReadOnlyAccess)" NotImplemented
 check "a session policy with a principal" "$(code sts assume-role --role-arn arn:aws:iam::000000000000:role/reader --role-session-name bad --policy '{"Statement":{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}}')" MalformedPolicyDocument
 aws s3 rm --recursive s3://smoke/sts/ > /dev/null 2>&1
 

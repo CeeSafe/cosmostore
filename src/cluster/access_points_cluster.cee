@@ -10,21 +10,36 @@ import web_client;
 const CLAIM_PREFIX: StringView = "access-point/";
 /// The peer path group 0's leader takes claims on (signed by a node, never an operator).
 const CLAIM_PATH: StringView = "/cluster/access-point";
-/// Claims `name` for `bucket` with `alias`: 201 when made now, 200 when it was the bucket's already (with its alias),
-/// 409 when another bucket's.
+/// Claims `name` for `bucket` with `alias`, pending: 201 with `<alias, token>` when made now (or taken over from a
+/// pending claim older than CLAIM_PENDING_MS); 200 with `<alias, "">` when the bucket's and confirmed already; 503
+/// while another create's pending claim is fresh; 409 when another bucket's and confirmed.
 const CLAIM_TAKE: u8 = 1;
-/// Lets `name` go if it is `bucket`'s.
+/// After DeleteAccessPoint (or the shard not having it): lets `name` go if it is `bucket`'s and confirmed. A pending
+/// claim is its creator's to confirm or abandon.
 const CLAIM_RELEASE: u8 = 2;
-/// Lets every name of `bucket` go (the bucket deleted, and its access points with it).
+/// After DeleteBucket: lets go every confirmed name of `bucket` confirmed before `<ms>`, the time the delete was
+/// answered (a name claimed again for a bucket made again since is kept).
 const CLAIM_RELEASE_BUCKET: u8 = 3;
 /// Finds a claim by name, or by what a request's bucket says (an alias, `<name>-<account>`): 200 with
-/// `<name>\n<bucket>\n<alias>`, or 404.
+/// `<name, bucket, alias>`, or 404. A read of the leader's copy, which has every claim answered.
 const CLAIM_FIND: u8 = 4;
+/// The shard made it (or has it): `name`'s pending claim with `token` is confirmed; a claim that is gone is made
+/// again, confirmed; 409 when another's.
+const CLAIM_CONFIRM: u8 = 5;
+/// The shard refused the create for good: `name`'s pending claim with `token` goes.
+const CLAIM_ABANDON: u8 = 6;
+/// How long a pending claim holds its name: past it, its create is taken to have failed, and the name may be claimed.
+const CLAIM_PENDING_MS: i64 = 60000;
 
 struct AccessPointClaim {
     name: Vector<u8>;
     bucket: Vector<u8>;
     alias: Vector<u8>;
+    confirmed: bool;
+    /// The creating request's, while pending (and kept once confirmed).
+    token: Vector<u8>;
+    /// When it was claimed, or confirmed: group 0 leader's clock.
+    madeMs: i64;
 }
 
 struct ClaimAnswer {
@@ -43,7 +58,12 @@ fn claimKey(name: Slice<u8>) -> Result<Vector<u8>, AllocError> {
     return Ok(k);
 }
 
+/// A field: a u16 length and its bytes; one over 65,535 bytes goes as an empty field, which every op refuses.
 fn pushField(out: borrow mut Vector<u8>, f: Slice<u8>) -> Result<void, AllocError> {
+    if (f.length > 65535) {
+        out.pushLE(0u16)?;
+        return Ok();
+    }
     out.pushLE(truncate<u16>(f.length))?;
     return out.extend(f);
 }
@@ -76,6 +96,49 @@ fn claimField<region a>(body: Slice<a, u8>, at: borrow mut usize) -> Slice<a, u8
     return Some(f);
 }
 
+/// A claim's stored value: `<bucket>\n<alias>\n<c or p>\n<token>\n<ms>`; the first two alone (as first built) are
+/// a confirmed claim of no time.
+fn encodeClaim(c: borrow AccessPointClaim) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    out.extend(c.bucket.view())?;
+    out.push('\n')?;
+    out.extend(c.alias.view())?;
+    out.push('\n')?;
+    out.push(if (c.confirmed) 'c' else 'p')?;
+    out.push('\n')?;
+    out.extend(c.token.view())?;
+    out.push('\n')?;
+    appendDecimal(mut out, checkedTruncate<u64>(c.madeMs) ?? 0)?;
+    return Ok(out);
+}
+
+fn decodeClaim(name: Slice<u8>, b: Slice<u8>) -> Result<AccessPointClaim?, AllocError> {
+    var pieces = Vector<Slice<u8>>.create();
+    var from = 0usize;
+    for (i in 0..b.length) {
+        if (b[i] == '\n') {
+            pieces.push(b[from..i])?;
+            from = i + 1;
+        }
+    }
+    pieces.push(b[from..])?;
+    if (pieces.length != 2 && pieces.length != 5) { return Ok(null); }
+    var c = AccessPointClaim {
+        name: copyBytes(name)?,
+        bucket: copyBytes(pieces[0])?,
+        alias: copyBytes(pieces[1])?,
+        confirmed: true,
+        token: Vector<u8>.create(),
+        madeMs: 0,
+    };
+    if (pieces.length == 5) {
+        c.confirmed = pieces[2] == "c".bytes();
+        c.token = copyBytes(pieces[3])?;
+        c.madeMs = (StringView.fromUtf8(pieces[4]) ?? "").parseInt<i64>() ?? 0;
+    }
+    return Ok(Some(c));
+}
+
 /// The claim of `name` as `st` (a copy of group 0) has it.
 fn storedClaim(st: borrow mut ObjectStore, name: Slice<u8>) -> Result<AccessPointClaim?, AllocError> {
     let key = claimKey(name)?;
@@ -84,20 +147,7 @@ fn storedClaim(st: borrow mut ObjectStore, name: Slice<u8>) -> Result<AccessPoin
         Ok(b) => b,
         Err(_) => { return Ok(null); }
     };
-    let b = bytes.view();
-    var cut = b.length;
-    for (i in 0..b.length) {
-        if (b[i] == '\n') {
-            cut = i;
-            break;
-        }
-    }
-    if (cut == b.length) { return Ok(null); }
-    return Ok(
-        Some(
-            AccessPointClaim { name: copyBytes(name)?, bucket: copyBytes(b[0..cut])?, alias: copyBytes(b[cut + 1..])? },
-        ),
-    );
+    return decodeClaim(name, bytes.view());
 }
 
 /// The names claimed under `prefix`, every page of them.
@@ -122,7 +172,8 @@ fn claimedNames(st: borrow mut ObjectStore, prefix: Slice<u8>) -> Result<Vector<
 }
 
 /// The access point a request's bucket names (ADR-0076 §3): `<name>-<account>` from its ARN's host, or its alias,
-/// `<the name's first 30>-<20 letters>-s3alias`, found among the names it begins with.
+/// `<the name's first 30>-<20 letters>-s3alias`, found among the names it begins with (at least 3 letters, as every
+/// name has).
 fn claimNamedBy(st: borrow mut ObjectStore, token: Slice<u8>) -> Result<AccessPointClaim?, AllocError> {
     if (!mayNameAccessPoint(token)) { return Ok(null); }
     if (accountSuffixed(token)) {
@@ -135,7 +186,7 @@ fn claimNamedBy(st: borrow mut ObjectStore, token: Slice<u8>) -> Result<AccessPo
     if (token.length <= tail.length + 21 || token[token.length - tail.length..] != tail) { return Ok(null); }
     var stem = token[0..token.length - tail.length - 20];
     if (stem.length > 0 && stem[stem.length - 1] == '-') { stem = stem[0..stem.length - 1]; }
-    if (stem.length == 0) { return Ok(null); }
+    if (stem.length < 3) { return Ok(null); }
     let names = claimedNames(st, stem)?;
     for (i in 0..names.length) {
         match (storedClaim(st, names[i].view())?) {
@@ -170,13 +221,20 @@ async fn localClaim(shared: borrow NodeShared, token: Slice<u8>, byName: bool) -
     };
 }
 
-/// The claim `token` names: this node's copy first, then group 0's leader, whose copy has every claim made (a copy here
-/// may be a moment behind, just after a CreateAccessPoint through another node).
-async fn findClaim(shared: borrow NodeShared, token: Slice<u8>, byName: bool) -> Result<AccessPointClaim?, NodeFault> {
+/// The claim `token` names: this node's copy first, then, for S3 Control's calls, group 0's leader, whose copy has
+/// every claim answered (a copy here may be a moment behind, just after a CreateAccessPoint through another node).
+/// A request's bucket is resolved by this node's copy alone: a bucket named like an alias costs no peer request.
+async fn findClaim(
+    shared: borrow NodeShared,
+    token: Slice<u8>,
+    byName: bool,
+    askLeader: bool,
+) -> Result<AccessPointClaim?, NodeFault> {
     match (await localClaim(shared, token, byName)?) {
         Some(c) => { return Ok(Some(c)); }
         null => {}
     }
+    if (!askLeader) { return Ok(null); }
     let body = match (claimRequest(CLAIM_FIND, token, if (byName) "1".bytes() else "".bytes(), "".bytes())) {
         Ok(b) => b,
         Err(_) => { return Err(NodeFault.OutOfMemory); }
@@ -185,32 +243,29 @@ async fn findClaim(shared: borrow NodeShared, token: Slice<u8>, byName: bool) ->
     if (answer.status != 200) { return Ok(null); }
     let b = answer.body.view();
     var at = 0usize;
-    let name = claimField(b, mut at);
-    let bucket = claimField(b, mut at);
-    let alias = claimField(b, mut at);
-    return match (name) {
-        Some(n) => match (bucket) {
-            Some(bk) => match (alias) {
-                Some(a) => match (copyBytes(n)) {
-                    Ok(nn) => match (copyBytes(bk)) {
-                        Ok(bb) => match (copyBytes(a)) {
-                            Ok(aa) => Ok(Some(AccessPointClaim { name: nn, bucket: bb, alias: aa })),
-                            Err(_) => Err(NodeFault.OutOfMemory),
-                        },
-                        Err(_) => Err(NodeFault.OutOfMemory),
-                    },
-                    Err(_) => Err(NodeFault.OutOfMemory),
-                },
-                null => Ok(null),
-            },
-            null => Ok(null),
-        },
-        null => Ok(null),
+    let name = claimField(b, mut at) ?? "".bytes();
+    let bucket = claimField(b, mut at) ?? "".bytes();
+    let alias = claimField(b, mut at) ?? "".bytes();
+    if (name.length == 0 || bucket.length == 0) { return Ok(null); }
+    return match (claimOf(name, bucket, alias)) {
+        Ok(c) => Ok(Some(c)),
+        Err(_) => Err(NodeFault.OutOfMemory),
     };
 }
 
+fn claimOf(name: Slice<u8>, bucket: Slice<u8>, alias: Slice<u8>) -> Result<AccessPointClaim, AllocError> {
+    return Ok(AccessPointClaim {
+        name: copyBytes(name)?,
+        bucket: copyBytes(bucket)?,
+        alias: copyBytes(alias)?,
+        confirmed: true,
+        token: Vector<u8>.create(),
+        madeMs: 0,
+    });
+}
+
 /// Sends a claim's op to group 0's leader: this node if it leads, else each node in turn, for up to FRONT_WAIT_MS.
-/// Every op may be sent again: a claim made already for the same bucket answers as made. 503 when none took it.
+/// 503 when none took it.
 async fn askClaims(shared: borrow NodeShared, body: Slice<u8>) -> Result<ClaimAnswer, NodeFault> {
     var waited = 0u64;
     while (true) {
@@ -267,8 +322,62 @@ async fn claimWrite(
     return await group0Write(shared, slot, change, keyView, bytes);
 }
 
-/// `POST /cluster/access-point` (ADR-0078 §5), a node's, on group 0's leader: 421 elsewhere. Behind group 0's gate,
-/// and once everything its replica holds is applied, so that it reads every claim made before.
+/// Writes `c` as its name's claim: 200, or 503 when group 0 did not take it.
+async fn writeClaim(
+    shared: borrow NodeShared,
+    slot: borrow ShardSlot,
+    c: borrow AccessPointClaim,
+) -> Result<u16, NodeFault> {
+    let key = match (claimKey(c.name.view())) {
+        Ok(k) => k,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    let value = match (encodeClaim(c)) {
+        Ok(v) => v,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    if (await claimWrite(shared, slot, Group0Change.Put, key.view(), value.view())?) { return Ok(200); }
+    return Ok(503);
+}
+
+async fn dropClaim(shared: borrow NodeShared, slot: borrow ShardSlot, name: Slice<u8>) -> Result<u16, NodeFault> {
+    let key = match (claimKey(name)) {
+        Ok(k) => k,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    if (await claimWrite(shared, slot, Group0Change.Delete, key.view(), "".bytes())?) { return Ok(200); }
+    return Ok(503);
+}
+
+/// What a take of a name for `bucket` finds, `held` being its claim: 201, a claim to make (none, or a pending one
+/// past CLAIM_PENDING_MS); 200, the bucket's and confirmed; 409, another bucket's and confirmed; 503, another create's
+/// pending claim, in flight (whichever bucket: it is not known yet whether it will be made).
+fn takeDecision(held: borrow AccessPointClaim?, bucket: Slice<u8>, now: i64) -> u16 {
+    return match (held) {
+        Some(c) => {
+            if (c.confirmed) {
+                if (c.bucket.view() == bucket) 200u16 else 409u16
+            } else if (now - c.madeMs < CLAIM_PENDING_MS) {
+                503u16
+            } else {
+                201u16
+            }
+        }
+        null => 201u16,
+    };
+}
+
+fn newClaimToken() -> Vector<u8>? {
+    var random = [0u8; 16];
+    if (Random.fill(mut random[..]).isErr()) { return null; }
+    var hex = Vector<u8>.create();
+    if (appendHexBytes(mut hex, random[..]).isErr()) { return null; }
+    return Some(hex);
+}
+
+/// `POST /cluster/access-point` (ADR-0078 §5), a node's, on group 0's leader: 421 elsewhere. A find reads the
+/// leader's copy; every other op runs behind group 0's gate, once everything its replica holds is applied, so that it
+/// reads every claim made before.
 async fn changeClaim(shared: borrow NodeShared, body: Slice<u8>) -> Result<ClaimAnswer, NodeFault> {
     if (body.length < 1) { return Ok(claimAnswer(400)); }
     let op = body[0];
@@ -282,6 +391,16 @@ async fn changeClaim(shared: borrow NodeShared, body: Slice<u8>) -> Result<Claim
     };
     let slot = borrow shared.slots[g];
     if (!(await viewOf(slot))?.leads) { return Ok(claimAnswer(421)); }
+    if (op == CLAIM_FIND) {
+        // Every claim answered was applied here before its answer (group0Write waits for it): no gate, no wait.
+        return match (await localClaim(shared, first, second == "1".bytes())?) {
+            Some(c) => match (claimFields(c.name.view(), c.bucket.view(), c.alias.view())) {
+                Ok(b) => Ok(ClaimAnswer { status: 200, body: b }),
+                Err(_) => Err(NodeFault.OutOfMemory),
+            },
+            null => Ok(claimAnswer(404)),
+        };
+    }
     var gate = match (await slot.gate.lock()) {
         Ok(gd) => gd,
         Err(_) => { return Err(NodeFault.Net); }
@@ -295,16 +414,10 @@ async fn changeClaim(shared: borrow NodeShared, body: Slice<u8>) -> Result<Claim
         if (waited >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(claimAnswer(503)); }
         waited += FRONT_POLL_MS;
     }
-    if (op == CLAIM_FIND) {
-        return match (await localClaim(shared, first, second == "1".bytes())?) {
-            Some(c) => match (claimFields(c.name.view(), c.bucket.view(), c.alias.view())) {
-                Ok(b) => Ok(ClaimAnswer { status: 200, body: b }),
-                Err(_) => Err(NodeFault.OutOfMemory),
-            },
-            null => Ok(claimAnswer(404)),
-        };
-    }
+    let now = Clock.unixMillis();
     if (op == CLAIM_RELEASE_BUCKET) {
+        if (first.length == 0) { return Ok(claimAnswer(400)); }
+        let before = (StringView.fromUtf8(second) ?? "").parseInt<i64>() ?? 0;
         var names = Vector<Vector<u8>>.create();
         {
             var guard = match (await slot.store.get().lock()) {
@@ -324,57 +437,89 @@ async fn changeClaim(shared: borrow NodeShared, body: Slice<u8>) -> Result<Claim
                 };
                 match (held) {
                     Some(c) => {
-                        if (c.bucket.view() == first && names.push(c.name).isErr()) {
-                            return Err(NodeFault.OutOfMemory);
-                        }
+                        let gone = c.bucket.view() == first && c.confirmed && c.madeMs < before;
+                        if (gone && names.push(c.name).isErr()) { return Err(NodeFault.OutOfMemory); }
                     }
                     null => {}
                 }
             }
         }
         for (i in 0..names.length) {
-            let key = match (claimKey(names[i].view())) {
-                Ok(k) => k,
-                Err(_) => { return Err(NodeFault.OutOfMemory); }
-            };
-            if (!(await claimWrite(shared, slot, Group0Change.Delete, key.view(), "".bytes())?)) {
-                return Ok(claimAnswer(503));
-            }
+            if ((await dropClaim(shared, slot, names[i].view())?) != 200) { return Ok(claimAnswer(503)); }
         }
         return Ok(claimAnswer(200));
     }
-    if (op != CLAIM_TAKE && op != CLAIM_RELEASE) { return Ok(claimAnswer(400)); }
-    if (!accessPointNameOk(first) || second.length == 0) { return Ok(claimAnswer(400)); }
+    if (!accessPointNameOk(first)) { return Ok(claimAnswer(400)); }
     let held = await localClaim(shared, first, true)?;
-    let key = match (claimKey(first)) {
-        Ok(k) => k,
-        Err(_) => { return Err(NodeFault.OutOfMemory); }
-    };
     if (op == CLAIM_RELEASE) {
+        if (second.length == 0) { return Ok(claimAnswer(400)); }
         let mine = match (borrow held) {
-            Some(c) => c.bucket.view() == second,
+            Some(c) => c.bucket.view() == second && c.confirmed,
             null => false,
         };
         if (!mine) { return Ok(claimAnswer(200)); }
-        let done = await claimWrite(shared, slot, Group0Change.Delete, key.view(), "".bytes())?;
-        return Ok(claimAnswer(if (done) 200 else 503));
+        return Ok(claimAnswer(await dropClaim(shared, slot, first)?));
     }
-    match (held) {
-        Some(c) => {
-            if (c.bucket.view() != second) { return Ok(claimAnswer(409)); }
-            return Ok(ClaimAnswer { status: 200, body: c.alias });
-        }
-        null => {}
+    if (op == CLAIM_ABANDON) {
+        if (second.length == 0) { return Ok(claimAnswer(400)); }
+        let mine = match (borrow held) {
+            Some(c) => !c.confirmed && c.token.view() == second,
+            null => false,
+        };
+        if (!mine) { return Ok(claimAnswer(200)); }
+        return Ok(claimAnswer(await dropClaim(shared, slot, first)?));
     }
-    if (third.length == 0) { return Ok(claimAnswer(400)); }
-    var value = Vector<u8>.create();
-    let built = value.extend(second).isOk() && value.push('\n').isOk() && value.extend(third).isOk();
-    if (!built) { return Err(NodeFault.OutOfMemory); }
-    if (!(await claimWrite(shared, slot, Group0Change.Put, key.view(), value.view())?)) {
-        return Ok(claimAnswer(503));
+    if (op == CLAIM_CONFIRM) {
+        // first: name; second: token; third: `<bucket>\n<alias>`, to make it again if it is gone.
+        if (second.length == 0) { return Ok(claimAnswer(400)); }
+        var claim = match (held) {
+            Some(c) => c,
+            null => {
+                let cut = indexOfFrom(third, "\n".bytes(), 0) ?? third.length;
+                if (cut == 0 || cut >= third.length) { return Ok(claimAnswer(400)); }
+                match (claimOf(first, third[0..cut], third[cut + 1..])) {
+                    Ok(c) => c,
+                    Err(_) => { return Err(NodeFault.OutOfMemory); }
+                }
+            }
+        };
+        if (claim.confirmed && claim.token.view() == second) { return Ok(claimAnswer(200)); }
+        let ours = claim.token.length == 0 || claim.token.view() == second;
+        if (!ours) { return Ok(claimAnswer(409)); }
+        claim.confirmed = true;
+        claim.token.clear();
+        if (claim.token.extend(second).isErr()) { return Err(NodeFault.OutOfMemory); }
+        claim.madeMs = now;
+        return Ok(claimAnswer(await writeClaim(shared, slot, borrow claim)?));
     }
-    return match (copyBytes(third)) {
-        Ok(a) => Ok(ClaimAnswer { status: 201, body: a }),
+    if (op != CLAIM_TAKE) { return Ok(claimAnswer(400)); }
+    if (second.length == 0 || third.length == 0) { return Ok(claimAnswer(400)); }
+    let decided = takeDecision(held, second, now);
+    if (decided == 200) {
+        let alias = match (borrow held) {
+            Some(c) => c.alias.view(),
+            null => "".bytes(),
+        };
+        return match (claimFields(alias, "".bytes(), "".bytes())) {
+            Ok(b) => Ok(ClaimAnswer { status: 200, body: b }),
+            Err(_) => Err(NodeFault.OutOfMemory),
+        };
+    }
+    if (decided != 201) { return Ok(claimAnswer(decided)); }
+    let token = match (newClaimToken()) {
+        Some(t) => t,
+        null => { return Ok(claimAnswer(503)); }
+    };
+    var claim = match (claimOf(first, second, third)) {
+        Ok(c) => c,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    claim.confirmed = false;
+    claim.token = token;
+    claim.madeMs = now;
+    if ((await writeClaim(shared, slot, borrow claim)?) != 200) { return Ok(claimAnswer(503)); }
+    return match (claimFields(third, claim.token.view(), "".bytes())) {
+        Ok(b) => Ok(ClaimAnswer { status: 201, body: b }),
         Err(_) => Err(NodeFault.OutOfMemory),
     };
 }
@@ -411,22 +556,40 @@ fn targetParam<region a>(target: Slice<a, u8>, name: StringView) -> Slice<a, u8>
     return null;
 }
 
-/// Whether a request names its bucket itself, not a key or a sub-resource: `/<bucket>`, or `/` virtual-hosted.
+/// Whether a request names its bucket itself, not a key or a sub-resource: `/<bucket>`, or `/` virtual-hosted; a
+/// presigned URL's `X-Amz-…` parameters are no sub-resource.
 fn namesBucketItself(target: Slice<u8>, hosted: bool) -> bool {
-    if (indexOfFrom(target, "?".bytes(), 0).isSome()) { return false; }
-    if (hosted) { return target == "/".bytes(); }
-    if (target.length < 2) { return false; }
-    let rest = target[1..];
+    var path = target;
+    match (indexOfFrom(target, "?".bytes(), 0)) {
+        Some(q) => {
+            path = target[0..q];
+            var at = q + 1;
+            while (at < target.length) {
+                var end = at;
+                while (end < target.length && target[end] != '&') { end += 1; }
+                let pair = target[at..end];
+                let signing = pair.length >= 6 && Ascii.equalsIgnoringCase(pair[0..6], "x-amz-");
+                if (pair.length > 0 && !signing) { return false; }
+                at = end + 1;
+            }
+        }
+        null => {}
+    }
+    if (hosted) { return path == "/".bytes(); }
+    if (path.length < 2) { return false; }
+    let rest = path[1..];
     return match (indexOfFrom(rest, "/".bytes(), 0)) {
         Some(i) => i == rest.length - 1,
         null => true,
     };
 }
 
-/// Lets go every name a bucket's access points had, once the bucket is deleted (its shard deleted them with it). An
-/// answer is not waited on for good: a name left claimed is let go by a DeleteAccessPoint of it.
-async fn releaseBucketClaims(shared: borrow NodeShared, bucket: Slice<u8>) -> Result<void, NodeFault> {
-    let body = match (claimRequest(CLAIM_RELEASE_BUCKET, bucket, "".bytes(), "".bytes())) {
+/// Lets go every name a bucket's access points had, once the bucket is deleted (its shard deleted them with it): those
+/// confirmed before `answeredMs`. A name left claimed is let go by a DeleteAccessPoint of it.
+async fn releaseBucketClaims(shared: borrow NodeShared, bucket: Slice<u8>, answeredMs: i64) -> Result<void, NodeFault> {
+    var ms = Vector<u8>.create();
+    if (appendDecimal(mut ms, checkedTruncate<u64>(answeredMs) ?? 0).isErr()) { return Err(NodeFault.OutOfMemory); }
+    let body = match (claimRequest(CLAIM_RELEASE_BUCKET, bucket, ms.view(), "".bytes())) {
         Ok(b) => b,
         Err(_) => { return Err(NodeFault.OutOfMemory); }
     };
@@ -476,7 +639,7 @@ async fn routeControl(shared: borrow NodeShared, raw: borrow mut RawMessage) -> 
     if (kind == 2) { return await routeRequest(shared, shardOfBucket(borrow shared.file, name.view()), raw); }
     if (kind != 3) { return await routeRequest(shared, 0, raw); }
     if (method == Method.Put && !policyCall) { return await createThroughClaim(shared, raw, name.view()); }
-    let claim = match (await findClaim(shared, name.view(), true)?) {
+    let claim = match (await findClaim(shared, name.view(), true, true)?) {
         Some(c) => c,
         null => { return Ok(frontError("NoSuchAccessPoint", 404)); }
     };
@@ -497,9 +660,50 @@ async fn routeControl(shared: borrow NodeShared, raw: borrow mut RawMessage) -> 
     return Ok(answer);
 }
 
-/// CreateAccessPoint on a cluster: the name claimed in group 0 for the bucket with an alias (the front's), then made on
-/// the bucket's shard with that alias. A claim made now and refused for good by the shard is let go; a claim the
-/// bucket had already is kept, since its access point may be there (the shard then says it is).
+/// Whether `name` is a bucket name S3 takes: 3 to 63 of a-z, 0-9, `.` and `-`.
+fn bucketNameOk(name: Slice<u8>) -> bool {
+    if (name.length < 3 || name.length > 63) { return false; }
+    for (c in name) {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-')) { return false; }
+    }
+    return true;
+}
+
+/// Whether a request carries a signature, in its `Authorization` field or a presigned URL's query: one without is
+/// anonymous, which S3 Control refuses, and is sent on without a claim.
+fn signedRequest(raw: borrow RawMessage) -> bool {
+    for (i in 0..raw.names.length) {
+        if (Ascii.equalsIgnoringCase(raw.names[i].view(), "authorization")) { return true; }
+    }
+    let t = raw.target.view();
+    let needle = "x-amz-signature=".bytes();
+    if (t.length < needle.length) { return false; }
+    for (i in 0..t.length - needle.length + 1) {
+        if (Ascii.equalsIgnoringCase(t[i..i + needle.length], "x-amz-signature=")) { return true; }
+    }
+    return false;
+}
+
+/// Sends a claim op, its answer not waited on for good.
+async fn tellClaims(
+    shared: borrow NodeShared,
+    op: u8,
+    a: Slice<u8>,
+    b: Slice<u8>,
+    c: Slice<u8>,
+) -> Result<u16, NodeFault> {
+    let body = match (claimRequest(op, a, b, c)) {
+        Ok(x) => x,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    return Ok((await askClaims(shared, body.view())?).status);
+}
+
+/// CreateAccessPoint on a cluster: the name claimed in group 0 for the bucket with an alias (the front's), pending
+/// with a token only this request has; then made on the bucket's shard with that alias. Made there (or there
+/// already: AccessPointAlreadyOwnedByYou), the claim is confirmed; refused for good, abandoned, by its token, so no
+/// other request's create is undone. Unknown (5xx), it stays pending: the client's retry waits for it, and after
+/// CLAIM_PENDING_MS it may be claimed again. A claim the bucket has, confirmed, is kept whatever the shard answers.
 async fn createThroughClaim(
     shared: borrow NodeShared,
     raw: borrow mut RawMessage,
@@ -510,7 +714,9 @@ async fn createThroughClaim(
         Ok(f) => f,
         Err(_) => false,
     };
-    if (!found || bucket.length == 0) { return await routeRequest(shared, 0, raw); }
+    // A request the shard will refuse whatever the claims say goes there without one: no body's bucket, a name S3
+    // would not take, no signature.
+    if (!found || !bucketNameOk(bucket.view()) || !signedRequest(raw)) { return await routeRequest(shared, 0, raw); }
     var alias = Vector<u8>.create();
     match (accessPointAlias(name, mut alias)) {
         Ok(true) => {}
@@ -524,16 +730,25 @@ async fn createThroughClaim(
     let claimed = await askClaims(shared, body.view())?;
     if (claimed.status == 409) { return Ok(frontError("AccessPointAlreadyOwnedByYou", 409)); }
     if (claimed.status != 200 && claimed.status != 201) { return Ok(statusOnly(503)); }
-    if (raw.addHeader(ACCESS_POINT_ALIAS_FIELD.bytes(), claimed.body.view()).isErr()) {
-        return Err(NodeFault.OutOfMemory);
-    }
+    var at = 0usize;
+    let given = claimField(claimed.body.view(), mut at) ?? "".bytes();
+    let token = claimField(claimed.body.view(), mut at) ?? "".bytes();
+    if (given.length == 0 || (claimed.status == 201 && token.length == 0)) { return Ok(statusOnly(503)); }
+    if (raw.addHeader(ACCESS_POINT_ALIAS_FIELD.bytes(), given).isErr()) { return Err(NodeFault.OutOfMemory); }
     let answer = await routeRequest(shared, shardOfBucket(borrow shared.file, bucket.view()), raw)?;
-    if (claimed.status == 201 && answer.status >= 400 && answer.status < 500) {
-        let release = match (claimRequest(CLAIM_RELEASE, name, bucket.view(), "".bytes())) {
-            Ok(b) => b,
-            Err(_) => { return Err(NodeFault.OutOfMemory); }
-        };
-        let _ = await askClaims(shared, release.view())?;
+    if (claimed.status != 201) { return Ok(answer); }
+    let there = indexOfFrom(answer.body.view(), "<Code>AccessPointAlreadyOwnedByYou</Code>".bytes(), 0).isSome();
+    if (answer.status == 200 || there) {
+        var again = Vector<u8>.create();
+        let built = again.extend(bucket.view()).isOk() && again.push('\n').isOk() && again.extend(given).isOk();
+        if (!built) { return Err(NodeFault.OutOfMemory); }
+        if ((await tellClaims(shared, CLAIM_CONFIRM, name, token, again.view())?) == 409) {
+            let _ = await AsyncConsole.writeError(
+                "cosmostore: an access point was made whose name another took meanwhile\n",
+            );
+        }
+    } else if (answer.status >= 400 && answer.status < 500) {
+        let _ = await tellClaims(shared, CLAIM_ABANDON, name, token, "".bytes())?;
     }
     return Ok(answer);
 }

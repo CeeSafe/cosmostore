@@ -19,7 +19,11 @@ and ETag; destinations on this server first, other S3 endpoints in a second slic
    S3's `ReplicationConfiguration` (`Role` taken and ignored; up to 1,000 rules of `ID`, `Priority`, `Status`, a
    `Filter` or `Prefix` on the key, `DeleteMarkerReplication`, and a `Destination` bucket ARN on this server). The
    source's and every destination's versioning must be enabled (InvalidRequest), and stay so (suspending a source's
-   versioning while it has rules is InvalidBucketState). Filters on tags, `ExistingObjectReplication`, replica
+   versioning while it has rules is InvalidBucketState). At one destination the enabled rule that takes a key with
+   the highest `Priority` decides, its delete-marker setting too; two rules giving one priority are InvalidArgument,
+   a priority past u32 too, and a `DeleteMarkerReplication` status is `Enabled` or `Disabled` (the M7 review's A3).
+   A destination `StorageClass` other than `STANDARD` is NotImplemented (A2). Filters on tags,
+   `ExistingObjectReplication`, replica
    modification sync, replication time control and destinations elsewhere are NotImplemented.
 2. **Replication rides the outbox.** When a write's record is applied, every enabled rule whose filter takes the key
    adds its destination as one more target of the record's event (a new object or a completed upload always; a

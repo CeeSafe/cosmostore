@@ -49,8 +49,12 @@
      `x-cosmo-replica-extras` (the source's checksums and part sizes), is written by `putReplica` (ADR-0077 §3); a
      DELETE with `x-cosmo-replica-version` by `putReplicaMarker`. The shard's S3 server takes these fields only when
      they are among the request's signed headers and a long-term key signed it (not a session's, never anonymous):
-     AccessDenied otherwise. The front strips every other `x-cosmo-` field from clients' requests and lets these
-     through. A single PUT's body must have the MD5 it names (BadDigest). A multipart source goes as an upload with
+     AccessDenied otherwise (and always on `serve`, where no delivery sends them). The front lets these fields, and
+     `x-cosmo-log-delivery`, through only on a request of the node's own delivery task, which stamps its requests to
+     its front with `x-cosmo-internal`: HMAC-SHA256 under the cluster's secret of the method, path, query and
+     `x-amz-date` (outside the request's signature, which covers the date); every other `x-cosmo-` field, and these
+     on any other request, it strips (the M7 review's B2, B3: any key holder could set a replica's id first, or keep
+     its requests out of a log). A single PUT's body must have the MD5 it names (BadDigest). A multipart source goes as an upload with
      its parts, whose CompleteMultipartUpload carries `x-cosmo-replica-version`: the store completes it as that
      version (`completeUploadAs`; the record is an ordinary completion with that id, so no new format), and, the
      key having one with that id already (a delivery tried again), aborts the upload and answers with it. So no
@@ -91,23 +95,28 @@
      once, in order per shard.
 5. **Access Points on a cluster (slice d, built).** An access point's configuration stays its bucket's, a record of the
    bucket's shard, as on `serve` (ADR-0076 §2), so the shard's S3 server checks requests through it as `serve` does.
-   - **Its name is the cluster's:** a claim in group 0, the object `access-point/<name>` (`<bucket>\n<alias>`) of its
-     system bucket, which every node holds a copy of (no new record: group 0's writes are a store's, ADR-0062 §3).
-     Group 0's leader takes claims on a peer path of its own, `POST /cluster/access-point`, signed by a node: take a
-     name for a bucket (made now, the bucket's already, or another bucket's: 409), let it go if it is a bucket's, let
-     go every name of a bucket, find one. Behind group 0's gate, once its replica has applied everything it holds.
-   - **CreateAccessPoint** through any node: the front picks an alias, claims the name with it, then sends the
-     request to the bucket's shard with the alias (`x-cosmo-access-point-alias`, which a client cannot send: the front
-     strips its `x-cosmo-` fields). A claim made now that the shard refuses (NoSuchBucket, AccessDenied) is let go; a
-     claim the bucket had already is kept, since its access point may be there (the shard answers
-     AccessPointAlreadyOwnedByYou). A claim left by a failure that is not one (ServiceUnavailable) is let go by a
-     DeleteAccessPoint of the name, which its bucket's shard answers NoSuchAccessPoint.
+   - **Its name is the cluster's:** a claim in group 0, the object `access-point/<name>` of its system bucket
+     (`<bucket>\n<alias>\n<c or p>\n<token>\n<ms>`), which every node holds a copy of (no new record: group 0's
+     writes are a store's, ADR-0062 §3). Group 0's leader takes claim ops on a peer path of its own,
+     `POST /cluster/access-point`, signed by a node, behind group 0's gate once its replica has applied everything it
+     holds: take, confirm, abandon, let go, let go a bucket's, and find (a read of the leader's copy, without the gate).
+   - **A claim is pending until made** (the M7 review's B1: a claim let go on any refusal could be let go by a
+     racing or anonymous create while its access point existed). CreateAccessPoint through any node: a request with
+     a signature and a body's bucket S3 would take; the front picks an alias and takes the name, **pending**, with a
+     token only this request has. A fresh pending claim makes every other take wait (503, which clients retry); one
+     older than 60 s is taken to have failed and may be taken over. The request goes to the bucket's shard with the
+     alias (`x-cosmo-access-point-alias`, which a client cannot send). Made there, or there already
+     (AccessPointAlreadyOwnedByYou), the claim is **confirmed** by its token (made again if it is gone); refused for
+     good (4xx), **abandoned** by its token, so no other request's claim is undone; unknown (5xx), it stays pending.
+     A take for a bucket whose claim is confirmed is answered with its alias, and the shard says whether it is there.
    - **The other calls** find the name's bucket by its claim (this node's copy, then group 0's leader, whose copy
-     has every claim made) and go to its shard; DeleteAccessPoint lets the name go once the shard has deleted it.
-     ListAccessPoints of a bucket goes to its shard; of every bucket, to every shard, merged by name, as ListBuckets.
-     A bucket deleted through the front lets its names go.
-   - **A request through one** names it by its alias or by `<name>-<account>`: the front finds the claim and routes
-     the request, as it came, to the bucket's shard, whose S3 server finds the access point in its own store. For
+     has every claim answered) and go to its shard. DeleteAccessPoint lets a confirmed claim go once the shard has
+     deleted it, or answers NoSuchAccessPoint (so a claim left behind is let go that way); a pending one is its
+     creator's. ListAccessPoints of a bucket goes to its shard; of every bucket, to every shard, merged by name, as
+     ListBuckets. A bucket deleted through the front (presigned too) lets go its names confirmed before the delete
+     was answered, so a name taken again for a bucket made again is kept.
+   - **A request through one** names it by its alias or by `<name>-<account>`: the front finds the claim in its own
+     copy (a bucket named like an alias costs no peer request) and routes the request, as it came, to the bucket's shard, whose S3 server finds the access point in its own store. For
      ARNs, whose host is `<name>-<account>.<domain>`, `cosmostore node --domain` gives the nodes `serve`'s domain:
      the front and the shards' S3 servers read virtual-hosted requests by it.
    - The S3 server's count of buckets with access points stays at "some" on a cluster, as the others do.

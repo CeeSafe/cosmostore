@@ -16,6 +16,7 @@ fn parseReplication(xml: Slice<u8>) -> Result<Vector<ReplicationRule>, S3Fail> {
         return Err(S3Fail.Code(S3Code.MalformedXML));
     }
     var rules = Vector<ReplicationRule>.create();
+    var prioritized = Vector<bool>.create(); // whether each rule gave its Priority
     var at: usize = 0;
     while (true) {
         let r = match (nextElement(xml, "Rule", mut at)?) {
@@ -45,9 +46,13 @@ fn parseReplication(xml: Slice<u8>) -> Result<Vector<ReplicationRule>, S3Fail> {
         }
         if (rule.id.length > 255) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
         var text = Vector<u8>.create();
-        if (rawElement(r, "Priority", mut text)?) {
+        let givenPriority = rawElement(r, "Priority", mut text)?;
+        if (givenPriority) {
             rule.priority = match (parseDecimal(trimBlank(text.view()))) {
-                Some(n) => truncate<u32>(n.min(4294967295)),
+                Some(n) => match (checkedTruncate<u32>(n)) {
+                    Some(p) => p,
+                    null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                },
                 null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
             };
         }
@@ -69,7 +74,11 @@ fn parseReplication(xml: Slice<u8>) -> Result<Vector<ReplicationRule>, S3Fail> {
             Some(m) => {
                 text.clear();
                 let _ = rawElement(r[m..], "Status", mut text)?;
-                rule.deleteMarkers = trimBlank(text.view()) == "Enabled".bytes();
+                let says = trimBlank(text.view());
+                if (says != "Enabled".bytes() && says != "Disabled".bytes()) {
+                    return Err(S3Fail.Code(S3Code.MalformedXML));
+                }
+                rule.deleteMarkers = says == "Enabled".bytes();
             }
             null => {}
         }
@@ -82,6 +91,12 @@ fn parseReplication(xml: Slice<u8>) -> Result<Vector<ReplicationRule>, S3Fail> {
             null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
         };
         let _ = rawElement(destination, "Bucket", mut arn)?;
+        // Replicas are stored as their sources are: a storage class of their own is not done (the M7 review's A2).
+        var storageClass = Vector<u8>.create();
+        if (rawElement(destination, "StorageClass", mut storageClass)? &&
+            trimBlank(storageClass.view()) != "STANDARD".bytes()) {
+            return Err(S3Fail.Code(S3Code.NotImplemented));
+        }
         // A bucket here (`arn:aws:s3:::<bucket>`), or on another endpoint of `--replication-targets`
         // (`arn:cosmostore:s3::<target>:<bucket>`, kept as `<target>:<bucket>`, ADR-0077 §6).
         let arnPrefix = "arn:aws:s3:::".bytes();
@@ -104,8 +119,13 @@ fn parseReplication(xml: Slice<u8>) -> Result<Vector<ReplicationRule>, S3Fail> {
         }
         for (i in 0..rules.length) {
             if (rules[i].id.view() == rule.id.view()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            // As AWS: two rules of one priority could not say which decides.
+            if (givenPriority && prioritized[i] && rules[i].priority == rule.priority) {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
         }
         rules.push(rule)?;
+        prioritized.push(givenPriority)?;
     }
     if (rules.length == 0) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
     return Ok(rules);

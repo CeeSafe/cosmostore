@@ -97,6 +97,27 @@ ADR-0078 built is checked only by hand. The cluster S3 smoke takes about four mi
 ADR-0072 to ADR-0075 and ADR-0077 still said a cluster refuses their item; each now points to ADR-0078's section
 (this review).
 
+## The findings, closed (the owner: "continue", on the recommendation to fix them all)
+
+| Finding | What closed it | Evidence |
+|---|---|---|
+| A1 STS parameters dropped | Every parameter but the call's own is NotImplemented (`PolicyArns`, tags, `ExternalId`, MFA, `SourceIdentity`) | `stsParametersNotTakenAreRefused`; S3 smoke: `assume-role --policy-arns` |
+| A2 replication `StorageClass` | Other than `STANDARD`, NotImplemented | `replicationRulePriorities` |
+| A3 replication `Priority` | At a destination the highest-priority rule that takes the key decides; one priority twice, or past u32, refused; a delete-marker status `Enabled` or `Disabled` | `replicationRulePriorities` |
+| A4 inventory `AccountId`, `IsEnabled` | `AccountId` NotImplemented; `IsEnabled` `true` or `false` | the inventory test's new cases |
+| A5 access points' account | Kept with each (access points v2; v1 read with none); another account's is NoSuchAccessPoint and not listed; `BucketAccountId` of another, and `maxResults`/`nextToken`, NotImplemented | `accessPointsKeepTheirAccount` |
+| B1 a claim let go while its access point exists | Claims pending until made, with a token only their create has: confirmed or abandoned by it; a fresh pending claim makes other takes wait; DeleteAccessPoint lets go confirmed ones only; DeleteBucket only those confirmed before it was answered; no claim for an unsigned request | `accessPointClaimsPendingThenConfirmed` (the anonymous race); cluster smoke |
+| B2 replica fields from any key | The front lets them through only on its node's delivery's requests, stamped with an HMAC under the cluster secret; on `serve` refused | `replicaFieldsOnlySignedByAKey` (serve), `internalStampsDiffer`; both smokes: a client's forged replica id not taken |
+| B3 log delivery from any key | As B2; on `serve` it means nothing | `logDeliveryOnlySignedByAKey` |
+| B4 alias-shaped bucket names | Data requests resolve by this node's copy alone; a find takes no gate; an alias stem under 3 letters is none | cluster smoke |
+| B5 a long `<Bucket>` | The body's bucket checked (3 to 63 of S3's letters) before a claim; a field over 65,535 bytes goes empty | `accessPointFrontChecks` |
+| B6 presigned DeleteBucket | `X-Amz-…` parameters are no sub-resource | `accessPointFrontChecks` |
+| C no cluster run in CI | `tools/cluster_s3_smoke.sh` in CI's end-to-end step, its ARN host in `/etc/hosts` | CI |
+
+**Found while closing them:** the stamp, first put among the signed headers, broke every delivery through the front
+(the front takes it off, so the shard's signature check failed): the cluster smoke caught it at once; the stamp now
+goes outside the signature, which covers the date it binds.
+
 ## Not covered, or not yet
 
 - What ADR-0071 left out: directory buckets and S3 Tables. What each item's ADR lists as not done (multi-Region and
@@ -108,7 +129,8 @@ ADR-0072 to ADR-0075 and ADR-0077 still said a cluster refuses their item; each 
 ## Verdict
 
 Every item's "done when" holds, on `serve` and on a cluster, and the outbox delivers at least once and in order
-under leader kills. **M7 should not close yet:** A1 (an STS parameter that would narrow a session is ignored) and B1
-(an access point's name can be let go, by anyone) are security defects; B2 and B3 let a key holder do what it should
-not; A2 to A5 break the "never silently ignored" rule. Recommended before closing: fix A1 to A5 and B1 to B6, each
-with a test, and put the cluster S3 smoke in CI (C).
+under leader kills. The findings of the review are closed, each with its test, and CI runs the cluster smoke. M7 can
+close; the owner's word closes it.
+
+The first verdict, for the record: M7 should not close yet: A1 and B1 were security defects, B2 and B3 let a key
+holder do what it should not, A2 to A5 broke the "never silently ignored" rule.

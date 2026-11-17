@@ -266,8 +266,9 @@ alias; requests through it use the alias as the bucket, or the ARN `arn:aws:s3:u
 - **Through it** only objects, listings, uploads and batch deletes; bucket configuration goes to the bucket.
 - **On a cluster** (ADR-0078 §5): S3 Control works through any node, and a name is the cluster's, whatever shard its
   bucket is on. Give every `cosmostore node` the same `--domain` (as `serve`'s domain) for ARNs, whose host is
-  `<name>-<account>.<domain>`; aliases need nothing. A name left claimed after a failure (CreateAccessPoint said
-  ServiceUnavailable, and the access point is not there) is let go by `delete-access-point` of it.
+  `<name>-<account>.<domain>`; aliases need nothing. A CreateAccessPoint that said ServiceUnavailable holds its name for a
+  minute (another create of it waits); after that the name may be taken again. A name still claimed with no access
+  point behind it is let go by `delete-access-point` of it.
 
 ## Replication
 

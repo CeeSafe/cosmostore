@@ -97,3 +97,67 @@ fn replicationToOtherEndpoints() -> Result<void, TestFailure> {
     Check.isTrue(!failuresHave(many.view(), "k".bytes(), [0u8; 16]), "the oldest dropped")?;
     return Ok();
 }
+
+fn ruleXml(
+    id: StringView,
+    priority: StringView,
+    prefix: StringView,
+    markers: StringView,
+    destination: StringView,
+) -> String {
+    var x = textOf("<Rule><ID>");
+    let _ = x.append(id);
+    let _ = x.append("</ID><Priority>");
+    let _ = x.append(priority);
+    let _ = x.append("</Priority><Filter><Prefix>");
+    let _ = x.append(prefix);
+    let _ = x.append("</Prefix></Filter><Status>Enabled</Status><DeleteMarkerReplication><Status>");
+    let _ = x.append(markers);
+    let _ = x.append("</Status></DeleteMarkerReplication><Destination><Bucket>arn:aws:s3:::");
+    let _ = x.append(destination);
+    let _ = x.append("</Bucket></Destination></Rule>");
+    return x;
+}
+
+fn configOf(rules: Slice<StringView>) -> String {
+    var x = textOf("<ReplicationConfiguration><Role>r</Role>");
+    for (r in rules) { let _ = x.append(r); }
+    let _ = x.append("</ReplicationConfiguration>");
+    return x;
+}
+
+/// A3 of the M7 review: at one destination the highest-priority rule that takes a key decides, its delete-marker
+/// setting too; two rules of one given priority are refused; A2: a storage class other than STANDARD is refused, and
+/// a delete-marker status is Enabled or Disabled.
+@test
+fn replicationRulePriorities() -> Result<void, TestFailure> {
+    let low = ruleXml("all", "1", "", "Enabled", "backup");
+    let high = ruleXml("logs", "5", "logs/", "Disabled", "backup");
+    let elsewhere = ruleXml("copy", "3", "", "Enabled", "other");
+    let config = configOf([low.view(), high.view(), elsewhere.view()][..]);
+    let rules = parseReplication(config.view().bytes())!;
+    // logs/a: rule "logs" (5) decides for backup, so no marker goes there; "copy" still decides for other.
+    Check.isTrue(!replicationRuleDecides(rules.view(), 0, "logs/a".bytes()), "the lower rule, under logs/")?;
+    Check.isTrue(replicationRuleDecides(rules.view(), 1, "logs/a".bytes()), "the higher rule")?;
+    Check.isTrue(!replicationTakes(borrow rules[1], EVENT_MARKER, "logs/a".bytes()), "its markers off")?;
+    Check.isTrue(replicationRuleDecides(rules.view(), 2, "logs/a".bytes()), "another destination's rule")?;
+    // img/a: only "all" takes it at backup.
+    Check.isTrue(replicationRuleDecides(rules.view(), 0, "img/a".bytes()), "the lower rule, elsewhere")?;
+    Check.isTrue(!replicationRuleDecides(rules.view(), 1, "img/a".bytes()), "a rule that does not take it")?;
+    let twice = ruleXml("again", "5", "x/", "Enabled", "third");
+    Check.isTrue(
+        parseReplication(configOf([high.view(), twice.view()][..]).view().bytes()).isErr(),
+        "a priority twice",
+    )?;
+    let typo = ruleXml("t", "1", "", "Enabeld", "backup");
+    Check.isTrue(parseReplication(configOf([typo.view()][..]).view().bytes()).isErr(), "a marker status typo")?;
+    let huge = ruleXml("h", "4294967296", "", "Enabled", "backup");
+    Check.isTrue(parseReplication(configOf([huge.view()][..]).view().bytes()).isErr(), "a priority past u32")?;
+    let glacier =
+        "<ReplicationConfiguration><Rule><Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::b</Bucket><StorageClass>GLACIER</StorageClass></Destination></Rule></ReplicationConfiguration>";
+    Check.isTrue(parseReplication(glacier.bytes()).isErr(), "GLACIER")?;
+    let standard =
+        "<ReplicationConfiguration><Rule><Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::b</Bucket><StorageClass>STANDARD</StorageClass></Destination></Rule></ReplicationConfiguration>";
+    Check.isTrue(parseReplication(standard.bytes()).isOk(), "STANDARD")?;
+    return Ok();
+}
