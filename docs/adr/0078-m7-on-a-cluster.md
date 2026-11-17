@@ -1,6 +1,6 @@
 # ADR-0078: M7 on a cluster
 
-**Status:** accepted by the owner, 17 Nov 2026 (proposed 16 Nov 2026, after M7, on the owner's "continue"). §2 and §3 are built; §4 is built (steps 1 to 4: event notifications, replication, access logs, inventory) and passes its chaos-harness run; §5, slice d (Access Points), is built.
+**Status:** accepted by the owner, 17 Nov 2026 (proposed 16 Nov 2026, after M7, on the owner's "continue"). §2 and §3 are built; §4 is built (steps 1 to 4: event notifications, replication, access logs, inventory) and passes its chaos-harness run; §5, slice d (Access Points), is built. The owner accepted it as written, §5 included, the same day ("I accept the ADRs as it were written").
 
 ## Context
 

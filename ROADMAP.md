@@ -2810,3 +2810,4 @@ Browser form uploads with a SigV4 POST policy.
   request by alias or by `<name>-<account>` to the bucket's shard; `cosmostore node --domain` reads virtual-hosted
   requests, so ARNs work. A deleted bucket's names are let go. Tests: two new, 313 in all; the cluster smoke, 97
   checks. ADR-0078 is built.
+- **ADR-0078 accepted as written** by the owner (17 Nov 2026), §5 (Access Points on a cluster) included.
