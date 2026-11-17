@@ -1,0 +1,226 @@
+// Inventory reports on a cluster (ADR-0078 §4): each shard's leader makes its buckets' reports from its store, as
+// `serve` does, and writes their files through the node's own front, the destination being any shard's.
+import web_core;
+import web_transport;
+import web_http;
+import web_client;
+
+/// When a configuration's report was last written, as this node knows it while it leads the source's shard.
+struct ClusterInventoryRun {
+    shard: u32;
+    source: Vector<u8>;
+    id: Vector<u8>;
+    lastMs: i64;
+}
+
+async fn leadsShard(slot: borrow ShardSlot) -> Result<bool, NodeFault> {
+    var guard = match (await slot.replica.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    return Ok(guard.data().core.isLeader());
+}
+
+/// `?list-type=2&prefix=…&delimiter=/`, signed, through the front: the newest report folder's time under the
+/// configuration's base (0 for none); null when it could not be asked.
+async fn newestThroughFront(
+    target: borrow ReplicationTarget,
+    client: borrow Client,
+    c: borrow InventoryConfig,
+    source: Slice<u8>,
+) -> Result<i64?, AllocError> {
+    var base = Vector<u8>.create();
+    inventoryBase(c, source, mut base)?;
+    var path = Vector<u8>.create();
+    path.push('/')?;
+    appendUriEncoded(mut path, c.destination.view(), false)?;
+    var newest: i64 = 0;
+    var token = Vector<u8>.create();
+    let none = Vector<HeaderPair>.create();
+    for (round in 0..100000) {
+        var query = Vector<u8>.create();
+        if (token.length > 0) {
+            query.extend("continuation-token=".bytes())?;
+            appendUriEncoded(mut query, token.view(), false)?;
+            query.push('&')?;
+        }
+        query.extend("delimiter=%2F&list-type=2&prefix=".bytes())?;
+        appendUriEncoded(mut query, base.view(), false)?;
+        var body = NoBody {};
+        let answer = await remoteCall(client, target, Method.Get, path.view(), query.view(), none.view(), mut body)?;
+        if (answer.status != 200) { return Ok(null); }
+        let xml = answer.body.view();
+        var at: usize = 0;
+        while (true) {
+            let p = match (nextElement(xml, "Prefix", mut at)) {
+                Ok(Some(p)) => p,
+                _ => { break; }
+            };
+            let t = reportTimeOf(p, base.view());
+            if (t > newest) { newest = t; }
+        }
+        if ((elementText(xml, "IsTruncated") ?? "".bytes()) != "true".bytes()) { break; }
+        token.clear();
+        match (elementText(xml, "NextContinuationToken")) {
+            Some(t) => { token.extend(t)?; }
+            null => { break; }
+        }
+    }
+    return Ok(Some(newest));
+}
+
+/// One report file, PUT through the front; whether it was written.
+async fn putThroughFront(
+    target: borrow ReplicationTarget,
+    client: borrow Client,
+    destination: Slice<u8>,
+    f: borrow InventoryFile,
+) -> Result<bool, AllocError> {
+    var path = Vector<u8>.create();
+    remotePath(destination, f.key.view(), mut path)?;
+    var headers = Vector<HeaderPair>.create();
+    headers.push(remotePair("content-type".bytes(), inventoryContentType(f.kind).bytes())?)?;
+    var body = match (BytesBody.of(f.bytes.view())) {
+        Ok(b) => b,
+        Err(_) => { return Ok(false); }
+    };
+    let answer = await remoteCall(client, target, Method.Put, path.view(), "".bytes(), headers.view(), mut body)?;
+    return Ok(answer.status >= 200 && answer.status < 300);
+}
+
+/// Makes one configuration's report from the shard's store, a page of versions at a time under its lock, and writes
+/// each file through the front without it: its data files, then its manifest and checksum. Whether it was written.
+async fn reportThroughFront(
+    slot: borrow ShardSlot,
+    target: borrow ReplicationTarget,
+    client: borrow Client,
+    source: Slice<u8>,
+    c: borrow InventoryConfig,
+    now: i64,
+) -> Result<bool, NodeFault> {
+    var scan = match (InventoryScan.begin(c, source)) {
+        Ok(s) => s,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    let destination = c.destination.view();
+    while (true) {
+        var next: Result<InventoryFile?, StoreError> = Ok(null);
+        {
+            var guard = match (await slot.store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let st = guard.data();
+            // A page of the index, copied: on a worker thread.
+            next = await Async.blocking(() => scan.next(st, source, c));
+        }
+        let f = match (next) {
+            Ok(Some(f)) => f,
+            Ok(null) => { break; }
+            Err(_) => { return Ok(false); } // the source is gone
+        };
+        match (await putThroughFront(target, client, destination, borrow f)) {
+            Ok(true) => {}
+            _ => { return Ok(false); }
+        }
+        if (scan.written(borrow f).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    let tail = match (scan.manifest(source, c, now)) {
+        Ok(t) => t,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    for (i in 0..tail.length) {
+        match (await putThroughFront(target, client, destination, borrow tail[i])) {
+            Ok(true) => {}
+            _ => { return Ok(false); }
+        }
+    }
+    return Ok(true);
+}
+
+/// Every check (a tenth of a day, at most INVENTORY_CHECK_MS, as on `serve`): for each shard this node leads, each
+/// enabled configuration of its buckets whose report is a day (or a week) old, or that has none, gets one. A shard
+/// it no longer leads is forgotten, so its next leader's reports are asked for again and not repeated.
+async fn inventoryClusterForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
+    var options = ClientOptions.defaults();
+    options.totalMs = 60000;
+    options.retry = RetryPolicy.never();
+    let client = match (Client.create(options, deliveryConnector())) {
+        Ok(c) => c,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    let dayMs = shared.inventoryDayMs;
+    let every = if (dayMs / 10 < INVENTORY_CHECK_MS) (if (dayMs / 10 > 0) dayMs / 10 else 1) else INVENTORY_CHECK_MS;
+    var runs = Vector<ClusterInventoryRun>.create();
+    while (true) {
+        if (!(await frontPause(every))) { return Err(NodeFault.Net); }
+        let target = match (selfTarget(shared)) {
+            Ok(Some(t)) => t,
+            Ok(null) => { continue; }
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        };
+        for (i in 0..shared.slots.length) {
+            let slot = borrow shared.slots[i];
+            let leading = slot.failed.load() == 0 && await leadsShard(slot)?;
+            if (!leading) {
+                var r = 0usize;
+                while (r < runs.length) {
+                    if (runs[r].shard == slot.shard) { let _ = runs.swapRemove(r); } else { r += 1; }
+                }
+                continue;
+            }
+            var buckets = BucketPolicies { names: Vector<Vector<u8>>.create(), documents: Vector<Vector<u8>>.create() };
+            {
+                var guard = match (await slot.store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NodeFault.Net); }
+                };
+                buckets = match (guard.data().inventoryBuckets()) {
+                    Ok(b) => b,
+                    Err(_) => { continue; }
+                };
+            }
+            for (b in 0..buckets.names.length) {
+                let configs = match (decodeInventory(buckets.documents[b].view())) {
+                    Ok(c) => c,
+                    Err(_) => { continue; }
+                };
+                let source = buckets.names[b].view();
+                for (k in 0..configs.length) {
+                    let c = borrow configs[k];
+                    if (!c.enabled) { continue; }
+                    var at = runs.length;
+                    for (r in 0..runs.length) {
+                        if (runs[r].shard == slot.shard && runs[r].source.view() == source &&
+                            runs[r].id.view() == c.id.view()) {
+                            at = r;
+                        }
+                    }
+                    if (at == runs.length) {
+                        let last = match (await newestThroughFront(borrow target, borrow client, c, source)) {
+                            Ok(Some(t)) => t,
+                            Ok(null) => { continue; } // not asked: tried again next time
+                            Err(_) => { return Err(NodeFault.OutOfMemory); }
+                        };
+                        let made = runs.push(ClusterInventoryRun {
+                            shard: slot.shard,
+                            source: copyBytes(source).ok() ?? Vector<u8>.create(),
+                            id: copyBytes(c.id.view()).ok() ?? Vector<u8>.create(),
+                            lastMs: last,
+                        });
+                        if (made.isErr()) { continue; }
+                    }
+                    let now = Clock.unixMillis();
+                    let period = truncate<i64>(dayMs * (c.days as u64));
+                    if (runs[at].lastMs > 0 && now - runs[at].lastMs < period) { continue; }
+                    let written = await reportThroughFront(slot, borrow target, borrow client, source, c, now)?;
+                    if (!written) {
+                        let _ = await AsyncConsole.writeError("cosmostore: an inventory report could not be written\n");
+                    }
+                    runs[at].lastMs = now; // tried: not again until its next period
+                }
+            }
+        }
+    }
+    return Err(NodeFault.Net);
+}

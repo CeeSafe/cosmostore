@@ -219,3 +219,59 @@ fn replicaFaultsTorn() -> Result<void, TestFailure> => sweepReplicas("rfault-tor
 
 @test
 fn replicaFaultsCrash() -> Result<void, TestFailure> => sweepReplicas("rfault-crash", SweepMode.Crash);
+
+/// A replica's upload (ADR-0078 §4): completed as its source's version, once; refused without versioning.
+@test
+fn replicaUploadCompletesAsItsSourcesVersion() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("replica-upload");
+    let a = patterned(60000, 5);
+    let b = patterned(20000, 7);
+    var id = [0u8; 16];
+    id[0] = 0x42;
+    id[15] = 0x07;
+    var etag = [0u8; 16];
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        replicaBuckets(mut s)!;
+        let up = s.createUpload("dst", "multi", "")!;
+        let p1 = sendPart(mut s, "dst", "multi", up, 1, a.view())!;
+        let p2 = sendPart(mut s, "dst", "multi", up, 2, b.view())!;
+        let chosen = [choice(1, p1), choice(2, p2)];
+        let done = s.completeUploadAs("dst", "multi", up, chosen[..], PutCondition.None, "".bytes(), Some(id))!;
+        Check.isTrue(done.versionId[..] == id[..], "the source's id")?;
+        Check.equalU64(2, done.parts as u64)?;
+        etag = done.md5;
+        // Delivered again: the second upload goes, and the version there answers.
+        let again = s.createUpload("dst", "multi", "")!;
+        let q1 = sendPart(mut s, "dst", "multi", again, 1, a.view())!;
+        let q2 = sendPart(mut s, "dst", "multi", again, 2, b.view())!;
+        let twice = [choice(1, q1), choice(2, q2)];
+        let second = s.completeUploadAs("dst", "multi", again, twice[..], PutCondition.None, "".bytes(), Some(id))!;
+        Check.isTrue(second.md5[..] == etag[..], "the first version answers")?;
+        Check.equalU64(1, s.versionsOf("dst", "multi")!.length as u64)?;
+        Check.isTrue(s.abortUpload("dst", "multi", again).isErr(), "the second upload is gone")?;
+        // Not into a bucket without versioning.
+        s.createBucket("plain")!;
+        let plain = s.createUpload("plain", "multi", "")!;
+        let r1 = sendPart(mut s, "plain", "multi", plain, 1, a.view())!;
+        let one = [choice(1, r1)];
+        Check.isTrue(
+            s.completeUploadAs("plain", "multi", plain, one[..], PutCondition.None, "".bytes(), Some(id)).isErr(),
+            "no versioning",
+        )?;
+    }
+    // The journal, then a checkpoint, keep its id and ETag.
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        let v = s.versionsOf("dst", "multi")!;
+        Check.equalU64(1, v.length as u64)?;
+        Check.isTrue(v[0].versionId[..] == id[..], "the id after a reopen")?;
+        Check.isTrue(v[0].md5[..] == etag[..], "the ETag after a reopen")?;
+        var whole = copyBytes(a.view())!;
+        whole.extend(b.view())!;
+        Check.equalBytes(whole.view(), s.getObject("dst", "multi")!.view())?;
+        if (round == 0) { let _ = s.checkpoint()!; }
+    }
+    removeTree(dir.view());
+    return Ok();
+}

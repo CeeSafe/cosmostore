@@ -1,6 +1,6 @@
 # ADR-0078: M7 on a cluster
 
-**Status:** accepted by the owner, 17 Nov 2026 (proposed 16 Nov 2026, after M7, on the owner's "continue"). §2 and §3 are built; §4 is built for event notifications and replication (steps 1 to 3), to be built for access logs and inventory; §1's slice d (Access Points) is to be built.
+**Status:** accepted by the owner, 17 Nov 2026 (proposed 16 Nov 2026, after M7, on the owner's "continue"). §2 and §3 are built; §4 is built (steps 1 to 4: event notifications, replication, access logs, inventory), its chaos-harness run to come; §1's slice d (Access Points) is to be built.
 
 ## Context
 
@@ -50,9 +50,12 @@
      DELETE with `x-cosmo-replica-version` by `putReplicaMarker`. The shard's S3 server takes these fields only when
      they are among the request's signed headers and a long-term key signed it (not a session's, never anonymous):
      AccessDenied otherwise. The front strips every other `x-cosmo-` field from clients' requests and lets these
-     through. A single PUT's body must have the MD5 it names (BadDigest). A multipart source goes as one PUT: its
-     ETag and parts are the source's, and with its extras so are its part numbers; one over 5 GiB is refused, so it
-     reads FAILED. Its body is a client's, unsealed: a destination that seals is refused (a cluster has no SSE keys,
+     through. A single PUT's body must have the MD5 it names (BadDigest). A multipart source goes as an upload with
+     its parts, whose CompleteMultipartUpload carries `x-cosmo-replica-version`: the store completes it as that
+     version (`completeUploadAs`; the record is an ordinary completion with that id, so no new format), and, the
+     key having one with that id already (a delivery tried again), aborts the upload and answers with it. So no
+     replica is bigger than the front's 64 MiB request limit: every source on a cluster came through it, a part
+     at a time. Its body is a client's, unsealed: a destination that seals is refused (a cluster has no SSE keys,
      and SSE-C sources cannot be opened by the delivery task, so they read FAILED).
    - **Built so far:** step 1, the record (`OutboxDelivered`, type 19; a raft replica's cursor at open derived from
      its checkpoint, so no new checkpoint format); step 2, webhooks: `cosmostore node --notify-targets` (its shards'
@@ -64,6 +67,20 @@
      not revoked; another endpoint's as on `serve`. A replica refused for good, by either, is noted behind the
      shard's gate, so the version reads FAILED. PutBucketReplication on a cluster cannot see a destination of another
      shard: it is taken, and refused at delivery if it is not a bucket with versioning.
+   - **Access logs (step 4):** every shard's S3 server queues its requests' lines on one queue of its node, as
+     `serve`'s does; the node delivers each target's lines as an object (`--access-log-seconds`, 300 by default),
+     a PUT through its own front signed with the first key, with `x-cosmo-log-delivery`: such a request, signed by
+     a long-term key, is not logged itself, or a bucket that logs into itself would never stop. Lines are lost
+     with a node, as `serve`'s with it. PutBucketLogging cannot see a target of another shard; a wrong one loses
+     its lines (said on stderr). The count of buckets that log stays at "some" on a cluster.
+   - **The client's address:** the front forwards it as `x-cosmo-peer` (dropping a client's), and a shard's S3
+     server on a cluster takes its peer from it: access log lines name the client, and a policy's `aws:SourceIp`
+     is the client's, where before this it was the front's (a node reaches a shard's S3 server only on loopback).
+   - **Inventory (step 4):** each shard's leader makes its buckets' reports from its store, a page of versions
+     at a time under the store's lock (`InventoryScan`, which `serve` now uses too), and PUTs each file through
+     its front, the destination being any shard's. When a configuration's last report was made is found, the
+     first time a leader looks at it, by a ListObjectsV2 of the destination through the front; a node forgets
+     the shards it stops leading, so a new leader neither repeats a report nor skips one.
    - **Status** on a cluster reads the cursor the shard's records moved, so it is the same on every replica. A
      destination of another shard counts as another endpoint's does: COMPLETED once delivered, FAILED if noted.
      The S3 server's count of buckets with replication stays at "some" on a cluster, as the policy counts do: the
@@ -75,6 +92,11 @@
 5. **Until its slice**, a feature keeps refusing on a cluster as it does now.
 
 ## Consequences
+
+- Slice c, step 4: `replicaUploadCompletesAsItsSourcesVersion`; the cluster smoke replicates a 72 MiB upload
+  across shards (its id, ETag and bytes), logs PUTs made through three nodes and a GET into a bucket of another
+  shard, sees a bucket that logs into itself stop, and gets an inventory report (manifest, checksum, a CSV row per
+  object) in a bucket of another shard.
 
 - Slice c, step 3: `replicaFieldsOnlySignedByAKey`; the cluster smoke replicates a PUT and a two-part upload to a
   bucket of another shard (id, ETag, bytes, part 2 by number, REPLICA), a delete marker with its id, a PUT to

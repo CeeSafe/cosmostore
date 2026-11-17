@@ -4745,11 +4745,45 @@ struct ObjectStore {
         chosen: Slice<PartChoice>,
         condition: PutCondition,
         expected: Slice<u8>,
+    ) -> Result<PutOutcome, StoreError> => this.completeUploadAs(bucket, key, id, chosen, condition, expected, null);
+
+    /// `completeUploadIf`, the version taking the id `asVersion` names if it is given: a replica's (ADR-0078 §4), in
+    /// a bucket with versioning enabled, as `putReplica` writes one. If the key already has a version with that id
+    /// (a delivery tried again), the upload is aborted and that version answers.
+    fn completeUploadAs(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16],
+        chosen: Slice<PartChoice>,
+        condition: PutCondition,
+        expected: Slice<u8>,
+        asVersion: [u8; 16]?,
     ) -> Result<PutOutcome, StoreError> {
         this.commitStaged()?;
         this.checkWritable()?;
         var manifest = Vector<u8>.create();
-        let versionId = this.versionIdFor(bucket.bytes(), key.bytes())?;
+        let versionId = match (asVersion) {
+            Some(v) => {
+                if (isNullVersionId(v) || this.versioningOf(bucket.bytes())? != VERSIONING_ENABLED) {
+                    return Err(StoreError.InvalidKey);
+                }
+                let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
+                if (this.state.index.slotOf(borrow k, v) != NO_VERSION_SLOT) {
+                    let _ = this.abortUpload(bucket, key, id);
+                    let there = this.headObjectOf(bucket, key, Some(v))?;
+                    return Ok(PutOutcome {
+                        md5: there.md5,
+                        generation: there.generation,
+                        parts: there.parts,
+                        extras: there.extras,
+                        versionId: v,
+                    });
+                }
+                v
+            }
+            null => this.versionIdFor(bucket.bytes(), key.bytes())?,
+        };
         var meta = Vector<u8>.create();
         var extrasBlob = Vector<u8>.create();
         {

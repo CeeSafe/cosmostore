@@ -230,3 +230,73 @@ async fn deliverClusterForever(shared: borrow NodeShared) -> Result<void, NodeFa
     }
     return Err(NodeFault.Net);
 }
+
+/// Access logs on a cluster (ADR-0078 §4): every second, the lines this node's shards' S3 servers queued, into their
+/// targets' batches; a batch due goes as one object, a PUT through the node's own front (its target may be another
+/// shard's), marked as a log delivery so it is not logged itself. One that fails loses its lines, as on `serve`.
+async fn accessLogClusterForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
+    var options = ClientOptions.defaults();
+    options.totalMs = 60000;
+    options.retry = RetryPolicy.never();
+    let client = match (Client.create(options, deliveryConnector())) {
+        Ok(c) => c,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    var batches = Vector<AccessLogBatch>.create();
+    var failing = false;
+    while (true) {
+        if (!(await frontPause(1000))) { return Err(NodeFault.Net); }
+        let now = Clock.unixMillis();
+        gatherLines(borrow shared.accessLog, mut batches, now);
+        while (true) {
+            let batch = match (nextDue(mut batches, now, shared.accessLog.everyMs)) {
+                Some(b) => b,
+                null => { break; }
+            };
+            let done = match (await sendLogObject(shared, borrow client, borrow batch, now)) {
+                Ok(d) => d,
+                Err(_) => false,
+            };
+            if (!done && !failing) {
+                let _ = await AsyncConsole.writeError(
+                    "cosmostore: an access log could not be delivered to its target bucket; its lines are lost\n",
+                );
+            }
+            failing = !done;
+        }
+    }
+    return Err(NodeFault.Net);
+}
+
+async fn sendLogObject(
+    shared: borrow NodeShared,
+    client: borrow Client,
+    batch: borrow AccessLogBatch,
+    now: i64,
+) -> Result<bool, AllocError> {
+    let target = match (selfTarget(shared)?) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    var key = Vector<u8>.create();
+    logObjectKey(batch.prefix.view(), now, mut key)?;
+    var path = Vector<u8>.create();
+    remotePath(batch.target.view(), key.view(), mut path)?;
+    var headers = Vector<HeaderPair>.create();
+    headers.push(remotePair("content-type".bytes(), "text/plain".bytes())?)?;
+    headers.push(remotePair(LOG_DELIVERY_FIELD.bytes(), "1".bytes())?)?;
+    var body = match (BytesBody.of(batch.bytes.view())) {
+        Ok(b) => b,
+        Err(_) => { return Ok(false); }
+    };
+    let answer = await remoteCall(
+        client,
+        borrow target,
+        Method.Put,
+        path.view(),
+        "".bytes(),
+        headers.view(),
+        mut body,
+    )?;
+    return Ok(answer.status >= 200 && answer.status < 300);
+}

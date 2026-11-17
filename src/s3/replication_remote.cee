@@ -500,9 +500,10 @@ async fn sendRemote(
     };
     var headers = Vector<HeaderPair>.create();
     if (replicaHeaders(borrow v, sealed, mut headers).isErr()) { return RemoteOutcome.Again; }
-    // With fidelity (a CosmoStore that takes them, ADR-0078 §4): one PUT with the source's id, MD5, parts and
-    // extras, written as the source version is.
-    if (fidelity) {
+    // With fidelity (a CosmoStore that takes them, ADR-0078 §4): a single PUT's replica is one PUT with the source's
+    // id, MD5 and extras; a multipart one is an upload with its parts, completed as the source's id (below).
+    let multipart = v.parts > 0 && extras.partSizes.length == v.parts as usize;
+    if (fidelity && !multipart) {
         if (!fidelityHeaders(borrow v, mut headers)) { return RemoteOutcome.Again; }
         body.left = v.size;
         return match (await remoteCall(client, t, Method.Put, path.view(), "".bytes(), headers.view(), mut body)) {
@@ -607,7 +608,26 @@ async fn sendRemote(
         Ok(b) => b,
         Err(_) => { return RemoteOutcome.Again; }
     };
-    let done = match (await remoteCall(client, t, Method.Post, path.view(), query.view(), noHeaders.view(), mut xml)) {
+    var completeHeaders = Vector<HeaderPair>.create();
+    if (fidelity) {
+        var vid = Vector<u8>.create();
+        if (appendVersionId(mut vid, v.versionId).isErr() || !pushPair(
+            mut completeHeaders,
+            REPLICA_VERSION_FIELD.bytes(),
+            vid.view(),
+        )) {
+            return RemoteOutcome.Again;
+        }
+    }
+    let done = match (await remoteCall(
+        client,
+        t,
+        Method.Post,
+        path.view(),
+        query.view(),
+        completeHeaders.view(),
+        mut xml,
+    )) {
         Ok(a) => a,
         Err(_) => { return RemoteOutcome.Again; }
     };

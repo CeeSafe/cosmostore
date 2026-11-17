@@ -129,6 +129,12 @@ struct NodeS3Setup {
     replicationTargetsText: Vector<u8>;
     /// The node's own front, `http://<address>`: where its delivery task sends replicas into the cluster's buckets.
     frontUrl: Vector<u8>;
+    /// The node's queue of access log lines, which every shard's S3 server feeds (ADR-0078 §4), and how often a
+    /// target's lines become an object (`--access-log-seconds`).
+    accessLines: Channel<AccessLogEntry>;
+    accessLogEveryMs: u64;
+    /// A day, for inventory reports (`--inventory-day-seconds`, shorter for tests).
+    inventoryDayMs: u64;
 }
 
 /// What a shard's S3 server needs that the node gives it: its store, the node's credentials, STS's keys and roles.
@@ -176,8 +182,9 @@ fn clusterS3App(
         corsBuckets: AtomicU64.create(1),
         encryptedBuckets: AtomicU64.create(1),
         audit: null,
-        accessLog: null,
-        loggingBuckets: AtomicU64.create(0),
+        accessLog: Some(AccessLog { lines: sts.accessLines.clone(), dropped: AtomicU64.create(0) }),
+        // "Some", for good, as policies are.
+        loggingBuckets: AtomicU64.create(1),
         accessPointBuckets: AtomicU64.create(0),
         // "Some", for good, as policies are.
         replicationBuckets: AtomicU64.create(1),
@@ -1015,12 +1022,27 @@ impl Handler<FrontApp> for FrontHandler {
         }
         let fields = request.headers();
         for (i in 0..fields.count()) {
-            // The cluster's own headers are the nodes' to set: a client's go (ADR-0068 §1). A replica's fields pass:
-            // the shard's S3 server takes them only signed, by a long-term key (ADR-0078 §4).
+            // The cluster's own headers are the nodes' to set: a client's go (ADR-0068 §1). A replica's fields and a
+            // log delivery's pass: the shard's S3 server takes them only signed, by a long-term key (ADR-0078 §4).
             let name = fields.nameBytes(i);
-            let replicaField = name.length >= 16 && Ascii.equalsIgnoringCase(name[0..16], "x-cosmo-replica-");
-            if (!replicaField && name.length >= 8 && Ascii.equalsIgnoringCase(name[0..8], "x-cosmo-")) { continue; }
+            let signedField = (name.length >= 16 && Ascii.equalsIgnoringCase(name[0..16], "x-cosmo-replica-")) ||
+                Ascii.equalsIgnoringCase(name, LOG_DELIVERY_FIELD);
+            if (!signedField && name.length >= 8 && Ascii.equalsIgnoringCase(name[0..8], "x-cosmo-")) { continue; }
             if (raw.addHeader(name, fields.value(i)).isErr()) { return Err(HandlerError.Internal); }
+        }
+        // The client's address, for the shard's S3 server: its policies' `aws:SourceIp` and its access log lines
+        // (ADR-0078 §4) are the client's, not this front's.
+        match (ctx.connection().peerAddress()) {
+            Some(a) => {
+                var text = String.create();
+                if (appendPeerAddress(mut text, a).isErr() || raw.addHeader(
+                    PEER_FIELD.bytes(),
+                    text.view().bytes(),
+                ).isErr()) {
+                    return Err(HandlerError.Internal);
+                }
+            }
+            null => {}
         }
         // A write's request id (ADR-0068 §1): the node's prefix, then its count of requests.
         if (isWriteMethod(raw.method.view())) {

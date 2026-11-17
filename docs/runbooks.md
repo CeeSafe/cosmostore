@@ -198,7 +198,10 @@ bucket's requests arrive as objects `photos/YYYY-mm-DD-HH-MM-SS-<random>` in `lo
   target bucket is deleted, deliveries fail (`an access log could not be delivered` on stderr) until logging is
   turned off or the bucket is made again.
 - **Query values are not logged,** only the parameters' names: a presigned URL's signature never lands in a bucket.
-- **Not on a cluster yet:** its S3 port answers `NotImplemented`.
+- **On a cluster** (ADR-0078 §4): each node delivers the lines of the requests its shards served, every
+  `--access-log-seconds` (300 by default), through its own S3 port signed with the first key of the credentials
+  file. A target bucket in another shard is not checked when logging is put: a wrong one loses its lines (the node's
+  log says so). A node that stops loses the lines it had not delivered, as `serve` does.
 - **Bytes sent and object size are `-`.**
 
 ## Static websites
@@ -228,7 +231,9 @@ writes a report of `photos` to `reports` under `inv/photos/daily/` every day (AD
   next is due a day after the newest one in the destination.
 - **CSV only** (ORC and Parquet are `NotImplemented`), and the gzip files are not compressed (CEESAFE_GAPS G35): plan
   their space as the CSV's.
-- **Not on a cluster yet.**
+- **On a cluster** (ADR-0078 §4): the leader of the source bucket's shard writes its reports, through its node's S3
+  port; `--inventory-day-seconds` as on `serve`. A destination in another shard is not checked when the
+  configuration is put: a wrong one shows as "an inventory report could not be written" in the leader's log.
 
 ## Temporary credentials (STS)
 
@@ -286,7 +291,8 @@ marks the version `FAILED` and shows in the log; an unreachable endpoint holds t
 shard's leader sends its replicas; one into a bucket of the cluster goes through that node's own S3 port, signed with
 the first key of the credentials file, so keep that key there and not revoked. Replicas keep their source's id and
 ETag across shards. A destination in another shard is not checked when the rule is put: a wrong one shows as `FAILED`.
-Objects over 5 GiB, and SSE-C objects, are not replicated within a cluster (`FAILED`).
+A multipart object's replica goes as an upload with the same parts. SSE-C objects are not replicated within a
+cluster (`FAILED`).
 
 ## Rate limits
 

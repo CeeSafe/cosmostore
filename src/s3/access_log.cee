@@ -81,6 +81,7 @@ fn loggingXml(target: borrow (LoggingTarget?), out: borrow mut Vector<u8>) -> Re
 }
 
 async fn recountLogging(app: borrow S3App) -> Result<void, S3Fail> {
+    if (app.cluster) { return Ok(); } // the count stays at "some" (ADR-0078 §4)
     var guard = await lockStore(app)?;
     let store = guard.data();
     app.loggingBuckets.store(store.loggingBucketCount());
@@ -105,8 +106,6 @@ async fn putBucketLogging(
     auth: Authenticated,
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
-    // A cluster's S3 port delivers no access logs yet (ADR-0072 §4), as it keeps no audit log.
-    if (app.cluster) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
     let xml = await readSmallBody(auth, exchange, 65536)?;
     verifySmallBody(req, xml.view(), true)?;
     var stored = Vector<u8>.create();
@@ -120,7 +119,8 @@ async fn putBucketLogging(
                 let name = StringView.fromUtf8(t.bucket.view()) ?? "";
                 exists = store.bucketExists(name).ok() ?? false;
             }
-            if (!exists) { return Err(S3Fail.Code(S3Code.InvalidTargetBucketForLogging)); }
+            // On a cluster, a target of another shard is not seen here: its objects are refused, if it is not one.
+            if (!exists && !app.cluster) { return Err(S3Fail.Code(S3Code.InvalidTargetBucketForLogging)); }
             encodeLogging(borrow t, mut stored)?;
         }
         null => {}
@@ -382,9 +382,39 @@ fn deliverLogObject(store: borrow mut ObjectStore, batch: borrow AccessLogBatch,
     return store.putObject(bucket, name, "text/plain", batch.bytes.view(), PutCondition.None).isOk();
 }
 
-/// Every second: the lines queued since, into their targets' batches; a batch `everyMs` old, or of
-/// ACCESS_LOG_OBJECT_BYTES, delivered as one object (ADR-0072 §3). A delivery that fails loses its lines, said once
-/// on stderr until one succeeds again.
+/// The lines queued since the last call, into their targets' batches.
+fn gatherLines(w: borrow AccessLogWriter, batches: borrow mut Vector<AccessLogBatch>, now: i64) {
+    while (true) {
+        let e = match (w.lines.tryRecv()) {
+            Some(e) => e,
+            null => { break; }
+        };
+        var at = batches.length;
+        for (i in 0..batches.length) {
+            if (batches[i].target.view() == e.target.view() && batches[i].prefix.view() == e.prefix.view()) { at = i; }
+        }
+        if (at == batches.length) {
+            let made = batches.push(
+                AccessLogBatch { target: e.target, prefix: e.prefix, bytes: Vector<u8>.create(), since: now },
+            );
+            if (made.isErr()) { continue; }
+        }
+        let _ = batches[at].bytes.extend(e.line.view());
+    }
+}
+
+/// A batch due for delivery, taken out: `everyMs` old, or of ACCESS_LOG_OBJECT_BYTES (ADR-0072 §3).
+fn nextDue(batches: borrow mut Vector<AccessLogBatch>, now: i64, everyMs: u64) -> AccessLogBatch? {
+    for (k in 0..batches.length) {
+        let due = batches[k].bytes.length >= ACCESS_LOG_OBJECT_BYTES ||
+            (now - batches[k].since) >= truncate<i64>(everyMs);
+        if (due) { return Some(batches.swapRemove(k)); }
+    }
+    return null;
+}
+
+/// Every second: the lines queued since, into their targets' batches; a batch due delivered as one object (ADR-0072
+/// §3). A delivery that fails loses its lines, said once on stderr until one succeeds again.
 async fn accessLogForever(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     w: borrow AccessLogWriter,
@@ -394,34 +424,12 @@ async fn accessLogForever(
     while (true) {
         await deliveryPause(1000)?;
         let now = Clock.unixMillis();
+        gatherLines(w, mut batches, now);
         while (true) {
-            let e = match (w.lines.tryRecv()) {
-                Some(e) => e,
+            let batch = match (nextDue(mut batches, now, w.everyMs)) {
+                Some(b) => b,
                 null => { break; }
             };
-            var at = batches.length;
-            for (i in 0..batches.length) {
-                if (batches[i].target.view() == e.target.view() && batches[i].prefix.view() == e.prefix.view()) {
-                    at = i;
-                }
-            }
-            if (at == batches.length) {
-                let made = batches.push(
-                    AccessLogBatch { target: e.target, prefix: e.prefix, bytes: Vector<u8>.create(), since: now },
-                );
-                if (made.isErr()) { continue; }
-            }
-            let _ = batches[at].bytes.extend(e.line.view());
-        }
-        var k = 0usize;
-        while (k < batches.length) {
-            let due = batches[k].bytes.length >= ACCESS_LOG_OBJECT_BYTES ||
-                (now - batches[k].since) >= truncate<i64>(w.everyMs);
-            if (!due) {
-                k += 1;
-                continue;
-            }
-            let batch = batches.swapRemove(k);
             var done = false;
             {
                 var guard = match (await store.get().lock()) {

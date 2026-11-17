@@ -69,6 +69,10 @@ struct NodeShared {
     /// with the current first key, as a client's write.
     frontUrl: Vector<u8>;
     credentials: Arc<CredentialSets>?;
+    /// The access log lines this node's shards' S3 servers queued, delivered as objects through the front.
+    accessLog: AccessLogWriter;
+    /// A day, for inventory reports (ADR-0078 §4).
+    inventoryDayMs: u64;
     /// Scrub (ADR-0063): how often a pass starts, and what passes found: versions checked, damage found, records
     /// repaired from a replica, extents fetched (a damaged one removed comes back this way, as a missing one does).
     scrubEveryMs: u64;
@@ -307,6 +311,8 @@ fn openNode(
             Err(_) => { return Err(textOf("out of memory")); }
         },
         credentials: credentials,
+        accessLog: AccessLogWriter { lines: sts.accessLines.clone(), everyMs: sts.accessLogEveryMs },
+        inventoryDayMs: sts.inventoryDayMs,
         requests: AtomicU64.create(0),
         scrubEveryMs: scrubEveryMs,
         codeAfterMs: codeAfterMs,
@@ -994,6 +1000,8 @@ async fn runNode(
         s.spawn(async () => await rebalanceForever(node));
         s.spawn(async () => await scrubForever(node));
         s.spawn(async () => await deliverClusterForever(node));
+        s.spawn(async () => await accessLogClusterForever(node));
+        s.spawn(async () => await inventoryClusterForever(node));
         s.spawn(async () => await codeForever(node));
         for (i in 0..peers) {
             let at = i;
@@ -1120,6 +1128,12 @@ fn nodeCommand() -> i32 {
         notifyTargetsText: Vector<u8>.create(),
         replicationTargetsText: Vector<u8>.create(),
         frontUrl: Vector<u8>.create(),
+        accessLines: match (Channel<AccessLogEntry>.create(ACCESS_LOG_QUEUE)) {
+            Ok(c) => c,
+            Err(_) => { return 1; }
+        },
+        accessLogEveryMs: (args.accessLogSeconds ?? 300) * 1000,
+        inventoryDayMs: (args.inventoryDaySeconds ?? 86400) * 1000,
     };
     {
         var url = textOf("http://");
@@ -1311,6 +1325,10 @@ struct ClusterArguments {
     notifyTargets: String?;
     /// The other endpoints replication goes to (ADR-0078 §4).
     replicationTargets: String?;
+    /// How often a target bucket's access log lines become an object (ADR-0078 §4).
+    accessLogSeconds: u64?;
+    /// A day for inventory reports, 1 to 86400 seconds (tests).
+    inventoryDaySeconds: u64?;
     /// How an empty directory starts (ADR-0066): the cluster's formation, or joining it.
     init: bool;
     join: bool;
@@ -1331,6 +1349,8 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var websiteDomain: String? = null;
     var notifyTargets: String? = null;
     var replicationTargets: String? = null;
+    var accessLogSeconds: u64? = null;
+    var inventoryDaySeconds: u64? = null;
     var init = false;
     var join = false;
     var at = from;
@@ -1377,6 +1397,13 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             notifyTargets = Some(textOf(value));
         } else if (option == "--replication-targets") {
             replicationTargets = Some(textOf(value));
+        } else if (option == "--access-log-seconds") {
+            accessLogSeconds = value.parseInt<u64>();
+            if ((accessLogSeconds ?? 0) == 0) { return null; }
+        } else if (option == "--inventory-day-seconds") {
+            inventoryDaySeconds = value.parseInt<u64>();
+            let n = inventoryDaySeconds ?? 0;
+            if (n < 1 || n > 86400) { return null; }
         } else if (option == "--scrub-seconds") {
             scrubSeconds = value.parseInt<u64>();
             if (scrubSeconds.isNull() || (scrubSeconds ?? 0) == 0) { return null; }
@@ -1402,6 +1429,8 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 websiteDomain: websiteDomain,
                 notifyTargets: notifyTargets,
                 replicationTargets: replicationTargets,
+                accessLogSeconds: accessLogSeconds,
+                inventoryDaySeconds: inventoryDaySeconds,
                 init: init,
                 join: join,
             }),

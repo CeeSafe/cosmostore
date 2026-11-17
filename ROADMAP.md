@@ -2789,4 +2789,11 @@ Browser form uploads with a SigV4 POST policy.
   node.
 - **ADR-0078 accepted** by the owner (17 Nov 2026), with slices a and b and slice c's steps 1 to 3 built; access logs
   and inventory on a cluster, the chaos-harness run, and slice d (Access Points) are next.
+- **Slice c, step 4 (access logs and inventory on a cluster):** every shard's S3 server queues access log lines on
+  its node's queue; the node PUTs each target's object through its front with `x-cosmo-log-delivery`, which is not
+  logged itself. Each shard's leader makes inventory reports (`InventoryScan`, shared with `serve`) and PUTs their
+  files through the front; it finds the last report by listing the destination through the front. Found on the way:
+  a shard's S3 server saw the front's address, not the client's (in access logs, and in policies' `aws:SourceIp`);
+  the front now forwards it as `x-cosmo-peer`. And a multipart replica over the front's 64 MiB could not be sent as
+  one PUT: it is now an upload with the source's parts, completed as the source's version (`completeUploadAs`).
 

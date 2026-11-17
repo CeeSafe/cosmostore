@@ -71,7 +71,7 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --notify-targets targets --replication-targets reptargets >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -220,6 +220,9 @@ printf 'replicate me' > r1.txt
 head -c 9437184 /dev/urandom > r2.bin
 on 1 s3api put-object --bucket rsrc --key r/small.txt --body r1.txt > /dev/null 2>&1
 on 2 s3 cp r2.bin s3://rsrc/r/multi.bin > /dev/null 2>&1
+# Over the 64 MiB a request through the front may hold: its replica is an upload with its parts.
+head -c 75497472 /dev/urandom > r3.bin
+on 3 s3 cp r3.bin s3://rsrc/r/large.bin > /dev/null 2>&1
 on 3 s3api put-object --bucket rsrc --key f/small.txt --body r1.txt --metadata colour=blue > /dev/null 2>&1
 on 1 s3api put-object --bucket rsrc --key lost/x.txt --body r1.txt > /dev/null 2>&1
 status_of() { on "$1" s3api head-object --bucket rsrc --key "$2" --query ReplicationStatus --output text 2>/dev/null; }
@@ -227,7 +230,7 @@ replicated() {
     for i in $(seq 1 80); do [ "$(status_of 3 "$1")" = COMPLETED ] && return 0; pause 0.25; done
     return 1
 }
-for k in r/small.txt r/multi.bin; do
+for k in r/small.txt r/multi.bin r/large.bin; do
     replicated "$k" && pass "$k replicated" || fail "$k replicated: $(status_of 3 "$k")"
     sv=$(on 1 s3api head-object --bucket rsrc --key "$k" --query '[VersionId,ETag]' --output text 2>&1)
     check "$k keeps its version id and ETag, read through node 2" "$(on 2 s3api head-object --bucket "$rdst" --key "$k" --query '[VersionId,ETag]' --output text 2>&1)" "$sv"
@@ -236,6 +239,7 @@ done
 check "the same status through every node" "$(status_of 1 r/multi.bin) $(status_of 2 r/multi.bin)" "COMPLETED COMPLETED"
 check "a multipart ETag" "$(on 1 s3api head-object --bucket "$rdst" --key r/multi.bin --query ETag --output text 2>&1 | grep -c -- '-2"')" 1
 check "the multipart replica's bytes" "$(on 3 s3 cp "s3://$rdst/r/multi.bin" - 2>/dev/null | cmp -s - r2.bin && echo same)" same
+check "the 72 MiB replica's bytes" "$(on 1 s3 cp "s3://$rdst/r/large.bin" - 2>/dev/null | cmp -s - r3.bin && echo same)" same
 check "its second part, by number" "$(on 2 s3api head-object --bucket "$rdst" --key r/multi.bin --part-number 2 --query ContentLength --output text 2>&1)" 1048576
 marker=$(on 2 s3api delete-object --bucket rsrc --key r/small.txt --query VersionId --output text 2>&1)
 for i in $(seq 1 40); do
@@ -249,6 +253,58 @@ check "its ETag there" "$(on 2 s3api head-object --bucket faraway --key f/small.
 check "its metadata there" "$(on 2 s3api head-object --bucket faraway --key f/small.txt --query Metadata.colour --output text 2>&1)" blue
 for i in $(seq 1 60); do [ "$(status_of 2 lost/x.txt)" = FAILED ] && break; pause 0.25; done
 check "a destination that refuses: FAILED, through every node" "$(status_of 1 lost/x.txt) $(status_of 2 lost/x.txt) $(status_of 3 lost/x.txt)" "FAILED FAILED FAILED"
+
+# Access logs on a cluster (ADR-0078 §4): each request's line, queued on the node whose shard served it, delivered as
+# an object through that node's front, into a target that may be another shard's.
+logsb=""
+for c in logs logs1 logs2 logs3 logs4 logs5 logs6 logs7; do [ "$(shardOf "$c")" != "$(shardOf logged)" ] && { logsb=$c; break; }; done
+on 1 s3api create-bucket --bucket logged > /dev/null 2>&1
+on 2 s3api create-bucket --bucket "$logsb" > /dev/null 2>&1
+on 2 s3api put-bucket-logging --bucket logged --bucket-logging-status "{\"LoggingEnabled\":{\"TargetBucket\":\"$logsb\",\"TargetPrefix\":\"in/\"}}" > /dev/null 2>&1 && pass "put-bucket-logging through node 2 (into $logsb, another shard)" || fail "put-bucket-logging through node 2"
+for n in 1 2 3; do on "$n" s3api put-object --bucket logged --key "seen$n" --body one.txt > /dev/null 2>&1; done
+on 3 s3api get-object --bucket logged --key seen1 got.txt > /dev/null 2>&1
+loglines() {
+    rm -rf logsdir; mkdir logsdir
+    on 1 s3 cp --recursive "s3://$logsb/in/" logsdir/ > /dev/null 2>&1
+    cat logsdir/* 2>/dev/null
+}
+for i in $(seq 1 40); do [ "$(loglines | grep -c 'REST.PUT.OBJECT seen')" = 3 ] && break; pause 0.5; done
+check "the three PUTs through three nodes, in its access log" "$(loglines | grep -c 'REST.PUT.OBJECT seen')" 3
+check "and the GET" "$(loglines | grep -c 'REST.GET.OBJECT seen1')" 1
+check "a line names its bucket and requester" "$(loglines | grep 'REST.PUT.OBJECT seen2' | awk '{ print $2, $6 }')" "logged $AWS_ACCESS_KEY_ID"
+# A bucket that logs into itself: the log objects' own PUTs are not logged, so it stops once requests do.
+on 3 s3api create-bucket --bucket selflog > /dev/null 2>&1
+on 3 s3api put-bucket-logging --bucket selflog --bucket-logging-status '{"LoggingEnabled":{"TargetBucket":"selflog","TargetPrefix":"log/"}}' > /dev/null 2>&1
+on 1 s3api put-object --bucket selflog --key x --body one.txt > /dev/null 2>&1
+selfcount() { on 2 s3api list-objects-v2 --bucket selflog --prefix log/ --query 'length(Contents)' --output text 2>/dev/null; }
+for i in $(seq 1 40); do [ "$(selfcount)" != None ] && [ "$(selfcount)" -ge 1 ] 2>/dev/null && break; pause 0.5; done
+pause 7
+first=$(selfcount)
+pause 7
+check "a bucket logging into itself stops (each listing adds one object, its deliveries none)" "$(selfcount)" "$((first + 1))"
+
+# Inventory on a cluster (ADR-0078 §4): the source's shard's leader makes the report and writes it through its node's
+# front, into a destination of another shard.
+invdst=""
+for c in invdst invdst1 invdst2 invdst3 invdst4 invdst5 invdst6 invdst7; do [ "$(shardOf "$c")" != "$(shardOf inv)" ] && { invdst=$c; break; }; done
+on 1 s3api create-bucket --bucket inv > /dev/null 2>&1
+on 2 s3api create-bucket --bucket "$invdst" > /dev/null 2>&1
+for n in 1 2 3; do on "$n" s3api put-object --bucket inv --key "i$n" --body one.txt > /dev/null 2>&1; done
+on 3 s3api put-bucket-inventory-configuration --bucket inv --id daily --inventory-configuration "{\"Id\":\"daily\",\"IsEnabled\":true,\"Destination\":{\"S3BucketDestination\":{\"Bucket\":\"arn:aws:s3:::$invdst\",\"Format\":\"CSV\",\"Prefix\":\"rep\"}},\"Schedule\":{\"Frequency\":\"Daily\"},\"IncludedObjectVersions\":\"Current\",\"OptionalFields\":[\"Size\",\"ETag\"]}" > /dev/null 2>&1 && pass "put-bucket-inventory-configuration through node 3 (into $invdst, another shard)" || fail "put-bucket-inventory-configuration through node 3"
+for i in $(seq 1 80); do
+    m=$(on 1 s3api list-objects-v2 --bucket "$invdst" --prefix rep/inv/daily/ --query "Contents[?ends_with(Key, 'manifest.json')].Key | [0]" --output text 2>/dev/null)
+    [ -n "$m" ] && [ "$m" != "None" ] && break
+    pause 0.25
+done
+check "a report is written" "$([ -n "$m" ] && [ "$m" != "None" ] && echo yes)" yes
+on 2 s3api delete-bucket-inventory-configuration --bucket inv --id daily > /dev/null 2>&1
+pause 1
+on 2 s3 cp "s3://$invdst/$m" manifest.json > /dev/null 2>&1
+on 3 s3 cp "s3://$invdst/${m%manifest.json}manifest.checksum" manifest.checksum > /dev/null 2>&1
+check "its manifest's checksum" "$(cat manifest.checksum)" "$(python3 -c 'import hashlib; print(hashlib.md5(open("manifest.json","rb").read()).hexdigest())')"
+data=$(python3 -c 'import json,sys; print(json.load(open("manifest.json"))["files"][0]["key"])')
+on 1 s3 cp "s3://$invdst/$data" data.csv.gz > /dev/null 2>&1
+check "its CSV: a row per object, with the bucket, key, size and ETag" "$(python3 -c 'import gzip,csv; r=list(csv.reader(gzip.open("data.csv.gz","rt"))); print(len(r), len(r[0]), r[0][0], sorted(x[1] for x in r))')" "3 4 inv ['i1', 'i2', 'i3']"
 
 # Event notifications on a cluster (ADR-0078 §4): the shard's leader delivers, and a new one goes on.
 keys() { python3 -c 'import json,sys

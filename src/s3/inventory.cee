@@ -184,13 +184,14 @@ async fn serveInventory(
         if (at == next.length) { return Err(S3Fail.Code(S3Code.NoSuchConfiguration)); }
         let _ = next.remove(at);
     } else if (isMethod(req.method, Method.Put)) {
-        // A cluster's S3 port writes no reports yet (ADR-0074 §4).
-        if (app.cluster) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
         let xml = await readSmallBody(auth, exchange, 65536)?;
         verifySmallBody(req, xml.view(), true)?;
         let c = parseInventory(xml.view())?;
         if (c.id.view() != id.view()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
-        if (!(await bucketThere(app, c.destination.view()))) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        // On a cluster, a destination of another shard is not seen here: its reports are refused, if it is not one.
+        if (!app.cluster && !(await bucketThere(app, c.destination.view()))) {
+            return Err(S3Fail.Code(S3Code.InvalidArgument));
+        }
         if (at == next.length) {
             if (next.length >= MAX_INVENTORY_CONFIGS) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
             next.push(c)?;
@@ -350,32 +351,11 @@ fn appendReportTime(out: borrow mut Vector<u8>, millis: i64) -> Result<void, All
     return Ok();
 }
 
-/// When the newest report under `base` in `destination` was made (its folder's time), 0 for none.
-fn newestReport(store: borrow ObjectStore, destination: StringView, base: Slice<u8>) -> i64 {
-    let prefix = StringView.fromUtf8(base) ?? "";
-    var newest = Vector<u8>.create();
-    var marker = Vector<u8>.create();
-    while (true) {
-        let page = match (store.listObjects(destination, prefix, "/", marker.view(), marker.length > 0, 1000)) {
-            Ok(p) => p,
-            Err(_) => { break; }
-        };
-        for (i in 0..page.commonPrefixes.length) {
-            let p = page.commonPrefixes[i].view();
-            if (p.length > base.length && p[base.length] >= '0' && p[base.length] <= '9' && compareBytes(
-                p,
-                newest.view(),
-            ) > 0) {
-                newest.clear();
-                if (newest.extend(p).isErr()) { return 0; }
-            }
-        }
-        if (!page.truncated) { break; }
-        marker.clear();
-        if (marker.extend(page.nextMarker.view()).isErr()) { break; }
-    }
-    if (newest.length < base.length + 17) { return 0; }
-    let t = newest.view()[base.length..base.length + 17]; // YYYY-MM-DDTHH-MMZ
+/// The time of a report folder's name under `base`, `<base>YYYY-MM-DDTHH-MMZ/`; 0 if it is not one.
+fn reportTimeOf(folder: Slice<u8>, base: Slice<u8>) -> i64 {
+    if (folder.length < base.length + 17 || folder[0..base.length] != base) { return 0; }
+    let t = folder[base.length..base.length + 17]; // YYYY-MM-DDTHH-MMZ
+    if (t[0] < '0' || t[0] > '9') { return 0; }
     var iso = Vector<u8>.create();
     if (iso.extend(t[0..13]).isErr() || iso.push(':').isErr() || iso.extend(t[14..16]).isErr() ||
         iso.extend(":00Z".bytes()).isErr()) {
@@ -385,6 +365,179 @@ fn newestReport(store: borrow ObjectStore, destination: StringView, base: Slice<
         Some(ms) => ms,
         null => 0,
     };
+}
+
+/// When the newest report under `base` in `destination` was made (its folder's time), 0 for none.
+fn newestReport(store: borrow ObjectStore, destination: StringView, base: Slice<u8>) -> i64 {
+    let prefix = StringView.fromUtf8(base) ?? "";
+    var newest: i64 = 0;
+    var marker = Vector<u8>.create();
+    while (true) {
+        let page = match (store.listObjects(destination, prefix, "/", marker.view(), marker.length > 0, 1000)) {
+            Ok(p) => p,
+            Err(_) => { break; }
+        };
+        for (i in 0..page.commonPrefixes.length) {
+            let t = reportTimeOf(page.commonPrefixes[i].view(), base);
+            if (t > newest) { newest = t; }
+        }
+        if (!page.truncated) { break; }
+        marker.clear();
+        if (marker.extend(page.nextMarker.view()).isErr()) { break; }
+    }
+    return newest;
+}
+
+/// An object of a report: a data file, its manifest, or the manifest's checksum (ADR-0074 §3).
+struct InventoryFile {
+    key: Vector<u8>;
+    bytes: Vector<u8>;
+    /// INVENTORY_DATA, INVENTORY_MANIFEST or INVENTORY_CHECKSUM.
+    kind: u8;
+}
+
+const INVENTORY_DATA: u8 = 0;
+const INVENTORY_MANIFEST: u8 = 1;
+const INVENTORY_CHECKSUM: u8 = 2;
+
+fn inventoryContentType(kind: u8) -> StringView => match (kind) {
+    INVENTORY_DATA => "application/gzip",
+    INVENTORY_MANIFEST => "application/json",
+    _ => "text/plain",
+};
+
+/// A report being made: the source's versions listed a page at a time into data files, which the caller writes
+/// (into the store on `serve`, through the front on a cluster, ADR-0078 §4), then its manifest.
+struct InventoryScan {
+    base: Vector<u8>;
+    /// The manifest's `files`, as JSON.
+    files: Vector<u8>;
+    csv: Vector<u8>;
+    keyMarker: Vector<u8>;
+    versionMarker: [u8; 16]?;
+    count: usize;
+    finished: bool;
+
+    fn begin(c: borrow InventoryConfig, source: Slice<u8>) -> Result<InventoryScan, AllocError> {
+        var base = Vector<u8>.create();
+        inventoryBase(c, source, mut base)?;
+        return Ok(InventoryScan {
+            base: base,
+            files: Vector<u8>.create(),
+            csv: Vector<u8>.create(),
+            keyMarker: Vector<u8>.create(),
+            versionMarker: null,
+            count: 0,
+            finished: false,
+        });
+    }
+
+    /// Lists until a data file is full or the listing ends: that file, or null when every one has been given. Under
+    /// the store's lock, on a worker thread; the caller writes the file, then calls `written`.
+    fn next(
+        borrow mut this,
+        store: borrow ObjectStore,
+        source: Slice<u8>,
+        c: borrow InventoryConfig,
+    ) -> Result<InventoryFile?, StoreError> {
+        let bucket = StringView.fromUtf8(source) ?? "";
+        let filter = StringView.fromUtf8(c.filter.view()) ?? "";
+        while (!this.finished) {
+            let page = store.listVersions(
+                bucket,
+                filter,
+                "",
+                this.keyMarker.view(),
+                false,
+                this.versionMarker,
+                1000,
+            )?;
+            for (i in 0..page.versions.length) {
+                let v = borrow page.versions[i];
+                if (!c.allVersions && (!v.latest || v.deleteMarker)) { continue; }
+                inventoryRow(mut this.csv, source, c, v)?;
+            }
+            let last = !page.truncated;
+            if (last) {
+                this.finished = true;
+            } else {
+                this.keyMarker.clear();
+                this.keyMarker.extend(page.nextKey.view())?;
+                this.versionMarker = page.nextVersionId;
+            }
+            if (this.csv.length >= INVENTORY_FILE_BYTES || (last && (this.csv.length > 0 || this.count == 0))) {
+                var gz = Vector<u8>.create();
+                gzipStored(this.csv.view(), mut gz)?;
+                this.csv.clear();
+                var key = copyBytes(this.base.view())?;
+                key.extend("data/".bytes())?;
+                var random = [0u8; 16];
+                let _ = Random.fill(mut random[..]);
+                appendHexBytes(mut key, random[..])?;
+                key.extend(".csv.gz".bytes())?;
+                return Ok(Some(InventoryFile { key: key, bytes: gz, kind: INVENTORY_DATA }));
+            }
+        }
+        return Ok(null);
+    }
+
+    /// A data file `next` gave was written: it goes in the manifest.
+    fn written(borrow mut this, f: borrow InventoryFile) -> Result<void, AllocError> {
+        if (this.count > 0) { this.files.push(',')?; }
+        this.files.extend("{\"key\":\"".bytes())?;
+        appendJsonText(mut this.files, f.key.view())?;
+        this.files.extend("\",\"size\":".bytes())?;
+        appendDecimal(mut this.files, f.bytes.length as u64)?;
+        this.files.extend(",\"MD5checksum\":\"".bytes())?;
+        appendHexBytes(mut this.files, Md5.of(f.bytes.view())[..])?;
+        this.files.extend("\"}".bytes())?;
+        this.count += 1;
+        return Ok();
+    }
+
+    /// The manifest and its checksum, in the folder of the report's time; written last, in this order.
+    fn manifest(
+        borrow this,
+        source: Slice<u8>,
+        c: borrow InventoryConfig,
+        now: i64,
+    ) -> Result<Vector<InventoryFile>, AllocError> {
+        var manifest = Vector<u8>.create();
+        manifest.extend("{\"sourceBucket\":\"".bytes())?;
+        appendJsonText(mut manifest, source)?;
+        manifest.extend("\",\"destinationBucket\":\"arn:aws:s3:::".bytes())?;
+        appendJsonText(mut manifest, c.destination.view())?;
+        manifest.extend("\",\"version\":\"2016-11-30\",\"creationTimestamp\":\"".bytes())?;
+        appendDecimal(mut manifest, truncate<u64>(now))?;
+        manifest.extend("\",\"fileFormat\":\"CSV\",\"fileSchema\":\"".bytes())?;
+        inventorySchema(c, mut manifest)?;
+        manifest.extend("\",\"files\":[".bytes())?;
+        manifest.extend(this.files.view())?;
+        manifest.extend("]}".bytes())?;
+        var folder = copyBytes(this.base.view())?;
+        appendReportTime(mut folder, now)?;
+        folder.push('/')?;
+        var manifestKey = copyBytes(folder.view())?;
+        manifestKey.extend("manifest.json".bytes())?;
+        var checksum = Vector<u8>.create();
+        appendHexBytes(mut checksum, Md5.of(manifest.view())[..])?;
+        var checksumKey = copyBytes(folder.view())?;
+        checksumKey.extend("manifest.checksum".bytes())?;
+        var out = Vector<InventoryFile>.create();
+        out.push(InventoryFile { key: manifestKey, bytes: manifest, kind: INVENTORY_MANIFEST })?;
+        out.push(InventoryFile { key: checksumKey, bytes: checksum, kind: INVENTORY_CHECKSUM })?;
+        return Ok(out);
+    }
+}
+
+fn putInventoryFile(
+    store: borrow mut ObjectStore,
+    destination: StringView,
+    f: borrow InventoryFile,
+) -> Result<void, StoreError> {
+    let key = StringView.fromUtf8(f.key.view()) ?? "";
+    let _ = store.putObject(destination, key, inventoryContentType(f.kind), f.bytes.view(), PutCondition.None)?;
+    return Ok();
 }
 
 /// Writes one configuration's report now: its data files, then its manifest and the manifest's checksum (ADR-0074 §3).
@@ -398,74 +551,17 @@ fn writeReport(
     let bucket = StringView.fromUtf8(source) ?? "";
     let destination = StringView.fromUtf8(c.destination.view()) ?? "";
     if (!store.bucketExists(destination)? || !store.bucketExists(bucket)?) { return Ok(false); }
-    var base = Vector<u8>.create();
-    inventoryBase(c, source, mut base)?;
-    var files = Vector<u8>.create(); // the manifest's `files`, as JSON
-    var csv = Vector<u8>.create();
-    var keyMarker = Vector<u8>.create();
-    var versionMarker: [u8; 16]? = null;
-    var count = 0usize;
-    let filter = StringView.fromUtf8(c.filter.view()) ?? "";
+    var scan = InventoryScan.begin(c, source)?;
     while (true) {
-        let page = store.listVersions(bucket, filter, "", keyMarker.view(), false, versionMarker, 1000)?;
-        for (i in 0..page.versions.length) {
-            let v = borrow page.versions[i];
-            if (!c.allVersions && (!v.latest || v.deleteMarker)) { continue; }
-            inventoryRow(mut csv, source, c, v)?;
-        }
-        let last = !page.truncated;
-        if (csv.length >= INVENTORY_FILE_BYTES || (last && (csv.length > 0 || count == 0))) {
-            var gz = Vector<u8>.create();
-            gzipStored(csv.view(), mut gz)?;
-            var key = copyBytes(base.view())?;
-            key.extend("data/".bytes())?;
-            var random = [0u8; 16];
-            let _ = Random.fill(mut random[..]);
-            appendHexBytes(mut key, random[..])?;
-            key.extend(".csv.gz".bytes())?;
-            let keyText = StringView.fromUtf8(key.view()) ?? "";
-            let _ = store.putObject(destination, keyText, "application/gzip", gz.view(), PutCondition.None)?;
-            if (count > 0) { files.push(',')?; }
-            files.extend("{\"key\":\"".bytes())?;
-            appendJsonText(mut files, key.view())?;
-            files.extend("\",\"size\":".bytes())?;
-            appendDecimal(mut files, gz.length as u64)?;
-            files.extend(",\"MD5checksum\":\"".bytes())?;
-            appendHexBytes(mut files, Md5.of(gz.view())[..])?;
-            files.extend("\"}".bytes())?;
-            count += 1;
-            csv.clear();
-        }
-        if (last) { break; }
-        keyMarker.clear();
-        keyMarker.extend(page.nextKey.view())?;
-        versionMarker = page.nextVersionId;
+        let f = match (scan.next(store, source, c)?) {
+            Some(f) => f,
+            null => { break; }
+        };
+        putInventoryFile(store, destination, borrow f)?;
+        scan.written(borrow f)?;
     }
-    var manifest = Vector<u8>.create();
-    manifest.extend("{\"sourceBucket\":\"".bytes())?;
-    appendJsonText(mut manifest, source)?;
-    manifest.extend("\",\"destinationBucket\":\"arn:aws:s3:::".bytes())?;
-    appendJsonText(mut manifest, c.destination.view())?;
-    manifest.extend("\",\"version\":\"2016-11-30\",\"creationTimestamp\":\"".bytes())?;
-    appendDecimal(mut manifest, truncate<u64>(now))?;
-    manifest.extend("\",\"fileFormat\":\"CSV\",\"fileSchema\":\"".bytes())?;
-    inventorySchema(c, mut manifest)?;
-    manifest.extend("\",\"files\":[".bytes())?;
-    manifest.extend(files.view())?;
-    manifest.extend("]}".bytes())?;
-    var folder = copyBytes(base.view())?;
-    appendReportTime(mut folder, now)?;
-    folder.push('/')?;
-    var manifestKey = copyBytes(folder.view())?;
-    manifestKey.extend("manifest.json".bytes())?;
-    let manifestName = StringView.fromUtf8(manifestKey.view()) ?? "";
-    let _ = store.putObject(destination, manifestName, "application/json", manifest.view(), PutCondition.None)?;
-    var checksum = Vector<u8>.create();
-    appendHexBytes(mut checksum, Md5.of(manifest.view())[..])?;
-    var checksumKey = copyBytes(folder.view())?;
-    checksumKey.extend("manifest.checksum".bytes())?;
-    let checksumName = StringView.fromUtf8(checksumKey.view()) ?? "";
-    let _ = store.putObject(destination, checksumName, "text/plain", checksum.view(), PutCondition.None)?;
+    let tail = scan.manifest(source, c, now)?;
+    for (i in 0..tail.length) { putInventoryFile(store, destination, borrow tail[i])?; }
     return Ok(true);
 }
 
