@@ -1,6 +1,6 @@
 # ADR-0078: M7 on a cluster
 
-**Status:** accepted by the owner, 17 Nov 2026 (proposed 16 Nov 2026, after M7, on the owner's "continue"). §2 and §3 are built; §4 is built (steps 1 to 4: event notifications, replication, access logs, inventory), its chaos-harness run to come; §1's slice d (Access Points) is to be built.
+**Status:** accepted by the owner, 17 Nov 2026 (proposed 16 Nov 2026, after M7, on the owner's "continue"). §2 and §3 are built; §4 is built (steps 1 to 4: event notifications, replication, access logs, inventory) and passes its chaos-harness run; §1's slice d (Access Points) is to be built.
 
 ## Context
 
@@ -92,6 +92,13 @@
 5. **Until its slice**, a feature keeps refusing on a cluster as it does now.
 
 ## Consequences
+
+- Slice c, the chaos-harness run: `tools/cluster_chaos.py --outbox` versions the clients' bucket, sends its events to
+  a webhook of the harness's and replicates it to a bucket of the other shard, while the faults (with `kill-leader`)
+  run; after the heal, every acknowledged PUT's and DELETE's event was delivered at least once, no event of a write
+  never made, the first deliveries' sequencers rising, and the replicas' bucket holding exactly the source's versions
+  and markers. Three runs (60 s of leader kills alone, two of 90 s with every default fault) passed, with 297, 17 and
+  67 events delivered again after a leader's change, and stayed linearizable.
 
 - Slice c, step 4: `replicaUploadCompletesAsItsSourcesVersion`; the cluster smoke replicates a 72 MiB upload
   across shards (its id, ETag and bytes), logs PUTs made through three nodes and a GET into a bucket of another

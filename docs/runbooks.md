@@ -404,7 +404,10 @@ any object by multipart upload, and any object by ranged GETs (the AWS CLI's way
 - **Testing a build against faults** (ADR-0065): `tools/cluster_chaos.sh` runs three nodes on one machine behind a
   proxy of its own (no firewall rule), kills, pauses and partitions them for a minute while clients race, and checks
   what the clients saw for linearizability (`RUNS`, `SECONDS_EACH`, `NODES=5`). `tools/chaos_mutants.sh` checks that
-  it still catches stale reads.
+  it still catches stale reads. `tools/cluster_chaos.py --outbox` also turns on a webhook and replication to a bucket
+  of the other shard, kills shard leaders among the faults (`kill-leader`), and after the heal checks every
+  acknowledged write's event was delivered at least once, the first deliveries in the shard's order, and the replicas'
+  bucket holding exactly the source's versions (ADR-0078 §4).
 - **Rolling restarts and upgrades:** restart one node at a time, the next only once the status shows the first's
   replicas at the others' applied index; a node reads older formats, so upgrade forwards, never back.
 - **Adding and removing nodes** (ADR-0062): put every node that may take part in the cluster file from the start,

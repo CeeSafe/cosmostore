@@ -2797,3 +2797,9 @@ Browser form uploads with a SigV4 POST policy.
   the front now forwards it as `x-cosmo-peer`. And a multipart replica over the front's 64 MiB could not be sent as
   one PUT: it is now an upload with the source's parts, completed as the source's version (`completeUploadAs`).
 
+- **Slice c, the chaos-harness run:** `tools/cluster_chaos.py --outbox` (and a `kill-leader` fault): the clients'
+  bucket versioned, its events to a webhook of the harness's, replicated to a bucket of the other shard. After the
+  heal: every acknowledged write's event delivered at least once, none of a write never made, first deliveries in
+  sequencer order, the replicas exactly the source's versions and markers. Three runs passed (leader kills alone for
+  60 s; every default fault for 90 s, twice), with 297, 17 and 67 events delivered again after a leader's change.
+  Slice d (Access Points on a cluster) is next.

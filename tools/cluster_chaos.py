@@ -5,7 +5,8 @@ keys, faults injected (kills, pauses, partitions), and the history checked for l
 usage:
   cluster_chaos.py [--binary out/cosmostore] [--nodes 3] [--seconds 60] [--seed N] [--port-base 20100]
                    [--clients 6] [--keys 4] [--keep] [--disk-loss | --racks 3]
-                   [--nemesis kill,pause,isolate,isolate-leader,split,bridge,skew,lose-disk]
+                   [--nemesis kill,kill-leader,pause,isolate,isolate-leader,split,bridge,skew,lose-disk]
+                   [--outbox]   webhooks and replication on: every event delivered, in order; every version replicated
   cluster_chaos.py --self-test          the checker against histories whose answer is known
 
 Standard library only; no firewall rule, nothing installed. Exit status 0 when the history is linearizable and the
@@ -354,10 +355,11 @@ def authorize(method, host, path, query, headers, body):
     return headers
 
 
-def s3(port, method, path, query="", body=b"", timeout=4.0):
-    """(status, body), or (None, reason) when no answer came."""
+def s3(port, method, path, query="", body=b"", timeout=4.0, extra=None):
+    """(status, body), or (None, reason) when no answer came. `query` is canonical: sorted, encoded, `name=` for a
+    name alone."""
     host = f"127.0.0.1:{port}"
-    headers = authorize(method, host, path, query, {}, body)
+    headers = authorize(method, host, path, query, extra or {}, body)
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         c.request(method, path + ("?" + query if query else ""), body=body, headers=headers)
@@ -816,7 +818,7 @@ def client(cid, cluster, history, keys, rng, stop, counts, large=0.1, cold=()):
             status, _ = s3(port, "PUT", f"/{BUCKET}/{key}", body=body)
             outcome = "ok" if status == 200 else ("fail" if status is not None and 400 <= status < 500 else "unknown")
             history.add(dict(c=cid, n=node, op="put", key=key, value=tag, start=start, end=history.now(),
-                             outcome=outcome, status=status))
+                             outcome=outcome, status=status, etag=hashlib.md5(body).hexdigest()))
         elif roll < 0.45:
             status, _ = s3(port, "DELETE", f"/{BUCKET}/{key}")
             outcome = "ok" if status == 204 else ("fail" if status is not None and 400 <= status < 500 else "unknown")
@@ -844,7 +846,7 @@ def client(cid, cluster, history, keys, rng, stop, counts, large=0.1, cold=()):
 
 
 NEMESES = ["kill", "pause", "isolate", "isolate-leader", "split", "bridge", "skew", "lose-disk", "rack-kill",
-           "rack-isolate", "slow", "flaky", "throttle"]
+           "rack-isolate", "slow", "flaky", "throttle", "kill-leader"]
 # The default: every fault but the two that need a mode of their own (`--disk-loss`) or that only cut a node off.
 DEFAULT_NEMESES = ["kill", "pause", "isolate", "isolate-leader", "split", "bridge", "skew", "slow", "flaky", "throttle"]
 
@@ -917,11 +919,11 @@ def faults(cluster, proxy, rng, stop, log, history, kinds, failures):
                 failures.append(f"node {victim}'s disk loss could not be recovered from")
             log.append(f"{history.now():8.3f} healed")
             continue
-        if kind == "isolate-leader":
+        if kind in ("isolate-leader", "kill-leader"):
             leaders = {s: l for s, l in cluster.leaders().items() if s != 65535 and l != 0}
             if leaders:
                 victim = rng.choice(sorted(leaders.values()))
-            kind = "isolate"
+            kind = "isolate" if kind == "isolate-leader" else "kill"
         hold = rng.uniform(2.0, 6.0)
         t = history.now()
         if kind in ("slow", "flaky", "throttle"):
@@ -1038,6 +1040,195 @@ def ops_by_key(events, keys):
     return per
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# The outbox under faults (ADR-0078 §4): a webhook and a replica of every write, delivered by the source shard's
+# leader while leaders are killed, paused and cut off.
+
+class Hook:
+    """A webhook of the harness's own: every POST's records, in the order they came, with how many came."""
+
+    def __init__(self, port):
+        import http.server
+        hook = self
+        self.lock = threading.Lock()
+        self.records = []  # (key, eventName, eTag, sequencer), in arrival order
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                try:
+                    for r in json.loads(body).get("Records", []):
+                        o = r["s3"]["object"]
+                        with hook.lock:
+                            hook.records.append((o["key"], r["eventName"], o.get("eTag", ""), o["sequencer"]))
+                except (ValueError, KeyError):
+                    pass
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def seen(self):
+        with self.lock:
+            return list(self.records)
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def shard_of(bucket, shards=2):
+    """ADR-0060 §3, for the harness's cluster file: SHA-256(cluster name ‖ bucket)'s first 8 bytes, modulo the shards."""
+    d = hashlib.sha256(bytes.fromhex("0dd0ee0ff0aa0bb0") + bucket.encode()).digest()
+    return int.from_bytes(d[:8], "big") % shards
+
+
+def outbox_copy():
+    """The replicas' bucket, on the other shard than the source's: each replica crosses the cluster."""
+    for c in [f"chaoscopy{i}" for i in range(20)]:
+        if shard_of(c) != shard_of(BUCKET):
+            return c
+    return "chaoscopy"
+
+
+def outbox_setup(cluster, copy):
+    """Versioning on both buckets; the source's events to the webhook; every version and marker replicated. Whether
+    each was taken."""
+    port = cluster.s3_port(1)
+    versioning = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+    notify = (b"<NotificationConfiguration><QueueConfiguration><Id>all</Id>"
+              b"<Queue>arn:cosmostore:sqs::hook:webhook</Queue><Event>s3:ObjectCreated:*</Event>"
+              b"<Event>s3:ObjectRemoved:*</Event></QueueConfiguration></NotificationConfiguration>")
+    replicate = (f"<ReplicationConfiguration><Role>r</Role><Rule><ID>all</ID><Priority>1</Priority>"
+                 f"<Status>Enabled</Status><Filter><Prefix></Prefix></Filter>"
+                 f"<DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>"
+                 f"<Destination><Bucket>arn:aws:s3:::{copy}</Bucket></Destination></Rule>"
+                 f"</ReplicationConfiguration>").encode()
+    steps = [("PUT", f"/{copy}", "", b""), ("PUT", f"/{BUCKET}", "versioning=", versioning),
+             ("PUT", f"/{copy}", "versioning=", versioning), ("PUT", f"/{BUCKET}", "notification=", notify),
+             ("PUT", f"/{BUCKET}", "replication=", replicate)]
+    for method, path, query, body in steps:
+        status, data = None, b""
+        for _ in range(50):
+            md5 = __import__("base64").b64encode(hashlib.md5(body).digest()).decode()
+            status, data = s3(port, method, path, query=query, body=body, extra={"content-md5": md5})
+            if status == 200:
+                break
+            time.sleep(0.2)
+        if status != 200:
+            print(f"FAIL {method} {path}?{query}: {status} {data[:300]!r}")
+            return False
+    return True
+
+
+def versions_of(cluster, bucket):
+    """{(key, version id)} of every version and delete marker, read through any node that answers; None if none did."""
+    for i in range(1, cluster.n + 1):
+        found = set()
+        marker = None
+        complete = True
+        while True:
+            query = (f"key-marker={marker[0]}&version-id-marker={marker[1]}&versions=" if marker else "versions=")
+            status, data = s3(cluster.s3_port(i), "GET", f"/{bucket}", query=query, timeout=10)
+            if status != 200:
+                complete = False
+                break
+            for kind, inner in re.findall(rb"<(Version|DeleteMarker)>(.*?)</\1>", data, re.S):
+                k = re.search(rb"<Key>([^<]*)</Key>", inner).group(1).decode()
+                v = re.search(rb"<VersionId>([^<]*)</VersionId>", inner).group(1).decode()
+                found.add((k, v))
+            if b"<IsTruncated>true</IsTruncated>" not in data:
+                break
+            nk = re.search(rb"<NextKeyMarker>([^<]*)</NextKeyMarker>", data)
+            nv = re.search(rb"<NextVersionIdMarker>([^<]*)</NextVersionIdMarker>", data)
+            if not nk or not nv:
+                complete = False
+                break
+            marker = (nk.group(1).decode(), nv.group(1).decode())
+        if complete:
+            return found
+    return None
+
+
+def outbox_check(cluster, hook, history, copy, keys, work, seconds=180):
+    """After the heal: every acknowledged write's event delivered at least once, no event of a write never asked for,
+    the first deliveries in the shard's order (its sequencers rising); and the replicas' bucket holding exactly the
+    source's versions and markers. Waits until they are, or `seconds`. (verdict, lines)"""
+    puts = [e for e in history.events if e["op"] == "put" and e["key"] in keys]
+    acked = {(e["key"], e["etag"]) for e in puts if e["outcome"] == "ok"}
+    asked = {(e["key"], e["etag"]) for e in puts}
+    deletes = {}
+    for e in history.events:
+        if e["op"] == "delete" and e["outcome"] == "ok":
+            deletes[e["key"]] = deletes.get(e["key"], 0) + 1
+    deadline = time.time() + seconds
+    while True:
+        records = hook.seen()
+        created = {(k, t.strip('"')) for k, n, t, _ in records if n.startswith("ObjectCreated")}
+        markers = {}
+        for k, n, _, s in records:
+            if n.startswith("ObjectRemoved"):
+                markers.setdefault(k, set()).add(s)
+        missing = acked - created
+        short = {k: d for k, d in deletes.items() if len(markers.get(k, ())) < d}
+        source = versions_of(cluster, BUCKET)
+        replicas = versions_of(cluster, copy)
+        same = source is not None and replicas is not None and source == replicas
+        if (not missing and not short and same) or time.time() > deadline:
+            break
+        time.sleep(2)
+    lines = []
+    ok = True
+    with open(os.path.join(work, "hook.jsonl"), "w") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+    first = {}
+    order = []
+    for k, n, t, s in records:
+        if s not in first:
+            first[s] = len(order)
+            order.append((int(s, 16), k, n))
+    dupes = len(records) - len(order)
+    lines.append(f"ok   {len(records)} events delivered ({len(order)} distinct, {dupes} again after a leader's change); "
+                 f"{len(acked)} acknowledged PUTs, {sum(deletes.values())} DELETEs")
+    if missing:
+        ok = False
+        lines.append(f"FAIL {len(missing)} acknowledged PUTs' events never delivered, e.g. {sorted(missing)[:3]}")
+    else:
+        lines.append("ok   every acknowledged PUT's event delivered at least once")
+    if short:
+        ok = False
+        lines.append(f"FAIL fewer delete markers' events than acknowledged DELETEs: {short}")
+    else:
+        lines.append("ok   every acknowledged DELETE's marker delivered at least once")
+    phantom = created - asked
+    if phantom:
+        ok = False
+        lines.append(f"FAIL {len(phantom)} events of PUTs never made, e.g. {sorted(phantom)[:3]}")
+    late = [(order[i - 1], order[i]) for i in range(1, len(order)) if order[i][0] <= order[i - 1][0]]
+    if late:
+        ok = False
+        lines.append(f"FAIL {len(late)} events first delivered after a later one, e.g. {late[:2]}")
+    else:
+        lines.append("ok   first deliveries in the shard's order (sequencers rising)")
+    if source is None or replicas is None:
+        ok = False
+        lines.append("FAIL the versions could not be listed")
+    elif source != replicas:
+        ok = False
+        lines.append(f"FAIL replicas: {len(source - replicas)} versions not replicated (e.g. "
+                     f"{sorted(source - replicas)[:3]}), {len(replicas - source)} not the source's")
+    else:
+        lines.append(f"ok   {copy} (shard {shard_of(copy)}) holds the source's {len(source)} versions and markers, "
+                     f"ids kept")
+    return ok, lines
+
+
 def run(args):
     binary = os.path.abspath(args.binary)
     work = tempfile.mkdtemp(prefix="cosmo-chaos-")
@@ -1050,7 +1241,8 @@ def run(args):
     rng = random.Random(seed)
     if args.nemesis is None:
         args.nemesis = ",".join(DEFAULT_NEMESES + (["lose-disk"] if args.disk_loss else [])
-                                + (["rack-kill", "rack-isolate"] if args.racks else []))
+                                + (["rack-kill", "rack-isolate"] if args.racks else [])
+                                + (["kill-leader", "kill-leader"] if args.outbox else []))
     for k in args.nemesis.split(","):
         if k not in NEMESES:
             print(f"chaos: no fault called {k}; there are {', '.join(NEMESES)}")
@@ -1078,6 +1270,16 @@ def run(args):
     if args.code_after_seconds:
         # Large values coded within seconds (ADR-0064): reads of them decode, under the faults.
         cluster.extra += ["--code-after-seconds", str(args.code_after_seconds)]
+    hook = None
+    copy = outbox_copy()
+    if args.outbox:
+        if hosts:
+            print("chaos: --outbox runs on this machine only (its webhook listens here)")
+            return False
+        hook = Hook(args.port_base + 60)
+        with open(os.path.join(work, "targets"), "w") as f:
+            f.write(f"hook http://127.0.0.1:{args.port_base + 60}/events\n")
+        cluster.extra += ["--notify-targets", os.path.join(work, "targets")]
     proxy = Proxy({i: (cluster.proxy_port(i), cluster.peer_port(i)) for i in range(1, args.nodes + 1)})
     proxy.start()
     ok = False
@@ -1100,6 +1302,8 @@ def run(args):
             time.sleep(0.2)
         if status != 200:
             print(f"FAIL the bucket could not be made: {status} {data[:200]!r}")
+            return False
+        if args.outbox and not outbox_setup(cluster, copy):
             return False
         # The standbys joined before the clients start, so that there are nodes outside group 0 to lose disks of.
         for i in standby:
@@ -1204,6 +1408,11 @@ def run(args):
         if unanswered:
             print("FAIL after the heal, no answer for: " + ", ".join(unanswered))
             ok = False
+        if hook is not None:
+            good, lines = outbox_check(cluster, hook, history, copy, keys, work)
+            for line in lines:
+                print(line)
+            ok = ok and good
         # A replica that stopped itself (a journal it found corrupt, a failed write) is a failure of its own. The
         # remote nodes' logs first (ADR-0069 §2).
         cluster.stop_all()
@@ -1251,6 +1460,8 @@ def run(args):
         # A run that did not reach its end (the harness's own exception) keeps its evidence.
         ok = ok and finished
         proxy.stop()
+        if hook is not None:
+            hook.stop()
         cluster.stop_all()
         if cluster.tunnels:
             for i in range(1, cluster.n + 1):
@@ -1285,6 +1496,9 @@ def main():
                    help="nodes in this many racks (at least two nodes each), and rack-kill and rack-isolate among the faults")
     p.add_argument("--disk-loss", action="store_true",
                    help="four nodes or more, the fourth on joined from standby, and lose-disk among the faults")
+    p.add_argument("--outbox", action="store_true",
+                   help="versioning, a webhook and replication to a bucket of the other shard on; after the heal, every "
+                        "event delivered at least once and in order, every version replicated (ADR-0078 §4)")
     p.add_argument("--self-test", action="store_true")
     args = p.parse_args()
     if args.self_test:
