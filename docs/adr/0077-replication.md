@@ -38,7 +38,8 @@ and ETag; destinations on this server first, other S3 endpoints in a second slic
    `PENDING` while its event waits in the outbox, else `FAILED` (a destination that went away, lost its versioning,
    or refused the replica: the event is then passed over and the failure counted and logged, so one bad destination
    does not hold the outbox). The replica's `REPLICA` is its stored field.
-5. **A cluster's S3 port** refuses `PutBucketReplication` for now (its outbox is not delivered there yet).
+5. **A cluster's S3 port** refused `PutBucketReplication` at first (its outbox was not delivered there); ADR-0078 §4
+   built it, a replica into the cluster keeping its source's version id across shards.
 6. **Other endpoints** (part 2): `serve --replication-targets` names them, a line each: `<id> <http or https url>
    <access key> <secret key> [region]` (the file's text is wiped once read). A rule's destination
    `arn:cosmostore:s3::<id>:<bucket>` (kept as `<id>:<bucket>`) replicates there; an id the file does not have is

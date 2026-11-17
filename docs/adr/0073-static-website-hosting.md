@@ -29,8 +29,8 @@
    - not found: if `<key>/<index>` is there, 302 to `/<key>/`; a rule for the error code (404 or 403): its
      redirect; else the error document with the error's status, or a small HTML page naming the error.
 3. **Not supported:** a custom domain without the `<bucket>.` form (S3's CNAME of a bucket named as its host), HTTPS
-   on the website endpoint beyond what `serve` listens with, and a cluster: its S3 port refuses `PutBucketWebsite`
-   for now.
+   on the website endpoint beyond what `serve` listens with, and, at first, a cluster: its S3 port refused
+   `PutBucketWebsite` (ADR-0078 §3 built it: `cosmostore node --website-domain`).
 
 ## Consequences
 

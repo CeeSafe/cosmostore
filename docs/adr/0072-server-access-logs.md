@@ -28,8 +28,8 @@ M7").
    writer gathers them per target and, every `--access-log-seconds` (300 by default) or at 1 MiB, writes them as one
    object `<prefix>YYYY-mm-DD-HH-MM-SS-<16 hex>` in the target bucket. A delivery that fails (the target gone) loses
    its lines and says so once on stderr. A crash loses what is queued: as S3, best effort.
-4. **A cluster's S3 port** refuses `PutBucketLogging` with `NotImplemented` for now, as it keeps no audit log
-   (runbook): the lines would need a delivering task per shard leader.
+4. **A cluster's S3 port** refused `PutBucketLogging` with `NotImplemented` at first, as it keeps no audit log
+   (runbook): the lines needed a delivering task. ADR-0078 §4 built it: each node delivers its shards' lines.
 
 ## Consequences
 

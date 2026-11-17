@@ -28,7 +28,8 @@
    one. `serve --inventory-day-seconds` shortens a day, for tests.
 4. **gzip without compression:** lib/std has no deflate (CEESAFE_GAPS G35), so a data file is gzip of stored blocks
    (RFC 1951 §3.2.4) with its own CRC-32: valid, every reader opens it, as large as its CSV.
-5. **A cluster's S3 port** refuses `PutBucketInventoryConfiguration` for now: the reports would need a leader's task.
+5. **A cluster's S3 port** refused `PutBucketInventoryConfiguration` at first: the reports needed a leader's task,
+   which ADR-0078 §4 built.
 
 ## Consequences
 

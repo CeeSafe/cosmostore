@@ -93,7 +93,11 @@ def linearizable(ops, initial=None):
     """`search` with one unseen unknown write kept, then, if that finds no order, with all of them (`prune`): the
     first is quick; the second settles what the first could not, within the search's limit. (True, None), (False,
     the operation no order gets past), or (None, why) when the search was too large to settle it."""
-    good, at = search(ops, initial, 1)
+    try:
+        good, at = search(ops, initial, 1)
+    except RuntimeError as e:
+        # Too large with one unseen write kept: a report, not a crash of the harness (the M7 review's 5-minute run).
+        return None, str(e)
     if good:
         return True, None
     # The unseen writes that began in the seconds before each operation a search could not get past, the windows

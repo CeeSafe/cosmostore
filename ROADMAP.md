@@ -2811,3 +2811,13 @@ Browser form uploads with a SigV4 POST policy.
   requests, so ARNs work. A deleted bucket's names are let go. Tests: two new, 313 in all; the cluster smoke, 97
   checks. ADR-0078 is built.
 - **ADR-0078 accepted as written** by the owner (17 Nov 2026), §5 (Access Points on a cluster) included.
+
+### 17 Nov 2026: M7's exit review (`docs/m7-exit-review.md`)
+
+- **The owner:** "Do the M7 exit review". Every item's "done when" holds on `serve` and on a cluster; six chaos runs
+  with `--outbox` (three of 5 minutes) deliver every event at least once and in order and replicate every version.
+- **Not closed yet:** two readers of the code found STS parameters taken and not done (`PolicyArns` among them),
+  replication's `StorageClass` and `Priority`, inventory's and access points' accounts (A1 to A5), and six defects
+  in ADR-0078's code, the worst an access point's claim let go while it exists (B1 to B6); CI runs no cluster smoke.
+  The review recommends fixing them before closing M7. The M7 ADRs' "refused on a cluster" lines now point to
+  ADR-0078; the chaos checker reports a per-key search too large instead of stopping.
