@@ -118,6 +118,12 @@ ADR-0072 to ADR-0075 and ADR-0077 still said a cluster refuses their item; each 
 (the front takes it off, so the shard's signature check failed): the cluster smoke caught it at once; the stamp now
 goes outside the signature, which covers the date it binds.
 
+**Found by CI's first cluster smoke:** CI's AWS CLI (2.39) downloads with the CRT transfer client, which signs
+`content-length: 0` on a GET or HEAD; the front's HTTP client (CeeSafe.Web's) leaves a zero length out of such a
+request, so the shard's signature check failed: 9 checks, every `aws s3 cp` download. SigV4 now reads a signed
+`content-length` that did not arrive as 0 when no `transfer-encoding` says a body follows (`sigv4MissingZeroLength`;
+the cluster smoke passes with the CRT client and the classic one).
+
 ## Not covered, or not yet
 
 - What ADR-0071 left out: directory buckets and S3 Tables. What each item's ADR lists as not done (multi-Region and
@@ -130,7 +136,7 @@ goes outside the signature, which covers the date it binds.
 
 Every item's "done when" holds, on `serve` and on a cluster, and the outbox delivers at least once and in order
 under leader kills. The findings of the review are closed, each with its test, and CI runs the cluster smoke. M7 can
-close; the owner's word closes it.
+close; the owner's word closes it. **Closed** by the owner, 17 Nov 2026 ("Go ahead close M7").
 
 The first verdict, for the record: M7 should not close yet: A1 and B1 were security defects, B2 and B3 let a key
 holder do what it should not, A2 to A5 broke the "never silently ignored" rule.

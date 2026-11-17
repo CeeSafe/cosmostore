@@ -287,6 +287,9 @@ This milestone covers bucket replication and multi-site, inventory, access logs,
 website hosting, Access Points, STS, and possibly directory buckets or Tables. Each
 item is an independent project with its own support matrix.
 
+**Closed 17 Nov 2026** (`docs/m7-exit-review.md`): the six items on `serve` and on a cluster (ADR-0071 to
+ADR-0078); directory buckets and Tables were left out (ADR-0071 §3).
+
 ---
 
 ## Part 3: First four weeks (concrete backlog)
@@ -2827,3 +2830,13 @@ Browser form uploads with a SigV4 POST policy.
   or abandoned by their create's token; the front lets replica and log-delivery fields through only on its node's
   stamped requests (refused on `serve`); alias-shaped names cost no peer request; CI runs the cluster smoke. Tests:
   319; the cluster smoke 98 checks. M7 can close on the owner's word.
+
+### 17 Nov 2026: M7 closed
+
+- The owner: "Go ahead close M7". **M7 (advanced S3) is closed:** access logs, website hosting, inventory, STS,
+  Access Points and replication, each with its support matrix, on `serve` and on a cluster's S3 port; the exit
+  review's findings closed (`docs/m7-exit-review.md`); ADR-0071 to ADR-0078 accepted. What is not covered is listed
+  in the review. Directory buckets and S3 Tables, left out of M7, are for a later milestone if wanted.
+- CI's first cluster smoke failed 9 downloads: its AWS CLI's CRT client signs `content-length: 0` on a GET, which the
+  front's HTTP client does not send on. SigV4 now reads a signed `content-length` that did not arrive as 0 when no
+  `transfer-encoding` says a body follows (`sigv4MissingZeroLength`).
