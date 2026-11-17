@@ -1,6 +1,6 @@
 # ADR-0078: M7 on a cluster
 
-**Status:** accepted by the owner, 17 Nov 2026 (proposed 16 Nov 2026, after M7, on the owner's "continue"). §2 and §3 are built; §4 is built (steps 1 to 4: event notifications, replication, access logs, inventory) and passes its chaos-harness run; §1's slice d (Access Points) is to be built.
+**Status:** accepted by the owner, 17 Nov 2026 (proposed 16 Nov 2026, after M7, on the owner's "continue"). §2 and §3 are built; §4 is built (steps 1 to 4: event notifications, replication, access logs, inventory) and passes its chaos-harness run; §5, slice d (Access Points), is built.
 
 ## Context
 
@@ -89,9 +89,38 @@
      webhook, an access log, an inventory report and replicas (same shard, another shard) through every node; the
      chaos harness with webhooks and replication on, killing leaders mid-delivery: every event delivered at least
      once, in order per shard.
-5. **Until its slice**, a feature keeps refusing on a cluster as it does now.
+5. **Access Points on a cluster (slice d, built).** An access point's configuration stays its bucket's, a record of the
+   bucket's shard, as on `serve` (ADR-0076 §2), so the shard's S3 server checks requests through it as `serve` does.
+   - **Its name is the cluster's:** a claim in group 0, the object `access-point/<name>` (`<bucket>\n<alias>`) of its
+     system bucket, which every node holds a copy of (no new record: group 0's writes are a store's, ADR-0062 §3).
+     Group 0's leader takes claims on a peer path of its own, `POST /cluster/access-point`, signed by a node: take a
+     name for a bucket (made now, the bucket's already, or another bucket's: 409), let it go if it is a bucket's, let
+     go every name of a bucket, find one. Behind group 0's gate, once its replica has applied everything it holds.
+   - **CreateAccessPoint** through any node: the front picks an alias, claims the name with it, then sends the
+     request to the bucket's shard with the alias (`x-cosmo-access-point-alias`, which a client cannot send: the front
+     strips its `x-cosmo-` fields). A claim made now that the shard refuses (NoSuchBucket, AccessDenied) is let go; a
+     claim the bucket had already is kept, since its access point may be there (the shard answers
+     AccessPointAlreadyOwnedByYou). A claim left by a failure that is not one (ServiceUnavailable) is let go by a
+     DeleteAccessPoint of the name, which its bucket's shard answers NoSuchAccessPoint.
+   - **The other calls** find the name's bucket by its claim (this node's copy, then group 0's leader, whose copy
+     has every claim made) and go to its shard; DeleteAccessPoint lets the name go once the shard has deleted it.
+     ListAccessPoints of a bucket goes to its shard; of every bucket, to every shard, merged by name, as ListBuckets.
+     A bucket deleted through the front lets its names go.
+   - **A request through one** names it by its alias or by `<name>-<account>`: the front finds the claim and routes
+     the request, as it came, to the bucket's shard, whose S3 server finds the access point in its own store. For
+     ARNs, whose host is `<name>-<account>.<domain>`, `cosmostore node --domain` gives the nodes `serve`'s domain:
+     the front and the shards' S3 servers read virtual-hosted requests by it.
+   - The S3 server's count of buckets with access points stays at "some" on a cluster, as the others do.
+6. **Until its slice**, a feature keeps refusing on a cluster as it does now.
 
 ## Consequences
+
+- Slice d: `accessPointClaimsFoundByNameAliasAndArn` (by name, by an alias, one of a name over 30 letters among others
+  that begin the same, by `<name>-<account>`), `accessPointClaimRequestsAndTargets`; the cluster smoke (97 checks)
+  makes an access point through node 1 and reads it through node 3, is refused its name for a bucket of another shard
+  and a bucket that is not there (whose name stays free), lists every shard's and a bucket's, writes by alias, lists
+  by alias, reads by ARN, has a policy deny a write through it, deletes it and finds its alias gone, takes its name
+  for another bucket, and sees a deleted bucket's names let go.
 
 - Slice c, the chaos-harness run: `tools/cluster_chaos.py --outbox` versions the clients' bucket, sends its events to
   a webhook of the harness's and replicates it to a bucket of the other shard, while the faults (with `kill-leader`)

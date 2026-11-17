@@ -71,7 +71,7 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -305,6 +305,39 @@ check "its manifest's checksum" "$(cat manifest.checksum)" "$(python3 -c 'import
 data=$(python3 -c 'import json,sys; print(json.load(open("manifest.json"))["files"][0]["key"])')
 on 1 s3 cp "s3://$invdst/$data" data.csv.gz > /dev/null 2>&1
 check "its CSV: a row per object, with the bucket, key, size and ETag" "$(python3 -c 'import gzip,csv; r=list(csv.reader(gzip.open("data.csv.gz","rt"))); print(len(r), len(r[0]), r[0][0], sorted(x[1] for x in r))')" "3 4 inv ['i1', 'i2', 'i3']"
+
+# Access Points on a cluster (ADR-0078 §5): names claimed in group 0, unique across shards; S3 Control through any
+# node; an alias or an ARN's host routed to its bucket's shard.
+ctl() { local n="$1"; shift; AWS_ENDPOINT_URL="http://localhost:$((BASE + 10 + n))" aws --no-cli-pager s3control "$@" --account-id 000000000000; }
+apon() { local n="$1"; shift; AWS_ENDPOINT_URL="http://localhost:$((BASE + 10 + n))" aws --no-cli-pager "$@"; }
+errcode() { "$@" 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9]*\)).*/\1/p' | head -1; }
+apb=""
+for c in apb apb1 apb2 apb3 apb4 apb5 apb6 apb7; do [ "$(shardOf "$c")" != "$(shardOf apa)" ] && { apb=$c; break; }; done
+on 1 s3api create-bucket --bucket apa > /dev/null 2>&1
+on 2 s3api create-bucket --bucket "$apb" > /dev/null 2>&1
+printf 'through a door' > ap.txt
+alias=$(ctl 1 create-access-point --name door --bucket apa --query Alias --output text 2>&1)
+check "create-access-point through node 1 gives an alias" "${alias: -8}" "-s3alias"
+check "get-access-point through node 3" "$(ctl 3 get-access-point --name door --query '[Bucket,Alias]' --output text 2>&1)" "apa	$alias"
+check "the name again, for a bucket of another shard, through node 2" "$(errcode ctl 2 create-access-point --name door --bucket "$apb")" AccessPointAlreadyOwnedByYou
+check "a bucket that is not there" "$(errcode ctl 2 create-access-point --name nowhere --bucket nobucket)" NoSuchBucket
+check "leaves its name unclaimed" "$(errcode ctl 3 get-access-point --name nowhere)" NoSuchAccessPoint
+ctl 2 create-access-point --name window --bucket "$apb" > /dev/null 2>&1 && pass "another, on $apb (shard $(shardOf "$apb"); apa's is $(shardOf apa))" || fail "another, on $apb"
+check "list-access-points through node 3: every shard's" "$(ctl 3 list-access-points --query 'AccessPointList[].Name' --output text 2>&1 | tr '\t' ' ')" "door window"
+check "and a bucket's, through node 1" "$(ctl 1 list-access-points --bucket "$apb" --query 'AccessPointList[].Name' --output text 2>&1)" window
+on 2 s3api put-object --bucket "$alias" --key ap/door.txt --body ap.txt > /dev/null 2>&1 && pass "a write by its alias through node 2" || fail "a write by its alias through node 2"
+check "lands in its bucket, read through node 3" "$(on 3 s3 cp s3://apa/ap/door.txt - 2>&1)" "through a door"
+check "a listing by its alias through node 1" "$(on 1 s3api list-objects-v2 --bucket "$alias" --query 'Contents[].Key' --output text 2>&1)" ap/door.txt
+check "a read by its ARN through node 3" "$(apon 3 s3api get-object --bucket arn:aws:s3:us-east-1:000000000000:accesspoint/door --key ap/door.txt ap.out > /dev/null 2>&1; cat ap.out 2>&1)" "through a door"
+ctl 1 put-access-point-policy --name door --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam:::user/'"$AWS_ACCESS_KEY_ID"'"},"Action":"s3:PutObject","Resource":"arn:aws:s3:us-east-1:000000000000:accesspoint/door/object/*"}]}' > /dev/null 2>&1 && pass "put-access-point-policy through node 1" || fail "put-access-point-policy through node 1"
+check "its policy denies a write through it, through node 3" "$(errcode on 3 s3api put-object --bucket "$alias" --key ap/no.txt --body ap.txt)" AccessDenied
+ctl 2 delete-access-point --name door > /dev/null 2>&1 && pass "delete-access-point through node 2" || fail "delete-access-point through node 2"
+check "gone through node 1" "$(errcode ctl 1 get-access-point --name door)" NoSuchAccessPoint
+check "and its alias with it" "$(errcode on 3 s3api list-objects-v2 --bucket "$alias")" NoSuchBucket
+ctl 3 create-access-point --name door --bucket "$apb" > /dev/null 2>&1 && pass "its name free again, taken for $apb" || fail "its name free again, taken for $apb"
+on 1 s3api delete-bucket --bucket "$apb" > /dev/null 2>&1
+ctl 2 create-access-point --name window --bucket apa > /dev/null 2>&1 && pass "a deleted bucket's names are let go" || fail "a deleted bucket's names are let go"
+check "and the access point is apa's" "$(ctl 1 get-access-point --name window --query Bucket --output text 2>&1)" apa
 
 # Event notifications on a cluster (ADR-0078 §4): the shard's leader delivers, and a new one goes on.
 keys() { python3 -c 'import json,sys

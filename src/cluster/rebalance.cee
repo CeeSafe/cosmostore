@@ -95,27 +95,37 @@ async fn readActive(shared: borrow NodeShared) -> Result<Vector<u32>, NodeFault>
     };
 }
 
-/// One of group 0's writes: the system bucket, or the active set into it (two writes, each committed before the next:
-/// in a Raft log a record is not applied when it is staged, ADR-0058, so a bucket made in a write is not there for it).
+/// What one of group 0's writes does to its system bucket.
+enum Group0Change {
+    MakeBucket,
+    Put,
+    Delete,
+}
+
+/// One of group 0's writes: the system bucket, or an object of it put or deleted (the active set, an access point's
+/// claim). The bucket is a write of its own, committed before the next: in a Raft log a record is not applied when it
+/// is staged, ADR-0058, so a bucket made in a write is not there for it.
 fn writeGroup0Record(
     r: borrow mut ShardReplica,
     st: borrow mut ObjectStore,
-    bucket: bool,
-    ids: Slice<u32>,
+    change: Group0Change,
+    key: StringView,
+    bytes: Slice<u8>,
 ) -> Result<u64?, StoreError> {
     let before = r.beginWrite(st)?;
-    let staged = if (bucket) st.createBucket(SYSTEM_BUCKET) else match (encodeIds(ids)) {
-        Ok(bytes) => match (st.putObject(
+    let staged = match (change) {
+        Group0Change.MakeBucket => st.createBucket(SYSTEM_BUCKET),
+        Group0Change.Put => match (st.putObject(
             SYSTEM_BUCKET,
-            ACTIVE_KEY,
+            key,
             "application/octet-stream",
-            bytes.view(),
+            bytes,
             PutCondition.None,
         )) {
             Ok(_) => Ok(),
             Err(e) => Err(e),
         },
-        Err(e) => Err(StoreError.OutOfMemory(e)),
+        Group0Change.Delete => st.deleteObject(SYSTEM_BUCKET, key),
     };
     match (staged) {
         Ok() => {}
@@ -149,15 +159,24 @@ async fn writeActive(shared: borrow NodeShared, ids: Slice<u32>) -> Result<bool,
         };
         hasBucket = storeGuard.data().bucketExists(SYSTEM_BUCKET).ok() ?? false;
     }
-    if (!hasBucket && !(await group0Write(shared, slot, true, ids)?)) { return Ok(false); }
-    return await group0Write(shared, slot, false, ids);
+    if (!hasBucket && !(await group0Write(shared, slot, Group0Change.MakeBucket, ACTIVE_KEY, "".bytes())?)) {
+        return Ok(false);
+    }
+    let bytes = match (encodeIds(ids)) {
+        Ok(b) => b,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    return await group0Write(shared, slot, Group0Change.Put, ACTIVE_KEY, bytes.view());
 }
 
+/// One write of group 0, as its leader here, behind its gate (the caller's): proposed, and waited for until applied;
+/// true when it is, in the term it was proposed in.
 async fn group0Write(
     shared: borrow NodeShared,
     slot: borrow ShardSlot,
-    bucket: bool,
-    ids: Slice<u32>,
+    change: Group0Change,
+    key: StringView,
+    bytes: Slice<u8>,
 ) -> Result<bool, NodeFault> {
     var index = 0u64;
     var term = 0u64;
@@ -174,7 +193,7 @@ async fn group0Write(
             Err(_) => { return Err(NodeFault.Net); }
         };
         let st = storeGuard.data();
-        let written = await Async.blocking(() => writeGroup0Record(r, st, bucket, ids));
+        let written = await Async.blocking(() => writeGroup0Record(r, st, change, key, bytes));
         index = match (written) {
             Ok(Some(i)) => i,
             _ => { return Ok(false); }

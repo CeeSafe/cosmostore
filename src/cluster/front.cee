@@ -123,6 +123,8 @@ struct NodeS3Setup {
     keys: Vector<MasterKey>;
     rolesText: Vector<u8>;
     websiteDomain: Vector<u8>;
+    /// `--domain`: virtual-hosted requests' domain (ADR-0078 §5).
+    domain: Vector<u8>;
     /// The notification targets file's text (ADR-0078 §4).
     notifyTargetsText: Vector<u8>;
     /// The replication targets file's text (ADR-0078 §4), wiped once the node has opened: it holds secrets.
@@ -154,7 +156,7 @@ fn clusterS3App(
         store: store,
         credentials: credentials,
         requests: AtomicU64.create(0),
-        domain: Vector<u8>.create(),
+        domain: copyBytes(sts.domain.view())?,
         websiteDomain: copyBytes(sts.websiteDomain.view())?,
         commitTurn: AsyncMutex<u8>.create(0)?,
         published: AtomicU64.create(0),
@@ -185,7 +187,8 @@ fn clusterS3App(
         accessLog: Some(AccessLog { lines: sts.accessLines.clone(), dropped: AtomicU64.create(0) }),
         // "Some", for good, as policies are.
         loggingBuckets: AtomicU64.create(1),
-        accessPointBuckets: AtomicU64.create(0),
+        // "Some", for good, as policies are (ADR-0078 §5).
+        accessPointBuckets: AtomicU64.create(1),
         // "Some", for good, as policies are.
         replicationBuckets: AtomicU64.create(1),
         replicationTargetIds: replicationTargetIdsOf(sts.replicationTargetsText.view())?,
@@ -897,6 +900,42 @@ async fn routeRequest(shared: borrow NodeShared, shard: u32, raw: borrow RawMess
 /// ListBuckets on a cluster (ADR-0060 §7): every shard's answer, each a linearizable read, the `<Bucket>` entries
 /// merged by name into the first answer's frame.
 async fn listAllBuckets(shared: borrow NodeShared, raw: borrow RawMessage) -> Result<RawMessage, NodeFault> {
+    return await mergeShardLists(shared, raw, "Bucket", "Buckets");
+}
+
+/// `<open>…</close>` of `name`.
+fn tagOf(name: StringView, close: bool) -> Result<Vector<u8>, AllocError> {
+    var t = Vector<u8>.create();
+    t.extend((if (close) "</" else "<").bytes())?;
+    t.extend(name.bytes())?;
+    t.push('>')?;
+    return Ok(t);
+}
+
+/// Every shard's answer to `raw`, each a linearizable read, its `<item>` entries merged by their `<Name>` into the
+/// first answer's `<list>`: ListBuckets (ADR-0060 §7), ListAccessPoints (ADR-0078 §5).
+async fn mergeShardLists(
+    shared: borrow NodeShared,
+    raw: borrow RawMessage,
+    item: StringView,
+    list: StringView,
+) -> Result<RawMessage, NodeFault> {
+    let open1 = match (tagOf(item, false)) {
+        Ok(t) => t,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    let close1 = match (tagOf(item, true)) {
+        Ok(t) => t,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    let openList = match (tagOf(list, false)) {
+        Ok(t) => t,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    let closeList = match (tagOf(list, true)) {
+        Ok(t) => t,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
     var first: RawMessage? = null;
     var entries = Vector<Vector<u8>>.create();
     var names = Vector<Vector<u8>>.create();
@@ -908,12 +947,12 @@ async fn listAllBuckets(shared: borrow NodeShared, raw: borrow RawMessage) -> Re
         let b = answer.body.view();
         var at = 0usize;
         while (true) {
-            let open = match (indexOfFrom(b, "<Bucket>".bytes(), at)) {
+            let open = match (indexOfFrom(b, open1.view(), at)) {
                 Some(i) => i,
                 null => { break; }
             };
-            let close = match (indexOfFrom(b, "</Bucket>".bytes(), open)) {
-                Some(i) => i + 9,
+            let close = match (indexOfFrom(b, close1.view(), open)) {
+                Some(i) => i + close1.length,
                 null => { break; }
             };
             let entry = b[open..close];
@@ -942,11 +981,11 @@ async fn listAllBuckets(shared: borrow NodeShared, raw: borrow RawMessage) -> Re
     };
     // The frame: everything up to `<Buckets>` and from `</Buckets>`, the merged entries between.
     let b = out.body.view();
-    let start = match (indexOfFrom(b, "<Buckets>".bytes(), 0)) {
-        Some(i) => i + 9,
+    let start = match (indexOfFrom(b, openList.view(), 0)) {
+        Some(i) => i + openList.length,
         null => { return Ok(out); }
     };
-    let end = match (indexOfFrom(b, "</Buckets>".bytes(), start)) {
+    let end = match (indexOfFrom(b, closeList.view(), start)) {
         Some(i) => i,
         null => { return Ok(out); }
     };
@@ -1067,8 +1106,18 @@ impl Handler<FrontApp> for FrontHandler {
             }
             if (raw.body.extend(buf.view()[0..n]).isErr()) { return Err(HandlerError.Internal); }
         }
-        // A website request (ADR-0078 §3) names its bucket by its host, `<bucket>.<website domain>`.
+        // S3 Control (ADR-0078 §5): routed by an access point's claim in group 0, or by its bucket.
+        if (isControlRequest(borrow raw)) {
+            let routed = match (await routeControl(shared, mut raw)) {
+                Ok(a) => a,
+                Err(_) => frontError("InternalError", 500),
+            };
+            return await relay(exchange, shownOf(routed), false);
+        }
+        // A website request (ADR-0078 §3) names its bucket by its host, `<bucket>.<website domain>`; with `--domain`,
+        // a virtual-hosted request by `<bucket>.<domain>` (ADR-0078 §5).
         var site = Vector<u8>.create();
+        var hosted = Vector<u8>.create();
         for (i in 0..raw.names.length) {
             if (!Ascii.equalsIgnoringCase(raw.names[i].view(), "host")) { continue; }
             match (websiteBucketOf(raw.values[i].view(), shared.websiteDomain.view())) {
@@ -1077,8 +1126,24 @@ impl Handler<FrontApp> for FrontHandler {
                 }
                 null => {}
             }
+            if (virtualBucket(raw.values[i].view(), shared.domain.view(), mut hosted).isErr()) {
+                return Err(HandlerError.Internal);
+            }
         }
-        let bucket = if (site.length > 0) site.view() else bucketOfTarget(raw.target.view());
+        let bucket = if (site.length > 0) site.view() else if (hosted.length > 0) hosted.view() else bucketOfTarget(
+            raw.target.view(),
+        );
+        // An access point's alias, or `<name>-<account>` from its ARN's host (ADR-0078 §5): its bucket's shard. The
+        // request goes as it came; the shard's S3 server finds the access point in its own store.
+        var through = Vector<u8>.create();
+        if (site.length == 0 && mayNameAccessPoint(bucket)) {
+            match (await findClaim(shared, bucket, false)) {
+                Ok(Some(c)) => { through = c.bucket; }
+                Ok(null) => {}
+                Err(_) => { return await relay(exchange, frontError("InternalError", 500), false); }
+            }
+        }
+        let routed = if (through.length > 0) through.view() else bucket;
         let head = Methods.parse(raw.method.view()) == Method.Head;
         // A copy reads its source from its own shard's store: a source in another shard's bucket is not there.
         for (i in 0..raw.names.length) {
@@ -1087,7 +1152,7 @@ impl Handler<FrontApp> for FrontHandler {
             if (source.length > 0 && shardOfBucket(
                 borrow shared.file,
                 source,
-            ) != shardOfBucket(borrow shared.file, bucket)) {
+            ) != shardOfBucket(borrow shared.file, routed)) {
                 return await relay(exchange, frontError("NotImplemented", 501), false);
             }
         }
@@ -1103,20 +1168,29 @@ impl Handler<FrontApp> for FrontHandler {
                 0,
                 borrow raw,
             ) else Ok(frontError("NotImplemented", 501))
-        } else await routeRequest(shared, shardOfBucket(borrow shared.file, bucket), borrow raw);
+        } else await routeRequest(shared, shardOfBucket(borrow shared.file, routed), borrow raw);
         let answer = match (answered) {
             Ok(a) => a,
             Err(_) => frontError("InternalError", 500),
         };
-        let shown = if (answer.status == 503 && answer.body.length == 0) frontError(
-            "ServiceUnavailable",
-            503,
-        ) else if (answer.status == 421) frontError(
-            "ServiceUnavailable",
-            503,
-        ) else answer;
-        return await relay(exchange, shown, head);
+        // A bucket deleted takes its access points with it: their names are let go (ADR-0078 §5).
+        let bucketGone = method == Method.Delete && answer.status == 204 && through.length == 0 && bucket.length > 0 &&
+            site.length == 0 && namesBucketItself(raw.target.view(), hosted.length > 0);
+        if (bucketGone && (await releaseBucketClaims(shared, bucket)).isErr()) {
+            let _ = await AsyncConsole.writeError(
+                "cosmostore: a deleted bucket's access point names were not let go\n",
+            );
+        }
+        return await relay(exchange, shownOf(answer), head);
     }
+}
+
+/// A shard's answer as the client sees it: 503 without a body, or 421 (no leader took it), as ServiceUnavailable.
+fn shownOf(answer: RawMessage) -> RawMessage {
+    if ((answer.status == 503 && answer.body.length == 0) || answer.status == 421) {
+        return frontError("ServiceUnavailable", 503);
+    }
+    return answer;
 }
 
 /// Sends a response as a shard's S3 server gave it: its status, its headers but the framing ones, its body. A HEAD's

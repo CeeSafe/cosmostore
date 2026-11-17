@@ -60,6 +60,8 @@ struct NodeShared {
     requests: AtomicU64;
     /// `--website-domain` (ADR-0078 §3): a request to `<bucket>.<domain>` is that bucket's website.
     websiteDomain: Vector<u8>;
+    /// `--domain` (ADR-0078 §5): a request to `<bucket>.<domain>` is that bucket's, virtual-hosted.
+    domain: Vector<u8>;
     /// `--notify-targets` (ADR-0078 §4): the webhooks this node's leaders deliver to.
     notifyTargets: Vector<NotifyTarget>;
     /// `--replication-targets` (ADR-0078 §4): the other endpoints replicas go to (no SSE keys: a cluster seals
@@ -291,6 +293,10 @@ fn openNode(
         clockSkewMs: clockSkewMs,
         requestPrefix: requestPrefixOf(id),
         websiteDomain: match (copyBytes(sts.websiteDomain.view())) {
+            Ok(d) => d,
+            Err(_) => { return Err(textOf("out of memory")); }
+        },
+        domain: match (copyBytes(sts.domain.view())) {
             Ok(d) => d,
             Err(_) => { return Err(textOf("out of memory")); }
         },
@@ -751,7 +757,9 @@ impl Handler<NodeApp> for PeerHandler {
         let isRecord = request.method() == Method.Post && path == "/record-fetch";
         // A piece of a coded extent another replica needs (ADR-0064 §4, §5).
         let isPiece = request.method() == Method.Post && path == "/piece-fetch";
-        if (!isRaft && !isStatus && !isS3 && !isExtent && !isFetch && !isActive && !isRecord && !isPiece) {
+        // An access point's name claimed, let go or looked up in group 0, by another node's front (ADR-0078 §5).
+        let isClaim = request.method() == Method.Post && path == CLAIM_PATH;
+        if (!isRaft && !isStatus && !isS3 && !isExtent && !isFetch && !isActive && !isRecord && !isPiece && !isClaim) {
             return await exchange.send(Status.notFound(), "".bytes());
         }
         // The body, whole: a batch is decoded only once its signature holds.
@@ -806,6 +814,13 @@ impl Handler<NodeApp> for PeerHandler {
                 Some(bytes) => await exchange.send(Status.ok(), bytes.view()),
                 null => await exchange.send(Status.notFound(), "".bytes()),
             };
+        }
+        if (isClaim) {
+            let answer = match (await changeClaim(shared, body.view())) {
+                Ok(a) => a,
+                Err(_) => claimAnswer(500),
+            };
+            return await exchange.send(statusOf(answer.status), answer.body.view());
         }
         if (isActive) {
             let status = match (await changeActive(shared, body.view())) {
@@ -1125,6 +1140,7 @@ fn nodeCommand() -> i32 {
         keys: Vector<MasterKey>.create(),
         rolesText: Vector<u8>.create(),
         websiteDomain: Vector<u8>.create(),
+        domain: Vector<u8>.create(),
         notifyTargetsText: Vector<u8>.create(),
         replicationTargetsText: Vector<u8>.create(),
         frontUrl: Vector<u8>.create(),
@@ -1189,6 +1205,14 @@ fn nodeCommand() -> i32 {
         Some(d) => {
             for (c in d.view().bytes()) {
                 if (sts.websiteDomain.push(if (c >= 'A' && c <= 'Z') c + 32 else c).isErr()) { return 1; }
+            }
+        }
+        null => {}
+    }
+    match (borrow args.domain) {
+        Some(d) => {
+            for (c in d.view().bytes()) {
+                if (sts.domain.push(if (c >= 'A' && c <= 'Z') c + 32 else c).isErr()) { return 1; }
             }
         }
         null => {}
@@ -1285,6 +1309,9 @@ fn nodeCommand() -> i32 {
     } && match (peerHandler()) {
         Ok(h) => server.router().post("/piece-fetch", h).isOk(),
         Err(_) => false,
+    } && match (peerHandler()) {
+        Ok(h) => server.router().post(CLAIM_PATH, h).isOk(),
+        Err(_) => false,
     };
     if (!routed || !routedS3) { return 1; }
     var front: Server<FrontApp>? = null;
@@ -1321,6 +1348,8 @@ struct ClusterArguments {
     roles: String?;
     /// Website hosting on the node's S3 port (ADR-0078 §3).
     websiteDomain: String?;
+    /// Virtual-hosted requests, `<bucket>.<domain>`, as `serve`'s domain (ADR-0078 §5).
+    domain: String?;
     /// The webhooks event notifications go to (ADR-0078 §4).
     notifyTargets: String?;
     /// The other endpoints replication goes to (ADR-0078 §4).
@@ -1347,6 +1376,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var stsKeys: String? = null;
     var roles: String? = null;
     var websiteDomain: String? = null;
+    var domain: String? = null;
     var notifyTargets: String? = null;
     var replicationTargets: String? = null;
     var accessLogSeconds: u64? = null;
@@ -1393,6 +1423,8 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             roles = Some(textOf(value));
         } else if (option == "--website-domain") {
             websiteDomain = Some(textOf(value));
+        } else if (option == "--domain") {
+            domain = Some(textOf(value));
         } else if (option == "--notify-targets") {
             notifyTargets = Some(textOf(value));
         } else if (option == "--replication-targets") {
@@ -1427,6 +1459,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 stsKeys: stsKeys,
                 roles: roles,
                 websiteDomain: websiteDomain,
+                domain: domain,
                 notifyTargets: notifyTargets,
                 replicationTargets: replicationTargets,
                 accessLogSeconds: accessLogSeconds,

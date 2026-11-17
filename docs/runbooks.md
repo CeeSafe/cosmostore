@@ -263,8 +263,11 @@ alias; requests through it use the alias as the bucket, or the ARN `arn:aws:s3:u
   and `.../object/<key pattern>`; a Deny there refuses requests through it, not to the bucket itself.
 - **Anonymous reads through it** need its policy and the bucket's to allow them, and its public-access block off
   (`--public-access-block-configuration` at creation: it is all on otherwise, and cannot change later).
-- **Through it** only objects, listings, uploads and batch deletes; bucket configuration goes to the bucket. Not on a
-  cluster yet.
+- **Through it** only objects, listings, uploads and batch deletes; bucket configuration goes to the bucket.
+- **On a cluster** (ADR-0078 §5): S3 Control works through any node, and a name is the cluster's, whatever shard its
+  bucket is on. Give every `cosmostore node` the same `--domain` (as `serve`'s domain) for ARNs, whose host is
+  `<name>-<account>.<domain>`; aliases need nothing. A name left claimed after a failure (CreateAccessPoint said
+  ServiceUnavailable, and the access point is not there) is let go by `delete-access-point` of it.
 
 ## Replication
 

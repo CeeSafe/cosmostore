@@ -18,7 +18,7 @@
    path-style or under `<account>.<domain>`. Names are 3 to 50 of a-z, 0-9 and `-`, one per server
    (`AccessPointAlreadyOwnedByYou`); the look-up and the write hold the store's lock together. Any 12-digit account
    id is taken and given back in ARNs (`arn:aws:s3:us-east-1:<account>:accesspoint/<name>`). Long-term keys and
-   their `GetSessionToken` sessions only; not on a cluster yet (NotImplemented).
+   their `GetSessionToken` sessions only. On a cluster: ADR-0078 §5.
 2. **Stored** as a `BucketConfig` of kind 15 on the access point's bucket (checkpoint format 22): name, alias
    (`<name, up to 30>-<20 of a-z 2-7>-s3alias`), block, creation time, policy. Deleting the bucket deletes them.
 3. **A request through one:** a bucket name that is an alias, or `<name>-<12 digits>` (from the ARN's host), and

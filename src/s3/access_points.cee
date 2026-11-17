@@ -8,6 +8,9 @@ import web_server;
 
 const S3_CONTROL_XMLNS: StringView = "http://awss3control.amazonaws.com/doc/2018-08-20/";
 const ACCESS_POINT_REGION: StringView = "us-east-1";
+/// On a cluster, the alias a CreateAccessPoint takes: the front's, which it claimed with the name in group 0 (ADR-0078
+/// §5). A client's `x-cosmo-` fields never reach a shard (the front strips them).
+const ACCESS_POINT_ALIAS_FIELD: StringView = "x-cosmo-access-point-alias";
 /// Every setting on, as an access point is made without a `PublicAccessBlockConfiguration` (AWS's default).
 const ACCESS_POINT_BLOCK_ALL: u8 = 15;
 
@@ -204,7 +207,8 @@ fn pointsOf(store: borrow ObjectStore, bucket: Slice<u8>) -> Result<Vector<Acces
 }
 
 /// `/v20180820/accesspoint[/<name>[/policy]]` with `x-amz-account-id` (ADR-0076 §1). Long-term keys and their
-/// `GetSessionToken` sessions only; not on a cluster yet.
+/// `GetSessionToken` sessions only. On a cluster (ADR-0078 §5) the front routes each to the bucket's shard, and a
+/// CreateAccessPoint takes the alias the front claimed.
 async fn serveControl(
     app: borrow S3App,
     req: borrow S3Request,
@@ -213,7 +217,6 @@ async fn serveControl(
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
     if (who.key.isNull() || who.role.isSome()) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
-    if (app.cluster) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
     let account = trimBlank(headerOf(req, "x-amz-account-id") ?? "".bytes());
     if (account.length != 12) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
     for (c in account) {
@@ -287,7 +290,13 @@ async fn serveControl(
             createdMs: Clock.unixMillis(),
             policy: Vector<u8>.create(),
         };
-        if (!accessPointAlias(name, mut point.alias)?) { return Err(S3Fail.Code(S3Code.InternalError)); }
+        if (app.cluster) {
+            let given = trimBlank(headerOf(req, ACCESS_POINT_ALIAS_FIELD) ?? "".bytes());
+            if (given.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            point.alias.extend(given)?;
+        } else if (!accessPointAlias(name, mut point.alias)?) {
+            return Err(S3Fail.Code(S3Code.InternalError));
+        }
         var body = Vector<u8>.create();
         controlHead(mut body, "CreateAccessPointResult")?;
         var arn = Vector<u8>.create();
@@ -313,7 +322,8 @@ async fn serveControl(
             let bucketView = bucket.view();
             let pointsView = points.view();
             await Async.blocking(() => storeAccessPoints(store, bucketView, pointsView))?;
-            app.accessPointBuckets.store(store.accessPointBucketCount());
+            // On a cluster the record is applied after the answer: the count stays at "some".
+            if (!app.cluster) { app.accessPointBuckets.store(store.accessPointBucketCount()); }
         }
         return await sendXml(exchange, borrow body);
     }
@@ -377,7 +387,7 @@ async fn serveControl(
     let bucketView = hit.bucket.view();
     let pointsView = points.view();
     await Async.blocking(() => storeAccessPoints(store, bucketView, pointsView))?;
-    app.accessPointBuckets.store(store.accessPointBucketCount());
+    if (!app.cluster) { app.accessPointBuckets.store(store.accessPointBucketCount()); }
     await exchange.send(if (isMethod(m, Method.Delete)) Status.noContent() else Status.ok(), "".bytes())?;
     return Ok();
 }

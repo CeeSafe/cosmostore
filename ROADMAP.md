@@ -2803,3 +2803,10 @@ Browser form uploads with a SigV4 POST policy.
   sequencer order, the replicas exactly the source's versions and markers. Three runs passed (leader kills alone for
   60 s; every default fault for 90 s, twice), with 297, 17 and 67 events delivered again after a leader's change.
   Slice d (Access Points on a cluster) is next.
+- **Slice d, Access Points on a cluster (ADR-0078 §5):** an access point's name is a claim in group 0 (the object
+  `access-point/<name>` of its system bucket, `<bucket>\n<alias>`; no new record), taken and let go by group 0's
+  leader on a peer path of its own. The front claims a name before the bucket's shard makes the access point (with the
+  alias the front picked), routes S3 Control by the claims (ListAccessPoints merged across shards), and routes a
+  request by alias or by `<name>-<account>` to the bucket's shard; `cosmostore node --domain` reads virtual-hosted
+  requests, so ARNs work. A deleted bucket's names are let go. Tests: two new, 313 in all; the cluster smoke, 97
+  checks. ADR-0078 is built.

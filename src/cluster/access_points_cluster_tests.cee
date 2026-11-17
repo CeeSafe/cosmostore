@@ -1,0 +1,72 @@
+// Access Points on a cluster (ADR-0078 §5): the claims in group 0's system bucket, and how the front reads a request.
+
+fn putClaim(s: borrow mut ObjectStore, name: StringView, value: StringView) {
+    let key = claimKey(name.bytes())!;
+    let _ = s.putObject(
+        SYSTEM_BUCKET,
+        StringView.fromUtf8(key.view()) ?? "",
+        "application/octet-stream",
+        value.bytes(),
+        PutCondition.None,
+    )!;
+}
+
+@test
+fn accessPointClaimsFoundByNameAliasAndArn() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("ap-claims");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket(SYSTEM_BUCKET)!;
+    putClaim(mut s, "door", "apa\ndoor-abcdefghijklmnopqrst-s3alias");
+    putClaim(mut s, "doorway", "apb\ndoorway-bbbbbbbbbbbbbbbbbbbb-s3alias");
+    // A name over 30 letters: its alias begins with the first 30 only (ADR-0076 §2).
+    let long = "a-very-long-access-point-name-of-forty-c";
+    putClaim(mut s, long, "apc\na-very-long-access-point-name-cccccccccccccccccccc-s3alias");
+    putClaim(
+        mut s,
+        "a-very-long-access-point-name-other",
+        "apd\na-very-long-access-point-name-dddddddddddddddddddd-s3alias",
+    );
+    let byName = lookClaim(mut s, "door".bytes(), true)!!;
+    Check.equalText("apa", StringView.fromUtf8(byName.bucket.view()) ?? "")?;
+    let byAlias = lookClaim(mut s, "doorway-bbbbbbbbbbbbbbbbbbbb-s3alias".bytes(), false)!!;
+    Check.equalText("doorway", StringView.fromUtf8(byAlias.name.view()) ?? "")?;
+    let longAlias = lookClaim(mut s, "a-very-long-access-point-name-cccccccccccccccccccc-s3alias".bytes(), false)!!;
+    Check.equalText(long, StringView.fromUtf8(longAlias.name.view()) ?? "")?;
+    Check.equalText("apc", StringView.fromUtf8(longAlias.bucket.view()) ?? "")?;
+    let byArn = lookClaim(mut s, "doorway-000000000000".bytes(), false)!!;
+    Check.equalText("apb", StringView.fromUtf8(byArn.bucket.view()) ?? "")?;
+    // An alias of the right shape that no claim has, a bucket's own name, a name not claimed.
+    Check.isTrue(lookClaim(mut s, "door-zzzzzzzzzzzzzzzzzzzz-s3alias".bytes(), false)!.isNull(), "a wrong alias")?;
+    Check.isTrue(lookClaim(mut s, "door".bytes(), false)!.isNull(), "a plain bucket name")?;
+    Check.isTrue(lookClaim(mut s, "window".bytes(), true)!.isNull(), "an unclaimed name")?;
+    Check.equalU64(4, claimedNames(mut s, "".bytes())!.length as u64)?;
+    Check.equalU64(2, claimedNames(mut s, "door".bytes())!.length as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn accessPointClaimRequestsAndTargets() -> Result<void, TestFailure> {
+    let body = claimRequest(CLAIM_TAKE, "door".bytes(), "apa".bytes(), "".bytes())!;
+    Check.equalU64(CLAIM_TAKE as u64, body[0] as u64)?;
+    var at = 1usize;
+    Check.equalText("door", StringView.fromUtf8(claimField(body.view(), mut at)!) ?? "")?;
+    Check.equalText("apa", StringView.fromUtf8(claimField(body.view(), mut at)!) ?? "")?;
+    Check.equalU64(0, claimField(body.view(), mut at)!.length as u64)?;
+    Check.isTrue(claimField(body.view(), mut at).isNull(), "no fourth field")?;
+    Check.isTrue(claimField(body.view()[0..4], mut at).isNull(), "a short body")?;
+    // The bucket itself, path-style or virtual-hosted; not a key or a sub-resource.
+    Check.isTrue(namesBucketItself("/apa".bytes(), false), "/apa")?;
+    Check.isTrue(namesBucketItself("/apa/".bytes(), false), "/apa/")?;
+    Check.isTrue(!namesBucketItself("/apa/key".bytes(), false), "/apa/key")?;
+    Check.isTrue(!namesBucketItself("/apa?versioning".bytes(), false), "?versioning")?;
+    Check.isTrue(namesBucketItself("/".bytes(), true), "/ hosted")?;
+    Check.isTrue(!namesBucketItself("/key".bytes(), true), "/key hosted")?;
+    Check.equalText(
+        "apa",
+        StringView.fromUtf8(targetParam("/v20180820/accesspoint?bucket=apa".bytes(), "bucket")!) ?? "",
+    )?;
+    Check.equalText("b", StringView.fromUtf8(targetParam("/x?a=1&bucket=b&c".bytes(), "bucket")!) ?? "")?;
+    Check.isTrue(targetParam("/x?buckets=1".bytes(), "bucket").isNull(), "another parameter")?;
+    return Ok();
+}
