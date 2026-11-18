@@ -295,6 +295,7 @@ ADR-0078); directory buckets and Tables were left out (ADR-0071 §3).
 Proposed in ADR-0079 (18 Nov 2026), for the owner to accept: directory buckets (CreateBucket with a directory
 configuration, CreateSession and `s3express` signing, S3's limits for them), then S3 Tables (the `s3tables` catalog
 API and the Iceberg REST calls an engine needs, commits as a compare-and-set).
+The owner chose directory buckets only, with S3's limits enforced (18 Nov 2026); their design is ADR-0080 (proposed).
 
 ---
 
@@ -2867,3 +2868,8 @@ Browser form uploads with a SigV4 POST policy.
   each with its own ADR and support matrix. Checked first: boto3 sends a `--x-s3` bucket's requests to a custom
   endpoint path-style, after a CreateSession (`GET /<bucket>?session`) signed for `s3express`, so CreateSession and
   that signing service are the entry fee. For the owner: accept it, and whether both items or directory buckets only.
+- **The owner's choices:** directory buckets only (Tables wait), with S3's limits enforced. **ADR-0080 proposes
+  directory buckets** from AWS's pages and from what boto3 sends a custom endpoint: every call on a `--x-s3` bucket,
+  CreateBucket included, takes a session first and arrives with its token; CopyObject and ListDirectoryBuckets come
+  signed for `s3express` with the long-term key, ListDirectoryBuckets as `GET /`. Three slices; for the owner to
+  accept, with ADR-0079.

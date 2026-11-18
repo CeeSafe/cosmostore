@@ -1,6 +1,7 @@
 # ADR-0079: Directory buckets and S3 Tables, the plan of M8
 
-**Status:** proposed, 18 Nov 2026, for the owner to accept or change. M7 left both out (ADR-0071 §3: "other storage
+**Status:** proposed, 18 Nov 2026; the owner chose, the same day, **directory buckets only** and **S3's limits
+enforced** (the two questions below). Its acceptance is the owner's. M7 left both out (ADR-0071 §3: "other storage
 classes with APIs of their own; a later milestone may take them"); the owner asked to go on after M7 closed.
 
 ## Context
@@ -50,12 +51,13 @@ classes with APIs of their own; a later milestone may take them"); the owner ask
 5. **Not in M8:** S3 Metadata tables (a journal of a bucket's changes as a table), S3 Vectors, and any Iceberg
    engine inside the server.
 
-## For the owner to decide
+## For the owner to decide (decided 18 Nov 2026)
 
-- **Both items, or directory buckets only.** Tables are worth it only if Iceberg engines are meant to run against
+- **Both items, or directory buckets only.** The owner: directory buckets only; S3 Tables wait until Iceberg engines
+  are meant to run against CosmoStore (§1's item 2 and §4 stay as the design for then). Tables are worth it only if Iceberg engines are meant to run against
   CosmoStore; directory buckets are worth it for S3 compatibility alone.
-- **How strict directory buckets are.** Proposed: S3's limits enforced, so code that works here works on AWS. The
-  other way, a directory bucket that does everything a bucket does, is less to build and less faithful.
+- **How strict directory buckets are.** The owner: S3's limits enforced, so code that works here works on AWS (the
+  other way, a directory bucket that does everything a bucket does, was less to build and less faithful).
 
 ## Consequences
 
