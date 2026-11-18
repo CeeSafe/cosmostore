@@ -14,7 +14,7 @@ void Check(string name, object got, object want)
 async Task<string> CodeOf(Func<Task> f)
 {
     try { await f(); return "no error"; }
-    catch (AmazonS3Exception e) { return e.ErrorCode ?? ((int)e.StatusCode).ToString(); }
+    catch (Amazon.Runtime.AmazonServiceException e) { return e.ErrorCode ?? ((int)e.StatusCode).ToString(); }
 }
 static string Md5(byte[] data) => "\"" + Convert.ToHexString(MD5.HashData(data)).ToLowerInvariant() + "\"";
 static async Task<byte[]> ReadAll(GetObjectResponse r)
@@ -118,4 +118,211 @@ Check("delete objects", deleted.DeletedObjects.Count, keys.Count);
 await s3.DeleteBucketAsync(b);
 // A HEAD has no body: the .NET SDK reports its status, NotFound, where Java names NoSuchBucket.
 Check("bucket deleted", await CodeOf(() => s3.GetObjectMetadataAsync(b, "x")), "NotFound");
+
+// M7 (ADR-0072 to ADR-0077): each item's configuration calls and what each does. common.sh starts serve with access
+// logs every 2 s, a 3 s inventory day, websites under web.localhost and a role "reader" of sdk-m7.
+async Task<bool> Until(Func<Task<bool>> f, int seconds = 15)
+{
+    var end = DateTime.UtcNow.AddSeconds(seconds);
+    while (DateTime.UtcNow < end)
+    {
+        if (await f()) { return true; }
+        await Task.Delay(250);
+    }
+    return false;
+}
+async Task<List<string>> KeysUnder(string bucket, string prefix) =>
+    ((await s3.ListObjectsV2Async(new ListObjectsV2Request { BucketName = bucket, Prefix = prefix })).S3Objects ?? []).Select(o => o.Key).ToList();
+async Task<string> Read(AmazonS3Client c, string bucket, string key)
+{
+    try { return System.Text.Encoding.UTF8.GetString(await ReadAll(await c.GetObjectAsync(bucket, key))); }
+    catch (Amazon.Runtime.AmazonServiceException e) { return e.ErrorCode; }
+}
+async Task<string> Gone<T>(Func<Task<T>> get, Func<T, bool> empty, string code)
+{
+    // The .NET SDK gives some "not found" answers as an empty configuration rather than its error (the other SDKs
+    // throw), so either is gone.
+    try { return empty(await get()) ? "gone" : "still there"; }
+    catch (Amazon.Runtime.AmazonServiceException e) { return e.ErrorCode == code ? "gone" : e.ErrorCode; }
+}
+const string m7 = "sdk-m7", logs = "sdk-m7-logs", account = "000000000000";
+await s3.PutBucketAsync(m7);
+await s3.PutBucketAsync(logs);
+await s3.PutObjectAsync(new PutObjectRequest { BucketName = m7, Key = "index.html", ContentBody = "the index", ContentType = "text/html" });
+await s3.PutObjectAsync(new PutObjectRequest { BucketName = m7, Key = "error.html", ContentBody = "the error page", ContentType = "text/html" });
+
+// Access logs (ADR-0072).
+await s3.PutBucketLoggingAsync(new PutBucketLoggingRequest
+{
+    BucketName = m7, LoggingConfig = new S3BucketLoggingConfig { TargetBucketName = logs, TargetPrefix = "access/" },
+});
+var lg = (await s3.GetBucketLoggingAsync(new GetBucketLoggingRequest { BucketName = m7 })).BucketLoggingConfig;
+Check("GetBucketLogging", lg.TargetBucketName + " " + lg.TargetPrefix, logs + " access/");
+Check("logging to a bucket that is not there", await CodeOf(() => s3.PutBucketLoggingAsync(new PutBucketLoggingRequest
+{
+    BucketName = m7, LoggingConfig = new S3BucketLoggingConfig { TargetBucketName = "sdk-nowhere", TargetPrefix = "x/" },
+})), "InvalidTargetBucketForLogging");
+await s3.PutObjectAsync(new PutObjectRequest { BucketName = m7, Key = "logged.txt", ContentBody = "logged" });
+Check("the PUT's line in a log object", await Until(async () =>
+{
+    foreach (var k in await KeysUnder(logs, "access/"))
+    {
+        if ((await Read(s3, logs, k)).Contains("REST.PUT.OBJECT logged.txt")) { return true; }
+    }
+    return false;
+}), true);
+await s3.PutBucketLoggingAsync(new PutBucketLoggingRequest { BucketName = m7, LoggingConfig = new S3BucketLoggingConfig() });
+var off = (await s3.GetBucketLoggingAsync(new GetBucketLoggingRequest { BucketName = m7 })).BucketLoggingConfig;
+Check("logging off", string.IsNullOrEmpty(off?.TargetBucketName), true);
+
+// Website hosting (ADR-0073), through <bucket>.web.localhost, with a policy that lets anyone read.
+await s3.PutBucketWebsiteAsync(new PutBucketWebsiteRequest
+{
+    BucketName = m7, WebsiteConfiguration = new WebsiteConfiguration { IndexDocumentSuffix = "index.html", ErrorDocument = "error.html" },
+});
+var ws = (await s3.GetBucketWebsiteAsync(new GetBucketWebsiteRequest { BucketName = m7 })).WebsiteConfiguration;
+Check("GetBucketWebsite", ws.IndexDocumentSuffix + " " + ws.ErrorDocument, "index.html error.html");
+await s3.PutBucketPolicyAsync(new PutBucketPolicyRequest
+{
+    BucketName = m7,
+    Policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::sdk-m7/*\"}]}",
+});
+var port = endpoint[(endpoint.LastIndexOf(':') + 1)..];
+async Task<string> Page(string path)
+{
+    var req = new HttpRequestMessage(HttpMethod.Get, endpoint + path);
+    req.Headers.Host = $"{m7}.web.localhost:{port}";
+    var resp = await http.SendAsync(req);
+    return (int)resp.StatusCode + " " + await resp.Content.ReadAsStringAsync();
+}
+Check("the site's index", await Page("/"), "200 the index");
+Check("the site's error document", await Page("/no-such-page"), "404 the error page");
+await s3.DeleteBucketWebsiteAsync(new DeleteBucketWebsiteRequest { BucketName = m7 });
+Check("the website deleted", await Gone(() => s3.GetBucketWebsiteAsync(new GetBucketWebsiteRequest { BucketName = m7 }),
+    r => string.IsNullOrEmpty(r.WebsiteConfiguration?.IndexDocumentSuffix), "NoSuchWebsiteConfiguration"), "gone");
+await s3.DeleteBucketPolicyAsync(new DeleteBucketPolicyRequest { BucketName = m7 });
+
+// Inventory (ADR-0074): a daily CSV report into the logs bucket; a day is 3 s here.
+PutBucketInventoryConfigurationRequest Inventory(string id, string accountId) => new()
+{
+    BucketName = m7, InventoryId = id,
+    InventoryConfiguration = new InventoryConfiguration
+    {
+        InventoryId = id, IsEnabled = true, IncludedObjectVersions = InventoryIncludedObjectVersions.Current,
+        Schedule = new InventorySchedule { Frequency = InventoryFrequency.Daily },
+        Destination = new InventoryDestination
+        {
+            S3BucketDestination = new InventoryS3BucketDestination
+            {
+                BucketName = "arn:aws:s3:::" + logs, InventoryFormat = InventoryFormat.CSV, Prefix = "inv", AccountId = accountId,
+            },
+        },
+    },
+};
+await s3.PutBucketInventoryConfigurationAsync(Inventory("daily", null));
+var inv = (await s3.GetBucketInventoryConfigurationAsync(new GetBucketInventoryConfigurationRequest { BucketName = m7, InventoryId = "daily" })).InventoryConfiguration;
+Check("GetBucketInventoryConfiguration", $"{inv.InventoryId} {inv.IsEnabled} {inv.Schedule.Frequency} {inv.Destination.S3BucketDestination.BucketName}",
+    "daily True Daily arn:aws:s3:::" + logs);
+Check("ListBucketInventoryConfigurations", (await s3.ListBucketInventoryConfigurationsAsync(new ListBucketInventoryConfigurationsRequest { BucketName = m7 }))
+    .InventoryConfigurationList.Count, 1);
+Check("an account id is not done, not dropped", await CodeOf(() => s3.PutBucketInventoryConfigurationAsync(Inventory("acct", "111122223333"))), "NotImplemented");
+string manifest = null;
+await Until(async () => (manifest = (await KeysUnder(logs, "inv/")).FirstOrDefault(k => k.EndsWith("manifest.json"))) != null, 20);
+Check("a report's manifest", manifest != null, true);
+if (manifest != null)
+{
+    var files = System.Text.Json.JsonDocument.Parse(await Read(s3, logs, manifest)).RootElement.GetProperty("files");
+    var gz = await ReadAll(await s3.GetObjectAsync(logs, files[0].GetProperty("key").GetString()));
+    using var unzip = new StreamReader(new System.IO.Compression.GZipStream(new MemoryStream(gz), System.IO.Compression.CompressionMode.Decompress));
+    var listedKeys = (await unzip.ReadToEndAsync()).Trim().Split('\n').Select(l => l.Split(',')[1].Trim('"')).Order();
+    Check("its CSV has every object", string.Join(" ", listedKeys), "error.html index.html logged.txt");
+}
+await s3.DeleteBucketInventoryConfigurationAsync(new DeleteBucketInventoryConfigurationRequest { BucketName = m7, InventoryId = "daily" });
+Check("the inventory deleted", await Gone(() => s3.GetBucketInventoryConfigurationAsync(new GetBucketInventoryConfigurationRequest
+{
+    BucketName = m7, InventoryId = "daily",
+}), r => r.InventoryConfiguration?.InventoryId == null, "NoSuchConfiguration"), "gone");
+
+// STS (ADR-0075): a session token, and the role "reader", sign S3 requests.
+var sts = new Amazon.SecurityToken.AmazonSecurityTokenServiceClient(new Amazon.SecurityToken.AmazonSecurityTokenServiceConfig
+{
+    ServiceURL = endpoint, AuthenticationRegion = "us-east-1", MaxErrorRetry = 0,
+});
+AmazonS3Client As(Amazon.SecurityToken.Model.Credentials c) => new(
+    new Amazon.Runtime.SessionAWSCredentials(c.AccessKeyId, c.SecretAccessKey, c.SessionToken),
+    new AmazonS3Config { ServiceURL = endpoint, ForcePathStyle = true, AuthenticationRegion = "us-east-1", MaxErrorRetry = 0 });
+var session = (await sts.GetSessionTokenAsync(new Amazon.SecurityToken.Model.GetSessionTokenRequest { DurationSeconds = 900 })).Credentials;
+Check("GetSessionToken gives an ASIA key", session.AccessKeyId[..4], "ASIA");
+Check("the session reads", await Read(As(session), m7, "logged.txt"), "logged");
+var reader = As((await sts.AssumeRoleAsync(new Amazon.SecurityToken.Model.AssumeRoleRequest
+{
+    RoleArn = $"arn:aws:iam::{account}:role/reader", RoleSessionName = "dotnet",
+})).Credentials);
+Check("the role reads", await Read(reader, m7, "logged.txt"), "logged");
+Check("the role does not write", await CodeOf(() => reader.PutObjectAsync(new PutObjectRequest { BucketName = m7, Key = "no", ContentBody = "no" })), "AccessDenied");
+Check("nor read another bucket", await CodeOf(() => reader.ListObjectsV2Async(new ListObjectsV2Request { BucketName = logs })), "AccessDenied");
+Check("policy ARNs are not done, not dropped", await CodeOf(() => sts.AssumeRoleAsync(new Amazon.SecurityToken.Model.AssumeRoleRequest
+{
+    RoleArn = $"arn:aws:iam::{account}:role/reader", RoleSessionName = "arns",
+    PolicyArns = [new Amazon.SecurityToken.Model.PolicyDescriptorType { Arn = "arn:aws:iam::aws:policy/ReadOnlyAccess" }],
+})), "NotImplemented");
+
+// Access Points (ADR-0076): S3 Control puts the account in the host (`<account>.localhost`); a request by ARN goes
+// to `<name>-<account>.localhost`.
+var ctl = new Amazon.S3Control.AmazonS3ControlClient(new Amazon.S3Control.AmazonS3ControlConfig
+{
+    ServiceURL = endpoint.Replace("127.0.0.1", "localhost"), AuthenticationRegion = "us-east-1", MaxErrorRetry = 0,
+});
+var made = await ctl.CreateAccessPointAsync(new Amazon.S3Control.Model.CreateAccessPointRequest { AccountId = account, Name = "sdk-ap", Bucket = m7 });
+Check("CreateAccessPoint gives an alias", (made.Alias ?? "").EndsWith("-s3alias"), true);
+var ap = await ctl.GetAccessPointAsync(new Amazon.S3Control.Model.GetAccessPointRequest { AccountId = account, Name = "sdk-ap" });
+Check("GetAccessPoint", ap.Bucket + " " + ap.NetworkOrigin, m7 + " Internet");
+Check("ListAccessPoints", (await ctl.ListAccessPointsAsync(new Amazon.S3Control.Model.ListAccessPointsRequest { AccountId = account, Bucket = m7 }))
+    .AccessPointList.Count, 1);
+Check("a name twice", await CodeOf(() => ctl.CreateAccessPointAsync(new Amazon.S3Control.Model.CreateAccessPointRequest
+{
+    AccountId = account, Name = "sdk-ap", Bucket = m7,
+})), "AccessPointAlreadyOwnedByYou");
+await s3.PutObjectAsync(new PutObjectRequest { BucketName = made.Alias, Key = "ap/door.txt", ContentBody = "through a door" });
+Check("a write by its alias lands in its bucket", await Read(s3, m7, "ap/door.txt"), "through a door");
+Check("a read by its ARN", await Read(Client(false), $"arn:aws:s3:us-east-1:{account}:accesspoint/sdk-ap", "ap/door.txt"), "through a door");
+await ctl.DeleteAccessPointAsync(new Amazon.S3Control.Model.DeleteAccessPointRequest { AccountId = account, Name = "sdk-ap" });
+Check("the access point deleted", await CodeOf(() => ctl.GetAccessPointAsync(new Amazon.S3Control.Model.GetAccessPointRequest
+{
+    AccountId = account, Name = "sdk-ap",
+})), "NoSuchAccessPoint");
+
+// Replication (ADR-0077): a new version copied to another bucket with its version id and ETag.
+const string rs = "sdk-rsrc", rd = "sdk-rdst";
+foreach (var bucket in new[] { rs, rd })
+{
+    await s3.PutBucketAsync(bucket);
+    await s3.PutBucketVersioningAsync(new PutBucketVersioningRequest
+    {
+        BucketName = bucket, VersioningConfig = new S3BucketVersioningConfig { Status = VersionStatus.Enabled },
+    });
+}
+ReplicationRule Rule(string id) => new()
+{
+    Id = id, Priority = 1, Status = ReplicationRuleStatus.Enabled,
+    Filter = new ReplicationRuleFilter { Prefix = "" },
+    DeleteMarkerReplication = new DeleteMarkerReplication { Status = DeleteMarkerReplicationStatus.Enabled },
+    Destination = new ReplicationDestination { BucketArn = "arn:aws:s3:::" + rd },
+};
+PutBucketReplicationRequest Replication(params ReplicationRule[] rules) => new()
+{
+    BucketName = rs, Configuration = new ReplicationConfiguration { Role = $"arn:aws:iam::{account}:role/r", Rules = rules.ToList() },
+};
+Check("one priority twice", await CodeOf(() => s3.PutBucketReplicationAsync(Replication(Rule("all"), Rule("again")))), "InvalidArgument");
+await s3.PutBucketReplicationAsync(Replication(Rule("all")));
+Check("GetBucketReplication", (await s3.GetBucketReplicationAsync(new GetBucketReplicationRequest { BucketName = rs }))
+    .Configuration.Rules[0].Destination.BucketArn, "arn:aws:s3:::" + rd);
+var src = await s3.PutObjectAsync(new PutObjectRequest { BucketName = rs, Key = "r/one.txt", ContentBody = "replicate me" });
+Check("replicated", await Until(async () => (await s3.GetObjectMetadataAsync(rs, "r/one.txt")).ReplicationStatus == ReplicationStatus.Completed), true);
+var replica = await s3.GetObjectMetadataAsync(rd, "r/one.txt");
+Check("the replica keeps its version id and ETag", replica.VersionId + " " + replica.ETag, src.VersionId + " " + src.ETag);
+Check("and is a replica", replica.ReplicationStatus?.Value, "REPLICA");
+await s3.DeleteBucketReplicationAsync(new DeleteBucketReplicationRequest { BucketName = rs });
+Check("the replication deleted", await Gone(() => s3.GetBucketReplicationAsync(new GetBucketReplicationRequest { BucketName = rs }),
+    r => (r.Configuration?.Rules?.Count ?? 0) == 0, "ReplicationConfigurationNotFoundError"), "gone");
 return failed ? 1 : 0;
