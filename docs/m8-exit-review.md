@@ -144,4 +144,4 @@ each with a test (A5 to A8 checked against AWS's pages first), A9 either built o
 smokes and the SDK matrix again. Closing M8 is the owner's decision.
 
 **After the fixes:** every finding is closed with its test, A9 by ADR-0081 (RenameObject, built the same day). M8's
-"done when" holds; M8 can close on the owner's word.
+"done when" holds; M8 can close on the owner's word. **Closed** by the owner, 18 Nov 2026 ("go ahead and close M8").

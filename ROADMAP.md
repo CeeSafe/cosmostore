@@ -157,7 +157,7 @@ Milestones are sequential gates, and each one has measurable exit criteria. Size
 M0 Foundations ──► M1 Storage core ──► M2 Index+GC ──► M3 S3 core ──► M4 Perf hardening
    (4–6 wk)          (6–8 wk)            (4–6 wk)        (8–10 wk)      (4–6 wk)
                                                                             │
-                         M7 Advanced S3 ◄── M6 Cluster ◄── M5 Production features
+  M8 Directory buckets ◄── M7 Advanced S3 ◄── M6 Cluster ◄── M5 Production features
                           (ongoing)        (16–24 wk)        (12–16 wk)
 ```
 
@@ -296,6 +296,10 @@ ADR-0079 (accepted 18 Nov 2026) proposed directory buckets (CreateBucket with a 
 configuration, CreateSession and `s3express` signing, S3's limits for them), then S3 Tables (the `s3tables` catalog
 API and the Iceberg REST calls an engine needs, commits as a compare-and-set).
 The owner chose directory buckets only, with S3's limits enforced (18 Nov 2026); their design is ADR-0080 (accepted 18 Nov 2026), in three slices.
+
+**Closed 18 Nov 2026** (`docs/m8-exit-review.md`): directory buckets on `serve` and on a cluster (ADR-0080), with
+the exit review's findings closed and RenameObject (ADR-0081); S3 Tables wait until Iceberg engines are meant to run
+against CosmoStore (ADR-0079).
 
 ---
 
@@ -2980,3 +2984,11 @@ Browser form uploads with a SigV4 POST policy.
   fault sweep `renameFaults{Once,Sticky,Torn,Crash}`; S3 smoke (12 checks), cluster smoke (112), boto3 (with and
   without sessions). 343 tests.
 - **Next:** the owner's word on closing M8.
+
+### 18 Nov 2026: M8 closed
+
+- The owner: "go ahead and close M8". **M8 (directory buckets) is closed:** CreateBucket with a directory
+  configuration, CreateSession and `s3express` signing, ListDirectoryBuckets, S3's limits and behaviours for them,
+  and RenameObject, on `serve` and on a cluster, through the AWS CLI and every SDK of the matrix (ADR-0080,
+  ADR-0081; `docs/m8-exit-review.md`). Not done, and refused: access points of directory buckets. S3 Tables are
+  left for when Iceberg engines are meant to run against CosmoStore (ADR-0079).
