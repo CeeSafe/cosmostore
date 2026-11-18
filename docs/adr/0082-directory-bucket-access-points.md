@@ -1,6 +1,7 @@
 # ADR-0082: Access points of directory buckets
 
-**Status:** proposed, 18 Nov 2026; its three slices built the same day. The owner asked for this next ("Take on Access points on directory buckets next"),
+**Status:** accepted, 19 Nov 2026 (the owner: "I accept the proposed ADR-0082"). Proposed 18 Nov 2026, when its
+three slices were built. The owner asked for this next ("Take on Access points on directory buckets next"),
 after M8 closed with it refused (ADR-0080 §6). It extends ADR-0076 (access points) and ADR-0080 (directory buckets).
 
 ## Context
@@ -38,7 +39,7 @@ after M8 closed with it refused (ADR-0080 §6). It extends ADR-0076 (access poin
   - **On a cluster (ADR-0078 §5):** their names and aliases are claimed in group 0.
   - **Directory buckets (ADR-0080):** CreateSession tokens name a bucket.
 
-## Decision (proposed)
+## Decision
 
 1. **Names and the record.**
    - A directory bucket's access point is named `<base>--<zone>--xa-s3`, with the base as above and the zone this

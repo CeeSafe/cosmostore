@@ -3041,3 +3041,8 @@ Browser form uploads with a SigV4 POST policy.
   gate on binfadel passed (base `5bd6d7d` against `faa5596`, 3 rounds, built with ceesafec 0.56.0). At c32, small
   metadata reads were p99 1.01 and ops/s 1.00, small GETs 0.98 and 1.02, and large writes 0.93 and 1.03. The CI
   failures were the runner's noise.
+
+### 19 Nov 2026: ADR-0082 accepted
+
+- The owner: "I accept the proposed ADR-0082". Access points of directory buckets are done: on `serve` and on a
+  cluster, with their scopes, sessions and listing, through every SDK of the matrix.
