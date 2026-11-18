@@ -1,6 +1,6 @@
 # ADR-0083: S3 Tables and the Iceberg REST catalog (M9)
 
-**Status:** proposed, 19 Nov 2026. Slices 1 and 2 built the same day. The owner: "Next we need s3 tables iceberg". ADR-0079 §1 item 2 and §4 sketched
+**Status:** proposed, 19 Nov 2026. All four slices built the same day. The owner: "Next we need s3 tables iceberg". ADR-0079 §1 item 2 and §4 sketched
 S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR is that design, as M9's one item.
 
 ## Context
@@ -83,7 +83,11 @@ S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR
    - Table bucket `<name>` is the store bucket `<name>--table-s3`, its warehouse. CreateTableBucket makes it, and
      DeleteTableBucket deletes it once it has no namespaces.
    - S3's CreateBucket refuses `--table-s3` names (as it refuses `--x-s3` ones), and ListBuckets leaves them out.
-   - Its ARN is `arn:aws:s3tables:<region>:<account>:bucket/<name>`, and its `tableBucketId` is a UUID kept with it.
+   - Its ARN is `arn:aws:s3tables:<region>:<account>:bucket/<name>`.
+   - **No record of its own:** its name and creation time are its hidden bucket's, and its `tableBucketId` is a
+     UUID's form of a hash of both. So CreateTableBucket is one write, which a cluster's shard commits as one.
+   - **Names:** the store takes such a name past S3's 63 characters (up to 73: a valid bucket name and
+     `--table-s3`), for these buckets alone.
 3. **The catalog is objects, and its compare-and-set is a conditional write.**
    - **Where records live:** a namespace is the object `.s3tables/namespaces/<ns>`, and a table is
      `.s3tables/tables/<ns>/<name>`, in the table bucket's hidden bucket. Each is a small JSON record. A table's
@@ -119,8 +123,18 @@ S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR
    Control: long-term keys and their `GetSessionToken` sessions), encryption other than the server's default,
    tags, replication, storage classes, metrics, logging, record expiration and migration. CreateTable's `metadata`
    (an Iceberg schema given to the S3 Tables API itself) is taken and written as the first metadata file.
-7. **On a cluster** (slice 3): a table bucket's calls go to its hidden bucket's shard. ListTableBuckets merges the
-   shards, as ListBuckets does (ADR-0060). The catalog's records live on the same shard as the table's data.
+7. **On a cluster** (slice 3):
+   - **Routing:** the front routes a request signed for `s3tables` by the table bucket it names, to its hidden
+     bucket's shard. It finds the name in CreateTableBucket's body, the ARN in the path, GetTable's query, or the
+     Iceberg `warehouse` or `prefix`. The catalog's records live on the same shard as the table's data.
+   - **ListTableBuckets:** each shard answers its first `maxBuckets` after the token, and the front merges them by
+     name and pages them.
+   - **No request reads its own writes:** a shard's leader stages a request's entries and applies them only once
+     Raft commits them (ADR-0058). So:
+     - CreateTableBucket is one write.
+     - A dropped table's purge walks its keys with a cursor rather than listing again.
+     - DeleteTableBucket with objects left over (a purge cut short) answers ConflictException after deleting
+       them, and a retry deletes the bucket.
 8. **Tests:**
    - Unit tests of names, ARNs, records, the JSON model, requirements and updates.
    - The S3 smoke: the table bucket API through the AWS CLI (`aws s3tables`).

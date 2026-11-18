@@ -143,6 +143,7 @@ public class Check {
         M7.run(endpoint, s3);
         Directory.run(endpoint);
         DirectoryAccessPoints.run(endpoint);
+        Tables.run(endpoint);
         System.exit(failed ? 1 : 0);
     }
 }

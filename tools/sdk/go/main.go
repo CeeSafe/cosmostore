@@ -150,6 +150,7 @@ func main() {
 	m7(ctx, cfg, endpoint, c, client)
 	directory(ctx, cfg)
 	directoryAccessPoints(ctx, cfg, endpoint)
+	tables(ctx, cfg)
 	if failed {
 		os.Exit(1)
 	}

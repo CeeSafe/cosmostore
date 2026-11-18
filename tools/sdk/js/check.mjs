@@ -18,6 +18,11 @@ import {
   S3ControlClient, CreateAccessPointCommand, GetAccessPointCommand, ListAccessPointsCommand, DeleteAccessPointCommand,
 } from "@aws-sdk/client-s3-control";
 import { STSClient, GetSessionTokenCommand, AssumeRoleCommand } from "@aws-sdk/client-sts";
+import {
+  S3TablesClient, CreateTableBucketCommand, ListTableBucketsCommand, CreateNamespaceCommand, CreateTableCommand,
+  GetTableCommand, UpdateTableMetadataLocationCommand, RenameTableCommand, ListTablesCommand, DeleteTableCommand,
+  DeleteNamespaceCommand, DeleteTableBucketCommand,
+} from "@aws-sdk/client-s3tables";
 import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
@@ -281,5 +286,31 @@ for (const sessions of [true, false]) {
   await ctl.send(new DeleteAccessPointCommand({ AccountId: ACCOUNT, Name: AP }));
   await d.send(new DeleteObjectCommand({ Bucket: APB, Key: "pub/a.txt" }));
   await d.send(new DeleteBucketCommand({ Bucket: APB }));
+}
+// S3 Tables (ADR-0083): table buckets, namespaces and tables, and the metadata location's compare-and-set.
+{
+  const t = new S3TablesClient({ endpoint, region: "us-east-1", maxAttempts: 1 });
+  const s = new S3Client({ endpoint, forcePathStyle: true, region: "us-east-1", maxAttempts: 1 });
+  const arn = (await t.send(new CreateTableBucketCommand({ name: "sdk-js-tables" }))).arn;
+  check("CreateTableBucket", arn, `arn:aws:s3tables:us-east-1:${ACCOUNT}:bucket/sdk-js-tables`);
+  check("ListTableBuckets", (await t.send(new ListTableBucketsCommand({}))).tableBuckets.map((b) => b.name), ["sdk-js-tables"]);
+  await t.send(new CreateNamespaceCommand({ tableBucketARN: arn, namespace: ["sales"] }));
+  const made = await t.send(new CreateTableCommand({ tableBucketARN: arn, namespace: "sales", name: "orders", format: "ICEBERG" }));
+  const got = await t.send(new GetTableCommand({ tableArn: made.tableARN }));
+  check("GetTable by its ARN", got.name, "orders");
+  const wh = got.warehouseLocation;
+  const [wb, ...rest] = wh.slice(5).split("/");
+  await s.send(new PutObjectCommand({ Bucket: wb, Key: rest.join("/") + "/metadata/00001-j.metadata.json", Body: "{}" }));
+  const moved = await t.send(new UpdateTableMetadataLocationCommand({ tableBucketARN: arn, namespace: "sales", name: "orders",
+    versionToken: got.versionToken, metadataLocation: wh + "/metadata/00001-j.metadata.json" }));
+  check("UpdateTableMetadataLocation", moved.metadataLocation, wh + "/metadata/00001-j.metadata.json");
+  check("a stale versionToken", await codeOf(t.send(new UpdateTableMetadataLocationCommand({ tableBucketARN: arn, namespace: "sales",
+    name: "orders", versionToken: got.versionToken, metadataLocation: wh + "/metadata/00002-j.metadata.json" }))), "ConflictException");
+  await t.send(new RenameTableCommand({ tableBucketARN: arn, namespace: "sales", name: "orders", newName: "orders2" }));
+  check("RenameTable", (await t.send(new ListTablesCommand({ tableBucketARN: arn }))).tables.map((x) => x.name), ["orders2"]);
+  await t.send(new DeleteTableCommand({ tableBucketARN: arn, namespace: "sales", name: "orders2" }));
+  await t.send(new DeleteNamespaceCommand({ tableBucketARN: arn, namespace: "sales" }));
+  await t.send(new DeleteTableBucketCommand({ tableBucketARN: arn }));
+  check("DeleteTableBucket", (await t.send(new ListTableBucketsCommand({}))).tableBuckets ?? [], []);
 }
 process.exit(failed ? 1 : 0);

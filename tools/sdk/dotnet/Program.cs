@@ -404,4 +404,41 @@ foreach (var sessions in new[] { false })
     await d.DeleteObjectAsync(apBucket, "pub/a.txt");
     await d.DeleteBucketAsync(apBucket);
 }
+// S3 Tables (ADR-0083): table buckets, namespaces and tables, and the metadata location's compare-and-set.
+{
+    var t = new Amazon.S3Tables.AmazonS3TablesClient(new Amazon.S3Tables.AmazonS3TablesConfig
+    {
+        ServiceURL = endpoint, AuthenticationRegion = "us-east-1", MaxErrorRetry = 0,
+    });
+    var arn = (await t.CreateTableBucketAsync(new Amazon.S3Tables.Model.CreateTableBucketRequest { Name = "sdk-net-tables" })).Arn;
+    Check("CreateTableBucket", arn, $"arn:aws:s3tables:us-east-1:{account}:bucket/sdk-net-tables");
+    Check("ListTableBuckets", string.Join(",", (await t.ListTableBucketsAsync(new Amazon.S3Tables.Model.ListTableBucketsRequest())).TableBuckets.Select(b => b.Name)), "sdk-net-tables");
+    await t.CreateNamespaceAsync(new Amazon.S3Tables.Model.CreateNamespaceRequest { TableBucketARN = arn, Namespace = new List<string> { "sales" } });
+    var tableMade = await t.CreateTableAsync(new Amazon.S3Tables.Model.CreateTableRequest
+    {
+        TableBucketARN = arn, Namespace = "sales", Name = "orders", Format = Amazon.S3Tables.OpenTableFormat.ICEBERG,
+    });
+    var tableGot = await t.GetTableAsync(new Amazon.S3Tables.Model.GetTableRequest { TableArn = tableMade.TableARN });
+    Check("GetTable by its ARN", tableGot.Name, "orders");
+    var wh = tableGot.WarehouseLocation;
+    var parts = wh.Substring(5).Split('/', 2);
+    await s3.PutObjectAsync(new PutObjectRequest { BucketName = parts[0], Key = parts[1] + "/metadata/00001-n.metadata.json", ContentBody = "{}" });
+    var moved = await t.UpdateTableMetadataLocationAsync(new Amazon.S3Tables.Model.UpdateTableMetadataLocationRequest
+    {
+        TableBucketARN = arn, Namespace = "sales", Name = "orders", VersionToken = tableGot.VersionToken,
+        MetadataLocation = wh + "/metadata/00001-n.metadata.json",
+    });
+    Check("UpdateTableMetadataLocation", moved.MetadataLocation, wh + "/metadata/00001-n.metadata.json");
+    Check("a stale versionToken", await CodeOf(() => t.UpdateTableMetadataLocationAsync(new Amazon.S3Tables.Model.UpdateTableMetadataLocationRequest
+    {
+        TableBucketARN = arn, Namespace = "sales", Name = "orders", VersionToken = tableGot.VersionToken,
+        MetadataLocation = wh + "/metadata/00002-n.metadata.json",
+    })), "ConflictException");
+    await t.RenameTableAsync(new Amazon.S3Tables.Model.RenameTableRequest { TableBucketARN = arn, Namespace = "sales", Name = "orders", NewName = "orders2" });
+    Check("RenameTable", string.Join(",", (await t.ListTablesAsync(new Amazon.S3Tables.Model.ListTablesRequest { TableBucketARN = arn })).Tables.Select(x => x.Name)), "orders2");
+    await t.DeleteTableAsync(new Amazon.S3Tables.Model.DeleteTableRequest { TableBucketARN = arn, Namespace = "sales", Name = "orders2" });
+    await t.DeleteNamespaceAsync(new Amazon.S3Tables.Model.DeleteNamespaceRequest { TableBucketARN = arn, Namespace = "sales" });
+    await t.DeleteTableBucketAsync(new Amazon.S3Tables.Model.DeleteTableBucketRequest { TableBucketARN = arn });
+    Check("DeleteTableBucket", (await t.ListTableBucketsAsync(new Amazon.S3Tables.Model.ListTableBucketsRequest())).TableBuckets?.Count ?? 0, 0);
+}
 return failed ? 1 : 0;

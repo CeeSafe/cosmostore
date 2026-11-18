@@ -98,5 +98,5 @@ except NoSuchTableError:
     check("purge_table", "NoSuchTableError", "NoSuchTableError")
 catalog.drop_namespace("sales")
 tables.delete_table_bucket(tableBucketARN=arn)
-check("cleaned up", tables.list_table_buckets()["tableBuckets"], [])
+check("cleaned up", "iceberg-check" in [b["name"] for b in tables.list_table_buckets()["tableBuckets"]], False)
 sys.exit(1 if failed else 0)

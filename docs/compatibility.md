@@ -45,7 +45,7 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
 - **S3 Tables** (ADR-0083, M9): the S3 Tables API (`aws s3tables`, boto3's `s3tables`) on `serve`: table buckets,
   namespaces, tables, GetTable by ARN, rename, and Get/UpdateTableMetadataLocation as a compare-and-set on the
   versionToken (ConflictException when it is not current). A table's `warehouseLocation` is
-  `s3://<hash>--table-s3/<table id>`, which an engine reads and writes with S3's calls (not the catalog's
+  `s3://<name>--table-s3/<table id>`, which an engine reads and writes with S3's calls (not the catalog's
   `.s3tables/` keys, and no bucket call). Policies, maintenance, encryption, tags, replication and the rest are
   NotImplemented. CreateTable takes an Iceberg `metadata` schema (not `schemaV2`).
 - **The Iceberg REST catalog** (ADR-0083 §5): `<endpoint>/iceberg`, signed for `s3tables`, the `warehouse` a table
@@ -58,8 +58,11 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
       (`purge_table`, as S3 Tables drops only with `purgeRequested=true`). Its stale commits are refused with 409
       and retried.
     - Checked by `tools/iceberg_check.py`.
-  - **Not taken:** staged creates, nested namespaces, views, credential vending, and statistics updates. A table
-    on a cluster comes later.
+  - **Not taken:** staged creates, nested namespaces, views, credential vending, and statistics updates.
+  - **On a cluster** as on `serve`: each table bucket's calls go to its shard.
+  - **SDKs:** the S3 Tables API is checked with boto3, the AWS CLI, Go, JavaScript, Java and .NET. Each makes,
+    lists and deletes a table bucket, a namespace and a table, gets a table by its ARN, swaps its metadata location,
+    has a stale versionToken refused, and renames it.
 
 - **boto3** presigns with SigV2 for a custom endpoint unless it is told otherwise:
   `Config(signature_version="s3v4")`. CosmoStore accepts SigV4 only, and refuses SigV2 with S3's `InvalidRequest`.

@@ -3108,3 +3108,33 @@ Browser form uploads with a SigV4 POST policy.
   spec from the S3 Tables API, properties, rename and purge), run by the S3 smoke when `ICEBERG_PYTHON` is set. CI
   installs PyIceberg for it. Also the unit tests `icebergNewTableMetadata` and `icebergRequirementsAndUpdates`.
 - **Next:** slice 3, the cluster.
+
+### 19 Nov 2026: M9 slice 3, S3 Tables on a cluster (ADR-0083 §7)
+
+- **The front:** a request signed for `s3tables` goes to its table bucket's shard, the shard of `<name>--table-s3`.
+  It finds the bucket in CreateTableBucket's body, the ARN in the path, GetTable's query, or the Iceberg
+  `warehouse` or `prefix`. ListTableBuckets is merged across shards and paged.
+- **A request cannot read its own writes on a shard:** its entries are applied once Raft commits them. So:
+  - **A table bucket has no record:** it is the bucket `<name>--table-s3` (the store takes such a name up to 73
+    characters), its id derived from its name and creation time, and CreateTableBucket one write. Slice 1 had named
+    it by a hash, with a record; nothing was released with that.
+  - **A drop's purge** walks the warehouse with a cursor.
+  - **DeleteTableBucket** with objects left over answers ConflictException, and a retry deletes it.
+- **Tests:** the cluster smoke's 9 checks:
+  - two table buckets on different shards (5 and 7), the merged listing and its pages;
+  - a table made and its metadata location swapped through other nodes, a stale token refused, its files purged;
+  - PyIceberg end to end through node 2 (the check's 16).
+
+  129 cluster checks in all.
+- **Next:** slice 4, the rest of the SDK matrix.
+
+### 19 Nov 2026: M9 slice 4, S3 Tables in the SDK matrix (ADR-0083)
+
+- **Each SDK's check:** Go, JavaScript, Java and .NET each check the S3 Tables API with their own `s3tables`
+  client: table buckets made, listed and deleted, a namespace, a table got by its ARN, its metadata location
+  swapped, a stale versionToken refused (ConflictException), and a rename. boto3 and the CLI did so in slice 1.
+  All pass.
+- **CI:** the runner's Python is now 3.15, for which pyarrow has no wheels yet, so CI's first PyIceberg install
+  failed. CI now makes PyIceberg's venv on Python 3.13 (`actions/setup-python`) and pins `pyiceberg[pyarrow]==0.12.0`,
+  the version checked here.
+- **All of M9 is built** (ADR-0083, proposed): accepting it, and closing M9, are the owner's decisions.

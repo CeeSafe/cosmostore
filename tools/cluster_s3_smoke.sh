@@ -386,6 +386,33 @@ onl 3 s3 rm --recursive s3://b--local-az1--x-s3/ > /dev/null 2>&1 # the CRT's de
 for d in a b c; do on 3 s3api delete-bucket --bucket "$d--local-az1--x-s3" > /dev/null 2>&1; done
 check "deleted through node 3" "$(on 1 s3api list-directory-buckets --query 'length(Buckets)' 2>&1)" 0
 
+# S3 Tables on a cluster (ADR-0083 §7): a table bucket's calls on its hidden bucket's shard, through every node.
+for t in tables-a tables-b; do on 1 s3tables create-table-bucket --name "$t" > /dev/null 2>&1; done
+pass "two table buckets, on shards $(shardOf tables-a--table-s3) and $(shardOf tables-b--table-s3)"
+check "list-table-buckets through node 2, merged" "$(on 2 s3tables list-table-buckets --query 'tableBuckets[].name' --output text 2>&1)" "tables-a	tables-b"
+check "one page, then the next" "$(t=$(on 3 s3tables list-table-buckets --max-buckets 1 --query continuationToken --output text 2>&1); on 1 s3tables list-table-buckets --max-buckets 1 --continuation-token "$t" --query 'tableBuckets[].name' --output text 2>&1)" "tables-b"
+tba=arn:aws:s3tables:us-east-1:000000000000:bucket/tables-b
+on 3 s3tables create-namespace --table-bucket-arn "$tba" --namespace sales > /dev/null 2>&1
+on 2 s3tables create-table --table-bucket-arn "$tba" --namespace sales --name orders --format ICEBERG > /dev/null 2>&1
+read -r cwh ctok <<< "$(on 1 s3tables get-table --table-bucket-arn "$tba" --namespace sales --name orders --query '[warehouseLocation,versionToken]' --output text 2>&1)"
+cwb=${cwh#s3://}; cwb=${cwb%%/*}; cpre=${cwh#s3://*/}
+on 3 s3api put-object --bucket "$cwb" --key "$cpre/metadata/00001-a.metadata.json" --body dir.txt > /dev/null 2>&1
+check "update-table-metadata-location through node 2" "$(on 2 s3tables update-table-metadata-location --table-bucket-arn "$tba" --namespace sales --name orders --version-token "$ctok" --metadata-location "$cwh/metadata/00001-a.metadata.json" --query metadataLocation --output text 2>&1)" "$cwh/metadata/00001-a.metadata.json"
+check "a stale token through node 3" "$(on 3 s3tables update-table-metadata-location --table-bucket-arn "$tba" --namespace sales --name orders --version-token "$ctok" --metadata-location "$cwh/metadata/00002-b.metadata.json" 2>&1 | grep -o ConflictException | head -1)" ConflictException
+on 1 s3tables delete-table --table-bucket-arn "$tba" --namespace sales --name orders > /dev/null 2>&1
+check "its files gone with it" "$(on 2 s3api list-objects-v2 --bucket "$cwb" --prefix "$cpre/" --query 'length(Contents || `[]`)' 2>&1)" 0
+on 2 s3tables delete-namespace --table-bucket-arn "$tba" --namespace sales > /dev/null 2>&1
+# PyIceberg through node 2, its catalog and its files on the table bucket's shard.
+if [ -n "${ICEBERG_PYTHON:-}" ]; then
+    if "$ICEBERG_PYTHON" "$OLDPWD/tools/iceberg_check.py" "http://127.0.0.1:$((BASE + 12))" > iceberg.out 2>&1; then
+        pass "PyIceberg through node 2: $(grep -c '^ok' iceberg.out) checks"
+    else
+        fail "PyIceberg through node 2"; cat iceberg.out
+    fi
+fi
+for t in tables-a tables-b; do on 3 s3tables delete-table-bucket --table-bucket-arn "arn:aws:s3tables:us-east-1:000000000000:bucket/$t" > /dev/null 2>&1; done
+check "deleted through node 3" "$(on 1 s3tables list-table-buckets --query 'length(tableBuckets)' 2>&1)" 0
+
 # Event notifications on a cluster (ADR-0078 §4): the shard's leader delivers, and a new one goes on.
 keys() { python3 -c 'import json,sys
 print(" ".join(json.loads(l)["Records"][0]["s3"]["object"]["key"] for l in open(sys.argv[1]) if l.strip()))' hook.out; }

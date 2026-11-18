@@ -1,0 +1,203 @@
+// S3 Tables on a cluster (ADR-0083 §7): a request signed for `s3tables` goes to its table bucket's shard, the shard
+// of the hidden bucket `<name>--table-s3` that holds its catalog and its warehouse; ListTableBuckets asks every shard
+// and merges their answers by name, a page at a time.
+import web_core;
+import web_http;
+import web_server;
+
+/// Whether a request is signed for S3 Tables: its Authorization's credential scope names `s3tables`.
+fn tablesRequestRaw(raw: borrow RawMessage) -> bool {
+    for (i in 0..raw.names.length) {
+        if (!Ascii.equalsIgnoringCase(raw.names[i].view(), "authorization")) { continue; }
+        let v = raw.values[i].view();
+        let at = match (indexOfFrom(v, "Credential=".bytes(), 0)) {
+            Some(a) => a + 11,
+            null => { return false; }
+        };
+        // `<key>/<date>/<region>/<service>/aws4_request`: the fourth part.
+        var part = 0;
+        var start = at;
+        var j = at;
+        while (j < v.length && v[j] != ',' && v[j] != ' ') {
+            if (v[j] == '/') {
+                if (part == 3) { return v[start..j] == "s3tables".bytes(); }
+                part += 1;
+                start = j + 1;
+            }
+            j += 1;
+        }
+        return false;
+    }
+    return false;
+}
+
+/// The target's path segments, URL-decoded, and the query (as it came).
+fn tablesTarget(target: Slice<u8>, segs: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
+    let q = indexOfFrom(target, "?".bytes(), 0) ?? target.length;
+    let path = target[0..q];
+    var at: usize = if (path.length > 0 && path[0] == '/') 1 else 0;
+    while (at < path.length) {
+        var end = at;
+        while (end < path.length && path[end] != '/') { end += 1; }
+        var s = Vector<u8>.create();
+        let _ = percentDecodeInto(mut s, path[at..end], false)?;
+        segs.push(s)?;
+        at = end + 1;
+    }
+    return Ok();
+}
+
+/// A query parameter's value, URL-decoded.
+fn decodedParam(target: Slice<u8>, name: StringView) -> Result<Vector<u8>?, AllocError> {
+    return match (targetParam(target, name)) {
+        Some(v) => {
+            var out = Vector<u8>.create();
+            let _ = percentDecodeInto(mut out, v, true)?;
+            Ok(Some(out))
+        }
+        null => Ok(null),
+    };
+}
+
+/// The table bucket a request names: by its body (CreateTableBucket), an ARN in its path, GetTable's query, or the
+/// Iceberg catalog's `warehouse` or `prefix`. Empty for ListTableBuckets (every shard's), null for none.
+fn tablesBucketOfRaw(raw: borrow RawMessage) -> Result<Vector<u8>?, AllocError> {
+    var segs = Vector<Vector<u8>>.create();
+    tablesTarget(raw.target.view(), mut segs)?;
+    if (segs.length == 0) { return Ok(null); }
+    let top = segs[0].view();
+    var arn = Vector<u8>.create();
+    if (top == "buckets".bytes() && segs.length == 1) {
+        if (Methods.parse(raw.method.view()) != Method.Put) { return Ok(Some(Vector<u8>.create())); }
+        match (parseJson(raw.body.view())?) {
+            Some(j) => {
+                let name = jsonMemberText(borrow j, "name") ?? "".bytes();
+                if (!tableBucketNameOk(name)) { return Ok(null); }
+                return Ok(Some(copyBytes(name)?));
+            }
+            null => { return Ok(null); }
+        }
+    } else if ((top == "buckets".bytes() ||
+        top == "namespaces".bytes() || top == "tables".bytes()) && segs.length >= 2) {
+        arn.extend(segs[1].view())?;
+    } else if (top == "get-table".bytes()) {
+        match (decodedParam(raw.target.view(), "tableBucketARN")?) {
+            Some(a) => { arn = a; }
+            null => {
+                match (decodedParam(raw.target.view(), "tableArn")?) {
+                    Some(a) => { arn = a; }
+                    null => { return Ok(null); }
+                }
+            }
+        }
+    } else if (top == "iceberg".bytes() && segs.length >= 3 && segs[1].view() == "v1".bytes()) {
+        if (segs[2].view() == "config".bytes()) {
+            match (decodedParam(raw.target.view(), "warehouse")?) {
+                Some(a) => { arn = a; }
+                null => { return Ok(null); }
+            }
+        } else {
+            arn.extend(segs[2].view())?;
+        }
+    } else {
+        return Ok(null);
+    }
+    var id = Vector<u8>.create();
+    return tableBucketOfArn(arn.view(), mut id);
+}
+
+/// A request signed for `s3tables` on a cluster: to its table bucket's shard; ListTableBuckets merged; one naming no
+/// table bucket to shard 0, whose server says what is wrong with it.
+async fn routeTablesRaw(shared: borrow NodeShared, raw: borrow RawMessage) -> Result<RawMessage, NodeFault> {
+    let bucket = match (tablesBucketOfRaw(raw)) {
+        Ok(b) => b,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    return match (bucket) {
+        Some(name) => {
+            if (name.length == 0) { return await mergeTableBuckets(shared, raw); }
+            var hidden = Vector<u8>.create();
+            let built = hidden.extend(name.view()).isOk() && hidden.extend(TABLE_BUCKET_SUFFIX.bytes()).isOk();
+            if (!built) { return Err(NodeFault.OutOfMemory); }
+            await routeRequest(shared, shardOfBucket(borrow shared.file, hidden.view()), raw)
+        }
+        null => await routeRequest(shared, 0, raw),
+    };
+}
+
+/// ListTableBuckets on a cluster: each shard answers its own in name order after `continuationToken`, at most
+/// `maxBuckets`; the first `maxBuckets` of them all are the page, its token the last name's, as each shard reads it.
+async fn mergeTableBuckets(shared: borrow NodeShared, raw: borrow RawMessage) -> Result<RawMessage, NodeFault> {
+    var limit: usize = 1000;
+    match (targetParam(raw.target.view(), "maxBuckets")) {
+        Some(t) => {
+            match (parseDecimal(t)) {
+                Some(v) => { limit = if (v > 1000) 1000 else v as usize; }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    var first: RawMessage? = null;
+    var entries = Vector<Json>.create();
+    var more = false;
+    var shard = 0u32;
+    while (shard < shared.file.shards) {
+        let answer = await routeRequest(shared, shard, raw)?;
+        if (answer.status != 200) { return Ok(answer); }
+        let parsed = match (parseJson(answer.body.view())) {
+            Ok(Some(j)) => j,
+            Ok(null) => { return Ok(frontError("InternalError", 500)); }
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        };
+        if (jsonMember(borrow parsed, "continuationToken").isSome()) { more = true; }
+        match (jsonMember(borrow parsed, "tableBuckets")) {
+            Some(list) => {
+                match (list) {
+                    Json.Array(items) => {
+                        for (i in 0..items.length) {
+                            match (cloneJson(borrow items[i])) {
+                                Ok(c) => {
+                                    if (entries.push(c).isErr()) { return Err(NodeFault.OutOfMemory); }
+                                }
+                                Err(_) => { return Err(NodeFault.OutOfMemory); }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            null => {}
+        }
+        if (first.isNull()) { first = Some(answer); }
+        shard += 1;
+    }
+    var page = match (first) {
+        Some(f) => f,
+        null => { return Ok(statusOnly(503)); }
+    };
+    entries.sortBy(
+        (a, b) => compareBytes(jsonMemberText(a, "name") ?? "".bytes(), jsonMemberText(b, "name") ?? "".bytes()),
+    );
+    let shown = if (entries.length > limit) limit else entries.length;
+    if (entries.length > limit) { more = true; }
+    var list = jsonArray();
+    for (i in 0..shown) {
+        let c = match (cloneJson(borrow entries[i])) {
+            Ok(c) => c,
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        };
+        if (jsonPush(mut list, c).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    var answer = jsonObject();
+    if (jsonSet(mut answer, "tableBuckets", list).isErr()) { return Err(NodeFault.OutOfMemory); }
+    if (more && shown > 0) {
+        if (setToken(mut answer, jsonMemberText(borrow entries[shown - 1], "name") ?? "".bytes()).isErr()) {
+            return Err(NodeFault.OutOfMemory);
+        }
+    }
+    var body = Vector<u8>.create();
+    if (writeJson(mut body, borrow answer).isErr()) { return Err(NodeFault.OutOfMemory); }
+    page.body = body;
+    return Ok(page);
+}
