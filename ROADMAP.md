@@ -2925,3 +2925,16 @@ Browser form uploads with a SigV4 POST policy.
   checks five refusals and a policy taken. 332 tests, the cluster smoke 106, the CRT client by hand (a 20 MB
   multipart upload and download).
 - **Next (3b):** non-MD5 ETags, uploads' prefixes in listings, the SDK matrix.
+
+### 18 Nov 2026: M8 slice 3b, S3's behaviours for directory buckets, and boto3 (ADR-0080)
+
+- **ETags** of a directory bucket's objects are not MD5s: SHA-256 over a label, the stored MD5 and the part count,
+  cut to 16 bytes, no `-N` (the store keeps the real MD5 for its verification and scrub, so the ETag is made where
+  it is shown: GET, HEAD, PUT, copy, completion, POST, listings, and If-Match and its kin, including a copy
+  source's). A part's ETag stays its MD5. `directoryEtagsAreNotMd5s`.
+- **ListObjectsV2** with `/` names the prefixes of uploads in progress (within the page's range); a browser POST
+  upload to a directory bucket is NotImplemented.
+- **boto3** (201): a directory bucket made, listed, written, read with If-Match, a 12 MiB multipart upload
+  (no `-N`), refusals and deletion, with sessions and with them off; `create_session`. The S3 smoke checks the
+  ETags, a condition, a listing and an upload's directory. 333 tests, the cluster smoke 106.
+- **Next:** the Go, JavaScript, Java and .NET SDKs' directory bucket checks, then M8's exit.

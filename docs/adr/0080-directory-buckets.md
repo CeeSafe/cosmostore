@@ -92,8 +92,11 @@ only, with S3's limits enforced).
    tags (`x-amz-tagging`), object lock headers, `x-amz-request-payer`, `StartAfter` and a delimiter other than `/`
    (InvalidArgument, or NotImplemented where it is a feature), as S3's pages say.
 7. **Behaviour kept from S3:**
-   - **ETags** of a directory bucket's objects are not MD5s: 32 hex characters drawn at write time (a multipart
-     object's too, without the `-N`), stored as other ETags are; a client checks nothing against MD5 here.
+   - **ETags** of a directory bucket's objects are not MD5s: the first 16 bytes of SHA-256 over a label, the stored
+     MD5 and the part count, in hex, without a `-N` (built 18 Nov 2026 in place of drawing them at write time: the
+     store keeps the real MD5, which its verification and scrub check the bytes against, and the shown ETag is the
+     same on every read, listing and condition). A part's ETag stays its MD5, since CompleteMultipartUpload names
+     it back. A client checks nothing against MD5 here.
    - **Multipart:** parts consecutive from 1 at completion, else InvalidPartOrder.
    - **ListObjectsV2:** a prefix that is not empty ends in `/`, the delimiter is `/` or none; the order is the key
      order (S3 promises no order, so key order is a valid one, and a client that relies on none works); in-progress

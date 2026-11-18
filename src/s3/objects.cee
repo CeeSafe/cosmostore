@@ -98,8 +98,13 @@ struct ParsedEtag {
     parts: u32;
 }
 
-/// Whether `header` (an If-Match or If-None-Match list) names the ETag of `md5` and `parts`, or is `*`.
-fn etagListMatches(header: Slice<u8>, md5: borrow [u8; 16], parts: u32) -> bool {
+/// Whether `header` (an If-Match or If-None-Match list) names the ETag of `md5` and `parts` (as a directory bucket shows
+/// it when `directory`), or is `*`.
+fn etagListMatches(header: Slice<u8>, md5: borrow [u8; 16], parts: u32, directory: bool) -> bool {
+    if (directory) {
+        let shown = directoryEtag(md5, parts);
+        return etagListMatches(header, borrow shown, 0, false);
+    }
     var at: usize = 0;
     while (at < header.length) {
         let end = pieceEnd(header, at, ',');
@@ -116,8 +121,37 @@ fn etagListMatches(header: Slice<u8>, md5: borrow [u8; 16], parts: u32) -> bool 
     return false;
 }
 
-/// `"hex"`, or `"hex-N"` for a multipart object of N parts.
-fn appendEtag(out: borrow mut Vector<u8>, md5: borrow [u8; 16], parts: u32) -> Result<void, AllocError> {
+/// What a directory bucket's object shows for its ETag (ADR-0080 §7): not its MD5 (which the store keeps, and checks
+/// its bytes against), but the first 16 bytes of SHA-256 over a label, the MD5 and the part count, with no `-N`. As
+/// S3's there, a client can check nothing against it; and it is the same on every read and in every condition.
+fn directoryEtag(md5: borrow [u8; 16], parts: u32) -> [u8; 16] {
+    var input = Vector<u8>.create();
+    let _ = input.extend("cosmostore directory bucket etag ".bytes());
+    let _ = input.extend(md5[..]);
+    let _ = input.pushLE(parts);
+    let digest = Sha256.of(input.view());
+    var out = [0u8; 16];
+    for (i in 0..16) { out[i] = digest[i]; }
+    return out;
+}
+
+/// Whether `bucket` is a directory bucket, by its name: only one can have the suffix (ADR-0080 §2).
+fn inDirectoryBucket(bucket: StringView) -> bool => isDirectoryShaped(bucket.bytes());
+
+/// `"hex"`, or `"hex-N"` for a multipart object of N parts; a directory bucket's object's `directoryEtag`.
+fn appendEtag(
+    out: borrow mut Vector<u8>,
+    md5: borrow [u8; 16],
+    parts: u32,
+    directory: bool,
+) -> Result<void, AllocError> {
+    if (directory) {
+        let shown = directoryEtag(md5, parts);
+        out.push('"')?;
+        appendHexBytes(out, shown[..])?;
+        out.push('"')?;
+        return Ok();
+    }
     out.push('"')?;
     appendHexBytes(out, md5[..])?;
     if (parts > 0) {
@@ -181,7 +215,7 @@ fn resolveCondition(
         PutIf.Absent => Ok(PutCondition.IfAbsent),
         PutIf.Matches => match (store.headObject(bucket, key)) {
             Ok(info) => {
-                if (!etagListMatches(etags, borrow info.md5, info.parts)) {
+                if (!etagListMatches(etags, borrow info.md5, info.parts, inDirectoryBucket(bucket))) {
                     Err(StoreError.PreconditionFailed)
                 } else {
                     Ok(PutCondition.IfGeneration(info.generation))
@@ -193,7 +227,7 @@ fn resolveCondition(
         },
         PutIf.NoneMatch => match (store.headObject(bucket, key)) {
             Ok(info) => {
-                if (etagListMatches(etags, borrow info.md5, info.parts)) {
+                if (etagListMatches(etags, borrow info.md5, info.parts, inDirectoryBucket(bucket))) {
                     Err(StoreError.PreconditionFailed)
                 } else {
                     Ok(PutCondition.IfGeneration(info.generation))
@@ -497,10 +531,11 @@ async fn sendStored(
     exchange: borrow mut Exchange,
     md5: borrow [u8; 16],
     parts: u32,
+    directory: bool,
     body: borrow ReceivedBody,
 ) -> Result<void, S3Fail> {
     var etag = Vector<u8>.create();
-    appendEtag(mut etag, md5, parts)?;
+    appendEtag(mut etag, md5, parts, directory)?;
     exchange.header("etag", etag.view())?;
     // The stored checksum too, when it is not the client's (S3's default CRC64NVME).
     if (!sameAlgorithm(body.storedAlgorithm, body.checksumKind)) {
@@ -580,7 +615,7 @@ async fn putObject(
     )?;
     writtenVersionHeader(exchange, borrow outcome)?;
     if (sealing) { sseAnswerOf(exchange, envelope.view(), customerKeyOf(borrow asked))?; }
-    return await sendStored(exchange, borrow outcome.md5, 0, borrow body);
+    return await sendStored(exchange, borrow outcome.md5, 0, inDirectoryBucket(req.bucket.view()), borrow body);
 }
 
 /// The headers S3 stores with an object and returns on GET and HEAD, besides Content-Type (ADR-0012).
@@ -905,14 +940,22 @@ struct RangeSpan {
 }
 
 /// RFC 9110 §13.2.2's order: If-Match, If-Unmodified-Since, If-None-Match, If-Modified-Since.
-fn checkGetConditions(req: borrow S3Request, info: borrow ObjectInfo) -> Result<void, S3Code> =>
-    checkConditions(req, info, "if-match", "if-unmodified-since", "if-none-match", "if-modified-since");
+fn checkGetConditions(req: borrow S3Request, info: borrow ObjectInfo) -> Result<void, S3Code> => checkConditions(
+    req,
+    info,
+    inDirectoryBucket(req.bucket.view()),
+    "if-match",
+    "if-unmodified-since",
+    "if-none-match",
+    "if-modified-since",
+);
 
 /// The four conditionals under the given field names, in RFC 9110's order. A failed If-None-Match or
 /// If-Modified-Since is NotModified, which a copy turns into PreconditionFailed.
 fn checkConditions(
     req: borrow S3Request,
     info: borrow ObjectInfo,
+    directory: bool,
     ifMatch: StringView,
     ifUnmodifiedSince: StringView,
     ifNoneMatch: StringView,
@@ -921,7 +964,7 @@ fn checkConditions(
     let modified = info.mtimeMillis / 1000;
     match (headerOf(req, ifMatch)) {
         Some(t) => {
-            if (!etagListMatches(t, borrow info.md5, info.parts)) { return Err(S3Code.PreconditionFailed); }
+            if (!etagListMatches(t, borrow info.md5, info.parts, directory)) { return Err(S3Code.PreconditionFailed); }
         }
         null => {
             match (headerOf(req, ifUnmodifiedSince)) {
@@ -939,7 +982,7 @@ fn checkConditions(
     }
     match (headerOf(req, ifNoneMatch)) {
         Some(t) => {
-            if (etagListMatches(t, borrow info.md5, info.parts)) { return Err(S3Code.NotModified); }
+            if (etagListMatches(t, borrow info.md5, info.parts, directory)) { return Err(S3Code.NotModified); }
         }
         null => {
             match (headerOf(req, ifModifiedSince)) {
@@ -1186,7 +1229,7 @@ async fn getObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mu
     readVersionHeader(exchange, borrow plan.info)?;
     await replicationStatusHeader(app, req.bucket.view(), req.key.view(), borrow plan.info, exchange)?;
     var field = Vector<u8>.create();
-    appendEtag(mut field, borrow plan.info.md5, plan.info.parts)?;
+    appendEtag(mut field, borrow plan.info.md5, plan.info.parts, inDirectoryBucket(req.bucket.view()))?;
     exchange.header("etag", field.view())?;
     field.clear();
     appendHttpDate(mut field, plan.info.mtimeMillis / 1000)?;
@@ -1406,7 +1449,7 @@ async fn getObjectAttributes(
     let names = StringView.fromUtf8(wanted) ?? "";
     if (listedTrimmed(names, "ETag")) {
         var etag = Vector<u8>.create();
-        appendEtag(mut etag, borrow info.md5, info.parts)?;
+        appendEtag(mut etag, borrow info.md5, info.parts, inDirectoryBucket(req.bucket.view()))?;
         xmlElement(mut body, "ETag", etag.view()[1..etag.length - 1], false)?; // without its quotes, as S3 sends it
     }
     if (listedTrimmed(names, "Checksum")) {

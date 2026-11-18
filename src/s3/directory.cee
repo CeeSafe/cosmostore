@@ -479,3 +479,54 @@ fn consecutiveParts(parts: Slice<PartChoice>) -> Result<void, S3Fail> {
     }
     return Ok();
 }
+
+/// The prefixes of the uploads in progress under `prefix` (up to the next `/` after it), in byte order, once each.
+async fn uploadPrefixes(
+    app: borrow S3App,
+    bucket: StringView,
+    prefix: Slice<u8>,
+) -> Result<Vector<Vector<u8>>, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    let listing = match (store.listUploads(bucket, prefix, "".bytes(), null, 1000)) { // memory only
+        Ok(l) => l,
+        Err(e) => { return Err(storeFail(e, 0)); }
+    };
+    var out = Vector<Vector<u8>>.create();
+    for (i in 0..listing.uploads.length) {
+        let key = listing.uploads[i].key.view();
+        if (key.length <= prefix.length) { continue; }
+        let rest = key[prefix.length..];
+        let slash = pieceEnd(rest, 0, '/');
+        if (slash == rest.length) { continue; } // no directory below the prefix
+        let p = key[0..prefix.length + slash + 1];
+        var k = out.length;
+        while (k > 0 && compareBytes(out[k - 1].view(), p) > 0) { k -= 1; }
+        if (k > 0 && out[k - 1].view() == p) { continue; }
+        out.insert(k, copyBytes(p)?)?;
+    }
+    return Ok(out);
+}
+
+/// A directory bucket's ListObjectsV2 with the delimiter `/` names, among its common prefixes, the prefixes of the
+/// uploads in progress under `prefix` (ADR-0080 §7, as S3 does): those after the page's start (`after`), and up to
+/// its last entry when the page is truncated (a later page has the rest).
+async fn addUploadPrefixes(
+    app: borrow S3App,
+    bucket: StringView,
+    prefix: Slice<u8>,
+    after: Slice<u8>,
+    page: borrow mut ListPage,
+) -> Result<void, S3Fail> {
+    let found = await uploadPrefixes(app, bucket, prefix)?;
+    for (i in 0..found.length) {
+        let p = found[i].view();
+        if (after.length > 0 && compareBytes(p, after) <= 0) { continue; }
+        if (page.truncated && compareBytes(p, page.nextMarker.view()) > 0) { continue; }
+        var k = page.commonPrefixes.length;
+        while (k > 0 && compareBytes(page.commonPrefixes[k - 1].view(), p) > 0) { k -= 1; }
+        if (k > 0 && page.commonPrefixes[k - 1].view() == p) { continue; }
+        page.commonPrefixes.insert(k, copyBytes(p)?)?;
+    }
+    return Ok();
+}

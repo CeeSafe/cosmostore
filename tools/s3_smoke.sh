@@ -1106,6 +1106,16 @@ check "nor reach another directory bucket" "$(express "$rk" "$rs" "$rt" GET "/ot
 aws s3api delete-bucket --bucket other--local-az1--x-s3 > /dev/null 2>&1
 check "a changed token" "$(express "$rk" "$rs" "${rt%????}AAAA" GET "/$dir/a/b.txt" | cut -d' ' -f1)" 400
 check "s3express on a general-purpose bucket" "$(express "" "" "" GET "/smoke?list-type=2" | cut -d' ' -f1)" 400
+# A directory bucket's ETags are not MD5s (ADR-0080 §7), and conditions use them.
+detag=$(aws s3api head-object --bucket "$dir" --key a/b.txt --query ETag --output text 2>&1)
+check "an ETag that is not the MD5" "$([ "$detag" != "\"$(md5 -q dir.txt 2>/dev/null || md5sum dir.txt | cut -d' ' -f1)\"" ] && echo "${#detag}")" 34
+check "If-Match with it" "$(aws s3api get-object --bucket "$dir" --key a/b.txt --if-match "$detag" dir.out --query ETag --output text 2>&1)" "$detag"
+check "listed with it" "$(aws s3api list-objects-v2 --bucket "$dir" --prefix a/ --query 'Contents[0].ETag' --output text 2>&1)" "$detag"
+upload=$(aws s3api create-multipart-upload --bucket "$dir" --key pending/x/part.bin --query UploadId --output text 2>&1)
+check "an upload in progress is a directory" "$(aws s3api list-objects-v2 --bucket "$dir" --delimiter / --query 'CommonPrefixes[].Prefix' --output text 2>&1)" "a/	pending/	tree/"
+aws s3api abort-multipart-upload --bucket "$dir" --key pending/x/part.bin --upload-id "$upload" > /dev/null 2>&1
+check "and is not once it ends" "$(aws s3api list-objects-v2 --bucket "$dir" --delimiter / --query 'CommonPrefixes[].Prefix' --output text 2>&1)" "a/	tree/"
+
 # What a directory bucket does not take (ADR-0080 §6), as S3 refuses it.
 check "no versioning" "$(code s3api put-bucket-versioning --bucket "$dir" --versioning-configuration Status=Enabled)" NotImplemented
 check "no object tags" "$(code s3api put-object --bucket "$dir" --key t --body dir.txt --tagging a=b)" NotImplemented

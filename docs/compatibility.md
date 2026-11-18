@@ -10,7 +10,7 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
 |---|---|---|---|---|
 | AWS CLI v2 | 2.34.13 | `tools/s3_smoke.sh` | 358 | pass |
 | rclone | 1.73.2 | `tools/sdk/rclone.sh` | 20 | pass |
-| boto3 (botocore with CRT) | 1.42.97 | `tools/sdk/boto3.sh` | 178 | pass |
+| boto3 (botocore with CRT) | 1.42.97 | `tools/sdk/boto3.sh` | 201 | pass |
 | AWS SDK for Go v2 | service/s3 1.114.9, s3control 1.81.0, sts 1.52.0 | `tools/sdk/go.sh` | 55 | pass |
 | AWS SDK for JavaScript v3 | client-s3, client-s3-control, client-sts 3.1168.0 | `tools/sdk/js.sh` | 61 | pass |
 | AWS SDK for Java v2 (with aws-crt; s3, s3control, sts) | 2.57.11 | `tools/sdk/java.sh` | 58 | pass |

@@ -599,6 +599,36 @@ check("and is a replica", replica.get("ReplicationStatus"), "REPLICA")
 s3.delete_bucket_replication(Bucket=RS)
 check("the replication deleted", code_of(lambda: s3.get_bucket_replication(Bucket=RS)), "ReplicationConfigurationNotFoundError")
 
+# Directory buckets (ADR-0080): boto3 takes a session (CreateSession) before each bucket's calls; then the same with
+# sessions off, which signs every call for s3express with the long-term key.
+DIR = "sdk--local-az1--x-s3"
+dir_config = {"Location": {"Type": "AvailabilityZone", "Name": "local-az1"},
+              "Bucket": {"DataRedundancy": "SingleAvailabilityZone", "Type": "Directory"}}
+for sessions in (True, False):
+    d = client() if sessions else boto3.client(
+        "s3", endpoint_url=endpoint, config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1},
+                                                    signature_version="s3v4", s3_disable_express_session_auth=True))
+    how = " (sessions)" if sessions else " (sessions off)"
+    made = d.create_bucket(Bucket=DIR, CreateBucketConfiguration=dir_config)
+    check("create a directory bucket" + how, made["ResponseMetadata"]["HTTPHeaders"].get("x-amz-bucket-arn", "").endswith(":bucket/" + DIR), True)
+    check("list_directory_buckets" + how, [b["Name"] for b in d.list_directory_buckets()["Buckets"]], [DIR])
+    check("not in list_buckets" + how, DIR in [b["Name"] for b in d.list_buckets()["Buckets"]], False)
+    put = d.put_object(Bucket=DIR, Key="a/b.txt", Body=b"in a directory")
+    check("an ETag that is not the MD5" + how, put["ETag"] != '"%s"' % hashlib.md5(b"in a directory").hexdigest(), True)
+    check("get" + how, d.get_object(Bucket=DIR, Key="a/b.txt")["Body"].read(), b"in a directory")
+    check("If-Match with it" + how, d.get_object(Bucket=DIR, Key="a/b.txt", IfMatch=put["ETag"])["ETag"], put["ETag"])
+    check("listed" + how, [o["Key"] for o in d.list_objects_v2(Bucket=DIR, Prefix="a/")["Contents"]], ["a/b.txt"])
+    d.upload_fileobj(io.BytesIO(os.urandom(12 << 20)), DIR, "big/m.bin", Config=TransferConfig(multipart_threshold=5 << 20, multipart_chunksize=5 << 20))
+    check("a multipart ETag without -N" + how, "-" in d.head_object(Bucket=DIR, Key="big/m.bin")["ETag"], False)
+    check("no versioning" + how, code_of(lambda: d.put_bucket_versioning(Bucket=DIR, VersioningConfiguration={"Status": "Enabled"})), "NotImplemented")
+    check("a prefix ends in /" + how, code_of(lambda: d.list_objects_v2(Bucket=DIR, Prefix="a")), "InvalidArgument")
+    for k in ("a/b.txt", "big/m.bin"):
+        d.delete_object(Bucket=DIR, Key=k)
+    d.delete_bucket(Bucket=DIR)
+    check("deleted" + how, d.list_directory_buckets()["Buckets"], [])
+session = client().create_session(Bucket="sdk2--local-az1--x-s3", SessionMode="ReadOnly")
+check("create_session", session["Credentials"]["AccessKeyId"][:4], "ASIA")
+
 check("wrong secret", code_of(lambda: boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
                                                        aws_secret_access_key="wrong").list_buckets()),
       "SignatureDoesNotMatch")

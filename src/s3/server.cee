@@ -420,7 +420,11 @@ async fn serveS3(
         }
     }
     // A browser form upload is authenticated by its form's policy signature, not its headers (ADR-0018).
-    if (isPostObject(borrow req)) { return await postObject(app, borrow req, exchange, peer); }
+    if (isPostObject(borrow req)) {
+        // S3 takes no browser form uploads on a directory bucket (ADR-0080 §6).
+        if (inDirectoryBucket(req.bucket.view())) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        return await postObject(app, borrow req, exchange, peer);
+    }
     // STS (ADR-0075): a POST to the service, which S3 has none of; its answers and errors are STS's.
     if (isMethod(req.method, Method.Post) && req.bucket.length == 0) {
         return await serveSts(app, borrow req, exchange, requestId);
@@ -1199,7 +1203,7 @@ async fn listObjects(app: borrow S3App, req: borrow S3Request, exchange: borrow 
             null => {}
         }
     }
-    let page = await listPage(
+    var page = await listPage(
         app,
         req.bucket.view(),
         prefix.view(),
@@ -1208,6 +1212,10 @@ async fn listObjects(app: borrow S3App, req: borrow S3Request, exchange: borrow 
         afterIsPrefix,
         maxKeys,
     )?;
+    // A directory bucket's uploads in progress show as directories (ADR-0080 §7).
+    if (inDirectoryBucket(req.bucket.view()) && delimiter.view() == "/") {
+        await addUploadPrefixes(app, req.bucket.view(), prefix.view().bytes(), after.view(), mut page)?;
+    }
     // max-keys=0 lists nothing and, as S3 answers, is not truncated.
     let truncated = page.truncated && maxKeys > 0;
     // fetch-owner in v2; v1 always has owners.
@@ -1260,7 +1268,7 @@ async fn listObjects(app: borrow S3App, req: borrow S3Request, exchange: borrow 
         appendIso8601(mut body, page.mtimes[i])?;
         body.extend("</LastModified><ETag>".bytes())?;
         var etag = Vector<u8>.create();
-        appendEtag(mut etag, borrow page.md5s[i], page.parts[i])?;
+        appendEtag(mut etag, borrow page.md5s[i], page.parts[i], inDirectoryBucket(req.bucket.view()))?;
         appendXmlEscaped(mut body, etag.view())?;
         body.extend("</ETag><Size>".bytes())?;
         appendDecimal(mut body, page.sizes[i])?;

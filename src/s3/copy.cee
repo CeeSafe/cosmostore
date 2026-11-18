@@ -46,10 +46,11 @@ fn copySourceOf(req: borrow S3Request) -> Result<CopySource, S3Fail> {
 }
 
 /// The `x-amz-copy-source-if-*` conditions. Every failure is PreconditionFailed, as S3 answers for a copy.
-fn checkCopyConditions(req: borrow S3Request, info: borrow ObjectInfo) -> Result<void, S3Code> {
+fn checkCopyConditions(req: borrow S3Request, info: borrow ObjectInfo, directory: bool) -> Result<void, S3Code> {
     return match (checkConditions(
         req,
         info,
+        directory,
         "x-amz-copy-source-if-match",
         "x-amz-copy-source-if-unmodified-since",
         "x-amz-copy-source-if-none-match",
@@ -122,7 +123,7 @@ fn planCopy(
         Ok(i) => i,
         Err(e) => { return Err(storeFail(e, src.key.length)); }
     };
-    match (checkCopyConditions(req, borrow info)) {
+    match (checkCopyConditions(req, borrow info, inDirectoryBucket(src.bucket.view()))) {
         Ok() => {}
         Err(code) => { return Err(S3Fail.Code(code)); }
     }
@@ -431,6 +432,7 @@ async fn sendCopyResult(
     exchange: borrow mut Exchange,
     element: StringView,
     md5: borrow [u8; 16],
+    directory: bool,
     extras: Slice<u8>,
 ) -> Result<void, S3Fail> {
     var body = Vector<u8>.create();
@@ -438,7 +440,7 @@ async fn sendCopyResult(
     body.extend("<LastModified>".bytes())?;
     appendIso8601(mut body, Clock.unixMillis())?;
     body.extend("</LastModified>".bytes())?;
-    xmlEtag(mut body, md5, 0)?;
+    xmlEtag(mut body, md5, 0, directory)?;
     xmlChecksum(mut body, extras)?;
     body.extend("</".bytes())?;
     body.extend(element.bytes())?;
@@ -565,7 +567,8 @@ async fn copyObject(
     )?;
     writtenVersionHeader(exchange, borrow outcome)?;
     if (sealing) { sseAnswerOf(exchange, envelope.view(), customerKeyOf(borrow asked))?; }
-    return await sendCopyResult(exchange, "CopyObjectResult", borrow outcome.md5, outcome.extras.view());
+    let directory = inDirectoryBucket(req.bucket.view());
+    return await sendCopyResult(exchange, "CopyObjectResult", borrow outcome.md5, directory, outcome.extras.view());
 }
 
 async fn uploadPartCopy(
@@ -619,5 +622,5 @@ async fn uploadPartCopy(
     // A part's checksum, alone: COMPOSITE parts have no type of their own to show.
     var extras = Vector<u8>.create();
     singlePartExtras(copied.algorithm, copied.checksum.view(), mut extras)?;
-    return await sendCopyResult(exchange, "CopyPartResult", borrow md5, extras.view());
+    return await sendCopyResult(exchange, "CopyPartResult", borrow md5, false, extras.view()); // a part's
 }
