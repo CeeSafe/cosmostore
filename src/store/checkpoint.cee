@@ -29,7 +29,9 @@
 //           ADR-0045), and in format 10 u32+bytes the object lock configuration (empty for none; ADR-0047), and in
 //           format 11 u32+bytes the notification rules (ADR-0048), and in format 12 u32+bytes the CORS rules
 //           (ADR-0049), and in format 13 u32+bytes the quota (ADR-0052), and in format 14 u32+bytes the default
-//           encryption (empty, or `AES256`; ADR-0046)
+//           encryption (empty, or `AES256`; ADR-0046), then u32+bytes each of logging, website, inventory, access
+//           points, replication and replication failures (formats 19 to 24, ADR-0072 to ADR-0077), and in format 25
+//           u32+bytes a directory bucket's zone id (empty for a general-purpose bucket; ADR-0080)
 //   event:  an undelivered event of the outbox, as `encodeEvent` writes one (ADR-0048)
 //   object: u16+bytes bucket, u16+bytes key, 16 version id, u64 lsn, u64 size, i64 mtime ms,
 //           16 md5, u16+bytes content type, u64 payload segment, u64 payload offset,
@@ -48,7 +50,7 @@ const CHECKPOINT_MAGIC: u64 = 0x313054504B434353; // "CSCKPT01" in file order
 const CHECKPOINT_TRAILER_MAGIC: u32 = 0x444E4B43; // "CKND" in file order
 const CHECKPOINT_HEADER_LEN: usize = 64;
 const CHECKPOINT_TRAILER_LEN: usize = 16;
-const CHECKPOINT_FORMAT: u16 = 24;
+const CHECKPOINT_FORMAT: u16 = 25;
 const CHECKPOINT_CODED_COUNT: u8 = 5;
 const CHECKPOINT_CODED: u8 = 6;
 const CHECKPOINT_SESSION_COUNT: u8 = 7;
@@ -417,6 +419,8 @@ fn beginCheckpointJob(
         body.extend(b.replication.view())?;
         body.pushLE(truncate<u32>(b.replicationFailures.length))?;
         body.extend(b.replicationFailures.view())?;
+        body.pushLE(truncate<u32>(b.zone.length))?;
+        body.extend(b.zone.view())?;
         w.add(CHECKPOINT_BUCKET, body.view())?;
     }
     var uploads = Vector<Vector<u8>>.create();
@@ -786,6 +790,7 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
                 objectLock: Vector<u8>.create(),
                 notification: Vector<u8>.create(),
                 cors: Vector<u8>.create(),
+                zone: Vector<u8>.create(),
             };
             if (format >= 5) {
                 info.tags = corrupt(readBlob32(body, mut at))?;
@@ -854,6 +859,10 @@ fn readCheckpoint(dir: StringView, lsn: u64) -> Result<LoadedCheckpoint, StoreEr
             if (format >= 24) {
                 info.replicationFailures = corrupt(readBlob32(body, mut at))?;
                 if (!isFailuresValue(info.replicationFailures.view())) { return Err(StoreError.CheckpointCorrupt); }
+            }
+            if (format >= 25) {
+                info.zone = corrupt(readBlob32(body, mut at))?;
+                if (info.zone.length > 0 && !isZoneId(info.zone.view())) { return Err(StoreError.CheckpointCorrupt); }
             }
             if (at != body.length) { return Err(StoreError.CheckpointCorrupt); }
             if (!state.addBucket(name, info)?) { return Err(StoreError.CheckpointCorrupt); } // a bucket twice

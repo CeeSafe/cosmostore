@@ -1,0 +1,201 @@
+// Directory buckets (ADR-0080): CreateBucket with a directory configuration, ListDirectoryBuckets, and what a request
+// signed for `s3express` may reach. A directory bucket is an ordinary bucket whose BucketCreate record carries this
+// server's zone id.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+/// Whether a CreateBucket body asks for a directory bucket: its `CreateBucketConfiguration` has a `Location` or a
+/// `Bucket` (a general-purpose bucket's has only a `LocationConstraint`).
+fn asksDirectory(xml: Slice<u8>) -> bool {
+    for (element in ["<Location>", "<Location ", "<Bucket>", "<Bucket "]) {
+        if (findBytes(xml, element.bytes(), 0).isSome()) { return true; }
+    }
+    return false;
+}
+
+/// Whether element `name` of `xml` holds exactly `want`, blanks trimmed.
+fn elementIs(xml: Slice<u8>, name: StringView, want: StringView) -> bool => match (elementText(xml, name)) {
+    Some(t) => trimBlank(t) == want.bytes(),
+    null => false,
+};
+
+/// A directory configuration as this server takes one (ADR-0080 §2): `Location` of `Type` AvailabilityZone and this
+/// zone's `Name`, `Bucket` of `DataRedundancy` SingleAvailabilityZone and `Type` Directory, and no
+/// `LocationConstraint`. Anything else is InvalidArgument (another zone, a Local Zone).
+fn checkDirectoryConfig(xml: Slice<u8>, zone: Slice<u8>) -> Result<void, S3Fail> {
+    if (findBytes(xml, "<CreateBucketConfiguration".bytes(), 0).isNull()) {
+        return Err(S3Fail.Code(S3Code.MalformedXML));
+    }
+    if (findBytes(xml, "<LocationConstraint".bytes(), 0).isSome()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    var at: usize = 0;
+    let location = match (nextElement(xml, "Location", mut at)?) {
+        Some(l) => l,
+        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    };
+    if (!elementIs(location, "Type", "AvailabilityZone")) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    match (elementText(location, "Name")) {
+        Some(n) => {
+            if (trimBlank(n) != zone) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        }
+        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    }
+    var bat: usize = 0;
+    let bucket = match (nextElement(xml, "Bucket", mut bat)?) {
+        Some(b) => b,
+        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    };
+    if (!elementIs(bucket, "DataRedundancy", "SingleAvailabilityZone") || !elementIs(bucket, "Type", "Directory")) {
+        return Err(S3Fail.Code(S3Code.InvalidArgument));
+    }
+    return Ok();
+}
+
+/// A header S3 does not take on a directory bucket's CreateBucket (ADR-0080 §2): ACLs, grants, object lock and
+/// object ownership (a directory bucket is always bucket owner enforced).
+fn refusedDirectoryHeader(req: borrow S3Request) -> bool {
+    for (i in 0..req.headers.length) {
+        let n = req.headers[i].name.view();
+        if (n == "x-amz-acl".bytes() || n == "x-amz-bucket-object-lock-enabled".bytes() ||
+            n == "x-amz-object-ownership".bytes() || startsWithBytes(n, "x-amz-grant-".bytes())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The account in a directory bucket's ARN: `x-amz-account-id`'s if it is 12 digits, else `000000000000`.
+fn directoryAccount(req: borrow S3Request, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    match (headerOf(req, "x-amz-account-id")) {
+        Some(v) => {
+            let t = trimBlank(v);
+            var digits = t.length == 12;
+            for (c in t) {
+                if (c < '0' || c > '9') { digits = false; }
+            }
+            if (digits) { return out.extend(t); }
+        }
+        null => {}
+    }
+    return out.extend("000000000000".bytes());
+}
+
+/// `arn:aws:s3express:<region>:<account>:bucket/<name>`, the region the request was signed for.
+fn directoryArn(req: borrow S3Request, name: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.extend("arn:aws:s3express:".bytes())?;
+    out.extend(scopeField(req, 2) ?? "us-east-1".bytes())?;
+    out.push(':')?;
+    directoryAccount(req, out)?;
+    out.extend(":bucket/".bytes())?;
+    return out.extend(name);
+}
+
+/// CreateBucket of a directory bucket (ADR-0080 §2), its configuration in `xml`.
+async fn createDirectoryBucket(
+    app: borrow S3App,
+    req: borrow S3Request,
+    xml: Slice<u8>,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    if (app.zoneId.length == 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    if (refusedDirectoryHeader(req)) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    checkDirectoryConfig(xml, app.zoneId.view())?;
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let name = req.bucket.view();
+        let zone = app.zoneId.view();
+        match (await Async.blocking(() => store.createDirectoryBucket(name, zone))) {
+            Ok() => {}
+            Err(e) => { return Err(storeFail(e, 0)); }
+        }
+    }
+    var arn = Vector<u8>.create();
+    directoryArn(req, req.bucket.bytes(), mut arn)?;
+    exchange.header("x-amz-bucket-arn", arn.view())?;
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}
+
+/// Whether a request signed for `s3express` may reach its bucket (ADR-0080 §4): a directory bucket, or a CreateBucket
+/// of a name with a directory bucket's suffix; a bucket that is not there answers as it would anyway. A
+/// general-purpose bucket refuses such signatures.
+async fn expressReaches(app: borrow S3App, req: borrow S3Request) -> Result<void, S3Fail> {
+    let creating = isMethod(req.method, Method.Put) && req.key.length == 0 && req.query.length == 0;
+    if (creating && isDirectoryShaped(req.bucket.bytes())) { return Ok(); }
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (store.bucketZone(req.bucket.view())) { // memory only
+        Ok(z) => if (z.length > 0) Ok() else Err(S3Fail.Code(S3Code.AuthorizationHeaderMalformed)),
+        Err(StoreError.NoSuchBucket) => Ok(),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+/// ListDirectoryBuckets (ADR-0080 §5): this server's directory buckets in name order, `max-directory-buckets` (0 to
+/// 1,000) at a time, with the last name, in base64, as the next page's `continuation-token`.
+async fn listDirectoryBuckets(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let all = await storeBucketList(app)?;
+    var limit: usize = 1000;
+    match (paramOf(req, "max-directory-buckets")) {
+        Some(t) => {
+            match (parseDecimal(t)) {
+                Some(v) => {
+                    if (v > 1000) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                    limit = v as usize;
+                }
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+        }
+        null => {}
+    }
+    var after = Vector<u8>.create();
+    match (paramOf(req, "continuation-token")) {
+        Some(t) => {
+            if (t.length > 1024 || !decodeBase64(t, mut after)?) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        }
+        null => {}
+    }
+    var body = Vector<u8>.create();
+    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyDirectoryBucketsResult xmlns=\"".bytes())?;
+    body.extend(S3_XMLNS.bytes())?;
+    body.extend("\"><Buckets>".bytes())?;
+    var listed: usize = 0;
+    var last = Vector<u8>.create();
+    var more = false;
+    for (i in 0..all.length) {
+        if (!all[i].directory) { continue; }
+        let name = all[i].name.view();
+        if (after.length > 0 && compareBytes(name, after.view()) <= 0) { continue; }
+        if (listed == limit) {
+            more = true;
+            break;
+        }
+        body.extend("<Bucket>".bytes())?;
+        var arn = Vector<u8>.create();
+        directoryArn(req, name, mut arn)?;
+        xmlElement(mut body, "BucketArn", arn.view(), false)?;
+        xmlElement(mut body, "BucketRegion", scopeField(req, 2) ?? "us-east-1".bytes(), false)?;
+        body.extend("<CreationDate>".bytes())?;
+        appendIso8601(mut body, all[i].createdMillis)?;
+        body.extend("</CreationDate>".bytes())?;
+        xmlElement(mut body, "Name", name, false)?;
+        body.extend("</Bucket>".bytes())?;
+        listed += 1;
+        last.clear();
+        last.extend(name)?;
+    }
+    body.extend("</Buckets>".bytes())?;
+    if (more && last.length > 0) {
+        var token = Vector<u8>.create();
+        appendBase64(mut token, last.view())?;
+        xmlElement(mut body, "ContinuationToken", token.view(), false)?;
+    }
+    body.extend("</ListAllMyDirectoryBucketsResult>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}

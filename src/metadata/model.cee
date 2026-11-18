@@ -658,6 +658,80 @@ fn decodeBucketMillis(bytes: Slice<u8>) -> Result<i64, MetaFault> {
     return readI64(bytes, mut at);
 }
 
+/// BucketCreate meta of a directory bucket (ADR-0080 §2): `encodeBucketMeta`'s, then u16+bytes its zone id. A
+/// BucketCreate without it is a general-purpose bucket's.
+fn encodeDirectoryBucketMeta(
+    out: borrow mut Vector<u8>,
+    name: Slice<u8>,
+    mtimeMillis: i64,
+    zone: Slice<u8>,
+) -> Result<void, AllocError> {
+    encodeBucketMeta(out, name, mtimeMillis)?;
+    pushText16(out, zone)?;
+    return Ok();
+}
+
+/// The zone id of BucketCreate meta: empty for a general-purpose bucket.
+fn decodeBucketZone(bytes: Slice<u8>) -> Result<Vector<u8>, MetaFault> {
+    var at: usize = 0;
+    checkVersion(bytes, mut at)?;
+    let _ = readText16(bytes, mut at)?;
+    let _ = readI64(bytes, mut at)?;
+    if (at == bytes.length) { return Ok(Vector<u8>.create()); }
+    let zone = readText16(bytes, mut at)?;
+    if (at != bytes.length || !isZoneId(zone.view())) { return Err(MetaFault.TooLong); }
+    return Ok(zone);
+}
+
+/// A zone id (ADR-0080 §1): 1 to 20 of a-z, 0-9 and `-`, beginning and ending with a letter or digit, and no `--`
+/// (which would make a directory bucket's name ambiguous).
+fn isZoneId(zone: Slice<u8>) -> bool {
+    if (zone.length == 0 || zone.length > 20) { return false; }
+    for (i in 0..zone.length) {
+        let c = zone[i];
+        let alnum = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        if (!alnum && c != '-') { return false; }
+        if ((i == 0 || i + 1 == zone.length) && !alnum) { return false; }
+        if (c == '-' && i > 0 && zone[i - 1] == '-') { return false; }
+    }
+    return true;
+}
+
+/// The suffix every directory bucket's name ends with (ADR-0080).
+const DIRECTORY_SUFFIX: StringView = "--x-s3";
+
+/// Whether `name` has a directory bucket's suffix: such a name is never a general-purpose bucket's.
+fn isDirectoryShaped(name: Slice<u8>) -> bool {
+    let s = DIRECTORY_SUFFIX.bytes();
+    return name.length >= s.length && name[name.length - s.length..] == s;
+}
+
+/// S3's rules for a directory bucket's name in `zone` (ADR-0080): `<base>--<zone>--x-s3`, 3 to 63 characters in
+/// all; the base of a-z, 0-9 and `-`, beginning and ending with a letter or digit; not beginning `xn--`, `sthree-`
+/// or `amzn-s3-demo-`.
+fn isDirectoryBucketName(name: Slice<u8>, zone: Slice<u8>) -> bool {
+    if (name.length < 3 || name.length > MAX_BUCKET_NAME || !isZoneId(zone) || !isDirectoryShaped(name)) {
+        return false;
+    }
+    let tail = DIRECTORY_SUFFIX.bytes().length + zone.length + 2;
+    if (name.length <= tail) { return false; }
+    let base = name[0..name.length - tail];
+    let middle = name[base.length..name.length - DIRECTORY_SUFFIX.bytes().length];
+    if (middle.length != zone.length + 2 || middle[0] != '-' || middle[1] != '-' || middle[2..] != zone) {
+        return false;
+    }
+    for (prefix in ["xn--", "sthree-", "amzn-s3-demo-"]) {
+        if (base.length >= prefix.length && base[0..prefix.length] == prefix.bytes()) { return false; }
+    }
+    for (i in 0..base.length) {
+        let c = base[i];
+        let alnum = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        if (!alnum && c != '-') { return false; }
+        if ((i == 0 || i + 1 == base.length) && !alnum) { return false; }
+    }
+    return true;
+}
+
 /// S3 general-purpose bucket naming rules (3-63 chars; lowercase letters, digits, '.', '-';
 /// starts and ends with a letter or digit; no "..", not an IPv4 address).
 fn isValidBucketName(name: Slice<u8>) -> bool {

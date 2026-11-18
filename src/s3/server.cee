@@ -33,6 +33,9 @@ struct S3App {
     /// The website endpoint's domain (`serve --website-domain`, ADR-0073): `<bucket>.<it>` is a bucket's website;
     /// empty for none.
     websiteDomain: Vector<u8>;
+    /// The zone id of this server's directory buckets (`serve --zone-id`, ADR-0080 §1); empty for none, when a
+    /// directory configuration is NotImplemented.
+    zoneId: Vector<u8>;
     /// The commit turn of group commit (ADR-0022): its holder is the leader that syncs the journal.
     commitTurn: AsyncMutex<u8>;
     /// Every record with a lower LSN is published, as the last leader saw it: followers check it without the
@@ -501,7 +504,19 @@ async fn serveS3(
     // The stats and the admin API are for long-term keys (ADR-0075 §3).
     if (who.session && bucket == STATS_BUCKET) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
     if (bucket == STATS_BUCKET) { return await serveStats(app, borrow req, exchange); } // ADR-0021
+    // Signed for `s3express`: directory buckets' requests (ADR-0080 §4).
+    let express = signedForExpress(borrow req);
     if (req.bucket.length == 0) {
+        if (express) {
+            if (!isMethod(m, Method.Get)) { return Err(S3Fail.Code(S3Code.MethodNotAllowed)); }
+            if (!req.onlyParams("max-directory-buckets,continuation-token")) {
+                return Err(S3Fail.Code(S3Code.NotImplemented));
+            }
+            if (!sessionAllows(app, borrow req, borrow who, "s3express:ListAllMyDirectoryBuckets", "".bytes())?) {
+                return Err(S3Fail.Code(S3Code.AccessDenied));
+            }
+            return await listDirectoryBuckets(app, borrow req, exchange);
+        }
         if (isMethod(m, Method.Get) || isMethod(m, Method.Head)) {
             if (!req.onlyParams("max-buckets,continuation-token,prefix")) {
                 return Err(S3Fail.Code(S3Code.NotImplemented));
@@ -513,6 +528,7 @@ async fn serveS3(
         }
         return Err(S3Fail.Code(S3Code.MethodNotAllowed));
     }
+    if (express) { await expressReaches(app, borrow req)?; }
     if (req.key.length == 0) {
         // A bucket's policy (ADR-0043).
         if (req.hasParam("policy")) {
@@ -739,7 +755,7 @@ async fn serveS3(
             if (!sessionAllows(app, borrow req, borrow who, "s3:CreateBucket", bucket.bytes())?) {
                 return Err(S3Fail.Code(S3Code.AccessDenied));
             }
-            return await createBucket(app, borrow req, exchange);
+            return await createBucket(app, borrow req, auth, exchange);
         }
         if (isMethod(m, Method.Head)) {
             await authorize(app, borrow req, borrow who, "s3:ListBucket", bucket, none)?;
@@ -963,13 +979,14 @@ async fn listBuckets(app: borrow S3App, req: borrow S3Request, exchange: borrow 
     var more = false;
     for (i in 0..all.length) {
         let name = all[i].name.view();
+        if (all[i].directory) { continue; } // ListDirectoryBuckets' (ADR-0080 §5)
         if (!startsWithBytes(name, prefix)) { continue; }
         if (after.length > 0 && compareBytes(name, after.view()) <= 0) { continue; }
         if (buckets.length == limit) {
             more = true;
             break;
         }
-        buckets.push(BucketEntry { name: copyBytes(name)?, createdMillis: all[i].createdMillis })?;
+        buckets.push(BucketEntry { name: copyBytes(name)?, createdMillis: all[i].createdMillis, directory: false })?;
     }
     var body = Vector<u8>.create();
     body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"".bytes())?;
@@ -1002,7 +1019,16 @@ async fn storeBucketList(app: borrow S3App) -> Result<Vector<BucketEntry>, S3Fai
     };
 }
 
-async fn createBucket(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+async fn createBucket(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    // A directory configuration makes a directory bucket (ADR-0080 §2); a general-purpose bucket's
+    // `LocationConstraint` is taken and ignored, as before.
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    if (asksDirectory(xml.view())) { return await createDirectoryBucket(app, req, xml.view(), exchange); }
     // The ACL of the request's fields, checked before the bucket is made (ADR-0045 §3).
     let acl = storedAcl(requestAcl(req)? ?? privateAcl())?;
     // A bucket made with object lock has versioning enabled and the lock on (ADR-0047 §1).

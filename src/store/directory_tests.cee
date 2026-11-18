@@ -1,0 +1,161 @@
+// Directory buckets in the store (ADR-0080 §2): names, the zone in the BucketCreate record, through the journal and a
+// checkpoint, and a fault sweep of making one.
+
+@test
+fn directoryBucketNamesAndZones() -> Result<void, TestFailure> {
+    Check.isTrue(isZoneId("local-az1".bytes()), "a zone id")?;
+    Check.isTrue(isZoneId("usw2-az1".bytes()), "AWS's form")?;
+    for (bad in ["", "-az1", "az1-", "a--z", "Az1", "a_z", "abcdefghijklmnopqrstu"]) {
+        Check.isFalse(isZoneId(bad.bytes()), bad)?;
+    }
+    let zone = "local-az1".bytes();
+    Check.isTrue(isDirectoryBucketName("data--local-az1--x-s3".bytes(), zone), "a directory bucket's name")?;
+    Check.isTrue(isDirectoryBucketName("a--local-az1--x-s3".bytes(), zone), "a one-letter base")?;
+    for (bad in [
+        "data--other-az1--x-s3", "data--local-az1", "data-local-az1--x-s3", "--local-az1--x-s3", "-a--local-az1--x-s3",
+        "a---local-az1--x-s3", "Data--local-az1--x-s3", "da.ta--local-az1--x-s3", "xn--a--local-az1--x-s3",
+        "sthree-a--local-az1--x-s3", "amzn-s3-demo-a--local-az1--x-s3",
+        "a234567890123456789012345678901234567890123456789--local-az1--x-s3",
+    ]) {
+        Check.isFalse(isDirectoryBucketName(bad.bytes(), zone), bad)?;
+    }
+    Check.isTrue(isDirectoryShaped("anything--x-s3".bytes()), "the suffix")?;
+    Check.isFalse(isDirectoryShaped("plain".bytes()), "no suffix")?;
+    // The record: a zone after the time, none in a general-purpose bucket's.
+    var meta = Vector<u8>.create();
+    encodeDirectoryBucketMeta(mut meta, "data--local-az1--x-s3".bytes(), 1700000000000, zone)!;
+    Check.equalBytes(zone, decodeBucketZone(meta.view())!.view())?;
+    Check.equalBytes("data--local-az1--x-s3".bytes(), decodeBucketName(meta.view())!.view())?;
+    var plain = Vector<u8>.create();
+    encodeBucketMeta(mut plain, "plain".bytes(), 1700000000000)!;
+    Check.equalU64(0, decodeBucketZone(plain.view())!.length as u64)?;
+    meta.push(0)!;
+    Check.isTrue(decodeBucketZone(meta.view()).isErr(), "bytes after the zone")?;
+    return Ok();
+}
+
+@test
+fn directoryBucketsKeepTheirZone() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("directory-buckets");
+    let zone = "local-az1".bytes();
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createDirectoryBucket("data--local-az1--x-s3", zone)!;
+        s.createBucket("plain")!;
+        Check.isTrue(s.createBucket("other--local-az1--x-s3").isErr(), "a directory bucket's name, made ordinary")?;
+        Check.isTrue(s.createDirectoryBucket("data--other-az1--x-s3", zone).isErr(), "another zone's name")?;
+        Check.isTrue(s.createDirectoryBucket("data--local-az1--x-s3", zone).isErr(), "a name twice")?;
+        Check.isTrue(s.createDirectoryBucket("plain", zone).isErr(), "a general-purpose name")?;
+        let _ = s.putObject("data--local-az1--x-s3", "a/b", "", "one".bytes(), PutCondition.None)!;
+    }
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.equalBytes(zone, s.bucketZone("data--local-az1--x-s3")!.view())?;
+        Check.equalU64(0, s.bucketZone("plain")!.length as u64)?;
+        Check.isTrue(s.bucketZone("nothing").isErr(), "no bucket")?;
+        let all = s.listBucketInfo()!;
+        Check.equalU64(2, all.length as u64)?;
+        Check.isTrue(all[0].directory && !all[1].directory, "the directory bucket listed as one")?;
+        Check.equalBytes("one".bytes(), s.getObject("data--local-az1--x-s3", "a/b")!.view())?;
+        if (round == 0) { let _ = s.checkpoint()!; }
+    }
+    // Deleted and made again as an ordinary bucket's name is refused; as a directory bucket, it is one again.
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.deleteObject("data--local-az1--x-s3", "a/b")!;
+        s.deleteBucket("data--local-az1--x-s3")!;
+        Check.isTrue(s.createBucket("data--local-az1--x-s3").isErr(), "not as a general-purpose bucket")?;
+        s.createDirectoryBucket("data--local-az1--x-s3", zone)!;
+    }
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalBytes(zone, s.bucketZone("data--local-az1--x-s3")!.view())?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// What the directory bucket workload did: R_ABSENT, R_MAYBE or R_ACKED (replica_tests.cee) for the bucket and its
+/// object.
+struct DirectoryModel {
+    wrote: [u8; 2];
+}
+
+fn directoryWorkload(dir: StringView, m: borrow mut DirectoryModel) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    match (s.createDirectoryBucket("data--local-az1--x-s3", "local-az1".bytes())) {
+        Ok() => { m.wrote[0] = R_ACKED; }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.wrote[0] = R_MAYBE; }
+            return;
+        }
+    }
+    match (s.putObject("data--local-az1--x-s3", "k", "", "bytes".bytes(), PutCondition.None)) {
+        Ok(_) => { m.wrote[1] = R_ACKED; }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.wrote[1] = R_MAYBE; }
+        }
+    }
+}
+
+fn checkDirectory(s: borrow ObjectStore, m: borrow DirectoryModel) -> Result<void, TestFailure> {
+    let exists = s.bucketExists("data--local-az1--x-s3")!;
+    if (m.wrote[0] == R_ACKED) { Check.isTrue(exists, "an acknowledged directory bucket")?; }
+    if (m.wrote[0] == R_ABSENT) { Check.isFalse(exists, "no bucket that was not made")?; }
+    if (!exists) { return Ok(); }
+    // Never seen without its zone.
+    Check.equalBytes("local-az1".bytes(), s.bucketZone("data--local-az1--x-s3")!.view())?;
+    if (m.wrote[1] == R_ACKED) {
+        Check.equalBytes("bytes".bytes(), s.getObject("data--local-az1--x-s3", "k")!.view())?;
+    }
+    return Ok();
+}
+
+fn sweepDirectory(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    var clean = DirectoryModel { wrote: [0u8; 2] };
+    Faults.countOperations();
+    directoryWorkload(dir.view(), mut clean);
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 5, "the workload performs I/O")?;
+    for (i in 0..2) { Check.equalU64(R_ACKED as u64, clean.wrote[i] as u64)?; }
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        var m = DirectoryModel { wrote: [0u8; 2] };
+        armMode(borrow mode, n);
+        directoryWorkload(dir.view(), mut m);
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired().min(1))?;
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        {
+            var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+            checkDirectory(borrow s, borrow m)?;
+            Check.equalU64(0, s.verify()!.problems.length as u64)?;
+            let _ = s.checkpoint()!;
+        }
+        let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        checkDirectory(borrow s, borrow m)?;
+    }
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn directoryFaultsOnce() -> Result<void, TestFailure> => sweepDirectory("dfault-once", SweepMode.Once);
+
+@test
+fn directoryFaultsSticky() -> Result<void, TestFailure> => sweepDirectory("dfault-sticky", SweepMode.Sticky);
+
+@test
+fn directoryFaultsTorn() -> Result<void, TestFailure> => sweepDirectory("dfault-torn", SweepMode.StickyTorn);
+
+@test
+fn directoryFaultsCrash() -> Result<void, TestFailure> => sweepDirectory("dfault-crash", SweepMode.Crash);

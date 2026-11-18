@@ -125,6 +125,8 @@ enum PutCondition {
 struct BucketEntry {
     name: Vector<u8>;
     createdMillis: i64;
+    /// A directory bucket (ADR-0080).
+    directory: bool;
 }
 
 struct BucketInfo {
@@ -170,6 +172,8 @@ struct BucketInfo {
     notification: Vector<u8>;
     /// The CORS rules as they are stored; empty for none (ADR-0049).
     cors: Vector<u8>;
+    /// A directory bucket's zone id (ADR-0080 §2), from its BucketCreate record; empty for a general-purpose bucket.
+    zone: Vector<u8>;
 }
 
 /// Space use of one segment, for compaction (ADR-0005). `liveBytes` counts the records that
@@ -874,6 +878,10 @@ fn applyRecord(
                 Ok(t) => t,
                 Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
             };
+            let zone = match (decodeBucketZone(meta)) {
+                Ok(z) => z,
+                Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+            };
             let info = BucketInfo {
                 number: 0,
                 createdMillis: created,
@@ -896,6 +904,7 @@ fn applyRecord(
                 objectLock: Vector<u8>.create(),
                 notification: Vector<u8>.create(),
                 cors: Vector<u8>.create(),
+                zone: zone,
             };
             let _ = state.addBucket(name, info)?;
         }
@@ -3105,15 +3114,40 @@ struct ObjectStore {
         return Ok();
     }
 
+    /// A general-purpose bucket; a name with a directory bucket's suffix is not one (ADR-0080 §2).
     fn createBucket(borrow mut this, name: StringView) -> Result<void, StoreError> {
         this.checkWritable()?;
-        if (!isValidBucketName(name.bytes())) { return Err(StoreError.InvalidBucketName); }
+        if (!isValidBucketName(name.bytes()) || isDirectoryShaped(name.bytes())) {
+            return Err(StoreError.InvalidBucketName);
+        }
         if (this.state.hasBucket(name.bytes())?) { return Err(StoreError.BucketAlreadyExists); }
         this.scratch.clear();
         encodeBucketMeta(mut this.scratch, name.bytes(), Clock.unixMillis())?;
         let empty = [0u8; 1];
         this.commitOne(RecordType.BucketCreate, empty[0..0])?;
         return Ok();
+    }
+
+    /// A directory bucket in `zone` (ADR-0080 §2): one BucketCreate record that carries the zone, so the bucket is
+    /// never seen without it.
+    fn createDirectoryBucket(borrow mut this, name: StringView, zone: Slice<u8>) -> Result<void, StoreError> {
+        this.checkWritable()?;
+        if (!isDirectoryBucketName(name.bytes(), zone)) { return Err(StoreError.InvalidBucketName); }
+        if (this.state.hasBucket(name.bytes())?) { return Err(StoreError.BucketAlreadyExists); }
+        this.scratch.clear();
+        encodeDirectoryBucketMeta(mut this.scratch, name.bytes(), Clock.unixMillis(), zone)?;
+        let empty = [0u8; 1];
+        this.commitOne(RecordType.BucketCreate, empty[0..0])?;
+        return Ok();
+    }
+
+    /// A bucket's zone id if it is a directory bucket, empty if it is not; NoSuchBucket if there is none.
+    fn bucketZone(borrow this, name: StringView) -> Result<Vector<u8>, StoreError> {
+        let k = BucketKey { name: copyBytes(name.bytes())? };
+        return match (this.state.buckets.get(borrow k)) {
+            Some(b) => Ok(copyBytes(b.zone.view())?),
+            null => Err(StoreError.NoSuchBucket),
+        };
     }
 
     fn deleteBucket(borrow mut this, name: StringView) -> Result<void, StoreError> {
@@ -3228,6 +3262,7 @@ struct ObjectStore {
             entries.push(BucketEntry {
                 name: copyBytes(this.state.buckets.keyAt(i).name.view())?,
                 createdMillis: this.state.buckets.valueAt(i).createdMillis,
+                directory: this.state.buckets.valueAt(i).zone.length > 0,
             })?;
         }
         entries.viewMut().sortBy((a, b) => compareBytes(a.name.view(), b.name.view()));

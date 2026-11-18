@@ -135,6 +135,46 @@ enum PayloadMode {
     Chunked,
 }
 
+/// The signing service of directory buckets' requests (ADR-0080).
+const EXPRESS_SERVICE: StringView = "s3express";
+
+/// Field `n` of `req`'s credential scope (`<key>/<date>/<region>/<service>/aws4_request`: 1 the date, 2 the region,
+/// 3 the service), in the Authorization field or a presigned URL's `X-Amz-Credential`; null if it has none.
+fn scopeField<region a>(req: borrow(a) S3Request, n: usize) -> Slice<a, u8>? {
+    let credential = match (headerOf(req, "authorization")) {
+        Some(value) => {
+            let marker = "Credential=".bytes();
+            match (findBytes(value, marker, 0)) {
+                Some(at) => value[at + marker.length..],
+                null => { return null; }
+            }
+        }
+        null => match (paramOf(req, "X-Amz-Credential")) {
+            Some(v) => v,
+            null => { return null; }
+        },
+    };
+    var field: usize = 0;
+    var start: usize = 0;
+    for (i in 0..credential.length) {
+        let c = credential[i];
+        if (c == '/' || c == ',' || c == ' ') {
+            if (field == n) { return Some(credential[start..i]); }
+            if (c != '/') { return null; }
+            field += 1;
+            start = i + 1;
+        }
+    }
+    return null;
+}
+
+/// Whether `req` is signed for `s3express` (ADR-0080 §4). Read again after the signature checked, which took only
+/// `s3` and `s3express` for S3's calls.
+fn signedForExpress(req: borrow S3Request) -> bool => match (scopeField(req, 3)) {
+    Some(service) => service == EXPRESS_SERVICE.bytes(),
+    null => false,
+};
+
 /// What authentication found.
 struct Authenticated {
     payload: PayloadMode;
@@ -458,7 +498,10 @@ struct S3Request {
         payloadHash: Slice<u8>,
         query: Slice<u8>,
     ) -> Result<Authenticated, S3Code> {
-        if (auth.service.view() != service.bytes()) { return Err(S3Code.AuthorizationHeaderMalformed); }
+        // S3's calls are signed for `s3`, or for `s3express` (directory buckets, ADR-0080 §4); the dispatch decides
+        // what an `s3express` signature may reach (`signedForExpress`).
+        let express = service == "s3" && auth.service.view() == EXPRESS_SERVICE.bytes();
+        if (auth.service.view() != service.bytes() && !express) { return Err(S3Code.AuthorizationHeaderMalformed); }
         var found: usize? = null;
         // Temporary credentials (ADR-0075 §1): the token, sealed by this server, holds the secret and the key that
         // asked for them, which must still be in the credentials.

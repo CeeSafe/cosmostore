@@ -1,0 +1,73 @@
+// Directory buckets in the S3 layer (ADR-0080): the configuration CreateBucket takes, the headers it refuses, and
+// the signature's service and region.
+
+fn directoryConfig(locationType: StringView, zone: StringView, redundancy: StringView, kind: StringView) -> String {
+    var x = textOf("<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location><Type>");
+    let _ = x.append(locationType);
+    let _ = x.append("</Type><Name>");
+    let _ = x.append(zone);
+    let _ = x.append("</Name></Location><Bucket><DataRedundancy>");
+    let _ = x.append(redundancy);
+    let _ = x.append("</DataRedundancy><Type>");
+    let _ = x.append(kind);
+    let _ = x.append("</Type></Bucket></CreateBucketConfiguration>");
+    return x;
+}
+
+fn invalid(r: Result<void, S3Fail>) -> bool => match (r) {
+    Err(S3Fail.Code(S3Code.InvalidArgument)) => true,
+    _ => false,
+};
+
+@test
+fn directoryBucketConfigurations() -> Result<void, TestFailure> {
+    let zone = "local-az1".bytes();
+    let good = directoryConfig("AvailabilityZone", "local-az1", "SingleAvailabilityZone", "Directory");
+    Check.isTrue(asksDirectory(good.view().bytes()), "a directory configuration")?;
+    Check.isTrue(checkDirectoryConfig(good.view().bytes(), zone).isOk(), "taken")?;
+    let general =
+        "<CreateBucketConfiguration><LocationConstraint>eu-west-1</LocationConstraint></CreateBucketConfiguration>";
+    Check.isFalse(asksDirectory(general.bytes()), "a general-purpose bucket's")?;
+    Check.isFalse(asksDirectory("".bytes()), "no body")?;
+    let other = directoryConfig("AvailabilityZone", "usw2-az1", "SingleAvailabilityZone", "Directory");
+    Check.isTrue(invalid(checkDirectoryConfig(other.view().bytes(), zone)), "another zone")?;
+    let local = directoryConfig("LocalZone", "local-az1", "SingleLocalZone", "Directory");
+    Check.isTrue(invalid(checkDirectoryConfig(local.view().bytes(), zone)), "a Local Zone")?;
+    let kind = directoryConfig("AvailabilityZone", "local-az1", "SingleAvailabilityZone", "General");
+    Check.isTrue(invalid(checkDirectoryConfig(kind.view().bytes(), zone)), "not Directory")?;
+    var both = textOf("<CreateBucketConfiguration><LocationConstraint>x</LocationConstraint>");
+    let _ = both.append(
+        "<Location><Type>AvailabilityZone</Type><Name>local-az1</Name></Location><Bucket><DataRedundancy>SingleAvailabilityZone</DataRedundancy><Type>Directory</Type></Bucket></CreateBucketConfiguration>",
+    );
+    Check.isTrue(invalid(checkDirectoryConfig(both.view().bytes(), zone)), "with a LocationConstraint")?;
+    let noBucket =
+        "<CreateBucketConfiguration><Location><Type>AvailabilityZone</Type><Name>local-az1</Name></Location></CreateBucketConfiguration>";
+    Check.isTrue(invalid(checkDirectoryConfig(noBucket.bytes(), zone)), "no Bucket")?;
+    return Ok();
+}
+
+@test
+fn directoryRequestFields() -> Result<void, TestFailure> {
+    var req = bareRequest();
+    req.headers.push(policyHeader(
+        "authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIA/20261118/eu-north-1/s3express/aws4_request, SignedHeaders=host, Signature=00",
+    ))!;
+    Check.isTrue(signedForExpress(borrow req), "signed for s3express")?;
+    Check.equalBytes("eu-north-1".bytes(), scopeField(borrow req, 2) ?? "".bytes())?;
+    var arn = Vector<u8>.create();
+    directoryArn(borrow req, "data--local-az1--x-s3".bytes(), mut arn)!;
+    Check.equalBytes("arn:aws:s3express:eu-north-1:000000000000:bucket/data--local-az1--x-s3".bytes(), arn.view())?;
+    Check.isFalse(refusedDirectoryHeader(borrow req), "nothing refused")?;
+    req.headers.push(policyHeader("x-amz-grant-read", "id=x"))!;
+    Check.isTrue(refusedDirectoryHeader(borrow req), "a grant")?;
+    var plain = bareRequest();
+    plain.headers.push(policyHeader(
+        "authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIA/20261118/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=00",
+    ))!;
+    Check.isFalse(signedForExpress(borrow plain), "signed for s3")?;
+    let unsigned = bareRequest();
+    Check.isFalse(signedForExpress(borrow unsigned), "unsigned")?;
+    return Ok();
+}

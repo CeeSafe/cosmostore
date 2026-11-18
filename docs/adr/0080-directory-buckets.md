@@ -59,8 +59,9 @@ only, with S3's limits enforced).
    says `AvailabilityZone`, this zone, `SingleAvailabilityZone` and `Directory` (another zone, LocalZone or
    SingleLocalZone: InvalidArgument; a name of another form with a directory configuration, or a `--x-s3` name
    without one: InvalidBucketName), and none of the headers S3 does not take (InvalidArgument). The bucket is an
-   ordinary bucket with a `BucketConfig` of a new kind, `Directory` (the zone and the time), written in the same
-   batch as the bucket (a new checkpoint format); an ordinary bucket cannot become one or stop being one. The answer
+   ordinary bucket whose BucketCreate record carries the zone id after its time (a record without one is a
+   general-purpose bucket's), so a directory bucket is never seen without its zone; checkpoint format 25 keeps the
+   zone with the bucket. An ordinary bucket cannot become one or stop being one. The answer
    adds `x-amz-bucket-arn` (`arn:aws:s3express:<region>:<account>:bucket/<name>`; the account is
    `x-amz-account-id`'s, else `000000000000`).
 3. **CreateSession** (`GET /<bucket>?session`, path-style or under the domain): signed for `s3express` by a long-term
@@ -73,8 +74,8 @@ only, with S3's limits enforced).
 4. **A request with `x-amz-s3session-token`:** signed for `s3express` with the session's key; the token opens, has not
    expired (ExpiredToken, as STS's) and names this request's bucket (else AccessDenied); a ReadOnly session may make
    only the six calls above (else AccessDenied). The requester is the key that made the session (for policies, the
-   audit line and access logs), narrowed by the mode. A request to a directory bucket signed for `s3express` without
-   a session token is taken from a long-term key (CopyObject, ListDirectoryBuckets, and SDKs with sessions turned
+   audit line and access logs), narrowed by the mode. A request to a directory bucket signed for `s3`, or for `s3express` without
+   a session token, is taken from a long-term key (CopyObject, ListDirectoryBuckets, and SDKs with sessions turned
    off). `x-amz-security-token` and `x-amz-s3session-token` together: InvalidRequest. An ordinary bucket refuses
    `s3express` signatures and session tokens (AuthorizationHeaderMalformed, AccessDenied).
 5. **ListDirectoryBuckets:** `GET /` signed for `s3express`: this server's directory buckets in name order,
@@ -101,7 +102,7 @@ only, with S3's limits enforced).
 
 ## Consequences
 
-- The store gains one `BucketConfig` kind and a checkpoint format; its fault sweep covers a directory bucket made,
+- The store gains a field of the BucketCreate record and checkpoint format 25; its fault sweep covers a directory bucket made,
   written and deleted. The S3 layer gains the `s3express` service in signatures and a second kind of session token.
 - Tests: the unit tests of names, configurations, tokens and refusals; the S3 smoke and the cluster smoke make a
   directory bucket and use it through the AWS CLI (`s3api` with sessions, `s3 cp --recursive`); every SDK of the
@@ -110,8 +111,9 @@ only, with S3's limits enforced).
 
 ## Slices
 
-1. Names, the zone, CreateBucket and the `Directory` record, ListDirectoryBuckets, and `s3express` signatures from
-   long-term keys (sessions off).
+1. Names, the zone, CreateBucket and its record, ListDirectoryBuckets, and `s3express` signatures from long-term
+   keys (sessions off). Checked through boto3 with `AWS_S3_DISABLE_EXPRESS_SESSION_AUTH`: the AWS CLI (2.34) has
+   no way to turn sessions off, so its checks, and the smokes', come with slice 2.
 2. CreateSession and session tokens, ReadOnly sessions, the cluster.
 3. The refusals and S3's behaviours (§6, §7), then the SDK matrix.
 

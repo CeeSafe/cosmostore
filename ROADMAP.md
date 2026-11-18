@@ -2874,3 +2874,20 @@ Browser form uploads with a SigV4 POST policy.
   signed for `s3express` with the long-term key, ListDirectoryBuckets as `GET /`. Three slices; for the owner to
   accept, with ADR-0079.
 - **The owner: "accept ADR-0079 and ADR-0080".** M8 is directory buckets; slice 1 next.
+
+### 18 Nov 2026: M8 slice 1, directory buckets made and listed (ADR-0080)
+
+- **`serve --zone-id`** names the zone; **CreateBucket** with a directory configuration (this zone, AvailabilityZone,
+  SingleAvailabilityZone, Directory; another zone or a Local Zone InvalidArgument; ACL, grant, lock and ownership
+  headers InvalidArgument; without `--zone-id` NotImplemented) makes a directory bucket, answering `x-amz-bucket-arn`.
+  Its BucketCreate record carries the zone after its time, so the bucket is never seen without it; checkpoint
+  format 25 keeps it. A `--x-s3` name is never a general-purpose bucket's (InvalidBucketName).
+- **ListDirectoryBuckets** (`GET /` signed for `s3express`), paged by `max-directory-buckets` and a token;
+  ListBuckets leaves directory buckets out. **`s3express` signatures** are taken from long-term keys for directory
+  buckets (and a CreateBucket of a `--x-s3` name); a general-purpose bucket refuses them
+  (AuthorizationHeaderMalformed).
+- Tests: `directoryBucketNamesAndZones`, `directoryBucketsKeepTheirZone` (the journal, a checkpoint, made again),
+  the fault sweep `directoryFaults{Once,Sticky,Torn,Crash}`, `directoryBucketConfigurations`,
+  `directoryRequestFields`; boto3 with sessions off makes, lists (two pages), writes and reads one. The AWS CLI 2.34
+  cannot turn sessions off, so its checks and the smokes' come with slice 2 (CreateSession). 329 tests; the S3, TLS
+  and cluster smokes and boto3 pass as before.
