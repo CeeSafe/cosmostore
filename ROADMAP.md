@@ -3036,3 +3036,8 @@ Browser form uploads with a SigV4 POST policy.
 - **Found:** the JavaScript SDK writes an access point's paths as `/<name>//<key>`, as it does a directory
   bucket's, so `--xa-s3` names lose the extra `/` too (`directoryNamed`).
 - **All of ADR-0082 is built.** It is proposed: accepting it is the owner's decision.
+- **CI's perf gate failed twice on slice 1** (`faa5596`), flagging other groups each time: small metadata reads
+  and large writes at c32, then small GETs at c32. Slice 1 changes no step of an ordinary request, and the same
+  gate on binfadel passed (base `5bd6d7d` against `faa5596`, 3 rounds, built with ceesafec 0.56.0). At c32, small
+  metadata reads were p99 1.01 and ops/s 1.00, small GETs 0.98 and 1.02, and large writes 0.93 and 1.03. The CI
+  failures were the runner's noise.
