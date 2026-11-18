@@ -301,6 +301,14 @@ The owner chose directory buckets only, with S3's limits enforced (18 Nov 2026);
 the exit review's findings closed and RenameObject (ADR-0081); S3 Tables wait until Iceberg engines are meant to run
 against CosmoStore (ADR-0079).
 
+### M9: S3 Tables
+
+The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (proposed) designs it.
+- **Table buckets:** each is a hidden bucket. Its catalog is objects, with conditional writes as the compare-and-set.
+- **The APIs:** the S3 Tables API (signed for `s3tables`), and the Iceberg REST catalog, which writes the metadata
+  files itself.
+- **Done when** PyIceberg can create a table, append to it and read it back, on `serve` and on a cluster.
+
 ---
 
 ## Part 3: First four weeks (concrete backlog)
@@ -3046,3 +3054,13 @@ Browser form uploads with a SigV4 POST policy.
 
 - The owner: "I accept the proposed ADR-0082". Access points of directory buckets are done: on `serve` and on a
   cluster, with their scopes, sessions and listing, through every SDK of the matrix.
+
+### 19 Nov 2026: M9 proposed, S3 Tables (ADR-0083)
+
+- **The owner:** "Next we need s3 tables iceberg". **ADR-0083** (proposed) is the design, from AWS's S3 Tables
+  pages, the Iceberg REST catalog's spec, and what boto3's `s3tables` client sends to a custom endpoint. Its paths
+  (`/buckets`, `/tables/…`) are an S3 bucket's too, so only the signature's service tells the two apart.
+- **The design:** a table bucket is a hidden bucket `<name>--table-s3`, its warehouse. The catalog is JSON records
+  under `.s3tables/`, the versionToken a record's generation, and the compare-and-set a conditional write. So there
+  is no new journal record. The Iceberg REST catalog writes the metadata files.
+- **Slices:** the S3 Tables API, the Iceberg catalog (PyIceberg end to end), the cluster, then the SDK matrix.
