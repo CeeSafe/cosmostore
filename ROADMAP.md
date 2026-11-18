@@ -3013,3 +3013,26 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** `directoryAccessPointNames`, `directoryAccessPointScopes`, `directoryAccessPointPermissions`. The S3
   smoke's 23 checks, and boto3's 11.
 - **Next:** slice 2, the cluster.
+
+### 18 Nov 2026: access points of directory buckets, slice 2 on a cluster (ADR-0082 §5)
+
+- **Claims and routing:**
+  - A directory access point's name, its own alias, is claimed in group 0, and the front finds it by that claim:
+    data requests and CreateSession through it go to its bucket's shard.
+  - The `/scope` calls route as the policy calls do, and DeleteAccessPoint lets the name go (a scope's DELETE does
+    not).
+- **The listing:** ListAccessPointsForDirectoryBuckets of one bucket goes to its shard. Of every bucket, the front
+  merges the shards' first `maxResults` by name and pages them, with a `NextToken` every shard reads.
+- **Tests:** the cluster smoke's 10 checks. These are an access point on a shard-1 bucket and one on a shard-3
+  bucket, the merged listing and its pages, a scope read and requests through other nodes, and a name let go and
+  taken again for another bucket. 122 checks in all.
+- **Next:** slice 3, the rest of the SDK matrix.
+
+### 18 Nov 2026: access points of directory buckets, slice 3, the SDK matrix (ADR-0082)
+
+- **Each SDK's check:** Go, JavaScript, Java and .NET make a directory access point with a scope, read the scope
+  back, list it, write and read through it, and are refused outside its scope. Go, JavaScript and Java do this with
+  their sessions, .NET with them off (as ADR-0080 §9). boto3 did so in slice 1.
+- **Found:** the JavaScript SDK writes an access point's paths as `/<name>//<key>`, as it does a directory
+  bucket's, so `--xa-s3` names lose the extra `/` too (`directoryNamed`).
+- **All of ADR-0082 is built.** It is proposed: accepting it is the owner's decision.

@@ -1,6 +1,6 @@
 # ADR-0082: Access points of directory buckets
 
-**Status:** proposed, 18 Nov 2026. The owner asked for this next ("Take on Access points on directory buckets next"),
+**Status:** proposed, 18 Nov 2026; its three slices built the same day. The owner asked for this next ("Take on Access points on directory buckets next"),
 after M8 closed with it refused (ADR-0080 §6). It extends ADR-0076 (access points) and ADR-0080 (directory buckets).
 
 ## Context

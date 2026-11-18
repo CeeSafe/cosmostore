@@ -149,6 +149,7 @@ func main() {
 	check("bucket deleted", errors.As(err, &nf), true)
 	m7(ctx, cfg, endpoint, c, client)
 	directory(ctx, cfg)
+	directoryAccessPoints(ctx, cfg, endpoint)
 	if failed {
 		os.Exit(1)
 	}

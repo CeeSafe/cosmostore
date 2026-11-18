@@ -369,6 +369,19 @@ check "rename-object through node 2" "$(on 2 s3api rename-object --bucket b--loc
 check "the renamed object through node 1" "$(onl 1 s3 cp s3://b--local-az1--x-s3/k/four - 2>&1)" "in a directory"
 on 3 s3api delete-object --bucket b--local-az1--x-s3 --key k/four > /dev/null 2>&1
 check "delete-objects through node 3" "$(on 3 s3api delete-objects --bucket b--local-az1--x-s3 --delete 'Objects=[{Key=k/one},{Key=k/two}]' --query 'length(Deleted)' 2>&1)" 2
+# A directory bucket's access point (ADR-0082 §5): claimed by name, made through one node, used through the others.
+ctl 1 create-access-point --name dir-door--local-az1--xa-s3 --bucket b--local-az1--x-s3 --scope 'Prefixes=[pub/]' > /dev/null 2>&1 && pass "a directory access point through node 1" || fail "a directory access point through node 1"
+ctl 2 create-access-point --name dir-gate--local-az1--xa-s3 --bucket c--local-az1--x-s3 > /dev/null 2>&1 && pass "another, on c (shard $(shardOf c--local-az1--x-s3); b's is $(shardOf b--local-az1--x-s3))" || fail "another, on c"
+check "listed through node 3, merged" "$(ctl 3 list-access-points-for-directory-buckets --query 'AccessPointList[].Name' --output text 2>&1)" "dir-door--local-az1--xa-s3	dir-gate--local-az1--xa-s3"
+check "one page of one, then the next" "$(t=$(ctl 3 list-access-points-for-directory-buckets --max-results 1 --query NextToken --output text 2>&1); ctl 1 list-access-points-for-directory-buckets --max-results 1 --next-token "$t" --query 'AccessPointList[].Name' --output text 2>&1)" "dir-gate--local-az1--xa-s3"
+check "its scope through node 2" "$(ctl 2 get-access-point-scope --name dir-door--local-az1--xa-s3 --query 'Scope.Prefixes[0]' --output text 2>&1)" "pub/"
+on 2 s3api put-object --bucket dir-door--local-az1--xa-s3 --key pub/x --body dir.txt > /dev/null 2>&1 && pass "a PUT through it, node 2" || fail "a PUT through it, node 2"
+check "read through it, node 3" "$(on 3 s3api get-object --bucket dir-door--local-az1--xa-s3 --key pub/x dir.out > /dev/null 2>&1; cat dir.out)" "in a directory"
+check "outside its scope, node 1" "$(on 1 s3api get-object --bucket dir-door--local-az1--xa-s3 --key k/one dir.out 2>&1 | grep -o AccessDenied | head -1)" AccessDenied
+on 1 s3api delete-object --bucket b--local-az1--x-s3 --key pub/x > /dev/null 2>&1
+ctl 3 delete-access-point --name dir-door--local-az1--xa-s3 > /dev/null 2>&1 && pass "deleted through node 3" || fail "deleted through node 3"
+ctl 1 create-access-point --name dir-door--local-az1--xa-s3 --bucket c--local-az1--x-s3 > /dev/null 2>&1 && pass "its name free again" || fail "its name free again"
+for n in dir-door dir-gate; do ctl 2 delete-access-point --name "$n--local-az1--xa-s3" > /dev/null 2>&1; done
 onl 3 s3 rm --recursive s3://b--local-az1--x-s3/ > /dev/null 2>&1 # the CRT's deletes, by host name too
 for d in a b c; do on 3 s3api delete-bucket --bucket "$d--local-az1--x-s3" > /dev/null 2>&1; done
 check "deleted through node 3" "$(on 1 s3api list-directory-buckets --query 'length(Buckets)' 2>&1)" 0

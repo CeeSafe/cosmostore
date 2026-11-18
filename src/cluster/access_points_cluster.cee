@@ -176,6 +176,8 @@ fn claimedNames(st: borrow mut ObjectStore, prefix: Slice<u8>) -> Result<Vector<
 /// name has).
 fn claimNamedBy(st: borrow mut ObjectStore, token: Slice<u8>) -> Result<AccessPointClaim?, AllocError> {
     if (!mayNameAccessPoint(token)) { return Ok(null); }
+    // A directory bucket's access point is its own alias (ADR-0082 §5).
+    if (isDirectoryAccessPointShaped(token)) { return storedClaim(st, token); }
     if (accountSuffixed(token)) {
         match (storedClaim(st, token[0..token.length - 13])?) {
             Some(c) => { return Ok(Some(c)); }
@@ -603,14 +605,24 @@ async fn releaseBucketClaims(shared: borrow NodeShared, bucket: Slice<u8>, answe
 async fn routeControl(shared: borrow NodeShared, raw: borrow mut RawMessage) -> Result<RawMessage, NodeFault> {
     let base = "/v20180820/accesspoint".bytes();
     var name = Vector<u8>.create();
-    var policyCall = false;
-    // 0: something else; 1: every access point; 2: a bucket's (its name in `name`); 3: one (its name in `name`).
+    // A call of one's policy or (a directory bucket's, ADR-0082 §2) scope.
+    var subCall = false;
+    // 0: something else; 1: every access point; 2: a bucket's (its name in `name`); 3: one (its name in `name`);
+    // 4: directory buckets' (ADR-0082 §5), only `directoryBucket`'s when `name` has it.
     var kind = 0u8;
     {
         let t = raw.target.view();
         let q = indexOfFrom(t, "?".bytes(), 0) ?? t.length;
         let path = t[0..q];
-        if (path.length >= base.length && path[0..base.length] == base) {
+        if (path == "/v20180820/accesspointfordirectory".bytes()) {
+            kind = 4;
+            match (targetParam(t, "directoryBucket")) {
+                Some(b) => {
+                    if (name.extend(b).isErr()) { return Err(NodeFault.OutOfMemory); }
+                }
+                null => {}
+            }
+        } else if (path.length >= base.length && path[0..base.length] == base) {
             let rest = path[base.length..];
             if (rest.length == 0) {
                 match (targetParam(t, "bucket")) {
@@ -624,9 +636,12 @@ async fn routeControl(shared: borrow NodeShared, raw: borrow mut RawMessage) -> 
                 let tail = rest[1..];
                 let slash = indexOfFrom(tail, "/".bytes(), 0) ?? tail.length;
                 let one = tail[0..slash];
-                if (accessPointNameOk(one) && (slash == tail.length || tail[slash..] == "/policy".bytes())) {
+                let named = accessPointNameOk(one) || isDirectoryAccessPointShaped(one);
+                let sub =
+                    slash == tail.length || tail[slash..] == "/policy".bytes() || tail[slash..] == "/scope".bytes();
+                if (named && sub) {
                     kind = 3;
-                    policyCall = slash < tail.length;
+                    subCall = slash < tail.length;
                     if (name.extend(one).isErr()) { return Err(NodeFault.OutOfMemory); }
                 }
             }
@@ -636,9 +651,12 @@ async fn routeControl(shared: borrow NodeShared, raw: borrow mut RawMessage) -> 
     if (kind == 1 && method == Method.Get) {
         return await mergeShardLists(shared, raw, "AccessPoint", "AccessPointList");
     }
-    if (kind == 2) { return await routeRequest(shared, shardOfBucket(borrow shared.file, name.view()), raw); }
+    if (kind == 2 || (kind == 4 && name.length > 0)) {
+        return await routeRequest(shared, shardOfBucket(borrow shared.file, name.view()), raw);
+    }
+    if (kind == 4 && method == Method.Get) { return await mergeDirectoryAccessPoints(shared, raw); }
     if (kind != 3) { return await routeRequest(shared, 0, raw); }
-    if (method == Method.Put && !policyCall) { return await createThroughClaim(shared, raw, name.view()); }
+    if (method == Method.Put && !subCall) { return await createThroughClaim(shared, raw, name.view()); }
     let claim = match (await findClaim(shared, name.view(), true, true)?) {
         Some(c) => c,
         null => { return Ok(frontError("NoSuchAccessPoint", 404)); }
@@ -650,7 +668,7 @@ async fn routeControl(shared: borrow NodeShared, raw: borrow mut RawMessage) -> 
         "<Code>NoSuchAccessPoint</Code>".bytes(),
         0,
     ).isSome() || indexOfFrom(answer.body.view(), "<Code>NoSuchBucket</Code>".bytes(), 0).isSome()));
-    if (method == Method.Delete && !policyCall && gone) {
+    if (method == Method.Delete && !subCall && gone) {
         let body = match (claimRequest(CLAIM_RELEASE, name.view(), claim.bucket.view(), "".bytes())) {
             Ok(b) => b,
             Err(_) => { return Err(NodeFault.OutOfMemory); }
@@ -717,11 +735,16 @@ async fn createThroughClaim(
     // A request the shard will refuse whatever the claims say goes there without one: no body's bucket, a name S3
     // would not take, no signature.
     if (!found || !bucketNameOk(bucket.view()) || !signedRequest(raw)) { return await routeRequest(shared, 0, raw); }
+    // A directory bucket's access point's alias is its name (ADR-0082 §1); another's, the front's.
     var alias = Vector<u8>.create();
-    match (accessPointAlias(name, mut alias)) {
-        Ok(true) => {}
-        Ok(false) => { return Ok(frontError("InternalError", 500)); }
-        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    if (isDirectoryAccessPointShaped(name)) {
+        if (alias.extend(name).isErr()) { return Err(NodeFault.OutOfMemory); }
+    } else {
+        match (accessPointAlias(name, mut alias)) {
+            Ok(true) => {}
+            Ok(false) => { return Ok(frontError("InternalError", 500)); }
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        }
     }
     let body = match (claimRequest(CLAIM_TAKE, name, bucket.view(), alias.view())) {
         Ok(b) => b,
@@ -751,4 +774,90 @@ async fn createThroughClaim(
         let _ = await tellClaims(shared, CLAIM_ABANDON, name, token, "".bytes())?;
     }
     return Ok(answer);
+}
+
+/// ListAccessPointsForDirectoryBuckets of every bucket on a cluster (ADR-0082 §5): each shard answers its first
+/// `maxResults` after `nextToken` in name order, so the first `maxResults` of them all, merged by name, are the
+/// page; `NextToken` is its last name, in base64, as each shard reads it, when any shard had more.
+async fn mergeDirectoryAccessPoints(
+    shared: borrow NodeShared,
+    raw: borrow RawMessage,
+) -> Result<RawMessage, NodeFault> {
+    var limit: usize = 1000;
+    match (targetParam(raw.target.view(), "maxResults")) {
+        Some(t) => {
+            match (parseDecimal(t)) {
+                Some(v) => { limit = if (v > 1000) 1000 else v as usize; }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    var first: RawMessage? = null;
+    var entries = Vector<Vector<u8>>.create();
+    var names = Vector<Vector<u8>>.create();
+    var more = false;
+    var shard = 0u32;
+    while (shard < shared.file.shards) {
+        let answer = await routeRequest(shared, shard, raw)?;
+        if (answer.status != 200) { return Ok(answer); }
+        let b = answer.body.view();
+        if (indexOfFrom(b, "<NextToken>".bytes(), 0).isSome()) { more = true; }
+        var at = 0usize;
+        while (true) {
+            let open = match (indexOfFrom(b, "<AccessPoint>".bytes(), at)) {
+                Some(i) => i,
+                null => { break; }
+            };
+            let close = match (indexOfFrom(b, "</AccessPoint>".bytes(), open)) {
+                Some(i) => i + "</AccessPoint>".bytes().length,
+                null => { break; }
+            };
+            let entry = b[open..close];
+            let name = match (indexOfFrom(entry, "<Name>".bytes(), 0)) {
+                Some(n) => match (indexOfFrom(entry, "</Name>".bytes(), n)) {
+                    Some(e) => entry[n + 6..e],
+                    null => entry[0..0],
+                },
+                null => entry[0..0],
+            };
+            var e = Vector<u8>.create();
+            var nm = Vector<u8>.create();
+            if (e.extend(entry).isErr() || nm.extend(name).isErr()) { return Err(NodeFault.OutOfMemory); }
+            var k = names.length;
+            while (k > 0 && compareBytes(names[k - 1].view(), nm.view()) > 0) { k -= 1; }
+            if (entries.insert(k, e).isErr() || names.insert(k, nm).isErr()) { return Err(NodeFault.OutOfMemory); }
+            at = close;
+        }
+        if (first.isNull()) { first = Some(answer); }
+        shard += 1;
+    }
+    var page = match (first) {
+        Some(f) => f,
+        null => { return Ok(frontError("InternalError", 500)); }
+    };
+    let shown = if (entries.length > limit) limit else entries.length;
+    if (entries.length > limit) { more = true; }
+    var body = Vector<u8>.create();
+    let built = body.extend(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAccessPointsForDirectoryBucketsResult xmlns=\"".bytes(),
+    ).isOk() &&
+        body.extend(S3_CONTROL_XMLNS.bytes()).isOk() && body.extend("\"><AccessPointList>".bytes()).isOk();
+    if (!built) { return Err(NodeFault.OutOfMemory); }
+    for (i in 0..shown) {
+        if (body.extend(entries[i].view()).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    if (body.extend("</AccessPointList>".bytes()).isErr()) { return Err(NodeFault.OutOfMemory); }
+    if (more && shown > 0) {
+        var token = Vector<u8>.create();
+        let tokened = appendBase64(mut token, names[shown - 1].view()).isOk() &&
+            body.extend("<NextToken>".bytes()).isOk() && body.extend(token.view()).isOk() &&
+            body.extend("</NextToken>".bytes()).isOk();
+        if (!tokened) { return Err(NodeFault.OutOfMemory); }
+    }
+    if (body.extend("</ListAccessPointsForDirectoryBucketsResult>".bytes()).isErr()) {
+        return Err(NodeFault.OutOfMemory);
+    }
+    page.body = body;
+    return Ok(page);
 }

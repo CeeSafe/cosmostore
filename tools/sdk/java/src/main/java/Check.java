@@ -142,6 +142,7 @@ public class Check {
         check("bucket deleted", codeOf(() -> s3.headBucket(r -> r.bucket(b))), "NoSuchBucket");
         M7.run(endpoint, s3);
         Directory.run(endpoint);
+        DirectoryAccessPoints.run(endpoint);
         System.exit(failed ? 1 : 0);
     }
 }

@@ -14,6 +14,7 @@ import {
   GetBucketReplicationCommand, DeleteBucketReplicationCommand, ListDirectoryBucketsCommand, DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import {
+  GetAccessPointScopeCommand, ListAccessPointsForDirectoryBucketsCommand,
   S3ControlClient, CreateAccessPointCommand, GetAccessPointCommand, ListAccessPointsCommand, DeleteAccessPointCommand,
 } from "@aws-sdk/client-s3-control";
 import { STSClient, GetSessionTokenCommand, AssumeRoleCommand } from "@aws-sdk/client-sts";
@@ -258,5 +259,27 @@ for (const sessions of [true, false]) {
   for (const Key of ["a/b.txt", "big/m.bin"]) await d.send(new DeleteObjectCommand({ Bucket: DIR, Key }));
   await d.send(new DeleteBucketCommand({ Bucket: DIR }));
   check("deleted" + how, (await lister.send(new ListDirectoryBucketsCommand({}))).Buckets ?? [], []);
+}
+
+// A directory bucket's access point (ADR-0082): made with a scope, requests through it with the SDK's sessions.
+{
+  const APB = "sdk4--local-az1--x-s3", AP = "sdkjs--local-az1--xa-s3";
+  const d = new S3Client({ endpoint, forcePathStyle: true, region: "us-east-1", maxAttempts: 1 });
+  await d.send(new CreateBucketCommand({ Bucket: APB, CreateBucketConfiguration: {
+    Location: { Type: "AvailabilityZone", Name: "local-az1" }, Bucket: { DataRedundancy: "SingleAvailabilityZone", Type: "Directory" } } }));
+  const made = await ctl.send(new CreateAccessPointCommand({ AccountId: ACCOUNT, Name: AP, Bucket: APB,
+    Scope: { Prefixes: ["pub/"], Permissions: ["GetObject", "PutObject"] } }));
+  check("directory access point: its alias is its name", made.Alias, AP);
+  const scope = (await ctl.send(new GetAccessPointScopeCommand({ AccountId: ACCOUNT, Name: AP }))).Scope;
+  check("GetAccessPointScope", [scope.Prefixes, scope.Permissions], [["pub/"], ["GetObject", "PutObject"]]);
+  check("ListAccessPointsForDirectoryBuckets", (await ctl.send(new ListAccessPointsForDirectoryBucketsCommand({ AccountId: ACCOUNT,
+    DirectoryBucket: APB }))).AccessPointList.map((a) => a.Name), [AP]);
+  await d.send(new PutObjectCommand({ Bucket: AP, Key: "pub/a.txt", Body: "through" }));
+  check("a GET through it", (await bytes((await d.send(new GetObjectCommand({ Bucket: AP, Key: "pub/a.txt" }))).Body)).toString(), "through");
+  check("a key outside its scope", await codeOf(d.send(new GetObjectCommand({ Bucket: AP, Key: "other/a.txt" }))), "AccessDenied");
+  check("a permission outside its scope", await codeOf(d.send(new DeleteObjectCommand({ Bucket: AP, Key: "pub/a.txt" }))), "AccessDenied");
+  await ctl.send(new DeleteAccessPointCommand({ AccountId: ACCOUNT, Name: AP }));
+  await d.send(new DeleteObjectCommand({ Bucket: APB, Key: "pub/a.txt" }));
+  await d.send(new DeleteBucketCommand({ Bucket: APB }));
 }
 process.exit(failed ? 1 : 0);

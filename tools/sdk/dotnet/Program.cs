@@ -372,4 +372,36 @@ foreach (var sessions in new[] { false })
     await d.DeleteBucketAsync(dirBucket);
     Check("deleted" + how, (await dirLister.ListDirectoryBucketsAsync(new ListDirectoryBucketsRequest())).Buckets?.Count ?? 0, 0);
 }
+
+// A directory bucket's access point (ADR-0082): made with a scope; requests through it with sessions off.
+{
+    const string apBucket = "sdk4--local-az1--x-s3", door = "sdknet--local-az1--xa-s3";
+    var d = DirClient(false);
+    await d.PutBucketAsync(new PutBucketRequest
+    {
+        BucketName = apBucket,
+        PutBucketConfiguration = new PutBucketConfiguration
+        {
+            Location = new LocationInfo { Type = LocationType.AvailabilityZone, Name = "local-az1" },
+            BucketInfo = new BucketInfo { DataRedundancy = DataRedundancy.SingleAvailabilityZone, Type = BucketType.Directory },
+        },
+    });
+    var dirAp = await ctl.CreateAccessPointAsync(new Amazon.S3Control.Model.CreateAccessPointRequest
+    {
+        AccountId = account, Name = door, Bucket = apBucket,
+        Scope = new Amazon.S3Control.Model.Scope { Prefixes = new List<string> { "pub/" }, Permissions = new List<string> { "GetObject", "PutObject" } },
+    });
+    Check("directory access point: its alias is its name", dirAp.Alias, door);
+    var scope = (await ctl.GetAccessPointScopeAsync(new Amazon.S3Control.Model.GetAccessPointScopeRequest { AccountId = account, Name = door })).Scope;
+    Check("GetAccessPointScope", string.Join(",", scope.Prefixes) + " " + string.Join(",", scope.Permissions), "pub/ GetObject,PutObject");
+    Check("ListAccessPointsForDirectoryBuckets", string.Join(",", (await ctl.ListAccessPointsForDirectoryBucketsAsync(
+        new Amazon.S3Control.Model.ListAccessPointsForDirectoryBucketsRequest { AccountId = account, DirectoryBucket = apBucket })).AccessPointList.Select(a => a.Name)), door);
+    await d.PutObjectAsync(new PutObjectRequest { BucketName = door, Key = "pub/a.txt", ContentBody = "through" });
+    Check("a GET through it", System.Text.Encoding.UTF8.GetString(await ReadAll(await d.GetObjectAsync(new GetObjectRequest { BucketName = door, Key = "pub/a.txt" }))), "through");
+    Check("a key outside its scope", await CodeOf(() => d.GetObjectAsync(new GetObjectRequest { BucketName = door, Key = "other/a.txt" })), "AccessDenied");
+    Check("a permission outside its scope", await CodeOf(() => d.DeleteObjectAsync(door, "pub/a.txt")), "AccessDenied");
+    await ctl.DeleteAccessPointAsync(new Amazon.S3Control.Model.DeleteAccessPointRequest { AccountId = account, Name = door });
+    await d.DeleteObjectAsync(apBucket, "pub/a.txt");
+    await d.DeleteBucketAsync(apBucket);
+}
 return failed ? 1 : 0;

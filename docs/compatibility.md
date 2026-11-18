@@ -38,7 +38,9 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
   `s3express:CreateSession` stops its sessions at once. RenameObject (ADR-0081) moves an object atomically,
   with its conditions and `x-amz-client-token`; `x-amz-rename-source` may be `/key`, `bucket/key` or `key`. Access
   points of directory buckets (ADR-0082): `<base>--<zone>--xa-s3`, their own alias, with a scope of prefixes and
-  permissions; requests and sessions through them; on `serve` (a cluster refuses them until ADR-0082's slice 2).
+  permissions; requests and sessions through them; on `serve` and on a cluster. Checked with
+  boto3, Go, JavaScript and Java with their sessions, and .NET with them off (ADR-0080 §9); the JavaScript SDK's
+  `/<name>//<key>` is read as `/<name>/<key>` for an access point's name too.
 
 - **boto3** presigns with SigV2 for a custom endpoint unless it is told otherwise:
   `Config(signature_version="s3v4")`. CosmoStore accepts SigV4 only, and refuses SigV2 with S3's `InvalidRequest`.
