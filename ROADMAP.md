@@ -2845,7 +2845,7 @@ Browser form uploads with a SigV4 POST policy.
 
 - The exit review's "no client SDK test of M7's calls": boto3 (33 checks, `s3`, `s3control`, `sts`) and the Go SDK
   v2 (33, `tools/sdk/go/m7.go`) now run access logs, website hosting, inventory, STS, Access Points and
-  replication; `tools/sdk/common.sh` starts serve with M7's options. boto3 178, Go 55, all pass; the JavaScript SDK v3 (33 more, `client-s3-control` and `client-sts`) 61; the .NET SDK (33 more, `AWSSDK.S3Control`, `AWSSDK.SecurityToken`) 55.
+  replication; `tools/sdk/common.sh` starts serve with M7's options. boto3 178, Go 55, all pass; the JavaScript SDK v3 (33 more, `client-s3-control` and `client-sts`) 61; the .NET SDK (33 more, `AWSSDK.S3Control`, `AWSSDK.SecurityToken`) 55; the Java SDK v2 (33 more, `s3control`, `sts`) 58. Every SDK of the matrix now runs M7, which closes that gap of the exit review.
 - **Go found two defects** the CLI and boto3 let pass: S3 Control's errors were S3's `<Error>` form, which Go's
   s3control client reads as UnknownError (now `<ErrorResponse><Error>`, ADR-0076 §1); and a replication rule with its
   `Status` after `DeleteMarkerReplication`, Go's alphabetical order, was MalformedXML (`replicationRuleInAnyOrder`,

@@ -140,6 +140,7 @@ public class Check {
         check("delete objects", del.deleted().size(), ids.size());
         s3.deleteBucket(r -> r.bucket(b));
         check("bucket deleted", codeOf(() -> s3.headBucket(r -> r.bucket(b))), "NoSuchBucket");
+        M7.run(endpoint, s3);
         System.exit(failed ? 1 : 0);
     }
 }

@@ -129,7 +129,9 @@ the cluster smoke passes with the CRT client and the classic one).
 - What ADR-0071 left out: directory buckets and S3 Tables. What each item's ADR lists as not done (multi-Region and
   Object Lambda access points, ORC and Parquet, RTC, a custom website domain without the `<bucket>.` form, a KMS
   service).
-- No client SDK test of M7's calls beyond the AWS CLI (M3's matrix predates them).
+- ~~No client SDK test of M7's calls beyond the AWS CLI (M3's matrix predates them).~~ Closed 18 Nov 2026: boto3
+  and the Go, JavaScript, Java and .NET SDKs each run 33 checks of M7 (`docs/compatibility.md`); Go found two
+  defects, fixed (S3 Control's error form, ADR-0076 §1; replication rules in any order, ADR-0077 §1).
 - Access logs on a cluster are lost with a node (best effort, as S3's are).
 
 ## Verdict
