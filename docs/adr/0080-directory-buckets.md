@@ -112,7 +112,12 @@ only, with S3's limits enforced).
    bucket only in the host name of its CreateSession (`GET /?session` to `<bucket>.<endpoint host>`), whatever the
    addressing style: through an endpoint that is an IP address it sends no bucket at all, which no server can
    answer. So a CRT client needs an endpoint by name, under `serve`'s domain, whose `<bucket>.<name>` resolves
-   (the smokes use `localhost`; CI maps the buckets in `/etc/hosts`).
+   (the smokes use `localhost`; CI maps the buckets in `/etc/hosts`). The other SDKs, against a custom endpoint
+   (the SDK matrix, 18 Nov 2026): boto3, Go, JavaScript and Java work with their sessions and without; Go asks
+   for a session for ListDirectoryBuckets, which has no bucket, and fails before sending (list with sessions
+   off); .NET's S3 Express pre-signer fails before sending on any host that is not AWS's, so .NET works with
+   sessions off only; the JavaScript SDK writes `/<bucket>//<key>`, and a `--x-s3` bucket's path-style key loses
+   one leading `/` here (a directory bucket's key cannot begin with an empty directory).
 
 ## Consequences
 

@@ -2937,4 +2937,9 @@ Browser form uploads with a SigV4 POST policy.
 - **boto3** (201): a directory bucket made, listed, written, read with If-Match, a 12 MiB multipart upload
   (no `-N`), refusals and deletion, with sessions and with them off; `create_session`. The S3 smoke checks the
   ETags, a condition, a listing and an upload's directory. 333 tests, the cluster smoke 106.
-- **Next:** the Go, JavaScript, Java and .NET SDKs' directory bucket checks, then M8's exit.
+- **The rest of the SDK matrix:** Go (73), JavaScript (77) and Java (74) check directory buckets with their sessions
+  and without, .NET (63) without. Found: Go asks for a session for ListDirectoryBuckets, which has no bucket, and
+  fails before sending; .NET's S3 Express pre-signer fails before sending on any non-AWS host; the JavaScript SDK
+  writes `/<bucket>//<key>`, so a `--x-s3` bucket's path-style key loses one leading `/` here (ADR-0080 §9).
+  333 tests and every smoke pass.
+- **Next:** M8's exit review.

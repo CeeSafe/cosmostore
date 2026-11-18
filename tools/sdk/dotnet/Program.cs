@@ -325,4 +325,51 @@ Check("and is a replica", replica.ReplicationStatus?.Value, "REPLICA");
 await s3.DeleteBucketReplicationAsync(new DeleteBucketReplicationRequest { BucketName = rs });
 Check("the replication deleted", await Gone(() => s3.GetBucketReplicationAsync(new GetBucketReplicationRequest { BucketName = rs }),
     r => (r.Configuration?.Rules?.Count ?? 0) == 0, "ReplicationConfigurationNotFoundError"), "gone");
+
+// Directory buckets (ADR-0080), with the SDK's sessions off: with them on, its S3 Express pre-signer takes the request's
+// URI apart as an AWS S3 host name and fails before sending ("Invalid S3 URI") against any other endpoint.
+AmazonS3Client DirClient(bool sessions) => new(new AmazonS3Config
+{
+    ServiceURL = endpoint, ForcePathStyle = true, AuthenticationRegion = "us-east-1", MaxErrorRetry = 0,
+    DisableS3ExpressSessionAuth = !sessions,
+});
+const string dirBucket = "sdk--local-az1--x-s3";
+var dirLister = DirClient(false);
+foreach (var sessions in new[] { false })
+{
+    var how = sessions ? " (sessions)" : " (sessions off)";
+    var d = DirClient(sessions);
+    var dirMade = await d.PutBucketAsync(new PutBucketRequest
+    {
+        BucketName = dirBucket,
+        PutBucketConfiguration = new PutBucketConfiguration
+        {
+            Location = new LocationInfo { Type = LocationType.AvailabilityZone, Name = "local-az1" },
+            BucketInfo = new BucketInfo { DataRedundancy = DataRedundancy.SingleAvailabilityZone, Type = BucketType.Directory },
+        },
+    });
+    Check("create a directory bucket" + how, (int)dirMade.HttpStatusCode, 200);
+    Check("ListDirectoryBuckets" + how, string.Join(",", (await dirLister.ListDirectoryBucketsAsync(new ListDirectoryBucketsRequest())).Buckets.Select(x => x.BucketName)), dirBucket);
+    var dirPut = await d.PutObjectAsync(new PutObjectRequest { BucketName = dirBucket, Key = "a/b.txt", ContentBody = "in a directory" });
+    Check("an ETag that is not the MD5" + how, dirPut.ETag != Md5(System.Text.Encoding.UTF8.GetBytes("in a directory")), true);
+    Check("GET with If-Match" + how, System.Text.Encoding.UTF8.GetString(await ReadAll(await d.GetObjectAsync(new GetObjectRequest
+    {
+        BucketName = dirBucket, Key = "a/b.txt", EtagToMatch = dirPut.ETag,
+    }))), "in a directory");
+    Check("listed" + how, string.Join(",", (await d.ListObjectsV2Async(new ListObjectsV2Request { BucketName = dirBucket, Prefix = "a/" })).S3Objects.Select(o => o.Key)), "a/b.txt");
+    var dirBig = new byte[12 << 20];
+    new Random(4).NextBytes(dirBig);
+    await new TransferUtility(d, new TransferUtilityConfig { MinSizeBeforePartUpload = 5 << 20 }).UploadAsync(new TransferUtilityUploadRequest
+    {
+        BucketName = dirBucket, Key = "big/m.bin", InputStream = new MemoryStream(dirBig), PartSize = 5 << 20,
+    });
+    Check("a multipart ETag without -N" + how, (await d.GetObjectMetadataAsync(dirBucket, "big/m.bin")).ETag.Contains('-'), false);
+    Check("no versioning" + how, await CodeOf(() => d.PutBucketVersioningAsync(new PutBucketVersioningRequest
+    {
+        BucketName = dirBucket, VersioningConfig = new S3BucketVersioningConfig { Status = VersionStatus.Enabled },
+    })), "NotImplemented");
+    foreach (var k in new[] { "a/b.txt", "big/m.bin" }) { await d.DeleteObjectAsync(dirBucket, k); }
+    await d.DeleteBucketAsync(dirBucket);
+    Check("deleted" + how, (await dirLister.ListDirectoryBucketsAsync(new ListDirectoryBucketsRequest())).Buckets?.Count ?? 0, 0);
+}
 return failed ? 1 : 0;

@@ -11,14 +11,20 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
 | AWS CLI v2 | 2.34.13 | `tools/s3_smoke.sh` | 358 | pass |
 | rclone | 1.73.2 | `tools/sdk/rclone.sh` | 20 | pass |
 | boto3 (botocore with CRT) | 1.42.97 | `tools/sdk/boto3.sh` | 201 | pass |
-| AWS SDK for Go v2 | service/s3 1.114.9, s3control 1.81.0, sts 1.52.0 | `tools/sdk/go.sh` | 55 | pass |
-| AWS SDK for JavaScript v3 | client-s3, client-s3-control, client-sts 3.1168.0 | `tools/sdk/js.sh` | 61 | pass |
-| AWS SDK for Java v2 (with aws-crt; s3, s3control, sts) | 2.57.11 | `tools/sdk/java.sh` | 58 | pass |
-| AWS SDK for .NET (with CrtIntegration) | AWSSDK.S3 4.0.104.11, S3Control 4.1.1, SecurityToken 4.1.0.2 | `tools/sdk/dotnet.sh` | 55 | pass |
+| AWS SDK for Go v2 | service/s3 1.114.9, s3control 1.81.0, sts 1.52.0 | `tools/sdk/go.sh` | 73 | pass |
+| AWS SDK for JavaScript v3 | client-s3, client-s3-control, client-sts 3.1168.0 | `tools/sdk/js.sh` | 77 | pass |
+| AWS SDK for Java v2 (with aws-crt; s3, s3control, sts) | 2.57.11 | `tools/sdk/java.sh` | 74 | pass |
+| AWS SDK for .NET (with CrtIntegration) | AWSSDK.S3 4.0.104.11, S3Control 4.1.1, SecurityToken 4.1.0.2 | `tools/sdk/dotnet.sh` | 63 | pass |
 | Ceph s3-tests (subset) | commit 5b39871 | `tools/s3tests/run.sh` | 377 | pass |
 
 ### Client settings to know
 
+- **Directory buckets in the SDK matrix** (ADR-0080): boto3, Go, JavaScript and Java make, list, write (a multipart
+  upload too), read with If-Match, refuse and delete one with the SDK's sessions and with them off; .NET with them
+  off, since its S3 Express pre-signer fails on any endpoint that is not an AWS host name ("Invalid S3 URI", before
+  sending). Go, with sessions on, asks for a session for ListDirectoryBuckets, which has no bucket, and fails
+  before sending: list them with sessions off (`DisableS3ExpressSessionAuth`). The JavaScript SDK writes a
+  directory bucket's paths as `/<bucket>//<key>`, which the server reads as `/<bucket>/<key>`.
 - **Directory buckets with the AWS CRT** (ADR-0080 §9; the AWS CLI's transfer client on newer versions, and the SDKs'
   CRT clients): the CRT names the bucket only in the host of its CreateSession, so use an endpoint by host name
   under the server's domain (`http://localhost:9000` with `serve … localhost`) where `<bucket>.<host>` resolves; an

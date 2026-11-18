@@ -11,7 +11,7 @@ import {
   DeleteBucketWebsiteCommand, PutBucketPolicyCommand, DeleteBucketPolicyCommand, PutBucketInventoryConfigurationCommand,
   GetBucketInventoryConfigurationCommand, ListBucketInventoryConfigurationsCommand,
   DeleteBucketInventoryConfigurationCommand, PutBucketVersioningCommand, PutBucketReplicationCommand,
-  GetBucketReplicationCommand, DeleteBucketReplicationCommand,
+  GetBucketReplicationCommand, DeleteBucketReplicationCommand, ListDirectoryBucketsCommand, DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import {
   S3ControlClient, CreateAccessPointCommand, GetAccessPointCommand, ListAccessPointsCommand, DeleteAccessPointCommand,
@@ -235,4 +235,28 @@ check("the replica keeps its version id and ETag", [replica.VersionId, replica.E
 check("and is a replica", replica.ReplicationStatus, "REPLICA");
 await s3.send(new DeleteBucketReplicationCommand({ Bucket: RS }));
 check("the replication deleted", await codeOf(s3.send(new GetBucketReplicationCommand({ Bucket: RS }))), "ReplicationConfigurationNotFoundError");
+
+// Directory buckets (ADR-0080): with the SDK's sessions (CreateSession) and with them off. ListDirectoryBuckets takes no
+// session, and is listed with sessions off.
+const DIR = "sdk--local-az1--x-s3";
+const lister = new S3Client({ endpoint, forcePathStyle: true, region: "us-east-1", maxAttempts: 1, disableS3ExpressSessionAuth: true });
+for (const sessions of [true, false]) {
+  const how = sessions ? " (sessions)" : " (sessions off)";
+  const d = new S3Client({ endpoint, forcePathStyle: true, region: "us-east-1", maxAttempts: 1, disableS3ExpressSessionAuth: !sessions });
+  const made = await d.send(new CreateBucketCommand({ Bucket: DIR, CreateBucketConfiguration: {
+    Location: { Type: "AvailabilityZone", Name: "local-az1" }, Bucket: { DataRedundancy: "SingleAvailabilityZone", Type: "Directory" } } }));
+  check("create a directory bucket" + how, (made.BucketArn ?? "").endsWith(":bucket/" + DIR), true);
+  check("ListDirectoryBuckets" + how, (await lister.send(new ListDirectoryBucketsCommand({}))).Buckets.map((b) => b.Name), [DIR]);
+  const body = "in a directory";
+  const put = await d.send(new PutObjectCommand({ Bucket: DIR, Key: "a/b.txt", Body: body }));
+  check("an ETag that is not the MD5" + how, put.ETag !== `"${createHash("md5").update(body).digest("hex")}"`, true);
+  check("GET with If-Match" + how, (await bytes((await d.send(new GetObjectCommand({ Bucket: DIR, Key: "a/b.txt", IfMatch: put.ETag }))).Body)).toString(), body);
+  check("listed" + how, (await d.send(new ListObjectsV2Command({ Bucket: DIR, Prefix: "a/" }))).Contents.map((o) => o.Key), ["a/b.txt"]);
+  await new Upload({ client: d, params: { Bucket: DIR, Key: "big/m.bin", Body: randomBytes(12 << 20) }, partSize: 5 << 20, queueSize: 2 }).done();
+  check("a multipart ETag without -N" + how, (await d.send(new HeadObjectCommand({ Bucket: DIR, Key: "big/m.bin" }))).ETag.includes("-"), false);
+  check("no versioning" + how, await codeOf(d.send(new PutBucketVersioningCommand({ Bucket: DIR, VersioningConfiguration: { Status: "Enabled" } }))), "NotImplemented");
+  for (const Key of ["a/b.txt", "big/m.bin"]) await d.send(new DeleteObjectCommand({ Bucket: DIR, Key }));
+  await d.send(new DeleteBucketCommand({ Bucket: DIR }));
+  check("deleted" + how, (await lister.send(new ListDirectoryBucketsCommand({}))).Buckets ?? [], []);
+}
 process.exit(failed ? 1 : 0);

@@ -148,6 +148,7 @@ func main() {
 	_, err = c.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: b})
 	check("bucket deleted", errors.As(err, &nf), true)
 	m7(ctx, cfg, endpoint, c, client)
+	directory(ctx, cfg)
 	if failed {
 		os.Exit(1)
 	}
