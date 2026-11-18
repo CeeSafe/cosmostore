@@ -2840,3 +2840,13 @@ Browser form uploads with a SigV4 POST policy.
 - CI's first cluster smoke failed 9 downloads: its AWS CLI's CRT client signs `content-length: 0` on a GET, which the
   front's HTTP client does not send on. SigV4 now reads a signed `content-length` that did not arrive as 0 when no
   `transfer-encoding` says a body follows (`sigv4MissingZeroLength`).
+
+### 18 Nov 2026: M7's calls in the SDK matrix
+
+- The exit review's "no client SDK test of M7's calls": boto3 (33 checks, `s3`, `s3control`, `sts`) and the Go SDK
+  v2 (33, `tools/sdk/go/m7.go`) now run access logs, website hosting, inventory, STS, Access Points and
+  replication; `tools/sdk/common.sh` starts serve with M7's options. boto3 178, Go 55, all pass.
+- **Go found two defects** the CLI and boto3 let pass: S3 Control's errors were S3's `<Error>` form, which Go's
+  s3control client reads as UnknownError (now `<ErrorResponse><Error>`, ADR-0076 §1); and a replication rule with its
+  `Status` after `DeleteMarkerReplication`, Go's alphabetical order, was MalformedXML (`replicationRuleInAnyOrder`,
+  ADR-0077 §1). 321 tests; the S3, TLS and cluster smokes (CRT client) pass.

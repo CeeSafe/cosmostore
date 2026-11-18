@@ -22,7 +22,9 @@ and ETag; destinations on this server first, other S3 endpoints in a second slic
    versioning while it has rules is InvalidBucketState). At one destination the enabled rule that takes a key with
    the highest `Priority` decides, its delete-marker setting too; two rules giving one priority are InvalidArgument,
    a priority past u32 too, and a `DeleteMarkerReplication` status is `Enabled` or `Disabled` (the M7 review's A3).
-   A destination `StorageClass` other than `STANDARD` is NotImplemented (A2). Filters on tags,
+   A destination `StorageClass` other than `STANDARD` is NotImplemented (A2). A rule's elements may come in any
+   order (the Go SDK writes them alphabetically, the rule's `Status` after `DeleteMarkerReplication`'s; it was
+   MalformedXML until the SDK matrix found it, 18 Nov 2026). Filters on tags,
    `ExistingObjectReplication`, replica
    modification sync, replication time control and destinations elsewhere are NotImplemented.
 2. **Replication rides the outbox.** When a write's record is applied, every enabled rule whose filter takes the key

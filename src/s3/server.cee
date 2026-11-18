@@ -269,22 +269,40 @@ async fn respond(
                     let _ = await AsyncConsole.writeError(request.path());
                     let _ = await AsyncConsole.writeError("\n");
                 }
-                return await sendError(exchange, code, request.path().bytes(), requestId);
+                return await sendError(exchange, code, request.path().bytes(), requestId, isControlCall(request));
             }
             Err(S3Fail.OutOfMemory(_)) => {
                 facts.code = S3Code.InternalError;
-                return await sendError(exchange, S3Code.InternalError, request.path().bytes(), requestId);
+                return await sendError(
+                    exchange,
+                    S3Code.InternalError,
+                    request.path().bytes(),
+                    requestId,
+                    isControlCall(request),
+                );
             }
         }
     }
 }
 
-/// S3's XML error response; after the head was sent, the connection is closed instead.
+/// An S3 Control call (ADR-0076 §1): its path under `/v20180820/`, with the account in `x-amz-account-id`.
+fn isControlCall(request: borrow Request) -> bool {
+    if (!startsWithBytes(request.path().bytes(), "/v20180820/".bytes())) { return false; }
+    let fields = request.headers();
+    for (i in 0..fields.count()) {
+        if (sameIgnoringCase(fields.nameBytes(i), "x-amz-account-id".bytes())) { return true; }
+    }
+    return false;
+}
+
+/// S3's XML error response (S3 Control's wrapped form for its calls); after the head was sent, the connection is
+/// closed instead.
 async fn sendError(
     exchange: borrow mut Exchange,
     code: S3Code,
     resource: Slice<u8>,
     requestId: Slice<u8>,
+    control: bool,
 ) -> Result<void, HandlerError> {
     if (exchange.headSent()) {
         exchange.closeConnection();
@@ -293,7 +311,13 @@ async fn sendError(
     let status = s3Status(code);
     if (status == 304) { return await exchange.send(statusOf(304), "".bytes()); }
     var body = Vector<u8>.create();
-    match (errorXml(mut body, code, resource, requestId)) {
+    let made = if (control) controlErrorXml(mut body, code, requestId) else errorXml(
+        mut body,
+        code,
+        resource,
+        requestId,
+    );
+    match (made) {
         Ok() => {}
         Err(_) => { return Err(HandlerError.Internal); }
     }
@@ -316,6 +340,19 @@ fn errorXml(
     out.extend("</Resource><RequestId>".bytes())?;
     out.extend(requestId)?;
     out.extend("</RequestId></Error>".bytes())?;
+    return Ok();
+}
+
+/// S3 Control's error: `<ErrorResponse><Error>` with the code and message, then the request id (as AWS sends it, and
+/// the Go SDK's s3control client reads it; botocore reads either form).
+fn controlErrorXml(out: borrow mut Vector<u8>, code: S3Code, requestId: Slice<u8>) -> Result<void, AllocError> {
+    out.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ErrorResponse><Error><Code>".bytes())?;
+    out.extend(s3CodeName(code).bytes())?;
+    out.extend("</Code><Message>".bytes())?;
+    appendXmlEscaped(out, s3Message(code).bytes())?;
+    out.extend("</Message></Error><RequestId>".bytes())?;
+    out.extend(requestId)?;
+    out.extend("</RequestId><HostId></HostId></ErrorResponse>".bytes())?;
     return Ok();
 }
 

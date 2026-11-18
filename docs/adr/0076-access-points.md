@@ -20,7 +20,9 @@
    id is taken, kept with the access point and given back in ARNs (`arn:aws:s3:us-east-1:<account>:accesspoint/<name>`);
    another account does not see it (NoSuchAccessPoint), and a `BucketAccountId` other than the account is
    NotImplemented (the M7 review's A5). Long-term keys and
-   their `GetSessionToken` sessions only. On a cluster: ADR-0078 §5.
+   their `GetSessionToken` sessions only. On a cluster: ADR-0078 §5. Their errors are S3 Control's form,
+   `<ErrorResponse><Error><Code>…</Code><Message>…</Message></Error><RequestId>…</RequestId></ErrorResponse>`, which the
+   Go SDK's s3control client needs (it read S3's `<Error>` as UnknownError; found by the SDK matrix, 18 Nov 2026).
 2. **Stored** as a `BucketConfig` of kind 15 on the access point's bucket (checkpoint format 22): name, alias
    (`<name, up to 30>-<20 of a-z 2-7>-s3alias`), block, creation time, policy, and (v2) the account; v1's are read
    with none. Deleting the bucket deletes them.
