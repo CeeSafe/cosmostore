@@ -35,6 +35,12 @@ faults; 3,980 events, 635 again) passed every outbox check, and its per-key sear
 harness then stopped with an exception instead of saying so (fixed here: it reports "not settled"). Inconclusive, not
 a failure: no history has been found that is not linearizable, and the M6 review's 5-minute runs on binfadel settled.
 
+**Settled on Linux, 18 Nov 2026:** a 5-minute `--outbox` run alone on alghobashi (Debian 13, 8 cores, `nice 10`; commit
+2331f79 built on binfadel with ceesafec 0.56.0 and CeeSafe.Web ccda03a, seed 551288550): 3,549 operations (197
+unknown), 48 faults; 1,992 events delivered (1,486 distinct, 506 again after a leader's change), every acknowledged
+PUT's and DELETE's at least once, first deliveries in order, the replicas' bucket exactly the source's 1,486 versions
+and markers; every key linearizable, and the check across keys settled (350 listings, each one moment).
+
 ## Findings
 
 ### A. Taken and not done (the "never silently ignored" rule)

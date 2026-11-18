@@ -2850,3 +2850,7 @@ Browser form uploads with a SigV4 POST policy.
   s3control client reads as UnknownError (now `<ErrorResponse><Error>`, ADR-0076 §1); and a replication rule with its
   `Status` after `DeleteMarkerReplication`, Go's alphabetical order, was MalformedXML (`replicationRuleInAnyOrder`,
   ADR-0077 §1). 321 tests; the S3, TLS and cluster smokes (CRT client) pass.
+- **The outbox run across keys, settled:** the exit review's 5-minute `--outbox` runs on one Mac did not settle the
+  check across keys (four at once). One alone on alghobashi (commit 2331f79, built on binfadel with ceesafec 0.56.0
+  and CeeSafe.Web ccda03a): 3,549 operations, 48 faults, 1,992 events (506 again after a leader's change), every
+  outbox check passed, every key linearizable and the check across keys settled.
