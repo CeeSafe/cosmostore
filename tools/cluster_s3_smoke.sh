@@ -360,7 +360,8 @@ read -r xk xs xt <<< "$(on 1 s3api create-session --bucket b--local-az1--x-s3 --
 express() { python3 -I "$OLDPWD/tools/s3_raw.py" express "http://127.0.0.1:$((BASE + 10 + $1))" "${@:2}"; }
 check "a session from node 1 reads through node 3" "$(express 3 "$xk" "$xs" "$xt" GET /b--local-az1--x-s3/k/one)" "200 in a directory"
 check "but does not write through node 2" "$(express 2 "$xk" "$xs" "$xt" PUT /b--local-az1--x-s3/k/two | cut -d' ' -f1)" 403
-for d in a b c; do on 3 s3 rm --recursive "s3://$d--local-az1--x-s3/" > /dev/null 2>&1; on 3 s3api delete-bucket --bucket "$d--local-az1--x-s3" > /dev/null 2>&1; done
+onl 3 s3 rm --recursive s3://b--local-az1--x-s3/ > /dev/null 2>&1 # the CRT's deletes, by host name too
+for d in a b c; do on 3 s3api delete-bucket --bucket "$d--local-az1--x-s3" > /dev/null 2>&1; done
 check "deleted through node 3" "$(on 1 s3api list-directory-buckets --query 'length(Buckets)' 2>&1)" 0
 
 # Event notifications on a cluster (ADR-0078 §4): the shard's leader delivers, and a new one goes on.

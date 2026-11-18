@@ -1113,7 +1113,7 @@ check "no ListObjects v1" "$(code s3api list-objects --bucket "$dir")" NotImplem
 check "a prefix ends in /" "$(code s3api list-objects-v2 --bucket "$dir" --prefix tr)" InvalidArgument
 check "no STANDARD storage class" "$(code s3api put-object --bucket "$dir" --key t --body dir.txt --storage-class STANDARD)" InvalidArgument
 check "a policy is taken" "$(aws s3api put-bucket-policy --bucket "$dir" --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$dir"'/secret/*"}]}' 2>&1; echo $?)" 0
-aws s3 rm --recursive "s3://$dir/" > /dev/null 2>&1
+dl s3 rm --recursive "s3://$dir/" > /dev/null 2>&1
 aws s3api delete-bucket --bucket "$dir" > /dev/null 2>&1 && pass "delete the directory bucket" || fail "delete the directory bucket"
 
 # Deletes free the space.
