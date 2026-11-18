@@ -1,6 +1,6 @@
 # ADR-0083: S3 Tables and the Iceberg REST catalog (M9)
 
-**Status:** proposed, 19 Nov 2026. The owner: "Next we need s3 tables iceberg". ADR-0079 §1 item 2 and §4 sketched
+**Status:** proposed, 19 Nov 2026. Slices 1 and 2 built the same day. The owner: "Next we need s3 tables iceberg". ADR-0079 §1 item 2 and §4 sketched
 S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR is that design, as M9's one item.
 
 ## Context

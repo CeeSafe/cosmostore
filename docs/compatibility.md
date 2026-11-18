@@ -47,7 +47,19 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
   versionToken (ConflictException when it is not current). A table's `warehouseLocation` is
   `s3://<hash>--table-s3/<table id>`, which an engine reads and writes with S3's calls (not the catalog's
   `.s3tables/` keys, and no bucket call). Policies, maintenance, encryption, tags, replication and the rest are
-  NotImplemented. The Iceberg REST catalog and clusters come in later slices.
+  NotImplemented. CreateTable takes an Iceberg `metadata` schema (not `schemaV2`).
+- **The Iceberg REST catalog** (ADR-0083 §5): `<endpoint>/iceberg`, signed for `s3tables`, the `warehouse` a table
+  bucket's ARN.
+  - **PyIceberg:**
+    - Catalog properties: `"type": "rest"`, `"uri": "<endpoint>/iceberg"`, `"warehouse": "<table bucket ARN>"`,
+      `"rest.sigv4-enabled": "true"`, `"rest.signing-name": "s3tables"`.
+    - Its S3 settings: `s3.endpoint` and the keys.
+    - What it does: creates a table, appends, reads, commits schema and property changes, renames, and purges
+      (`purge_table`, as S3 Tables drops only with `purgeRequested=true`). Its stale commits are refused with 409
+      and retried.
+    - Checked by `tools/iceberg_check.py`.
+  - **Not taken:** staged creates, nested namespaces, views, credential vending, and statistics updates. A table
+    on a cluster comes later.
 
 - **boto3** presigns with SigV2 for a custom endpoint unless it is told otherwise:
   `Config(signature_version="s3v4")`. CosmoStore accepts SigV4 only, and refuses SigV2 with S3's `InvalidRequest`.

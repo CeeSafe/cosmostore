@@ -3084,3 +3084,27 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** `jsonModel`, `tableNamesAndArns`, `tableWarehouseCalls`. The S3 smoke's 22 checks
   (`aws s3tables`), and boto3's 10.
 - **Next:** slice 2, the Iceberg REST catalog, and PyIceberg end to end.
+
+### 19 Nov 2026: M9 slice 2, the Iceberg REST catalog, PyIceberg end to end (ADR-0083 §5)
+
+- **The catalog:** `/iceberg/v1/…`, signed for `s3tables`.
+  - **Config:** `GET /config?warehouse=<ARN>` gives the `prefix` (the ARN, URL-encoded) and its endpoints.
+  - **Namespaces:** list, create (the `owner` property only), load, HEAD and drop.
+  - **Tables:**
+    - **Create:** writes metadata file 0 (format version 2) in the table's warehouse.
+    - **Load and HEAD:** as the spec has them.
+    - **Commit:** checks the requirements against the current file (409 CommitFailedException), applies the
+      updates as PyIceberg's own `update_table_metadata` does, writes the next `<n>-<uuid>.metadata.json` and
+      swaps the record by If-Match. A lost swap is 409 and its file is removed.
+    - **Drop:** with `purgeRequested=true`, as S3 Tables.
+    - **Rename.**
+  - **Errors:** in Iceberg's `{"error":{…}}` shape.
+- **Also:** CreateTable of the S3 Tables API takes AWS's `metadata.iceberg` schema, spec and order, and writes the
+  first metadata file.
+- **Found:** PyIceberg 0.12 retries an append whose commit got 409, on refreshed metadata. So a stale append ends
+  committed, by design, and the check sends the stale commit itself to see the 409. It sends `purgeRequested=True`
+  with a capital T, which is now read either way.
+- **Tests:** `tools/iceberg_check.py` (16 checks: create, two appends read back, a stale commit, schema and partition
+  spec from the S3 Tables API, properties, rename and purge), run by the S3 smoke when `ICEBERG_PYTHON` is set. CI
+  installs PyIceberg for it. Also the unit tests `icebergNewTableMetadata` and `icebergRequirementsAndUpdates`.
+- **Next:** slice 3, the cluster.

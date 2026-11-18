@@ -1,0 +1,86 @@
+// The Iceberg REST catalog (ADR-0083 §5): a new table's metadata, requirements and updates.
+import web_core;
+import web_http;
+import web_server;
+
+fn jsonOf(text: StringView) -> Json => parseJson(text.bytes())!!;
+
+fn textOfJson(j: borrow Json) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    writeJson(mut out, j)!;
+    return out;
+}
+
+@test
+fn icebergNewTableMetadata() -> Result<void, TestFailure> {
+    let request = jsonOf(
+        "{\"name\":\"t\",\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"},{\"id\":2,\"name\":\"tags\",\"required\":false,\"type\":{\"type\":\"list\",\"element-id\":5,\"element\":\"string\",\"element-required\":false}}]},\"partition-spec\":{\"fields\":[{\"source-id\":1,\"field-id\":1000,\"name\":\"a_bucket\",\"transform\":\"bucket[4]\"}]},\"properties\":{\"k\":\"v\"}}",
+    );
+    let m = newTableMetadata(borrow request, "s3://w--table-s3/id".bytes())!!;
+    Check.isTrue(jsonMemberI64(borrow m, "format-version") == Some(2i64), "version 2")?;
+    Check.isTrue(jsonMemberI64(borrow m, "last-column-id") == Some(5i64), "the highest id, nested")?;
+    Check.isTrue(jsonMemberI64(borrow m, "last-partition-id") == Some(1000i64), "the spec's")?;
+    Check.equalBytes("s3://w--table-s3/id".bytes(), jsonMemberText(borrow m, "location")!)?;
+    let noSchema = jsonOf("{\"name\":\"t\"}");
+    Check.isTrue(newTableMetadata(borrow noSchema, "s3://w/x".bytes())!.isNull(), "no schema")?;
+    return Ok();
+}
+
+@test
+fn icebergRequirementsAndUpdates() -> Result<void, TestFailure> {
+    let request = jsonOf(
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}",
+    );
+    var m = newTableMetadata(borrow request, "s3://w--table-s3/id".bytes())!!;
+    let uuid = copyBytes(jsonMemberText(borrow m, "table-uuid")!)!;
+    // A first append: main has no snapshot yet (snapshot-id null).
+    let first = jsonOf("[{\"type\":\"assert-ref-snapshot-id\",\"ref\":\"main\",\"snapshot-id\":null}]");
+    Check.isTrue(checkRequirements(borrow m, borrow first)!.isNull(), "main unset")?;
+    let updates = jsonOf(
+        "[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":8933763417129393145,\"sequence-number\":1,\"timestamp-ms\":1700000000000,\"manifest-list\":\"s3://w--table-s3/id/metadata/snap.avro\",\"summary\":{\"operation\":\"append\"},\"schema-id\":0}},{\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",\"type\":\"branch\",\"snapshot-id\":8933763417129393145},{\"action\":\"set-properties\",\"updates\":{\"owner\":\"x\"}}]",
+    );
+    Check.isTrue(applyUpdates(mut m, borrow updates, "s3://w--table-s3/id".bytes())!.isNull(), "applied")?;
+    Check.isTrue(jsonMemberI64(borrow m, "current-snapshot-id") == Some(8933763417129393145i64), "current")?;
+    Check.isTrue(jsonMemberI64(borrow m, "last-sequence-number") == Some(1i64), "its sequence number")?;
+    Check.equalU64(1, arrayLength(borrow m, "snapshot-log") as u64)?;
+    // Now main is at that snapshot: the first requirement no longer holds; one naming it does.
+    Check.isTrue(checkRequirements(borrow m, borrow first)!.isSome(), "main moved on")?;
+    let second = jsonOf("[{\"type\":\"assert-ref-snapshot-id\",\"ref\":\"main\",\"snapshot-id\":8933763417129393145}]");
+    Check.isTrue(checkRequirements(borrow m, borrow second)!.isNull(), "main at it")?;
+    var uuidReq = Vector<u8>.create();
+    uuidReq.extend("[{\"type\":\"assert-table-uuid\",\"uuid\":\"".bytes())!;
+    uuidReq.extend(uuid.view())!;
+    uuidReq.extend("\"},{\"type\":\"assert-current-schema-id\",\"current-schema-id\":0}]".bytes())!;
+    let both = parseJson(uuidReq.view())!!;
+    Check.isTrue(checkRequirements(borrow m, borrow both)!.isNull(), "its uuid and schema")?;
+    let create = jsonOf("[{\"type\":\"assert-create\"}]");
+    Check.isTrue(checkRequirements(borrow m, borrow create)!.isSome(), "it exists")?;
+    let other = jsonOf("[{\"type\":\"assert-other\"}]");
+    Check.isTrue(checkRequirements(borrow m, borrow other)!.isSome(), "unknown")?;
+    // Updates that are wrong, or not done here.
+    for (bad in [
+        "[{\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",\"type\":\"branch\",\"snapshot-id\":1}]",
+        "[{\"action\":\"set-location\",\"location\":\"s3://elsewhere/t\"}]",
+        "[{\"action\":\"upgrade-format-version\",\"format-version\":3}]",
+        "[{\"action\":\"set-statistics\",\"snapshot-id\":1}]",
+        "[{\"action\":\"add-schema\",\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[]}}]",
+    ]) {
+        var copy = cloneJson(borrow m)!;
+        let update = jsonOf(bad);
+        Check.isTrue(applyUpdates(mut copy, borrow update, "s3://w--table-s3/id".bytes())!.isSome(), bad)?;
+    }
+    // A schema added and made current with -1; a property removed.
+    let evolve = jsonOf(
+        "[{\"action\":\"add-schema\",\"schema\":{\"type\":\"struct\",\"schema-id\":1,\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"},{\"id\":2,\"name\":\"b\",\"required\":false,\"type\":\"string\"}]}},{\"action\":\"set-current-schema\",\"schema-id\":-1},{\"action\":\"remove-properties\",\"removals\":[\"owner\"]}]",
+    );
+    Check.isTrue(applyUpdates(mut m, borrow evolve, "s3://w--table-s3/id".bytes())!.isNull(), "evolved")?;
+    Check.isTrue(jsonMemberI64(borrow m, "current-schema-id") == Some(1i64), "schema 1")?;
+    Check.isTrue(jsonMemberI64(borrow m, "last-column-id") == Some(2i64), "column 2")?;
+    Check.isTrue(jsonMemberText(jsonMember(borrow m, "properties")!, "owner").isNull(), "owner removed")?;
+    Check.isTrue(metadataVersion("s3://w/id/metadata/00012-abc.metadata.json".bytes()) == 12, "a file's version")?;
+    var seg = Vector<u8>.create();
+    encodedSegment("arn:aws:s3tables:us-east-1:0:bucket/b1".bytes(), mut seg)!;
+    Check.equalBytes("arn%3Aaws%3As3tables%3Aus-east-1%3A0%3Abucket%2Fb1".bytes(), seg.view())?;
+    let _ = textOfJson(borrow m);
+    return Ok();
+}

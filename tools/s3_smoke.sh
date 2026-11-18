@@ -1226,6 +1226,16 @@ check "delete-table removes its files" "$(aws s3api list-objects-v2 --bucket "$t
 aws s3tables delete-namespace --table-bucket-arn "$tarn" --namespace sales > /dev/null 2>&1
 aws s3tables delete-table-bucket --table-bucket-arn "$tarn" > /dev/null 2>&1 && pass "delete-table-bucket" || fail "delete-table-bucket"
 check "gone" "$(aws s3tables list-table-buckets --query 'length(tableBuckets)' 2>&1)" 0
+# The Iceberg REST catalog through PyIceberg (ADR-0083 §5), when ICEBERG_PYTHON names a Python that has it.
+if [ -n "${ICEBERG_PYTHON:-}" ]; then
+    if "$ICEBERG_PYTHON" "$here/iceberg_check.py" "http://127.0.0.1:$port" > iceberg.out 2>&1; then
+        pass "PyIceberg: $(grep -c '^ok' iceberg.out) checks"
+    else
+        fail "PyIceberg"; cat iceberg.out
+    fi
+else
+    echo "skip PyIceberg (set ICEBERG_PYTHON to a Python with pyiceberg[pyarrow] and boto3)"
+fi
 
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1

@@ -714,9 +714,8 @@ fn createTable(
     ns: Slice<u8>,
     body: Slice<u8>,
 ) -> Result<TablesAnswer, TablesError> {
-    // An Iceberg schema given here is written as the first metadata file by the Iceberg catalog (slice 2): until
-    // then, refused rather than dropped.
-    let j = tablesBody(body, ["encryptionConfiguration", "storageClassConfiguration", "tags", "metadata"][..])?;
+    // An Iceberg schema given here becomes the table's first metadata file (ADR-0083 §6).
+    let j = tablesBody(body, ["encryptionConfiguration", "storageClassConfiguration", "tags"][..])?;
     let name = copyBytes(jsonMemberText(borrow j, "name") ?? "".bytes())?;
     if (!tableNameOk(name.view(), false)) { return Err(TablesError.BadRequest); }
     if (jsonMemberText(borrow j, "format") != Some("ICEBERG".bytes())) { return Err(TablesError.BadRequest); }
@@ -728,12 +727,29 @@ fn createTable(
     jsonSet(mut rec, "id", jsonString(id.view())?)?;
     jsonSet(mut rec, "createdAt", jsonInteger(now)?)?;
     jsonSet(mut rec, "modifiedAt", jsonInteger(now)?)?;
+    let request: Json? = match (jsonMember(borrow j, "metadata")) {
+        Some(md) => Some(createRequestOfMetadata(md)?),
+        null => null,
+    };
     var generation: u64 = 0;
     {
         let _ = tableBucketRecord(store, bucketName)?;
         let nsKey = catalogKey(CATALOG_NAMESPACES, ns, "".bytes())?;
         if (readRecord(store, hidden.view(), nsKey.view())?.isNull()) { return Err(TablesError.NotFound); }
         let key = catalogKey(CATALOG_TABLES, ns, name.view())?;
+        if (readRecord(store, hidden.view(), key.view())?.isSome()) { return Err(TablesError.Conflict); }
+        match (borrow request) {
+            Some(r) => {
+                let warehouse = warehouseOf(bucketName, id.view())?;
+                let m = match (newTableMetadata(r, warehouse.view())?) {
+                    Some(m) => m,
+                    null => { return Err(TablesError.BadRequest); }
+                };
+                let location = writeMetadata(store, hidden.view(), id.view(), 0, borrow m)?;
+                jsonSet(mut rec, "metadataLocation", Json.Text(location))?;
+            }
+            null => {}
+        }
         let hiddenView = hidden.view();
         let keyView = key.view();
         let recRef = borrow rec;
@@ -1036,8 +1052,8 @@ fn routeTablesSync(
     let m = req.method;
     if (segs.length == 0) { return Err(TablesError.NotImplemented); }
     let top = segs[0].view();
-    // The Iceberg REST catalog is slice 2's (ADR-0083 §5).
-    if (top == "iceberg".bytes()) { return Err(TablesError.NotImplemented); }
+    // The Iceberg REST catalog (ADR-0083 §5).
+    if (top == "iceberg".bytes()) { return icebergRoute(store, req, segs.view()[1..], body); }
     if (top == "get-table".bytes() && segs.length == 1) {
         if (!isMethod(m, Method.Get)) { return Err(TablesError.BadRequest); }
         return getTable(store, req);
@@ -1198,3 +1214,138 @@ fn tableWarehouseRefusal(req: borrow S3Request) -> Result<void, S3Fail> {
     }
     return Err(S3Fail.Code(S3Code.NotImplemented));
 }
+
+/// CreateTable's `metadata` (`{"iceberg":{"schema","partitionSpec","writeOrder","properties"}}`, AWS's camelCase
+/// shapes) as an Iceberg CreateTableRequest. `schemaV2` (nested types) is not done.
+fn createRequestOfMetadata(md: borrow Json) -> Result<Json, TablesError> {
+    let ice = match (jsonMember(md, "iceberg")) {
+        Some(i) => i,
+        null => { return Err(TablesError.BadRequest); }
+    };
+    if (jsonMember(ice, "schemaV2").isSome()) { return Err(TablesError.NotImplemented); }
+    let fields = match (jsonMember(ice, "schema")) {
+        Some(s) => match (jsonMember(s, "fields")) {
+            Some(f) => f,
+            null => { return Err(TablesError.BadRequest); }
+        },
+        null => { return Err(TablesError.BadRequest); }
+    };
+    var out = jsonArray();
+    match (fields) {
+        Json.Array(items) => {
+            for (i in 0..items.length) {
+                let f = borrow items[i];
+                var g = jsonObject();
+                jsonSet(mut g, "id", jsonInteger(jsonMemberI64(f, "id") ?? (truncate<i64>(i) + 1))?)?;
+                jsonSet(mut g, "name", jsonString(jsonMemberText(f, "name") ?? "".bytes())?)?;
+                var required = false;
+                match (jsonMember(f, "required")) {
+                    Some(v) => {
+                        match (v) {
+                            Json.Bool(b) => { required = b; }
+                            _ => {}
+                        }
+                    }
+                    null => {}
+                }
+                jsonSet(mut g, "required", Json.Bool(required))?;
+                jsonSet(mut g, "type", jsonString(jsonMemberText(f, "type") ?? "".bytes())?)?;
+                jsonPush(mut out, g)?;
+            }
+        }
+        _ => { return Err(TablesError.BadRequest); }
+    }
+    var schema = jsonObject();
+    jsonSet(mut schema, "type", jsonString("struct".bytes())?)?;
+    jsonSet(mut schema, "fields", out)?;
+    var request = jsonObject();
+    jsonSet(mut request, "schema", schema)?;
+    match (jsonMember(ice, "partitionSpec")) {
+        Some(ps) => {
+            var specFields = jsonArray();
+            match (jsonMember(ps, "fields")) {
+                Some(fs) => {
+                    match (fs) {
+                        Json.Array(items) => {
+                            for (i in 0..items.length) {
+                                let f = borrow items[i];
+                                var g = jsonObject();
+                                jsonSet(mut g, "source-id", jsonInteger(jsonMemberI64(f, "sourceId") ?? 0)?)?;
+                                jsonSet(
+                                    mut g,
+                                    "field-id",
+                                    jsonInteger(jsonMemberI64(f, "fieldId") ?? (1000 + truncate<i64>(i)))?,
+                                )?;
+                                jsonSet(mut g, "name", jsonString(jsonMemberText(f, "name") ?? "".bytes())?)?;
+                                jsonSet(
+                                    mut g,
+                                    "transform",
+                                    jsonString(jsonMemberText(f, "transform") ?? "identity".bytes())?,
+                                )?;
+                                jsonPush(mut specFields, g)?;
+                            }
+                        }
+                        _ => { return Err(TablesError.BadRequest); }
+                    }
+                }
+                null => {}
+            }
+            var spec = jsonObject();
+            jsonSet(mut spec, "fields", specFields)?;
+            jsonSet(mut request, "partition-spec", spec)?;
+        }
+        null => {}
+    }
+    match (jsonMember(ice, "writeOrder")) {
+        Some(wo) => {
+            var orderFields = jsonArray();
+            match (jsonMember(wo, "fields")) {
+                Some(fs) => {
+                    match (fs) {
+                        Json.Array(items) => {
+                            for (i in 0..items.length) {
+                                let f = borrow items[i];
+                                var g = jsonObject();
+                                jsonSet(mut g, "source-id", jsonInteger(jsonMemberI64(f, "sourceId") ?? 0)?)?;
+                                jsonSet(
+                                    mut g,
+                                    "transform",
+                                    jsonString(jsonMemberText(f, "transform") ?? "identity".bytes())?,
+                                )?;
+                                jsonSet(
+                                    mut g,
+                                    "direction",
+                                    jsonString(jsonMemberText(f, "direction") ?? "asc".bytes())?,
+                                )?;
+                                jsonSet(
+                                    mut g,
+                                    "null-order",
+                                    jsonString(jsonMemberText(f, "nullOrder") ?? "nulls-first".bytes())?,
+                                )?;
+                                jsonPush(mut orderFields, g)?;
+                            }
+                        }
+                        _ => { return Err(TablesError.BadRequest); }
+                    }
+                }
+                null => {}
+            }
+            var order = jsonObject();
+            let orderId = jsonMemberI64(wo, "orderId") ?? (if (orderFields_len(borrow orderFields) > 0) 1i64 else 0i64);
+            jsonSet(mut order, "order-id", jsonInteger(orderId)?)?;
+            jsonSet(mut order, "fields", orderFields)?;
+            jsonSet(mut request, "write-order", order)?;
+        }
+        null => {}
+    }
+    match (jsonMember(ice, "properties")) {
+        Some(p) => { jsonSet(mut request, "properties", cloneJson(p)?)?; }
+        null => {}
+    }
+    return Ok(request);
+}
+
+fn orderFields_len(j: borrow Json) -> usize => match (j) {
+    Json.Array(items) => items.length,
+    _ => 0,
+};

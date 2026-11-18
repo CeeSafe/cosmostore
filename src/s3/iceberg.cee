@@ -1,0 +1,1017 @@
+// The Iceberg REST catalog of S3 Tables (ADR-0083 §5): `/iceberg/v1/…`, signed for `s3tables`, its `{prefix}` a
+// table bucket's ARN. The catalog writes each version's table metadata file (format version 2) in the table's
+// warehouse, checks a commit's requirements against the current one, applies its updates, and swaps the table's
+// record to the new file by If-Match.
+import web_core;
+import web_http;
+import web_server;
+
+/// How many earlier metadata files a table's metadata-log keeps (Iceberg's `write.metadata.previous-versions-max`).
+const ICEBERG_METADATA_LOG_MAX: usize = 100;
+
+/// An Iceberg REST error: `{"error":{"message","type","code"}}`.
+fn icebergError(code: u16, kind: StringView, message: StringView) -> Result<TablesAnswer, TablesError> {
+    var e = jsonObject();
+    jsonSet(mut e, "message", jsonString(message.bytes())?)?;
+    jsonSet(mut e, "type", jsonString(kind.bytes())?)?;
+    jsonSet(mut e, "code", jsonInteger(code as i64)?)?;
+    var j = jsonObject();
+    jsonSet(mut j, "error", e)?;
+    var body = Vector<u8>.create();
+    writeJson(mut body, borrow j)?;
+    return Ok(tablesAnswer(code, body));
+}
+
+fn badRequest(message: StringView) -> Result<TablesAnswer, TablesError> =>
+    icebergError(400, "BadRequestException", message);
+
+fn noSuchNamespace() -> Result<TablesAnswer, TablesError> =>
+    icebergError(404, "NoSuchNamespaceException", "The namespace does not exist.");
+
+fn noSuchTable() -> Result<TablesAnswer, TablesError> =>
+    icebergError(404, "NoSuchTableException", "The table does not exist.");
+
+fn icebergUnsupported() -> Result<TablesAnswer, TablesError> =>
+    icebergError(406, "UnsupportedOperationException", "This Iceberg REST call is not supported here.");
+
+/// A table bucket's ARN, URL-encoded as a path's one segment (the `prefix` the config gives).
+fn encodedSegment(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let hex = "0123456789ABCDEF".bytes();
+    for (c in text) {
+        let plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' ||
+            c == '_' || c == '.' || c == '~';
+        if (plain) {
+            out.push(c)?;
+        } else {
+            out.push('%')?;
+            out.push(hex[(c >> 4) as usize])?;
+            out.push(hex[(c & 15) as usize])?;
+        }
+    }
+    return Ok();
+}
+
+/// The endpoints this catalog has, as `GET /v1/config` lists them.
+const ICEBERG_ENDPOINTS: StringView =
+    "GET /v1/{prefix}/namespaces,POST /v1/{prefix}/namespaces,GET /v1/{prefix}/namespaces/{namespace},HEAD /v1/{prefix}/namespaces/{namespace},DELETE /v1/{prefix}/namespaces/{namespace},GET /v1/{prefix}/namespaces/{namespace}/tables,POST /v1/{prefix}/namespaces/{namespace}/tables,GET /v1/{prefix}/namespaces/{namespace}/tables/{table},HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table},POST /v1/{prefix}/namespaces/{namespace}/tables/{table},DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table},POST /v1/{prefix}/tables/rename";
+
+fn icebergConfig(store: borrow ObjectStore, req: borrow S3Request) -> Result<TablesAnswer, TablesError> {
+    let warehouse = paramOf(req, "warehouse") ?? "".bytes();
+    var none = Vector<u8>.create();
+    let name = match (tableBucketOfArn(warehouse, mut none)?) {
+        Some(n) => n,
+        null => { return badRequest("The warehouse must be a table bucket's ARN."); }
+    };
+    match (tableBucketRecord(store, name.view())) {
+        Ok(_) => {}
+        Err(TablesError.NotFound) => { return icebergError(404, "NoSuchWarehouseException", "No such table bucket."); }
+        Err(e) => { return Err(e); }
+    }
+    var prefix = Vector<u8>.create();
+    encodedSegment(warehouse, mut prefix)?;
+    var overrides = jsonObject();
+    jsonSet(mut overrides, "prefix", Json.Text(prefix))?;
+    var endpoints = jsonArray();
+    for (e in ICEBERG_ENDPOINTS.split(",")) { jsonPush(mut endpoints, jsonString(e.bytes())?)?; }
+    var j = jsonObject();
+    jsonSet(mut j, "defaults", jsonObject())?;
+    jsonSet(mut j, "overrides", overrides)?;
+    jsonSet(mut j, "endpoints", endpoints)?;
+    return tablesJson(borrow j);
+}
+
+// ---- Namespaces ----
+
+fn namespaceJson(name: Slice<u8>) -> Result<Json, AllocError> => namespaceArray(name);
+
+fn icebergListNamespaces(
+    store: borrow ObjectStore,
+    req: borrow S3Request,
+    bucket: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucket)?;
+    var list = jsonArray();
+    // One level only: a parent has no children.
+    if (paramOf(req, "parent").isNull()) {
+        let keys = catalogKeys(store, hidden.view(), CATALOG_NAMESPACES.bytes(), "".bytes(), 0)?;
+        for (i in 0..keys.length) {
+            jsonPush(mut list, namespaceJson(keys[i].view()[CATALOG_NAMESPACES.bytes().length..])?)?;
+        }
+    }
+    var j = jsonObject();
+    jsonSet(mut j, "namespaces", list)?;
+    return tablesJson(borrow j);
+}
+
+fn namespaceExists(store: borrow ObjectStore, hidden: Slice<u8>, ns: Slice<u8>) -> Result<bool, TablesError> {
+    let key = catalogKey(CATALOG_NAMESPACES, ns, "".bytes())?;
+    return Ok(readRecord(store, hidden, key.view())?.isSome());
+}
+
+fn icebergCreateNamespace(
+    store: borrow mut ObjectStore,
+    bucket: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let j = match (parseJson(body)?) {
+        Some(j) => j,
+        null => { return badRequest("The body is not JSON."); }
+    };
+    let ns = match (singleNamespace(borrow j)) {
+        Ok(n) => n,
+        Err(_) => { return badRequest("A namespace is one level here."); }
+    };
+    if (!tableNameOk(ns.view(), true)) { return badRequest("A namespace is 1 to 255 of a-z, 0-9 and _."); }
+    // Only `owner`, as S3 Tables keeps.
+    match (jsonMember(borrow j, "properties")) {
+        Some(p) => {
+            match (p) {
+                Json.Object(ms) => {
+                    for (i in 0..ms.length) {
+                        if (ms[i].key.view() != "owner".bytes()) {
+                            return badRequest("Only the owner property is kept.");
+                        }
+                    }
+                }
+                _ => { return badRequest("The properties must be an object."); }
+            }
+        }
+        null => {}
+    }
+    let hidden = tableWarehouseBucket(bucket)?;
+    var id = Vector<u8>.create();
+    if (!newUuid(mut id)?) { return Err(TablesError.Internal); }
+    var rec = jsonObject();
+    jsonSet(mut rec, "id", Json.Text(id))?;
+    jsonSet(mut rec, "createdAt", jsonInteger(Clock.unixMillis())?)?;
+    let key = catalogKey(CATALOG_NAMESPACES, ns.view(), "".bytes())?;
+    match (writeRecord(store, hidden.view(), key.view(), borrow rec, PutCondition.IfAbsent)) {
+        Ok(_) => {}
+        Err(TablesError.Conflict) => {
+            return icebergError(409, "AlreadyExistsException", "The namespace already exists.");
+        }
+        Err(e) => { return Err(e); }
+    }
+    var answer = jsonObject();
+    jsonSet(mut answer, "namespace", namespaceJson(ns.view())?)?;
+    jsonSet(mut answer, "properties", jsonObject())?;
+    return tablesJson(borrow answer);
+}
+
+fn icebergNamespace(
+    store: borrow mut ObjectStore,
+    m: Method,
+    bucket: Slice<u8>,
+    ns: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucket)?;
+    if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
+    if (isMethod(m, Method.Head)) { return Ok(tablesNoContent()); }
+    if (isMethod(m, Method.Get)) {
+        var answer = jsonObject();
+        jsonSet(mut answer, "namespace", namespaceJson(ns)?)?;
+        jsonSet(mut answer, "properties", jsonObject())?;
+        return tablesJson(borrow answer);
+    }
+    if (isMethod(m, Method.Delete)) {
+        return match (deleteNamespace(store, bucket, ns)) {
+            Ok(a) => Ok(a),
+            Err(TablesError.Conflict) => icebergError(409, "NamespaceNotEmptyException", "The namespace has tables."),
+            Err(e) => Err(e),
+        };
+    }
+    return icebergUnsupported();
+}
+
+// ---- Table metadata ----
+
+/// The highest field id a schema's type assigns: struct fields, list elements and map keys and values, nested.
+fn highestFieldId(t: borrow Json) -> i64 {
+    var top: i64 = 0;
+    match (jsonMember(t, "fields")) {
+        Some(fs) => {
+            match (fs) {
+                Json.Array(items) => {
+                    for (i in 0..items.length) {
+                        let f = borrow items[i];
+                        let id = jsonMemberI64(f, "id") ?? 0;
+                        if (id > top) { top = id; }
+                        match (jsonMember(f, "type")) {
+                            Some(ty) => {
+                                let inner = highestFieldId(ty);
+                                if (inner > top) { top = inner; }
+                            }
+                            null => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    for (k in ["element-id", "key-id", "value-id"]) {
+        let id = jsonMemberI64(t, k) ?? 0;
+        if (id > top) { top = id; }
+    }
+    for (k in ["element", "key", "value"]) {
+        match (jsonMember(t, k)) {
+            Some(inner) => {
+                let id = highestFieldId(inner);
+                if (id > top) { top = id; }
+            }
+            null => {}
+        }
+    }
+    return top;
+}
+
+fn highestPartitionFieldId(spec: borrow Json, floor: i64) -> i64 {
+    var top = floor;
+    match (jsonMember(spec, "fields")) {
+        Some(fs) => {
+            match (fs) {
+                Json.Array(items) => {
+                    for (i in 0..items.length) {
+                        let id = jsonMemberI64(borrow items[i], "field-id") ?? 0;
+                        if (id > top) { top = id; }
+                    }
+                }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    return top;
+}
+
+fn arrayLength(j: borrow Json, key: StringView) -> usize => match (jsonMember(j, key)) {
+    Some(v) => match (v) {
+        Json.Array(items) => items.length,
+        _ => 0,
+    },
+    null => 0,
+};
+
+/// Whether an array member holds an element whose `idKey` is `id`.
+fn hasId(j: borrow Json, key: StringView, idKey: StringView, id: i64) -> bool {
+    match (jsonMember(j, key)) {
+        Some(v) => {
+            match (v) {
+                Json.Array(items) => {
+                    for (i in 0..items.length) {
+                        if (jsonMemberI64(borrow items[i], idKey) == Some(id)) { return true; }
+                    }
+                }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    return false;
+}
+
+fn appendTo(m: borrow mut Json, key: StringView, value: Json) -> Result<void, AllocError> {
+    match (jsonMemberMut(m, key)) {
+        Some(a) => { return jsonPush(a, value); }
+        null => {}
+    }
+    var a = jsonArray();
+    jsonPush(mut a, value)?;
+    return jsonSet(m, key, a);
+}
+
+/// The last element's `idKey` of an array member: what `-1` means in a set-current-schema and the like.
+fn lastId(j: borrow Json, key: StringView, idKey: StringView) -> i64? => match (jsonMember(j, key)) {
+    Some(v) => match (v) {
+        Json.Array(items) => if (items.length == 0) null else jsonMemberI64(borrow items[items.length - 1], idKey),
+        _ => null,
+    },
+    null => null,
+};
+
+/// A new table's first metadata (format version 2) from a CreateTableRequest: its schema as schema 0, its spec as
+/// spec 0, its order, its properties, and the warehouse as its location.
+fn newTableMetadata(request: borrow Json, location: Slice<u8>) -> Result<Json?, TablesError> {
+    var schema = match (jsonMember(request, "schema")) {
+        Some(s) => cloneJson(s)?,
+        null => { return Ok(null); }
+    };
+    if (jsonMemberText(borrow schema, "type") != Some("struct".bytes())) { return Ok(null); }
+    jsonSet(mut schema, "schema-id", jsonInteger(0)?)?;
+    let lastColumn = highestFieldId(borrow schema);
+    var spec = match (jsonMember(request, "partition-spec")) {
+        Some(s) => cloneJson(s)?,
+        null => {
+            var s = jsonObject();
+            jsonSet(mut s, "fields", jsonArray())?;
+            s
+        }
+    };
+    jsonSet(mut spec, "spec-id", jsonInteger(0)?)?;
+    let lastPartition = highestPartitionFieldId(borrow spec, 999);
+    var order = match (jsonMember(request, "write-order")) {
+        Some(o) => cloneJson(o)?,
+        null => {
+            var o = jsonObject();
+            jsonSet(mut o, "order-id", jsonInteger(0)?)?;
+            jsonSet(mut o, "fields", jsonArray())?;
+            o
+        }
+    };
+    let orderId = jsonMemberI64(borrow order, "order-id") ?? 0;
+    jsonSet(mut order, "order-id", jsonInteger(orderId)?)?;
+    let properties = match (jsonMember(request, "properties")) {
+        Some(p) => cloneJson(p)?,
+        null => jsonObject(),
+    };
+    var uuid = Vector<u8>.create();
+    if (!newUuid(mut uuid)?) { return Err(TablesError.Internal); }
+    var m = jsonObject();
+    jsonSet(mut m, "format-version", jsonInteger(2)?)?;
+    jsonSet(mut m, "table-uuid", Json.Text(uuid))?;
+    jsonSet(mut m, "location", jsonString(location)?)?;
+    jsonSet(mut m, "last-sequence-number", jsonInteger(0)?)?;
+    jsonSet(mut m, "last-updated-ms", jsonInteger(Clock.unixMillis())?)?;
+    jsonSet(mut m, "last-column-id", jsonInteger(lastColumn)?)?;
+    var schemas = jsonArray();
+    jsonPush(mut schemas, schema)?;
+    jsonSet(mut m, "schemas", schemas)?;
+    jsonSet(mut m, "current-schema-id", jsonInteger(0)?)?;
+    var specs = jsonArray();
+    jsonPush(mut specs, spec)?;
+    jsonSet(mut m, "partition-specs", specs)?;
+    jsonSet(mut m, "default-spec-id", jsonInteger(0)?)?;
+    jsonSet(mut m, "last-partition-id", jsonInteger(lastPartition)?)?;
+    var orders = jsonArray();
+    jsonPush(mut orders, order)?;
+    jsonSet(mut m, "sort-orders", orders)?;
+    jsonSet(mut m, "default-sort-order-id", jsonInteger(orderId)?)?;
+    jsonSet(mut m, "properties", properties)?;
+    jsonSet(mut m, "current-snapshot-id", jsonInteger(-1)?)?;
+    jsonSet(mut m, "refs", jsonObject())?;
+    jsonSet(mut m, "snapshots", jsonArray())?;
+    jsonSet(mut m, "snapshot-log", jsonArray())?;
+    jsonSet(mut m, "metadata-log", jsonArray())?;
+    return Ok(Some(m));
+}
+
+/// Why a commit is refused: a requirement that does not hold (409), or an update this catalog does not apply
+/// or that is wrong (400).
+enum CommitRefusal {
+    Requirement,
+    Update,
+}
+
+/// Each requirement against the current metadata (ADR-0083 §5).
+fn checkRequirements(m: borrow Json, requirements: borrow Json) -> Result<CommitRefusal?, AllocError> {
+    let items = match (requirements) {
+        Json.Array(items) => items,
+        _ => { return Ok(Some(CommitRefusal.Update)); }
+    };
+    for (i in 0..items.length) {
+        let r = borrow items[i];
+        let kind = jsonMemberText(r, "type") ?? "".bytes();
+        let holds = if (kind == "assert-create".bytes()) {
+            false // the table exists
+        } else if (kind == "assert-table-uuid".bytes()) {
+            jsonMemberText(r, "uuid") == jsonMemberText(m, "table-uuid")
+        } else if (kind == "assert-ref-snapshot-id".bytes()) {
+            let refName = jsonMemberText(r, "ref") ?? "".bytes();
+            let current: i64? = match (jsonMember(m, "refs")) {
+                Some(refs) => match (refs) {
+                    Json.Object(ms) => {
+                        var found: i64? = null;
+                        for (k in 0..ms.length) {
+                            if (ms[k].key.view() == refName) {
+                                found = jsonMemberI64(borrow ms[k].value, "snapshot-id");
+                            }
+                        }
+                        found
+                    },
+                    _ => null,
+                },
+                null => null,
+            };
+            let wanted = match (jsonMember(r, "snapshot-id")) {
+                Some(v) => jsonI64(v),
+                null => null,
+            };
+            current == wanted
+        } else if (kind == "assert-last-assigned-field-id".bytes()) {
+            jsonMemberI64(r, "last-assigned-field-id") == jsonMemberI64(m, "last-column-id")
+        } else if (kind == "assert-current-schema-id".bytes()) {
+            jsonMemberI64(r, "current-schema-id") == jsonMemberI64(m, "current-schema-id")
+        } else if (kind == "assert-last-assigned-partition-id".bytes()) {
+            jsonMemberI64(r, "last-assigned-partition-id") == jsonMemberI64(m, "last-partition-id")
+        } else if (kind == "assert-default-spec-id".bytes()) {
+            jsonMemberI64(r, "default-spec-id") == jsonMemberI64(m, "default-spec-id")
+        } else if (kind == "assert-default-sort-order-id".bytes()) {
+            jsonMemberI64(r, "default-sort-order-id") == jsonMemberI64(m, "default-sort-order-id")
+        } else {
+            return Ok(Some(CommitRefusal.Update)); // an unknown requirement: 400
+        };
+        if (!holds) { return Ok(Some(CommitRefusal.Requirement)); }
+    }
+    return Ok(null);
+}
+
+/// Applies a commit's updates to `m`, as Iceberg's own catalogs do; Update for one not done or not valid.
+fn applyUpdates(m: borrow mut Json, updates: borrow Json, warehouse: Slice<u8>) -> Result<CommitRefusal?, AllocError> {
+    let items = match (updates) {
+        Json.Array(items) => items,
+        _ => { return Ok(Some(CommitRefusal.Update)); }
+    };
+    var addedSnapshots = Vector<i64>.create();
+    let now = Clock.unixMillis();
+    for (i in 0..items.length) {
+        let u = borrow items[i];
+        let action = jsonMemberText(u, "action") ?? "".bytes();
+        if (action == "assign-uuid".bytes()) {
+            let uuid = jsonMemberText(u, "uuid") ?? "".bytes();
+            if (uuid.length == 0) { return Ok(Some(CommitRefusal.Update)); }
+            jsonSet(m, "table-uuid", jsonString(uuid)?)?;
+        } else if (action == "upgrade-format-version".bytes()) {
+            let v = jsonMemberI64(u, "format-version") ?? 0;
+            if (v != 2) { return Ok(Some(CommitRefusal.Update)); } // version 2 tables only
+        } else if (action == "add-schema".bytes()) {
+            let schema = match (jsonMember(u, "schema")) {
+                Some(s) => cloneJson(s)?,
+                null => { return Ok(Some(CommitRefusal.Update)); }
+            };
+            let id = jsonMemberI64(borrow schema, "schema-id") ?? -1;
+            if (id < 0 || hasId(m, "schemas", "schema-id", id)) { return Ok(Some(CommitRefusal.Update)); }
+            let highest = highestFieldId(borrow schema);
+            let last = jsonMemberI64(m, "last-column-id") ?? 0;
+            appendTo(m, "schemas", schema)?;
+            jsonSet(m, "last-column-id", jsonInteger(if (highest > last) highest else last)?)?;
+        } else if (action == "set-current-schema".bytes()) {
+            var id = jsonMemberI64(u, "schema-id") ?? -2;
+            if (id == -1) { id = lastId(m, "schemas", "schema-id") ?? -2; }
+            if (!hasId(m, "schemas", "schema-id", id)) { return Ok(Some(CommitRefusal.Update)); }
+            jsonSet(m, "current-schema-id", jsonInteger(id)?)?;
+        } else if (action == "add-spec".bytes()) {
+            let spec = match (jsonMember(u, "spec")) {
+                Some(s) => cloneJson(s)?,
+                null => { return Ok(Some(CommitRefusal.Update)); }
+            };
+            let id = jsonMemberI64(borrow spec, "spec-id") ?? -1;
+            if (id < 0 || hasId(m, "partition-specs", "spec-id", id)) { return Ok(Some(CommitRefusal.Update)); }
+            let last = highestPartitionFieldId(borrow spec, jsonMemberI64(m, "last-partition-id") ?? 999);
+            appendTo(m, "partition-specs", spec)?;
+            jsonSet(m, "last-partition-id", jsonInteger(last)?)?;
+        } else if (action == "set-default-spec".bytes()) {
+            var id = jsonMemberI64(u, "spec-id") ?? -2;
+            if (id == -1) { id = lastId(m, "partition-specs", "spec-id") ?? -2; }
+            if (!hasId(m, "partition-specs", "spec-id", id)) { return Ok(Some(CommitRefusal.Update)); }
+            jsonSet(m, "default-spec-id", jsonInteger(id)?)?;
+        } else if (action == "add-sort-order".bytes()) {
+            let order = match (jsonMember(u, "sort-order")) {
+                Some(o) => cloneJson(o)?,
+                null => { return Ok(Some(CommitRefusal.Update)); }
+            };
+            let id = jsonMemberI64(borrow order, "order-id") ?? -1;
+            if (id < 0 || hasId(m, "sort-orders", "order-id", id)) { return Ok(Some(CommitRefusal.Update)); }
+            appendTo(m, "sort-orders", order)?;
+        } else if (action == "set-default-sort-order".bytes()) {
+            var id = jsonMemberI64(u, "sort-order-id") ?? -2;
+            if (id == -1) { id = lastId(m, "sort-orders", "order-id") ?? -2; }
+            if (!hasId(m, "sort-orders", "order-id", id)) { return Ok(Some(CommitRefusal.Update)); }
+            jsonSet(m, "default-sort-order-id", jsonInteger(id)?)?;
+        } else if (action == "add-snapshot".bytes()) {
+            let snapshot = match (jsonMember(u, "snapshot")) {
+                Some(s) => cloneJson(s)?,
+                null => { return Ok(Some(CommitRefusal.Update)); }
+            };
+            let id = match (jsonMemberI64(borrow snapshot, "snapshot-id")) {
+                Some(v) => v,
+                null => { return Ok(Some(CommitRefusal.Update)); }
+            };
+            if (hasId(m, "snapshots", "snapshot-id", id) || jsonMemberText(borrow snapshot, "manifest-list").isNull()) {
+                return Ok(Some(CommitRefusal.Update));
+            }
+            let sequence = jsonMemberI64(borrow snapshot, "sequence-number");
+            let lastSequence = jsonMemberI64(m, "last-sequence-number") ?? 0;
+            match (sequence) {
+                Some(s) => {
+                    if (s <= lastSequence && jsonMember(borrow snapshot, "parent-snapshot-id").isSome()) {
+                        return Ok(Some(CommitRefusal.Update));
+                    }
+                    jsonSet(m, "last-sequence-number", jsonInteger(s)?)?;
+                }
+                null => {}
+            }
+            let stamp = jsonMemberI64(borrow snapshot, "timestamp-ms") ?? now;
+            appendTo(m, "snapshots", snapshot)?;
+            jsonSet(m, "last-updated-ms", jsonInteger(stamp)?)?;
+            addedSnapshots.push(id)?;
+        } else if (action == "set-snapshot-ref".bytes()) {
+            let refName = copyBytes(jsonMemberText(u, "ref-name") ?? "".bytes())?;
+            let id = jsonMemberI64(u, "snapshot-id") ?? -1;
+            let kind = jsonMemberText(u, "type") ?? "".bytes();
+            if (refName.length == 0 || (kind != "branch".bytes() && kind != "tag".bytes())) {
+                return Ok(Some(CommitRefusal.Update));
+            }
+            if (!hasId(m, "snapshots", "snapshot-id", id)) { return Ok(Some(CommitRefusal.Update)); }
+            var r = jsonObject();
+            jsonSet(mut r, "snapshot-id", jsonInteger(id)?)?;
+            jsonSet(mut r, "type", jsonString(kind)?)?;
+            for (k in ["max-ref-age-ms", "max-snapshot-age-ms", "min-snapshots-to-keep"]) {
+                match (jsonMember(u, k)) {
+                    Some(v) => {
+                        match (v) {
+                            Json.Null => {}
+                            _ => { jsonSet(mut r, k, cloneJson(v)?)?; }
+                        }
+                    }
+                    null => {}
+                }
+            }
+            match (jsonMemberMut(m, "refs")) {
+                Some(refs) => { jsonSet(refs, textOfRef(refName.view()), r)?; }
+                null => {
+                    var refs = jsonObject();
+                    jsonSet(mut refs, textOfRef(refName.view()), r)?;
+                    jsonSet(m, "refs", refs)?;
+                }
+            }
+            if (refName.view() == "main".bytes()) {
+                jsonSet(m, "current-snapshot-id", jsonInteger(id)?)?;
+                let stamp = if (holdsId(addedSnapshots.view(), id)) jsonMemberI64(m, "last-updated-ms") ?? now else now;
+                var entry = jsonObject();
+                jsonSet(mut entry, "snapshot-id", jsonInteger(id)?)?;
+                jsonSet(mut entry, "timestamp-ms", jsonInteger(stamp)?)?;
+                appendTo(m, "snapshot-log", entry)?;
+                jsonSet(m, "last-updated-ms", jsonInteger(stamp)?)?;
+            }
+        } else if (action == "remove-snapshots".bytes()) {
+            var gone = Vector<i64>.create();
+            match (jsonMember(u, "snapshot-ids")) {
+                Some(v) => {
+                    match (v) {
+                        Json.Array(ids) => {
+                            for (k in 0..ids.length) { gone.push(jsonI64(borrow ids[k]) ?? -1)?; }
+                        }
+                        _ => { return Ok(Some(CommitRefusal.Update)); }
+                    }
+                }
+                null => { return Ok(Some(CommitRefusal.Update)); }
+            }
+            for (k in 0..gone.length) {
+                if (!hasId(m, "snapshots", "snapshot-id", gone[k])) { return Ok(Some(CommitRefusal.Update)); }
+            }
+            match (jsonMemberMut(m, "snapshots")) {
+                Some(s) => {
+                    match (s) {
+                        Json.Array(kept) => {
+                            kept.retain((x) => !holdsId(gone.view(), jsonMemberI64(x, "snapshot-id") ?? -1));
+                        }
+                        _ => {}
+                    }
+                }
+                null => {}
+            }
+        } else if (action == "remove-snapshot-ref".bytes()) {
+            let refName = copyBytes(jsonMemberText(u, "ref-name") ?? "".bytes())?;
+            match (jsonMemberMut(m, "refs")) {
+                Some(refs) => { jsonRemove(refs, refName.view()); }
+                null => {}
+            }
+            if (refName.view() == "main".bytes()) { jsonSet(m, "current-snapshot-id", jsonInteger(-1)?)?; }
+        } else if (action == "set-location".bytes()) {
+            let location = jsonMemberText(u, "location") ?? "".bytes();
+            // Within the table's warehouse only, where its files are (ADR-0083 §4).
+            if (location != warehouse && !startsWithBytes(location, warehouse)) {
+                return Ok(Some(CommitRefusal.Update));
+            }
+            jsonSet(m, "location", jsonString(location)?)?;
+        } else if (action == "set-properties".bytes()) {
+            let changes = match (jsonMember(u, "updates")) {
+                Some(c) => cloneJson(c)?,
+                null => { return Ok(Some(CommitRefusal.Update)); }
+            };
+            match (changes) {
+                Json.Object(ms) => {
+                    for (k in 0..ms.length) {
+                        let key = copyBytes(ms[k].key.view())?;
+                        let value = cloneJson(borrow ms[k].value)?;
+                        match (jsonMemberMut(m, "properties")) {
+                            Some(p) => { jsonSet(p, textOfRef(key.view()), value)?; }
+                            null => {}
+                        }
+                    }
+                }
+                _ => { return Ok(Some(CommitRefusal.Update)); }
+            }
+        } else if (action == "remove-properties".bytes()) {
+            match (jsonMember(u, "removals")) {
+                Some(v) => {
+                    match (v) {
+                        Json.Array(keys) => {
+                            for (k in 0..keys.length) {
+                                match (borrow keys[k]) {
+                                    Json.Text(t) => {
+                                        let key = copyBytes(t.view())?;
+                                        match (jsonMemberMut(m, "properties")) {
+                                            Some(p) => { jsonRemove(p, key.view()); }
+                                            null => {}
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => { return Ok(Some(CommitRefusal.Update)); }
+                    }
+                }
+                null => { return Ok(Some(CommitRefusal.Update)); }
+            }
+        } else {
+            return Ok(Some(CommitRefusal.Update)); // statistics, removing schemas or specs, and the rest: not done
+        }
+    }
+    return Ok(null);
+}
+
+/// A key as a StringView, for `jsonSet` (keys are the client's, checked UTF-8 by the parser's caller here).
+fn textOfRef(key: Slice<u8>) -> StringView => StringView.fromUtf8(key) ?? "";
+
+// ---- Metadata files ----
+
+/// The key a metadata location names in the table bucket's hidden bucket; null if it is not there.
+fn metadataKey<region a>(location: Slice<a, u8>, hidden: Slice<u8>) -> Slice<a, u8>? {
+    let scheme = "s3://".bytes();
+    if (!startsWithBytes(location, scheme)) { return null; }
+    let rest = location[scheme.length..];
+    if (!startsWithBytes(rest, hidden) || rest.length <= hidden.length || rest[hidden.length] != '/') { return null; }
+    return Some(rest[hidden.length + 1..]);
+}
+
+fn holdsId(ids: Slice<i64>, id: i64) -> bool {
+    for (x in ids) {
+        if (x == id) { return true; }
+    }
+    return false;
+}
+
+fn readMetadata(store: borrow ObjectStore, hidden: Slice<u8>, location: Slice<u8>) -> Result<Json, TablesError> {
+    let key = match (metadataKey(location, hidden)) {
+        Some(k) => k,
+        null => { return Err(TablesError.Internal); }
+    };
+    let bytes = match (store.getObject(catalogText(hidden), catalogText(key))) {
+        Ok(b) => b,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    return match (parseJson(bytes.view())?) {
+        Some(j) => Ok(j),
+        null => Err(TablesError.Internal),
+    };
+}
+
+/// The version number a metadata file's name begins with (`00003-<uuid>.metadata.json`), or -1.
+fn metadataVersion(location: Slice<u8>) -> i64 {
+    var slash = 0usize;
+    for (i in 0..location.length) {
+        if (location[i] == '/') { slash = i + 1; }
+    }
+    let name = location[slash..];
+    let dash = pieceEnd(name, 0, '-');
+    return parseJsonInteger(name[0..dash]) ?? -1;
+}
+
+/// Writes `m` as the table's metadata file of version `n`; its location.
+fn writeMetadata(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    tableId: Slice<u8>,
+    n: i64,
+    m: borrow Json,
+) -> Result<Vector<u8>, TablesError> {
+    var key = copyBytes(tableId)?;
+    key.extend("/metadata/".bytes())?;
+    var digits = Vector<u8>.create();
+    appendDecimal(mut digits, truncate<u64>(n))?;
+    for (i in digits.length..5) { key.push('0')?; }
+    key.extend(digits.view())?;
+    key.push('-')?;
+    if (!newUuid(mut key)?) { return Err(TablesError.Internal); }
+    key.extend(".metadata.json".bytes())?;
+    var body = Vector<u8>.create();
+    writeJson(mut body, m)?;
+    match (store.putObject(
+        catalogText(hidden),
+        catalogText(key.view()),
+        "application/json",
+        body.view(),
+        PutCondition.IfAbsent,
+    )) {
+        Ok(_) => {}
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    }
+    var location = copyBytes("s3://".bytes())?;
+    location.extend(hidden)?;
+    location.push('/')?;
+    location.extend(key.view())?;
+    return Ok(location);
+}
+
+fn loadResult(location: Slice<u8>, m: Json) -> Result<TablesAnswer, TablesError> {
+    var j = jsonObject();
+    jsonSet(mut j, "metadata-location", jsonString(location)?)?;
+    jsonSet(mut j, "metadata", m)?;
+    jsonSet(mut j, "config", jsonObject())?;
+    return tablesJson(borrow j);
+}
+
+// ---- Tables ----
+
+fn icebergListTables(store: borrow ObjectStore, bucket: Slice<u8>, ns: Slice<u8>) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucket)?;
+    if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
+    var base = catalogKey(CATALOG_TABLES, ns, "".bytes())?;
+    base.push('/')?;
+    let keys = catalogKeys(store, hidden.view(), base.view(), "".bytes(), 0)?;
+    var list = jsonArray();
+    for (i in 0..keys.length) {
+        var id = jsonObject();
+        jsonSet(mut id, "namespace", namespaceJson(ns)?)?;
+        jsonSet(mut id, "name", jsonString(keys[i].view()[base.length..])?)?;
+        jsonPush(mut list, id)?;
+    }
+    var j = jsonObject();
+    jsonSet(mut j, "identifiers", list)?;
+    return tablesJson(borrow j);
+}
+
+fn icebergCreateTable(
+    store: borrow mut ObjectStore,
+    bucket: Slice<u8>,
+    ns: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let request = match (parseJson(body)?) {
+        Some(j) => j,
+        null => { return badRequest("The body is not JSON."); }
+    };
+    let name = copyBytes(jsonMemberText(borrow request, "name") ?? "".bytes())?;
+    if (!tableNameOk(name.view(), false)) { return badRequest("A table is 1 to 255 of a-z, 0-9 and _."); }
+    match (jsonMember(borrow request, "stage-create")) {
+        Some(v) => {
+            match (v) {
+                Json.Bool(true) => { return badRequest("Staged creates are not supported."); }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    let hidden = tableWarehouseBucket(bucket)?;
+    if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
+    let key = catalogKey(CATALOG_TABLES, ns, name.view())?;
+    if (readRecord(store, hidden.view(), key.view())?.isSome()) {
+        return icebergError(409, "AlreadyExistsException", "The table already exists.");
+    }
+    var id = Vector<u8>.create();
+    if (!newUuid(mut id)?) { return Err(TablesError.Internal); }
+    let warehouse = warehouseOf(bucket, id.view())?;
+    // A location given must be the warehouse S3 Tables gives it.
+    match (jsonMemberText(borrow request, "location")) {
+        Some(l) => {
+            if (l != warehouse.view()) { return badRequest("A table's location is its warehouse."); }
+        }
+        null => {}
+    }
+    let m = match (newTableMetadata(borrow request, warehouse.view())?) {
+        Some(m) => m,
+        null => { return badRequest("A table needs a struct schema."); }
+    };
+    let location = writeMetadata(store, hidden.view(), id.view(), 0, borrow m)?;
+    let now = Clock.unixMillis();
+    var rec = jsonObject();
+    jsonSet(mut rec, "id", jsonString(id.view())?)?;
+    jsonSet(mut rec, "createdAt", jsonInteger(now)?)?;
+    jsonSet(mut rec, "modifiedAt", jsonInteger(now)?)?;
+    jsonSet(mut rec, "metadataLocation", jsonString(location.view())?)?;
+    match (writeRecord(store, hidden.view(), key.view(), borrow rec, PutCondition.IfAbsent)) {
+        Ok(_) => {}
+        Err(TablesError.Conflict) => {
+            return icebergError(409, "AlreadyExistsException", "The table already exists.");
+        }
+        Err(e) => { return Err(e); }
+    }
+    return loadResult(location.view(), m);
+}
+
+/// The table's record and current metadata; NotFound if it has none (made through the S3 Tables API, with no
+/// metadata file yet).
+fn currentTable(
+    store: borrow ObjectStore,
+    bucket: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+) -> Result<CatalogRecord?, TablesError> {
+    let hidden = tableWarehouseBucket(bucket)?;
+    let key = catalogKey(CATALOG_TABLES, ns, name)?;
+    return readRecord(store, hidden.view(), key.view());
+}
+
+fn icebergCommit(
+    store: borrow mut ObjectStore,
+    bucket: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let request = match (parseJson(body)?) {
+        Some(j) => j,
+        null => { return badRequest("The body is not JSON."); }
+    };
+    let hidden = tableWarehouseBucket(bucket)?;
+    var rec = match (currentTable(store, bucket, ns, name)?) {
+        Some(r) => r,
+        null => { return noSuchTable(); }
+    };
+    let previous = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
+    if (previous.length == 0) { return noSuchTable(); }
+    let id = copyBytes(jsonMemberText(borrow rec.json, "id") ?? "".bytes())?;
+    var m = readMetadata(store, hidden.view(), previous.view())?;
+    let requirements = match (jsonMember(borrow request, "requirements")) {
+        Some(r) => cloneJson(r)?,
+        null => jsonArray(),
+    };
+    match (checkRequirements(borrow m, borrow requirements)?) {
+        Some(CommitRefusal.Requirement) => {
+            return icebergError(409, "CommitFailedException", "A requirement of the commit does not hold.");
+        }
+        Some(CommitRefusal.Update) => { return badRequest("A requirement is not one this catalog knows."); }
+        null => {}
+    }
+    let updates = match (jsonMember(borrow request, "updates")) {
+        Some(u) => cloneJson(u)?,
+        null => jsonArray(),
+    };
+    let previousStamp = jsonMemberI64(borrow m, "last-updated-ms") ?? 0;
+    let warehouse = warehouseOf(bucket, id.view())?;
+    match (applyUpdates(mut m, borrow updates, warehouse.view())?) {
+        Some(_) => { return badRequest("An update is not valid here, or not one this catalog applies."); }
+        null => {}
+    }
+    // The file it replaces joins the metadata log, which keeps the last ICEBERG_METADATA_LOG_MAX.
+    var entry = jsonObject();
+    jsonSet(mut entry, "metadata-file", jsonString(previous.view())?)?;
+    jsonSet(mut entry, "timestamp-ms", jsonInteger(previousStamp)?)?;
+    appendTo(mut m, "metadata-log", entry)?;
+    match (jsonMemberMut(mut m, "metadata-log")) {
+        Some(log) => {
+            match (log) {
+                Json.Array(items) => {
+                    while (items.length > ICEBERG_METADATA_LOG_MAX) { let _ = items.remove(0); }
+                }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    let version = metadataVersion(previous.view()) + 1;
+    let location = writeMetadata(store, hidden.view(), id.view(), if (version > 0) version else 1, borrow m)?;
+    jsonSet(mut rec.json, "metadataLocation", jsonString(location.view())?)?;
+    jsonSet(mut rec.json, "modifiedAt", jsonInteger(Clock.unixMillis())?)?;
+    let key = catalogKey(CATALOG_TABLES, ns, name)?;
+    match (writeRecord(store, hidden.view(), key.view(), borrow rec.json, PutCondition.IfGeneration(rec.generation))) {
+        Ok(_) => {}
+        Err(TablesError.Conflict) => {
+            // Another commit swapped first: this one's file is no table's.
+            if (metadataKey(location.view(), hidden.view()).isSome()) {
+                let k = metadataKey(location.view(), hidden.view()) ?? "".bytes();
+                let _ = store.deleteObject(catalogText(hidden.view()), catalogText(k));
+            }
+            return icebergError(409, "CommitFailedException", "The table changed since it was read.");
+        }
+        Err(e) => { return Err(e); }
+    }
+    var j = jsonObject();
+    jsonSet(mut j, "metadata-location", jsonString(location.view())?)?;
+    jsonSet(mut j, "metadata", m)?;
+    return tablesJson(borrow j);
+}
+
+fn icebergTable(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucket: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let m = req.method;
+    let hidden = tableWarehouseBucket(bucket)?;
+    if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
+    if (isMethod(m, Method.Post)) { return icebergCommit(store, bucket, ns, name, body); }
+    let rec = match (currentTable(store, bucket, ns, name)?) {
+        Some(r) => r,
+        null => { return noSuchTable(); }
+    };
+    if (isMethod(m, Method.Head)) { return Ok(tablesNoContent()); }
+    if (isMethod(m, Method.Get)) {
+        let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
+        if (location.length == 0) { return noSuchTable(); }
+        let metadata = readMetadata(store, hidden.view(), location.view())?;
+        return loadResult(location.view(), metadata);
+    }
+    if (isMethod(m, Method.Delete)) {
+        // As S3 Tables: a drop purges, so it is asked for.
+        let purge = paramOf(req, "purgeRequested") ?? "".bytes();
+        if (!equalsIgnoreCase(purge, "true".bytes())) {
+            return badRequest("A table is dropped with its files here: purgeRequested=true.");
+        }
+        return match (deleteTable(store, req, bucket, ns, name)) {
+            Ok(a) => Ok(a),
+            Err(TablesError.NotFound) => noSuchTable(),
+            Err(e) => Err(e),
+        };
+    }
+    return icebergUnsupported();
+}
+
+fn icebergRename(
+    store: borrow mut ObjectStore,
+    bucket: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let j = match (parseJson(body)?) {
+        Some(j) => j,
+        null => { return badRequest("The body is not JSON."); }
+    };
+    var from = Vector<Vector<u8>>.create();
+    for (side in ["source", "destination"]) {
+        let ident = match (jsonMember(borrow j, side)) {
+            Some(i) => i,
+            null => { return badRequest("A rename names its source and destination."); }
+        };
+        let ns = match (singleNamespace(ident)) {
+            Ok(n) => n,
+            Err(_) => { return badRequest("A namespace is one level here."); }
+        };
+        from.push(ns)?;
+        from.push(copyBytes(jsonMemberText(ident, "name") ?? "".bytes())?)?;
+    }
+    var rename = jsonObject();
+    jsonSet(mut rename, "newNamespaceName", jsonString(from[2].view())?)?;
+    jsonSet(mut rename, "newName", jsonString(from[3].view())?)?;
+    var request = Vector<u8>.create();
+    writeJson(mut request, borrow rename)?;
+    return match (renameTable(store, bucket, from[0].view(), from[1].view(), request.view())) {
+        Ok(a) => Ok(a),
+        Err(TablesError.NotFound) => noSuchTable(),
+        Err(TablesError.Conflict) => icebergError(409, "AlreadyExistsException", "The destination table exists."),
+        Err(TablesError.BadRequest) => badRequest("A name is not valid."),
+        Err(e) => Err(e),
+    };
+}
+
+/// `/iceberg/v1/…` (`segs` after `iceberg`).
+fn icebergRoute(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    segs: Slice<Vector<u8>>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let m = req.method;
+    if (segs.length < 2 || segs[0].view() != "v1".bytes()) { return icebergUnsupported(); }
+    if (segs.length == 2 && segs[1].view() == "config".bytes() && isMethod(m, Method.Get)) {
+        return icebergConfig(store, req);
+    }
+    var none = Vector<u8>.create();
+    let bucket = match (tableBucketOfArn(segs[1].view(), mut none)?) {
+        Some(b) => b,
+        null => { return badRequest("The prefix must be a table bucket's ARN."); }
+    };
+    match (tableBucketRecord(store, bucket.view())) {
+        Ok(_) => {}
+        Err(TablesError.NotFound) => { return icebergError(404, "NoSuchWarehouseException", "No such table bucket."); }
+        Err(e) => { return Err(e); }
+    }
+    let rest = segs[2..];
+    if (rest.length == 2 && rest[0].view() == "tables".bytes() && rest[1].view() == "rename".bytes() &&
+        isMethod(m, Method.Post)) {
+        return icebergRename(store, bucket.view(), body);
+    }
+    if (rest.length == 0 || rest[0].view() != "namespaces".bytes()) { return icebergUnsupported(); }
+    if (rest.length == 1) {
+        if (isMethod(m, Method.Get)) { return icebergListNamespaces(store, req, bucket.view()); }
+        if (isMethod(m, Method.Post)) { return icebergCreateNamespace(store, bucket.view(), body); }
+        return icebergUnsupported();
+    }
+    // A multi-level namespace (its parts joined by 0x1F) is not one here.
+    let ns = rest[1].view();
+    if (findBytes(ns, [0x1Fu8][..], 0).isSome()) { return noSuchNamespace(); }
+    if (rest.length == 2) { return icebergNamespace(store, m, bucket.view(), ns); }
+    if (rest[2].view() != "tables".bytes()) { return icebergUnsupported(); }
+    if (rest.length == 3) {
+        if (isMethod(m, Method.Get)) { return icebergListTables(store, bucket.view(), ns); }
+        if (isMethod(m, Method.Post)) { return icebergCreateTable(store, bucket.view(), ns, body); }
+        return icebergUnsupported();
+    }
+    if (rest.length == 4) { return icebergTable(store, req, bucket.view(), ns, rest[3].view(), body); }
+    return icebergUnsupported();
+}
