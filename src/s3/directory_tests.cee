@@ -166,3 +166,108 @@ fn expressSessionsReachTheirBucketAndMode() -> Result<void, TestFailure> {
     Check.isTrue(deniedBySession(borrow elsewhere, borrow readWrite), "another bucket")?;
     return Ok();
 }
+
+fn gated(method: Method, key: StringView, params: StringView, header: StringView, value: StringView) -> S3Code? {
+    var req = bareRequest();
+    req.method = method;
+    let _ = req.bucket.append("data--local-az1--x-s3");
+    let _ = req.key.append(key);
+    var at: usize = 0;
+    let list = params.bytes();
+    while (at < list.length) {
+        let end = pieceEnd(list, at, '&');
+        let pair = list[at..end];
+        let eq = pieceEnd(pair, 0, '=');
+        req.query.push(QueryParam {
+            name: copyBytes(pair[0..eq])!,
+            value: copyBytes(if (eq < pair.length) pair[eq + 1..] else "".bytes())!,
+        })!;
+        at = end + 1;
+    }
+    if (header.length > 0) { req.headers.push(policyHeader(header, value))!; }
+    return match (directoryRefusal(borrow req)) {
+        Ok() => null,
+        Err(S3Fail.Code(c)) => Some(c),
+        Err(_) => Some(S3Code.InternalError),
+    };
+}
+
+fn isCode(got: S3Code?, want: S3Code) -> bool => match (got) {
+    Some(c) => s3CodeName(c) == s3CodeName(want),
+    null => false,
+};
+
+@test
+fn directoryBucketsRefuseWhatS3Does() -> Result<void, TestFailure> {
+    // Taken.
+    Check.isTrue(gated(Method.Get, "", "list-type=2&prefix=a/&delimiter=/", "", "").isNull(), "ListObjectsV2")?;
+    Check.isTrue(gated(Method.Get, "", "uploads", "", "").isNull(), "ListMultipartUploads")?;
+    Check.isTrue(gated(Method.Put, "", "policy", "", "").isNull(), "PutBucketPolicy")?;
+    Check.isTrue(gated(Method.Get, "", "session", "", "").isNull(), "CreateSession")?;
+    Check.isTrue(gated(Method.Put, "k", "", "x-amz-server-side-encryption", "AES256").isNull(), "SSE-S3")?;
+    Check.isTrue(gated(Method.Put, "k", "partNumber=1&uploadId=x", "", "").isNull(), "UploadPart")?;
+    Check.isTrue(gated(Method.Delete, "", "", "", "").isNull(), "DeleteBucket")?;
+    Check.isTrue(gated(Method.Get, "k", "x-id=GetObject", "", "").isNull(), "x-id")?;
+    // Calls S3 does not take on a directory bucket.
+    for (p in [
+        "versioning",
+        "acl",
+        "tagging",
+        "replication",
+        "logging",
+        "website",
+        "cors",
+        "versions",
+        "object-lock",
+    ]) {
+        Check.isTrue(isCode(gated(Method.Get, "", p, "", ""), S3Code.NotImplemented), p)?;
+    }
+    Check.isTrue(isCode(gated(Method.Get, "", "", "", ""), S3Code.NotImplemented), "ListObjects v1")?;
+    Check.isTrue(isCode(gated(Method.Get, "", "encoding-type=url", "", ""), S3Code.NotImplemented), "the CLI's v1")?;
+    Check.isTrue(isCode(gated(Method.Get, "", "list-type=1", "", ""), S3Code.NotImplemented), "list-type 1")?;
+    for (p in ["tagging", "acl", "retention", "legal-hold", "select"]) {
+        Check.isTrue(isCode(gated(Method.Put, "k", p, "", ""), S3Code.NotImplemented), p)?;
+    }
+    // Features' headers, and what is invalid there.
+    Check.isTrue(isCode(gated(Method.Put, "k", "", "x-amz-tagging", "a=b"), S3Code.NotImplemented), "tags")?;
+    Check.isTrue(isCode(gated(Method.Put, "k", "", "x-amz-acl", "private"), S3Code.NotImplemented), "an ACL")?;
+    Check.isTrue(
+        isCode(
+            gated(Method.Put, "k", "", "x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            S3Code.NotImplemented,
+        ),
+        "SSE-C",
+    )?;
+    Check.isTrue(
+        isCode(gated(Method.Put, "k", "", "x-amz-object-lock-mode", "GOVERNANCE"), S3Code.NotImplemented),
+        "a lock",
+    )?;
+    Check.isTrue(isCode(gated(Method.Put, "k", "", "content-md5", "x"), S3Code.InvalidArgument), "Content-MD5")?;
+    Check.isTrue(
+        isCode(gated(Method.Put, "k", "", "x-amz-server-side-encryption", "aws:kms"), S3Code.InvalidArgument),
+        "KMS",
+    )?;
+    Check.isTrue(
+        isCode(gated(Method.Put, "k", "", "x-amz-storage-class", "STANDARD"), S3Code.InvalidArgument),
+        "STANDARD",
+    )?;
+    Check.isTrue(gated(Method.Put, "k", "", "x-amz-storage-class", "EXPRESS_ONEZONE").isNull(), "EXPRESS_ONEZONE")?;
+    Check.isTrue(
+        isCode(gated(Method.Get, "", "list-type=2&start-after=a", "", ""), S3Code.InvalidArgument),
+        "start-after",
+    )?;
+    Check.isTrue(
+        isCode(gated(Method.Get, "", "list-type=2&delimiter=-", "", ""), S3Code.InvalidArgument),
+        "delimiter",
+    )?;
+    Check.isTrue(isCode(gated(Method.Get, "", "list-type=2&prefix=a", "", ""), S3Code.InvalidArgument), "a prefix")?;
+    // Parts in order from 1.
+    var parts = Vector<PartChoice>.create();
+    for (n in [1u32, 2, 3]) {
+        parts.push(PartChoice { number: n, md5: [0u8; 16], checksum: [0u8; 32], checksumLength: 0 })!;
+    }
+    Check.isTrue(consecutiveParts(parts.view()).isOk(), "1, 2, 3")?;
+    parts[1].number = 4;
+    Check.isTrue(consecutiveParts(parts.view()).isErr(), "1, 4, 3")?;
+    return Ok();
+}

@@ -75,7 +75,8 @@ only, with S3's limits enforced).
    encryption, or InvalidArgument; SSE-C's are refused. The token is sealed as STS's are (ADR-0075's keys, AES-256-GCM) but with
    its own version byte and additional data, so neither kind of token opens as the other; it holds the key that made
    it, the bucket, the mode and its expiry (5 minutes), and the answer is `CreateSessionResult`.
-4. **A request with `x-amz-s3session-token`:** signed for `s3express` with the session's key; the token opens, has not
+4. **A request with `x-amz-s3session-token`:** signed with the session's key, for `s3express` (boto3, the CLI's
+   classic client) or `s3` (the AWS CRT signs its object calls so: found by CI, 18 Nov 2026); the token opens, has not
    expired (ExpiredToken, as STS's) and names this request's bucket (else AccessDenied); a ReadOnly session may make
    only the six calls above (else AccessDenied). The requester is the key that made the session (for policies, the
    audit line and access logs), narrowed by the mode. A request to a directory bucket signed for `s3`, or for `s3express` without
@@ -104,6 +105,12 @@ only, with S3's limits enforced).
    merges the shards as ListBuckets does (ADR-0060), and the front passes `x-amz-s3session-token` through; the token
    opens on any node because the STS keys are the same on every node (ADR-0078 §2).
 
+9. **The AWS CRT** (the CLI's transfer client on newer versions, and the SDKs' CRT clients) puts a directory
+   bucket only in the host name of its CreateSession (`GET /?session` to `<bucket>.<endpoint host>`), whatever the
+   addressing style: through an endpoint that is an IP address it sends no bucket at all, which no server can
+   answer. So a CRT client needs an endpoint by name, under `serve`'s domain, whose `<bucket>.<name>` resolves
+   (the smokes use `localhost`; CI maps the buckets in `/etc/hosts`).
+
 ## Consequences
 
 - The store gains a field of the BucketCreate record and checkpoint format 25; its fault sweep covers a directory bucket made,
@@ -120,7 +127,8 @@ only, with S3's limits enforced).
    no way to turn sessions off, so its checks, and the smokes', come with slice 2.
 2. CreateSession and session tokens, ReadOnly sessions, the cluster: the AWS CLI with sessions in the S3 smoke and
    the cluster smoke (a session made through one node used through another).
-3. The refusals and S3's behaviours (§6, §7), then the SDK matrix.
+3. The refusals and S3's behaviours (§6, §7), then the SDK matrix: (a) the refusals, the listing rules and
+   consecutive parts; (b) non-MD5 ETags, uploads' prefixes in listings, and the SDK matrix.
 
 ## Rejected
 

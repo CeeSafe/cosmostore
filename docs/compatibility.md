@@ -19,6 +19,11 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
 
 ### Client settings to know
 
+- **Directory buckets with the AWS CRT** (ADR-0080 §9; the AWS CLI's transfer client on newer versions, and the SDKs'
+  CRT clients): the CRT names the bucket only in the host of its CreateSession, so use an endpoint by host name
+  under the server's domain (`http://localhost:9000` with `serve … localhost`) where `<bucket>.<host>` resolves; an
+  IP address endpoint cannot work with it.
+
 - **boto3** presigns with SigV2 for a custom endpoint unless it is told otherwise:
   `Config(signature_version="s3v4")`. CosmoStore accepts SigV4 only, and refuses SigV2 with S3's `InvalidRequest`.
   boto3's CRC32C and CRC64NVME checksums need `pip install "boto3[crt]"`, the Java SDK's need the

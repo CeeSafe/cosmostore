@@ -381,3 +381,101 @@ async fn createSession(
     exchange.header("x-amz-server-side-encryption", "AES256".bytes())?;
     return await sendXml(exchange, borrow body);
 }
+
+// ---- What a directory bucket takes (ADR-0080 §6) ----
+
+/// The query parameters a directory bucket's own calls take: ListObjectsV2's and ListMultipartUploads', CreateSession,
+/// and the configurations S3 keeps for it (policy, default encryption, lifecycle, inventory); CosmoStore's quota.
+const DIRECTORY_BUCKET_PARAMS: StringView =
+    "list-type,prefix,delimiter,max-keys,continuation-token,fetch-owner,encoding-type,start-after,uploads,key-marker,upload-id-marker,max-uploads,session,policy,encryption,lifecycle,inventory,id,quota";
+/// And its objects' calls: the multipart calls, GetObjectAttributes, and GET's response overrides.
+const DIRECTORY_OBJECT_PARAMS: StringView =
+    "uploads,uploadId,partNumber,max-parts,part-number-marker,attributes,response-content-type,response-content-language,response-expires,response-cache-control,response-content-disposition,response-content-encoding";
+
+/// A header of a feature directory buckets do not have (NotImplemented): ACLs, tags, object lock, Requester Pays,
+/// SSE-C, website redirects.
+fn notADirectoryField(name: Slice<u8>) -> bool {
+    for (exact in [
+        "x-amz-acl", "x-amz-tagging", "x-amz-tagging-directive", "x-amz-request-payer",
+        "x-amz-website-redirect-location", "x-amz-bucket-object-lock-enabled",
+    ]) {
+        if (name == exact.bytes()) { return true; }
+    }
+    for (prefix in [
+        "x-amz-grant-", "x-amz-object-lock-", "x-amz-server-side-encryption-customer-",
+        "x-amz-copy-source-server-side-encryption-customer-",
+    ]) {
+        if (startsWithBytes(name, prefix.bytes())) { return true; }
+    }
+    return false;
+}
+
+/// What a directory bucket refuses of a request (ADR-0080 §6): a call S3 does not take on one (NotImplemented, as
+/// any call this server does not take), a feature's header (NotImplemented), `Content-MD5` (S3 takes no MD5 there),
+/// an encryption other than SSE-S3, a storage class other than `EXPRESS_ONEZONE`, and a listing's `start-after`, a
+/// delimiter other than `/` or a prefix that does not end in it (InvalidArgument).
+fn directoryRefusal(req: borrow S3Request) -> Result<void, S3Fail> {
+    let allowed = if (req.key.length == 0) DIRECTORY_BUCKET_PARAMS else DIRECTORY_OBJECT_PARAMS;
+    if (!req.onlyParams(allowed)) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    // ListObjects (v1): a bucket's GET that is none of the calls it takes (whatever else it sends, `encoding-type`).
+    if (req.key.length == 0 && isMethod(req.method, Method.Get)) {
+        var named = false;
+        for (call in ["list-type", "uploads", "session", "policy", "encryption", "lifecycle", "inventory", "quota"]) {
+            if (req.hasParam(call)) { named = true; }
+        }
+        if (!named) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    }
+    if (req.key.length == 0 && isMethod(req.method, Method.Get) && req.hasParam("list-type") &&
+        paramOf(req, "list-type") != Some("2".bytes())) {
+        return Err(S3Fail.Code(S3Code.NotImplemented));
+    }
+    for (i in 0..req.headers.length) {
+        let n = req.headers[i].name.view();
+        if (notADirectoryField(n)) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        if (n == "content-md5".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        let v = trimBlank(req.headers[i].value.view());
+        if (n == "x-amz-server-side-encryption".bytes() && v != "AES256".bytes()) {
+            return Err(S3Fail.Code(S3Code.InvalidArgument));
+        }
+        if (n == "x-amz-storage-class".bytes() && v != "EXPRESS_ONEZONE".bytes()) {
+            return Err(S3Fail.Code(S3Code.InvalidArgument));
+        }
+    }
+    // A listing's prefixes end in the delimiter, which is `/`.
+    if (req.key.length == 0 && (req.hasParam("list-type") || req.hasParam("uploads"))) {
+        if (req.hasParam("start-after")) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        match (paramOf(req, "delimiter")) {
+            Some(d) => {
+                if (d != "/".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+            null => {}
+        }
+        match (paramOf(req, "prefix")) {
+            Some(p) => {
+                if (p.length > 0 && p[p.length - 1] != '/') { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+            null => {}
+        }
+    }
+    return Ok();
+}
+
+/// Whether `bucket` is a directory bucket: only a name with its suffix can be, so others are not looked up.
+async fn isDirectoryBucket(app: borrow S3App, bucket: StringView) -> Result<bool, S3Fail> {
+    if (!isDirectoryShaped(bucket.bytes())) { return Ok(false); }
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (store.bucketZone(bucket)) { // memory only
+        Ok(z) => Ok(z.length > 0),
+        Err(StoreError.NoSuchBucket) => Ok(false),
+        Err(e) => Err(storeFail(e, 0)),
+    };
+}
+
+/// A directory bucket's multipart upload completes with its parts numbered 1, 2, … in order (S3: InvalidPartOrder).
+fn consecutiveParts(parts: Slice<PartChoice>) -> Result<void, S3Fail> {
+    for (i in 0..parts.length) {
+        if (parts[i].number as usize != i + 1) { return Err(S3Fail.Code(S3Code.InvalidPartOrder)); }
+    }
+    return Ok();
+}

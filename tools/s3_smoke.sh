@@ -1080,6 +1080,9 @@ aws s3 rm --recursive s3://site/ > /dev/null 2>&1
 
 # Directory buckets (ADR-0080): the CLI takes a session (CreateSession) before each bucket's calls, signed for s3express.
 dir=data--local-az1--x-s3
+# Through `localhost`, not 127.0.0.1: the AWS CRT (the CLI's transfer client on newer versions) puts a directory
+# bucket only in the host name of its CreateSession, so it needs `<bucket>.localhost` (in CI's /etc/hosts).
+dl() { AWS_ENDPOINT_URL="http://localhost:$port" aws "$@"; }
 dirconf='Location={Type=AvailabilityZone,Name=local-az1},Bucket={DataRedundancy=SingleAvailabilityZone,Type=Directory}'
 check "create a directory bucket" "$(aws s3api create-bucket --bucket "$dir" --create-bucket-configuration "$dirconf" --query BucketArn --output text 2>&1)" "arn:aws:s3express:us-east-1:000000000000:bucket/$dir"
 # Another zone's bucket: the CLI's CreateSession for it finds no such bucket here, before its CreateBucket.
@@ -1089,9 +1092,9 @@ check "list-directory-buckets" "$(aws s3api list-directory-buckets --query 'Buck
 check "not in list-buckets" "$(aws s3api list-buckets --query "length(Buckets[?Name=='$dir'])" 2>&1)" 0
 printf 'in a directory' > dir.txt
 aws s3api put-object --bucket "$dir" --key a/b.txt --body dir.txt > /dev/null 2>&1 && pass "a PUT with a session" || fail "a PUT with a session"
-check "a GET with a session" "$(aws s3 cp "s3://$dir/a/b.txt" - 2>&1)" "in a directory"
+check "a GET with a session" "$(dl s3 cp "s3://$dir/a/b.txt" - 2>&1)" "in a directory"
 mkdir -p dirtree/x && printf 1 > dirtree/one && printf 2 > dirtree/x/two
-check "s3 cp --recursive" "$(aws s3 cp --recursive dirtree "s3://$dir/tree/" 2>&1 | grep -c upload:)" 2
+check "s3 cp --recursive" "$(dl s3 cp --recursive dirtree "s3://$dir/tree/" 2>&1 | grep -c upload:)" 2
 check "and listed" "$(aws s3api list-objects-v2 --bucket "$dir" --prefix tree/ --query 'length(Contents)' 2>&1)" 2
 read -r rk rs rt <<< "$(aws s3api create-session --bucket "$dir" --session-mode ReadOnly --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
 check "create-session gives a key" "${rk:0:4}" ASIA
@@ -1103,6 +1106,13 @@ check "nor reach another directory bucket" "$(express "$rk" "$rs" "$rt" GET "/ot
 aws s3api delete-bucket --bucket other--local-az1--x-s3 > /dev/null 2>&1
 check "a changed token" "$(express "$rk" "$rs" "${rt%????}AAAA" GET "/$dir/a/b.txt" | cut -d' ' -f1)" 400
 check "s3express on a general-purpose bucket" "$(express "" "" "" GET "/smoke?list-type=2" | cut -d' ' -f1)" 400
+# What a directory bucket does not take (ADR-0080 §6), as S3 refuses it.
+check "no versioning" "$(code s3api put-bucket-versioning --bucket "$dir" --versioning-configuration Status=Enabled)" NotImplemented
+check "no object tags" "$(code s3api put-object --bucket "$dir" --key t --body dir.txt --tagging a=b)" NotImplemented
+check "no ListObjects v1" "$(code s3api list-objects --bucket "$dir")" NotImplemented
+check "a prefix ends in /" "$(code s3api list-objects-v2 --bucket "$dir" --prefix tr)" InvalidArgument
+check "no STANDARD storage class" "$(code s3api put-object --bucket "$dir" --key t --body dir.txt --storage-class STANDARD)" InvalidArgument
+check "a policy is taken" "$(aws s3api put-bucket-policy --bucket "$dir" --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$dir"'/secret/*"}]}' 2>&1; echo $?)" 0
 aws s3 rm --recursive "s3://$dir/" > /dev/null 2>&1
 aws s3api delete-bucket --bucket "$dir" > /dev/null 2>&1 && pass "delete the directory bucket" || fail "delete the directory bucket"
 

@@ -2908,3 +2908,20 @@ Browser form uploads with a SigV4 POST policy.
   smoke makes and uses a directory bucket with the AWS CLI's sessions (`s3 cp --recursive` too) and checks a
   ReadOnly session, another bucket, a changed token and an `s3express` signature on a general-purpose bucket; the
   cluster smoke (106) lists through every node and uses a session from node 1 through node 3. 331 tests.
+
+### 18 Nov 2026: slice 2's CI, and M8 slice 3a, what a directory bucket refuses (ADR-0080)
+
+- **CI failed slice 2's smoke** on its AWS CLI (2.39), whose CRT transfer client (1) names a directory bucket only in
+  the host of its CreateSession, so through `http://127.0.0.1:…` it sends `GET /?session` with no bucket, and (2)
+  signs its object calls for `s3`, not `s3express`, with the session token. A session token is now taken signed for
+  either; for (1) a CRT client needs an endpoint by name (`<bucket>.<host>` resolving): the smokes' `s3 cp`s go
+  through `localhost` and CI maps the two buckets in `/etc/hosts` (ADR-0080 §9, `docs/compatibility.md`).
+- **Slice 3a:** a directory bucket refuses what S3 does not take on one (ADR-0080 §6): calls by their query
+  (versioning, ACLs, tags, replication, logging, website, CORS, versions, object lock, retention, ListObjects v1,
+  …) and features' headers (ACLs, tags, object lock, Requester Pays, SSE-C, website redirects) NotImplemented;
+  `Content-MD5`, an encryption other than SSE-S3, a storage class other than `EXPRESS_ONEZONE`, `start-after`, a
+  delimiter other than `/` and a prefix not ending in it InvalidArgument; a multipart upload's parts consecutive
+  from 1 (InvalidPartOrder). Only `--x-s3` names are looked up. `directoryBucketsRefuseWhatS3Does`; the S3 smoke
+  checks five refusals and a policy taken. 332 tests, the cluster smoke 106, the CRT client by hand (a 20 MB
+  multipart upload and download).
+- **Next (3b):** non-MD5 ETags, uploads' prefixes in listings, the SDK matrix.

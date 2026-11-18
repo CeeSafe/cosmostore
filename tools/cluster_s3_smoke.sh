@@ -346,6 +346,8 @@ check "and the access point is apa's" "$(ctl 1 get-access-point --name window --
 # Directory buckets on a cluster (ADR-0080 §8): made through one node, listed through every one (the shards merged),
 # used with CreateSession's sessions through the others; a session from one node opens on another (STS's keys).
 dirconf='Location={Type=AvailabilityZone,Name=local-az1},Bucket={DataRedundancy=SingleAvailabilityZone,Type=Directory}'
+# Object calls through `localhost`: the AWS CRT puts a directory bucket only in its CreateSession's host name.
+onl() { local n="$1"; shift; aws --no-cli-pager --endpoint-url "http://localhost:$((BASE + 10 + n))" "$@"; }
 for d in a b c; do on 1 s3api create-bucket --bucket "$d--local-az1--x-s3" --create-bucket-configuration "$dirconf" > /dev/null 2>&1; done
 for n in 2 3; do
     check "list-directory-buckets through node $n, merged across shards" "$(on "$n" s3api list-directory-buckets --query 'Buckets[].Name' --output text 2>&1)" "a--local-az1--x-s3	b--local-az1--x-s3	c--local-az1--x-s3"
@@ -353,7 +355,7 @@ done
 check "and not in list-buckets" "$(on 2 s3api list-buckets --query "length(Buckets[?ends_with(Name, '--x-s3')])" 2>&1)" 0
 printf 'in a directory' > dir.txt
 on 2 s3api put-object --bucket b--local-az1--x-s3 --key k/one --body dir.txt > /dev/null 2>&1 && pass "a PUT with a session, through node 2" || fail "a PUT with a session, through node 2"
-check "read through node 3" "$(on 3 s3 cp s3://b--local-az1--x-s3/k/one - 2>&1)" "in a directory"
+check "read through node 3" "$(onl 3 s3 cp s3://b--local-az1--x-s3/k/one - 2>&1)" "in a directory"
 read -r xk xs xt <<< "$(on 1 s3api create-session --bucket b--local-az1--x-s3 --session-mode ReadOnly --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
 express() { python3 -I "$OLDPWD/tools/s3_raw.py" express "http://127.0.0.1:$((BASE + 10 + $1))" "${@:2}"; }
 check "a session from node 1 reads through node 3" "$(express 3 "$xk" "$xs" "$xt" GET /b--local-az1--x-s3/k/one)" "200 in a directory"
