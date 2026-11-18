@@ -1,0 +1,132 @@
+// Access points of directory buckets (ADR-0082): names, the scope and its stored form, and what each call needs.
+import web_core;
+import web_http;
+import web_server;
+
+@test
+fn directoryAccessPointNames() -> Result<void, TestFailure> {
+    let zone = "local-az1".bytes();
+    Check.isTrue(isDirectoryAccessPointName("door--local-az1--xa-s3".bytes(), zone), "a name")?;
+    Check.isTrue(isDirectoryAccessPointName("a-b--local-az1--xa-s3".bytes(), zone), "a dash inside")?;
+    for (bad in [
+        "do--local-az1--xa-s3", "door--other-az1--xa-s3", "-door--local-az1--xa-s3", "door---local-az1--xa-s3",
+        "Door--local-az1--xa-s3", "do.or--local-az1--xa-s3", "door--local-az1--x-s3", "door",
+        "a23456789012345678901234567890123456789012345678901--local-az1--xa-s3",
+    ]) {
+        Check.isFalse(isDirectoryAccessPointName(bad.bytes(), zone), bad)?;
+    }
+    Check.isFalse(isDirectoryAccessPointName("door--local-az1--xa-s3".bytes(), "".bytes()), "no zone")?;
+    Check.isTrue(mayNameAccessPoint("door--local-az1--xa-s3".bytes()), "it may name an access point")?;
+    Check.isFalse(mayNameAccessPoint("data--local-az1--x-s3".bytes()), "a directory bucket's name does not")?;
+    var arn = Vector<u8>.create();
+    pointArn(mut arn, "000000000000".bytes(), "door--local-az1--xa-s3".bytes())!;
+    Check.equalBytes(
+        "arn:aws:s3express:us-east-1:000000000000:accesspoint/door--local-az1--xa-s3".bytes(),
+        arn.view(),
+    )?;
+    // Its own alias: found by it, as a request names it.
+    var point = testPoint("door--local-az1--xa-s3", "door--local-az1--xa-s3", "");
+    point.scopePrefixes.push(copyBytes("pub/".bytes())!)!;
+    point.scopePermissions = SCOPE_GET_OBJECT | SCOPE_LIST_BUCKET;
+    var points = Vector<AccessPoint>.create();
+    points.push(point)!;
+    points.push(testPoint("plain", "plain-abcdefghijklmnopqrst-s3alias", ""))!;
+    var stored = Vector<u8>.create();
+    encodeAccessPoints(points.view(), mut stored)!;
+    Check.equalU64(3, stored[0] as u64)?;
+    let back = decodeAccessPoints(stored.view())!;
+    Check.equalU64(1, back[0].scopePrefixes.length as u64)?;
+    Check.equalU64((SCOPE_GET_OBJECT | SCOPE_LIST_BUCKET) as u64, back[0].scopePermissions as u64)?;
+    Check.equalU64(0, back[1].scopePrefixes.length as u64)?;
+    var all = BucketPolicies { names: Vector<Vector<u8>>.create(), documents: Vector<Vector<u8>>.create() };
+    all.names.push(copyBytes("data--local-az1--x-s3".bytes())!)!;
+    all.documents.push(stored)!;
+    let hit = findAccessPoint(borrow all, "door--local-az1--xa-s3".bytes(), false)!!;
+    Check.equalBytes("data--local-az1--x-s3".bytes(), hit.bucket.view())?;
+    Check.equalBytes("pub/".bytes(), hit.point.scopePrefixes[0].view())?;
+    return Ok();
+}
+
+fn scopeOf(xml: StringView) -> Result<AccessPoint, S3Fail> {
+    var point = testPoint("door--local-az1--xa-s3", "door--local-az1--xa-s3", "");
+    parseScope(xml.bytes(), mut point)?;
+    return Ok(point);
+}
+
+@test
+fn directoryAccessPointScopes() -> Result<void, TestFailure> {
+    let point = scopeOf(
+        "<CreateAccessPointRequest><Bucket>b</Bucket><Scope><Prefixes><Prefix>pub/*</Prefix><Prefix>a&amp;b/</Prefix></Prefixes><Permissions><Permission>GetObject</Permission><Permission>ListBucket</Permission></Permissions></Scope></CreateAccessPointRequest>",
+    )!;
+    Check.equalU64(2, point.scopePrefixes.length as u64)?;
+    Check.equalBytes("a&b/".bytes(), point.scopePrefixes[1].view())?;
+    Check.equalU64((SCOPE_GET_OBJECT | SCOPE_LIST_BUCKET) as u64, point.scopePermissions as u64)?;
+    var xml = Vector<u8>.create();
+    scopeXml(mut xml, borrow point)!;
+    Check.equalBytes(
+        "<Scope><Prefixes><Prefix>pub/*</Prefix><Prefix>a&amp;b/</Prefix></Prefixes><Permissions><Permission>GetObject</Permission><Permission>ListBucket</Permission></Permissions></Scope>".bytes(),
+        xml.view(),
+    )?;
+    Check.isTrue(
+        scopeOf("<Scope><Permissions><Permission>Everything</Permission></Permissions></Scope>").isErr(),
+        "an unknown permission",
+    )?;
+    var long = String.create();
+    long.append("<Scope><Prefixes><Prefix>")!;
+    for (i in 0..256) { long.append("a")!; }
+    long.append("</Prefix></Prefixes></Scope>")!;
+    Check.isTrue(scopeOf(long.view()).isErr(), "256 bytes of prefixes")?;
+    let none = scopeOf("<CreateAccessPointRequest><Bucket>b</Bucket></CreateAccessPointRequest>")!;
+    Check.isTrue(none.scopePrefixes.length == 0 && none.scopePermissions == 0, "no scope")?;
+    // What a scope takes.
+    let prefixes = point.scopePrefixes.view();
+    Check.isTrue(scopeTakesKey(prefixes, "pub/x.txt".bytes()), "a key under pub/*")?;
+    Check.isTrue(scopeTakesKey(prefixes, "a&b/c".bytes()), "under a&b/")?;
+    Check.isFalse(scopeTakesKey(prefixes, "secret/x".bytes()), "elsewhere")?;
+    Check.isTrue(scopeTakesKey(Vector<Vector<u8>>.create().view(), "anything".bytes()), "no prefixes")?;
+    return Ok();
+}
+
+fn needs(method: Method, key: StringView, param: StringView) -> u8 {
+    var req = bareRequest();
+    req.method = method;
+    let _ = req.bucket.append("data--local-az1--x-s3");
+    let _ = req.key.append(key);
+    if (param.length > 0) { req.query.push(policyParam(param, "1"))!; }
+    return scopePermissionOf(borrow req);
+}
+
+@test
+fn directoryAccessPointPermissions() -> Result<void, TestFailure> {
+    Check.equalU64(SCOPE_GET_OBJECT as u64, needs(Method.Get, "k", "") as u64)?;
+    Check.equalU64(SCOPE_GET_OBJECT as u64, needs(Method.Head, "k", "") as u64)?;
+    Check.equalU64(SCOPE_GET_OBJECT_ATTRIBUTES as u64, needs(Method.Get, "k", "attributes") as u64)?;
+    Check.equalU64(SCOPE_LIST_MULTIPART_UPLOAD_PARTS as u64, needs(Method.Get, "k", "uploadId") as u64)?;
+    Check.equalU64(SCOPE_PUT_OBJECT as u64, needs(Method.Put, "k", "") as u64)?;
+    Check.equalU64(SCOPE_PUT_OBJECT as u64, needs(Method.Post, "k", "uploads") as u64)?;
+    Check.equalU64(SCOPE_DELETE_OBJECT as u64, needs(Method.Delete, "k", "") as u64)?;
+    Check.equalU64(SCOPE_ABORT_MULTIPART_UPLOAD as u64, needs(Method.Delete, "k", "uploadId") as u64)?;
+    Check.equalU64(SCOPE_LIST_BUCKET as u64, needs(Method.Get, "", "list-type") as u64)?;
+    Check.equalU64(SCOPE_LIST_BUCKET_MULTIPART_UPLOADS as u64, needs(Method.Get, "", "uploads") as u64)?;
+    Check.equalU64(SCOPE_DELETE_OBJECT as u64, needs(Method.Post, "", "delete") as u64)?;
+    Check.equalU64(0, needs(Method.Head, "", "") as u64)?;
+    Check.equalU64(0, needs(Method.Get, "", "session") as u64)?;
+    // A requester through one, against its scope.
+    var who = requesterOf(Some(0), null);
+    Check.isTrue(scopeAllowsKey(borrow who, SCOPE_PUT_OBJECT, "x".bytes()), "no access point, no scope")?;
+    who.directoryAccessPoint = copyBytes("door--local-az1--xa-s3".bytes())!;
+    who.scopePrefixes.push(copyBytes("pub/".bytes())!)!;
+    who.scopePermissions = SCOPE_GET_OBJECT;
+    Check.isTrue(scopeAllowsKey(borrow who, SCOPE_GET_OBJECT, "pub/a".bytes()), "in scope")?;
+    Check.isFalse(scopeAllowsKey(borrow who, SCOPE_PUT_OBJECT, "pub/a".bytes()), "another permission")?;
+    Check.isFalse(scopeAllowsKey(borrow who, SCOPE_GET_OBJECT, "other/a".bytes()), "another prefix")?;
+    var list = bareRequest();
+    let _ = list.bucket.append("data--local-az1--x-s3");
+    list.query.push(policyParam("list-type", "2"))!;
+    list.query.push(policyParam("prefix", "pub/"))!;
+    who.scopePermissions = SCOPE_LIST_BUCKET;
+    Check.isTrue(checkScope(borrow list, borrow who).isOk(), "a listing within pub/")?;
+    list.query[1].value = copyBytes("".bytes())!;
+    Check.isTrue(checkScope(borrow list, borrow who).isErr(), "a listing of everything")?;
+    return Ok();
+}

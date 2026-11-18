@@ -41,7 +41,8 @@ fn accountSuffixed(name: Slice<u8>) -> bool {
 
 fn mayNameAccessPoint(name: Slice<u8>) -> bool {
     let alias = "-s3alias".bytes();
-    return (name.length > alias.length && name[name.length - alias.length..] == alias) || accountSuffixed(name);
+    return (name.length > alias.length && name[name.length - alias.length..] == alias) || accountSuffixed(name) ||
+        isDirectoryAccessPointShaped(name);
 }
 
 /// The access point `name` means, by its alias or as `<name>-<account>`; null for none.
@@ -59,19 +60,26 @@ fn findAccessPoint(all: borrow BucketPolicies, name: Slice<u8>, byName: bool) ->
             if (hit) {
                 return Ok(Some(AccessPointHit {
                     bucket: copyBytes(all.names[b].view())?,
-                    point: AccessPoint {
-                        name: copyBytes(p.name.view())?,
-                        alias: copyBytes(p.alias.view())?,
-                        block: p.block,
-                        createdMs: p.createdMs,
-                        policy: copyBytes(p.policy.view())?,
-                        account: copyBytes(p.account.view())?,
-                    },
+                    point: copyAccessPoint(p)?,
                 }));
             }
         }
     }
     return Ok(null);
+}
+
+fn copyAccessPoint(p: borrow AccessPoint) -> Result<AccessPoint, AllocError> {
+    var out = accessPointOf(
+        copyBytes(p.name.view())?,
+        copyBytes(p.alias.view())?,
+        p.block,
+        p.createdMs,
+        copyBytes(p.policy.view())?,
+        copyBytes(p.account.view())?,
+    );
+    for (k in 0..p.scopePrefixes.length) { out.scopePrefixes.push(copyBytes(p.scopePrefixes[k].view())?)?; }
+    out.scopePermissions = p.scopePermissions;
+    return Ok(out);
 }
 
 /// The access point a request's bucket names (ADR-0076 §2), if any access point is configured and it could be one.
@@ -93,6 +101,14 @@ fn throughAccessPoint(
 ) -> Result<void, S3Fail> {
     who.accessPoint = true;
     who.accessPointBlock = hit.point.block;
+    // A directory bucket's access point: its name and scope (ADR-0082 §3, §4).
+    if (isDirectoryAccessPointShaped(hit.point.name.view())) {
+        who.directoryAccessPoint = copyBytes(hit.point.name.view())?;
+        for (k in 0..hit.point.scopePrefixes.length) {
+            who.scopePrefixes.push(copyBytes(hit.point.scopePrefixes[k].view())?)?;
+        }
+        who.scopePermissions = hit.point.scopePermissions;
+    }
     if (hit.point.policy.length == 0) { return Ok(); }
     who.accessPointPolicy = match (parseAccessPointPolicy(
         hit.point.policy.view(),
@@ -129,6 +145,14 @@ fn accessPointArn(out: borrow mut Vector<u8>, account: Slice<u8>, name: Slice<u8
     out.extend(":accesspoint/".bytes())?;
     return out.extend(name);
 }
+
+/// An access point's ARN: `arn:aws:s3express:…` for a directory bucket's (ADR-0082 §1), else `arn:aws:s3:…`.
+fn pointArn(out: borrow mut Vector<u8>, account: Slice<u8>, name: Slice<u8>) -> Result<void, AllocError> =>
+    if (isDirectoryAccessPointShaped(name)) directoryAccessPointArn(out, account, name) else accessPointArn(
+        out,
+        account,
+        name,
+    );
 
 fn controlHead(out: borrow mut Vector<u8>, element: StringView) -> Result<void, AllocError> {
     out.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<".bytes())?;
@@ -175,7 +199,7 @@ fn accessPointXml(
     // The account it was made under; the asking one for an access point made before it was kept.
     let owner = if (p.account.length > 0) p.account.view() else account;
     var arn = Vector<u8>.create();
-    accessPointArn(mut arn, owner, p.name.view())?;
+    pointArn(mut arn, owner, p.name.view())?;
     xmlTextElement(out, "AccessPointArn", arn.view())?;
     xmlTextElement(out, "BucketAccountId", owner)?;
     return Ok();
@@ -226,6 +250,11 @@ async fn serveControl(
         if (c < '0' || c > '9') { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
     }
     let path = req.rawPath.view();
+    // ListAccessPointsForDirectoryBuckets (ADR-0082 §2).
+    if (path == "/v20180820/accesspointfordirectory".bytes()) {
+        if (!isMethod(req.method, Method.Get)) { return Err(S3Fail.Code(S3Code.MethodNotAllowed)); }
+        return await listDirectoryAccessPoints(app, req, account, exchange);
+    }
     let base = "/v20180820/accesspoint".bytes();
     if (!startsWithBytes(path, base)) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
     let rest = path[base.length..];
@@ -259,8 +288,9 @@ async fn serveControl(
                     Err(_) => { continue; }
                 };
                 for (i in 0..points.length) {
-                    // Another account's are not this one's to list.
+                    // Another account's are not this one's to list; a directory bucket's are listed apart (ADR-0082).
                     if (points[i].account.length > 0 && points[i].account.view() != account) { continue; }
+                    if (isDirectoryAccessPointShaped(points[i].name.view())) { continue; }
                     body.extend("<AccessPoint>".bytes())?;
                     accessPointXml(mut body, account, all.names[b].view(), borrow points[i], false)?;
                     body.extend("</AccessPoint>".bytes())?;
@@ -274,11 +304,17 @@ async fn serveControl(
     let tail = rest[1..];
     let slash = pieceEnd(tail, 0, '/');
     let name = tail[0..slash];
-    let policyCall = slash < tail.length;
+    let scopeCall = slash < tail.length && tail[slash..] == "/scope".bytes();
+    let policyCall = slash < tail.length && !scopeCall;
     if (policyCall && tail[slash..] != "/policy".bytes()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-    if (!accessPointNameOk(name)) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    // A directory bucket's access point is named `<base>--<zone>--xa-s3` (ADR-0082 §1).
+    let directoryName = isDirectoryAccessPointShaped(name);
+    if (if (directoryName) !isDirectoryAccessPointName(name, app.zoneId.view()) else !accessPointNameOk(name)) {
+        return Err(S3Fail.Code(S3Code.InvalidArgument));
+    }
+    if (scopeCall && !directoryName) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
     // CreateAccessPoint.
-    if (!policyCall && isMethod(m, Method.Put)) {
+    if (!policyCall && !scopeCall && isMethod(m, Method.Put)) {
         let xml = await readSmallBody(auth, exchange, 65536)?;
         var bucket = Vector<u8>.create();
         if (!rawElement(xml.view(), "Bucket", mut bucket)? || bucket.length == 0) {
@@ -287,8 +323,16 @@ async fn serveControl(
         if (findBytes(xml.view(), "<VpcConfiguration".bytes(), 0).isSome()) {
             return Err(S3Fail.Code(S3Code.NotImplemented));
         }
-        // Access points of directory buckets (named `--<zone>--xa-s3`, ADR-0080 §6) are not done.
-        if (isDirectoryShaped(trimBlank(bucket.view()))) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        // A directory bucket's access point has a directory access point's name, and only it a scope (ADR-0082 §1).
+        let directory = isDirectoryShaped(trimBlank(bucket.view()));
+        if (directory != directoryName) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        // On a cluster, the front's claims and routing of them are slice 2's (ADR-0082 §5): not yet.
+        if (directory && app.cluster) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        if (!directory && findBytes(xml.view(), "<Scope".bytes(), 0).isSome()) {
+            return Err(S3Fail.Code(S3Code.InvalidRequest));
+        }
+        // Tags are not kept with an access point: refused, not dropped.
+        if (findBytes(xml.view(), "<Tags".bytes(), 0).isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
         // A bucket of another account (cross-account access points) is not done.
         var bucketAccount = Vector<u8>.create();
         if (rawElement(
@@ -303,15 +347,18 @@ async fn serveControl(
             "<PublicAccessBlockConfiguration".bytes(),
             0,
         ).isSome()) parsePublicAccessBlock(xml.view())? else ACCESS_POINT_BLOCK_ALL;
-        var point = AccessPoint {
-            name: copyBytes(name)?,
-            alias: Vector<u8>.create(),
-            block: block,
-            createdMs: Clock.unixMillis(),
-            policy: Vector<u8>.create(),
-            account: copyBytes(account)?,
-        };
-        if (app.cluster) {
+        var point = accessPointOf(
+            copyBytes(name)?,
+            Vector<u8>.create(),
+            block,
+            Clock.unixMillis(),
+            Vector<u8>.create(),
+            copyBytes(account)?,
+        );
+        if (directory) {
+            parseScope(xml.view(), mut point)?;
+            point.alias.extend(name)?; // its own alias (ADR-0082 §1)
+        } else if (app.cluster) {
             let given = trimBlank(headerOf(req, ACCESS_POINT_ALIAS_FIELD) ?? "".bytes());
             if (given.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
             point.alias.extend(given)?;
@@ -321,7 +368,7 @@ async fn serveControl(
         var body = Vector<u8>.create();
         controlHead(mut body, "CreateAccessPointResult")?;
         var arn = Vector<u8>.create();
-        accessPointArn(mut arn, account, name)?;
+        pointArn(mut arn, account, name)?;
         xmlTextElement(mut body, "AccessPointArn", arn.view())?;
         xmlTextElement(mut body, "Alias", point.alias.view())?;
         body.extend("</CreateAccessPointResult>".bytes())?;
@@ -330,6 +377,14 @@ async fn serveControl(
             let store = guard.data();
             let bucketName = StringView.fromUtf8(bucket.view()) ?? "";
             if (!(store.bucketExists(bucketName).ok() ?? false)) { return Err(S3Fail.Code(S3Code.NoSuchBucket)); }
+            // A directory bucket of this zone, which the name's zone is (ADR-0082 §1).
+            if (directory) {
+                let zone = match (store.bucketZone(bucketName)) {
+                    Ok(z) => z,
+                    Err(e) => { return Err(storeFail(e, 0)); }
+                };
+                if (zone.view() != app.zoneId.view()) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            }
             let all = match (store.accessPointBuckets()) {
                 Ok(a) => a,
                 Err(e) => { return Err(storeFail(e, 0)); }
@@ -363,11 +418,19 @@ async fn serveControl(
     if (hit.point.account.length > 0 && hit.point.account.view() != account) {
         return Err(S3Fail.Code(S3Code.NoSuchAccessPoint));
     }
-    if (!policyCall && isMethod(m, Method.Get)) {
+    if (!policyCall && !scopeCall && isMethod(m, Method.Get)) {
         var body = Vector<u8>.create();
         controlHead(mut body, "GetAccessPointResult")?;
         accessPointXml(mut body, account, hit.bucket.view(), borrow hit.point, true)?;
         body.extend("</GetAccessPointResult>".bytes())?;
+        return await sendXml(exchange, borrow body);
+    }
+    // GetAccessPointScope: an access point with none has an empty one (ADR-0082 §2).
+    if (scopeCall && isMethod(m, Method.Get)) {
+        var body = Vector<u8>.create();
+        controlHead(mut body, "GetAccessPointScopeResult")?;
+        scopeXml(mut body, borrow hit.point)?;
+        body.extend("</GetAccessPointScopeResult>".bytes())?;
         return await sendXml(exchange, borrow body);
     }
     if (policyCall && isMethod(m, Method.Get)) {
@@ -384,7 +447,16 @@ async fn serveControl(
         if (points[i].name.view() == name) { at = i; }
     }
     if (at == points.length) { return Err(S3Fail.Code(S3Code.NoSuchAccessPoint)); }
-    if (!policyCall && isMethod(m, Method.Delete)) {
+    if (scopeCall && isMethod(m, Method.Delete)) {
+        points[at].scopePrefixes.clear();
+        points[at].scopePermissions = 0;
+    } else if (scopeCall && isMethod(m, Method.Put)) {
+        let xml = await readSmallBody(auth, exchange, 65536)?;
+        if (findBytes(xml.view(), "<Scope".bytes(), 0).isNull()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        parseScope(xml.view(), mut points[at])?;
+    } else if (scopeCall) {
+        return Err(S3Fail.Code(S3Code.MethodNotAllowed));
+    } else if (!policyCall && isMethod(m, Method.Delete)) {
         let _ = points.remove(at);
     } else if (policyCall && isMethod(m, Method.Delete)) {
         points[at].policy.clear();

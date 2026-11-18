@@ -470,8 +470,17 @@ async fn serveS3(
     match (borrow through) {
         Some(h) => {
             throughAccessPoint(app, mut who, h)?;
-            if (req.key.length == 0 && !accessPointBucketCall(borrow req)) {
+            // A directory bucket's access point also takes CreateSession; it takes no anonymous request, and its
+            // scope bounds the rest (ADR-0082 §3, §4).
+            let directoryPoint = who.directoryAccessPoint.length > 0;
+            let session = directoryPoint && req.key.length == 0 && isMethod(req.method, Method.Get) &&
+                req.onlyParams("session") && req.hasParam("session");
+            if (req.key.length == 0 && !accessPointBucketCall(borrow req) && !session) {
                 return Err(S3Fail.Code(S3Code.InvalidRequest));
+            }
+            if (directoryPoint) {
+                if (who.key.isNull()) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+                checkScope(borrow req, borrow who)?;
             }
         }
         null => {}
@@ -545,7 +554,9 @@ async fn serveS3(
     // A CreateSession session reaches only its bucket, and a ReadOnly one only its calls (ADR-0080 §4).
     match (expressSessionOf(app, borrow req)?) {
         Some(s) => {
-            checkExpressSession(borrow req, borrow s)?;
+            let reached =
+                if (who.directoryAccessPoint.length > 0) who.directoryAccessPoint.view() else req.bucket.bytes();
+            checkExpressSessionOf(borrow req, borrow s, reached)?;
             // The bucket's policy decides CreateSession again on each use: a session asked for before its bucket
             // was made (an SDK's CreateBucket) met no policy then.
             if (!(isMethod(m, Method.Put) && req.key.length == 0 && req.query.length == 0)) {
@@ -924,6 +935,10 @@ async fn serveS3(
     if (isMethod(m, Method.Put) && req.hasParam("renameObject")) {
         if (!directory || !req.onlyParams("renameObject")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
         let source = renameSourceOf(borrow req)?;
+        // Through a directory bucket's access point, the source is deleted, within its scope (ADR-0082 §3).
+        if (!scopeAllowsKey(borrow who, SCOPE_DELETE_OBJECT, source.bytes())) {
+            return Err(S3Fail.Code(S3Code.AccessDenied));
+        }
         await authorizeObject(app, borrow req, borrow who, "s3:PutObject", "s3:PutObject")?;
         await authorize(app, borrow req, borrow who, "s3:DeleteObject", bucket, source.bytes())?;
         return await renameObject(app, borrow req, exchange);

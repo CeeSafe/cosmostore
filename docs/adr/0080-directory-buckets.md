@@ -31,7 +31,7 @@ only, with S3's limits enforced).
     calls PutObject, GetObject, HeadObject, DeleteObject(s), CopyObject, GetObjectAttributes, RenameObject,
     ListObjectsV2, HeadBucket and the multipart calls. (RenameObject, found missing by the M8 exit review, is
     ADR-0081's: a record of its own. Access points of directory buckets,
-    named `--<zone>--xa-s3`, are not done either: CreateAccessPoint on one is NotImplemented.)
+    named `--<zone>--xa-s3`, are ADR-0082's.)
   - **Behaviour:** ListObjectsV2 is not in key order, its prefix must end in the delimiter and the delimiter can only
     be `/`, `StartAfter` is not taken, and `CommonPrefixes` include the prefixes of uploads in progress. Deleting an
     object deletes the empty "directories" above it. A multipart upload's parts must be consecutive from 1 (else 400),

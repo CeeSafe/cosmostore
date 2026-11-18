@@ -16,13 +16,37 @@ struct AccessPoint {
     policy: Vector<u8>;
     /// The account it was made under (`x-amz-account-id`); empty for one made before v2 (the M7 review's A5).
     account: Vector<u8>;
+    /// A directory bucket's access point's scope (ADR-0082 §3): its prefixes, and its permissions as the bits of
+    /// `SCOPE_*`; none of either for no limit. Not in v1 or v2, which read with none.
+    scopePrefixes: Vector<Vector<u8>>;
+    scopePermissions: u8;
 }
 
-/// Access points v2: u8 version, u16 count, then per access point the name, the alias (each u16+bytes), u8 block,
-/// i64 creation time, u32 policy length and the policy, and its account (u16+bytes; not in v1, which is still read).
+/// An access point with no scope: the fields up to v2.
+fn accessPointOf(
+    name: Vector<u8>,
+    alias: Vector<u8>,
+    block: u8,
+    createdMs: i64,
+    policy: Vector<u8>,
+    account: Vector<u8>,
+) -> AccessPoint => AccessPoint {
+    name: name,
+    alias: alias,
+    block: block,
+    createdMs: createdMs,
+    policy: policy,
+    account: account,
+    scopePrefixes: Vector<Vector<u8>>.create(),
+    scopePermissions: 0,
+};
+
+/// Access points v3: u8 version, u16 count, then per access point the name, the alias (each u16+bytes), u8 block,
+/// i64 creation time, u32 policy length and the policy, its account (u16+bytes; not in v1), and its scope: u8 count
+/// of prefixes, each u16+bytes, and u8 permissions (not in v1 or v2, which are still read).
 fn encodeAccessPoints(points: Slice<AccessPoint>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
     if (points.length == 0) { return Ok(); }
-    out.push(2)?;
+    out.push(3)?;
     out.pushLE(truncate<u16>(points.length))?;
     for (i in 0..points.length) {
         let p = borrow points[i];
@@ -33,6 +57,9 @@ fn encodeAccessPoints(points: Slice<AccessPoint>, out: borrow mut Vector<u8>) ->
         out.pushLE(truncate<u32>(p.policy.length))?;
         out.extend(p.policy.view())?;
         pushText16(out, p.account.view())?;
+        out.push(truncate<u8>(p.scopePrefixes.length))?;
+        for (k in 0..p.scopePrefixes.length) { pushText16(out, p.scopePrefixes[k].view())?; }
+        out.push(p.scopePermissions)?;
     }
     return Ok();
 }
@@ -40,9 +67,9 @@ fn encodeAccessPoints(points: Slice<AccessPoint>, out: borrow mut Vector<u8>) ->
 fn decodeAccessPoints(b: Slice<u8>) -> Result<Vector<AccessPoint>, MetaFault> {
     var out = Vector<AccessPoint>.create();
     if (b.length == 0) { return Ok(out); }
-    // v1 as first built; v2 adds each one's account.
+    // v1 as first built; v2 adds each one's account, v3 its scope (ADR-0082).
     let version = b[0];
-    if (version != 1 && version != 2) { return Err(MetaFault.BadVersion); }
+    if (version < 1 || version > 3) { return Err(MetaFault.BadVersion); }
     need(b, 1, 2)?;
     let n = b.readLE<u16>(1) as usize;
     if (n == 0 || n > MAX_ACCESS_POINTS) { return Err(MetaFault.TooLong); }
@@ -61,14 +88,17 @@ fn decodeAccessPoints(b: Slice<u8>) -> Result<Vector<AccessPoint>, MetaFault> {
         at += length;
         let account = if (version >= 2) readText16(b, mut at)? else Vector<u8>.create();
         if (name.length == 0 || alias.length == 0) { return Err(MetaFault.TooLong); }
-        out.push(AccessPoint {
-            name: name,
-            alias: alias,
-            block: block,
-            createdMs: createdMs,
-            policy: policy,
-            account: account,
-        })?;
+        var point = accessPointOf(name, alias, block, createdMs, policy, account);
+        if (version >= 3) {
+            need(b, at, 1)?;
+            let prefixes = b[at] as usize;
+            at += 1;
+            for (k in 0..prefixes) { point.scopePrefixes.push(readText16(b, mut at)?)?; }
+            need(b, at, 1)?;
+            point.scopePermissions = b[at];
+            at += 1;
+        }
+        out.push(point)?;
     }
     if (at != b.length) { return Err(MetaFault.TooLong); }
     return Ok(out);

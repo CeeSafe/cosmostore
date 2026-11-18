@@ -2992,3 +2992,24 @@ Browser form uploads with a SigV4 POST policy.
   and RenameObject, on `serve` and on a cluster, through the AWS CLI and every SDK of the matrix (ADR-0080,
   ADR-0081; `docs/m8-exit-review.md`). Not done, and refused: access points of directory buckets. S3 Tables are
   left for when Iceberg engines are meant to run against CosmoStore (ADR-0079).
+
+### 18 Nov 2026: access points of directory buckets, slice 1 on `serve` (ADR-0082, proposed)
+
+- **The owner:** "Take on Access points on directory buckets next". **ADR-0082** (proposed) designs them, from AWS's
+  pages and what boto3 sends to a custom endpoint (a CreateSession on the access point's name, then its calls, all
+  signed for `s3express`; the S3 Control calls on their usual paths).
+- **Built on `serve`:**
+  - **Names and record:** names `<base>--<zone>--xa-s3`, which are their own aliases, with `arn:aws:s3express:`
+    ARNs. They are kept in the bucket's access point record, whose encoding v3 adds the scope (v1 and v2 still read).
+  - **S3 Control:** CreateAccessPoint with a `Scope`, Get/Put/DeleteAccessPointScope, and
+    ListAccessPointsForDirectoryBuckets (paged); ListAccessPoints leaves them out. Tags on any access point are
+    NotImplemented, not dropped.
+  - **Requests through one:** checked against the scope (each call's permission, and its key or a listing's prefix
+    in a prefix; DeleteObjects per key, and RenameObject's source). Anonymous requests are refused.
+  - **Sessions:** a session made through an access point is that access point's, so no session goes around a scope
+    or a policy.
+  - **Policies:** an access point's policy names it by its `s3express` ARN.
+  - **On a cluster:** CreateAccessPoint is NotImplemented until slice 2.
+- **Tests:** `directoryAccessPointNames`, `directoryAccessPointScopes`, `directoryAccessPointPermissions`. The S3
+  smoke's 23 checks, and boto3's 11.
+- **Next:** slice 2, the cluster.

@@ -1,0 +1,277 @@
+// Access points of directory buckets (ADR-0082): names `<base>--<zone>--xa-s3`, which are their own aliases, an
+// optional scope of prefixes and permissions, and the S3 Control calls only they have (the scope, and their listing).
+import web_core;
+import web_http;
+import web_server;
+
+const DIRECTORY_ACCESS_POINT_SUFFIX: StringView = "--xa-s3";
+
+/// The permissions of a scope (ADR-0082 §3), as bits.
+const SCOPE_GET_OBJECT: u8 = 1;
+const SCOPE_GET_OBJECT_ATTRIBUTES: u8 = 2;
+const SCOPE_PUT_OBJECT: u8 = 4;
+const SCOPE_DELETE_OBJECT: u8 = 8;
+const SCOPE_LIST_BUCKET: u8 = 16;
+const SCOPE_LIST_BUCKET_MULTIPART_UPLOADS: u8 = 32;
+const SCOPE_LIST_MULTIPART_UPLOAD_PARTS: u8 = 64;
+const SCOPE_ABORT_MULTIPART_UPLOAD: u8 = 128;
+/// All of a scope's prefixes together, in bytes: under 256, as S3 takes them.
+const SCOPE_PREFIX_BYTES: usize = 255;
+
+/// The permissions' names, by bit.
+fn scopePermissionName(bit: usize) -> StringView => match (bit) {
+    0 => "GetObject",
+    1 => "GetObjectAttributes",
+    2 => "PutObject",
+    3 => "DeleteObject",
+    4 => "ListBucket",
+    5 => "ListBucketMultipartUploads",
+    6 => "ListMultipartUploadParts",
+    _ => "AbortMultipartUpload",
+};
+
+fn isDirectoryAccessPointShaped(name: Slice<u8>) -> bool {
+    let suffix = DIRECTORY_ACCESS_POINT_SUFFIX.bytes();
+    return name.length > suffix.length && name[name.length - suffix.length..] == suffix;
+}
+
+/// `<base>--<zone>--xa-s3` for this server's zone: a base of 3 to 50 lowercase letters, digits and `-`, not beginning
+/// or ending with `-` (ADR-0082 §1).
+fn isDirectoryAccessPointName(name: Slice<u8>, zone: Slice<u8>) -> bool {
+    if (zone.length == 0 || !isDirectoryAccessPointShaped(name)) { return false; }
+    var tail = Vector<u8>.create();
+    let _ = tail.extend("--".bytes());
+    let _ = tail.extend(zone);
+    let _ = tail.extend(DIRECTORY_ACCESS_POINT_SUFFIX.bytes());
+    if (name.length <= tail.length || name[name.length - tail.length..] != tail.view()) { return false; }
+    let base = name[0..name.length - tail.length];
+    if (base.length < 3 || base.length > 50 || base[0] == '-' || base[base.length - 1] == '-') { return false; }
+    for (c in base) {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) { return false; }
+    }
+    return true;
+}
+
+fn directoryAccessPointArn(
+    out: borrow mut Vector<u8>,
+    account: Slice<u8>,
+    name: Slice<u8>,
+) -> Result<void, AllocError> {
+    out.extend("arn:aws:s3express:".bytes())?;
+    out.extend(ACCESS_POINT_REGION.bytes())?;
+    out.push(':')?;
+    out.extend(account)?;
+    out.extend(":accesspoint/".bytes())?;
+    return out.extend(name);
+}
+
+/// A `<Scope>`'s prefixes and permissions, into `point` (ADR-0082 §3): InvalidRequest for an unknown permission or
+/// prefixes of 256 bytes or more in all. A document without `<Scope>` leaves it as it is.
+fn parseScope(xml: Slice<u8>, point: borrow mut AccessPoint) -> Result<void, S3Fail> {
+    let start = match (findBytes(xml, "<Scope>".bytes(), 0)) {
+        Some(s) => s,
+        null => {
+            if (findBytes(xml, "<Scope/>".bytes(), 0).isSome()) {
+                point.scopePrefixes.clear();
+                point.scopePermissions = 0;
+            }
+            return Ok();
+        }
+    };
+    let end = match (findBytes(xml, "</Scope>".bytes(), start)) {
+        Some(e) => e,
+        null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    };
+    let scope = xml[start..end];
+    var prefixes = Vector<Vector<u8>>.create();
+    var total: usize = 0;
+    var at: usize = 0;
+    while (true) {
+        let raw = match (nextElement(scope, "Prefix", mut at)?) {
+            Some(p) => p,
+            null => { break; }
+        };
+        var prefix = Vector<u8>.create();
+        if (!xmlUnescape(raw, mut prefix)?) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        total += prefix.length;
+        if (total > SCOPE_PREFIX_BYTES || prefixes.length >= 255) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        prefixes.push(prefix)?;
+    }
+    var permissions: u8 = 0;
+    at = 0;
+    while (true) {
+        let raw = match (nextElement(scope, "Permission", mut at)?) {
+            Some(p) => trimBlank(p),
+            null => { break; }
+        };
+        var known = false;
+        for (bit in 0..8) {
+            if (raw == scopePermissionName(bit).bytes()) {
+                permissions = permissions | (1u8 << truncate<u8>(bit));
+                known = true;
+            }
+        }
+        if (!known) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    }
+    point.scopePrefixes = prefixes;
+    point.scopePermissions = permissions;
+    return Ok();
+}
+
+/// `<Scope>` as S3 Control writes it: its prefixes and permissions, each list left out when empty.
+fn scopeXml(out: borrow mut Vector<u8>, point: borrow AccessPoint) -> Result<void, AllocError> {
+    out.extend("<Scope>".bytes())?;
+    if (point.scopePrefixes.length > 0) {
+        out.extend("<Prefixes>".bytes())?;
+        for (k in 0..point.scopePrefixes.length) { xmlTextElement(out, "Prefix", point.scopePrefixes[k].view())?; }
+        out.extend("</Prefixes>".bytes())?;
+    }
+    if (point.scopePermissions != 0) {
+        out.extend("<Permissions>".bytes())?;
+        for (bit in 0..8) {
+            if ((point.scopePermissions & (1u8 << truncate<u8>(bit))) != 0) {
+                xmlTextElement(out, "Permission", scopePermissionName(bit).bytes())?;
+            }
+        }
+        out.extend("</Permissions>".bytes())?;
+    }
+    return out.extend("</Scope>".bytes());
+}
+
+/// The scope permission a request through a directory bucket's access point needs (ADR-0082 §3); 0 for none
+/// (HeadBucket, CreateSession). RenameObject's source is checked apart (`scopeAllowsKey`).
+fn scopePermissionOf(req: borrow S3Request) -> u8 {
+    let m = req.method;
+    if (req.key.length == 0) {
+        if (isMethod(m, Method.Get) && req.hasParam("uploads")) { return SCOPE_LIST_BUCKET_MULTIPART_UPLOADS; }
+        if (isMethod(m, Method.Get) && req.hasParam("list-type")) { return SCOPE_LIST_BUCKET; }
+        if (isMethod(m, Method.Post) && req.hasParam("delete")) { return SCOPE_DELETE_OBJECT; }
+        return 0;
+    }
+    if (isMethod(m, Method.Get) || isMethod(m, Method.Head)) {
+        if (req.hasParam("attributes")) { return SCOPE_GET_OBJECT_ATTRIBUTES; }
+        if (req.hasParam("uploadId")) { return SCOPE_LIST_MULTIPART_UPLOAD_PARTS; }
+        return SCOPE_GET_OBJECT;
+    }
+    if (isMethod(m, Method.Delete)) {
+        return if (req.hasParam("uploadId")) SCOPE_ABORT_MULTIPART_UPLOAD else SCOPE_DELETE_OBJECT;
+    }
+    return SCOPE_PUT_OBJECT; // PUT and POST of a key: writes, copies, uploads and their completion, renames
+}
+
+/// Whether a scope's prefixes take `key` (none: every key). A prefix ending in `*` means what one without it does.
+fn scopeTakesKey(prefixes: Slice<Vector<u8>>, key: Slice<u8>) -> bool {
+    if (prefixes.length == 0) { return true; }
+    for (k in 0..prefixes.length) {
+        var p = prefixes[k].view();
+        if (p.length > 0 && p[p.length - 1] == '*') { p = p[0..p.length - 1]; }
+        if (startsWithBytes(key, p)) { return true; }
+    }
+    return false;
+}
+
+/// Whether the scope of the access point a request came through lets it act on `key` with `permission`.
+fn scopeAllowsKey(who: borrow Requester, permission: u8, key: Slice<u8>) -> bool {
+    if (who.directoryAccessPoint.length == 0) { return true; }
+    if (permission != 0 && who.scopePermissions != 0 && (who.scopePermissions & permission) == 0) { return false; }
+    return scopeTakesKey(who.scopePrefixes.view(), key);
+}
+
+/// A request through a directory bucket's access point, against its scope (ADR-0082 §3): its permission, and its
+/// key, or a listing's prefix, in a prefix. DeleteObjects' keys are each checked by the batch. AccessDenied else.
+fn checkScope(req: borrow S3Request, who: borrow Requester) -> Result<void, S3Fail> {
+    if (who.directoryAccessPoint.length == 0) { return Ok(); }
+    let permission = scopePermissionOf(req);
+    if (permission == 0) { return Ok(); }
+    if (who.scopePermissions != 0 && (who.scopePermissions & permission) == 0) {
+        return Err(S3Fail.Code(S3Code.AccessDenied));
+    }
+    if (req.key.length == 0 && permission == SCOPE_DELETE_OBJECT) { return Ok(); } // DeleteObjects: per key
+    let key = if (req.key.length > 0) req.key.bytes() else paramOf(req, "prefix") ?? "".bytes();
+    if (!scopeTakesKey(who.scopePrefixes.view(), key)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    return Ok();
+}
+
+/// One directory access point listed: its bucket, for sorting by name.
+struct ListedPoint {
+    bucket: Vector<u8>;
+    point: AccessPoint;
+}
+
+/// ListAccessPointsForDirectoryBuckets (ADR-0082 §2): this account's directory buckets' access points in name order,
+/// only `directoryBucket`'s when it is given, `maxResults` (0 to 1,000) at a time, with the last name, in base64, as
+/// the next page's `nextToken`.
+async fn listDirectoryAccessPoints(
+    app: borrow S3App,
+    req: borrow S3Request,
+    account: Slice<u8>,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    if (!req.onlyParams("directoryBucket,maxResults,nextToken")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    var limit: usize = 1000;
+    match (paramOf(req, "maxResults")) {
+        Some(t) => {
+            match (parseDecimal(t)) {
+                Some(v) => {
+                    if (v > 1000) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                    limit = v as usize;
+                }
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            }
+        }
+        null => {}
+    }
+    var after = Vector<u8>.create();
+    match (paramOf(req, "nextToken")) {
+        Some(t) => {
+            if (t.length > 1024 || !decodeBase64(t, mut after)?) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        }
+        null => {}
+    }
+    let only = paramOf(req, "directoryBucket");
+    var found = Vector<ListedPoint>.create();
+    {
+        var guard = await lockStore(app)?;
+        let all = match (guard.data().accessPointBuckets()) {
+            Ok(a) => a,
+            Err(e) => { return Err(storeFail(e, 0)); }
+        };
+        for (b in 0..all.names.length) {
+            match (only) {
+                Some(o) => {
+                    if (all.names[b].view() != o) { continue; }
+                }
+                null => {}
+            }
+            let points = match (decodeAccessPoints(all.documents[b].view())) {
+                Ok(p) => p,
+                Err(_) => { continue; }
+            };
+            for (i in 0..points.length) {
+                let p = borrow points[i];
+                if (!isDirectoryAccessPointShaped(p.name.view())) { continue; }
+                if (p.account.length > 0 && p.account.view() != account) { continue; }
+                if (after.length > 0 && compareBytes(p.name.view(), after.view()) <= 0) { continue; }
+                found.push(ListedPoint { bucket: copyBytes(all.names[b].view())?, point: copyAccessPoint(p)? })?;
+            }
+        }
+    }
+    found.sortBy((a, b) => compareBytes(a.point.name.view(), b.point.name.view()));
+    var body = Vector<u8>.create();
+    controlHead(mut body, "ListAccessPointsForDirectoryBucketsResult")?;
+    body.extend("<AccessPointList>".bytes())?;
+    let shown = if (found.length > limit) limit else found.length;
+    for (i in 0..shown) {
+        body.extend("<AccessPoint>".bytes())?;
+        accessPointXml(mut body, account, found[i].bucket.view(), borrow found[i].point, false)?;
+        body.extend("</AccessPoint>".bytes())?;
+    }
+    body.extend("</AccessPointList>".bytes())?;
+    if (shown < found.length && shown > 0) {
+        var token = Vector<u8>.create();
+        appendBase64(mut token, found[shown - 1].point.name.view())?;
+        xmlTextElement(mut body, "NextToken", token.view())?;
+    }
+    body.extend("</ListAccessPointsForDirectoryBucketsResult>".bytes())?;
+    return await sendXml(exchange, borrow body);
+}

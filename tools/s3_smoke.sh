@@ -1160,6 +1160,34 @@ check "an upload in progress is a directory" "$(aws s3api list-objects-v2 --buck
 aws s3api abort-multipart-upload --bucket "$dir" --key pending/x/part.bin --upload-id "$upload" > /dev/null 2>&1
 check "and is not once it ends" "$(aws s3api list-objects-v2 --bucket "$dir" --delimiter / --query 'CommonPrefixes[].Prefix' --output text 2>&1)" "a/	ren/	tree/"
 
+# A directory bucket's access point (ADR-0082): made with a scope, then requests through it with its sessions.
+door=door--local-az1--xa-s3
+check "create-access-point for a directory bucket" "$(ctl create-access-point --name "$door" --bucket "$dir" --scope 'Prefixes=[pub/*],Permissions=[GetObject,PutObject,ListBucket]' --query '[Alias,AccessPointArn]' --output text 2>&1)" "$door	arn:aws:s3express:us-east-1:000000000000:accesspoint/$door"
+check "get-access-point-scope" "$(ctl get-access-point-scope --name "$door" --query '[Scope.Prefixes[0],length(Scope.Permissions)]' --output text 2>&1)" "pub/*	3"
+check "list-access-points-for-directory-buckets" "$(ctl list-access-points-for-directory-buckets --directory-bucket "$dir" --query 'AccessPointList[].Name' --output text 2>&1)" "$door"
+check "not in list-access-points" "$(ctl list-access-points --query "length(AccessPointList[?Name=='$door'])" 2>&1)" 0
+check "a general-purpose name for it" "$(apcode s3control create-access-point --account-id 000000000000 --name plain-door --bucket "$dir")" InvalidRequest
+check "a scope on a general-purpose bucket's" "$(apcode s3control put-access-point-scope --account-id 000000000000 --name smoke-ap --scope 'Prefixes=[a/]')" InvalidRequest
+check "a PUT through it, in its scope" "$(aws s3api put-object --bucket "$door" --key pub/door.txt --body dir.txt > /dev/null 2>&1; echo $?)" 0
+check "read through the bucket" "$(aws s3api get-object --bucket "$dir" --key pub/door.txt dir.out > /dev/null 2>&1; cat dir.out)" "in a directory"
+check "a GET through it" "$(aws s3api get-object --bucket "$door" --key pub/door.txt dir.out > /dev/null 2>&1; cat dir.out)" "in a directory"
+check "a listing within its prefix" "$(aws s3api list-objects-v2 --bucket "$door" --prefix pub/ --query 'Contents[].Key' --output text 2>&1)" "pub/door.txt"
+check "a key outside its scope" "$(code s3api get-object --bucket "$door" --key a/b.txt dir.out)" AccessDenied
+check "a permission outside its scope" "$(code s3api delete-object --bucket "$door" --key pub/door.txt)" AccessDenied
+check "a listing outside its prefix" "$(code s3api list-objects-v2 --bucket "$door" --prefix a/)" AccessDenied
+read -r dk ds dt <<< "$(aws s3api create-session --bucket "$door" --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
+check "its session through it" "$(express "$dk" "$ds" "$dt" GET "/$door/pub/door.txt")" "200 in a directory"
+check "but not around it, to its bucket" "$(express "$dk" "$ds" "$dt" GET "/$dir/a/b.txt" | cut -d' ' -f1)" 403
+check "and a bucket's session not through it" "$(express "$wk" "$ws" "$wt" GET "/$door/pub/door.txt" | cut -d' ' -f1)" 403
+check "no anonymous request" "$(curl -s -o /dev/null -w '%{http_code}' "$AWS_ENDPOINT_URL/$door/pub/door.txt")" 403
+check "the scope widened" "$(ctl put-access-point-scope --name "$door" --scope 'Permissions=[GetObject,DeleteObject]' > /dev/null 2>&1; aws s3api delete-object --bucket "$door" --key pub/door.txt > /dev/null 2>&1; echo $?)" 0
+check "then deleted" "$(ctl delete-access-point-scope --name "$door" > /dev/null 2>&1; ctl get-access-point-scope --name "$door" --query 'length(Scope.Permissions || `[]`)' 2>&1)" 0
+door_policy='{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3express:CreateSession","Resource":"arn:aws:s3express:us-east-1:000000000000:accesspoint/'"$door"'"}]}'
+check "a policy of it" "$(ctl put-access-point-policy --name "$door" --policy "$door_policy" > /dev/null 2>&1; echo $?)" 0
+check "denies its sessions" "$(code s3api create-session --bucket "$door")" AccessDenied
+check "and the one it gave" "$(express "$dk" "$ds" "$dt" GET "/$door/a/b.txt" | cut -d' ' -f1)" 403
+check "delete-access-point" "$(ctl delete-access-point --name "$door" > /dev/null 2>&1; ctl list-access-points-for-directory-buckets --query 'length(AccessPointList)' 2>&1)" 0
+
 # What a directory bucket does not take (ADR-0080 §6), as S3 refuses it.
 check "no versioning" "$(code s3api put-bucket-versioning --bucket "$dir" --versioning-configuration Status=Enabled)" NotImplemented
 check "no object tags" "$(code s3api put-object --bucket "$dir" --key t --body dir.txt --tagging a=b)" NotImplemented

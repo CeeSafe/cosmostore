@@ -638,6 +638,30 @@ for sessions in (True, False):
         d.delete_object(Bucket=DIR, Key=k)
     d.delete_bucket(Bucket=DIR)
     check("deleted" + how, d.list_directory_buckets()["Buckets"], [])
+
+# A directory bucket's access point (ADR-0082): its scope, requests through it with its sessions, its listing.
+APB, AP = "sdk3--local-az1--x-s3", "sdkdoor--local-az1--xa-s3"
+d = client()
+d.create_bucket(Bucket=APB, CreateBucketConfiguration=dir_config)
+made = ctl.create_access_point(AccountId=ACCOUNT, Name=AP, Bucket=APB,
+                               Scope={"Prefixes": ["pub/"], "Permissions": ["GetObject", "PutObject", "ListBucket"]})
+check("directory access point: its alias is its name", made["Alias"], AP)
+check("directory access point: its ARN", made["AccessPointArn"], "arn:aws:s3express:us-east-1:%s:accesspoint/%s" % (ACCOUNT, AP))
+check("get_access_point_scope", ctl.get_access_point_scope(AccountId=ACCOUNT, Name=AP)["Scope"]["Permissions"],
+      ["GetObject", "PutObject", "ListBucket"])
+check("list_access_points_for_directory_buckets",
+      [p["Name"] for p in ctl.list_access_points_for_directory_buckets(AccountId=ACCOUNT, DirectoryBucket=APB)["AccessPointList"]], [AP])
+d.put_object(Bucket=AP, Key="pub/a.txt", Body=b"through")
+check("a GET through it", d.get_object(Bucket=AP, Key="pub/a.txt")["Body"].read(), b"through")
+check("listed through it", [o["Key"] for o in d.list_objects_v2(Bucket=AP, Prefix="pub/")["Contents"]], ["pub/a.txt"])
+check("a key outside its scope", code_of(lambda: d.put_object(Bucket=AP, Key="other/a.txt", Body=b"x")), "AccessDenied")
+check("a permission outside its scope", code_of(lambda: d.delete_object(Bucket=AP, Key="pub/a.txt")), "AccessDenied")
+ctl.delete_access_point_scope(AccountId=ACCOUNT, Name=AP)
+d.delete_object(Bucket=AP, Key="pub/a.txt")
+ctl.delete_access_point(AccountId=ACCOUNT, Name=AP)
+check("deleted", ctl.list_access_points_for_directory_buckets(AccountId=ACCOUNT)["AccessPointList"], [])
+d.delete_bucket(Bucket=APB)
+
 session = client().create_session(Bucket="sdk2--local-az1--x-s3", SessionMode="ReadOnly")
 check("create_session", session["Credentials"]["AccessKeyId"][:4], "ASIA")
 
