@@ -52,7 +52,7 @@ only, with S3's limits enforced).
 
 ## Decision (proposed)
 
-1. **The zone.** `serve --zone-id <id>` (and on a cluster, a `zone-id` line in the cluster file) names the one zone
+1. **The zone.** `serve --zone-id <id>` (and on a cluster, `node --zone-id`, the same on every node) names the one zone
    this server's directory buckets are in, e.g. `local-az1`: 1 to 20 of a-z, 0-9 and `-`. Without one, a directory
    configuration is NotImplemented. The region in ARNs is the one requests are signed for.
 2. **CreateBucket of a directory bucket:** the name has the form above with this server's zone id, the configuration
@@ -67,10 +67,14 @@ only, with S3's limits enforced).
 3. **CreateSession** (`GET /<bucket>?session`, path-style or under the domain): signed for `s3express` by a long-term
    key or a `GetSessionToken` session (not by another CreateSession session, not by an assumed role: as STS's
    tokens, ADR-0075 §3). The mode is ReadWrite or ReadOnly (unset: ReadWrite); a bucket's policy decides
-   `s3express:CreateSession` for it. The bucket must exist, or be a name of this zone's form that does not exist yet:
-   then the session can only make that bucket (what boto3 does). Encryption headers must be the bucket's default
-   encryption, or InvalidArgument; SSE-C's are refused. The token is an STS token (ADR-0075's sealing and keys) with
-   two more fields, the bucket and the mode, and expires in 5 minutes; the answer is `CreateSessionResult`.
+   `s3express:CreateSession` for it. The bucket must exist, or be a name of this zone's form that does not exist yet
+   (an SDK asks for a session before CreateBucket, and keeps using it on the bucket it made: so such a session is
+   an ordinary session of that bucket, and the requests it signs are authorized as the key's are); another name is
+   NoSuchBucket, a general-purpose bucket InvalidRequest. CreateSession needs `--sts-key-file` (NotImplemented
+   without). Encryption headers must be the bucket's default
+   encryption, or InvalidArgument; SSE-C's are refused. The token is sealed as STS's are (ADR-0075's keys, AES-256-GCM) but with
+   its own version byte and additional data, so neither kind of token opens as the other; it holds the key that made
+   it, the bucket, the mode and its expiry (5 minutes), and the answer is `CreateSessionResult`.
 4. **A request with `x-amz-s3session-token`:** signed for `s3express` with the session's key; the token opens, has not
    expired (ExpiredToken, as STS's) and names this request's bucket (else AccessDenied); a ReadOnly session may make
    only the six calls above (else AccessDenied). The requester is the key that made the session (for policies, the
@@ -114,7 +118,8 @@ only, with S3's limits enforced).
 1. Names, the zone, CreateBucket and its record, ListDirectoryBuckets, and `s3express` signatures from long-term
    keys (sessions off). Checked through boto3 with `AWS_S3_DISABLE_EXPRESS_SESSION_AUTH`: the AWS CLI (2.34) has
    no way to turn sessions off, so its checks, and the smokes', come with slice 2.
-2. CreateSession and session tokens, ReadOnly sessions, the cluster.
+2. CreateSession and session tokens, ReadOnly sessions, the cluster: the AWS CLI with sessions in the S3 smoke and
+   the cluster smoke (a session made through one node used through another).
 3. The refusals and S3's behaviours (§6, §7), then the SDK matrix.
 
 ## Rejected

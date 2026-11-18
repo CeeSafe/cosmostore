@@ -199,3 +199,185 @@ async fn listDirectoryBuckets(
     body.extend("</ListAllMyDirectoryBucketsResult>".bytes())?;
     return await sendXml(exchange, borrow body);
 }
+
+// ---- CreateSession (ADR-0080 §3, §4) ----
+
+/// The field a directory bucket's request carries its session token in.
+const EXPRESS_TOKEN_FIELD: StringView = "x-amz-s3session-token";
+/// A CreateSession token is sealed as STS's are, with its own version and additional data.
+const EXPRESS_TOKEN_VERSION: u8 = 2;
+const EXPRESS_AAD: StringView = "cosmostore-s3express-1 ";
+/// Its credentials last 5 minutes and are not extended.
+const EXPRESS_SESSION_MS: i64 = 300000;
+const EXPRESS_READ_ONLY: u8 = 1;
+const EXPRESS_READ_WRITE: u8 = 2;
+
+/// A CreateSession session: the key that made it, the bucket it is for, its mode, until when. `secret` is wiped once
+/// the request's signing key is made.
+struct ExpressSession {
+    accessKey: Vector<u8>;
+    secret: Vector<u8>;
+    parent: Vector<u8>;
+    bucket: Vector<u8>;
+    mode: u8;
+    expiresMs: i64;
+}
+
+fn sealExpressToken(
+    keys: Slice<MasterKey>,
+    s: borrow ExpressSession,
+    out: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    var plain = Vector<u8>.create();
+    plain.pushLE(s.expiresMs)?;
+    pushText16(mut plain, s.accessKey.view())?;
+    pushText16(mut plain, s.secret.view())?;
+    pushText16(mut plain, s.parent.view())?;
+    pushText16(mut plain, s.bucket.view())?;
+    plain.push(s.mode)?;
+    return sealToken(keys, EXPRESS_TOKEN_VERSION, EXPRESS_AAD, mut plain, out);
+}
+
+fn expressFields(p: Slice<u8>, at: borrow mut usize) -> Result<ExpressSession, MetaFault> => Ok(ExpressSession {
+    accessKey: readText16(p, at)?,
+    secret: readText16(p, at)?,
+    parent: readText16(p, at)?,
+    bucket: readText16(p, at)?,
+    mode: 0,
+    expiresMs: 0,
+});
+
+/// The session a CreateSession token holds; null for one these keys did not seal, an STS token, or one changed.
+fn openExpressToken(keys: Slice<MasterKey>, token: Slice<u8>) -> Result<ExpressSession?, AllocError> {
+    let plain = match (openToken(keys, EXPRESS_TOKEN_VERSION, EXPRESS_AAD, token)?) {
+        Some(p) => p,
+        null => { return Ok(null); }
+    };
+    let p = plain.view();
+    if (p.length < 8) { return Ok(null); }
+    var pos: usize = 8;
+    var s = match (expressFields(p, mut pos)) {
+        Ok(s) => s,
+        Err(_) => { return Ok(null); }
+    };
+    if (pos + 1 != p.length || (p[pos] != EXPRESS_READ_ONLY && p[pos] != EXPRESS_READ_WRITE)) { return Ok(null); }
+    s.mode = p[pos];
+    s.expiresMs = p.readLE<i64>(0);
+    return Ok(Some(s));
+}
+
+/// The session a request's `x-amz-s3session-token` holds, opened again after its signature checked; null without one.
+fn expressSessionOf(app: borrow S3App, req: borrow S3Request) -> Result<ExpressSession?, AllocError> {
+    return match (headerOf(req, EXPRESS_TOKEN_FIELD)) {
+        Some(t) => openExpressToken(app.stsKeys.view(), trimBlank(t)),
+        null => Ok(null),
+    };
+}
+
+/// What a ReadOnly session may do (ADR-0080 §4, S3's list): GetObject, HeadObject, GetObjectAttributes and ListParts
+/// (a GET or HEAD of a key), ListObjectsV2 and ListMultipartUploads (a GET of the bucket with `list-type=2` or
+/// `uploads`).
+fn readOnlyCall(req: borrow S3Request) -> bool {
+    let reads = isMethod(req.method, Method.Get) || isMethod(req.method, Method.Head);
+    if (!reads) { return false; }
+    if (req.key.length > 0) { return true; }
+    return isMethod(req.method, Method.Get) && (req.hasParam("list-type") || req.hasParam("uploads"));
+}
+
+/// A request with a CreateSession token reaches only the bucket the session is for, and a ReadOnly session only
+/// its calls (ADR-0080 §4): else AccessDenied.
+fn checkExpressSession(req: borrow S3Request, s: borrow ExpressSession) -> Result<void, S3Fail> {
+    if (s.bucket.view() != req.bucket.bytes()) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    if (s.mode == EXPRESS_READ_ONLY && !readOnlyCall(req)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    return Ok();
+}
+
+/// CreateSession (ADR-0080 §3): `GET /<bucket>?session`, from a long-term key or a `GetSessionToken` session, for a
+/// directory bucket or a name of this zone's form not made yet (an SDK asks for a session before CreateBucket).
+async fn createSession(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    parent: Slice<u8>,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    if (app.zoneId.length == 0 || app.stsKeys.length == 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    // Not from an assumed role, nor from another CreateSession session (ADR-0075 §3's rule for STS's tokens).
+    if (who.role.isSome() || headerOf(req, EXPRESS_TOKEN_FIELD).isSome()) {
+        return Err(S3Fail.Code(S3Code.AccessDenied));
+    }
+    let bucket = req.bucket.view();
+    var exists = false;
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        match (store.bucketZone(bucket)) { // memory only
+            Ok(z) => {
+                if (z.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); } // a general-purpose bucket
+                exists = true;
+            }
+            Err(StoreError.NoSuchBucket) => {}
+            Err(e) => { return Err(storeFail(e, 0)); }
+        }
+    }
+    if (!exists && !isDirectoryBucketName(bucket.bytes(), app.zoneId.view())) {
+        return Err(S3Fail.Code(S3Code.NoSuchBucket));
+    }
+    if (exists) { await authorize(app, req, who, "s3express:CreateSession", bucket, "".bytes())?; }
+    var mode = EXPRESS_READ_WRITE;
+    match (headerOf(req, "x-amz-create-session-mode")) {
+        Some(v) => {
+            let m = trimBlank(v);
+            if (m == "ReadOnly".bytes()) {
+                mode = EXPRESS_READ_ONLY;
+            } else if (m != "ReadWrite".bytes()) {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
+        }
+        null => {}
+    }
+    // The session's encryption is the bucket's (S3 lets it say only that): SSE-S3 here.
+    match (headerOf(req, "x-amz-server-side-encryption")) {
+        Some(v) => {
+            if (trimBlank(v) != "AES256".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        }
+        null => {}
+    }
+    for (field in [
+        "x-amz-server-side-encryption-aws-kms-key-id", "x-amz-server-side-encryption-context",
+        "x-amz-server-side-encryption-bucket-key-enabled",
+    ]) {
+        if (headerOf(req, field).isSome()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    }
+    var session = ExpressSession {
+        accessKey: Vector<u8>.create(),
+        secret: Vector<u8>.create(),
+        parent: copyBytes(parent)?,
+        bucket: copyBytes(bucket.bytes())?,
+        mode: mode,
+        expiresMs: Clock.unixMillis() + EXPRESS_SESSION_MS,
+    };
+    var random = [0u8; 30];
+    if (!temporaryKeyId(mut session.accessKey)? || Random.fill(mut random[..]).isErr()) {
+        return Err(S3Fail.Code(S3Code.InternalError));
+    }
+    appendBase64(mut session.secret, random[..])?;
+    for (i in 0..30) { random[i] = 0; }
+    var token = Vector<u8>.create();
+    if (!sealExpressToken(app.stsKeys.view(), borrow session, mut token)?) {
+        return Err(S3Fail.Code(S3Code.InternalError));
+    }
+    var body = Vector<u8>.create();
+    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CreateSessionResult xmlns=\"".bytes())?;
+    body.extend(S3_XMLNS.bytes())?;
+    body.extend("\"><Credentials>".bytes())?;
+    xmlElement(mut body, "SessionToken", token.view(), false)?;
+    xmlElement(mut body, "SecretAccessKey", session.secret.view(), false)?;
+    xmlElement(mut body, "AccessKeyId", session.accessKey.view(), false)?;
+    body.extend("<Expiration>".bytes())?;
+    appendIso8601(mut body, session.expiresMs)?;
+    body.extend("</Expiration></Credentials></CreateSessionResult>".bytes())?;
+    for (i in 0..session.secret.length) { session.secret[i] = 0; }
+    exchange.header("x-amz-server-side-encryption", "AES256".bytes())?;
+    return await sendXml(exchange, borrow body);
+}

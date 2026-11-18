@@ -506,12 +506,43 @@ struct S3Request {
         // Temporary credentials (ADR-0075 §1): the token, sealed by this server, holds the secret and the key that
         // asked for them, which must still be in the credentials.
         var session: StsSession? = null;
-        match (headerOf(this, "x-amz-security-token") ?? paramOf(this, "X-Amz-Security-Token")) {
+        // A CreateSession token (ADR-0080 §4), signed for `s3express`, is a session of its key with no role; its
+        // bucket and mode are checked at the dispatch (`checkExpressSession`).
+        let fromExpress = match (headerOf(this, EXPRESS_TOKEN_FIELD)) {
             Some(token) => {
-                let opened = match (openStsToken(sts, trimBlank(token))) {
-                    Ok(Some(s)) => s,
+                if (headerOf(this, "x-amz-security-token").isSome() || paramOf(this, "X-Amz-Security-Token").isSome()) {
+                    return Err(S3Code.InvalidRequest);
+                }
+                if (!express) { return Err(S3Code.AccessDenied); }
+                match (openExpressToken(sts, trimBlank(token))) {
+                    Ok(Some(e)) => Some(StsSession {
+                        accessKey: e.accessKey,
+                        secret: e.secret,
+                        parent: e.parent,
+                        role: Vector<u8>.create(),
+                        name: Vector<u8>.create(),
+                        policy: Vector<u8>.create(),
+                        expiresMs: e.expiresMs,
+                    }),
                     Ok(null) => { return Err(S3Code.InvalidToken); }
                     Err(_) => { return Err(S3Code.InternalError); }
+                }
+            }
+            null => null,
+        };
+        let stsToken = if (fromExpress.isSome()) null else headerOf(this, "x-amz-security-token") ?? paramOf(
+            this,
+            "X-Amz-Security-Token",
+        );
+        if (fromExpress.isSome() || stsToken.isSome()) {
+            {
+                let opened = match (fromExpress) {
+                    Some(s) => s,
+                    null => match (openStsToken(sts, trimBlank(stsToken ?? "".bytes()))) {
+                        Ok(Some(s)) => s,
+                        Ok(null) => { return Err(S3Code.InvalidToken); }
+                        Err(_) => { return Err(S3Code.InternalError); }
+                    },
                 };
                 if (!sameSignature(opened.accessKey.view(), auth.accessKey.view())) { return Err(S3Code.InvalidToken); }
                 if (opened.expiresMs <= now * 1000) { return Err(S3Code.ExpiredToken); }
@@ -523,12 +554,10 @@ struct S3Request {
                 if (found.isNull()) { return Err(S3Code.InvalidToken); }
                 session = Some(opened);
             }
-            null => {
-                for (i in 0..credentials.length) {
-                    if (!credentials[i].revoked &&
-                        sameSignature(credentials[i].accessKey.view(), auth.accessKey.view())) {
-                        found = Some(i);
-                    }
+        } else {
+            for (i in 0..credentials.length) {
+                if (!credentials[i].revoked && sameSignature(credentials[i].accessKey.view(), auth.accessKey.view())) {
+                    found = Some(i);
                 }
             }
         }

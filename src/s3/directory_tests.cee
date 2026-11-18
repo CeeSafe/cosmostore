@@ -1,5 +1,9 @@
 // Directory buckets in the S3 layer (ADR-0080): the configuration CreateBucket takes, the headers it refuses, and
-// the signature's service and region.
+// the signature's service and region; CreateSession's tokens and what a session reaches.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
 
 fn directoryConfig(locationType: StringView, zone: StringView, redundancy: StringView, kind: StringView) -> String {
     var x = textOf("<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location><Type>");
@@ -69,5 +73,96 @@ fn directoryRequestFields() -> Result<void, TestFailure> {
     Check.isFalse(signedForExpress(borrow plain), "signed for s3")?;
     let unsigned = bareRequest();
     Check.isFalse(signedForExpress(borrow unsigned), "unsigned")?;
+    return Ok();
+}
+
+fn expressSession(bucket: StringView, mode: u8) -> ExpressSession => ExpressSession {
+    accessKey: copyBytes("ASIAEXPRESS0000000001".bytes())!,
+    secret: copyBytes("secret".bytes())!,
+    parent: copyBytes("AKIAPARENT".bytes())!,
+    bucket: copyBytes(bucket.bytes())!,
+    mode: mode,
+    expiresMs: 1700000000000,
+};
+
+@test
+fn expressTokensAreTheirOwn() -> Result<void, TestFailure> {
+    var keys = Vector<MasterKey>.create();
+    keys.push(stsKey("k1", 7))!;
+    let s = expressSession("data--local-az1--x-s3", EXPRESS_READ_ONLY);
+    var token = Vector<u8>.create();
+    Check.isTrue(sealExpressToken(keys.view(), borrow s, mut token)!, "sealed")?;
+    let opened = openExpressToken(keys.view(), token.view())!!;
+    Check.equalBytes("data--local-az1--x-s3".bytes(), opened.bucket.view())?;
+    Check.equalBytes("AKIAPARENT".bytes(), opened.parent.view())?;
+    Check.equalU64(EXPRESS_READ_ONLY as u64, opened.mode as u64)?;
+    Check.isTrue(opened.expiresMs == 1700000000000, "its expiry")?;
+    // Not an STS token, and an STS token is not one of these.
+    Check.isTrue(openStsToken(keys.view(), token.view())!.isNull(), "not an STS token")?;
+    let sts = StsSession {
+        accessKey: copyBytes("ASIASTS".bytes())!,
+        secret: copyBytes("s".bytes())!,
+        parent: copyBytes("AKIAPARENT".bytes())!,
+        role: Vector<u8>.create(),
+        name: Vector<u8>.create(),
+        policy: Vector<u8>.create(),
+        expiresMs: 1,
+    };
+    var stsToken = Vector<u8>.create();
+    Check.isTrue(sealStsToken(keys.view(), borrow sts, mut stsToken)!, "an STS token")?;
+    Check.isTrue(openExpressToken(keys.view(), stsToken.view())!.isNull(), "an STS token is not a session's")?;
+    // Another key, or a changed byte.
+    var other = Vector<MasterKey>.create();
+    other.push(stsKey("k1", 8))!;
+    Check.isTrue(openExpressToken(other.view(), token.view())!.isNull(), "another key")?;
+    var raw = Vector<u8>.create();
+    let _ = decodeBase64(token.view(), mut raw)!;
+    raw[raw.length - 20] = raw[raw.length - 20] ^ 1;
+    var changed = Vector<u8>.create();
+    appendBase64(mut changed, raw.view())!;
+    Check.isTrue(openExpressToken(keys.view(), changed.view())!.isNull(), "a changed token")?;
+    return Ok();
+}
+
+fn sessionRequest(method: Method, bucket: StringView, key: StringView, param: StringView) -> S3Request {
+    var req = bareRequest();
+    req.method = method;
+    let _ = req.bucket.append(bucket);
+    let _ = req.key.append(key);
+    if (param.length > 0) {
+        req.query.push(QueryParam { name: copyBytes(param.bytes())!, value: copyBytes("2".bytes())! })!;
+    }
+    return req;
+}
+
+fn deniedBySession(req: borrow S3Request, s: borrow ExpressSession) -> bool =>
+    match (checkExpressSession(req, s)) {
+        Err(S3Fail.Code(S3Code.AccessDenied)) => true,
+        _ => false,
+    };
+
+@test
+fn expressSessionsReachTheirBucketAndMode() -> Result<void, TestFailure> {
+    let bucket = "data--local-az1--x-s3";
+    let readOnly = expressSession(bucket, EXPRESS_READ_ONLY);
+    let readWrite = expressSession(bucket, EXPRESS_READ_WRITE);
+    let get = sessionRequest(Method.Get, bucket, "k", "");
+    let head = sessionRequest(Method.Head, bucket, "k", "");
+    let list = sessionRequest(Method.Get, bucket, "", "list-type");
+    let uploads = sessionRequest(Method.Get, bucket, "", "uploads");
+    let put = sessionRequest(Method.Put, bucket, "k", "");
+    let delete = sessionRequest(Method.Delete, bucket, "k", "");
+    let policy = sessionRequest(Method.Get, bucket, "", "policy");
+    Check.isTrue(checkExpressSession(borrow get, borrow readOnly).isOk(), "GetObject, ReadOnly")?;
+    Check.isTrue(checkExpressSession(borrow head, borrow readOnly).isOk(), "HeadObject, ReadOnly")?;
+    Check.isTrue(checkExpressSession(borrow list, borrow readOnly).isOk(), "ListObjectsV2, ReadOnly")?;
+    Check.isTrue(checkExpressSession(borrow uploads, borrow readOnly).isOk(), "ListMultipartUploads, ReadOnly")?;
+    Check.isTrue(deniedBySession(borrow put, borrow readOnly), "PutObject, not ReadOnly")?;
+    Check.isTrue(deniedBySession(borrow delete, borrow readOnly), "DeleteObject, not ReadOnly")?;
+    Check.isTrue(deniedBySession(borrow policy, borrow readOnly), "GetBucketPolicy, not ReadOnly")?;
+    Check.isTrue(checkExpressSession(borrow put, borrow readWrite).isOk(), "PutObject, ReadWrite")?;
+    Check.isTrue(checkExpressSession(borrow policy, borrow readWrite).isOk(), "GetBucketPolicy, ReadWrite")?;
+    let elsewhere = sessionRequest(Method.Get, "other--local-az1--x-s3", "k", "");
+    Check.isTrue(deniedBySession(borrow elsewhere, borrow readWrite), "another bucket")?;
     return Ok();
 }

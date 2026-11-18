@@ -71,7 +71,7 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --zone-id local-az1 >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -342,6 +342,24 @@ ctl 3 create-access-point --name door --bucket "$apb" > /dev/null 2>&1 && pass "
 on 1 s3api delete-bucket --bucket "$apb" > /dev/null 2>&1
 ctl 2 create-access-point --name window --bucket apa > /dev/null 2>&1 && pass "a deleted bucket's names are let go" || fail "a deleted bucket's names are let go"
 check "and the access point is apa's" "$(ctl 1 get-access-point --name window --query Bucket --output text 2>&1)" apa
+
+# Directory buckets on a cluster (ADR-0080 §8): made through one node, listed through every one (the shards merged),
+# used with CreateSession's sessions through the others; a session from one node opens on another (STS's keys).
+dirconf='Location={Type=AvailabilityZone,Name=local-az1},Bucket={DataRedundancy=SingleAvailabilityZone,Type=Directory}'
+for d in a b c; do on 1 s3api create-bucket --bucket "$d--local-az1--x-s3" --create-bucket-configuration "$dirconf" > /dev/null 2>&1; done
+for n in 2 3; do
+    check "list-directory-buckets through node $n, merged across shards" "$(on "$n" s3api list-directory-buckets --query 'Buckets[].Name' --output text 2>&1)" "a--local-az1--x-s3	b--local-az1--x-s3	c--local-az1--x-s3"
+done
+check "and not in list-buckets" "$(on 2 s3api list-buckets --query "length(Buckets[?ends_with(Name, '--x-s3')])" 2>&1)" 0
+printf 'in a directory' > dir.txt
+on 2 s3api put-object --bucket b--local-az1--x-s3 --key k/one --body dir.txt > /dev/null 2>&1 && pass "a PUT with a session, through node 2" || fail "a PUT with a session, through node 2"
+check "read through node 3" "$(on 3 s3 cp s3://b--local-az1--x-s3/k/one - 2>&1)" "in a directory"
+read -r xk xs xt <<< "$(on 1 s3api create-session --bucket b--local-az1--x-s3 --session-mode ReadOnly --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
+express() { python3 -I "$OLDPWD/tools/s3_raw.py" express "http://127.0.0.1:$((BASE + 10 + $1))" "${@:2}"; }
+check "a session from node 1 reads through node 3" "$(express 3 "$xk" "$xs" "$xt" GET /b--local-az1--x-s3/k/one)" "200 in a directory"
+check "but does not write through node 2" "$(express 2 "$xk" "$xs" "$xt" PUT /b--local-az1--x-s3/k/two | cut -d' ' -f1)" 403
+for d in a b c; do on 3 s3 rm --recursive "s3://$d--local-az1--x-s3/" > /dev/null 2>&1; on 3 s3api delete-bucket --bucket "$d--local-az1--x-s3" > /dev/null 2>&1; done
+check "deleted through node 3" "$(on 1 s3api list-directory-buckets --query 'length(Buckets)' 2>&1)" 0
 
 # Event notifications on a cluster (ADR-0078 §4): the shard's leader delivers, and a new one goes on.
 keys() { python3 -c 'import json,sys

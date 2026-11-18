@@ -8,6 +8,11 @@ usage:
   s3_raw.py put-with     ENDPOINT BUCKET KEY TEXT NAME:VALUE...
                                                             a PUT of TEXT with these fields, signed: prints its status
                                                             and version id (`-` for none)
+  s3_raw.py express      ENDPOINT KEY SECRET TOKEN METHOD PATH[?QUERY]
+                                                            a request signed for `s3express` (directory buckets,
+                                                            ADR-0080) with KEY and SECRET (empty: the environment's)
+                                                            and TOKEN in x-amz-s3session-token (empty: none): prints
+                                                            its status and body
   s3_raw.py presign      ENDPOINT METHOD BUCKET KEY SECONDS [SUBRESOURCE]
                                                             prints a presigned URL (query auth, ADR-0011), with
                                                             `?SUBRESOURCE` if one is given (`quota`, ADR-0052)
@@ -29,16 +34,21 @@ def sign(key, msg):
     return hmac.new(key, msg.encode(), hashlib.sha256).digest()
 
 
-def signing_key(secret, date):
+def signing_key(secret, date, service="s3"):
     k = sign(("AWS4" + secret).encode(), date)
     k = sign(k, REGION)
-    k = sign(k, "s3")
+    k = sign(k, service)
     return sign(k, "aws4_request")
 
 
-def authorize(method, host, path, headers, payload_hash):
-    access = os.environ["AWS_ACCESS_KEY_ID"]
-    secret = os.environ["AWS_SECRET_ACCESS_KEY"]
+def canonical_query(query):
+    pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+    return "&".join(f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}" for k, v in sorted(pairs))
+
+
+def authorize(method, host, path, headers, payload_hash, service="s3", access=None, secret=None, query=""):
+    access = access or os.environ["AWS_ACCESS_KEY_ID"]
+    secret = secret or os.environ["AWS_SECRET_ACCESS_KEY"]
     now = datetime.datetime.now(datetime.timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     date = amz_date[:8]
@@ -50,14 +60,14 @@ def authorize(method, host, path, headers, payload_hash):
     canonical = "\n".join([
         method,
         path,
-        "",
+        canonical_query(query),
         "".join(f"{n}:{headers[n].strip()}\n" for n in names),
         ";".join(names),
         payload_hash,
     ])
-    scope = f"{date}/{REGION}/s3/aws4_request"
+    scope = f"{date}/{REGION}/{service}/aws4_request"
     sts = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()])
-    key = signing_key(secret, date)
+    key = signing_key(secret, date, service)
     signature = hmac.new(key, sts.encode(), hashlib.sha256).hexdigest()
     headers["authorization"] = (
         f"AWS4-HMAC-SHA256 Credential={access}/{scope}, SignedHeaders={';'.join(names)}, Signature={signature}"
@@ -175,6 +185,21 @@ def put_with(endpoint, bucket, key, text, fields):
     return status, got.get("x-amz-version-id", "-")
 
 
+def express(endpoint, access, secret, token, method, target):
+    s, host = connect(endpoint)
+    path, _, query = target.partition("?")
+    extra = {"x-amz-s3session-token": token} if token else {}
+    body = b"x" if method == "PUT" else b""
+    headers, *_ = authorize(method, host, path, extra, hashlib.sha256(body).hexdigest(), "s3express",
+                            access or None, secret or None, query)
+    headers["content-length"] = str(len(body))
+    s.sendall((f"{method} {target} HTTP/1.1\r\n" + "".join(f"{n}: {v}\r\n" for n, v in headers.items())
+               + "connection: close\r\n\r\n").encode() + body)
+    status, _, rest = read_response(s)
+    s.close()
+    return status, rest.decode(errors="replace")
+
+
 def main():
     cmd = sys.argv[1]
     if cmd in ("chunked-put", "bad-chunk"):
@@ -188,6 +213,9 @@ def main():
     elif cmd == "put-with":
         status, version = put_with(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:])
         print(status, version)
+    elif cmd == "express":
+        status, text = express(*sys.argv[2:8])
+        print(status, text if status < 300 else "")
     elif cmd == "abort-get":
         print(abort_get(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])))
     else:

@@ -2891,3 +2891,20 @@ Browser form uploads with a SigV4 POST policy.
   `directoryRequestFields`; boto3 with sessions off makes, lists (two pages), writes and reads one. The AWS CLI 2.34
   cannot turn sessions off, so its checks and the smokes' come with slice 2 (CreateSession). 329 tests; the S3, TLS
   and cluster smokes and boto3 pass as before.
+
+### 18 Nov 2026: M8 slice 2, CreateSession and the cluster (ADR-0080)
+
+- **CreateSession** (`GET /<bucket>?session`): from a long-term key or a `GetSessionToken` session (not a role's,
+  not another CreateSession's), for a directory bucket or a name of this zone's form not made yet (the SDKs take a
+  session before CreateBucket and keep it); ReadWrite or ReadOnly; SSE-S3 only. Its token is sealed under STS's
+  keys with its own version and additional data (STS's sealing made generic, `sealToken`/`openToken`), holding the
+  key, the bucket, the mode and a 5-minute expiry.
+- **`x-amz-s3session-token`:** signed for `s3express`, it opens as a session of its key with no role; the request
+  must be for its bucket, and a ReadOnly session's one of S3's six reads (AccessDenied); with an STS token too,
+  InvalidRequest.
+- **On a cluster:** `node --zone-id`; ListDirectoryBuckets merged across shards by the front as ListBuckets is; a
+  session made through one node opens on any other.
+- Tests: `expressTokensAreTheirOwn`, `expressSessionsReachTheirBucketAndMode`; `tools/s3_raw.py express`. The S3
+  smoke makes and uses a directory bucket with the AWS CLI's sessions (`s3 cp --recursive` too) and checks a
+  ReadOnly session, another bucket, a changed token and an `s3express` signature on a general-purpose bucket; the
+  cluster smoke (106) lists through every node and uses a session from node 1 through node 3. 331 tests.

@@ -38,7 +38,7 @@ remoteport=$((port + 3))
 echo "AKIAFARSERVER0000001 far/secret/0123456789abcdefghij" > "$work/far.credentials"
 printf 'far http://127.0.0.1:%s AKIAFARSERVER0000001 far/secret/0123456789abcdefghij\n' "$remoteport" > "$work/replication.targets"
 start_server() {
-    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 --website-domain web.localhost --inventory-day-seconds 3 --sts-key-file "$work/sts.keys" --roles-file "$work/roles" --replication-targets "$work/replication.targets" 2>> "$work/server.log" &
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 --website-domain web.localhost --inventory-day-seconds 3 --sts-key-file "$work/sts.keys" --roles-file "$work/roles" --replication-targets "$work/replication.targets" --zone-id local-az1 2>> "$work/server.log" &
     server=$!
     sleep 1
 }
@@ -1077,6 +1077,34 @@ check "the object is still there" "$(site "$web/plain.txt") $(cat site.body)" "2
 aws s3api delete-bucket-website --bucket site > /dev/null 2>&1
 check "no website after its deletion" "$(site "$web/" ; grep -c NoSuchWebsiteConfiguration site.body)" "404 1"
 aws s3 rm --recursive s3://site/ > /dev/null 2>&1
+
+# Directory buckets (ADR-0080): the CLI takes a session (CreateSession) before each bucket's calls, signed for s3express.
+dir=data--local-az1--x-s3
+dirconf='Location={Type=AvailabilityZone,Name=local-az1},Bucket={DataRedundancy=SingleAvailabilityZone,Type=Directory}'
+check "create a directory bucket" "$(aws s3api create-bucket --bucket "$dir" --create-bucket-configuration "$dirconf" --query BucketArn --output text 2>&1)" "arn:aws:s3express:us-east-1:000000000000:bucket/$dir"
+# Another zone's bucket: the CLI's CreateSession for it finds no such bucket here, before its CreateBucket.
+check "another zone" "$(code s3api create-bucket --bucket x--usw2-az1--x-s3 --create-bucket-configuration 'Location={Type=AvailabilityZone,Name=usw2-az1},Bucket={DataRedundancy=SingleAvailabilityZone,Type=Directory}')" NoSuchBucket
+check "a directory bucket's name without its configuration" "$(code s3api create-bucket --bucket plain--local-az1--x-s3)" InvalidBucketName
+check "list-directory-buckets" "$(aws s3api list-directory-buckets --query 'Buckets[].Name' --output text 2>&1)" "$dir"
+check "not in list-buckets" "$(aws s3api list-buckets --query "length(Buckets[?Name=='$dir'])" 2>&1)" 0
+printf 'in a directory' > dir.txt
+aws s3api put-object --bucket "$dir" --key a/b.txt --body dir.txt > /dev/null 2>&1 && pass "a PUT with a session" || fail "a PUT with a session"
+check "a GET with a session" "$(aws s3 cp "s3://$dir/a/b.txt" - 2>&1)" "in a directory"
+mkdir -p dirtree/x && printf 1 > dirtree/one && printf 2 > dirtree/x/two
+check "s3 cp --recursive" "$(aws s3 cp --recursive dirtree "s3://$dir/tree/" 2>&1 | grep -c upload:)" 2
+check "and listed" "$(aws s3api list-objects-v2 --bucket "$dir" --prefix tree/ --query 'length(Contents)' 2>&1)" 2
+read -r rk rs rt <<< "$(aws s3api create-session --bucket "$dir" --session-mode ReadOnly --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
+check "create-session gives a key" "${rk:0:4}" ASIA
+express() { python3 -I "$here/s3_raw.py" express "$AWS_ENDPOINT_URL" "$@"; }
+check "a ReadOnly session reads" "$(express "$rk" "$rs" "$rt" GET "/$dir/a/b.txt")" "200 in a directory"
+check "but does not write" "$(express "$rk" "$rs" "$rt" PUT "/$dir/a/no.txt" | cut -d' ' -f1)" 403
+aws s3api create-bucket --bucket other--local-az1--x-s3 --create-bucket-configuration "$dirconf" > /dev/null 2>&1
+check "nor reach another directory bucket" "$(express "$rk" "$rs" "$rt" GET "/other--local-az1--x-s3?list-type=2" | cut -d' ' -f1)" 403
+aws s3api delete-bucket --bucket other--local-az1--x-s3 > /dev/null 2>&1
+check "a changed token" "$(express "$rk" "$rs" "${rt%????}AAAA" GET "/$dir/a/b.txt" | cut -d' ' -f1)" 400
+check "s3express on a general-purpose bucket" "$(express "" "" "" GET "/smoke?list-type=2" | cut -d' ' -f1)" 400
+aws s3 rm --recursive "s3://$dir/" > /dev/null 2>&1
+aws s3api delete-bucket --bucket "$dir" > /dev/null 2>&1 && pass "delete the directory bucket" || fail "delete the directory bucket"
 
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1

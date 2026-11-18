@@ -36,35 +36,38 @@ struct StsRole {
 
 // ---- The token ----
 
-fn stsAad(out: borrow mut Vector<u8>, keyId: Slice<u8>) -> Result<void, AllocError> {
-    out.extend("cosmostore-sts-1 ".bytes())?;
+fn tokenAad(out: borrow mut Vector<u8>, prefix: StringView, keyId: Slice<u8>) -> Result<void, AllocError> {
+    out.extend(prefix.bytes())?;
     return out.extend(keyId);
 }
 
-/// The session as a token: base64 of u8 version, u8 key id length, the key id, a 12-byte nonce, the sealed session and
-/// its 16-byte tag. Sealed under the first key; null without one.
-fn sealStsToken(keys: Slice<MasterKey>, s: borrow StsSession, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+/// What STS's tokens are sealed with (`cosmostore-sts-1 ` and the key's id as additional data); a CreateSession token
+/// (ADR-0080 §3) has its own version and prefix, so neither opens as the other.
+const STS_AAD: StringView = "cosmostore-sts-1 ";
+
+/// `plain` as a token: base64 of u8 `version`, u8 key id length, the key id, a 12-byte nonce, the sealed bytes and
+/// their 16-byte tag, with `aadPrefix` and the key id as additional data. Sealed under the first key; false without
+/// one. `plain` is sealed in place.
+fn sealToken(
+    keys: Slice<MasterKey>,
+    version: u8,
+    aadPrefix: StringView,
+    plain: borrow mut Vector<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
     if (keys.length == 0) { return Ok(false); }
     let key = borrow keys[0];
     let cipher = match (Aes256Gcm.create(key.key[..])) {
         Some(c) => c,
         null => { return Ok(false); }
     };
-    var plain = Vector<u8>.create();
-    plain.pushLE(s.expiresMs)?;
-    pushText16(mut plain, s.accessKey.view())?;
-    pushText16(mut plain, s.secret.view())?;
-    pushText16(mut plain, s.parent.view())?;
-    pushText16(mut plain, s.role.view())?;
-    pushText16(mut plain, s.name.view())?;
-    pushText16(mut plain, s.policy.view())?;
     var nonce = [0u8; 12];
     if (Random.fill(mut nonce[..]).isErr()) { return Ok(false); }
     var aad = Vector<u8>.create();
-    stsAad(mut aad, key.id.view())?;
+    tokenAad(mut aad, aadPrefix, key.id.view())?;
     let tag = cipher.seal(nonce, aad.view(), mut plain.viewMut());
     var sealed = Vector<u8>.create();
-    sealed.push(STS_TOKEN_VERSION)?;
+    sealed.push(version)?;
     sealed.push(truncate<u8>(key.id.length))?;
     sealed.extend(key.id.view())?;
     sealed.extend(nonce[..])?;
@@ -74,15 +77,21 @@ fn sealStsToken(keys: Slice<MasterKey>, s: borrow StsSession, out: borrow mut Ve
     return Ok(true);
 }
 
-/// The session a token holds; null for one these keys did not seal, or that was changed.
-fn openStsToken(keys: Slice<MasterKey>, token: Slice<u8>) -> Result<StsSession?, AllocError> {
+/// The plaintext of a token `sealToken` made with `version` and `aadPrefix`; null for one these keys did not seal,
+/// another kind of token, or one that was changed.
+fn openToken(
+    keys: Slice<MasterKey>,
+    version: u8,
+    aadPrefix: StringView,
+    token: Slice<u8>,
+) -> Result<Vector<u8>?, AllocError> {
     var raw = Vector<u8>.create();
     if (token.length > 8192 || !decodeBase64(token, mut raw)?) { return Ok(null); }
     let b = raw.view();
-    if (b.length < 2 || b[0] != STS_TOKEN_VERSION) { return Ok(null); }
+    if (b.length < 2 || b[0] != version) { return Ok(null); }
     let idLength = b[1] as usize;
     let head = 2 + idLength + 12;
-    if (b.length < head + 8 + 16) { return Ok(null); }
+    if (b.length < head + 16) { return Ok(null); }
     let id = b[2..2 + idLength];
     var at = keys.length;
     for (i in 0..keys.length) {
@@ -99,9 +108,32 @@ fn openStsToken(keys: Slice<MasterKey>, token: Slice<u8>) -> Result<StsSession?,
     for (i in 0..16) { tag[i] = b[b.length - 16 + i]; }
     var plain = copyBytes(b[head..b.length - 16])?;
     var aad = Vector<u8>.create();
-    stsAad(mut aad, id)?;
+    tokenAad(mut aad, aadPrefix, id)?;
     if (!cipher.open(nonce, aad.view(), mut plain.viewMut(), tag)) { return Ok(null); }
+    return Ok(Some(plain));
+}
+
+/// The session as a token (`sealToken`, STS's version and additional data).
+fn sealStsToken(keys: Slice<MasterKey>, s: borrow StsSession, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    var plain = Vector<u8>.create();
+    plain.pushLE(s.expiresMs)?;
+    pushText16(mut plain, s.accessKey.view())?;
+    pushText16(mut plain, s.secret.view())?;
+    pushText16(mut plain, s.parent.view())?;
+    pushText16(mut plain, s.role.view())?;
+    pushText16(mut plain, s.name.view())?;
+    pushText16(mut plain, s.policy.view())?;
+    return sealToken(keys, STS_TOKEN_VERSION, STS_AAD, mut plain, out);
+}
+
+/// The session a token holds; null for one these keys did not seal, or that was changed.
+fn openStsToken(keys: Slice<MasterKey>, token: Slice<u8>) -> Result<StsSession?, AllocError> {
+    let plain = match (openToken(keys, STS_TOKEN_VERSION, STS_AAD, token)?) {
+        Some(p) => p,
+        null => { return Ok(null); }
+    };
     let p = plain.view();
+    if (p.length < 8) { return Ok(null); }
     let expiresMs = p.readLE<i64>(0);
     var pos: usize = 8;
     let fields = stsFields(p, mut pos);
