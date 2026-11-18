@@ -1,6 +1,6 @@
 # ADR-0080: Directory buckets (M8)
 
-**Status:** proposed, 18 Nov 2026, for the owner to accept: M8's one item (ADR-0079; the owner chose directory buckets
+**Status:** accepted, 18 Nov 2026 (the owner: "accept ADR-0079 and ADR-0080"); proposed the same day as M8's one item (ADR-0079; the owner chose directory buckets
 only, with S3's limits enforced).
 
 ## Context

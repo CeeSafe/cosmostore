@@ -1,7 +1,7 @@
 # ADR-0079: Directory buckets and S3 Tables, the plan of M8
 
-**Status:** proposed, 18 Nov 2026; the owner chose, the same day, **directory buckets only** and **S3's limits
-enforced** (the two questions below). Its acceptance is the owner's. M7 left both out (ADR-0071 §3: "other storage
+**Status:** accepted, 18 Nov 2026 (the owner: "accept ADR-0079 and ADR-0080"); proposed the same day. The owner chose, the same day, **directory buckets only** and **S3's limits
+enforced** (the two questions below). M7 left both out (ADR-0071 §3: "other storage
 classes with APIs of their own; a later milestone may take them"); the owner asked to go on after M7 closed.
 
 ## Context

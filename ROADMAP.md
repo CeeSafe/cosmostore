@@ -290,12 +290,12 @@ item is an independent project with its own support matrix.
 **Closed 17 Nov 2026** (`docs/m7-exit-review.md`): the six items on `serve` and on a cluster (ADR-0071 to
 ADR-0078); directory buckets and Tables were left out (ADR-0071 §3).
 
-### M8: Directory buckets and S3 Tables (proposed)
+### M8: Directory buckets
 
-Proposed in ADR-0079 (18 Nov 2026), for the owner to accept: directory buckets (CreateBucket with a directory
+ADR-0079 (accepted 18 Nov 2026) proposed directory buckets (CreateBucket with a directory
 configuration, CreateSession and `s3express` signing, S3's limits for them), then S3 Tables (the `s3tables` catalog
 API and the Iceberg REST calls an engine needs, commits as a compare-and-set).
-The owner chose directory buckets only, with S3's limits enforced (18 Nov 2026); their design is ADR-0080 (proposed).
+The owner chose directory buckets only, with S3's limits enforced (18 Nov 2026); their design is ADR-0080 (accepted 18 Nov 2026), in three slices.
 
 ---
 
@@ -2873,3 +2873,4 @@ Browser form uploads with a SigV4 POST policy.
   CreateBucket included, takes a session first and arrives with its token; CopyObject and ListDirectoryBuckets come
   signed for `s3express` with the long-term key, ListDirectoryBuckets as `GET /`. Three slices; for the owner to
   accept, with ADR-0079.
+- **The owner: "accept ADR-0079 and ADR-0080".** M8 is directory buckets; slice 1 next.
