@@ -12,7 +12,7 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
 | rclone | 1.73.2 | `tools/sdk/rclone.sh` | 20 | pass |
 | boto3 (botocore with CRT) | 1.42.97 | `tools/sdk/boto3.sh` | 178 | pass |
 | AWS SDK for Go v2 | service/s3 1.114.9, s3control 1.81.0, sts 1.52.0 | `tools/sdk/go.sh` | 55 | pass |
-| AWS SDK for JavaScript v3 | client-s3 3.1168.0 | `tools/sdk/js.sh` | 28 | pass |
+| AWS SDK for JavaScript v3 | client-s3, client-s3-control, client-sts 3.1168.0 | `tools/sdk/js.sh` | 61 | pass |
 | AWS SDK for Java v2 (with aws-crt) | 2.57.11 | `tools/sdk/java.sh` | 25 | pass |
 | AWS SDK for .NET (with CrtIntegration) | AWSSDK.S3 4.0.104.11 | `tools/sdk/dotnet.sh` | 22 | pass |
 | Ceph s3-tests (subset) | commit 5b39871 | `tools/s3tests/run.sh` | 377 | pass |
@@ -97,7 +97,7 @@ checks of boto3 (`s3`, `s3control` and `sts` clients): access logs delivered int
 and error document through `<bucket>.web.localhost`, an inventory's manifest and CSV, a session token and an assumed
 role signing S3 requests, an access point by alias and by ARN, and a replica keeping its source's version id and
 ETag; and what is refused rather than dropped (an inventory's `AccountId`, STS `PolicyArns`, a replication priority
-given twice). The Go SDK runs the same 33 (`tools/sdk/go/m7.go`), and found two defects the CLI and boto3 had
+given twice). The Go and JavaScript SDKs run the same 33 (`tools/sdk/go/m7.go`, `tools/sdk/js/check.mjs`), and found two defects the CLI and boto3 had
 let pass: S3 Control's errors were S3's `<Error>` form, which its s3control client reads as UnknownError (now
 `<ErrorResponse><Error>`, ADR-0076 §1), and a replication rule with its `Status` after `DeleteMarkerReplication`,
 as Go writes it, was MalformedXML (ADR-0077 §1).
