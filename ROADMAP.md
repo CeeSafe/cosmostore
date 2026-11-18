@@ -2953,3 +2953,15 @@ Browser form uploads with a SigV4 POST policy.
   tags kept by a copy, inventory's MD5 ETags, the storage class, lifecycle and encryption rules taken that S3 does
   not take (A2–A8); RenameObject listed as taken and not built (A9).
 - **Next:** fix the findings, each with a test, if the owner agrees.
+
+### 18 Nov 2026: M8's exit review findings closed (the owner: "continue and fix them all")
+
+- **Sessions:** no S3 Control, no bucket-less calls, no copy from another bucket, no unsigned token; a bucket's
+  policy decides `s3express:CreateSession` on every use; policies take `s3express:` actions and ARNs; the logs name
+  the session's key; a CreateBucket signed for `s3express` must name a directory bucket.
+- **Directory buckets:** DeleteObjects; `versionId=null`; tags only empty (a tagged copy NotImplemented); lifecycle
+  only expiration and aborts; always encrypted, a request naming only its bucket's encryption, and CreateSession
+  answering it; `EXPRESS_ONEZONE`; inventory's directory ETags; HeadBucket's zone; no access points yet.
+- 335 tests, the S3 and TLS smokes, the cluster smoke (110) and the whole SDK matrix pass.
+- **RenameObject** (A9) needs a journal record: proposed as ADR-0081, for the owner to accept or leave out of M8.
+- **Next:** the owner's word on M8 and ADR-0081.

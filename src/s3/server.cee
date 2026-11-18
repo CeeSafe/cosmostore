@@ -430,6 +430,10 @@ async fn serveS3(
         return await serveSts(app, borrow req, exchange, requestId);
     }
     let now = Clock.unixMillis() / 1000;
+    // A CreateSession token is checked with the signature it came with; one with none is refused, not passed over
+    // (ADR-0080 §4).
+    let sessionToken = headerOf(borrow req, EXPRESS_TOKEN_FIELD).isSome();
+    if (sessionToken && req.isAnonymous()) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
     let attempt = if (req.isAnonymous()) req.anonymous() else req.authenticate(
         app.credentials.get().view(),
         app.stsKeys.view(),
@@ -472,9 +476,11 @@ async fn serveS3(
         }
         null => {}
     }
-    // S3 Control's access point calls (ADR-0076 §1).
+    // S3 Control's access point calls (ADR-0076 §1); not for a CreateSession session, which reaches its bucket only
+    // (ADR-0080 §4).
     if (through.isNull() && startsWithBytes(req.rawPath.view(), "/v20180820/".bytes()) &&
         headerOf(borrow req, "x-amz-account-id").isSome()) {
+        if (sessionToken) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
         return await serveControl(app, borrow req, auth, borrow who, exchange);
     }
     // Who the request is, for its line in the audit log (ADR-0051) and the bucket's access log (ADR-0072).
@@ -488,7 +494,8 @@ async fn serveS3(
         facts.requester.clear();
         let credentials = app.credentials.get().view();
         match (borrow auth.session) {
-            Some(s) => { facts.requester.extend(s.accessKey.view())?; }
+            // A CreateSession session's requests are its key's (ADR-0080 §4); an STS session's, its own key id's.
+            Some(s) => { facts.requester.extend(if (sessionToken) s.parent.view() else s.accessKey.view())?; }
             null => {
                 match (auth.key) {
                     Some(i) => { facts.requester.extend(credentials[i].accessKey.view())?; }
@@ -511,6 +518,8 @@ async fn serveS3(
     // Signed for `s3express`: directory buckets' requests (ADR-0080 §4).
     let express = signedForExpress(borrow req);
     if (req.bucket.length == 0) {
+        // A CreateSession session names a bucket: not the service's calls (ADR-0080 §4).
+        if (sessionToken) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
         if (express) {
             if (!isMethod(m, Method.Get)) { return Err(S3Fail.Code(S3Code.MethodNotAllowed)); }
             if (!req.onlyParams("max-directory-buckets,continuation-token")) {
@@ -535,12 +544,29 @@ async fn serveS3(
     if (express) { await expressReaches(app, borrow req)?; }
     // A CreateSession session reaches only its bucket, and a ReadOnly one only its calls (ADR-0080 §4).
     match (expressSessionOf(app, borrow req)?) {
-        Some(s) => { checkExpressSession(borrow req, borrow s)?; }
+        Some(s) => {
+            checkExpressSession(borrow req, borrow s)?;
+            // The bucket's policy decides CreateSession again on each use: a session asked for before its bucket
+            // was made (an SDK's CreateBucket) met no policy then.
+            if (!(isMethod(m, Method.Put) && req.key.length == 0 && req.query.length == 0)) {
+                await authorize(app, borrow req, borrow who, "s3express:CreateSession", bucket, "".bytes())?;
+            }
+        }
         null => {}
     }
     // What a directory bucket does not take (ADR-0080 §6).
     let directory = await isDirectoryBucket(app, bucket)?;
-    if (directory) { directoryRefusal(borrow req)?; }
+    if (directory) {
+        directoryRefusal(borrow req)?;
+        // A request names its bucket's encryption, or none (ADR-0080 §3).
+        if (headerOf(borrow req, SSE_FIELD).isSome()) {
+            let asked = sseRequestOf(borrow req)?;
+            let held = await bucketDefaultSse(app, bucket)?;
+            if (!directoryEncryptionAgrees(borrow asked, borrow held)) {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
+        }
+    }
     // CreateSession (ADR-0080 §3).
     if (req.key.length == 0 && req.hasParam("session")) {
         if (!isMethod(m, Method.Get)) { return Err(S3Fail.Code(S3Code.MethodNotAllowed)); }
@@ -1097,6 +1123,11 @@ async fn bucketExists(app: borrow S3App, name: StringView) -> Result<bool, S3Fai
 async fn headBucket(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
     if (!await bucketExists(app, req.bucket.view())?) { return Err(S3Fail.Code(S3Code.NoSuchBucket)); }
     exchange.header("x-amz-bucket-region", "us-east-1".bytes())?;
+    // A directory bucket's zone (ADR-0080 §2), as S3 says it.
+    if (inDirectoryBucket(req.bucket.view())) {
+        exchange.header("x-amz-bucket-location-type", "AvailabilityZone".bytes())?;
+        exchange.header("x-amz-bucket-location-name", app.zoneId.view())?;
+    }
     await exchange.send(Status.ok(), "".bytes())?;
     return Ok();
 }
@@ -1272,7 +1303,8 @@ async fn listObjects(app: borrow S3App, req: borrow S3Request, exchange: borrow 
         appendXmlEscaped(mut body, etag.view())?;
         body.extend("</ETag><Size>".bytes())?;
         appendDecimal(mut body, page.sizes[i])?;
-        body.extend("</Size><StorageClass>STANDARD</StorageClass>".bytes())?;
+        body.extend("</Size>".bytes())?;
+        xmlStorageClass(mut body, req.bucket.bytes())?;
         if (withOwner) {
             body.extend("<Owner><ID>cosmostore</ID><DisplayName>cosmostore</DisplayName></Owner>".bytes())?;
         }

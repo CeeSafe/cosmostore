@@ -8,7 +8,7 @@ usage:
   s3_raw.py put-with     ENDPOINT BUCKET KEY TEXT NAME:VALUE...
                                                             a PUT of TEXT with these fields, signed: prints its status
                                                             and version id (`-` for none)
-  s3_raw.py express      ENDPOINT KEY SECRET TOKEN METHOD PATH[?QUERY]
+  s3_raw.py express      ENDPOINT KEY SECRET TOKEN METHOD PATH[?QUERY] [NAME:VALUE...]
                                                             a request signed for `s3express` (directory buckets,
                                                             ADR-0080) with KEY and SECRET (empty: the environment's)
                                                             and TOKEN in x-amz-s3session-token (empty: none): prints
@@ -185,10 +185,13 @@ def put_with(endpoint, bucket, key, text, fields):
     return status, got.get("x-amz-version-id", "-")
 
 
-def express(endpoint, access, secret, token, method, target):
+def express(endpoint, access, secret, token, method, target, *fields):
     s, host = connect(endpoint)
     path, _, query = target.partition("?")
     extra = {"x-amz-s3session-token": token} if token else {}
+    for f in fields:  # more headers, as name:value
+        name, _, value = f.partition(":")
+        extra[name.lower()] = value
     body = b"x" if method == "PUT" else b""
     headers, *_ = authorize(method, host, path, extra, hashlib.sha256(body).hexdigest(), "s3express",
                             access or None, secret or None, query)
@@ -214,7 +217,7 @@ def main():
         status, version = put_with(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:])
         print(status, version)
     elif cmd == "express":
-        status, text = express(*sys.argv[2:8])
+        status, text = express(*sys.argv[2:])
         print(status, text if status < 300 else "")
     elif cmd == "abort-get":
         print(abort_get(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])))

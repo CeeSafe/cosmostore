@@ -123,7 +123,11 @@ async fn createDirectoryBucket(
 /// general-purpose bucket refuses such signatures.
 async fn expressReaches(app: borrow S3App, req: borrow S3Request) -> Result<void, S3Fail> {
     let creating = isMethod(req.method, Method.Put) && req.key.length == 0 && req.query.length == 0;
-    if (creating && isDirectoryShaped(req.bucket.bytes())) { return Ok(); }
+    if (creating) {
+        return if (isDirectoryShaped(req.bucket.bytes())) Ok() else Err(S3Fail.Code(
+            S3Code.AuthorizationHeaderMalformed,
+        ));
+    }
     var guard = await lockStore(app)?;
     let store = guard.data();
     return match (store.bucketZone(req.bucket.view())) { // memory only
@@ -276,11 +280,13 @@ fn expressSessionOf(app: borrow S3App, req: borrow S3Request) -> Result<ExpressS
 
 /// What a ReadOnly session may do (ADR-0080 §4, S3's list): GetObject, HeadObject, GetObjectAttributes and ListParts
 /// (a GET or HEAD of a key), ListObjectsV2 and ListMultipartUploads (a GET of the bucket with `list-type=2` or
-/// `uploads`).
+/// `uploads`); and HeadBucket.
 fn readOnlyCall(req: borrow S3Request) -> bool {
     let reads = isMethod(req.method, Method.Get) || isMethod(req.method, Method.Head);
     if (!reads) { return false; }
     if (req.key.length > 0) { return true; }
+    // HeadBucket needs no session, but an SDK sends its own with it.
+    if (isMethod(req.method, Method.Head)) { return req.query.length == 0; }
     return isMethod(req.method, Method.Get) && (req.hasParam("list-type") || req.hasParam("uploads"));
 }
 
@@ -288,6 +294,16 @@ fn readOnlyCall(req: borrow S3Request) -> bool {
 /// its calls (ADR-0080 §4): else AccessDenied.
 fn checkExpressSession(req: borrow S3Request, s: borrow ExpressSession) -> Result<void, S3Fail> {
     if (s.bucket.view() != req.bucket.bytes()) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    // A copy's source too (CopyObject, UploadPartCopy): a session reads no other bucket. SDKs sign a copy with
+    // the long-term key, which may copy from another bucket.
+    if (headerOf(req, "x-amz-copy-source").isSome()) {
+        match (copySourceOf(req)) {
+            Ok(src) => {
+                if (src.bucket.bytes() != s.bucket.view()) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+            }
+            Err(e) => { return Err(e); }
+        }
+    }
     if (s.mode == EXPRESS_READ_ONLY && !readOnlyCall(req)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
     return Ok();
 }
@@ -336,19 +352,18 @@ async fn createSession(
         }
         null => {}
     }
-    // The session's encryption is the bucket's (S3 lets it say only that): SSE-S3 here.
-    match (headerOf(req, "x-amz-server-side-encryption")) {
+    // The session's encryption is the bucket's (S3 lets it say only that; the dispatch checked it agrees). A KMS
+    // context for the session's objects is not kept with it: refused. Bucket keys are always on, as S3's.
+    if (headerOf(req, "x-amz-server-side-encryption-context").isSome()) {
+        return Err(S3Fail.Code(S3Code.NotImplemented));
+    }
+    match (headerOf(req, "x-amz-server-side-encryption-bucket-key-enabled")) {
         Some(v) => {
-            if (trimBlank(v) != "AES256".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            if (trimBlank(v) != "true".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
         }
         null => {}
     }
-    for (field in [
-        "x-amz-server-side-encryption-aws-kms-key-id", "x-amz-server-side-encryption-context",
-        "x-amz-server-side-encryption-bucket-key-enabled",
-    ]) {
-        if (headerOf(req, field).isSome()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
-    }
+    let encryption = if (exists) await bucketDefaultSse(app, bucket)? else SseRequest.None;
     var session = ExpressSession {
         accessKey: Vector<u8>.create(),
         secret: Vector<u8>.create(),
@@ -378,7 +393,14 @@ async fn createSession(
     appendIso8601(mut body, session.expiresMs)?;
     body.extend("</Expiration></Credentials></CreateSessionResult>".bytes())?;
     for (i in 0..session.secret.length) { session.secret[i] = 0; }
-    exchange.header("x-amz-server-side-encryption", "AES256".bytes())?;
+    match (encryption) {
+        SseRequest.Managed => { exchange.header(SSE_FIELD, "AES256".bytes())?; }
+        SseRequest.Kms(name) => {
+            exchange.header(SSE_FIELD, "aws:kms".bytes())?;
+            if (name.length > 0) { exchange.header("x-amz-server-side-encryption-aws-kms-key-id", name.view())?; }
+        }
+        _ => {}
+    }
     return await sendXml(exchange, borrow body);
 }
 
@@ -387,16 +409,17 @@ async fn createSession(
 /// The query parameters a directory bucket's own calls take: ListObjectsV2's and ListMultipartUploads', CreateSession,
 /// and the configurations S3 keeps for it (policy, default encryption, lifecycle, inventory); CosmoStore's quota.
 const DIRECTORY_BUCKET_PARAMS: StringView =
-    "list-type,prefix,delimiter,max-keys,continuation-token,fetch-owner,encoding-type,start-after,uploads,key-marker,upload-id-marker,max-uploads,session,policy,encryption,lifecycle,inventory,id,quota";
-/// And its objects' calls: the multipart calls, GetObjectAttributes, and GET's response overrides.
+    "list-type,prefix,delimiter,max-keys,continuation-token,fetch-owner,encoding-type,start-after,uploads,key-marker,upload-id-marker,max-uploads,session,policy,encryption,lifecycle,inventory,id,quota,delete";
+/// And its objects' calls: the multipart calls, GetObjectAttributes, GET's response overrides, and `versionId`
+/// (`null` only: a directory bucket has no versions).
 const DIRECTORY_OBJECT_PARAMS: StringView =
-    "uploads,uploadId,partNumber,max-parts,part-number-marker,attributes,response-content-type,response-content-language,response-expires,response-cache-control,response-content-disposition,response-content-encoding";
+    "versionId,uploads,uploadId,partNumber,max-parts,part-number-marker,attributes,response-content-type,response-content-language,response-expires,response-cache-control,response-content-disposition,response-content-encoding";
 
-/// A header of a feature directory buckets do not have (NotImplemented): ACLs, tags, object lock, Requester Pays,
-/// SSE-C, website redirects.
+/// A header of a feature directory buckets do not have (NotImplemented): ACLs, object lock, Requester Pays, SSE-C,
+/// website redirects. Tags are refused when there are some (`directoryRefusal`, `copyObject`).
 fn notADirectoryField(name: Slice<u8>) -> bool {
     for (exact in [
-        "x-amz-acl", "x-amz-tagging", "x-amz-tagging-directive", "x-amz-request-payer",
+        "x-amz-acl", "x-amz-request-payer",
         "x-amz-website-redirect-location", "x-amz-bucket-object-lock-enabled",
     ]) {
         if (name == exact.bytes()) { return true; }
@@ -412,8 +435,9 @@ fn notADirectoryField(name: Slice<u8>) -> bool {
 
 /// What a directory bucket refuses of a request (ADR-0080 §6): a call S3 does not take on one (NotImplemented, as
 /// any call this server does not take), a feature's header (NotImplemented), `Content-MD5` (S3 takes no MD5 there),
-/// an encryption other than SSE-S3, a storage class other than `EXPRESS_ONEZONE`, and a listing's `start-after`, a
-/// delimiter other than `/` or a prefix that does not end in it (InvalidArgument).
+/// an encryption other than SSE-S3 or SSE-KMS, a storage class other than `EXPRESS_ONEZONE`, a `versionId` other
+/// than `null`, and a listing's `start-after`, a delimiter other than `/` or a prefix that does not end in it
+/// (InvalidArgument).
 fn directoryRefusal(req: borrow S3Request) -> Result<void, S3Fail> {
     let allowed = if (req.key.length == 0) DIRECTORY_BUCKET_PARAMS else DIRECTORY_OBJECT_PARAMS;
     if (!req.onlyParams(allowed)) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
@@ -429,12 +453,22 @@ fn directoryRefusal(req: borrow S3Request) -> Result<void, S3Fail> {
         paramOf(req, "list-type") != Some("2".bytes())) {
         return Err(S3Fail.Code(S3Code.NotImplemented));
     }
+    match (paramOf(req, "versionId")) {
+        Some(v) => {
+            if (v != "null".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        }
+        null => {}
+    }
     for (i in 0..req.headers.length) {
         let n = req.headers[i].name.view();
         if (notADirectoryField(n)) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+        // Tags: only the empty set (S3's CopyObject and PutObject); a copy's tags are checked as it is planned.
+        if (n == "x-amz-tagging".bytes() && trimBlank(req.headers[i].value.view()).length > 0) {
+            return Err(S3Fail.Code(S3Code.NotImplemented));
+        }
         if (n == "content-md5".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
         let v = trimBlank(req.headers[i].value.view());
-        if (n == "x-amz-server-side-encryption".bytes() && v != "AES256".bytes()) {
+        if (n == "x-amz-server-side-encryption".bytes() && v != "AES256".bytes() && v != "aws:kms".bytes()) {
             return Err(S3Fail.Code(S3Code.InvalidArgument));
         }
         if (n == "x-amz-storage-class".bytes() && v != "EXPRESS_ONEZONE".bytes()) {

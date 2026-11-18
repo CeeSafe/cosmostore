@@ -164,6 +164,19 @@ fn expressSessionsReachTheirBucketAndMode() -> Result<void, TestFailure> {
     Check.isTrue(checkExpressSession(borrow policy, borrow readWrite).isOk(), "GetBucketPolicy, ReadWrite")?;
     let elsewhere = sessionRequest(Method.Get, "other--local-az1--x-s3", "k", "");
     Check.isTrue(deniedBySession(borrow elsewhere, borrow readWrite), "another bucket")?;
+    // HeadBucket, which an SDK sends with its session.
+    let headBucket = sessionRequest(Method.Head, bucket, "", "");
+    Check.isTrue(checkExpressSession(borrow headBucket, borrow readOnly).isOk(), "HeadBucket, ReadOnly")?;
+    // A copy's source is the session's bucket too (the exit review's B3).
+    var copyIn = sessionRequest(Method.Put, bucket, "k", "");
+    copyIn.headers.push(policyHeader("x-amz-copy-source", "/data--local-az1--x-s3/src"))!;
+    Check.isTrue(checkExpressSession(borrow copyIn, borrow readWrite).isOk(), "a copy within the bucket")?;
+    var copyOut = sessionRequest(Method.Put, bucket, "k", "");
+    copyOut.headers.push(policyHeader("x-amz-copy-source", "secrets/k"))!;
+    Check.isTrue(deniedBySession(borrow copyOut, borrow readWrite), "a copy from another bucket")?;
+    var partCopy = sessionRequest(Method.Put, bucket, "k", "partNumber");
+    partCopy.headers.push(policyHeader("x-amz-copy-source", "other--local-az1--x-s3/k"))!;
+    Check.isTrue(deniedBySession(borrow partCopy, borrow readWrite), "UploadPartCopy from another bucket")?;
     return Ok();
 }
 
@@ -243,10 +256,18 @@ fn directoryBucketsRefuseWhatS3Does() -> Result<void, TestFailure> {
         "a lock",
     )?;
     Check.isTrue(isCode(gated(Method.Put, "k", "", "content-md5", "x"), S3Code.InvalidArgument), "Content-MD5")?;
+    // SSE-KMS is taken; whether it is the bucket's own encryption the dispatch checks (`directoryEncryptionAgrees`).
+    Check.isTrue(gated(Method.Put, "k", "", "x-amz-server-side-encryption", "aws:kms").isNull(), "KMS")?;
+    // DeleteObjects; `versionId` only `null`; tags only the empty set (the exit review's A1, A7, A8).
+    Check.isTrue(gated(Method.Post, "", "delete", "", "").isNull(), "DeleteObjects")?;
+    Check.isTrue(gated(Method.Get, "k", "versionId=null", "", "").isNull(), "versionId=null")?;
+    Check.isTrue(gated(Method.Delete, "k", "versionId=null", "", "").isNull(), "DeleteObject versionId=null")?;
     Check.isTrue(
-        isCode(gated(Method.Put, "k", "", "x-amz-server-side-encryption", "aws:kms"), S3Code.InvalidArgument),
-        "KMS",
+        isCode(gated(Method.Get, "k", "versionId=3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY", "", ""), S3Code.InvalidArgument),
+        "another versionId",
     )?;
+    Check.isTrue(gated(Method.Put, "k", "", "x-amz-tagging", "").isNull(), "an empty tag set")?;
+    Check.isTrue(gated(Method.Put, "k", "", "x-amz-tagging-directive", "REPLACE").isNull(), "a tagging directive")?;
     Check.isTrue(
         isCode(gated(Method.Put, "k", "", "x-amz-storage-class", "STANDARD"), S3Code.InvalidArgument),
         "STANDARD",
@@ -295,5 +316,25 @@ fn directoryEtagsAreNotMd5s() -> Result<void, TestFailure> {
     Check.isTrue(etagListMatches(multi.view(), borrow md5, 3, true), "a multipart one")?;
     Check.isTrue(inDirectoryBucket("data--local-az1--x-s3"), "by its name")?;
     Check.isFalse(inDirectoryBucket("plain"), "a general-purpose bucket")?;
+    return Ok();
+}
+
+@test
+fn directoryEncryptionIsTheBuckets() -> Result<void, TestFailure> {
+    let kms = SseRequest.Kms(kmsKeyNameOf("k1".bytes())!);
+    let other = SseRequest.Kms(kmsKeyNameOf("k2".bytes())!);
+    let unnamed = SseRequest.Kms(KmsKeyName { length: 0, bytes: [0u8; 32] });
+    let none = SseRequest.None;
+    let managed = SseRequest.Managed;
+    Check.isTrue(directoryEncryptionAgrees(borrow none, borrow kms), "nothing asked")?;
+    Check.isTrue(directoryEncryptionAgrees(borrow managed, borrow managed), "SSE-S3")?;
+    Check.isTrue(!directoryEncryptionAgrees(borrow managed, borrow kms), "SSE-S3 on a KMS bucket")?;
+    Check.isTrue(directoryEncryptionAgrees(borrow kms, borrow kms), "its KMS key")?;
+    Check.isTrue(directoryEncryptionAgrees(borrow unnamed, borrow kms), "aws:kms naming no key")?;
+    Check.isTrue(!directoryEncryptionAgrees(borrow other, borrow kms), "another KMS key")?;
+    Check.isTrue(!directoryEncryptionAgrees(borrow kms, borrow managed), "KMS on an SSE-S3 bucket")?;
+    // What objects show of a directory bucket (the exit review's A3, A4).
+    Check.isTrue(storageClassOf("data--local-az1--x-s3".bytes()) == "EXPRESS_ONEZONE", "EXPRESS_ONEZONE")?;
+    Check.isTrue(storageClassOf("plain".bytes()) == "STANDARD", "STANDARD")?;
     return Ok();
 }

@@ -29,6 +29,14 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
   CRT clients): the CRT names the bucket only in the host of its CreateSession, so use an endpoint by host name
   under the server's domain (`http://localhost:9000` with `serve … localhost`) where `<bucket>.<host>` resolves; an
   IP address endpoint cannot work with it.
+- **What a directory bucket takes** (ADR-0080 §6, §7, after the M8 exit review): its objects are always encrypted
+  (its default, else SSE-S3 with `--sse-key-file`) and requests may name only that; `versionId` only `null`; tags
+  only the empty set (a copy of a tagged object is NotImplemented unless `--tagging-directive REPLACE`); lifecycle
+  rules that expire objects or abort uploads, by prefix and size; DeleteObjects with a checksum, not
+  `Content-MD5`; policies with `s3express:` actions on `arn:aws:s3express:…:bucket/<name>`. A CreateSession session
+  reaches its bucket only (no S3 Control, no ListBuckets, no copy from another bucket); a Deny of
+  `s3express:CreateSession` stops its sessions at once. Not done: RenameObject, and access points of directory
+  buckets (NotImplemented).
 
 - **boto3** presigns with SigV2 for a custom endpoint unless it is told otherwise:
   `Config(signature_version="s3v4")`. CosmoStore accepts SigV4 only, and refuses SigV2 with S3's `InvalidRequest`.

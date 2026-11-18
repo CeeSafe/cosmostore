@@ -207,12 +207,20 @@ fn actionPattern(text: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
         out.push('*')?;
         return Ok(out);
     }
-    if (text.length <= 3 || !equalsIgnoreCase(text[0..3], "s3:".bytes())) { return Err(malformedPolicy()); }
+    // `s3:`, or `s3express:` for a directory bucket's CreateSession and ListAllMyDirectoryBuckets (ADR-0080 §3).
+    let express = "s3express:".bytes();
+    let service: usize = if (text.length > express.length && equalsIgnoreCase(
+        text[0..express.length],
+        express,
+    )) express.length else 3;
+    if (text.length <= service || !(service > 3 || equalsIgnoreCase(text[0..3], "s3:".bytes()))) {
+        return Err(malformedPolicy());
+    }
     for (c in text) {
         let lower = lowerAscii(c);
         out.push(lower)?;
     }
-    for (c in out.view()[3..]) {
+    for (c in out.view()[service..]) {
         if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '*' || c == '?')) {
             return Err(malformedPolicy());
         }
@@ -228,13 +236,35 @@ fn literalPrefix(pattern: Slice<u8>) -> Slice<u8> {
     return pattern;
 }
 
+/// A resource ARN's bucket or objects part: after `arn:aws:s3:::`, or after a directory bucket's
+/// `arn:aws:s3express:<region>:<account>:bucket/` (ADR-0080 §3); null for another ARN.
+fn policyArnTail(text: Slice<u8>) -> Slice<u8>? {
+    let arn = POLICY_S3_ARN.bytes();
+    if (startsWithBytes(text, arn)) { return Some(text[arn.length..]); }
+    let express = "arn:aws:s3express:".bytes();
+    if (!startsWithBytes(text, express)) { return null; }
+    let region = match (findBytes(text, ":".bytes(), express.length)) {
+        Some(c) => c,
+        null => { return null; }
+    };
+    let account = match (findBytes(text, ":".bytes(), region + 1)) {
+        Some(c) => c,
+        null => { return null; }
+    };
+    let kind = "bucket/".bytes();
+    let rest = text[account + 1..];
+    if (!startsWithBytes(rest, kind)) { return null; }
+    return Some(rest[kind.length..]);
+}
+
 /// A resource pattern of this bucket, after `arn:aws:s3:::`: the bucket, or objects in it (ADR-0043 §3). A pattern
 /// that could name nothing in the bucket is MalformedPolicy, as S3 answers.
 fn resourcePattern(text: Slice<u8>, bucket: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
-    let arn = POLICY_S3_ARN.bytes();
-    if (!startsWithBytes(text, arn)) { return Err(malformedPolicy()); }
+    let pattern = match (policyArnTail(text)) {
+        Some(t) => t,
+        null => { return Err(malformedPolicy()); }
+    };
     if (findBytes(text, "${".bytes(), 0).isSome()) { return Err(notImplemented()); } // policy variables
-    let pattern = text[arn.length..];
     var objects = copyBytes(bucket)?;
     objects.push('/')?;
     let fixed = literalPrefix(pattern);
@@ -572,10 +602,13 @@ fn accessPointResourcePattern(text: Slice<u8>, name: Slice<u8>, bucket: Slice<u8
 /// A resource of an identity policy: `*`, or `arn:aws:s3:::` and a bucket or objects pattern, kept after the prefix.
 fn identityResourcePattern(text: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
     if (text == "*".bytes()) { return Ok(copyBytes(text)?); }
-    let arn = POLICY_S3_ARN.bytes();
-    if (!startsWithBytes(text, arn) || text.length == arn.length) { return Err(malformedPolicy()); }
+    let tail = match (policyArnTail(text)) {
+        Some(t) => t,
+        null => { return Err(malformedPolicy()); }
+    };
+    if (tail.length == 0) { return Err(malformedPolicy()); }
     if (findBytes(text, "${".bytes(), 0).isSome()) { return Err(notImplemented()); } // policy variables
-    return Ok(copyBytes(text[arn.length..])?);
+    return Ok(copyBytes(tail)?);
 }
 
 fn parsePolicyDocument(

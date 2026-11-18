@@ -109,9 +109,39 @@ passes the token through and drops a client's `x-cosmo-*` fields.
 The SDK matrix (as for M7: run by hand, `tools/sdk/`). No chaos run takes a directory bucket: its data path is any
 bucket's, and its one new record (the zone in BucketCreate) has its fault sweep and checkpoint format 25 test.
 
+## The findings, closed (the owner: "continue and fix them all")
+
+| Finding | What closed it | Evidence |
+|---|---|---|
+| A1 DeleteObjects refused | `delete` among a directory bucket's calls | `directoryBucketsRefuseWhatS3Does`; S3 smoke and cluster smoke: `delete-objects` |
+| A2 a copy keeps the source's tags | A copy that would give a directory bucket tags is NotImplemented (S3's CopyObject says so); `x-amz-tagging-directive` and an empty `x-amz-tagging` taken | unit test; S3 smoke: a tagged object copied, then with `REPLACE` |
+| A3 inventory's MD5 ETags | Inventory shows the directory ETag | `directoryEtag` in `inventoryRow` |
+| A4 `STANDARD` | `EXPRESS_ONEZONE` in listings, GetObjectAttributes, ListParts, uploads and inventory | `directoryEncryptionIsTheBuckets`; both smokes |
+| A5 lifecycle rules not taken | Tag filters, NoncurrentVersionExpiration, ExpiredObjectDeleteMarker NotImplemented (checked against AWS's pages: expiration and aborts, by prefix and size) | `putBucketLifecycle` |
+| A6 encryption | Objects always sealed (the default, else SSE-S3 with the server's keys); a request names only the bucket's; CreateSession answers it; KMS context NotImplemented | `directoryEncryptionIsTheBuckets`; S3 smoke (three checks) |
+| A7 `versionId=null` | Taken; another id InvalidArgument (AWS's pages: "only the null value") | unit test; S3 smoke |
+| A8 an empty `x-amz-tagging` | Taken | unit test |
+| A9 RenameObject | Listed as not done in ADR-0080; it needs a journal record of its own, so an ADR of its own (proposed: ADR-0081) | ADR-0080 |
+| Smaller | HeadBucket in a ReadOnly session; HeadBucket's zone headers; CreateAccessPoint on a directory bucket NotImplemented. `inDirectoryBucket` by name stays: a general-purpose `--x-s3` bucket can be made only before M8 | unit test; S3 smoke |
+| B1 sessions reach S3 Control | A request with a session token is AccessDenied there | both smokes |
+| B2 bucket-less calls | Likewise for ListBuckets and ListDirectoryBuckets | both smokes |
+| B3 a copy's source | Held to the session's bucket (CopyObject, UploadPartCopy) | `expressSessionsReachTheirBucketAndMode`; S3 smoke |
+| B4 `s3express:` in policies | Actions `s3express:…` and resources `arn:aws:s3express:<region>:<account>:bucket/<name>`, in bucket and role policies | `directoryBucketPolicies`; S3 smoke |
+| B5 CreateSession before the bucket | The bucket's policy decides `s3express:CreateSession` on each use of a session | S3 smoke: a Deny stops a session made before it |
+| B6 the log's requester | The key that made the session | `server.cee` |
+| B7 a token without a signature | AccessDenied | S3 smoke |
+| B8 a bucket made with `s3express` | A CreateBucket signed so must name a directory bucket | S3 smoke |
+| B9 `//key` | Path-style and virtual-host both drop one `/` | ADR-0080 §9 |
+
+**After the fixes:** 335 tests, the S3 and TLS smokes, the cluster smoke (110), and the SDK matrix (boto3, Go,
+JavaScript, Java, .NET) all pass.
+
 ## Verdict
 
 **M8 should not close yet.** A1 breaks a call every SDK uses, B1 and B3 let a session reach past its bucket and
 mode, and A2 to A8 break the "never silently ignored" rule or S3's answer. The recommendation is to fix them all,
 each with a test (A5 to A8 checked against AWS's pages first), A9 either built or listed as not done, then run the
 smokes and the SDK matrix again. Closing M8 is the owner's decision.
+
+**After the fixes:** every finding is closed with its test, or (A9) listed as not done with an ADR proposed. M8's
+"done when" holds; M8 can close on the owner's word, with RenameObject (ADR-0081, if accepted) as its own item.

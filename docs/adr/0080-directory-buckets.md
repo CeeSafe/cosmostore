@@ -29,7 +29,9 @@ only, with S3's limits enforced).
     MD5 checksums (Content-MD5), ListObjects v1, ListObjectVersions, CORS, and lifecycle transitions.
   - **Taken:** bucket policies, default encryption, lifecycle expiration, inventory, access points; and the object
     calls PutObject, GetObject, HeadObject, DeleteObject(s), CopyObject, GetObjectAttributes, RenameObject,
-    ListObjectsV2, HeadBucket and the multipart calls.
+    ListObjectsV2, HeadBucket and the multipart calls. (RenameObject is not built yet: NotImplemented, found by
+    the M8 exit review; it needs a record of its own, for an ADR of its own. Access points of directory buckets,
+    named `--<zone>--xa-s3`, are not done either: CreateAccessPoint on one is NotImplemented.)
   - **Behaviour:** ListObjectsV2 is not in key order, its prefix must end in the delimiter and the delimiter can only
     be `/`, `StartAfter` is not taken, and `CommonPrefixes` include the prefixes of uploads in progress. Deleting an
     object deletes the empty "directories" above it. A multipart upload's parts must be consecutive from 1 (else 400),
@@ -72,21 +74,33 @@ only, with S3's limits enforced).
    an ordinary session of that bucket, and the requests it signs are authorized as the key's are); another name is
    NoSuchBucket, a general-purpose bucket InvalidRequest. CreateSession needs `--sts-key-file` (NotImplemented
    without). Encryption headers must be the bucket's default
-   encryption, or InvalidArgument; SSE-C's are refused. The token is sealed as STS's are (ADR-0075's keys, AES-256-GCM) but with
+   encryption, or InvalidArgument; SSE-C's are refused. A directory bucket's objects are always sealed: its default
+   encryption (SSE-S3 or SSE-KMS), else SSE-S3 when the server has `--sse-key-file`; a request may name only that
+   (or nothing), and CreateSession answers with it. A KMS context for a session is NotImplemented (not kept with
+   it); `x-amz-server-side-encryption-bucket-key-enabled` may only be `true`. Bucket policies and role policies take
+   `s3express:` actions and the `arn:aws:s3express:<region>:<account>:bucket/<name>` resource (the exit review's
+   B4); `s3:*` does not cover them, as on AWS. The token is sealed as STS's are (ADR-0075's keys, AES-256-GCM) but with
    its own version byte and additional data, so neither kind of token opens as the other; it holds the key that made
    it, the bucket, the mode and its expiry (5 minutes), and the answer is `CreateSessionResult`.
 4. **A request with `x-amz-s3session-token`:** signed with the session's key, for `s3express` (boto3, the CLI's
    classic client) or `s3` (the AWS CRT signs its object calls so: found by CI, 18 Nov 2026); the token opens, has not
    expired (ExpiredToken, as STS's) and names this request's bucket (else AccessDenied); a ReadOnly session may make
-   only the six calls above (else AccessDenied). The requester is the key that made the session (for policies, the
-   audit line and access logs), narrowed by the mode. A request to a directory bucket signed for `s3`, or for `s3express` without
+   only the six calls above and HeadBucket (else AccessDenied). A session reaches nothing else: not S3 Control, not
+   the calls without a bucket (ListBuckets, ListDirectoryBuckets), not a copy's source in another bucket (SDKs sign
+   copies with the long-term key); a token without a signature is AccessDenied (the exit review's B1 to B3, B7).
+   The bucket's policy decides `s3express:CreateSession` again on each use, so a session asked for before its
+   bucket was made, or before a Deny, stops at once (B5). The requester is the key that made the session (for
+   policies, the audit line and access logs, B6), narrowed by the mode. A request to a directory bucket signed for `s3`, or for `s3express` without
    a session token, is taken from a long-term key (CopyObject, ListDirectoryBuckets, and SDKs with sessions turned
    off). `x-amz-security-token` and `x-amz-s3session-token` together: InvalidRequest. An ordinary bucket refuses
    `s3express` signatures and session tokens (AuthorizationHeaderMalformed, AccessDenied).
 5. **ListDirectoryBuckets:** `GET /` signed for `s3express`: this server's directory buckets in name order,
    `max-directory-buckets` at a time with an opaque `ContinuationToken` (the last name, encoded). ListBuckets (signed
    for `s3`) leaves directory buckets out, as S3 does.
-6. **What a directory bucket refuses:** every call that section of the documentation does not take, with
+6. **What a directory bucket refuses** (completed by the M8 exit review: DeleteObjects is taken; `versionId` only
+   `null`, else InvalidArgument; tags only the empty set, so a copy that would bring some is NotImplemented, as S3's
+   CopyObject says; lifecycle rules only expire objects and abort uploads, by prefix and size: tag filters and
+   version actions NotImplemented): every call that section of the documentation does not take, with
    NotImplemented, so a client sees the difference and nothing is ignored (where AWS's error is known, its own:
    checked with each call in the slices); and on the calls it takes, `Content-MD5`, SSE-C headers, `x-amz-acl`,
    tags (`x-amz-tagging`), object lock headers, `x-amz-request-payer`, `StartAfter` and a delimiter other than `/`
@@ -104,6 +118,9 @@ only, with S3's limits enforced).
    - **Directories** are not stored: a key's prefixes exist while a key or an upload under them does, so deleting
      the last object under one deletes it, as S3 says.
    - **No versioning:** a directory bucket is never versioned; each write replaces the key.
+   - **The storage class** shown is `EXPRESS_ONEZONE` (listings, GetObjectAttributes, ListParts, uploads,
+     inventory), and inventory's ETags are the directory ETags. HeadBucket says `x-amz-bucket-location-type`
+     `AvailabilityZone` and `x-amz-bucket-location-name` the zone.
 8. **On a cluster:** the `Directory` record goes with the bucket's other records on its shard, ListDirectoryBuckets
    merges the shards as ListBuckets does (ADR-0060), and the front passes `x-amz-s3session-token` through; the token
    opens on any node because the STS keys are the same on every node (ADR-0078 §2).
@@ -117,7 +134,8 @@ only, with S3's limits enforced).
    for a session for ListDirectoryBuckets, which has no bucket, and fails before sending (list with sessions
    off); .NET's S3 Express pre-signer fails before sending on any host that is not AWS's, so .NET works with
    sessions off only; the JavaScript SDK writes `/<bucket>//<key>`, and a `--x-s3` bucket's path-style key loses
-   one leading `/` here (a directory bucket's key cannot begin with an empty directory).
+   one leading `/` here (a directory bucket's key cannot begin with an empty directory); a virtual host's `//key`
+   does the same, so both forms name one key.
 
 ## Consequences
 

@@ -1106,6 +1106,34 @@ check "nor reach another directory bucket" "$(express "$rk" "$rs" "$rt" GET "/ot
 aws s3api delete-bucket --bucket other--local-az1--x-s3 > /dev/null 2>&1
 check "a changed token" "$(express "$rk" "$rs" "${rt%????}AAAA" GET "/$dir/a/b.txt" | cut -d' ' -f1)" 400
 check "s3express on a general-purpose bucket" "$(express "" "" "" GET "/smoke?list-type=2" | cut -d' ' -f1)" 400
+check "nor makes one" "$(express "" "" "" PUT "/plain-by-express" | cut -d' ' -f1)" 400
+# A session reaches its bucket only (the M8 exit review's B1 to B3, B7).
+read -r wk ws wt <<< "$(aws s3api create-session --bucket "$dir" --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)"
+check "a session does not reach S3 Control" "$(express "$wk" "$ws" "$wt" GET "/v20180820/accesspoint" x-amz-account-id:000000000000 | cut -d' ' -f1)" 403
+check "nor list buckets" "$(express "$wk" "$ws" "$wt" GET "/" | cut -d' ' -f1)" 403
+check "nor copy from another bucket" "$(express "$wk" "$ws" "$wt" PUT "/$dir/copied" x-amz-copy-source:smoke/small.txt | cut -d' ' -f1)" 403
+check "a token without a signature" "$(curl -s -o /dev/null -w '%{http_code}' -H "x-amz-s3session-token: $wt" "$AWS_ENDPOINT_URL/$dir/a/b.txt")" 403
+check "the session's encryption is the bucket's" "$(aws s3api create-session --bucket "$dir" --query ServerSideEncryption --output text 2>&1)" AES256
+check "and objects are sealed with it" "$(aws s3api head-object --bucket "$dir" --key a/b.txt --query ServerSideEncryption --output text 2>&1)" AES256
+check "no other encryption" "$(code s3api put-object --bucket "$dir" --key t --body dir.txt --server-side-encryption aws:kms)" InvalidArgument
+# A bucket policy of s3express actions (B4, B5): a key denied CreateSession gets none, and its sessions stop.
+denyme='{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam:::user/'"$AWS_ACCESS_KEY_ID"'"},"Action":"s3express:CreateSession","Resource":"arn:aws:s3express:us-east-1:000000000000:bucket/'"$dir"'"}]}'
+check "an s3express policy is taken" "$(aws s3api put-bucket-policy --bucket "$dir" --policy "$denyme" 2>&1; echo $?)" 0
+check "CreateSession denied by it" "$(code s3api create-session --bucket "$dir")" AccessDenied
+check "and a session made before" "$(express "$wk" "$ws" "$wt" GET "/$dir/a/b.txt" | cut -d' ' -f1)" 403
+# The CLI takes a session for every call, which the policy denies: the key removes it without one.
+check "the policy removed by the key itself" "$(express "" "" "" DELETE "/$dir?policy" | cut -d' ' -f1)" 204
+check "the policy gone, the session again" "$(express "$wk" "$ws" "$wt" GET "/$dir/a/b.txt")" "200 in a directory"
+# What S3 shows and takes for a directory bucket's objects (A1, A2, A4, A7).
+check "versionId null" "$(aws s3api head-object --bucket "$dir" --key a/b.txt --version-id null --query ContentLength --output text 2>&1)" 14
+check "another versionId" "$(code s3api head-object --bucket "$dir" --key a/b.txt --version-id 3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY)" 400
+check "the storage class" "$(aws s3api list-objects-v2 --bucket "$dir" --prefix a/ --query 'Contents[0].StorageClass' --output text 2>&1)" EXPRESS_ONEZONE
+check "head-bucket's zone" "$(aws s3api head-bucket --bucket "$dir" --query '[BucketLocationType,BucketLocationName]' --output text 2>&1)" "AvailabilityZone	local-az1"
+aws s3api put-object --bucket smoke --key tagged.txt --body dir.txt --tagging a=b > /dev/null 2>&1
+check "a tagged object is not copied in" "$(code s3api copy-object --bucket "$dir" --key tagged.txt --copy-source smoke/tagged.txt)" NotImplemented
+check "but is with its tags replaced by none" "$(aws s3api copy-object --bucket "$dir" --key tagged.txt --copy-source smoke/tagged.txt --tagging-directive REPLACE > /dev/null 2>&1; echo $?)" 0
+aws s3api delete-object --bucket smoke --key tagged.txt > /dev/null 2>&1
+check "delete-objects" "$(aws s3api delete-objects --bucket "$dir" --delete 'Objects=[{Key=tagged.txt},{Key=tree/one}]' --query 'length(Deleted)' 2>&1)" 2
 # A directory bucket's ETags are not MD5s (ADR-0080 §7), and conditions use them.
 detag=$(aws s3api head-object --bucket "$dir" --key a/b.txt --query ETag --output text 2>&1)
 check "an ETag that is not the MD5" "$([ "$detag" != "\"$(md5 -q dir.txt 2>/dev/null || md5sum dir.txt | cut -d' ' -f1)\"" ] && echo "${#detag}")" 34

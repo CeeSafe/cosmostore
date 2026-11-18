@@ -973,9 +973,11 @@ async fn sseAskedFor(app: borrow S3App, req: borrow S3Request) -> Result<SseRequ
     return await bucketDefaultSse(app, req.bucket.view());
 }
 
-/// A bucket's default encryption (ADR-0046 §5): SSE-S3, or none. Read under the lock, without I/O.
+/// A bucket's default encryption (ADR-0046 §5): SSE-S3, SSE-KMS, or none. Read under the lock, without I/O. A
+/// directory bucket's objects are always sealed (ADR-0080 §3): with none set, SSE-S3 when this server has its keys.
 async fn bucketDefaultSse(app: borrow S3App, bucket: StringView) -> Result<SseRequest, S3Fail> {
-    if (app.encryptedBuckets.load() == 0) { return Ok(SseRequest.None); }
+    let fallback = if (inDirectoryBucket(bucket) && app.sseKeys.length > 0) SseRequest.Managed else SseRequest.None;
+    if (app.encryptedBuckets.load() == 0) { return Ok(fallback); }
     var guard = await lockStore(app)?;
     let store = guard.data();
     let stored = match (store.bucketConfig(bucket, BUCKET_CONFIG_ENCRYPTION)) {
@@ -983,8 +985,25 @@ async fn bucketDefaultSse(app: borrow S3App, bucket: StringView) -> Result<SseRe
         Err(StoreError.NoSuchBucket) => { return Ok(SseRequest.None); } // the write reports it
         Err(e) => { return Err(storeFail(e, 0)); }
     };
+    if (stored.length == 0) { return Ok(fallback); }
     return Ok(defaultOfStored(stored.view()));
 }
+
+/// Whether a directory bucket's request asks for the encryption its bucket has (ADR-0080 §3): S3 lets a request
+/// name only that, or nothing.
+fn directoryEncryptionAgrees(asked: borrow SseRequest, bucket: borrow SseRequest) -> bool => match (asked) {
+    SseRequest.None => true,
+    SseRequest.Managed => match (bucket) {
+        SseRequest.Managed => true,
+        SseRequest.None => true,
+        _ => false,
+    },
+    SseRequest.Kms(n) => match (bucket) {
+        SseRequest.Kms(d) => n.length == 0 || n.view() == d.view(),
+        _ => false,
+    },
+    SseRequest.Customer(_) => false,
+};
 
 /// A stored default (`BucketConfig` kind 11) as a request: `AES256`, or `aws:kms` with its key's id after a space.
 fn defaultOfStored(stored: Slice<u8>) -> SseRequest {
