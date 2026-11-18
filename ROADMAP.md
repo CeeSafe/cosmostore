@@ -2943,3 +2943,13 @@ Browser form uploads with a SigV4 POST policy.
   writes `/<bucket>//<key>`, so a `--x-s3` bucket's path-style key loses one leading `/` here (ADR-0080 §9).
   333 tests and every smoke pass.
 - **Next:** M8's exit review.
+
+### 18 Nov 2026: M8's exit review (`docs/m8-exit-review.md`)
+
+- ADR-0080's "done when" checked against the tests, the smokes and the SDK matrix, and two reviews of the code by
+  readers who had not written it (the calls a directory bucket takes and refuses; CreateSession's sessions).
+- **Verdict: not yet.** DeleteObjects is refused on a directory bucket (A1); a session reaches S3 Control (B1) and a
+  copy's source in another bucket (B3), and bucket-less calls (B2); policies cannot name `s3express:` actions (B4);
+  tags kept by a copy, inventory's MD5 ETags, the storage class, lifecycle and encryption rules taken that S3 does
+  not take (A2–A8); RenameObject listed as taken and not built (A9).
+- **Next:** fix the findings, each with a test, if the owner agrees.
