@@ -1,0 +1,265 @@
+// RenameObject in the store (ADR-0081): the Rename record moves a directory bucket's object to another key, through
+// the journal, a checkpoint and compaction, and a fault sweep of renames.
+
+const RENAME_BUCKET: StringView = "data--local-az1--x-s3";
+
+fn renameBytes(n: usize, seed: u8) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    for (i in 0..n) { out.push(truncate<u8>(i) ^ seed)!; }
+    return out;
+}
+
+fn generationOf(s: borrow ObjectStore, key: StringView) -> u64 => s.headObject(RENAME_BUCKET, key)!.generation;
+
+fn renamedAway(s: borrow ObjectStore, key: StringView) -> bool => match (s.headObject(RENAME_BUCKET, key)) {
+    Err(StoreError.NoSuchKey) => true,
+    _ => false,
+};
+
+@test
+fn renameMovesAnObject() -> Result<void, TestFailure> {
+    var meta = Vector<u8>.create();
+    encodeRenameMeta(mut meta, "b".bytes(), "from/k".bytes(), "to/k".bytes(), 42)!;
+    let r = decodeRenameMeta(meta.view())!;
+    Check.equalBytes("from/k".bytes(), r.from.view())?;
+    Check.equalBytes("to/k".bytes(), r.to.view())?;
+    Check.equalU64(42, r.generation)?;
+    var longer = copyBytes(meta.view())!;
+    longer.push(0)!;
+    Check.isTrue(decodeRenameMeta(longer.view()).isErr(), "bytes after the generation")?;
+    let dir = scratchDirectory("rename-moves");
+    let big = renameBytes(40000, 7); // in extents
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        s.createDirectoryBucket(RENAME_BUCKET, "local-az1".bytes())!;
+        let _ = s.putObject(RENAME_BUCKET, "a", "text/plain", "inline".bytes(), PutCondition.None)!;
+        let _ = s.putObject(RENAME_BUCKET, "big", "", big.view(), PutCondition.None)!;
+        let _ = s.putObject(RENAME_BUCKET, "taken", "", "old".bytes(), PutCondition.None)!;
+        let before = s.headObject(RENAME_BUCKET, "a")!;
+        let g = generationOf(borrow s, "a");
+        // Another generation, or no such key.
+        Check.isTrue(match (s.renameObject(RENAME_BUCKET, "a", "x", g + 1, "".bytes())) {
+            Err(StoreError.PreconditionFailed) => true,
+            _ => false,
+        }, "another generation")?;
+        Check.isTrue(match (s.renameObject(RENAME_BUCKET, "nothing", "x", g, "".bytes())) {
+            Err(StoreError.NoSuchKey) => true,
+            _ => false,
+        }, "no such key")?;
+        s.renameObject(RENAME_BUCKET, "a", "dir/a", g, "".bytes())!;
+        Check.isTrue(renamedAway(borrow s, "a"), "the source is gone")?;
+        let after = s.headObject(RENAME_BUCKET, "dir/a")!;
+        Check.equalBytes("inline".bytes(), s.getObject(RENAME_BUCKET, "dir/a")!.view())?;
+        Check.equalBytes("text/plain".bytes(), after.contentType.view())?;
+        Check.isTrue(after.mtimeMillis == before.mtimeMillis && after.md5[..] == before.md5[..], "the same object")?;
+        // Onto a key that has an object: it is replaced.
+        s.renameObject(RENAME_BUCKET, "big", "taken", generationOf(borrow s, "big"), "".bytes())!;
+        Check.equalBytes(big.view(), s.getObject(RENAME_BUCKET, "taken")!.view())?;
+        Check.isTrue(renamedAway(borrow s, "big"), "the extent object's source is gone")?;
+        Check.equalU64(2, s.bucketUsage(RENAME_BUCKET)![1])?;
+    }
+    // Through the journal, then a checkpoint.
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.equalBytes("inline".bytes(), s.getObject(RENAME_BUCKET, "dir/a")!.view())?;
+        Check.equalBytes(big.view(), s.getObject(RENAME_BUCKET, "taken")!.view())?;
+        Check.isTrue(renamedAway(borrow s, "a") && renamedAway(borrow s, "big"), "the sources stay gone")?;
+        Check.equalU64(2, s.bucketUsage(RENAME_BUCKET)![1])?;
+        Check.equalU64(0, s.verify()!.problems.length as u64)?;
+        if (round == 0) { let _ = s.checkpoint()!; }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// Compaction copies a renamed inline object under its new key; a copy planned before a rename is garbage, and the
+/// object's record stays live where it was.
+@test
+fn renameAndCompaction() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("rename-compaction");
+    // Small objects, several to a 4 KiB segment: "a" and "b" each share theirs with fillers deleted after.
+    let body = renameBytes(900, 3);
+    let names = ["a", "f0", "f1", "b", "f2", "f3", "f4", "f5", "f6", "f7"];
+    {
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        s.createDirectoryBucket(RENAME_BUCKET, "local-az1".bytes())!;
+        for (n in names) { let _ = s.putObject(RENAME_BUCKET, n, "", body.view(), PutCondition.None)!; }
+        for (n in names) {
+            if (n != "a" && n != "b") { s.deleteObject(RENAME_BUCKET, n)!; }
+        }
+        s.renameObject(RENAME_BUCKET, "a", "moved/a", generationOf(borrow s, "a"), "".bytes())!;
+        let _ = s.checkpoint()!;
+        // A compaction planned before "b" is renamed: its copy of "b" is garbage when applied.
+        var job = s.beginCompaction(67108864)!!;
+        while (!s.compactionPlanStep(mut job, 1000)!) {}
+        s.renameObject(RENAME_BUCKET, "b", "moved/b", generationOf(borrow s, "b"), "".bytes())!;
+        while (job.readBatch(1048576)!) { s.compactionCopyStep(mut job)!; }
+        let stats = s.finishCompaction(mut job)!;
+        // "moved/a" was copied under its new key, and segments went.
+        // "moved/a" was copied under its new key, and segments went.
+        Check.isTrue(stats.relocated > 0 && stats.segmentsRemoved > 0, "the compaction moved and removed")?;
+        Check.equalBytes(body.view(), s.getObject(RENAME_BUCKET, "moved/a")!.view())?;
+        Check.equalBytes(body.view(), s.getObject(RENAME_BUCKET, "moved/b")!.view())?;
+        let _ = s.checkpoint()!;
+        let _ = s.compact(67108864)!;
+        Check.equalBytes(body.view(), s.getObject(RENAME_BUCKET, "moved/b")!.view())?;
+        Check.equalU64(0, s.verify()!.problems.length as u64)?;
+    }
+    let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+    Check.equalBytes(body.view(), s.getObject(RENAME_BUCKET, "moved/a")!.view())?;
+    Check.equalBytes(body.view(), s.getObject(RENAME_BUCKET, "moved/b")!.view())?;
+    Check.isTrue(renamedAway(borrow s, "a") && renamedAway(borrow s, "b"), "the sources stay gone")?;
+    Check.equalU64(0, s.verify()!.problems.length as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// What the rename workload did: R_ABSENT, R_MAYBE or R_ACKED (replica_tests.cee) for its steps: the bucket, the
+/// three objects, then the two renames (an inline object to a new key, an extent object onto a key that has one).
+struct RenameModel {
+    wrote: [u8; 6];
+}
+
+fn renameWorkload(dir: StringView, m: borrow mut RenameModel) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    match (s.createDirectoryBucket(RENAME_BUCKET, "local-az1".bytes())) {
+        Ok() => { m.wrote[0] = R_ACKED; }
+        Err(e) => {
+            if (mayBeDurable(borrow e)) { m.wrote[0] = R_MAYBE; }
+            return;
+        }
+    }
+    let big = renameBytes(20000, 9);
+    for (p in ["a", "big", "taken"]) {
+        let at: usize = if (p == "a") 1 else if (p == "big") 2 else 3;
+        let body = if (p == "big") copyBytes(big.view())! else copyBytes(p.bytes())!;
+        match (s.putObject(RENAME_BUCKET, p, "", body.view(), PutCondition.None)) {
+            Ok(_) => { m.wrote[at] = R_ACKED; }
+            Err(e) => {
+                if (mayBeDurable(borrow e)) { m.wrote[at] = R_MAYBE; }
+                return;
+            }
+        }
+    }
+    for (r in 0..2) {
+        let from = if (r == 0) "a" else "big";
+        let to = if (r == 0) "dir/a" else "taken";
+        let g = match (s.headObject(RENAME_BUCKET, from)) {
+            Ok(i) => i.generation,
+            Err(_) => { return; }
+        };
+        match (s.renameObject(RENAME_BUCKET, from, to, g, "".bytes())) {
+            Ok() => { m.wrote[4 + r] = R_ACKED; }
+            Err(e) => {
+                if (mayBeDurable(borrow e)) { m.wrote[4 + r] = R_MAYBE; }
+                return;
+            }
+        }
+    }
+}
+
+/// Exactly one of the two states for each rename: the source with its bytes (and the destination as it was), or the
+/// destination with the source's bytes and no source.
+fn checkRename(s: borrow ObjectStore, m: borrow RenameModel) -> Result<void, TestFailure> {
+    if (!s.bucketExists(RENAME_BUCKET)!) {
+        Check.isTrue(m.wrote[0] != R_ACKED, "an acknowledged bucket")?;
+        return Ok();
+    }
+    let big = renameBytes(20000, 9);
+    for (r in 0..2) {
+        let from = if (r == 0) "a" else "big";
+        let to = if (r == 0) "dir/a" else "taken";
+        let bytes = if (r == 0) copyBytes("a".bytes())! else copyBytes(big.view())!;
+        let put = m.wrote[1 + r];
+        let source = !renamedAway(s, from);
+        let moved = match (s.getObject(RENAME_BUCKET, to)) {
+            Ok(b) => b.view() == bytes.view(),
+            Err(_) => false,
+        };
+        if (source) { Check.equalBytes(bytes.view(), s.getObject(RENAME_BUCKET, from)!.view())?; }
+        Check.isFalse(source && moved, "not both the source and the moved object")?;
+        let renamed = m.wrote[4 + r];
+        if (renamed == R_ACKED) { Check.isTrue(moved && !source, "an acknowledged rename")?; }
+        if (renamed == R_ABSENT) { Check.isFalse(moved, "no rename that was not made")?; }
+        if (put == R_ACKED) { Check.isTrue(source || moved, "an acknowledged object is somewhere")?; }
+        // The destination's earlier object is there until the rename replaces it.
+        if (r == 1 && !moved && m.wrote[3] == R_ACKED) {
+            Check.equalBytes("taken".bytes(), s.getObject(RENAME_BUCKET, "taken")!.view())?;
+        }
+    }
+    return Ok();
+}
+
+fn sweepRename(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    var clean = RenameModel { wrote: [0u8; 6] };
+    Faults.countOperations();
+    renameWorkload(dir.view(), mut clean);
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 10, "the workload performs I/O")?;
+    for (i in 0..6) { Check.equalU64(R_ACKED as u64, clean.wrote[i] as u64)?; }
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        var m = RenameModel { wrote: [0u8; 6] };
+        armMode(borrow mode, n);
+        renameWorkload(dir.view(), mut m);
+        Faults.disarm();
+        Check.equalU64(1, Faults.fired().min(1))?;
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        {
+            var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+            checkRename(borrow s, borrow m)?;
+            Check.equalU64(0, s.verify()!.problems.length as u64)?;
+            let _ = s.checkpoint()!;
+        }
+        let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        checkRename(borrow s, borrow m)?;
+    }
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn renameFaultsOnce() -> Result<void, TestFailure> => sweepRename("rfault-once", SweepMode.Once);
+
+@test
+fn renameFaultsSticky() -> Result<void, TestFailure> => sweepRename("rfault-sticky", SweepMode.Sticky);
+
+@test
+fn renameFaultsTorn() -> Result<void, TestFailure> => sweepRename("rfault-torn", SweepMode.StickyTorn);
+
+@test
+fn renameFaultsCrash() -> Result<void, TestFailure> => sweepRename("rfault-crash", SweepMode.Crash);
+
+fn retryIs(r: RenameRetry, want: StringView) -> bool => match (r) {
+    RenameRetry.New => want == "new",
+    RenameRetry.Done => want == "done",
+    RenameRetry.Mismatch => want == "mismatch",
+};
+
+/// A client token makes a retry answer the same, and another rename with it a mismatch (ADR-0081 §4).
+@test
+fn renameClientTokens() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("rename-tokens");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createDirectoryBucket(RENAME_BUCKET, "local-az1".bytes())!;
+    let _ = s.putObject(RENAME_BUCKET, "a", "", "x".bytes(), PutCondition.None)!;
+    let token = "retry-1".bytes();
+    Check.isTrue(retryIs(s.renameRetry(token, RENAME_BUCKET, "a", "b"), "new"), "unknown")?;
+    s.renameObject(RENAME_BUCKET, "a", "b", generationOf(borrow s, "a"), token)!;
+    Check.isTrue(retryIs(s.renameRetry(token, RENAME_BUCKET, "a", "b"), "done"), "a retry")?;
+    Check.isTrue(retryIs(s.renameRetry(token, RENAME_BUCKET, "a", "c"), "mismatch"), "another rename")?;
+    Check.isTrue(retryIs(s.renameRetry("other".bytes(), RENAME_BUCKET, "a", "b"), "new"), "another token")?;
+    removeTree(dir.view());
+    return Ok();
+}

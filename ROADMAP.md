@@ -2965,3 +2965,18 @@ Browser form uploads with a SigV4 POST policy.
 - 335 tests, the S3 and TLS smokes, the cluster smoke (110) and the whole SDK matrix pass.
 - **RenameObject** (A9) needs a journal record: proposed as ADR-0081, for the owner to accept or leave out of M8.
 - **Next:** the owner's word on M8 and ADR-0081.
+
+### 18 Nov 2026: RenameObject (ADR-0081, accepted: "Take on with ADR-0081")
+
+- **A `Rename` record** (record type 20): a directory bucket's object moves to another key if its current version is
+  still the generation named, with its locator, metadata and dates; the destination's earlier object is retired as an
+  overwrite's. No payload is copied; compaction copies a renamed inline object under its new key, and a copy planned
+  before a rename is garbage, its record staying live. The checkpoint format does not change.
+- **The S3 call:** `PUT /<key>?renameObject` with `x-amz-rename-source` as `/key`, `bucket/key` or `key`; the
+  source's and destination's conditions under the same hold of the store as the commit; `x-amz-client-token`
+  remembered in memory for 10 minutes (IdempotencyParameterMismatch for another rename); `s3:PutObject` on the
+  destination and `s3:DeleteObject` on the source; ReadOnly sessions and general-purpose buckets refused.
+- **Tests:** `renameMovesAnObject`, `renameAndCompaction`, `renameClientTokens`, `renameSourcesInEveryForm`, the
+  fault sweep `renameFaults{Once,Sticky,Torn,Crash}`; S3 smoke (12 checks), cluster smoke (112), boto3 (with and
+  without sessions). 343 tests.
+- **Next:** the owner's word on closing M8.

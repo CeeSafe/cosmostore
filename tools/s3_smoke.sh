@@ -1134,15 +1134,31 @@ check "a tagged object is not copied in" "$(code s3api copy-object --bucket "$di
 check "but is with its tags replaced by none" "$(aws s3api copy-object --bucket "$dir" --key tagged.txt --copy-source smoke/tagged.txt --tagging-directive REPLACE > /dev/null 2>&1; echo $?)" 0
 aws s3api delete-object --bucket smoke --key tagged.txt > /dev/null 2>&1
 check "delete-objects" "$(aws s3api delete-objects --bucket "$dir" --delete 'Objects=[{Key=tagged.txt},{Key=tree/one}]' --query 'length(Deleted)' 2>&1)" 2
+# RenameObject (ADR-0081): one record moves the object, its ETag and dates kept.
+aws s3api put-object --bucket "$dir" --key ren/src.txt --body dir.txt > /dev/null 2>&1
+renetag=$(aws s3api head-object --bucket "$dir" --key ren/src.txt --query ETag --output text 2>&1)
+check "rename-object" "$(aws s3api rename-object --bucket "$dir" --key ren/dst.txt --rename-source "$dir/ren/src.txt" > /dev/null 2>&1; echo $?)" 0
+check "the object under its new key" "$(aws s3api get-object --bucket "$dir" --key ren/dst.txt dir.out --query ETag --output text 2>&1; cat dir.out)" "$renetag
+in a directory"
+check "and not under its old one" "$(code s3api head-object --bucket "$dir" --key ren/src.txt)" 404
+aws s3api put-object --bucket "$dir" --key ren/other.txt --body dir.txt > /dev/null 2>&1
+check "If-None-Match * on a destination that exists" "$(code s3api rename-object --bucket "$dir" --key ren/dst.txt --rename-source /ren/other.txt --destination-if-none-match '*')" PreconditionFailed
+check "a source condition" "$(code s3api rename-object --bucket "$dir" --key ren/new.txt --rename-source /ren/other.txt --source-if-match '"0123"')" PreconditionFailed
+check "a missing source" "$(code s3api rename-object --bucket "$dir" --key ren/new.txt --rename-source /ren/none.txt)" NoSuchKey
+check "a client token" "$(aws s3api rename-object --bucket "$dir" --key ren/third.txt --rename-source ren/other.txt --client-token smoke-1 > /dev/null 2>&1; echo $?)" 0
+check "the same request again" "$(aws s3api rename-object --bucket "$dir" --key ren/third.txt --rename-source ren/other.txt --client-token smoke-1 > /dev/null 2>&1; echo $?)" 0
+check "the token for another rename" "$(code s3api rename-object --bucket "$dir" --key ren/fourth.txt --rename-source ren/third.txt --client-token smoke-1)" IdempotencyParameterMismatch
+check "a ReadOnly session does not rename" "$(express "$rk" "$rs" "$rt" PUT "/$dir/ren/x.txt?renameObject" x-amz-rename-source:/ren/third.txt | cut -d' ' -f1)" 403
+check "nor a general-purpose bucket" "$(code s3api rename-object --bucket smoke --key a --rename-source smoke/small.txt)" NotImplemented
 # A directory bucket's ETags are not MD5s (ADR-0080 §7), and conditions use them.
 detag=$(aws s3api head-object --bucket "$dir" --key a/b.txt --query ETag --output text 2>&1)
 check "an ETag that is not the MD5" "$([ "$detag" != "\"$(md5 -q dir.txt 2>/dev/null || md5sum dir.txt | cut -d' ' -f1)\"" ] && echo "${#detag}")" 34
 check "If-Match with it" "$(aws s3api get-object --bucket "$dir" --key a/b.txt --if-match "$detag" dir.out --query ETag --output text 2>&1)" "$detag"
 check "listed with it" "$(aws s3api list-objects-v2 --bucket "$dir" --prefix a/ --query 'Contents[0].ETag' --output text 2>&1)" "$detag"
 upload=$(aws s3api create-multipart-upload --bucket "$dir" --key pending/x/part.bin --query UploadId --output text 2>&1)
-check "an upload in progress is a directory" "$(aws s3api list-objects-v2 --bucket "$dir" --delimiter / --query 'CommonPrefixes[].Prefix' --output text 2>&1)" "a/	pending/	tree/"
+check "an upload in progress is a directory" "$(aws s3api list-objects-v2 --bucket "$dir" --delimiter / --query 'CommonPrefixes[].Prefix' --output text 2>&1)" "a/	pending/	ren/	tree/"
 aws s3api abort-multipart-upload --bucket "$dir" --key pending/x/part.bin --upload-id "$upload" > /dev/null 2>&1
-check "and is not once it ends" "$(aws s3api list-objects-v2 --bucket "$dir" --delimiter / --query 'CommonPrefixes[].Prefix' --output text 2>&1)" "a/	tree/"
+check "and is not once it ends" "$(aws s3api list-objects-v2 --bucket "$dir" --delimiter / --query 'CommonPrefixes[].Prefix' --output text 2>&1)" "a/	ren/	tree/"
 
 # What a directory bucket does not take (ADR-0080 §6), as S3 refuses it.
 check "no versioning" "$(code s3api put-bucket-versioning --bucket "$dir" --versioning-configuration Status=Enabled)" NotImplemented

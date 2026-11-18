@@ -1,6 +1,6 @@
 # ADR-0081: RenameObject for directory buckets
 
-**Status:** proposed, 18 Nov 2026. Found missing by the M8 exit review (finding A9): ADR-0080 lists RenameObject as
+**Status:** accepted, 18 Nov 2026 (the owner: "Take on with ADR-0081"); built the same day. Proposed 18 Nov 2026. Found missing by the M8 exit review (finding A9): ADR-0080 lists RenameObject as
 a call directory buckets take, and it was not built. It needs a journal record of its own, an on-disk format change,
 so it is this ADR's, for the owner to accept or leave out of M8.
 
@@ -50,16 +50,23 @@ so it is this ADR's, for the owner to accept or leave out of M8.
      - on a general-purpose bucket: NotImplemented.
    - **Authorization:** `s3:PutObject` on the destination and `s3:DeleteObject` on the source, for a long-term key.
      A session is authorized by its bucket and mode (ADR-0080 §4), and a ReadOnly session is refused.
-   - **`x-amz-client-token`:** the store keeps the last tokens of each bucket in memory, with their answers, for 10
-     minutes. A repeat answers the same.
-     - On `serve`, a restart forgets them: a repeat after a restart finds no source, and answers NoSuchKey.
-     - On a cluster, the token is the write's request id (ADR-0068), kept in the Raft log's sessions, so a repeat
-       through any node answers the same.
-5. **Fault sweep:** `renameFaults{Once,Sticky,Torn,Crash}` over a rename of an inline object and of an extent
+   - **`x-amz-client-token`** (1 to 64 characters of ASCII 33 to 126): the store keeps the tokens of its last 4,096
+     renames in memory for 10 minutes. A repeat with the same keys answers 200 again; the token with other keys is
+     IdempotencyParameterMismatch (400), as AWS's error list names it.
+     - A restart forgets them: a repeat after a restart finds no source, and answers NoSuchKey.
+     - On a cluster they are the shard leader's store's: a repeat after a change of leader answers as after a
+       restart. (Built so, 18 Nov 2026, in place of the Raft log's sessions proposed first: those are the front's
+       request ids, not a client's tokens.)
+   - **`x-amz-rename-source`:** AWS's pages show `/key`, `bucket/key` and a bare `key`; all three are taken,
+     URL-decoded: one leading `/` and then this bucket's name and `/` are dropped.
+5. **Conditions:** the source's `x-amz-rename-source-if-*` and the destination's `If-*`, read as GET's are (with the
+   directory ETags of ADR-0080 §7), after what other requests staged is committed, under the same hold of the store
+   as the commit; a destination that does not exist fails `If-Match` and passes `If-None-Match`.
+6. **Fault sweep:** `renameFaults{Once,Sticky,Torn,Crash}` over a rename of an inline object and of an extent
    object, with a PUT racing the destination. After every fault and crash, exactly one of these holds: the source
    is there with its bytes, or the destination is there with the source's bytes and the source is gone. The
    destination's previous bytes are freed only after the record is durable.
-6. **Tests:**
+7. **Tests:**
    - unit tests of the conditions and the errors;
    - the S3 smoke's `s3api rename-object`, with and without a session, and the cluster smoke's;
    - boto3's `rename_object`, and the other SDKs where theirs has it.

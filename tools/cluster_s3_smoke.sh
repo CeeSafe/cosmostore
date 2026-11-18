@@ -364,6 +364,10 @@ check "nor reaches S3 Control through node 1" "$(express 1 "$xk" "$xs" "$xt" GET
 check "nor lists buckets through node 2" "$(express 2 "$xk" "$xs" "$xt" GET / | cut -d' ' -f1)" 403
 check "the storage class through node 2" "$(on 2 s3api list-objects-v2 --bucket b--local-az1--x-s3 --query 'Contents[0].StorageClass' --output text 2>&1)" EXPRESS_ONEZONE
 on 1 s3api put-object --bucket b--local-az1--x-s3 --key k/two --body dir.txt > /dev/null 2>&1
+on 2 s3api put-object --bucket b--local-az1--x-s3 --key k/three --body dir.txt > /dev/null 2>&1
+check "rename-object through node 2" "$(on 2 s3api rename-object --bucket b--local-az1--x-s3 --key k/four --rename-source /k/three > /dev/null 2>&1; echo $?)" 0
+check "the renamed object through node 1" "$(onl 1 s3 cp s3://b--local-az1--x-s3/k/four - 2>&1)" "in a directory"
+on 3 s3api delete-object --bucket b--local-az1--x-s3 --key k/four > /dev/null 2>&1
 check "delete-objects through node 3" "$(on 3 s3api delete-objects --bucket b--local-az1--x-s3 --delete 'Objects=[{Key=k/one},{Key=k/two}]' --query 'length(Deleted)' 2>&1)" 2
 onl 3 s3 rm --recursive s3://b--local-az1--x-s3/ > /dev/null 2>&1 # the CRT's deletes, by host name too
 for d in a b c; do on 3 s3api delete-bucket --bucket "$d--local-az1--x-s3" > /dev/null 2>&1; done

@@ -121,7 +121,7 @@ bucket's, and its one new record (the zone in BucketCreate) has its fault sweep 
 | A6 encryption | Objects always sealed (the default, else SSE-S3 with the server's keys); a request names only the bucket's; CreateSession answers it; KMS context NotImplemented | `directoryEncryptionIsTheBuckets`; S3 smoke (three checks) |
 | A7 `versionId=null` | Taken; another id InvalidArgument (AWS's pages: "only the null value") | unit test; S3 smoke |
 | A8 an empty `x-amz-tagging` | Taken | unit test |
-| A9 RenameObject | Listed as not done in ADR-0080; it needs a journal record of its own, so an ADR of its own (proposed: ADR-0081) | ADR-0080 |
+| A9 RenameObject | ADR-0081 (accepted: "Take on with ADR-0081"): a Rename record, conditions, client tokens | `renameMovesAnObject`, `renameAndCompaction`, `renameClientTokens`, `renameFaults{Once,Sticky,Torn,Crash}`, `renameSourcesInEveryForm`; S3 smoke (12 checks), cluster smoke, boto3 |
 | Smaller | HeadBucket in a ReadOnly session; HeadBucket's zone headers; CreateAccessPoint on a directory bucket NotImplemented. `inDirectoryBucket` by name stays: a general-purpose `--x-s3` bucket can be made only before M8 | unit test; S3 smoke |
 | B1 sessions reach S3 Control | A request with a session token is AccessDenied there | both smokes |
 | B2 bucket-less calls | Likewise for ListBuckets and ListDirectoryBuckets | both smokes |
@@ -143,5 +143,5 @@ mode, and A2 to A8 break the "never silently ignored" rule or S3's answer. The r
 each with a test (A5 to A8 checked against AWS's pages first), A9 either built or listed as not done, then run the
 smokes and the SDK matrix again. Closing M8 is the owner's decision.
 
-**After the fixes:** every finding is closed with its test, or (A9) listed as not done with an ADR proposed. M8's
-"done when" holds; M8 can close on the owner's word, with RenameObject (ADR-0081, if accepted) as its own item.
+**After the fixes:** every finding is closed with its test, A9 by ADR-0081 (RenameObject, built the same day). M8's
+"done when" holds; M8 can close on the owner's word.

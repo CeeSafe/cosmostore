@@ -29,8 +29,8 @@ only, with S3's limits enforced).
     MD5 checksums (Content-MD5), ListObjects v1, ListObjectVersions, CORS, and lifecycle transitions.
   - **Taken:** bucket policies, default encryption, lifecycle expiration, inventory, access points; and the object
     calls PutObject, GetObject, HeadObject, DeleteObject(s), CopyObject, GetObjectAttributes, RenameObject,
-    ListObjectsV2, HeadBucket and the multipart calls. (RenameObject is not built yet: NotImplemented, found by
-    the M8 exit review; it needs a record of its own, for an ADR of its own. Access points of directory buckets,
+    ListObjectsV2, HeadBucket and the multipart calls. (RenameObject, found missing by the M8 exit review, is
+    ADR-0081's: a record of its own. Access points of directory buckets,
     named `--<zone>--xa-s3`, are not done either: CreateAccessPoint on one is NotImplemented.)
   - **Behaviour:** ListObjectsV2 is not in key order, its prefix must end in the delimiter and the delimiter can only
     be `/`, `StartAfter` is not taken, and `CommonPrefixes` include the prefixes of uploads in progress. Deleting an

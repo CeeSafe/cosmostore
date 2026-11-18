@@ -1,0 +1,130 @@
+// RenameObject (ADR-0081): `PUT /<key>?renameObject` on a directory bucket moves the object named by
+// `x-amz-rename-source` to `<key>`, atomically and without copying its bytes, by one Rename record.
+import web_core;
+import web_http;
+import web_server;
+
+const RENAME_SOURCE_FIELD: StringView = "x-amz-rename-source";
+
+/// The source key `x-amz-rename-source` names, URL-decoded: AWS's pages show `/key`, `bucket/key` and `key`, so one
+/// leading `/` and then this bucket's name and `/` are dropped. InvalidArgument for none.
+fn renameSourceOf(req: borrow S3Request) -> Result<String, S3Fail> {
+    let raw = trimBlank(headerOf(req, RENAME_SOURCE_FIELD) ?? "".bytes());
+    var decoded = Vector<u8>.create();
+    if (!percentDecodeInto(mut decoded, raw, false)?) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    var key = decoded.view();
+    if (key.length > 0 && key[0] == '/') { key = key[1..]; }
+    var named = copyBytes(req.bucket.bytes())?;
+    named.push('/')?;
+    if (startsWithBytes(key, named.view())) { key = key[named.length..]; }
+    if (key.length == 0) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    var out = String.create();
+    appendUtf8(mut out, key)?;
+    return Ok(out);
+}
+
+/// `x-amz-client-token`: 1 to 64 characters of ASCII 33 to 126, as S3 takes it.
+fn clientTokenOf(req: borrow S3Request) -> Result<Slice<u8>, S3Fail> {
+    let token = match (headerOf(req, "x-amz-client-token")) {
+        Some(t) => t,
+        null => { return Ok("".bytes()); }
+    };
+    if (token.length == 0 || token.length > 64) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    for (c in token) {
+        if (c < 33 || c > 126) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    }
+    return Ok(token);
+}
+
+/// The source's `x-amz-rename-source-if-*` and the destination's `If-*` conditions, against what each key holds
+/// now (null: no object). Every failure is PreconditionFailed, as S3 answers.
+fn checkRenameConditions(
+    req: borrow S3Request,
+    source: borrow ObjectInfo,
+    destination: borrow ObjectInfo?,
+) -> Result<void, S3Fail> {
+    match (checkConditions(
+        req,
+        source,
+        true,
+        "x-amz-rename-source-if-match",
+        "x-amz-rename-source-if-unmodified-since",
+        "x-amz-rename-source-if-none-match",
+        "x-amz-rename-source-if-modified-since",
+    )) {
+        Ok() => {}
+        Err(_) => { return Err(S3Fail.Code(S3Code.PreconditionFailed)); }
+    }
+    match (destination) {
+        Some(d) => {
+            match (checkConditions(
+                req,
+                d,
+                true,
+                "if-match",
+                "if-unmodified-since",
+                "if-none-match",
+                "if-modified-since",
+            )) {
+                Ok() => {}
+                Err(_) => { return Err(S3Fail.Code(S3Code.PreconditionFailed)); }
+            }
+        }
+        // No destination: `If-Match` cannot hold; `If-None-Match` does.
+        null => {
+            if (headerOf(req, "if-match").isSome()) { return Err(S3Fail.Code(S3Code.PreconditionFailed)); }
+        }
+    }
+    return Ok();
+}
+
+/// RenameObject (ADR-0081 §4). The dispatch checked the bucket is a directory bucket and authorized the request.
+async fn renameObject(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let source = renameSourceOf(req)?;
+    let token = clientTokenOf(req)?;
+    // A directory's name is no object's.
+    if (source.bytes()[source.length - 1] == '/' || req.key.bytes()[req.key.length - 1] == '/') {
+        return Err(
+            S3Fail.Code(if (source.bytes()[source.length - 1] == '/') S3Code.NoSuchKey else S3Code.InvalidArgument),
+        );
+    }
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let bucket = req.bucket.view();
+        let from = source.view();
+        let to = req.key.view();
+        // What earlier requests staged is published first, so the keys are read as they are (ADR-0081 §2).
+        match (await Async.blocking(() => store.commitStaged())) {
+            Ok(_) => {}
+            Err(e) => { return Err(storeFail(e, 0)); }
+        }
+        if (token.length > 0) {
+            match (store.renameRetry(token, bucket, from, to)) {
+                RenameRetry.Done => {
+                    await exchange.send(Status.ok(), "".bytes())?;
+                    return Ok();
+                }
+                RenameRetry.Mismatch => { return Err(S3Fail.Code(S3Code.IdempotencyParameterMismatch)); }
+                RenameRetry.New => {}
+            }
+        }
+        let info = match (store.headObject(bucket, from)) {
+            Ok(i) => i,
+            Err(e) => { return Err(storeFail(e, from.length)); }
+        };
+        let existing: ObjectInfo? = match (store.headObject(bucket, to)) {
+            Ok(i) => Some(i),
+            Err(StoreError.NoSuchKey) => null,
+            Err(e) => { return Err(storeFail(e, to.length)); }
+        };
+        checkRenameConditions(req, borrow info, existing.asBorrow())?;
+        let generation = info.generation;
+        match (await Async.blocking(() => store.renameObject(bucket, from, to, generation, token))) {
+            Ok() => {}
+            Err(e) => { return Err(storeFail(e, to.length)); }
+        }
+    }
+    await exchange.send(Status.ok(), "".bytes())?;
+    return Ok();
+}

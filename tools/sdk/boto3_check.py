@@ -622,6 +622,18 @@ for sessions in (True, False):
     check("a multipart ETag without -N" + how, "-" in d.head_object(Bucket=DIR, Key="big/m.bin")["ETag"], False)
     check("no versioning" + how, code_of(lambda: d.put_bucket_versioning(Bucket=DIR, VersioningConfiguration={"Status": "Enabled"})), "NotImplemented")
     check("a prefix ends in /" + how, code_of(lambda: d.list_objects_v2(Bucket=DIR, Prefix="a")), "InvalidArgument")
+    # RenameObject (ADR-0081): the multipart object moves, its ETag kept; the batch delete; versionId null.
+    big_etag = d.head_object(Bucket=DIR, Key="big/m.bin")["ETag"]
+    d.rename_object(Bucket=DIR, Key="big/renamed.bin", RenameSource=DIR + "/big/m.bin", ClientToken="sdk-rename-" + str(sessions))
+    check("rename_object" + how, d.head_object(Bucket=DIR, Key="big/renamed.bin")["ETag"], big_etag)
+    check("the source gone" + how, code_of(lambda: d.head_object(Bucket=DIR, Key="big/m.bin")), "404")
+    check("rename onto an existing key, If-None-Match *" + how,
+          code_of(lambda: d.rename_object(Bucket=DIR, Key="a/b.txt", RenameSource="/big/renamed.bin", DestinationIfNoneMatch="*")),
+          "PreconditionFailed")
+    check("versionId null" + how, d.head_object(Bucket=DIR, Key="a/b.txt", VersionId="null")["ContentLength"], 14)
+    check("the storage class" + how, d.list_objects_v2(Bucket=DIR, Prefix="a/")["Contents"][0]["StorageClass"], "EXPRESS_ONEZONE")
+    deleted = d.delete_objects(Bucket=DIR, Delete={"Objects": [{"Key": "a/b.txt"}, {"Key": "big/renamed.bin"}]})
+    check("delete_objects" + how, sorted(o["Key"] for o in deleted.get("Deleted", [])), ["a/b.txt", "big/renamed.bin"])
     for k in ("a/b.txt", "big/m.bin"):
         d.delete_object(Bucket=DIR, Key=k)
     d.delete_bucket(Bucket=DIR)

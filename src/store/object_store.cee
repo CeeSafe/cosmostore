@@ -1006,6 +1006,15 @@ fn applyRecord(
             if (moved) { state.releaseRecord(oldSegment, oldLength); }
             state.addSegmentBytes(segment, totalLen as u64, if (moved) totalLen as u64 else 0)?;
         }
+        RecordType.Rename => {
+            // Never live: the index and every later checkpoint hold the move (ADR-0081 §1).
+            state.addSegmentBytes(segment, totalLen as u64, 0)?;
+            let m = match (decodeRenameMeta(meta)) {
+                Ok(m) => m,
+                Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+            };
+            applyRename(state, borrow m)?;
+        }
         RecordType.BucketDelete => {
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
             let name = match (decodeBucketName(meta)) {
@@ -1112,6 +1121,32 @@ fn applyPut(
 
 /// Makes `version` the newest version of `key` in `bucket` (ADR-0041). With the null id it replaces the key's null
 /// version, wherever that is in the chain; with another id it only adds. The bucket's count is of versions.
+/// A Rename record's move (ADR-0081 §1): if the source key's current version is still the one of `generation`, the
+/// destination key gets it, with its locator, metadata and dates, and the source key has none; the destination's
+/// previous version is retired as an overwrite's. Otherwise nothing changes. Its payload stays where it is, so the
+/// segments' live bytes do not change.
+fn applyRename(state: borrow mut StoreState, m: borrow RenameMeta) -> Result<void, StoreError> {
+    let from = match (state.indexKey(m.bucket.view(), m.from.view())?) {
+        Some(k) => k,
+        null => { return Ok(); } // no such bucket
+    };
+    let current = match (state.index.get(borrow from)) {
+        Some(v) => v.lsn == m.generation && isNullVersionId(v.versionId) && !isDeleteMarker(v),
+        null => false,
+    };
+    if (!current) { return Ok(); }
+    let moved = match (state.index.removeVersion(borrow from, nullVersionId())) {
+        Some(v) => v,
+        null => { return Ok(); }
+    };
+    state.bumpObjects(m.bucket.view(), false, moved.size)?;
+    let to = match (state.indexKey(m.bucket.view(), m.to.view())?) {
+        Some(k) => k,
+        null => { return Ok(); }
+    };
+    return installVersion(state, m.bucket.view(), to, moved);
+}
+
 fn installVersion(
     state: borrow mut StoreState,
     bucket: Slice<u8>,
@@ -1468,8 +1503,30 @@ fn seekPast(
     return Ok(index.seek(borrow from));
 }
 
+/// A RenameObject's `x-amz-client-token` and what it renamed, kept in memory for `RENAME_TOKEN_MS` (ADR-0081 §4).
+struct RenameToken {
+    token: Vector<u8>;
+    bucket: Vector<u8>;
+    from: Vector<u8>;
+    to: Vector<u8>;
+    expiresMs: i64;
+}
+
+/// What a RenameObject's client token says: a new request, one already done with the same parameters, or a token
+/// used for another rename.
+enum RenameRetry {
+    New,
+    Done,
+    Mismatch,
+}
+
+const RENAME_TOKEN_MS: i64 = 600000;
+const RENAME_TOKENS_KEPT: usize = 4096;
+
 struct ObjectStore {
     private journal: Journal;
+    /// The client tokens of recent renames (ADR-0081 §4): memory only, so a restart forgets them.
+    private renameTokens: Vector<RenameToken>;
     private state: StoreState;
     private config: StoreConfig;
     private scratch: Vector<u8>;
@@ -1655,6 +1712,7 @@ struct ObjectStore {
             config: config,
             scratch: Vector<u8>.create(),
             pendingApplies: Vector<PendingApply>.create(),
+            renameTokens: Vector<RenameToken>.create(),
             inflightApplies: Vector<PendingApply>.create(),
             publishedNext: publishedNext,
             extentDir: extentDir,
@@ -4366,6 +4424,86 @@ struct ObjectStore {
         )?;
         this.commitStaged()?;
         return Ok(kind);
+    }
+
+    /// RenameObject (ADR-0081): the object of `from`, if its current version is still of `generation` (its
+    /// `ObjectInfo.generation`, read under the same hold of the store, after `commitStaged`), becomes `to`'s, by one
+    /// Rename record, committed and synced before this returns (ADR-0001). No payload is copied. A directory bucket's
+    /// only: its objects have the null version id. NoSuchKey when `from` has no such version, PreconditionFailed when
+    /// it has another.
+    fn renameObject(
+        borrow mut this,
+        bucket: StringView,
+        from: StringView,
+        to: StringView,
+        generation: u64,
+        token: Slice<u8>,
+    ) -> Result<void, StoreError> {
+        this.commitStaged()?;
+        this.checkWritable()?;
+        ObjectStore.checkKey(from)?;
+        ObjectStore.checkKey(to)?;
+        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        if (this.versioningOf(bucket.bytes())? != VERSIONING_OFF) { return Err(StoreError.MethodNotAllowed); }
+        let k = this.state.keyFor(bucket.bytes(), from.bytes())?;
+        match (this.state.index.get(borrow k)) {
+            Some(v) => {
+                if (isDeleteMarker(v) || !isNullVersionId(v.versionId)) { return Err(StoreError.NoSuchKey); }
+                if (v.lsn != generation) { return Err(StoreError.PreconditionFailed); }
+            }
+            null => { return Err(StoreError.NoSuchKey); }
+        }
+        if (from == to) { return Ok(); }
+        var meta = Vector<u8>.create();
+        encodeRenameMeta(mut meta, bucket.bytes(), from.bytes(), to.bytes(), generation)?;
+        let empty = [0u8; 1];
+        if (this.journal.wouldOverflow(meta.length, 0) || this.journal.needsRotation()) { this.commitStaged()?; }
+        this.pendingApplies.reserve(1)?;
+        let pos = this.stageRecord(RecordType.Rename, meta.view(), empty[0..0])?;
+        this.pendingApplies.push(PendingApply {
+            kind: RecordType.Rename,
+            lsn: pos.lsn,
+            segment: pos.segmentId,
+            offset: pos.offset,
+            total: truncate<u32>(recordLength(meta.length, 0)),
+            meta: meta,
+            payloadLen: 0,
+            manifest: Vector<u8>.create(),
+        })?;
+        this.commitStaged()?;
+        if (token.length > 0) {
+            if (this.renameTokens.length >= RENAME_TOKENS_KEPT) { let _ = this.renameTokens.remove(0); }
+            this.renameTokens.push(RenameToken {
+                token: copyBytes(token)?,
+                bucket: copyBytes(bucket.bytes())?,
+                from: copyBytes(from.bytes())?,
+                to: copyBytes(to.bytes())?,
+                expiresMs: Clock.unixMillis() + RENAME_TOKEN_MS,
+            })?;
+        }
+        return Ok();
+    }
+
+    /// A RenameObject's client token (ADR-0081 §4): Done when a rename of the same keys with it succeeded in the last
+    /// `RENAME_TOKEN_MS` (a retry, answered the same), Mismatch when it renamed others, else New. Memory only.
+    fn renameRetry(
+        borrow mut this,
+        token: Slice<u8>,
+        bucket: StringView,
+        from: StringView,
+        to: StringView,
+    ) -> RenameRetry {
+        let now = Clock.unixMillis();
+        while (this.renameTokens.length > 0 && this.renameTokens[0].expiresMs <= now) {
+            let _ = this.renameTokens.remove(0);
+        }
+        for (i in 0..this.renameTokens.length) {
+            let t = borrow this.renameTokens[i];
+            if (t.token.view() != token) { continue; }
+            let same = t.bucket.view() == bucket.bytes() && t.from.view() == from.bytes() && t.to.view() == to.bytes();
+            return if (same) RenameRetry.Done else RenameRetry.Mismatch;
+        }
+        return RenameRetry.New;
     }
 
     /// Stages the delete of `key` without committing it (ADR-0025), as `putFinishedDeferred` stages a PUT: the caller
