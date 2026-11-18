@@ -1,0 +1,1200 @@
+// S3 Tables (ADR-0083): table buckets, namespaces and tables through the S3 Tables API (REST-JSON, signed for
+// `s3tables`). A table bucket is a hidden store bucket, its warehouse; the catalog is JSON records under `.s3tables/`
+// in it, and a table's versionToken is its record's generation, so its compare-and-set is a conditional write.
+import web_core;
+import web_http;
+import web_server;
+
+const TABLES_SERVICE: StringView = "s3tables";
+const TABLE_BUCKET_SUFFIX: StringView = "--table-s3";
+/// The catalog's keys in a table bucket's hidden bucket: none of S3's calls may touch them.
+const CATALOG_PREFIX: StringView = ".s3tables/";
+const CATALOG_BUCKET_KEY: StringView = ".s3tables/bucket";
+const CATALOG_NAMESPACES: StringView = ".s3tables/namespaces/";
+const CATALOG_TABLES: StringView = ".s3tables/tables/";
+const TABLES_ACCOUNT: StringView = "000000000000";
+const TABLES_MAX_BODY: usize = 8388608;
+
+/// S3 Tables' errors (REST-JSON: the type in `x-amzn-ErrorType`, a message in the body).
+enum TablesError {
+    BadRequest,
+    Forbidden,
+    NotFound,
+    Conflict,
+    NotImplemented,
+    Internal,
+    @from OutOfMemory(AllocError),
+    @from Failed(S3Fail),
+}
+
+fn tablesErrorStatus(e: borrow TablesError) -> u16 => match (e) {
+    TablesError.BadRequest => 400,
+    TablesError.Forbidden => 403,
+    TablesError.NotFound => 404,
+    TablesError.Conflict => 409,
+    TablesError.NotImplemented => 501,
+    _ => 500,
+};
+
+fn tablesErrorName(e: borrow TablesError) -> StringView => match (e) {
+    TablesError.BadRequest => "BadRequestException",
+    TablesError.Forbidden => "ForbiddenException",
+    TablesError.NotFound => "NotFoundException",
+    TablesError.Conflict => "ConflictException",
+    TablesError.NotImplemented => "NotImplemented",
+    _ => "InternalServerErrorException",
+};
+
+fn tablesErrorMessage(e: borrow TablesError) -> StringView => match (e) {
+    TablesError.BadRequest => "The request is invalid.",
+    TablesError.Forbidden => "Access denied.",
+    TablesError.NotFound => "The specified resource was not found.",
+    TablesError.Conflict => "The request conflicts with the resource's current state.",
+    TablesError.NotImplemented => "This part of S3 Tables is not implemented.",
+    _ => "An internal error occurred.",
+};
+
+fn tablesStoreFail(e: StoreError) -> TablesError => match (e) {
+    StoreError.NoSuchBucket => TablesError.NotFound,
+    StoreError.NoSuchKey => TablesError.NotFound,
+    StoreError.PreconditionFailed => TablesError.Conflict,
+    StoreError.BucketAlreadyExists => TablesError.Conflict,
+    StoreError.BucketNotEmpty => TablesError.Conflict,
+    _ => TablesError.Internal,
+};
+
+/// An answer: its status and JSON body (empty for none).
+struct TablesAnswer {
+    status: u16;
+    body: Vector<u8>;
+    /// A dropped table's warehouse to empty after the answer's work (its hidden bucket and table id), or none.
+    purgeBucket: Vector<u8>;
+    purgeId: Vector<u8>;
+}
+
+fn tablesAnswer(status: u16, body: Vector<u8>) -> TablesAnswer => TablesAnswer {
+    status: status,
+    body: body,
+    purgeBucket: Vector<u8>.create(),
+    purgeId: Vector<u8>.create(),
+};
+
+fn tablesJson(j: borrow Json) -> Result<TablesAnswer, TablesError> {
+    var body = Vector<u8>.create();
+    writeJson(mut body, j)?;
+    return Ok(tablesAnswer(200, body));
+}
+
+fn tablesNoContent() -> TablesAnswer => tablesAnswer(204, Vector<u8>.create());
+
+// ---- Names ----
+
+/// Whether a request is signed for S3 Tables (ADR-0083 §1).
+fn signedForTables(req: borrow S3Request) -> bool => match (scopeField(req, 3)) {
+    Some(s) => s == TABLES_SERVICE.bytes(),
+    null => false,
+};
+
+fn isTableWarehouseShaped(name: Slice<u8>) -> bool {
+    let suffix = TABLE_BUCKET_SUFFIX.bytes();
+    return name.length > suffix.length && name[name.length - suffix.length..] == suffix;
+}
+
+/// A table bucket's name: 3 to 63 of a-z, 0-9 and `-`, beginning and ending with a letter or digit, without S3's
+/// reserved prefixes and suffixes.
+fn tableBucketNameOk(name: Slice<u8>) -> bool {
+    if (name.length < 3 || name.length > 63 || name[0] == '-' || name[name.length - 1] == '-') { return false; }
+    for (c in name) {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) { return false; }
+    }
+    for (p in ["xn--", "sthree-", "amzn-s3-demo-", "aws"]) {
+        if (startsWithBytes(name, p.bytes())) { return false; }
+    }
+    for (s in ["-s3alias", "--ol-s3", "--x-s3", "--table-s3"]) {
+        let b = s.bytes();
+        if (name.length >= b.length && name[name.length - b.length..] == b) { return false; }
+    }
+    return true;
+}
+
+/// A namespace's or table's name: 1 to 255 of a-z, 0-9 and `_`, beginning with a letter or digit; a namespace not
+/// beginning `aws`.
+fn tableNameOk(name: Slice<u8>, isNamespace: bool) -> bool {
+    if (name.length < 1 || name.length > 255 || name[0] == '_') { return false; }
+    for (c in name) {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) { return false; }
+    }
+    return !(isNamespace && startsWithBytes(name, "aws".bytes()));
+}
+
+/// The hidden store bucket of table bucket `name`: 32 hex digits of a hash of the name, then `--table-s3`, so any
+/// table bucket name fits a bucket name.
+fn tableWarehouseBucket(name: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var input = Vector<u8>.create();
+    input.extend("cosmostore table bucket ".bytes())?;
+    input.extend(name)?;
+    let digest = Sha256.of(input.view());
+    var out = Vector<u8>.create();
+    appendHexBytes(mut out, digest[0..16])?;
+    out.extend(TABLE_BUCKET_SUFFIX.bytes())?;
+    return Ok(out);
+}
+
+fn tablesRegion(req: borrow S3Request) -> Slice<u8> => scopeField(req, 2) ?? "us-east-1".bytes();
+
+fn tableBucketArn(req: borrow S3Request, name: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.extend("arn:aws:s3tables:".bytes())?;
+    out.extend(tablesRegion(req))?;
+    out.push(':')?;
+    out.extend(TABLES_ACCOUNT.bytes())?;
+    out.extend(":bucket/".bytes())?;
+    return out.extend(name);
+}
+
+/// The table bucket a table bucket's ARN names (`arn:aws:s3tables:<region>:<account>:bucket/<name>`), and the table
+/// id after `/table/` in a table's ARN; null if it is neither.
+fn tableBucketOfArn(arn: Slice<u8>, tableId: borrow mut Vector<u8>) -> Result<Vector<u8>?, AllocError> {
+    let head = "arn:aws:s3tables:".bytes();
+    if (!startsWithBytes(arn, head)) { return Ok(null); }
+    let marker = match (findBytes(arn, ":bucket/".bytes(), head.length)) {
+        Some(m) => m,
+        null => { return Ok(null); }
+    };
+    let rest = arn[marker + 8..];
+    let slash = pieceEnd(rest, 0, '/');
+    let name = rest[0..slash];
+    if (slash < rest.length) {
+        let tail = rest[slash..];
+        let table = "/table/".bytes();
+        if (!startsWithBytes(tail, table) || tail.length == table.length) { return Ok(null); }
+        tableId.extend(tail[table.length..])?;
+    }
+    if (!tableBucketNameOk(name)) { return Ok(null); }
+    return Ok(Some(copyBytes(name)?));
+}
+
+fn newUuid(out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    var b = [0u8; 16];
+    if (Random.fill(mut b[..]).isErr()) { return Ok(false); }
+    b[6] = (b[6] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80;
+    appendHexBytes(out, b[0..4])?;
+    out.push('-')?;
+    appendHexBytes(out, b[4..6])?;
+    out.push('-')?;
+    appendHexBytes(out, b[6..8])?;
+    out.push('-')?;
+    appendHexBytes(out, b[8..10])?;
+    out.push('-')?;
+    appendHexBytes(out, b[10..16])?;
+    return Ok(true);
+}
+
+fn isoText(millis: i64) -> Result<Json, AllocError> {
+    var t = Vector<u8>.create();
+    appendIso8601(mut t, millis)?;
+    return Ok(Json.Text(t));
+}
+
+fn versionTokenOf(generation: u64) -> Result<Vector<u8>, AllocError> {
+    var t = Vector<u8>.create();
+    appendDecimal(mut t, generation)?;
+    return Ok(t);
+}
+
+fn catalogKey(head: StringView, a: Slice<u8>, b: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var k = copyBytes(head.bytes())?;
+    k.extend(a)?;
+    if (b.length > 0) {
+        k.push('/')?;
+        k.extend(b)?;
+    }
+    return Ok(k);
+}
+
+// ---- The store ----
+
+/// A catalog record, and its generation (the versionToken of a table's).
+struct CatalogRecord {
+    json: Json;
+    generation: u64;
+}
+
+fn catalogText(b: Slice<u8>) -> StringView => StringView.fromUtf8(b) ?? "";
+
+/// Reads a record under the store; null if there is none.
+fn readRecord(store: borrow ObjectStore, bucket: Slice<u8>, key: Slice<u8>) -> Result<CatalogRecord?, TablesError> {
+    let info = match (store.headObject(catalogText(bucket), catalogText(key))) {
+        Ok(i) => i,
+        Err(StoreError.NoSuchKey) => { return Ok(null); }
+        Err(StoreError.NoSuchBucket) => { return Ok(null); }
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    let bytes = match (store.getObject(catalogText(bucket), catalogText(key))) {
+        Ok(b) => b,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    let json = match (parseJson(bytes.view())?) {
+        Some(j) => j,
+        null => { return Err(TablesError.Internal); }
+    };
+    return Ok(Some(CatalogRecord { json: json, generation: info.generation }));
+}
+
+fn writeRecord(
+    store: borrow mut ObjectStore,
+    bucket: Slice<u8>,
+    key: Slice<u8>,
+    j: borrow Json,
+    condition: PutCondition,
+) -> Result<u64, TablesError> {
+    var body = Vector<u8>.create();
+    writeJson(mut body, j)?;
+    return match (store.putObject(catalogText(bucket), catalogText(key), "application/json", body.view(), condition)) {
+        Ok(o) => Ok(o.generation),
+        Err(e) => Err(tablesStoreFail(e)),
+    };
+}
+
+/// The keys under `prefix` after `after`, at most `max` (0: all).
+fn catalogKeys(
+    store: borrow ObjectStore,
+    bucket: Slice<u8>,
+    prefix: Slice<u8>,
+    after: Slice<u8>,
+    max: usize,
+) -> Result<Vector<Vector<u8>>, TablesError> {
+    var out = Vector<Vector<u8>>.create();
+    var marker = copyBytes(after)?;
+    while (true) {
+        let page = match (store.listObjects(catalogText(bucket), catalogText(prefix), "", marker.view(), false, 1000)) {
+            Ok(p) => p,
+            Err(e) => { return Err(tablesStoreFail(e)); }
+        };
+        for (i in 0..page.keys.length) {
+            out.push(copyBytes(page.keys[i].view())?)?;
+            if (max > 0 && out.length >= max) { return Ok(out); }
+        }
+        if (!page.truncated || page.keys.length == 0) { break; }
+        marker = copyBytes(page.keys[page.keys.length - 1].view())?;
+    }
+    return Ok(out);
+}
+
+/// A table bucket that exists: its hidden bucket and its record; NotFound otherwise.
+fn tableBucketRecord(store: borrow ObjectStore, name: Slice<u8>) -> Result<CatalogRecord, TablesError> {
+    let hidden = tableWarehouseBucket(name)?;
+    return match (readRecord(store, hidden.view(), CATALOG_BUCKET_KEY.bytes())?) {
+        Some(r) => Ok(r),
+        null => Err(TablesError.NotFound),
+    };
+}
+
+// ---- Requests ----
+
+/// The path's segments, each URL-decoded (a table bucket's ARN is one segment, its `/` encoded).
+fn pathSegments(path: Slice<u8>) -> Result<Vector<Vector<u8>>, TablesError> {
+    var out = Vector<Vector<u8>>.create();
+    var at: usize = if (path.length > 0 && path[0] == '/') 1 else 0;
+    while (at <= path.length) {
+        let end = pieceEnd(path, at, '/');
+        var s = Vector<u8>.create();
+        if (!percentDecodeInto(mut s, path[at..end], false)?) { return Err(TablesError.BadRequest); }
+        out.push(s)?;
+        at = end + 1;
+        if (end == path.length) { break; }
+    }
+    if (out.length > 0 && out[out.length - 1].length == 0) { let _ = out.pop(); }
+    return Ok(out);
+}
+
+/// `maxBuckets` and the like: 1 to 1,000, else BadRequest; 1,000 when absent.
+fn pageSize(req: borrow S3Request, name: StringView) -> Result<usize, TablesError> {
+    return match (paramOf(req, name)) {
+        Some(t) => match (parseDecimal(t)) {
+            Some(v) => if (v >= 1 && v <= 1000) Ok(v as usize) else Err(TablesError.BadRequest),
+            null => Err(TablesError.BadRequest),
+        },
+        null => Ok(1000),
+    };
+}
+
+fn continuationOf(req: borrow S3Request) -> Result<Vector<u8>, TablesError> {
+    var after = Vector<u8>.create();
+    match (paramOf(req, "continuationToken")) {
+        Some(t) => {
+            if (t.length > 2048 || !decodeBase64(t, mut after)?) { return Err(TablesError.BadRequest); }
+        }
+        null => {}
+    }
+    return Ok(after);
+}
+
+fn setToken(j: borrow mut Json, last: Slice<u8>) -> Result<void, AllocError> {
+    var token = Vector<u8>.create();
+    appendBase64(mut token, last)?;
+    return jsonSet(j, "continuationToken", Json.Text(token));
+}
+
+/// A body's JSON object; BadRequest if it is not one.
+fn tablesObject(body: Slice<u8>) -> Result<Json, TablesError> {
+    let j = match (parseJson(if (body.length == 0) "{}".bytes() else body)?) {
+        Some(j) => j,
+        null => { return Err(TablesError.BadRequest); }
+    };
+    match (borrow j) {
+        Json.Object(_) => {}
+        _ => { return Err(TablesError.BadRequest); }
+    }
+    return Ok(j);
+}
+
+/// `tablesObject`, where a field S3 Tables has that this does not do is NotImplemented, not ignored.
+fn tablesBody(body: Slice<u8>, refused: Slice<StringView>) -> Result<Json, TablesError> {
+    let j = tablesObject(body)?;
+    for (f in refused) {
+        if (jsonMember(borrow j, f).isSome()) { return Err(TablesError.NotImplemented); }
+    }
+    return Ok(j);
+}
+
+/// `["name"]`: a namespace as S3 Tables gives it, one level only.
+fn singleNamespace(j: borrow Json) -> Result<Vector<u8>, TablesError> {
+    return match (jsonMember(j, "namespace")) {
+        Some(v) => match (v) {
+            Json.Array(items) => {
+                if (items.length != 1) { return Err(TablesError.BadRequest); }
+                match (borrow items[0]) {
+                    Json.Text(t) => Ok(copyBytes(t.view())?),
+                    _ => Err(TablesError.BadRequest),
+                }
+            },
+            _ => Err(TablesError.BadRequest),
+        },
+        null => Err(TablesError.BadRequest),
+    };
+}
+
+fn namespaceArray(name: Slice<u8>) -> Result<Json, AllocError> {
+    var a = jsonArray();
+    jsonPush(mut a, Json.Text(copyBytes(name)?))?;
+    return Ok(a);
+}
+
+// ---- Table buckets ----
+
+fn bucketView(req: borrow S3Request, rec: borrow Json) -> Result<Json, TablesError> {
+    let name = jsonMemberText(rec, "name") ?? "".bytes();
+    var j = jsonObject();
+    var arn = Vector<u8>.create();
+    tableBucketArn(req, name, mut arn)?;
+    jsonSet(mut j, "arn", Json.Text(arn))?;
+    jsonSet(mut j, "createdAt", isoText(jsonMemberI64(rec, "createdAt") ?? 0)?)?;
+    jsonSet(mut j, "name", jsonString(name)?)?;
+    jsonSet(mut j, "ownerAccountId", jsonString(TABLES_ACCOUNT.bytes())?)?;
+    jsonSet(mut j, "tableBucketId", jsonString(jsonMemberText(rec, "id") ?? "".bytes())?)?;
+    jsonSet(mut j, "type", jsonString("customer".bytes())?)?;
+    return Ok(j);
+}
+
+fn createTableBucket(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let j = tablesBody(body, ["encryptionConfiguration", "storageClassConfiguration", "tags"][..])?;
+    let name = copyBytes(jsonMemberText(borrow j, "name") ?? "".bytes())?;
+    if (!tableBucketNameOk(name.view())) { return Err(TablesError.BadRequest); }
+    let hidden = tableWarehouseBucket(name.view())?;
+    var id = Vector<u8>.create();
+    if (!newUuid(mut id)?) { return Err(TablesError.Internal); }
+    var rec = jsonObject();
+    jsonSet(mut rec, "name", jsonString(name.view())?)?;
+    jsonSet(mut rec, "id", Json.Text(id))?;
+    jsonSet(mut rec, "createdAt", jsonInteger(Clock.unixMillis())?)?;
+    {
+        let bucket = catalogText(hidden.view());
+        // A bucket made before its record (a crash between the two) is taken again.
+        match ((store.createBucket(bucket))) {
+            Ok() => {}
+            Err(StoreError.BucketAlreadyExists) => {}
+            Err(e) => { return Err(tablesStoreFail(e)); }
+        }
+        let hiddenView = hidden.view();
+        let recRef = borrow rec;
+        let _ = (writeRecord(store, hiddenView, CATALOG_BUCKET_KEY.bytes(), recRef, PutCondition.IfAbsent))?;
+    }
+    var answer = jsonObject();
+    var arn = Vector<u8>.create();
+    tableBucketArn(req, name.view(), mut arn)?;
+    jsonSet(mut answer, "arn", Json.Text(arn))?;
+    return tablesJson(borrow answer);
+}
+
+fn getTableBucket(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    name: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let rec = tableBucketRecord(store, name)?;
+    let view = bucketView(req, borrow rec.json)?;
+    return tablesJson(borrow view);
+}
+
+fn listTableBuckets(store: borrow mut ObjectStore, req: borrow S3Request) -> Result<TablesAnswer, TablesError> {
+    let max = pageSize(req, "maxBuckets")?;
+    let after = continuationOf(req)?;
+    let prefix = paramOf(req, "prefix") ?? "".bytes();
+    let onlyAws = match (paramOf(req, "type")) {
+        Some(t) => {
+            if (t != "customer".bytes() && t != "aws".bytes()) { return Err(TablesError.BadRequest); }
+            t == "aws".bytes()
+        }
+        null => false,
+    };
+    var records = Vector<Json>.create();
+    if (!onlyAws) {
+        let all = match (store.listBucketInfo()) {
+            Ok(a) => a,
+            Err(e) => { return Err(tablesStoreFail(e)); }
+        };
+        for (i in 0..all.length) {
+            if (!isTableWarehouseShaped(all[i].name.view())) { continue; }
+            match (readRecord(store, all[i].name.view(), CATALOG_BUCKET_KEY.bytes())?) {
+                Some(r) => {
+                    let name = jsonMemberText(borrow r.json, "name") ?? "".bytes();
+                    if (!startsWithBytes(name, prefix)) { continue; }
+                    if (after.length > 0 && compareBytes(name, after.view()) <= 0) { continue; }
+                    records.push(r.json)?;
+                }
+                null => {}
+            }
+        }
+    }
+    records.sortBy(
+        (a, b) => compareBytes(jsonMemberText(a, "name") ?? "".bytes(), jsonMemberText(b, "name") ?? "".bytes()),
+    );
+    var list = jsonArray();
+    let shown = if (records.length > max) max else records.length;
+    for (i in 0..shown) { jsonPush(mut list, bucketView(req, borrow records[i])?)?; }
+    var answer = jsonObject();
+    jsonSet(mut answer, "tableBuckets", list)?;
+    if (shown < records.length) {
+        setToken(mut answer, jsonMemberText(borrow records[shown - 1], "name") ?? "".bytes())?;
+    }
+    return tablesJson(borrow answer);
+}
+
+fn deleteTableBucket(store: borrow mut ObjectStore, name: Slice<u8>) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(name)?;
+    let _ = tableBucketRecord(store, name)?;
+    // A table bucket with namespaces is not deleted (AWS: delete its tables and namespaces first).
+    if (catalogKeys(store, hidden.view(), CATALOG_NAMESPACES.bytes(), "".bytes(), 1)?.length > 0) {
+        return Err(TablesError.Conflict);
+    }
+    // What is left: its record, and objects of tables already dropped.
+    let rest = catalogKeys(store, hidden.view(), "".bytes(), "".bytes(), 0)?;
+    let bucket = catalogText(hidden.view());
+    let keys = rest.view();
+    match ((store.deleteObjects(bucket, keys))) {
+        Ok(_) => {}
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    }
+    match ((store.deleteBucket(bucket))) {
+        Ok() => {}
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    }
+    return Ok(tablesNoContent());
+}
+
+// ---- Namespaces ----
+
+fn namespaceView(
+    req: borrow S3Request,
+    name: Slice<u8>,
+    bucketRec: borrow Json,
+    rec: borrow Json,
+) -> Result<Json, TablesError> {
+    var j = jsonObject();
+    jsonSet(mut j, "createdAt", isoText(jsonMemberI64(rec, "createdAt") ?? 0)?)?;
+    jsonSet(mut j, "createdBy", jsonString(TABLES_ACCOUNT.bytes())?)?;
+    jsonSet(mut j, "namespace", namespaceArray(name)?)?;
+    jsonSet(mut j, "namespaceId", jsonString(jsonMemberText(rec, "id") ?? "".bytes())?)?;
+    jsonSet(mut j, "ownerAccountId", jsonString(TABLES_ACCOUNT.bytes())?)?;
+    jsonSet(mut j, "tableBucketId", jsonString(jsonMemberText(bucketRec, "id") ?? "".bytes())?)?;
+    let _ = req;
+    return Ok(j);
+}
+
+fn createNamespace(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let j = tablesObject(body)?;
+    let ns = singleNamespace(borrow j)?;
+    if (!tableNameOk(ns.view(), true)) { return Err(TablesError.BadRequest); }
+    let hidden = tableWarehouseBucket(bucketName)?;
+    var id = Vector<u8>.create();
+    if (!newUuid(mut id)?) { return Err(TablesError.Internal); }
+    var rec = jsonObject();
+    jsonSet(mut rec, "id", Json.Text(id))?;
+    jsonSet(mut rec, "createdAt", jsonInteger(Clock.unixMillis())?)?;
+    {
+        let _ = tableBucketRecord(store, bucketName)?;
+        let key = catalogKey(CATALOG_NAMESPACES, ns.view(), "".bytes())?;
+        let hiddenView = hidden.view();
+        let keyView = key.view();
+        let recRef = borrow rec;
+        let _ = (writeRecord(store, hiddenView, keyView, recRef, PutCondition.IfAbsent))?;
+    }
+    var answer = jsonObject();
+    jsonSet(mut answer, "namespace", namespaceArray(ns.view())?)?;
+    var arn = Vector<u8>.create();
+    tableBucketArn(req, bucketName, mut arn)?;
+    jsonSet(mut answer, "tableBucketARN", Json.Text(arn))?;
+    return tablesJson(borrow answer);
+}
+
+fn getNamespace(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+    ns: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucketName)?;
+    let bucketRec = tableBucketRecord(store, bucketName)?;
+    let key = catalogKey(CATALOG_NAMESPACES, ns, "".bytes())?;
+    let rec = match (readRecord(store, hidden.view(), key.view())?) {
+        Some(r) => r,
+        null => { return Err(TablesError.NotFound); }
+    };
+    let view = namespaceView(req, ns, borrow bucketRec.json, borrow rec.json)?;
+    return tablesJson(borrow view);
+}
+
+fn listNamespaces(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let max = pageSize(req, "maxNamespaces")?;
+    let after = continuationOf(req)?;
+    let prefix = paramOf(req, "prefix") ?? "".bytes();
+    let hidden = tableWarehouseBucket(bucketName)?;
+    let bucketRec = tableBucketRecord(store, bucketName)?;
+    let base = catalogKey(CATALOG_NAMESPACES, prefix, "".bytes())?;
+    let start = if (after.length > 0) catalogKey(
+        CATALOG_NAMESPACES,
+        after.view(),
+        "".bytes(),
+    )? else Vector<u8>.create();
+    let keys = catalogKeys(store, hidden.view(), base.view(), start.view(), max + 1)?;
+    var list = jsonArray();
+    let shown = if (keys.length > max) max else keys.length;
+    let head = CATALOG_NAMESPACES.bytes().length;
+    for (i in 0..shown) {
+        let ns = keys[i].view()[head..];
+        match (readRecord(store, hidden.view(), keys[i].view())?) {
+            Some(r) => { jsonPush(mut list, namespaceView(req, ns, borrow bucketRec.json, borrow r.json)?)?; }
+            null => {}
+        }
+    }
+    var answer = jsonObject();
+    jsonSet(mut answer, "namespaces", list)?;
+    if (shown < keys.length) { setToken(mut answer, keys[shown - 1].view()[head..])?; }
+    return tablesJson(borrow answer);
+}
+
+fn deleteNamespace(
+    store: borrow mut ObjectStore,
+    bucketName: Slice<u8>,
+    ns: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucketName)?;
+    let _ = tableBucketRecord(store, bucketName)?;
+    let key = catalogKey(CATALOG_NAMESPACES, ns, "".bytes())?;
+    if (readRecord(store, hidden.view(), key.view())?.isNull()) { return Err(TablesError.NotFound); }
+    let tables = catalogKey(CATALOG_TABLES, ns, "".bytes())?;
+    var under = copyBytes(tables.view())?;
+    under.push('/')?;
+    if (catalogKeys(
+        store,
+        hidden.view(),
+        under.view(),
+        "".bytes(),
+        1,
+    )?.length > 0) { return Err(TablesError.Conflict); }
+    let bucket = catalogText(hidden.view());
+    let k = catalogText(key.view());
+    match ((store.deleteObject(bucket, k))) {
+        Ok() => {}
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    }
+    return Ok(tablesNoContent());
+}
+
+// ---- Tables ----
+
+fn tableArn(
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+    id: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    tableBucketArn(req, bucketName, out)?;
+    out.extend("/table/".bytes())?;
+    return out.extend(id);
+}
+
+fn warehouseOf(bucketName: Slice<u8>, id: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var w = copyBytes("s3://".bytes())?;
+    w.extend(tableWarehouseBucket(bucketName)?.view())?;
+    w.push('/')?;
+    w.extend(id)?;
+    return Ok(w);
+}
+
+/// A table that exists: its record; NotFound if its bucket, namespace or record is not there.
+fn tableRecord(
+    store: borrow ObjectStore,
+    bucketName: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+) -> Result<CatalogRecord, TablesError> {
+    let _ = tableBucketRecord(store, bucketName)?;
+    let hidden = tableWarehouseBucket(bucketName)?;
+    let key = catalogKey(CATALOG_TABLES, ns, name)?;
+    return match (readRecord(store, hidden.view(), key.view())?) {
+        Some(r) => Ok(r),
+        null => Err(TablesError.NotFound),
+    };
+}
+
+fn tableView(
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+    bucketRec: borrow Json,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+    rec: borrow CatalogRecord,
+    full: bool,
+) -> Result<Json, TablesError> {
+    let id = jsonMemberText(borrow rec.json, "id") ?? "".bytes();
+    var j = jsonObject();
+    jsonSet(mut j, "createdAt", isoText(jsonMemberI64(borrow rec.json, "createdAt") ?? 0)?)?;
+    jsonSet(mut j, "modifiedAt", isoText(jsonMemberI64(borrow rec.json, "modifiedAt") ?? 0)?)?;
+    jsonSet(mut j, "name", jsonString(name)?)?;
+    jsonSet(mut j, "namespace", namespaceArray(ns)?)?;
+    var arn = Vector<u8>.create();
+    tableArn(req, bucketName, id, mut arn)?;
+    jsonSet(mut j, "tableARN", Json.Text(arn))?;
+    jsonSet(mut j, "type", jsonString("customer".bytes())?)?;
+    jsonSet(mut j, "tableBucketId", jsonString(jsonMemberText(bucketRec, "id") ?? "".bytes())?)?;
+    if (full) {
+        jsonSet(mut j, "createdBy", jsonString(TABLES_ACCOUNT.bytes())?)?;
+        jsonSet(mut j, "modifiedBy", jsonString(TABLES_ACCOUNT.bytes())?)?;
+        jsonSet(mut j, "ownerAccountId", jsonString(TABLES_ACCOUNT.bytes())?)?;
+        jsonSet(mut j, "format", jsonString("ICEBERG".bytes())?)?;
+        jsonSet(mut j, "versionToken", Json.Text(versionTokenOf(rec.generation)?))?;
+        jsonSet(mut j, "warehouseLocation", Json.Text(warehouseOf(bucketName, id)?))?;
+        match (jsonMemberText(borrow rec.json, "metadataLocation")) {
+            Some(m) => { jsonSet(mut j, "metadataLocation", jsonString(m)?)?; }
+            null => {}
+        }
+    }
+    return Ok(j);
+}
+
+fn createTable(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+    ns: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    // An Iceberg schema given here is written as the first metadata file by the Iceberg catalog (slice 2): until
+    // then, refused rather than dropped.
+    let j = tablesBody(body, ["encryptionConfiguration", "storageClassConfiguration", "tags", "metadata"][..])?;
+    let name = copyBytes(jsonMemberText(borrow j, "name") ?? "".bytes())?;
+    if (!tableNameOk(name.view(), false)) { return Err(TablesError.BadRequest); }
+    if (jsonMemberText(borrow j, "format") != Some("ICEBERG".bytes())) { return Err(TablesError.BadRequest); }
+    let hidden = tableWarehouseBucket(bucketName)?;
+    var id = Vector<u8>.create();
+    if (!newUuid(mut id)?) { return Err(TablesError.Internal); }
+    let now = Clock.unixMillis();
+    var rec = jsonObject();
+    jsonSet(mut rec, "id", jsonString(id.view())?)?;
+    jsonSet(mut rec, "createdAt", jsonInteger(now)?)?;
+    jsonSet(mut rec, "modifiedAt", jsonInteger(now)?)?;
+    var generation: u64 = 0;
+    {
+        let _ = tableBucketRecord(store, bucketName)?;
+        let nsKey = catalogKey(CATALOG_NAMESPACES, ns, "".bytes())?;
+        if (readRecord(store, hidden.view(), nsKey.view())?.isNull()) { return Err(TablesError.NotFound); }
+        let key = catalogKey(CATALOG_TABLES, ns, name.view())?;
+        let hiddenView = hidden.view();
+        let keyView = key.view();
+        let recRef = borrow rec;
+        generation = (writeRecord(store, hiddenView, keyView, recRef, PutCondition.IfAbsent))?;
+    }
+    var answer = jsonObject();
+    var arn = Vector<u8>.create();
+    tableArn(req, bucketName, id.view(), mut arn)?;
+    jsonSet(mut answer, "tableARN", Json.Text(arn))?;
+    jsonSet(mut answer, "versionToken", Json.Text(versionTokenOf(generation)?))?;
+    return tablesJson(borrow answer);
+}
+
+/// GetTable (`/get-table`): by the bucket's ARN, namespace and name, or by the table's ARN.
+fn getTable(store: borrow mut ObjectStore, req: borrow S3Request) -> Result<TablesAnswer, TablesError> {
+    var tableId = Vector<u8>.create();
+    var bucketName = Vector<u8>.create();
+    var ns = Vector<u8>.create();
+    var name = Vector<u8>.create();
+    match (paramOf(req, "tableArn")) {
+        Some(arn) => {
+            bucketName = match (tableBucketOfArn(arn, mut tableId)?) {
+                Some(b) => b,
+                null => { return Err(TablesError.BadRequest); }
+            };
+            if (tableId.length == 0) { return Err(TablesError.BadRequest); }
+        }
+        null => {
+            let arn = paramOf(req, "tableBucketARN") ?? "".bytes();
+            var none = Vector<u8>.create();
+            bucketName = match (tableBucketOfArn(arn, mut none)?) {
+                Some(b) => b,
+                null => { return Err(TablesError.BadRequest); }
+            };
+            ns.extend(paramOf(req, "namespace") ?? "".bytes())?;
+            name.extend(paramOf(req, "name") ?? "".bytes())?;
+            if (ns.length == 0 || name.length == 0) { return Err(TablesError.BadRequest); }
+        }
+    }
+    let hidden = tableWarehouseBucket(bucketName.view())?;
+    let bucketRec = tableBucketRecord(store, bucketName.view())?;
+    // By its ARN: the record with that id.
+    if (tableId.length > 0) {
+        let keys = catalogKeys(store, hidden.view(), CATALOG_TABLES.bytes(), "".bytes(), 0)?;
+        for (i in 0..keys.length) {
+            match (readRecord(store, hidden.view(), keys[i].view())?) {
+                Some(r) => {
+                    if (jsonMemberText(borrow r.json, "id") == Some(tableId.view())) {
+                        let rest = keys[i].view()[CATALOG_TABLES.bytes().length..];
+                        let slash = pieceEnd(rest, 0, '/');
+                        ns.extend(rest[0..slash])?;
+                        name.extend(rest[slash + 1..])?;
+                        break;
+                    }
+                }
+                null => {}
+            }
+        }
+        if (name.length == 0) { return Err(TablesError.NotFound); }
+    }
+    let rec = tableRecord(store, bucketName.view(), ns.view(), name.view())?;
+    let view = tableView(req, bucketName.view(), borrow bucketRec.json, ns.view(), name.view(), borrow rec, true)?;
+    return tablesJson(borrow view);
+}
+
+fn listTables(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let max = pageSize(req, "maxTables")?;
+    let after = continuationOf(req)?;
+    let prefix = paramOf(req, "prefix") ?? "".bytes();
+    let onlyNs = paramOf(req, "namespace");
+    let hidden = tableWarehouseBucket(bucketName)?;
+    let bucketRec = tableBucketRecord(store, bucketName)?;
+    let base = match (onlyNs) {
+        Some(n) => {
+            var b = catalogKey(CATALOG_TABLES, n, "".bytes())?;
+            b.push('/')?;
+            b
+        }
+        null => copyBytes(CATALOG_TABLES.bytes())?,
+    };
+    let keys = catalogKeys(store, hidden.view(), base.view(), after.view(), 0)?;
+    var list = jsonArray();
+    var shown: usize = 0;
+    var last = Vector<u8>.create();
+    var more = false;
+    let head = CATALOG_TABLES.bytes().length;
+    for (i in 0..keys.length) {
+        let rest = keys[i].view()[head..];
+        let slash = pieceEnd(rest, 0, '/');
+        let ns = rest[0..slash];
+        let name = rest[slash + 1..];
+        if (!startsWithBytes(name, prefix)) { continue; }
+        if (shown == max) {
+            more = true;
+            break;
+        }
+        match (readRecord(store, hidden.view(), keys[i].view())?) {
+            Some(r) => {
+                jsonPush(mut list, tableView(req, bucketName, borrow bucketRec.json, ns, name, borrow r, false)?)?;
+                shown += 1;
+                last = copyBytes(keys[i].view())?;
+            }
+            null => {}
+        }
+    }
+    var answer = jsonObject();
+    jsonSet(mut answer, "tables", list)?;
+    if (more) { setToken(mut answer, last.view())?; }
+    return tablesJson(borrow answer);
+}
+
+/// Removes up to a page of a dropped table's objects (its warehouse prefix); false once there are none.
+fn purgePage(store: borrow mut ObjectStore, hidden: Slice<u8>, prefix: Slice<u8>) -> Result<bool, TablesError> {
+    let keys = catalogKeys(store, hidden, prefix, "".bytes(), 1000)?;
+    if (keys.length == 0) { return Ok(false); }
+    return match (store.deleteObjects(catalogText(hidden), keys.view())) {
+        Ok(_) => Ok(true),
+        Err(e) => Err(tablesStoreFail(e)),
+    };
+}
+
+/// Removes every object of a table's warehouse prefix (its id), a page at a time, the store let go between pages.
+async fn purgeWarehouse(app: borrow S3App, hidden: Slice<u8>, id: Slice<u8>) -> Result<void, TablesError> {
+    var prefix = copyBytes(id)?;
+    prefix.push('/')?;
+    while (true) {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let view = prefix.view();
+        if (!await Async.blocking(() => purgePage(store, hidden, view))?) { break; }
+    }
+    return Ok();
+}
+
+fn deleteTable(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucketName)?;
+    var id = Vector<u8>.create();
+    {
+        let rec = tableRecord(store, bucketName, ns, name)?;
+        match (paramOf(req, "versionToken")) {
+            Some(t) => {
+                if (t != versionTokenOf(rec.generation)?.view()) { return Err(TablesError.Conflict); }
+            }
+            null => {}
+        }
+        id.extend(jsonMemberText(borrow rec.json, "id") ?? "".bytes())?;
+        let key = catalogKey(CATALOG_TABLES, ns, name)?;
+        let bucket = catalogText(hidden.view());
+        let k = catalogText(key.view());
+        match ((store.deleteObject(bucket, k))) {
+            Ok() => {}
+            Err(e) => { return Err(tablesStoreFail(e)); }
+        }
+    }
+    // Its objects go after the answer's work, a page at a time (`purgeWarehouse`).
+    var answer = tablesNoContent();
+    answer.purgeBucket = hidden;
+    answer.purgeId = id;
+    return Ok(answer);
+}
+
+fn renameTable(
+    store: borrow mut ObjectStore,
+    bucketName: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let j = tablesObject(body)?;
+    let newName = copyBytes(jsonMemberText(borrow j, "newName") ?? name)?;
+    let newNs = copyBytes(jsonMemberText(borrow j, "newNamespaceName") ?? ns)?;
+    if (!tableNameOk(newName.view(), false) || !tableNameOk(newNs.view(), true)) { return Err(TablesError.BadRequest); }
+    let hidden = tableWarehouseBucket(bucketName)?;
+    let rec = tableRecord(store, bucketName, ns, name)?;
+    match (jsonMemberText(borrow j, "versionToken")) {
+        Some(t) => {
+            if (t != versionTokenOf(rec.generation)?.view()) { return Err(TablesError.Conflict); }
+        }
+        null => {}
+    }
+    let nsKey = catalogKey(CATALOG_NAMESPACES, newNs.view(), "".bytes())?;
+    if (readRecord(store, hidden.view(), nsKey.view())?.isNull()) { return Err(TablesError.NotFound); }
+    let to = catalogKey(CATALOG_TABLES, newNs.view(), newName.view())?;
+    if (readRecord(store, hidden.view(), to.view())?.isSome()) { return Err(TablesError.Conflict); }
+    let from = catalogKey(CATALOG_TABLES, ns, name)?;
+    let bucket = catalogText(hidden.view());
+    let f = catalogText(from.view());
+    let t = catalogText(to.view());
+    let generation = rec.generation;
+    // The record moves whole, by one Rename record (ADR-0081): its id and warehouse stay.
+    match ((store.renameObject(bucket, f, t, generation, "".bytes()))) {
+        Ok() => {}
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    }
+    return Ok(tablesNoContent());
+}
+
+fn getTableMetadataLocation(
+    store: borrow mut ObjectStore,
+    bucketName: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let rec = tableRecord(store, bucketName, ns, name)?;
+    var answer = jsonObject();
+    match (jsonMemberText(borrow rec.json, "metadataLocation")) {
+        Some(m) => { jsonSet(mut answer, "metadataLocation", jsonString(m)?)?; }
+        null => {}
+    }
+    jsonSet(mut answer, "versionToken", Json.Text(versionTokenOf(rec.generation)?))?;
+    let id = jsonMemberText(borrow rec.json, "id") ?? "".bytes();
+    jsonSet(mut answer, "warehouseLocation", Json.Text(warehouseOf(bucketName, id)?))?;
+    return tablesJson(borrow answer);
+}
+
+/// Whether `location` lies in the table's warehouse and names a metadata file.
+fn metadataLocationOk(location: Slice<u8>, warehouse: Slice<u8>) -> bool {
+    var inside = Vector<u8>.create();
+    let _ = inside.extend(warehouse);
+    let _ = inside.push('/');
+    if (!startsWithBytes(location, inside.view())) { return false; }
+    for (end in [".metadata.json", ".metadata.json.gz"]) {
+        let e = end.bytes();
+        if (location.length > e.length && location[location.length - e.length..] == e) { return true; }
+    }
+    return false;
+}
+
+/// UpdateTableMetadataLocation: the compare-and-set (ADR-0083 §3). The record is written only if it is still the
+/// generation the versionToken names (If-Match), else ConflictException.
+fn updateTableMetadataLocation(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let j = tablesObject(body)?;
+    let location = copyBytes(jsonMemberText(borrow j, "metadataLocation") ?? "".bytes())?;
+    let token = copyBytes(jsonMemberText(borrow j, "versionToken") ?? "".bytes())?;
+    if (location.length == 0 || location.length > 2048 || token.length == 0) { return Err(TablesError.BadRequest); }
+    let hidden = tableWarehouseBucket(bucketName)?;
+    var generation: u64 = 0;
+    var id = Vector<u8>.create();
+    {
+        var rec = tableRecord(store, bucketName, ns, name)?;
+        id.extend(jsonMemberText(borrow rec.json, "id") ?? "".bytes())?;
+        if (!metadataLocationOk(location.view(), warehouseOf(bucketName, id.view())?.view())) {
+            return Err(TablesError.BadRequest);
+        }
+        if (token.view() != versionTokenOf(rec.generation)?.view()) { return Err(TablesError.Conflict); }
+        jsonSet(mut rec.json, "metadataLocation", jsonString(location.view())?)?;
+        jsonSet(mut rec.json, "modifiedAt", jsonInteger(Clock.unixMillis())?)?;
+        let key = catalogKey(CATALOG_TABLES, ns, name)?;
+        let hiddenView = hidden.view();
+        let keyView = key.view();
+        let recRef = borrow rec.json;
+        let current = rec.generation;
+        generation = (writeRecord(store, hiddenView, keyView, recRef, PutCondition.IfGeneration(current)))?;
+    }
+    var answer = jsonObject();
+    jsonSet(mut answer, "metadataLocation", Json.Text(location))?;
+    jsonSet(mut answer, "name", jsonString(name)?)?;
+    jsonSet(mut answer, "namespace", namespaceArray(ns)?)?;
+    var arn = Vector<u8>.create();
+    tableArn(req, bucketName, id.view(), mut arn)?;
+    jsonSet(mut answer, "tableARN", Json.Text(arn))?;
+    jsonSet(mut answer, "versionToken", Json.Text(versionTokenOf(generation)?))?;
+    return tablesJson(borrow answer);
+}
+
+// ---- Dispatch ----
+
+/// The table bucket a path segment's ARN names; BadRequest if it names none.
+fn bucketOfSegment(segment: Slice<u8>) -> Result<Vector<u8>, TablesError> {
+    var none = Vector<u8>.create();
+    return match (tableBucketOfArn(segment, mut none)?) {
+        Some(b) => if (none.length == 0) Ok(b) else Err(TablesError.BadRequest),
+        null => Err(TablesError.BadRequest),
+    };
+}
+
+fn routeTablesSync(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let segs = pathSegments(req.rawPath.view())?;
+    let m = req.method;
+    if (segs.length == 0) { return Err(TablesError.NotImplemented); }
+    let top = segs[0].view();
+    // The Iceberg REST catalog is slice 2's (ADR-0083 §5).
+    if (top == "iceberg".bytes()) { return Err(TablesError.NotImplemented); }
+    if (top == "get-table".bytes() && segs.length == 1) {
+        if (!isMethod(m, Method.Get)) { return Err(TablesError.BadRequest); }
+        return getTable(store, req);
+    }
+    if (top == "buckets".bytes()) {
+        if (segs.length == 1) {
+            if (isMethod(m, Method.Put)) { return createTableBucket(store, req, body); }
+            if (isMethod(m, Method.Get)) { return listTableBuckets(store, req); }
+            return Err(TablesError.BadRequest);
+        }
+        let bucket = bucketOfSegment(segs[1].view())?;
+        // Its policy, encryption, maintenance, replication and the rest: not done (ADR-0083 §6).
+        if (segs.length > 2) { return Err(TablesError.NotImplemented); }
+        if (isMethod(m, Method.Get)) { return getTableBucket(store, req, bucket.view()); }
+        if (isMethod(m, Method.Delete)) { return deleteTableBucket(store, bucket.view()); }
+        return Err(TablesError.BadRequest);
+    }
+    if (top == "namespaces".bytes() && segs.length >= 2) {
+        let bucket = bucketOfSegment(segs[1].view())?;
+        if (segs.length == 2) {
+            if (isMethod(m, Method.Put)) { return createNamespace(store, req, bucket.view(), body); }
+            if (isMethod(m, Method.Get)) { return listNamespaces(store, req, bucket.view()); }
+            return Err(TablesError.BadRequest);
+        }
+        if (segs.length > 3) { return Err(TablesError.NotImplemented); }
+        let ns = segs[2].view();
+        if (isMethod(m, Method.Get)) { return getNamespace(store, req, bucket.view(), ns); }
+        if (isMethod(m, Method.Delete)) { return deleteNamespace(store, bucket.view(), ns); }
+        return Err(TablesError.BadRequest);
+    }
+    if (top == "tables".bytes() && segs.length >= 2) {
+        let bucket = bucketOfSegment(segs[1].view())?;
+        if (segs.length == 2) {
+            if (isMethod(m, Method.Get)) { return listTables(store, req, bucket.view()); }
+            return Err(TablesError.BadRequest);
+        }
+        let ns = segs[2].view();
+        if (segs.length == 3) {
+            if (isMethod(m, Method.Put)) { return createTable(store, req, bucket.view(), ns, body); }
+            return Err(TablesError.BadRequest);
+        }
+        let name = segs[3].view();
+        if (segs.length == 4) {
+            if (isMethod(m, Method.Delete)) { return deleteTable(store, req, bucket.view(), ns, name); }
+            return Err(TablesError.BadRequest);
+        }
+        let what = segs[4].view();
+        if (segs.length == 5 && what == "rename".bytes() && isMethod(m, Method.Put)) {
+            return renameTable(store, bucket.view(), ns, name, body);
+        }
+        if (segs.length == 5 && what == "metadata-location".bytes()) {
+            if (isMethod(m, Method.Get)) { return getTableMetadataLocation(store, bucket.view(), ns, name); }
+            if (isMethod(m, Method.Put)) {
+                return updateTableMetadataLocation(store, req, bucket.view(), ns, name, body);
+            }
+        }
+        // A table's policy, encryption, maintenance and the rest: not done (ADR-0083 §6).
+        return Err(TablesError.NotImplemented);
+    }
+    return Err(TablesError.NotImplemented);
+}
+
+/// The S3 Tables API's work under the store, on a worker thread, then a dropped table's objects removed.
+async fn routeTables(app: borrow S3App, req: borrow S3Request, body: Slice<u8>) -> Result<TablesAnswer, TablesError> {
+    var answer = tablesNoContent();
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        answer = await Async.blocking(() => routeTablesSync(store, req, body))?;
+    }
+    if (answer.purgeId.length > 0) {
+        let bucket = replace(mut answer.purgeBucket, Vector<u8>.create());
+        let id = replace(mut answer.purgeId, Vector<u8>.create());
+        await purgeWarehouse(app, bucket.view(), id.view())?;
+    }
+    return Ok(answer);
+}
+
+/// A request signed for `s3tables` (ADR-0083 §1): its body read and hashed first, as S3 Tables' clients send no
+/// `x-amz-content-sha256`; long-term keys and their `GetSessionToken` sessions only.
+async fn serveTables(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let unsigned = Authenticated { payload: PayloadMode.Unsigned, signer: null, key: null, session: null };
+    let body = await readSmallBody(unsigned, exchange, TABLES_MAX_BODY)?;
+    var hash = Vector<u8>.create();
+    appendHexBytes(mut hash, Sha256.of(body.view())[..])?;
+    let now = Clock.unixMillis() / 1000;
+    let answer: Result<TablesAnswer, TablesError> = match (req.authenticate(
+        app.credentials.get().view(),
+        app.stsKeys.view(),
+        now,
+        "s3tables",
+        Some(hash.view()),
+    )) {
+        Ok(auth) => {
+            let who = match (borrow auth.session) {
+                Some(s) => sessionRequester(app, auth.key, null, s)?,
+                null => requesterOf(auth.key, null),
+            };
+            if (who.key.isNull() || who.role.isSome() || headerOf(req, EXPRESS_TOKEN_FIELD).isSome()) {
+                Err(TablesError.Forbidden)
+            } else if (app.cluster) {
+                Err(TablesError.NotImplemented) // a cluster's routing of table buckets is slice 3's (ADR-0083 §7)
+            } else {
+                await routeTables(app, req, body.view())
+            }
+        }
+        Err(_) => Err(TablesError.Forbidden),
+    };
+    match (answer) {
+        Ok(a) => {
+            if (a.body.length > 0) { exchange.header("content-type", "application/json".bytes())?; }
+            await exchange.send(statusOf(a.status), a.body.view())?;
+        }
+        Err(TablesError.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
+        Err(e) => {
+            var b = Vector<u8>.create();
+            b.extend("{\"message\":".bytes())?;
+            writeJsonText(mut b, tablesErrorMessage(borrow e).bytes())?;
+            b.push('}')?;
+            exchange.header("content-type", "application/json".bytes())?;
+            exchange.header("x-amzn-errortype", tablesErrorName(borrow e).bytes())?;
+            await exchange.send(statusOf(tablesErrorStatus(borrow e)), b.view())?;
+        }
+    }
+    return Ok();
+}
+
+/// What S3's calls may do in a table bucket's warehouse (ADR-0083 §2, §4): an engine's object calls, a listing
+/// within a prefix, HeadBucket and DeleteObjects; never the catalog's `.s3tables/` keys, nor a bucket call
+/// (NotImplemented: DeleteBucket and configurations are the table bucket's own API's).
+fn tableWarehouseRefusal(req: borrow S3Request) -> Result<void, S3Fail> {
+    let catalog = CATALOG_PREFIX.bytes();
+    if (startsWithBytes(req.key.bytes(), catalog)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    match (headerOf(req, "x-amz-copy-source")) {
+        Some(_) => {
+            match (copySourceOf(req)) {
+                Ok(src) => {
+                    if (startsWithBytes(src.key.bytes(), catalog)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+                }
+                Err(e) => { return Err(e); }
+            }
+        }
+        null => {}
+    }
+    if (req.key.length > 0) { return Ok(); }
+    let m = req.method;
+    // CreateBucket of such a name: not S3's to make.
+    if (isMethod(m, Method.Put) && req.query.length == 0) { return Err(S3Fail.Code(S3Code.InvalidBucketName)); }
+    if (isMethod(m, Method.Head) && req.query.length == 0) { return Ok(); }
+    if (isMethod(m, Method.Post) && req.onlyParams("delete")) { return Ok(); }
+    if (isMethod(m, Method.Get) && (req.hasParam("list-type") || req.hasParam("uploads"))) {
+        // A listing names a prefix that cannot reach the catalog's keys.
+        let prefix = paramOf(req, "prefix") ?? "".bytes();
+        if (prefix.length == 0 || startsWithBytes(catalog, prefix) || startsWithBytes(prefix, catalog)) {
+            return Err(S3Fail.Code(S3Code.AccessDenied));
+        }
+        return Ok();
+    }
+    return Err(S3Fail.Code(S3Code.NotImplemented));
+}

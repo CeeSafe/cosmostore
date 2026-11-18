@@ -1,0 +1,135 @@
+// S3 Tables (ADR-0083): the JSON model, names, ARNs, and what S3's calls may do in a table bucket's warehouse.
+import web_core;
+import web_http;
+import web_server;
+
+fn roundTrip(text: StringView) -> Vector<u8> {
+    let j = parseJson(text.bytes())!!;
+    var out = Vector<u8>.create();
+    writeJson(mut out, borrow j)!;
+    return out;
+}
+
+@test
+fn jsonModel() -> Result<void, TestFailure> {
+    Check.equalBytes(
+        "{\"a\":[1,-2.5e3,true,false,null],\"b\":{\"c\":\"x\\\"y\"}}".bytes(),
+        roundTrip(" { \"a\" : [ 1 , -2.5e3 , true , false , null ] , \"b\" : { \"c\" : \"x\\\"y\" } } ").view(),
+    )?;
+    // Numbers keep their text: a snapshot id past 2^53 goes through exactly.
+    Check.equalBytes("{\"id\":8933763417129393145}".bytes(), roundTrip("{\"id\":8933763417129393145}").view())?;
+    let j = parseJson("{\"id\":8933763417129393145,\"s\":\"\\u00e9\\ud83d\\ude00\",\"n\":-7}".bytes())!!;
+    Check.isTrue(jsonMemberI64(borrow j, "id") == Some(8933763417129393145i64), "a 64-bit integer")?;
+    Check.isTrue(jsonMemberI64(borrow j, "n") == Some(-7i64), "a negative one")?;
+    Check.equalBytes([0xC3u8, 0xA9, 0xF0, 0x9F, 0x98, 0x80][..], jsonMemberText(borrow j, "s")!)?;
+    for (bad in ["", "{", "{\"a\":}", "[1,]", "{\"a\":1}x", "\"\\x\"", "01a", "{\"a\" 1}", "\"\\ud800\""]) {
+        Check.isTrue(parseJson(bad.bytes())!.isNull(), bad)?;
+    }
+    var deep = String.create();
+    for (i in 0..70) { deep.append("[")!; }
+    for (i in 0..70) { deep.append("]")!; }
+    Check.isTrue(parseJson(deep.bytes())!.isNull(), "nested past the limit")?;
+    // Editing.
+    var o = jsonObject();
+    jsonSet(mut o, "k", jsonInteger(-9223372036854775807 - 1)!)!;
+    jsonSet(mut o, "t", jsonString("a\nb".bytes())!)!;
+    jsonSet(mut o, "k", jsonInteger(42)!)!;
+    var out = Vector<u8>.create();
+    writeJson(mut out, borrow o)!;
+    Check.equalBytes("{\"k\":42,\"t\":\"a\\nb\"}".bytes(), out.view())?;
+    jsonRemove(mut o, "k".bytes());
+    let copy = cloneJson(borrow o)!;
+    out.clear();
+    writeJson(mut out, borrow copy)!;
+    Check.equalBytes("{\"t\":\"a\\nb\"}".bytes(), out.view())?;
+    Check.isTrue(parseJsonInteger("-9223372036854775808".bytes()).isNull(), "past i64 (kept as text)")?;
+    return Ok();
+}
+
+@test
+fn tableNamesAndArns() -> Result<void, TestFailure> {
+    Check.isTrue(tableBucketNameOk("analytics".bytes()) && tableBucketNameOk("a-1".bytes()), "table bucket names")?;
+    for (bad in [
+        "ab",
+        "Analytics",
+        "a_b",
+        "-ab",
+        "ab-",
+        "xn--ab",
+        "awsdata",
+        "data--x-s3",
+        "data--table-s3",
+        "data-s3alias",
+    ]) {
+        Check.isFalse(tableBucketNameOk(bad.bytes()), bad)?;
+    }
+    Check.isTrue(tableNameOk("orders_2025".bytes(), false) && tableNameOk("aws_like".bytes(), false), "table names")?;
+    Check.isFalse(tableNameOk("aws_like".bytes(), true), "a namespace beginning aws")?;
+    for (bad in ["", "_a", "a-b", "A", "a.b"]) { Check.isFalse(tableNameOk(bad.bytes(), false), bad)?; }
+    var id = Vector<u8>.create();
+    let b = tableBucketOfArn("arn:aws:s3tables:us-east-1:000000000000:bucket/analytics".bytes(), mut id)!!;
+    Check.equalBytes("analytics".bytes(), b.view())?;
+    Check.equalU64(0, id.length as u64)?;
+    let t = tableBucketOfArn("arn:aws:s3tables:eu-west-1:123456789012:bucket/analytics/table/abc-1".bytes(), mut id)!!;
+    Check.equalBytes("analytics".bytes(), t.view())?;
+    Check.equalBytes("abc-1".bytes(), id.view())?;
+    for (bad in [
+        "arn:aws:s3:::analytics",
+        "arn:aws:s3tables:us-east-1:0:bucket/Bad",
+        "arn:aws:s3tables:us-east-1:0:bucket/ab/x",
+    ]) {
+        var none = Vector<u8>.create();
+        Check.isTrue(tableBucketOfArn(bad.bytes(), mut none)!.isNull(), bad)?;
+    }
+    // The warehouse: a hash of the name, so any name fits a bucket's.
+    let w = tableWarehouseBucket("a234567890123456789012345678901234567890123456789012345678901ab".bytes())!;
+    Check.equalU64(42, w.length as u64)?;
+    Check.isTrue(isTableWarehouseShaped(w.view()), "--table-s3")?;
+    Check.isTrue(
+        metadataLocationOk("s3://w--table-s3/id/metadata/00001-a.metadata.json".bytes(), "s3://w--table-s3/id".bytes()),
+        "in it",
+    )?;
+    Check.isFalse(
+        metadataLocationOk("s3://w--table-s3/id2/m.metadata.json".bytes(), "s3://w--table-s3/id".bytes()),
+        "a sibling",
+    )?;
+    Check.isFalse(
+        metadataLocationOk("s3://w--table-s3/id/data/x.parquet".bytes(), "s3://w--table-s3/id".bytes()),
+        "not metadata",
+    )?;
+    let segs = pathSegments("/tables/arn%3Aaws%3As3tables%3Aus-east-1%3A0%3Abucket%2Fa1b/sales/orders/rename".bytes())!;
+    Check.equalU64(5, segs.length as u64)?;
+    Check.equalBytes("arn:aws:s3tables:us-east-1:0:bucket/a1b".bytes(), segs[1].view())?;
+    var again = Vector<u8>.create();
+    encodePathAgain("/buckets/arn%3Aa%2Fb".bytes(), mut again)!;
+    Check.equalBytes("/buckets/arn%253Aa%252Fb".bytes(), again.view())?;
+    return Ok();
+}
+
+fn warehouseCall(method: Method, key: StringView, param: StringView, value: StringView) -> S3Code? {
+    var req = bareRequest();
+    req.method = method;
+    let _ = req.bucket.append("002b2b5256073c200d64b94c800f0b93--table-s3");
+    let _ = req.key.append(key);
+    if (param.length > 0) { req.query.push(policyParam(param, value))!; }
+    if (param == "prefix") { req.query.push(policyParam("list-type", "2"))!; }
+    return match (tableWarehouseRefusal(borrow req)) {
+        Ok() => null,
+        Err(S3Fail.Code(c)) => Some(c),
+        Err(_) => Some(S3Code.InternalError),
+    };
+}
+
+@test
+fn tableWarehouseCalls() -> Result<void, TestFailure> {
+    Check.isTrue(warehouseCall(Method.Put, "id/data/a.parquet", "", "").isNull(), "an engine's PUT")?;
+    Check.isTrue(warehouseCall(Method.Get, "id/metadata/x.metadata.json", "", "").isNull(), "a GET")?;
+    Check.isTrue(warehouseCall(Method.Get, "", "prefix", "id/").isNull(), "a listing of a table's")?;
+    Check.isTrue(warehouseCall(Method.Head, "", "", "").isNull(), "HeadBucket")?;
+    Check.isTrue(isCode(warehouseCall(Method.Get, ".s3tables/bucket", "", ""), S3Code.AccessDenied), "the catalog")?;
+    Check.isTrue(isCode(warehouseCall(Method.Get, "", "prefix", ""), S3Code.AccessDenied), "a listing of everything")?;
+    Check.isTrue(isCode(warehouseCall(Method.Get, "", "prefix", ".s3"), S3Code.AccessDenied), "toward the catalog")?;
+    Check.isTrue(isCode(warehouseCall(Method.Delete, "", "", ""), S3Code.NotImplemented), "DeleteBucket")?;
+    Check.isTrue(isCode(warehouseCall(Method.Put, "", "versioning", ""), S3Code.NotImplemented), "versioning")?;
+    return Ok();
+}

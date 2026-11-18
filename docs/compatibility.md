@@ -42,6 +42,13 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
   boto3, Go, JavaScript and Java with their sessions, and .NET with them off (ADR-0080 §9); the JavaScript SDK's
   `/<name>//<key>` is read as `/<name>/<key>` for an access point's name too.
 
+- **S3 Tables** (ADR-0083, M9): the S3 Tables API (`aws s3tables`, boto3's `s3tables`) on `serve`: table buckets,
+  namespaces, tables, GetTable by ARN, rename, and Get/UpdateTableMetadataLocation as a compare-and-set on the
+  versionToken (ConflictException when it is not current). A table's `warehouseLocation` is
+  `s3://<hash>--table-s3/<table id>`, which an engine reads and writes with S3's calls (not the catalog's
+  `.s3tables/` keys, and no bucket call). Policies, maintenance, encryption, tags, replication and the rest are
+  NotImplemented. The Iceberg REST catalog and clusters come in later slices.
+
 - **boto3** presigns with SigV2 for a custom endpoint unless it is told otherwise:
   `Config(signature_version="s3v4")`. CosmoStore accepts SigV4 only, and refuses SigV2 with S3's `InvalidRequest`.
   boto3's CRC32C and CRC64NVME checksums need `pip install "boto3[crt]"`, the Java SDK's need the

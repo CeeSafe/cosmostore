@@ -382,6 +382,8 @@ async fn serveS3(
     let second = truncate<u64>(Clock.unixMillis() / 1000);
     if (!app.rates.admitAddress(peer, second)) { return Err(slowDown(exchange)); }
     var req = S3Request.of(request, app.domain.view())?;
+    // S3 Tables (ADR-0083 §1): its paths are an S3 bucket's too, so the signature's service decides.
+    if (signedForTables(borrow req)) { return await serveTables(app, borrow req, exchange); }
     // An access point's alias, or `<name>-<account>` from its ARN's host, is its bucket (ADR-0076 §2).
     let through = await resolveAccessPoint(app, req.bucket.bytes())?;
     match (borrow through) {
@@ -565,6 +567,8 @@ async fn serveS3(
         }
         null => {}
     }
+    // A table bucket's warehouse takes S3's object calls, not its catalog's keys or bucket calls (ADR-0083 §2).
+    if (isTableWarehouseShaped(bucket.bytes())) { tableWarehouseRefusal(borrow req)?; }
     // What a directory bucket does not take (ADR-0080 §6).
     let directory = await isDirectoryBucket(app, bucket)?;
     if (directory) {
@@ -1052,7 +1056,8 @@ async fn listBuckets(app: borrow S3App, req: borrow S3Request, exchange: borrow 
     var more = false;
     for (i in 0..all.length) {
         let name = all[i].name.view();
-        if (all[i].directory) { continue; } // ListDirectoryBuckets' (ADR-0080 §5)
+        if (all[i].directory) { continue; }                           // ListDirectoryBuckets' (ADR-0080 §5)
+        if (isTableWarehouseShaped(all[i].name.view())) { continue; } // a table bucket's (ADR-0083 §2)
         if (!startsWithBytes(name, prefix)) { continue; }
         if (after.length > 0 && compareBytes(name, after.view()) <= 0) { continue; }
         if (buckets.length == limit) {
@@ -1102,6 +1107,8 @@ async fn createBucket(
     // `LocationConstraint` is taken and ignored, as before.
     let xml = await readSmallBody(auth, exchange, 65536)?;
     if (asksDirectory(xml.view())) { return await createDirectoryBucket(app, req, xml.view(), exchange); }
+    // A table bucket's warehouse is made by CreateTableBucket only (ADR-0083 §2).
+    if (isTableWarehouseShaped(req.bucket.bytes())) { return Err(S3Fail.Code(S3Code.InvalidBucketName)); }
     // The ACL of the request's fields, checked before the bucket is made (ADR-0045 §3).
     let acl = storedAcl(requestAcl(req)? ?? privateAcl())?;
     // A bucket made with object lock has versioning enabled and the lock on (ADR-0047 §1).

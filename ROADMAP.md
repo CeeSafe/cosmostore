@@ -3064,3 +3064,23 @@ Browser form uploads with a SigV4 POST policy.
   under `.s3tables/`, the versionToken a record's generation, and the compare-and-set a conditional write. So there
   is no new journal record. The Iceberg REST catalog writes the metadata files.
 - **Slices:** the S3 Tables API, the Iceberg catalog (PyIceberg end to end), the cluster, then the SDK matrix.
+
+### 19 Nov 2026: M9 slice 1, the S3 Tables API on `serve` (ADR-0083)
+
+- **Routing:** a request signed for `s3tables` is S3 Tables'. Its body is read and hashed first (its clients send
+  no `x-amz-content-sha256`), and its path is URI-encoded once more in the canonical request, as SigV4 has it for
+  every service but S3: the table bucket's ARN is one encoded segment. Errors are REST-JSON
+  (`x-amzn-ErrorType`, `{"message"}`).
+- **The calls:** create, get, list and delete table buckets, namespaces and tables. Also GetTable by ARN,
+  RenameTable (the record moved by ADR-0081's Rename), and Get/UpdateTableMetadataLocation.
+  - **Records:** each is a JSON object under `.s3tables/` in the hidden bucket `<hash>--table-s3`. A versionToken
+    is its record's generation, and an update is an If-Match write.
+  - **Drops:** DeleteTable empties the table's warehouse prefix after its answer's work, a page at a time.
+  - **Not done:** policies, maintenance, encryption, tags and the rest are NotImplemented, as is a cluster (slice 3).
+- **S3 in a warehouse:** an engine's object calls are taken. The catalog's keys are refused, and so are bucket
+  calls (CreateBucket of a `--table-s3` name is InvalidBucketName) and a listing that could reach the catalog.
+- **New:** a JSON value model (`src/s3/json.cee`): parse with a depth limit, edit and write, numbers kept as their
+  text.
+- **Tests:** `jsonModel`, `tableNamesAndArns`, `tableWarehouseCalls`. The S3 smoke's 22 checks
+  (`aws s3tables`), and boto3's 10.
+- **Next:** slice 2, the Iceberg REST catalog, and PyIceberg end to end.

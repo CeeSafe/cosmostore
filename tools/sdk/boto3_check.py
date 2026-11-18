@@ -662,6 +662,33 @@ ctl.delete_access_point(AccountId=ACCOUNT, Name=AP)
 check("deleted", ctl.list_access_points_for_directory_buckets(AccountId=ACCOUNT)["AccessPointList"], [])
 d.delete_bucket(Bucket=APB)
 
+# S3 Tables (ADR-0083): table buckets, namespaces and tables, and the metadata location's compare-and-set.
+tables = boto3.client("s3tables", endpoint_url=endpoint, config=Config(retries={"max_attempts": 1}))
+tarn = tables.create_table_bucket(name="sdk-tables")["arn"]
+check("create_table_bucket", tarn, "arn:aws:s3tables:us-east-1:%s:bucket/sdk-tables" % ACCOUNT)
+check("list_table_buckets", [b["name"] for b in tables.list_table_buckets()["tableBuckets"]], ["sdk-tables"])
+tables.create_namespace(tableBucketARN=tarn, namespace=["sales"])
+made = tables.create_table(tableBucketARN=tarn, namespace="sales", name="orders", format="ICEBERG")
+got = tables.get_table(tableArn=made["tableARN"])
+check("get_table by its ARN", (got["name"], got["namespace"], got["versionToken"]), ("orders", ["sales"], made["versionToken"]))
+wh = got["warehouseLocation"]
+wbucket, wprefix = wh[5:].split("/", 1)
+client().put_object(Bucket=wbucket, Key=wprefix + "/metadata/00001-x.metadata.json", Body=b"{}")
+moved = tables.update_table_metadata_location(tableBucketARN=tarn, namespace="sales", name="orders",
+                                              versionToken=got["versionToken"], metadataLocation=wh + "/metadata/00001-x.metadata.json")
+check("update_table_metadata_location", tables.get_table_metadata_location(tableBucketARN=tarn, namespace="sales", name="orders")["metadataLocation"],
+      wh + "/metadata/00001-x.metadata.json")
+check("a stale versionToken", code_of(lambda: tables.update_table_metadata_location(tableBucketARN=tarn, namespace="sales", name="orders",
+      versionToken=got["versionToken"], metadataLocation=wh + "/metadata/00002-y.metadata.json")), "ConflictException")
+check("its token moved on", moved["versionToken"] != got["versionToken"], True)
+tables.rename_table(tableBucketARN=tarn, namespace="sales", name="orders", newName="orders2", versionToken=moved["versionToken"])
+check("rename_table", [t["name"] for t in tables.list_tables(tableBucketARN=tarn)["tables"]], ["orders2"])
+tables.delete_table(tableBucketARN=tarn, namespace="sales", name="orders2")
+check("the table's files gone with it", client().list_objects_v2(Bucket=wbucket, Prefix=wprefix + "/")["KeyCount"], 0)
+tables.delete_namespace(tableBucketARN=tarn, namespace="sales")
+tables.delete_table_bucket(tableBucketARN=tarn)
+check("delete_table_bucket", tables.list_table_buckets()["tableBuckets"], [])
+
 session = client().create_session(Bucket="sdk2--local-az1--x-s3", SessionMode="ReadOnly")
 check("create_session", session["Credentials"]["AccessKeyId"][:4], "ASIA")
 

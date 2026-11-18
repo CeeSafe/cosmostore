@@ -1198,6 +1198,35 @@ check "a policy is taken" "$(aws s3api put-bucket-policy --bucket "$dir" --polic
 dl s3 rm --recursive "s3://$dir/" > /dev/null 2>&1
 aws s3api delete-bucket --bucket "$dir" > /dev/null 2>&1 && pass "delete the directory bucket" || fail "delete the directory bucket"
 
+# S3 Tables (ADR-0083): table buckets, namespaces and tables through `aws s3tables`; the warehouse through S3.
+tarn=$(aws s3tables create-table-bucket --name smoke-tables --query arn --output text 2>&1)
+check "create-table-bucket" "$tarn" "arn:aws:s3tables:us-east-1:000000000000:bucket/smoke-tables"
+check "a name twice" "$(code s3tables create-table-bucket --name smoke-tables)" ConflictException
+check "list-table-buckets" "$(aws s3tables list-table-buckets --query 'tableBuckets[].name' --output text 2>&1)" smoke-tables
+check "not in list-buckets" "$(aws s3api list-buckets --query "length(Buckets[?ends_with(Name, '--table-s3')])" 2>&1)" 0
+aws s3tables create-namespace --table-bucket-arn "$tarn" --namespace sales > /dev/null 2>&1
+check "list-namespaces" "$(aws s3tables list-namespaces --table-bucket-arn "$tarn" --query 'namespaces[].namespace[0]' --output text 2>&1)" sales
+check "create-table" "$(aws s3tables create-table --table-bucket-arn "$tarn" --namespace sales --name orders --format ICEBERG --query 'tableARN' --output text 2>&1 | grep -c ':bucket/smoke-tables/table/')" 1
+read -r twh ttok <<< "$(aws s3tables get-table --table-bucket-arn "$tarn" --namespace sales --name orders --query '[warehouseLocation,versionToken]' --output text 2>&1)"
+twb=${twh#s3://}; twb=${twb%%/*}; tpre=${twh#s3://*/}
+check "its warehouse is a table bucket's" "${twb: -10}" "--table-s3"
+aws s3api put-object --bucket "$twb" --key "$tpre/metadata/00001-a.metadata.json" --body dir.txt > /dev/null 2>&1 && pass "an engine writes in the warehouse" || fail "an engine writes in the warehouse"
+check "update-table-metadata-location" "$(aws s3tables update-table-metadata-location --table-bucket-arn "$tarn" --namespace sales --name orders --version-token "$ttok" --metadata-location "$twh/metadata/00001-a.metadata.json" --query metadataLocation --output text 2>&1)" "$twh/metadata/00001-a.metadata.json"
+check "with a token no longer current" "$(code s3tables update-table-metadata-location --table-bucket-arn "$tarn" --namespace sales --name orders --version-token "$ttok" --metadata-location "$twh/metadata/00002-b.metadata.json")" ConflictException
+check "outside its warehouse" "$(code s3tables update-table-metadata-location --table-bucket-arn "$tarn" --namespace sales --name orders --version-token "$ttok" --metadata-location s3://elsewhere/x.metadata.json)" BadRequestException
+check "the catalog is not S3's" "$(code s3api get-object --bucket "$twb" --key .s3tables/bucket dir.out)" AccessDenied
+check "nor is the warehouse bucket" "$(code s3api delete-bucket --bucket "$twb")" NotImplemented
+check "a --table-s3 name for a bucket" "$(code s3api create-bucket --bucket mine--table-s3)" InvalidBucketName
+aws s3tables rename-table --table-bucket-arn "$tarn" --namespace sales --name orders --new-name orders_v2 > /dev/null 2>&1
+check "rename-table" "$(aws s3tables list-tables --table-bucket-arn "$tarn" --namespace sales --query 'tables[].name' --output text 2>&1)" orders_v2
+check "a namespace with tables" "$(code s3tables delete-namespace --table-bucket-arn "$tarn" --namespace sales)" ConflictException
+check "no maintenance yet" "$(code s3tables put-table-bucket-maintenance-configuration --table-bucket-arn "$tarn" --type icebergUnreferencedFileRemoval --value 'status=enabled,settings={icebergUnreferencedFileRemoval={unreferencedDays=4,nonCurrentDays=10}}')" NotImplemented
+aws s3tables delete-table --table-bucket-arn "$tarn" --namespace sales --name orders_v2 > /dev/null 2>&1
+check "delete-table removes its files" "$(aws s3api list-objects-v2 --bucket "$twb" --prefix "$tpre/" --query 'length(Contents || `[]`)' 2>&1)" 0
+aws s3tables delete-namespace --table-bucket-arn "$tarn" --namespace sales > /dev/null 2>&1
+aws s3tables delete-table-bucket --table-bucket-arn "$tarn" > /dev/null 2>&1 && pass "delete-table-bucket" || fail "delete-table-bucket"
+check "gone" "$(aws s3tables list-table-buckets --query 'length(tableBuckets)' 2>&1)" 0
+
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket smoke > /dev/null 2>&1 && pass "delete-bucket" || fail "delete-bucket"

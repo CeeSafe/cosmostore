@@ -1,0 +1,395 @@
+// A JSON value model (ADR-0083 §5): parse, read, edit and write JSON documents, for S3 Tables' REST-JSON bodies and
+// Iceberg table metadata. Numbers keep their text, so a 64-bit snapshot id goes through exactly.
+
+/// How deep a document may nest, and how large it may be.
+const JSON_MAX_DEPTH: usize = 64;
+
+struct JsonMember {
+    key: Vector<u8>;
+    value: Json;
+}
+
+enum Json {
+    Null,
+    Bool(bool),
+    /// A number as written (checked to be one).
+    Number(Vector<u8>),
+    Text(Vector<u8>),
+    Array(Vector<Json>),
+    Object(Vector<JsonMember>),
+}
+
+struct JsonParser<region a> {
+    text: Slice<a, u8>;
+    at: usize;
+
+    fn space(borrow mut this) {
+        while (this.at < this.text.length) {
+            let c = this.text[this.at];
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r') { return; }
+            this.at += 1;
+        }
+    }
+
+    fn literal(borrow mut this, word: StringView) -> bool {
+        let w = word.bytes();
+        if (this.at + w.length > this.text.length || this.text[this.at..this.at + w.length] != w) { return false; }
+        this.at += w.length;
+        return true;
+    }
+
+    fn hex4(borrow mut this) -> u32? {
+        if (this.at + 4 > this.text.length) { return null; }
+        var v: u32 = 0;
+        for (i in 0..4) {
+            let c = this.text[this.at + i];
+            let d: u32 = if (c >= '0' && c <= '9') (c - '0') as u32 else if (c >= 'a' && c <= 'f') (c - 'a' + 10) as u32
+                else if (c >= 'A' && c <= 'F') (c - 'A' + 10) as u32 else { return null; };
+            v = v * 16 + d;
+        }
+        this.at += 4;
+        return Some(v);
+    }
+
+    /// A string after its opening quote, unescaped into `out`; false if it is not one.
+    fn quoted(borrow mut this, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+        while (this.at < this.text.length) {
+            let c = this.text[this.at];
+            this.at += 1;
+            if (c == '"') { return Ok(true); }
+            if (c < 0x20) { return Ok(false); }
+            if (c != '\\') {
+                out.push(c)?;
+                continue;
+            }
+            if (this.at >= this.text.length) { return Ok(false); }
+            let e = this.text[this.at];
+            this.at += 1;
+            if (e == '"' || e == '\\' || e == '/') {
+                out.push(e)?;
+            } else if (e == 'b') {
+                out.push(8)?;
+            } else if (e == 'f') {
+                out.push(12)?;
+            } else if (e == 'n') {
+                out.push('\n')?;
+            } else if (e == 'r') {
+                out.push('\r')?;
+            } else if (e == 't') {
+                out.push('\t')?;
+            } else if (e == 'u') {
+                var cp = match (this.hex4()) {
+                    Some(v) => v,
+                    null => { return Ok(false); }
+                };
+                if (cp >= 0xD800 && cp < 0xDC00) {
+                    if (!this.literal("\\u")) { return Ok(false); }
+                    let low = match (this.hex4()) {
+                        Some(v) => v,
+                        null => { return Ok(false); }
+                    };
+                    if (low < 0xDC00 || low >= 0xE000) { return Ok(false); }
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                } else if (cp >= 0xDC00 && cp < 0xE000) {
+                    return Ok(false);
+                }
+                appendUtf8CodePoint(out, cp)?;
+            } else {
+                return Ok(false);
+            }
+        }
+        return Ok(false);
+    }
+
+    fn number(borrow mut this) -> Result<Json?, AllocError> {
+        let start = this.at;
+        if (this.at < this.text.length && this.text[this.at] == '-') { this.at += 1; }
+        let digits = this.at;
+        while (this.at < this.text.length && this.text[this.at] >= '0' && this.text[this.at] <= '9') { this.at += 1; }
+        if (this.at == digits) { return Ok(null); }
+        if (this.at < this.text.length && this.text[this.at] == '.') {
+            this.at += 1;
+            let f = this.at;
+            while (this.at < this.text.length && this.text[this.at] >= '0' && this.text[this.at] <= '9') {
+                this.at += 1;
+            }
+            if (this.at == f) { return Ok(null); }
+        }
+        if (this.at < this.text.length && (this.text[this.at] == 'e' || this.text[this.at] == 'E')) {
+            this.at += 1;
+            if (this.at < this.text.length && (this.text[this.at] == '+' || this.text[this.at] == '-')) {
+                this.at += 1;
+            }
+            let x = this.at;
+            while (this.at < this.text.length && this.text[this.at] >= '0' && this.text[this.at] <= '9') {
+                this.at += 1;
+            }
+            if (this.at == x) { return Ok(null); }
+        }
+        return Ok(Some(Json.Number(copyBytes(this.text[start..this.at])?)));
+    }
+
+    fn value(borrow mut this, depth: usize) -> Result<Json?, AllocError> {
+        if (depth > JSON_MAX_DEPTH) { return Ok(null); }
+        this.space();
+        if (this.at >= this.text.length) { return Ok(null); }
+        let c = this.text[this.at];
+        if (c == '{') {
+            this.at += 1;
+            var members = Vector<JsonMember>.create();
+            this.space();
+            if (this.at < this.text.length && this.text[this.at] == '}') {
+                this.at += 1;
+                return Ok(Some(Json.Object(members)));
+            }
+            while (true) {
+                this.space();
+                if (this.at >= this.text.length || this.text[this.at] != '"') { return Ok(null); }
+                this.at += 1;
+                var key = Vector<u8>.create();
+                if (!this.quoted(mut key)?) { return Ok(null); }
+                this.space();
+                if (this.at >= this.text.length || this.text[this.at] != ':') { return Ok(null); }
+                this.at += 1;
+                let v = match (this.value(depth + 1)?) {
+                    Some(v) => v,
+                    null => { return Ok(null); }
+                };
+                members.push(JsonMember { key: key, value: v })?;
+                this.space();
+                if (this.at >= this.text.length) { return Ok(null); }
+                let n = this.text[this.at];
+                this.at += 1;
+                if (n == '}') { return Ok(Some(Json.Object(members))); }
+                if (n != ',') { return Ok(null); }
+            }
+        }
+        if (c == '[') {
+            this.at += 1;
+            var items = Vector<Json>.create();
+            this.space();
+            if (this.at < this.text.length && this.text[this.at] == ']') {
+                this.at += 1;
+                return Ok(Some(Json.Array(items)));
+            }
+            while (true) {
+                let v = match (this.value(depth + 1)?) {
+                    Some(v) => v,
+                    null => { return Ok(null); }
+                };
+                items.push(v)?;
+                this.space();
+                if (this.at >= this.text.length) { return Ok(null); }
+                let n = this.text[this.at];
+                this.at += 1;
+                if (n == ']') { return Ok(Some(Json.Array(items))); }
+                if (n != ',') { return Ok(null); }
+            }
+        }
+        if (c == '"') {
+            this.at += 1;
+            var s = Vector<u8>.create();
+            if (!this.quoted(mut s)?) { return Ok(null); }
+            return Ok(Some(Json.Text(s)));
+        }
+        if (this.literal("true")) { return Ok(Some(Json.Bool(true))); }
+        if (this.literal("false")) { return Ok(Some(Json.Bool(false))); }
+        if (this.literal("null")) { return Ok(Some(Json.Null)); }
+        return this.number();
+    }
+}
+
+/// A whole document; null if it is not JSON (or nests deeper than JSON_MAX_DEPTH).
+fn parseJson(text: Slice<u8>) -> Result<Json?, AllocError> {
+    var p = JsonParser { text: text, at: 0 };
+    let v = match (p.value(0)?) {
+        Some(v) => v,
+        null => { return Ok(null); }
+    };
+    p.space();
+    if (p.at != text.length) { return Ok(null); }
+    return Ok(Some(v));
+}
+
+// ---- Reading ----
+
+/// An object's member `key`; null if `j` is no object or has none.
+fn jsonMember<region a>(j: borrow(a) Json, key: StringView) -> borrow(a) Json? => match (j) {
+    Json.Object(ms) => {
+        var found: borrow(a) Json? = null;
+        for (i in 0..ms.length) {
+            if (ms[i].key.view() == key.bytes()) { found = Some(borrow ms[i].value); }
+        }
+        found
+    },
+    _ => null,
+};
+
+/// A member's text, if it is a string.
+fn jsonMemberText<region a>(j: borrow(a) Json, key: StringView) -> Slice<a, u8>? => match (jsonMember(j, key)) {
+    Some(v) => match (v) {
+        Json.Text(s) => Some(s.view()),
+        _ => null,
+    },
+    null => null,
+};
+
+/// A number's value as an i64, if it is an integer that fits.
+fn jsonI64(j: borrow Json) -> i64? => match (j) {
+    Json.Number(t) => parseJsonInteger(t.view()),
+    _ => null,
+};
+
+fn jsonMemberI64(j: borrow Json, key: StringView) -> i64? => match (jsonMember(j, key)) {
+    Some(v) => jsonI64(v),
+    null => null,
+};
+
+fn parseJsonInteger(t: Slice<u8>) -> i64? {
+    if (t.length == 0 || t.length > 20) { return null; }
+    let negative = t[0] == '-';
+    let digits = if (negative) t[1..] else t;
+    if (digits.length == 0) { return null; }
+    var v: i64 = 0;
+    for (c in digits) {
+        if (c < '0' || c > '9') { return null; }
+        v = match (checkedMul(v, 10)) {
+            Some(x) => x,
+            null => { return null; }
+        };
+        v = match (checkedAdd(v, (c - '0') as i64)) {
+            Some(x) => x,
+            null => { return null; }
+        };
+    }
+    return Some(if (negative) -v else v);
+}
+
+fn checkedMul(a: i64, b: i64) -> i64? => if (a > 922337203685477580) null else Some(a * b);
+
+fn checkedAdd(a: i64, b: i64) -> i64? => if (a > 9223372036854775807 - b) null else Some(a + b);
+
+// ---- Editing ----
+
+/// Sets an object's member `key` to `value`, replacing one there; nothing if `j` is no object.
+fn jsonSet(j: borrow mut Json, key: StringView, value: Json) -> Result<void, AllocError> {
+    match (j) {
+        Json.Object(ms) => {
+            for (i in 0..ms.length) {
+                if (ms[i].key.view() == key.bytes()) {
+                    ms[i].value = value;
+                    return Ok();
+                }
+            }
+            ms.push(JsonMember { key: copyBytes(key.bytes())?, value: value })?;
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn jsonRemove(j: borrow mut Json, key: Slice<u8>) {
+    match (j) {
+        Json.Object(ms) => { ms.retain((m) => m.key.view() != key); }
+        _ => {}
+    }
+}
+
+fn jsonString(text: Slice<u8>) -> Result<Json, AllocError> => Ok(Json.Text(copyBytes(text)?));
+
+fn jsonInteger(v: i64) -> Result<Json, AllocError> {
+    var t = Vector<u8>.create();
+    if (v < 0) {
+        t.push('-')?;
+        appendDecimal(mut t, truncate<u64>(0 - (v + 1)) + 1)?;
+    } else {
+        appendDecimal(mut t, truncate<u64>(v))?;
+    }
+    return Ok(Json.Number(t));
+}
+
+fn jsonObject() -> Json => Json.Object(Vector<JsonMember>.create());
+
+fn jsonArray() -> Json => Json.Array(Vector<Json>.create());
+
+fn jsonPush(j: borrow mut Json, value: Json) -> Result<void, AllocError> {
+    match (j) {
+        Json.Array(items) => { items.push(value)?; }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn cloneJson(j: borrow Json) -> Result<Json, AllocError> => match (j) {
+    Json.Null => Ok(Json.Null),
+    Json.Bool(b) => Ok(Json.Bool(b)),
+    Json.Number(t) => Ok(Json.Number(copyBytes(t.view())?)),
+    Json.Text(t) => Ok(Json.Text(copyBytes(t.view())?)),
+    Json.Array(items) => {
+        var out = Vector<Json>.create();
+        for (i in 0..items.length) { out.push(cloneJson(borrow items[i])?)?; }
+        Ok(Json.Array(out))
+    },
+    Json.Object(ms) => {
+        var out = Vector<JsonMember>.create();
+        for (i in 0..ms.length) {
+            out.push(JsonMember { key: copyBytes(ms[i].key.view())?, value: cloneJson(borrow ms[i].value)? })?;
+        }
+        Ok(Json.Object(out))
+    },
+};
+
+// ---- Writing ----
+
+/// A JSON string literal of `text` (quotes and escapes).
+fn writeJsonText(out: borrow mut Vector<u8>, text: Slice<u8>) -> Result<void, AllocError> {
+    out.push('"')?;
+    let hex = "0123456789abcdef".bytes();
+    for (c in text) {
+        if (c == '"' || c == '\\') {
+            out.push('\\')?;
+            out.push(c)?;
+        } else if (c == '\n') {
+            out.extend("\\n".bytes())?;
+        } else if (c == '\r') {
+            out.extend("\\r".bytes())?;
+        } else if (c == '\t') {
+            out.extend("\\t".bytes())?;
+        } else if (c < 0x20) {
+            out.extend("\\u00".bytes())?;
+            out.push(hex[(c >> 4) as usize])?;
+            out.push(hex[(c & 15) as usize])?;
+        } else {
+            out.push(c)?;
+        }
+    }
+    return out.push('"');
+}
+
+fn writeJson(out: borrow mut Vector<u8>, j: borrow Json) -> Result<void, AllocError> {
+    match (j) {
+        Json.Null => { out.extend("null".bytes())?; }
+        Json.Bool(b) => { out.extend(if (b) "true".bytes() else "false".bytes())?; }
+        Json.Number(t) => { out.extend(t.view())?; }
+        Json.Text(t) => { writeJsonText(out, t.view())?; }
+        Json.Array(items) => {
+            out.push('[')?;
+            for (i in 0..items.length) {
+                if (i > 0) { out.push(',')?; }
+                writeJson(out, borrow items[i])?;
+            }
+            out.push(']')?;
+        }
+        Json.Object(ms) => {
+            out.push('{')?;
+            for (i in 0..ms.length) {
+                if (i > 0) { out.push(',')?; }
+                writeJsonText(out, ms[i].key.view())?;
+                out.push(':')?;
+                writeJson(out, borrow ms[i].value)?;
+            }
+            out.push('}')?;
+        }
+    }
+    return Ok();
+}
