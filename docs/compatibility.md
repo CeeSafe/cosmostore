@@ -10,7 +10,7 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
 |---|---|---|---|---|
 | AWS CLI v2 | 2.34.13 | `tools/s3_smoke.sh` | 358 | pass |
 | rclone | 1.73.2 | `tools/sdk/rclone.sh` | 20 | pass |
-| boto3 (botocore with CRT) | 1.42.97 | `tools/sdk/boto3.sh` | 139 | pass |
+| boto3 (botocore with CRT) | 1.42.97 | `tools/sdk/boto3.sh` | 178 | pass |
 | AWS SDK for Go v2 | service/s3 1.114.9 | `tools/sdk/go.sh` | 22 | pass |
 | AWS SDK for JavaScript v3 | client-s3 3.1168.0 | `tools/sdk/js.sh` | 28 | pass |
 | AWS SDK for Java v2 (with aws-crt) | 2.57.11 | `tools/sdk/java.sh` | 25 | pass |
@@ -91,3 +91,10 @@ and the subset; event notifications (ADR-0048) by 15 checks of the smoke script,
 (`tools/webhook.py`) and a kill of the server while an event waits, and 4 of boto3; CORS (ADR-0049) by 20 checks of the smoke script, which sends the preflights with curl, 4 of boto3
 and the subset. The rclone, Go, JavaScript, Java and .NET scripts pass as before; they do not
 exercise versioning.
+
+M7's calls (ADR-0072 to ADR-0077) are checked by the smoke script with the AWS CLI and, since 18 Nov 2026, by 33
+checks of boto3 (`s3`, `s3control` and `sts` clients): access logs delivered into a target bucket, a website's index
+and error document through `<bucket>.web.localhost`, an inventory's manifest and CSV, a session token and an assumed
+role signing S3 requests, an access point by alias and by ARN, and a replica keeping its source's version id and
+ETag; and what is refused rather than dropped (an inventory's `AccountId`, STS `PolicyArns`, a replication priority
+given twice).

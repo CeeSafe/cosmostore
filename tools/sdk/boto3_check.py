@@ -443,6 +443,162 @@ s3.delete_bucket_cors(Bucket=C)
 check("the CORS rules deleted", code_of(lambda: s3.get_bucket_cors(Bucket=C)), "NoSuchCORSConfiguration")
 s3.delete_bucket(Bucket=C)
 
+# M7 (ADR-0072 to ADR-0077) through boto3: each item's configuration calls, and what each does. common.sh starts
+# serve with access logs every 2 s, a 3 s inventory day, websites under web.localhost and a role "reader" of sdk-m7.
+import json
+import time
+
+
+def until(fn, seconds=15):
+    end = time.time() + seconds
+    while time.time() < end:
+        got = fn()
+        if got:
+            return got
+        time.sleep(0.25)
+    return None
+
+
+def keys_under(bucket, prefix):
+    return [o["Key"] for o in s3.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])]
+
+
+M7, LOGS = "sdk-m7", "sdk-m7-logs"
+s3.create_bucket(Bucket=M7)
+s3.create_bucket(Bucket=LOGS)
+s3.put_object(Bucket=M7, Key="index.html", Body=b"the index", ContentType="text/html")
+s3.put_object(Bucket=M7, Key="error.html", Body=b"the error page", ContentType="text/html")
+
+# Access logs (ADR-0072).
+logging_on = {"TargetBucket": LOGS, "TargetPrefix": "access/"}
+s3.put_bucket_logging(Bucket=M7, BucketLoggingStatus={"LoggingEnabled": logging_on})
+check("get_bucket_logging", s3.get_bucket_logging(Bucket=M7).get("LoggingEnabled"), logging_on)
+check("logging to a bucket that is not there", code_of(lambda: s3.put_bucket_logging(Bucket=M7, BucketLoggingStatus={
+    "LoggingEnabled": {"TargetBucket": "sdk-nowhere", "TargetPrefix": "x/"}})), "InvalidTargetBucketForLogging")
+s3.put_object(Bucket=M7, Key="logged.txt", Body=b"logged")
+
+
+def logged_put():
+    for k in keys_under(LOGS, "access/"):
+        if b"REST.PUT.OBJECT logged.txt" in s3.get_object(Bucket=LOGS, Key=k)["Body"].read():
+            return True
+    return False
+
+
+check("the PUT's line in a log object", until(logged_put), True)
+s3.put_bucket_logging(Bucket=M7, BucketLoggingStatus={})
+check("logging off", s3.get_bucket_logging(Bucket=M7).get("LoggingEnabled"), None)
+
+# Website hosting (ADR-0073): the configuration, then the site through <bucket>.web.localhost, with a policy that
+# lets anyone read.
+site = {"IndexDocument": {"Suffix": "index.html"}, "ErrorDocument": {"Key": "error.html"}}
+s3.put_bucket_website(Bucket=M7, WebsiteConfiguration=site)
+got = s3.get_bucket_website(Bucket=M7)
+check("get_bucket_website", {k: got.get(k) for k in site}, site)
+s3.put_bucket_policy(Bucket=M7, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": "*",
+    "Action": "s3:GetObject", "Resource": "arn:aws:s3:::%s/*" % M7}]}))
+
+
+def site_get(path):
+    req = urllib.request.Request(endpoint + path, headers={"Host": "%s.web.localhost:%s" % (M7, endpoint.rsplit(":", 1)[1])})
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+check("the site's index", site_get("/"), (200, b"the index"))
+check("the site's error document", site_get("/no-such-page"), (404, b"the error page"))
+s3.delete_bucket_website(Bucket=M7)
+check("the website deleted", code_of(lambda: s3.get_bucket_website(Bucket=M7)), "NoSuchWebsiteConfiguration")
+s3.delete_bucket_policy(Bucket=M7)
+
+# Inventory (ADR-0074): a daily CSV report into the logs bucket; a day is 3 s here.
+inventory = {"Id": "daily", "IsEnabled": True, "IncludedObjectVersions": "Current", "Schedule": {"Frequency": "Daily"},
+             "Destination": {"S3BucketDestination": {"Bucket": "arn:aws:s3:::" + LOGS, "Format": "CSV", "Prefix": "inv"}}}
+s3.put_bucket_inventory_configuration(Bucket=M7, Id="daily", InventoryConfiguration=inventory)
+got = s3.get_bucket_inventory_configuration(Bucket=M7, Id="daily")["InventoryConfiguration"]
+check("get_bucket_inventory_configuration", (got["Id"], got["IsEnabled"], got["Schedule"], got["Destination"]),
+      ("daily", True, {"Frequency": "Daily"}, inventory["Destination"]))
+check("list_bucket_inventory_configurations",
+      [c["Id"] for c in s3.list_bucket_inventory_configurations(Bucket=M7)["InventoryConfigurationList"]], ["daily"])
+check("an account id is not done, not dropped", code_of(lambda: s3.put_bucket_inventory_configuration(Bucket=M7, Id="acct",
+    InventoryConfiguration=dict(inventory, Id="acct", Destination={"S3BucketDestination": dict(
+        inventory["Destination"]["S3BucketDestination"], AccountId="111122223333")}))), "NotImplemented")
+manifest = until(lambda: [k for k in keys_under(LOGS, "inv/") if k.endswith("manifest.json")], 20)
+check("a report's manifest", bool(manifest), True)
+if manifest:
+    files = json.loads(s3.get_object(Bucket=LOGS, Key=manifest[0])["Body"].read())["files"]
+    import csv
+    import gzip
+    rows = list(csv.reader(io.TextIOWrapper(gzip.GzipFile(fileobj=io.BytesIO(
+        s3.get_object(Bucket=LOGS, Key=files[0]["key"])["Body"].read())))))
+    check("its CSV has every object", sorted(r[1] for r in rows), ["error.html", "index.html", "logged.txt"])
+s3.delete_bucket_inventory_configuration(Bucket=M7, Id="daily")
+check("the inventory deleted", code_of(lambda: s3.get_bucket_inventory_configuration(Bucket=M7, Id="daily")),
+      "NoSuchConfiguration")
+
+# STS (ADR-0075): a session token, and the role "reader", sign S3 requests through boto3.
+sts = boto3.client("sts", endpoint_url=endpoint)
+
+
+def as_creds(c):
+    return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=c["AccessKeyId"], aws_secret_access_key=c["SecretAccessKey"],
+                        aws_session_token=c["SessionToken"], config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1},
+                                                                           signature_version="s3v4"))
+
+
+session = sts.get_session_token(DurationSeconds=900)["Credentials"]
+check("get_session_token gives an ASIA key", session["AccessKeyId"][:4], "ASIA")
+check("the session reads", as_creds(session).get_object(Bucket=M7, Key="logged.txt")["Body"].read(), b"logged")
+role = sts.assume_role(RoleArn="arn:aws:iam::000000000000:role/reader", RoleSessionName="boto3")["Credentials"]
+reader = as_creds(role)
+check("the role reads", reader.get_object(Bucket=M7, Key="logged.txt")["Body"].read(), b"logged")
+check("the role does not write", code_of(lambda: reader.put_object(Bucket=M7, Key="no", Body=b"no")), "AccessDenied")
+check("nor read another bucket", code_of(lambda: reader.list_objects_v2(Bucket=LOGS)), "AccessDenied")
+check("policy ARNs are not done, not dropped", code_of(lambda: sts.assume_role(RoleArn="arn:aws:iam::000000000000:role/reader",
+    RoleSessionName="arns", PolicyArns=[{"arn": "arn:aws:iam::aws:policy/ReadOnlyAccess"}])), "NotImplemented")
+
+# Access Points (ADR-0076): S3 Control through boto3, then requests by alias and by ARN. S3 Control puts the
+# account in the host, so both go to localhost (`<account>.localhost`, `<name>-<account>.localhost`).
+ACCOUNT = "000000000000"
+ctl = boto3.client("s3control", endpoint_url=endpoint.replace("127.0.0.1", "localhost"))
+made = ctl.create_access_point(AccountId=ACCOUNT, Name="sdk-ap", Bucket=M7)
+alias = made.get("Alias", "")
+check("create_access_point gives an alias", alias[-8:], "-s3alias")
+got = ctl.get_access_point(AccountId=ACCOUNT, Name="sdk-ap")
+check("get_access_point", (got["Bucket"], got["NetworkOrigin"]), (M7, "Internet"))
+check("list_access_points", [a["Name"] for a in ctl.list_access_points(AccountId=ACCOUNT, Bucket=M7)["AccessPointList"]], ["sdk-ap"])
+check("a name twice", code_of(lambda: ctl.create_access_point(AccountId=ACCOUNT, Name="sdk-ap", Bucket=M7)),
+      "AccessPointAlreadyOwnedByYou")
+s3.put_object(Bucket=alias, Key="ap/door.txt", Body=b"through a door")
+check("a write by its alias lands in its bucket", s3.get_object(Bucket=M7, Key="ap/door.txt")["Body"].read(), b"through a door")
+arn = "arn:aws:s3:us-east-1:%s:accesspoint/sdk-ap" % ACCOUNT
+check("a read by its ARN", client("virtual").get_object(Bucket=arn, Key="ap/door.txt")["Body"].read(), b"through a door")
+ctl.delete_access_point(AccountId=ACCOUNT, Name="sdk-ap")
+check("the access point deleted", code_of(lambda: ctl.get_access_point(AccountId=ACCOUNT, Name="sdk-ap")), "NoSuchAccessPoint")
+
+# Replication (ADR-0077): a new version copied to another bucket with its version id and ETag.
+RS, RD = "sdk-rsrc", "sdk-rdst"
+for b in (RS, RD):
+    s3.create_bucket(Bucket=b)
+    s3.put_bucket_versioning(Bucket=b, VersioningConfiguration={"Status": "Enabled"})
+rule = {"ID": "all", "Priority": 1, "Status": "Enabled", "Filter": {"Prefix": ""},
+        "DeleteMarkerReplication": {"Status": "Enabled"}, "Destination": {"Bucket": "arn:aws:s3:::" + RD}}
+check("one priority twice", code_of(lambda: s3.put_bucket_replication(Bucket=RS, ReplicationConfiguration={
+    "Role": "arn:aws:iam::%s:role/r" % ACCOUNT, "Rules": [rule, dict(rule, ID="again")]})), "InvalidArgument")
+s3.put_bucket_replication(Bucket=RS, ReplicationConfiguration={"Role": "arn:aws:iam::%s:role/r" % ACCOUNT, "Rules": [rule]})
+check("get_bucket_replication", s3.get_bucket_replication(Bucket=RS)["ReplicationConfiguration"]["Rules"][0]["Destination"]["Bucket"],
+      "arn:aws:s3:::" + RD)
+put = s3.put_object(Bucket=RS, Key="r/one.txt", Body=b"replicate me")
+check("replicated", until(lambda: s3.head_object(Bucket=RS, Key="r/one.txt").get("ReplicationStatus") == "COMPLETED"), True)
+replica = s3.head_object(Bucket=RD, Key="r/one.txt")
+check("the replica keeps its version id and ETag", (replica["VersionId"], replica["ETag"]), (put["VersionId"], put["ETag"]))
+check("and is a replica", replica.get("ReplicationStatus"), "REPLICA")
+s3.delete_bucket_replication(Bucket=RS)
+check("the replication deleted", code_of(lambda: s3.get_bucket_replication(Bucket=RS)), "ReplicationConfigurationNotFoundError")
+
 check("wrong secret", code_of(lambda: boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
                                                        aws_secret_access_key="wrong").list_buckets()),
       "SignatureDoesNotMatch")

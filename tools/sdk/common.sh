@@ -16,7 +16,14 @@ echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > "$work/credentials"
 # SSE-S3's master key (ADR-0046 §4).
 printf 'k1 %s\n' "$(head -c 32 /dev/urandom | base64)" > "$work/sse.keys"
 
-"$bin" serve "$work/store" "$port" "$work/credentials" localhost --sse-key-file "$work/sse.keys" 2> "$work/server.log" &
+# M7 (ADR-0072 to ADR-0077): STS's token key and a role that reads boto3's M7 bucket; access logs every 2 s, a 3 s
+# inventory day, websites under web.localhost.
+printf 'sts1 %s\n' "$(head -c 32 /dev/urandom | base64)" > "$work/sts.keys"
+cat > "$work/roles" <<'ROLES'
+reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::sdk-m7","arn:aws:s3:::sdk-m7/*"]}]}
+ROLES
+
+"$bin" serve "$work/store" "$port" "$work/credentials" localhost --sse-key-file "$work/sse.keys" --sts-key-file "$work/sts.keys" --roles-file "$work/roles" --access-log-seconds 2 --inventory-day-seconds 3 --website-domain web.localhost 2> "$work/server.log" &
 server=$!
 sleep 1
 
