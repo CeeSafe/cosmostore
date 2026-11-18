@@ -290,6 +290,12 @@ item is an independent project with its own support matrix.
 **Closed 17 Nov 2026** (`docs/m7-exit-review.md`): the six items on `serve` and on a cluster (ADR-0071 to
 ADR-0078); directory buckets and Tables were left out (ADR-0071 §3).
 
+### M8: Directory buckets and S3 Tables (proposed)
+
+Proposed in ADR-0079 (18 Nov 2026), for the owner to accept: directory buckets (CreateBucket with a directory
+configuration, CreateSession and `s3express` signing, S3's limits for them), then S3 Tables (the `s3tables` catalog
+API and the Iceberg REST calls an engine needs, commits as a compare-and-set).
+
 ---
 
 ## Part 3: First four weeks (concrete backlog)
@@ -2854,3 +2860,10 @@ Browser form uploads with a SigV4 POST policy.
   check across keys (four at once). One alone on alghobashi (commit 2331f79, built on binfadel with ceesafec 0.56.0
   and CeeSafe.Web ccda03a): 3,549 operations, 48 faults, 1,992 events (506 again after a leader's change), every
   outbox check passed, every key linearizable and the check across keys settled.
+
+### 18 Nov 2026: M8 proposed (ADR-0079)
+
+- After M7, the item ADR-0071 §3 left for later: **ADR-0079 proposes M8**, directory buckets first, then S3 Tables,
+  each with its own ADR and support matrix. Checked first: boto3 sends a `--x-s3` bucket's requests to a custom
+  endpoint path-style, after a CreateSession (`GET /<bucket>?session`) signed for `s3express`, so CreateSession and
+  that signing service are the entry fee. For the owner: accept it, and whether both items or directory buckets only.
