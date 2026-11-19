@@ -64,6 +64,19 @@
    whole matrix and a `tools/scale.sh` run against them. On the M4 reference it gives what the reference's report
    says: T1 short at 4 KiB (2,908/s), T7 over in one phase (53.1 ms), T12 1.09 for the run, everything else met.
 
+8. **A failure must repeat** (added 19 Nov 2026, the owner's choice). On GitHub's macOS runners the gate failed
+   three times in a few days on throughput rows (small GETs 0.51, large writes 0.70, large GETs 0.78 at
+   concurrency 32), once on a commit that changed only `ROADMAP.md`, so base and head were the same code, and each
+   of the code changes passed on binfadel (pinned cores). The base's own spread cannot catch this noise, since
+   it moves between rounds of one build as much as between builds. So when the first pass fails,
+   `tools/perf_gate.sh` runs a second pass of fresh rounds:
+   - it fails (exit 1) only on a row (group or phase) that failed in both passes;
+   - if the second pass passed, it passes, and CI shows a "not confirmed" warning with both reports;
+   - if no row failed twice but the second pass was not clean either, it is inconclusive (exit 3, a warning).
+
+   A real regression repeats, so it still fails, at the cost of a second pass's time (about 8 minutes on CI).
+   `PERF_CONFIRM=0` judges on one pass, as before.
+
 ## Rejected
 
 - **Absolute thresholds in CI.** They test the runner. A self-hosted runner on the reference machine would make them

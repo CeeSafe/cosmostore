@@ -3145,3 +3145,10 @@ Browser form uploads with a SigV4 POST policy.
   - **Why it is noise:** slices 3 and 4 change nothing on `serve`'s request path (the cluster front, CreateBucket's
     name check, a store accessor), and the same gate on binfadel passed (base `8f18b6e` against `81aab62`, 3
     rounds). At c32, small GETs were p99 1.02 and ops/s 0.99; large writes 1.03 and 1.01.
+- **CI on `791b2bd`** (only `ROADMAP.md` changed, so base and head were the same code): the perf gate failed again,
+  on large GETs at c32 (ops/s 0.78). That shows the gate is failing on the runner's noise, not on the code.
+- **The perf gate now needs a failure to repeat** (ADR-0030 §8, the owner's choice): when the first pass fails, a
+  second pass of fresh rounds runs. The gate fails only on a row that failed in both passes. A pass followed by a
+  failure that does not repeat is a "not confirmed" warning, with both reports in the job summary. Tested locally
+  by forcing a failure: the three phases that failed both passes were confirmed, and a group that failed only
+  the first pass was left out.
