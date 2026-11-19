@@ -312,6 +312,15 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 **Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
 (ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
+### M13: A cluster as `serve`
+
+The owner chose ADR-0091's item A (19 Nov 2026), each node watching its own files. ADR-0092 (proposed) designs it:
+- **Reloads:** each node reloads its credentials and users files as `serve` does, so a revocation needs no
+  restart.
+- **SSE:** `node --sse-key-file` and `--kms-key-file`, so SSE-S3 and SSE-KMS work on a cluster.
+- **Done when** a key or user removed from every node's files is refused through every node without a restart, and
+  SSE-S3 and SSE-KMS objects put through one node read through the others.
+
 ### M12: The long tail
 
 **Closed 19 Nov 2026** (the owner: "Accept and close"; `docs/m12-exit-review.md`).
@@ -3713,3 +3722,11 @@ Browser form uploads with a SigV4 POST policy.
   - **C, compaction for S3 Tables.**
 - **Why A first:** revoking a key on a cluster takes every node's restart today.
 - **Next:** the owner's choice.
+
+### 19 Nov 2026: M13 is a cluster as `serve` (ADR-0092, proposed)
+
+- **The owner:** "A. - Each node watches its own files".
+- **Found while designing it:** a cluster serves no SSE-S3 either. A node has no SSE keys, so SSE-S3 is refused,
+  and `docs/compatibility.md` did not say so.
+- **ADR-0092's slices:** reloads on every node; `node --sse-key-file` and `--kms-key-file`; the exit review.
+- **Next:** slice 1.

@@ -1,6 +1,7 @@
 # ADR-0091: M13, what comes after the long tail (proposed)
 
-**Status:** proposed, 19 Nov 2026. The owner: "propose M13". M12 (the long tail, ADR-0090) closed the same day.
+**Status:** decided, 19 Nov 2026: the owner chose A, each node watching its own files ("A. - Each node watches
+its own files"); ADR-0092 designs it. Proposed the same day. The owner: "propose M13". M12 (the long tail, ADR-0090) closed the same day.
 ADR-0089 §3 named configurations decided at delivery the next candidate.
 
 ## Context
