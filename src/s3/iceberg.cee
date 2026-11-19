@@ -917,6 +917,59 @@ fn writeMetadata(
     return Ok(location);
 }
 
+/// Makes `m`, changed from the metadata at `previous`, the table's: stamps when it changed (unless a snapshot's time
+/// says), puts `previous` in its metadata log (the last ICEBERG_METADATA_LOG_MAX kept), writes the next version's file
+/// and swaps the table's record to it by If-Match. Its location; null if another commit swapped first (its file is
+/// then removed). A commit and snapshot management both commit so (ADR-0083 §5, ADR-0086 §2).
+fn swapMetadata(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    id: Slice<u8>,
+    key: Slice<u8>,
+    rec: borrow mut CatalogRecord,
+    previous: Slice<u8>,
+    m: borrow mut Json,
+    previousStamp: i64,
+) -> Result<Vector<u8>?, TablesError> {
+    // The metadata changed now, unless a snapshot's time already says when.
+    if ((jsonMemberI64(m, "last-updated-ms") ?? 0) == previousStamp) {
+        let now = Clock.unixMillis();
+        jsonSet(m, "last-updated-ms", jsonInteger(if (now > previousStamp) now else previousStamp + 1)?)?;
+    }
+    var entry = jsonObject();
+    jsonSet(mut entry, "metadata-file", jsonString(previous)?)?;
+    jsonSet(mut entry, "timestamp-ms", jsonInteger(previousStamp)?)?;
+    appendTo(m, "metadata-log", entry)?;
+    match (jsonMemberMut(m, "metadata-log")) {
+        Some(log) => {
+            match (log) {
+                Json.Array(items) => {
+                    while (items.length > ICEBERG_METADATA_LOG_MAX) { let _ = items.remove(0); }
+                }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    let version = metadataVersion(previous) + 1;
+    let location = writeMetadata(store, hidden, id, if (version > 0) version else 1, m)?;
+    jsonSet(mut rec.json, "metadataLocation", jsonString(location.view())?)?;
+    jsonSet(mut rec.json, "modifiedAt", jsonInteger(Clock.unixMillis())?)?;
+    match (writeRecord(store, hidden, key, borrow rec.json, PutCondition.IfGeneration(rec.generation))) {
+        Ok(g) => { rec.generation = g; }
+        Err(TablesError.Conflict) => {
+            // Another commit swapped first: this one's file is no table's.
+            removeMetadataFile(store, hidden, location.view());
+            return Ok(null);
+        }
+        Err(e) => {
+            removeMetadataFile(store, hidden, location.view());
+            return Err(e);
+        }
+    }
+    return Ok(Some(location));
+}
+
 /// Removes a metadata file this request wrote and no table names (a create or commit that lost its race).
 fn removeMetadataFile(store: borrow mut ObjectStore, hidden: Slice<u8>, location: Slice<u8>) {
     match (metadataKey(location, hidden)) {
@@ -1091,44 +1144,20 @@ fn icebergCommit(
         Some(_) => { return badRequest("An update is not valid here, or not one this catalog applies."); }
         null => {}
     }
-    // The metadata changed now, unless a snapshot's time already says when.
-    if ((jsonMemberI64(borrow m, "last-updated-ms") ?? 0) == previousStamp) {
-        let now = Clock.unixMillis();
-        jsonSet(mut m, "last-updated-ms", jsonInteger(if (now > previousStamp) now else previousStamp + 1)?)?;
-    }
-    // The file it replaces joins the metadata log, which keeps the last ICEBERG_METADATA_LOG_MAX.
-    var entry = jsonObject();
-    jsonSet(mut entry, "metadata-file", jsonString(previous.view())?)?;
-    jsonSet(mut entry, "timestamp-ms", jsonInteger(previousStamp)?)?;
-    appendTo(mut m, "metadata-log", entry)?;
-    match (jsonMemberMut(mut m, "metadata-log")) {
-        Some(log) => {
-            match (log) {
-                Json.Array(items) => {
-                    while (items.length > ICEBERG_METADATA_LOG_MAX) { let _ = items.remove(0); }
-                }
-                _ => {}
-            }
-        }
-        null => {}
-    }
-    let version = metadataVersion(previous.view()) + 1;
-    let location = writeMetadata(store, hidden.view(), id.view(), if (version > 0) version else 1, borrow m)?;
-    jsonSet(mut rec.json, "metadataLocation", jsonString(location.view())?)?;
-    jsonSet(mut rec.json, "modifiedAt", jsonInteger(Clock.unixMillis())?)?;
     let key = catalogKey(CATALOG_TABLES, ns, name)?;
-    match (writeRecord(store, hidden.view(), key.view(), borrow rec.json, PutCondition.IfGeneration(rec.generation))) {
-        Ok(_) => {}
-        Err(TablesError.Conflict) => {
-            // Another commit swapped first: this one's file is no table's.
-            removeMetadataFile(store, hidden.view(), location.view());
-            return icebergError(409, "CommitFailedException", "The table changed since it was read.");
-        }
-        Err(e) => {
-            removeMetadataFile(store, hidden.view(), location.view());
-            return Err(e);
-        }
-    }
+    let location = match (swapMetadata(
+        store,
+        hidden.view(),
+        id.view(),
+        key.view(),
+        mut rec,
+        previous.view(),
+        mut m,
+        previousStamp,
+    )?) {
+        Some(l) => l,
+        null => { return icebergError(409, "CommitFailedException", "The table changed since it was read."); }
+    };
     var j = jsonObject();
     jsonSet(mut j, "metadata-location", jsonString(location.view())?)?;
     jsonSet(mut j, "metadata", m)?;

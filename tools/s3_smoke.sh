@@ -8,7 +8,7 @@ bin=$(cd "$(dirname "${1:-out/cosmostore}")" && pwd)/$(basename "${1:-out/cosmos
 port=${2:-9311}
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
-trap 'kill "$server" "$hook" "${limited:-}" "${remote:-}" 2>/dev/null; rm -rf "$work"' EXIT
+trap 'kill "$server" "$hook" "${limited:-}" "${remote:-}" "${maint:-}" 2>/dev/null; rm -rf "$work"' EXIT
 
 export AWS_ACCESS_KEY_ID=AKIASMOKETEST0000001
 export AWS_SECRET_ACCESS_KEY=smoke/secret/0123456789abcdefghijkl
@@ -1253,7 +1253,11 @@ check "a --table-s3 name for a bucket" "$(code s3api create-bucket --bucket mine
 aws s3tables rename-table --table-bucket-arn "$tarn" --namespace sales --name orders --new-name orders_v2 > /dev/null 2>&1
 check "rename-table" "$(aws s3tables list-tables --table-bucket-arn "$tarn" --namespace sales --query 'tables[].name' --output text 2>&1)" orders_v2
 check "a namespace with tables" "$(code s3tables delete-namespace --table-bucket-arn "$tarn" --namespace sales)" ConflictException
-check "no maintenance yet" "$(code s3tables put-table-bucket-maintenance-configuration --table-bucket-arn "$tarn" --type icebergUnreferencedFileRemoval --value 'status=enabled,settings={icebergUnreferencedFileRemoval={unreferencedDays=4,nonCurrentDays=10}}')" NotImplemented
+# Maintenance (ADR-0086): its configurations through the CLI; compaction is not done.
+aws s3tables put-table-bucket-maintenance-configuration --table-bucket-arn "$tarn" --type icebergUnreferencedFileRemoval --value 'status=enabled,settings={icebergUnreferencedFileRemoval={unreferencedDays=4,nonCurrentDays=10}}' > /dev/null 2>&1 && pass "put-table-bucket-maintenance-configuration" || fail "put-table-bucket-maintenance-configuration"
+check "get-table-bucket-maintenance-configuration" "$(aws s3tables get-table-bucket-maintenance-configuration --table-bucket-arn "$tarn" --query 'configuration.icebergUnreferencedFileRemoval.settings.icebergUnreferencedFileRemoval.unreferencedDays' --output text 2>&1)" 4
+check "compaction is not done" "$(code s3tables put-table-maintenance-configuration --table-bucket-arn "$tarn" --namespace sales --name orders_v2 --type icebergCompaction --value 'status=enabled,settings={icebergCompaction={targetFileSizeMB=128}}')" NotImplemented
+check "get-table-maintenance-job-status" "$(aws s3tables get-table-maintenance-job-status --table-bucket-arn "$tarn" --namespace sales --name orders_v2 --query 'status.icebergCompaction.status' --output text 2>&1)" Disabled
 aws s3tables delete-table --table-bucket-arn "$tarn" --namespace sales --name orders_v2 > /dev/null 2>&1
 check "delete-table removes its files" "$(aws s3api list-objects-v2 --bucket "$twb" --prefix "$tpre/" --query 'length(Contents || `[]`)' 2>&1)" 0
 aws s3tables delete-namespace --table-bucket-arn "$tarn" --namespace sales > /dev/null 2>&1
@@ -1268,6 +1272,19 @@ if [ -n "${ICEBERG_PYTHON:-}" ]; then
     fi
 else
     echo "skip PyIceberg (set ICEBERG_PYTHON to a Python with pyiceberg[pyarrow] and boto3)"
+fi
+# Table maintenance (ADR-0086) through PyIceberg, on a server of its own whose day is 12 s (an hour is 0.5 s).
+if [ -n "${ICEBERG_PYTHON:-}" ]; then
+    maintport=$((port + 5))
+    "$bin" serve "$work/maint-store" "$maintport" "$work/credentials" localhost --tables-day-seconds 12 2>> "$work/maint.log" &
+    maint=$!
+    sleep 1
+    if "$ICEBERG_PYTHON" "$here/maintenance_check.py" "http://127.0.0.1:$maintport" 12 > maintenance.out 2>&1; then
+        pass "table maintenance: $(grep -c '^ok' maintenance.out) checks"
+    else
+        fail "table maintenance"; cat maintenance.out
+    fi
+    kill "$maint" 2>/dev/null
 fi
 
 # Deletes free the space.

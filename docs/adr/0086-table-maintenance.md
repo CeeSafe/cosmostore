@@ -71,7 +71,10 @@
 5. **When jobs run:**
    - **The loop:** beside the store's upkeep, a table maintenance pass runs every hour of a day (a day is 86,400 s,
      or `serve --tables-day-seconds` for tests, as `--inventory-day-seconds` is). Each pass runs each table's jobs
-     once, holding the store only for each read or write.
+     once.
+   - **How it holds the store:** snapshot management holds the store for one table's run (one metadata file read
+     and one written). Unreferenced file removal holds it for each manifest list's or manifest's read, decodes it
+     outside, then holds it for the sweep.
    - **On a cluster:** a shard's leader runs the pass for that shard's table buckets (ADR-0058 §8).
 6. **Not done:** compaction (refused when enabled), a job's per-ref settings (`max-snapshot-age-ms` on a branch), and
    removing files outside a table's warehouse.

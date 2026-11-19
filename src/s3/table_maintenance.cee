@@ -1,0 +1,498 @@
+// Table maintenance (ADR-0086): a table bucket's and a table's maintenance configurations and job status, the
+// snapshot management job, and the pass that runs each table's jobs every hour of a day.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+const MAINTENANCE_BUCKET_KEY: StringView = ".s3tables/maintenance/bucket";
+const MAINTENANCE_TABLES: StringView = ".s3tables/maintenance/tables/";
+const MAINTENANCE_STATUS: StringView = ".s3tables/maintenance/status/";
+const SNAPSHOT_MANAGEMENT: StringView = "icebergSnapshotManagement";
+const COMPACTION: StringView = "icebergCompaction";
+const UNREFERENCED_REMOVAL: StringView = "icebergUnreferencedFileRemoval";
+
+/// The pass's settings (`serve --tables-day-seconds`, for tests): how long a day is, in ms.
+struct TablesMaintainer {
+    dayMs: u64;
+}
+
+// ---- Configurations ----
+
+/// A type's configuration as AWS's defaults have it (ADR-0086 §1): `{"status","settings":{<type>:{…}}}`.
+fn defaultMaintenance(kind: StringView) -> Result<Json, AllocError> {
+    var s = jsonObject();
+    var status = "enabled".bytes();
+    if (kind == SNAPSHOT_MANAGEMENT) {
+        jsonSet(mut s, "minSnapshotsToKeep", jsonInteger(1)?)?;
+        jsonSet(mut s, "maxSnapshotAgeHours", jsonInteger(120)?)?;
+    } else if (kind == UNREFERENCED_REMOVAL) {
+        jsonSet(mut s, "unreferencedDays", jsonInteger(3)?)?;
+        jsonSet(mut s, "nonCurrentDays", jsonInteger(10)?)?;
+    } else {
+        // Compaction is not done here: disabled, whatever is asked (ADR-0086 §1).
+        jsonSet(mut s, "targetFileSizeMB", jsonInteger(512)?)?;
+        jsonSet(mut s, "strategy", jsonString("auto".bytes())?)?;
+        status = "disabled".bytes();
+    }
+    var settings = jsonObject();
+    jsonSet(mut settings, kind, s)?;
+    var v = jsonObject();
+    jsonSet(mut v, "status", jsonString(status)?)?;
+    jsonSet(mut v, "settings", settings)?;
+    return Ok(v);
+}
+
+/// The stored configurations document at `key` (`{<type>: value}`), `{}` if there is none.
+fn maintenanceDocument(store: borrow ObjectStore, hidden: Slice<u8>, key: Slice<u8>) -> Result<Json, TablesError> {
+    return match (readRecord(store, hidden, key)?) {
+        Some(r) => Ok(r.json),
+        null => Ok(jsonObject()),
+    };
+}
+
+/// A type's configuration in force: the stored one, else the default.
+fn maintenanceValue(document: borrow Json, kind: StringView) -> Result<Json, AllocError> {
+    return match (jsonMember(document, kind)) {
+        Some(v) => cloneJson(v),
+        null => defaultMaintenance(kind),
+    };
+}
+
+/// A setting of a configuration value, as an integer.
+fn maintenanceSetting(value: borrow Json, kind: StringView, setting: StringView) -> i64? {
+    let settings = jsonMember(value, "settings")?;
+    let s = jsonMember(settings, kind)?;
+    return jsonMemberI64(s, setting);
+}
+
+fn maintenanceEnabled(value: borrow Json) -> bool => jsonMemberText(value, "status") == Some("enabled".bytes());
+
+/// A Put's `value` (`{"status","settings":{<type>:{…}}}`), checked and with the defaults for what it leaves out:
+/// BadRequest for a member, setting or status not taken, NotImplemented for compaction enabled.
+fn maintenanceValueOf(body: Slice<u8>, kind: StringView) -> Result<Json, TablesError> {
+    let j = tablesObject(body)?;
+    if (!onlyMembers(borrow j, ["value"][..])) { return Err(TablesError.BadRequest); }
+    let given = jsonMember(borrow j, "value") ?? { return Err(TablesError.BadRequest); };
+    if (!onlyMembers(given, ["status", "settings"][..])) { return Err(TablesError.BadRequest); }
+    var value = defaultMaintenance(kind)?;
+    match (jsonMember(given, "status")) {
+        Some(_) => {
+            let status = jsonMemberText(given, "status") ?? "".bytes();
+            if (status != "enabled".bytes() && status != "disabled".bytes()) { return Err(TablesError.BadRequest); }
+            jsonSet(mut value, "status", jsonString(status)?)?;
+        }
+        null => {}
+    }
+    let snapshotNames = ["minSnapshotsToKeep", "maxSnapshotAgeHours"];
+    let unreferencedNames = ["unreferencedDays", "nonCurrentDays"];
+    let compactionNames = ["targetFileSizeMB", "strategy"];
+    let names: Slice<StringView> = if (kind == SNAPSHOT_MANAGEMENT) snapshotNames[..]
+        else if (kind == UNREFERENCED_REMOVAL) unreferencedNames[..]
+        else compactionNames[..];
+    match (jsonMember(given, "settings")) {
+        Some(settings) => {
+            if (!onlyMembers(settings, [kind][..])) { return Err(TablesError.BadRequest); }
+            match (jsonMember(settings, kind)) {
+                Some(s) => {
+                    if (!onlyMembers(s, names)) { return Err(TablesError.BadRequest); }
+                    var merged = jsonObject();
+                    match (jsonMember(borrow value, "settings")) {
+                        Some(defaults) => {
+                            match (jsonMember(defaults, kind)) {
+                                Some(d) => { merged = cloneJson(d)?; }
+                                null => {}
+                            }
+                        }
+                        null => {}
+                    }
+                    for (n in names) {
+                        match (jsonMember(s, n)) {
+                            Some(v) => {
+                                if (n == "strategy") {
+                                    let t = jsonMemberText(s, n) ?? "".bytes();
+                                    var known = false;
+                                    for (k in ["auto", "binpack", "sort", "z-order"]) {
+                                        if (t == k.bytes()) { known = true; }
+                                    }
+                                    if (!known) { return Err(TablesError.BadRequest); }
+                                } else {
+                                    // Positive integers, as AWS's model has them.
+                                    let i = jsonI64(v) ?? 0;
+                                    if (i < 1 || i > 2147483647) { return Err(TablesError.BadRequest); }
+                                }
+                                jsonSet(mut merged, n, cloneJson(v)?)?;
+                            }
+                            null => {}
+                        }
+                    }
+                    var wrapped = jsonObject();
+                    jsonSet(mut wrapped, kind, merged)?;
+                    jsonSet(mut value, "settings", wrapped)?;
+                }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    if (kind == COMPACTION && maintenanceEnabled(borrow value)) { return Err(TablesError.NotImplemented); }
+    return Ok(value);
+}
+
+fn tableMaintenanceKey(id: Slice<u8>) -> Result<Vector<u8>, AllocError> =>
+    catalogKey(MAINTENANCE_TABLES, id, "".bytes());
+
+fn jobStatusKey(id: Slice<u8>) -> Result<Vector<u8>, AllocError> => catalogKey(MAINTENANCE_STATUS, id, "".bytes());
+
+/// PutTableBucketMaintenanceConfiguration and PutTableMaintenanceConfiguration: one type's value into the document at
+/// `key`.
+fn putMaintenance(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    key: Slice<u8>,
+    kind: StringView,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let value = maintenanceValueOf(body, kind)?;
+    var document = maintenanceDocument(store, hidden, key)?;
+    jsonSet(mut document, kind, value)?;
+    let _ = writeRecord(store, hidden, key, borrow document, PutCondition.None)?;
+    return Ok(tablesNoContent());
+}
+
+/// A path's maintenance type: a table bucket's (`bucketLevel`) or a table's; null for another.
+fn maintenanceKind(segment: Slice<u8>, bucketLevel: bool) -> StringView? {
+    if (bucketLevel) { return if (segment == UNREFERENCED_REMOVAL.bytes()) Some(UNREFERENCED_REMOVAL) else null; }
+    if (segment == SNAPSHOT_MANAGEMENT.bytes()) { return Some(SNAPSHOT_MANAGEMENT); }
+    if (segment == COMPACTION.bytes()) { return Some(COMPACTION); }
+    return null;
+}
+
+/// GetTableBucketMaintenanceConfiguration.
+fn getBucketMaintenance(
+    store: borrow ObjectStore,
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucketName)?;
+    let document = maintenanceDocument(store, hidden.view(), MAINTENANCE_BUCKET_KEY.bytes())?;
+    var configuration = jsonObject();
+    jsonSet(mut configuration, UNREFERENCED_REMOVAL, maintenanceValue(borrow document, UNREFERENCED_REMOVAL)?)?;
+    var answer = jsonObject();
+    var arn = Vector<u8>.create();
+    tableBucketArn(req, bucketName, mut arn)?;
+    jsonSet(mut answer, "tableBucketARN", Json.Text(arn))?;
+    jsonSet(mut answer, "configuration", configuration)?;
+    return tablesJson(borrow answer);
+}
+
+/// GetTableMaintenanceConfiguration.
+fn getTableMaintenance(
+    store: borrow ObjectStore,
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+    id: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucketName)?;
+    let key = tableMaintenanceKey(id)?;
+    let document = maintenanceDocument(store, hidden.view(), key.view())?;
+    var configuration = jsonObject();
+    jsonSet(mut configuration, COMPACTION, defaultMaintenance(COMPACTION)?)?;
+    jsonSet(mut configuration, SNAPSHOT_MANAGEMENT, maintenanceValue(borrow document, SNAPSHOT_MANAGEMENT)?)?;
+    var answer = jsonObject();
+    var arn = Vector<u8>.create();
+    tableArn(req, bucketName, id, mut arn)?;
+    jsonSet(mut answer, "tableARN", Json.Text(arn))?;
+    jsonSet(mut answer, "configuration", configuration)?;
+    return tablesJson(borrow answer);
+}
+
+// ---- Job status ----
+
+/// Records a job's outcome for a table: `Successful` or `Failed` (with its message), at `nowMs`.
+fn writeJobStatus(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    id: Slice<u8>,
+    kind: StringView,
+    status: StringView,
+    failure: StringView,
+    nowMs: i64,
+) -> Result<void, TablesError> {
+    let key = jobStatusKey(id)?;
+    var document = maintenanceDocument(store, hidden, key.view())?;
+    var entry = jsonObject();
+    jsonSet(mut entry, "status", jsonString(status.bytes())?)?;
+    jsonSet(mut entry, "lastRunTimestamp", jsonInteger(nowMs)?)?;
+    if (failure.length > 0) { jsonSet(mut entry, "failureMessage", jsonString(failure.bytes())?)?; }
+    jsonSet(mut document, kind, entry)?;
+    let _ = writeRecord(store, hidden, key.view(), borrow document, PutCondition.None)?;
+    return Ok();
+}
+
+/// GetTableMaintenanceJobStatus: each job's last outcome; `Disabled` for one whose configuration is disabled (and
+/// for compaction), `Not_Yet_Run` for one that has not run.
+fn getJobStatus(
+    store: borrow ObjectStore,
+    req: borrow S3Request,
+    bucketName: Slice<u8>,
+    id: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucketName)?;
+    let key = jobStatusKey(id)?;
+    let recorded = maintenanceDocument(store, hidden.view(), key.view())?;
+    let tableKey = tableMaintenanceKey(id)?;
+    let tableDoc = maintenanceDocument(store, hidden.view(), tableKey.view())?;
+    let bucketDoc = maintenanceDocument(store, hidden.view(), MAINTENANCE_BUCKET_KEY.bytes())?;
+    var status = jsonObject();
+    for (kind in [COMPACTION, SNAPSHOT_MANAGEMENT, UNREFERENCED_REMOVAL]) {
+        let value = maintenanceValue(if (kind == UNREFERENCED_REMOVAL) borrow bucketDoc else borrow tableDoc, kind)?;
+        var entry = jsonObject();
+        if (!maintenanceEnabled(borrow value)) {
+            jsonSet(mut entry, "status", jsonString("Disabled".bytes())?)?;
+        } else {
+            match (jsonMember(borrow recorded, kind)) {
+                Some(r) => {
+                    jsonSet(mut entry, "status", jsonString(jsonMemberText(r, "status") ?? "Not_Yet_Run".bytes())?)?;
+                    match (jsonMemberI64(r, "lastRunTimestamp")) {
+                        Some(t) => { jsonSet(mut entry, "lastRunTimestamp", isoText(t)?)?; }
+                        null => {}
+                    }
+                    match (jsonMemberText(r, "failureMessage")) {
+                        Some(f) => { jsonSet(mut entry, "failureMessage", jsonString(f)?)?; }
+                        null => {}
+                    }
+                }
+                null => { jsonSet(mut entry, "status", jsonString("Not_Yet_Run".bytes())?)?; }
+            }
+        }
+        jsonSet(mut status, kind, entry)?;
+    }
+    var answer = jsonObject();
+    var arn = Vector<u8>.create();
+    tableArn(req, bucketName, id, mut arn)?;
+    jsonSet(mut answer, "tableARN", Json.Text(arn))?;
+    jsonSet(mut answer, "status", status)?;
+    return tablesJson(borrow answer);
+}
+
+/// A dropped table's maintenance records go with it.
+fn removeTableMaintenance(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    id: Slice<u8>,
+) -> Result<void, TablesError> {
+    removeCatalogObject(store, hidden, tableMaintenanceKey(id)?.view())?;
+    removeCatalogObject(store, hidden, jobStatusKey(id)?.view())?;
+    return removeCatalogObject(store, hidden, unreferencedNotesKey(id)?.view());
+}
+
+/// Deletes a catalog object, if it is there.
+fn removeCatalogObject(store: borrow mut ObjectStore, hidden: Slice<u8>, key: Slice<u8>) -> Result<void, TablesError> {
+    return match (store.deleteObject(catalogText(hidden), catalogText(key))) {
+        Ok() => Ok(),
+        Err(StoreError.NoSuchKey) => Ok(),
+        Err(e) => Err(tablesStoreFail(e)),
+    };
+}
+
+// ---- Snapshot management (ADR-0086 §2) ----
+
+/// The snapshots to expire: older than `cutoffMs`, and neither a ref's head nor among the newest `keep` of main's
+/// ancestry (from the current snapshot through each parent).
+fn snapshotsToExpire(m: borrow Json, cutoffMs: i64, keep: i64) -> Result<Vector<i64>, AllocError> {
+    var held = Vector<i64>.create();
+    match (jsonMember(m, "refs")) {
+        Some(refs) => {
+            match (refs) {
+                Json.Object(ms) => {
+                    for (i in 0..ms.length) {
+                        match (jsonMemberI64(borrow ms[i].value, "snapshot-id")) {
+                            Some(s) => { held.push(s)?; }
+                            null => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    let snapshots = match (jsonMember(m, "snapshots")) {
+        Some(s) => s,
+        null => { return Ok(Vector<i64>.create()); }
+    };
+    let items = match (snapshots) {
+        Json.Array(items) => items,
+        _ => { return Ok(Vector<i64>.create()); }
+    };
+    // Main's ancestry, newest first, the first `keep` held.
+    var at = jsonMemberI64(m, "current-snapshot-id") ?? -1;
+    var kept: i64 = 0;
+    while (at != -1 && kept < keep) {
+        held.push(at)?;
+        kept += 1;
+        var parent: i64 = -1;
+        for (i in 0..items.length) {
+            if (jsonMemberI64(borrow items[i], "snapshot-id") == Some(at)) {
+                parent = jsonMemberI64(borrow items[i], "parent-snapshot-id") ?? -1;
+            }
+        }
+        if (holdsId(held.view(), parent)) { break; } // a cycle: stop
+        at = parent;
+    }
+    var gone = Vector<i64>.create();
+    for (i in 0..items.length) {
+        let id = jsonMemberI64(borrow items[i], "snapshot-id") ?? { continue; };
+        let stamp = jsonMemberI64(borrow items[i], "timestamp-ms") ?? { continue; };
+        if (stamp < cutoffMs && !holdsId(held.view(), id)) { gone.push(id)?; }
+    }
+    return Ok(gone);
+}
+
+/// Snapshot management for one table, when its configuration is enabled: its expired snapshots removed by a commit
+/// (`swapMetadata`). True if it ran; a commit that lost its race tries again next pass.
+fn manageSnapshots(
+    store: borrow mut ObjectStore,
+    bucketName: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+    nowMs: i64,
+    hourMs: i64,
+) -> Result<bool, TablesError> {
+    let hidden = tableWarehouseBucket(bucketName)?;
+    var rec = tableRecord(store, bucketName, ns, name)?;
+    let id = copyBytes(jsonMemberText(borrow rec.json, "id") ?? "".bytes())?;
+    let configKey = tableMaintenanceKey(id.view())?;
+    let document = maintenanceDocument(store, hidden.view(), configKey.view())?;
+    let value = maintenanceValue(borrow document, SNAPSHOT_MANAGEMENT)?;
+    if (!maintenanceEnabled(borrow value)) { return Ok(false); }
+    let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
+    if (location.length == 0) { return Ok(false); } // no metadata yet
+    let keep = maintenanceSetting(borrow value, SNAPSHOT_MANAGEMENT, "minSnapshotsToKeep") ?? 1;
+    let hours = maintenanceSetting(borrow value, SNAPSHOT_MANAGEMENT, "maxSnapshotAgeHours") ?? 120;
+    var m = match (readMetadata(store, hidden.view(), location.view())) {
+        Ok(m) => m,
+        Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
+        Err(_) => {
+            writeJobStatus(
+                store,
+                hidden.view(),
+                id.view(),
+                SNAPSHOT_MANAGEMENT,
+                "Failed",
+                "The table's metadata could not be read.",
+                nowMs,
+            )?;
+            return Ok(true);
+        }
+    };
+    let gone = snapshotsToExpire(borrow m, nowMs - hours * hourMs, keep)?;
+    if (gone.length > 0) {
+        let previousStamp = jsonMemberI64(borrow m, "last-updated-ms") ?? 0;
+        removeSnapshots(mut m, gone.view())?;
+        let key = catalogKey(CATALOG_TABLES, ns, name)?;
+        match (swapMetadata(
+            store,
+            hidden.view(),
+            id.view(),
+            key.view(),
+            mut rec,
+            location.view(),
+            mut m,
+            previousStamp,
+        )?) {
+            Some(_) => {}
+            null => { return Ok(false); } // the table changed: next pass
+        }
+    }
+    writeJobStatus(store, hidden.view(), id.view(), SNAPSHOT_MANAGEMENT, "Successful", "", nowMs)?;
+    return Ok(true);
+}
+
+// ---- The pass (ADR-0086 §5) ----
+
+/// A table of a table bucket, as the pass visits it.
+struct MaintainedTable {
+    bucket: Vector<u8>;
+    ns: Vector<u8>;
+    name: Vector<u8>;
+}
+
+/// Every table of every table bucket in the store.
+fn maintainedTables(store: borrow ObjectStore) -> Result<Vector<MaintainedTable>, TablesError> {
+    var out = Vector<MaintainedTable>.create();
+    let all = match (store.listBucketInfo()) {
+        Ok(a) => a,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    let head = CATALOG_TABLES.bytes().length;
+    for (i in 0..all.length) {
+        let hidden = all[i].name.view();
+        if (!isTableWarehouseShaped(hidden)) { continue; }
+        let bucket = hidden[0..hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
+        let keys = catalogKeys(store, hidden, CATALOG_TABLES.bytes(), "".bytes(), 0)?;
+        for (k in 0..keys.length) {
+            let rest = keys[k].view()[head..];
+            let slash = pieceEnd(rest, 0, '/');
+            if (slash >= rest.length) { continue; }
+            out.push(MaintainedTable {
+                bucket: copyBytes(bucket)?,
+                ns: copyBytes(rest[0..slash])?,
+                name: copyBytes(rest[slash + 1..])?,
+            })?;
+        }
+    }
+    return Ok(out);
+}
+
+/// One table's snapshot management, under the store.
+fn maintainTable(
+    store: borrow mut ObjectStore,
+    t: borrow MaintainedTable,
+    nowMs: i64,
+    dayMs: i64,
+) -> Result<void, TablesError> {
+    let hourMs = if (dayMs / 24 > 0) dayMs / 24 else 1;
+    let _ = manageSnapshots(store, t.bucket.view(), t.ns.view(), t.name.view(), nowMs, hourMs)?;
+    return Ok();
+}
+
+/// Every hour of a day: each table's maintenance jobs, the store held for one table at a time (ADR-0086 §5).
+async fn tablesMaintenanceForever(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    w: borrow TablesMaintainer,
+) -> Result<ServerReport, NetError> {
+    let every = if (w.dayMs / 24 > 0) w.dayMs / 24 else 1;
+    let dayMs = truncate<i64>(w.dayMs);
+    while (true) {
+        await deliveryPause(every)?;
+        var tables = Vector<MaintainedTable>.create();
+        {
+            var guard = match (await store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NetError.Closed); }
+            };
+            let st = guard.data();
+            tables = match (await Async.blocking(() => maintainedTables(st))) {
+                Ok(t) => t,
+                Err(_) => { continue; }
+            };
+        }
+        for (i in 0..tables.length) {
+            let t = borrow tables[i];
+            {
+                var guard = match (await store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NetError.Closed); }
+                };
+                let st = guard.data();
+                let now = Clock.unixMillis();
+                let _ = await Async.blocking(() => maintainTable(st, t, now, dayMs));
+            }
+            // Then its unreferenced files, the store held for each read (ADR-0086 §3).
+            await removeUnreferenced(store, t, Clock.unixMillis(), dayMs)?;
+        }
+    }
+    return Err(NetError.Closed);
+}

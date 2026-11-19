@@ -1007,13 +1007,14 @@ fn deleteTable(
             Ok() => {}
             Err(e) => { return Err(tablesStoreFail(e)); }
         }
-        // Its policy goes with it (ADR-0084 §1).
+        // Its policy (ADR-0084 §1) and its maintenance records (ADR-0086) go with it.
         let policy = tablePolicyKey(id.view())?;
         match (store.deleteObject(bucket, catalogText(policy.view()))) {
             Ok() => {}
             Err(StoreError.NoSuchKey) => {}
             Err(e) => { return Err(tablesStoreFail(e)); }
         }
+        removeTableMaintenance(store, hidden.view(), id.view())?;
     }
     // Its objects go after the answer's work, a page at a time (`purgeWarehouse`).
     var answer = tablesNoContent();
@@ -1189,7 +1190,34 @@ fn routeTablesSync(
             checkTables(store, caller, policyActionOf(m, true), bucket.view(), "".bytes())?;
             return tablesPolicyCall(store, m, bucket.view(), TABLE_BUCKET_POLICY_KEY.bytes(), body, credentials);
         }
-        // Its encryption, maintenance, replication and the rest: not done (ADR-0083 §6).
+        // Its maintenance (ADR-0086 §1).
+        if (segs.length >= 3 && segs[2].view() == "maintenance".bytes()) {
+            let _ = tableBucketRecord(store, bucket.view())?;
+            if (segs.length == 3 && isMethod(m, Method.Get)) {
+                checkTables(
+                    store,
+                    caller,
+                    "s3tables:GetTableBucketMaintenanceConfiguration",
+                    bucket.view(),
+                    "".bytes(),
+                )?;
+                return getBucketMaintenance(store, req, bucket.view());
+            }
+            if (segs.length == 4 && isMethod(m, Method.Put)) {
+                let kind = maintenanceKind(segs[3].view(), true) ?? { return Err(TablesError.BadRequest); };
+                checkTables(
+                    store,
+                    caller,
+                    "s3tables:PutTableBucketMaintenanceConfiguration",
+                    bucket.view(),
+                    "".bytes(),
+                )?;
+                let hidden = tableWarehouseBucket(bucket.view())?;
+                return putMaintenance(store, hidden.view(), MAINTENANCE_BUCKET_KEY.bytes(), kind, body);
+            }
+            return Err(TablesError.BadRequest);
+        }
+        // Its encryption, replication and the rest: not done (ADR-0083 §6).
         if (segs.length > 2) { return Err(TablesError.NotImplemented); }
         if (isMethod(m, Method.Get)) {
             checkTables(store, caller, "s3tables:GetTableBucket", bucket.view(), "".bytes())?;
@@ -1267,6 +1295,25 @@ fn routeTablesSync(
                 checkTables(store, caller, "s3tables:UpdateTableMetadataLocation", bucket.view(), id.view())?;
                 return updateTableMetadataLocation(store, req, bucket.view(), ns, name, body);
             }
+        }
+        // Its maintenance and job status (ADR-0086 §1).
+        if (what == "maintenance".bytes()) {
+            if (segs.length == 5 && isMethod(m, Method.Get)) {
+                checkTables(store, caller, "s3tables:GetTableMaintenanceConfiguration", bucket.view(), id.view())?;
+                return getTableMaintenance(store, req, bucket.view(), id.view());
+            }
+            if (segs.length == 6 && isMethod(m, Method.Put)) {
+                let kind = maintenanceKind(segs[5].view(), false) ?? { return Err(TablesError.BadRequest); };
+                checkTables(store, caller, "s3tables:PutTableMaintenanceConfiguration", bucket.view(), id.view())?;
+                let hidden = tableWarehouseBucket(bucket.view())?;
+                let key = tableMaintenanceKey(id.view())?;
+                return putMaintenance(store, hidden.view(), key.view(), kind, body);
+            }
+            return Err(TablesError.BadRequest);
+        }
+        if (segs.length == 5 && what == "maintenance-job-status".bytes() && isMethod(m, Method.Get)) {
+            checkTables(store, caller, "s3tables:GetTableMaintenanceJobStatus", bucket.view(), id.view())?;
+            return getJobStatus(store, req, bucket.view(), id.view());
         }
         if (segs.length == 5 && what == "policy".bytes()) {
             checkTables(store, caller, policyActionOf(m, false), bucket.view(), id.view())?;

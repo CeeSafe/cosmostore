@@ -1,0 +1,196 @@
+// Table maintenance (ADR-0086): configurations, which snapshots expire, a snapshot management run against a store,
+// and the unreferenced files' notes and deletes.
+import web_core;
+import web_http;
+import web_server;
+
+const MAINT_ID: StringView = "0f8e9a2b-1c3d-4e5f-8a7b-6c5d4e3f2a1b";
+
+fn valueOf(body: StringView, kind: StringView) -> Result<Json, TablesError> => maintenanceValueOf(body.bytes(), kind);
+
+fn refusedWith(body: StringView, kind: StringView, notImplemented: bool) -> bool => match (valueOf(body, kind)) {
+    Err(TablesError.NotImplemented) => notImplemented,
+    Err(TablesError.BadRequest) => !notImplemented,
+    _ => false,
+};
+
+@test
+fn maintenanceConfigurations() -> Result<void, TestFailure> {
+    // AWS's defaults; compaction disabled here.
+    let snap = defaultMaintenance(SNAPSHOT_MANAGEMENT)!;
+    Check.isTrue(maintenanceEnabled(borrow snap), "snapshot management on")?;
+    Check.isTrue(maintenanceSetting(borrow snap, SNAPSHOT_MANAGEMENT, "maxSnapshotAgeHours") == Some(120i64), "120 h")?;
+    let unref = defaultMaintenance(UNREFERENCED_REMOVAL)!;
+    Check.isTrue(maintenanceSetting(borrow unref, UNREFERENCED_REMOVAL, "nonCurrentDays") == Some(10i64), "10 days")?;
+    let compaction = defaultMaintenance(COMPACTION)!;
+    Check.isFalse(maintenanceEnabled(borrow compaction), "compaction off")?;
+    // A partial setting keeps the other's default.
+    let v = valueOf(
+        "{\"value\":{\"status\":\"enabled\",\"settings\":{\"icebergSnapshotManagement\":{\"minSnapshotsToKeep\":3}}}}",
+        SNAPSHOT_MANAGEMENT,
+    )!;
+    Check.isTrue(maintenanceSetting(borrow v, SNAPSHOT_MANAGEMENT, "minSnapshotsToKeep") == Some(3i64), "set")?;
+    Check.isTrue(maintenanceSetting(borrow v, SNAPSHOT_MANAGEMENT, "maxSnapshotAgeHours") == Some(120i64), "kept")?;
+    let off = valueOf("{\"value\":{\"status\":\"disabled\"}}", UNREFERENCED_REMOVAL)!;
+    Check.isFalse(maintenanceEnabled(borrow off), "disabled")?;
+    Check.isTrue(valueOf("{\"value\":{\"status\":\"disabled\"}}", COMPACTION).isOk(), "compaction disabled is taken")?;
+    Check.isTrue(refusedWith("{\"value\":{\"status\":\"enabled\"}}", COMPACTION, true), "compaction enabled")?;
+    for (bad in [
+        "{\"value\":{\"status\":\"on\"}}",
+        "{\"value\":{\"status\":\"enabled\",\"extra\":1}}",
+        "{\"value\":{\"settings\":{\"icebergUnreferencedFileRemoval\":{\"unreferencedDays\":3}}}}",
+        "{\"value\":{\"settings\":{\"icebergSnapshotManagement\":{\"minSnapshotsToKeep\":0}}}}",
+        "{\"value\":{\"settings\":{\"icebergSnapshotManagement\":{\"keep\":1}}}}",
+        "{\"other\":{}}",
+    ]) {
+        Check.isTrue(refusedWith(bad, SNAPSHOT_MANAGEMENT, false), bad)?;
+    }
+    Check.isTrue(maintenanceKind("icebergCompaction".bytes(), false) == Some(COMPACTION), "a table's type")?;
+    Check.isTrue(maintenanceKind("icebergCompaction".bytes(), true).isNull(), "not a table bucket's")?;
+    return Ok();
+}
+
+@test
+fn snapshotsThatExpire() -> Result<void, TestFailure> {
+    // 1 <- 2 <- 3 <- 4 <- 5 (main), a tag on 2; times 100 to 500.
+    let m = parseJson(
+        "{\"current-snapshot-id\":5,\"refs\":{\"main\":{\"snapshot-id\":5,\"type\":\"branch\"},\"t\":{\"snapshot-id\":2,\"type\":\"tag\"}},\"snapshots\":[{\"snapshot-id\":1,\"timestamp-ms\":100},{\"snapshot-id\":2,\"parent-snapshot-id\":1,\"timestamp-ms\":200},{\"snapshot-id\":3,\"parent-snapshot-id\":2,\"timestamp-ms\":300},{\"snapshot-id\":4,\"parent-snapshot-id\":3,\"timestamp-ms\":400},{\"snapshot-id\":5,\"parent-snapshot-id\":4,\"timestamp-ms\":500}]}".bytes(),
+    )!!;
+    // Older than 450: 1 to 4; 4 and 5 are main's newest two, 2 a tag's head.
+    let gone = snapshotsToExpire(borrow m, 450, 2)!;
+    Check.equalU64(2, gone.length as u64)?;
+    Check.isTrue(holdsId(gone.view(), 1) && holdsId(gone.view(), 3), "1 and 3")?;
+    Check.equalU64(0, snapshotsToExpire(borrow m, 50, 1)!.length as u64)?;
+    Check.equalU64(3, snapshotsToExpire(borrow m, 1000, 1)!.length as u64)?; // all but 5 and the tag's 2
+    return Ok();
+}
+
+/// A table bucket `maint` with table `ns.t` whose metadata has snapshots 1 to 3 (main at 3), old ones.
+fn maintainedStore(name: StringView) -> Result<String, TestFailure> {
+    let dir = scratchDirectory(name);
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("maint--table-s3")!;
+    let hidden = "maint--table-s3".bytes();
+    let request = parseJson(
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+    )!!;
+    var warehouse = copyBytes("s3://maint--table-s3/".bytes())!;
+    warehouse.extend(MAINT_ID.bytes())!;
+    var m = newTableMetadata(borrow request, warehouse.view())!!;
+    var updates = String.create();
+    updates.append("[")!;
+    for (i in 1..4) {
+        if (i > 1) { updates.append(",")!; }
+        updates.append("{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":")!;
+        updates.appendNumber(i)!;
+        if (i > 1) {
+            updates.append(",\"parent-snapshot-id\":")!;
+            updates.appendNumber(i - 1)!;
+        }
+        updates.append(",\"sequence-number\":")!;
+        updates.appendNumber(i)!;
+        updates.append(",\"timestamp-ms\":")!;
+        updates.appendNumber(i * 1000)!;
+        updates.append(",\"manifest-list\":\"s3://maint--table-s3/")!;
+        updates.append(MAINT_ID)!;
+        updates.append(
+            "/metadata/snap.avro\"}},{\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",\"type\":\"branch\",\"snapshot-id\":",
+        )!;
+        updates.appendNumber(i)!;
+        updates.append("}")!;
+    }
+    updates.append("]")!;
+    let u = parseJson(updates.bytes())!!;
+    Check.isTrue(applyUpdates(mut m, borrow u, warehouse.view())!.isNull(), "three snapshots")?;
+    let location = writeMetadata(mut s, hidden, MAINT_ID.bytes(), 0, borrow m)!;
+    var ns = jsonObject();
+    jsonSet(mut ns, "id", jsonString("ns-id".bytes())!)!;
+    let _ = writeRecord(mut s, hidden, ".s3tables/namespaces/ns".bytes(), borrow ns, PutCondition.None)!;
+    var rec = jsonObject();
+    jsonSet(mut rec, "id", jsonString(MAINT_ID.bytes())!)!;
+    jsonSet(mut rec, "metadataLocation", Json.Text(location))!;
+    let _ = writeRecord(mut s, hidden, ".s3tables/tables/ns/t".bytes(), borrow rec, PutCondition.None)!;
+    return Ok(dir);
+}
+
+@test
+fn snapshotManagementCommits() -> Result<void, TestFailure> {
+    let dir = maintainedStore("maint-snapshots")?;
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = "maint--table-s3".bytes();
+    // A day of 24 s: an hour is 1 s, so 120 h is 120 s; at 1,000,000 ms the three are old. Main's newest one stays.
+    Check.isTrue(manageSnapshots(mut s, "maint".bytes(), "ns".bytes(), "t".bytes(), 1000000, 1000)!, "it ran")?;
+    let rec = tableRecord(borrow s, "maint".bytes(), "ns".bytes(), "t".bytes())!;
+    let location = jsonMemberText(borrow rec.json, "metadataLocation")!;
+    Check.isTrue(findBytes(location, "/metadata/00001-".bytes(), 0).isSome(), "a new metadata file, version 1")?;
+    let m = readMetadata(borrow s, hidden, location)!;
+    Check.equalU64(1, arrayLength(borrow m, "snapshots") as u64)?;
+    Check.isTrue(jsonMemberI64(borrow m, "current-snapshot-id") == Some(3i64), "main's head stays")?;
+    Check.equalU64(1, arrayLength(borrow m, "metadata-log") as u64)?;
+    // Its status: Successful.
+    let status = maintenanceDocument(borrow s, hidden, jobStatusKey(MAINT_ID.bytes())!.view())!;
+    Check.equalBytes(
+        "Successful".bytes(),
+        jsonMemberText(jsonMember(borrow status, SNAPSHOT_MANAGEMENT)!, "status")!,
+    )?;
+    // Disabled: nothing more.
+    let _ = putMaintenance(
+        mut s,
+        hidden,
+        tableMaintenanceKey(MAINT_ID.bytes())!.view(),
+        SNAPSHOT_MANAGEMENT,
+        "{\"value\":{\"status\":\"disabled\"}}".bytes(),
+    )!;
+    Check.isFalse(manageSnapshots(mut s, "maint".bytes(), "ns".bytes(), "t".bytes(), 1000000, 1000)!, "disabled")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn unreferencedFilesNotedThenDeleted() -> Result<void, TestFailure> {
+    let dir = maintainedStore("maint-unreferenced")?;
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = "maint--table-s3".bytes();
+    var live = copyBytes(MAINT_ID.bytes())!;
+    live.extend("/data/live.parquet".bytes())!;
+    var orphan = copyBytes(MAINT_ID.bytes())!;
+    orphan.extend("/data/orphan.parquet".bytes())!;
+    var back = copyBytes(MAINT_ID.bytes())!;
+    back.extend("/data/back.parquet".bytes())!;
+    for (k in [live.view(), orphan.view(), back.view()]) {
+        let _ = s.putObject("maint--table-s3", StringView.fromUtf8(k) ?? "", "", "x".bytes(), PutCondition.None)!;
+    }
+    let rec = tableRecord(borrow s, "maint".bytes(), "ns".bytes(), "t".bytes())!;
+    let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+    let run = UnreferencedRun {
+        hidden: copyBytes(hidden)!,
+        id: copyBytes(MAINT_ID.bytes())!,
+        metadata: readMetadata(borrow s, hidden, location.view())!,
+        location: copyBytes(location.view())!,
+        days: 2,
+    };
+    // What the metadata references: its own file, and the live data file.
+    var referenced = Vector<Vector<u8>>.create();
+    let _ = metadataReferences(borrow run.metadata, hidden, location.view(), mut referenced)!;
+    let _ = sortedInsert(mut referenced, live.view())!;
+    let day: i64 = 1000;
+    // At 10 s: the orphan and `back` are noted, nothing deleted.
+    sweepUnreferenced(mut s, borrow run, borrow referenced, 10000, day)!;
+    Check.equalU64(4, catalogKeys(borrow s, hidden, MAINT_ID.bytes(), "".bytes(), 0)!.length as u64)?;
+    // `back` is referenced again before its days are up: its note goes.
+    let _ = sortedInsert(mut referenced, back.view())!;
+    sweepUnreferenced(mut s, borrow run, borrow referenced, 11000, day)!;
+    // At 12 s, two days after its note: the orphan alone is deleted; the live and referenced files stay.
+    sweepUnreferenced(mut s, borrow run, borrow referenced, 12000, day)!;
+    let left = catalogKeys(borrow s, hidden, MAINT_ID.bytes(), "".bytes(), 0)!;
+    Check.equalU64(3, left.length as u64)?;
+    for (i in 0..left.length) { Check.isFalse(left[i].view() == orphan.view(), "the orphan is gone")?; }
+    // No notes are left.
+    let notes = maintenanceDocument(borrow s, hidden, unreferencedNotesKey(MAINT_ID.bytes())!.view())!;
+    Check.isTrue(match (borrow notes) {
+        Json.Object(ms) => ms.length == 0,
+        _ => false,
+    }, "no notes")?;
+    removeTree(dir.view());
+    return Ok();
+}

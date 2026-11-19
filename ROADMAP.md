@@ -3287,3 +3287,30 @@ Browser form uploads with a SigV4 POST policy.
     appended twice). The paths each names are read exactly. A file damaged, cut short or not Avro is refused.
 - 365 tests pass.
 - **Next:** slice 2, the maintenance calls and snapshot management.
+
+### 19 Nov 2026: M10 slices 2 and 3, maintenance calls, snapshot management, unreferenced file removal (ADR-0086)
+
+- **The calls:** Put/Get of a table bucket's and a table's maintenance configurations, and
+  GetTableMaintenanceJobStatus.
+  - They are checked as AWS's model has them: positive settings, `enabled` or `disabled`, and NotImplemented for
+    compaction enabled. AWS's defaults apply until a type is set.
+  - Each is authorized under ADR-0084's policies, and kept as catalog objects (`.s3tables/maintenance/…`).
+  - DeleteTable removes a table's.
+- **Snapshot management:** expires snapshots past `maxSnapshotAgeHours`, keeping refs' heads and the newest of main's
+  ancestry. It commits through the catalog's own path, `swapMetadata`, factored out of the Iceberg commit. A lost race
+  waits for the next pass.
+- **Unreferenced file removal:**
+  - **What is referenced:** the metadata file, its log, statistics files, every snapshot's manifest list and its
+    manifests (read with slice 1's Avro reader), and their data and delete files.
+  - **The sweep:** other warehouse files are noted, and deleted once noted for `unreferencedDays + nonCurrentDays`. A
+    note goes when its file is referenced again.
+  - **Holding the store:** for each manifest read, and for the sweep.
+  - **A manifest it cannot read** ends the run Failed, with nothing deleted.
+- **The pass:** every hour of a day, beside inventory (`serve --tables-day-seconds` for tests).
+- **Tests:**
+  - Unit: `maintenanceConfigurations`, `snapshotsThatExpire`, `snapshotManagementCommits` and
+    `unreferencedFilesNotedThenDeleted`; 369 in all.
+  - **`tools/maintenance_check.py`** (14 checks), run by the S3 smoke on a server whose day is 12 s: a PyIceberg table
+    appended six times is expired to its two newest snapshots, and an orphan and the expired manifest lists are
+    removed. Every row reads back, and it takes appends after.
+- **Next:** slice 4, the cluster.

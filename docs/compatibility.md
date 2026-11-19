@@ -57,6 +57,15 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
     - **A table's data:** an engine's S3 calls on it are `s3tables:GetTableData` (reads) and `s3tables:PutTableData`
       (writes and deletes).
     - **Not taken:** anonymous requests, AssumeRole sessions and directory-bucket sessions.
+  - **Maintenance** (ADR-0086): Put/Get of a table bucket's and a table's maintenance configurations, and the job
+    status, with AWS's defaults until they are set.
+    - **Snapshot management:** expires snapshots older than `maxSnapshotAgeHours`. It keeps every ref's head and the
+      newest `minSnapshotsToKeep` of main's ancestry.
+    - **Unreferenced file removal:** deletes a warehouse's file once no snapshot has referenced it for
+      `unreferencedDays + nonCurrentDays`. A run that cannot read a manifest (a codec other than `null` and
+      `deflate`, a damaged file) is Failed and deletes nothing.
+    - **Compaction:** taken only as `disabled`.
+    - **Jobs run** every hour of a day (`serve --tables-day-seconds` shortens the day, for tests).
   - **A table's files** are under its id (`<warehouse>/…`). An object of no table, or a listing whose prefix is not
     one table's, is refused.
   - **Upgrading:** a general-purpose bucket named `<name>--table-s3`, made before M9, stops the server from
