@@ -1,0 +1,140 @@
+// Policies for S3 Tables (ADR-0084): their grammar, the decision for a call, a table's data keys, and the check at
+// startup for `--table-s3` buckets S3 made before M9.
+import web_core;
+import web_http;
+import web_server;
+
+const POLICY_TABLE_ID: StringView = "0f8e9a2b-1c3d-4e5f-8a7b-6c5d4e3f2a1b";
+
+fn tablesPolicyRefused(json: StringView) -> bool {
+    let none = Vector<Credential>.create();
+    return parseTablesPolicy(json.bytes(), "sales".bytes(), none.view(), false).isErr();
+}
+
+@test
+fn tablesPolicyGrammar() -> Result<void, TestFailure> {
+    // `s3tables:` actions on this table bucket's ARN and its tables' (ADR-0084 §1).
+    let ok =
+        "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":[\"s3tables:DeleteTable\",\"s3tables:Get*\"],\"Resource\":[\"arn:aws:s3tables:us-east-1:000000000000:bucket/sales\",\"arn:aws:s3tables:eu-west-1:111122223333:bucket/sales/table/*\"]}]}";
+    Check.isFalse(tablesPolicyRefused(ok), "a table bucket's policy")?;
+    for (bad in [
+        // An S3 action, another table bucket, an S3 ARN, a principal-less statement.
+        "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3tables:us-east-1:0:bucket/sales\"}]}",
+        "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:GetTable\",\"Resource\":\"arn:aws:s3tables:us-east-1:0:bucket/other\"}]}",
+        "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:GetTable\",\"Resource\":\"arn:aws:s3:::sales\"}]}",
+        "{\"Statement\":[{\"Effect\":\"Deny\",\"Action\":\"s3tables:GetTable\",\"Resource\":\"arn:aws:s3tables:us-east-1:0:bucket/sales\"}]}",
+        "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:GetTable\",\"Resource\":\"arn:aws:s3tables:us-east-1:0:bucket/salesx\"}]}",
+    ]) {
+        Check.isTrue(tablesPolicyRefused(bad), bad)?;
+    }
+    // And an S3 bucket policy takes no `s3tables:` action.
+    let none = Vector<Credential>.create();
+    let s3 =
+        "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:GetTable\",\"Resource\":\"arn:aws:s3:::b\"}]}";
+    Check.isTrue(parseBucketPolicy(s3.bytes(), "b".bytes(), none.view(), false).isErr(), "not in a bucket policy")?;
+    return Ok();
+}
+
+fn tablesCaller(key: StringView) -> TablesCaller {
+    let req = bareRequest();
+    return TablesCaller {
+        principal: copyBytes(key.bytes())!,
+        facts: policyFacts(borrow req, false, false, null)!,
+    };
+}
+
+fn lets(store: borrow ObjectStore, key: StringView, action: StringView, table: StringView) -> bool {
+    let caller = tablesCaller(key);
+    return checkTables(store, borrow caller, action, "sales".bytes(), table.bytes()).isOk();
+}
+
+fn putPolicy(store: borrow mut ObjectStore, key: StringView, json: StringView) {
+    let _ = store.putObject("sales--table-s3", key, "application/json", json.bytes(), PutCondition.None)!;
+}
+
+@test
+fn tablesPoliciesDecide() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("tables-policies");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("sales--table-s3")!;
+    // No policy: a key may.
+    Check.isTrue(lets(borrow s, "AKIAONE", "s3tables:DeleteTable", POLICY_TABLE_ID), "no policy")?;
+    // The table bucket's: AKIAONE may not drop its tables, nor anyone read its bucket.
+    putPolicy(
+        mut s,
+        TABLE_BUCKET_POLICY_KEY,
+        "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam:::user/AKIAONE\"},\"Action\":\"s3tables:DeleteTable\",\"Resource\":\"arn:aws:s3tables:us-east-1:0:bucket/sales/table/*\"},{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:GetTableBucket\",\"Resource\":\"arn:aws:s3tables:us-east-1:0:bucket/sales\"}]}",
+    );
+    Check.isFalse(lets(borrow s, "AKIAONE", "s3tables:DeleteTable", POLICY_TABLE_ID), "a Deny for that key")?;
+    Check.isTrue(lets(borrow s, "AKIATWO", "s3tables:DeleteTable", POLICY_TABLE_ID), "another key")?;
+    Check.isTrue(lets(borrow s, "AKIAONE", "s3tables:GetTable", POLICY_TABLE_ID), "another action")?;
+    Check.isFalse(lets(borrow s, "AKIATWO", "s3tables:GetTableBucket", ""), "the bucket's resource")?;
+    // The policy calls are never refused to a key: it cannot lock itself out.
+    Check.isTrue(lets(borrow s, "AKIATWO", "s3tables:PutTableBucketPolicy", ""), "its policy calls")?;
+    Check.isTrue(lets(borrow s, "AKIATWO", "s3tables:DeleteTableBucketPolicy", ""), "and deleting it")?;
+    // A table's own policy: no one reads this table's data; another table's is not touched.
+    var key = tablePolicyKey(POLICY_TABLE_ID.bytes())!;
+    let _ = s.putObject(
+        "sales--table-s3",
+        StringView.fromUtf8(key.view()) ?? "",
+        "application/json",
+        "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:GetTableData\",\"Resource\":\"arn:aws:s3tables:us-east-1:0:bucket/sales/table/*\"}}".bytes(),
+        PutCondition.None,
+    )!;
+    Check.isFalse(lets(borrow s, "AKIATWO", "s3tables:GetTableData", POLICY_TABLE_ID), "its data")?;
+    Check.isTrue(lets(borrow s, "AKIATWO", "s3tables:PutTableData", POLICY_TABLE_ID), "writing it")?;
+    Check.isTrue(
+        lets(borrow s, "AKIATWO", "s3tables:GetTableData", "11111111-2222-4333-8444-555555555555"),
+        "another table",
+    )?;
+    // A stored policy that no longer parses refuses, as a bucket's does (ADR-0043 §9).
+    putPolicy(mut s, TABLE_BUCKET_POLICY_KEY, "{\"Statement\":[]");
+    Check.isFalse(lets(borrow s, "AKIATWO", "s3tables:GetTable", POLICY_TABLE_ID), "a broken policy")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn tableDataKeys() -> Result<void, TestFailure> {
+    let id = POLICY_TABLE_ID.bytes();
+    var key = copyBytes(id)!;
+    key.extend("/data/a.parquet".bytes())!;
+    Check.equalBytes(id, tableIdOfKey(key.view(), false)!)?;
+    Check.isTrue(tableIdOfKey(id, false).isNull(), "the id alone is no object's key")?;
+    Check.equalBytes(id, tableIdOfKey(id, true)!)?;
+    for (bad in [".s3tables/policy", "data/a.parquet", "0f8e9a2b-1c3d-4e5f-8a7b-6c5d4e3f2a1bX/a", ""]) {
+        Check.isTrue(tableIdOfKey(bad.bytes(), true).isNull(), bad)?;
+    }
+    return Ok();
+}
+
+@test
+fn tableBucketsMadeBeforeM9() -> Result<void, TestFailure> {
+    // A `--table-s3` bucket holding a key no table bucket can is S3's, from before M9 (ADR-0084 §5).
+    let dir = scratchDirectory("tables-legacy");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("plain")!;
+    s.createBucket("sales--table-s3")!;
+    s.createBucket("empty--table-s3")!;
+    for (k in [
+        "anything.txt",
+    ]) {
+        let _ = s.putObject("plain", k, "", "x".bytes(), PutCondition.None)!;
+    }
+    for (k in [
+        ".s3tables/namespaces/ns",
+        ".s3tables/tables/ns/t",
+        "0f8e9a2b-1c3d-4e5f-8a7b-6c5d4e3f2a1b/metadata/00000-a.metadata.json",
+        "0f8e9a2b-1c3d-4e5f-8a7b-6c5d4e3f2a1b/data/a.parquet",
+        "11111111-2222-4333-8444-555555555555/data/b.parquet",
+    ]) {
+        let _ = s.putObject("sales--table-s3", k, "", "x".bytes(), PutCondition.None)!;
+    }
+    Check.isTrue(legacyTableBucket(borrow s)!.isNull(), "a table bucket's keys, an ordinary bucket's, an empty one")?;
+    let _ = s.putObject("sales--table-s3", "zz-mine.csv", "", "x".bytes(), PutCondition.None)!;
+    Check.equalBytes("sales--table-s3".bytes(), legacyTableBucket(borrow s)!!.view())?;
+    let message = legacyTableBucketMessage("sales--table-s3".bytes())!;
+    Check.isTrue(findBytes(message.bytes(), "release before M9".bytes(), 0).isSome(), "says what to do")?;
+    removeTree(dir.view());
+    return Ok();
+}

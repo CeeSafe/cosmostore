@@ -812,7 +812,11 @@ fn createTable(
 }
 
 /// GetTable (`/get-table`): by the bucket's ARN, namespace and name, or by the table's ARN.
-fn getTable(store: borrow mut ObjectStore, req: borrow S3Request) -> Result<TablesAnswer, TablesError> {
+fn getTable(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    caller: borrow TablesCaller,
+) -> Result<TablesAnswer, TablesError> {
     var tableId = Vector<u8>.create();
     var bucketName = Vector<u8>.create();
     var ns = Vector<u8>.create();
@@ -859,6 +863,13 @@ fn getTable(store: borrow mut ObjectStore, req: borrow S3Request) -> Result<Tabl
         if (name.length == 0) { return Err(TablesError.NotFound); }
     }
     let rec = tableRecord(store, bucketName.view(), ns.view(), name.view())?;
+    checkTables(
+        store,
+        caller,
+        "s3tables:GetTable",
+        bucketName.view(),
+        jsonMemberText(borrow rec.json, "id") ?? "".bytes(),
+    )?;
     let nsId = namespaceIdOf(store, hidden.view(), ns.view())?;
     let view = tableView(
         req,
@@ -996,6 +1007,13 @@ fn deleteTable(
             Ok() => {}
             Err(e) => { return Err(tablesStoreFail(e)); }
         }
+        // Its policy goes with it (ADR-0084 §1).
+        let policy = tablePolicyKey(id.view())?;
+        match (store.deleteObject(bucket, catalogText(policy.view()))) {
+            Ok() => {}
+            Err(StoreError.NoSuchKey) => {}
+            Err(e) => { return Err(tablesStoreFail(e)); }
+        }
     }
     // Its objects go after the answer's work, a page at a time (`purgeWarehouse`).
     var answer = tablesNoContent();
@@ -1131,86 +1149,155 @@ fn bucketOfSegment(segment: Slice<u8>) -> Result<Vector<u8>, TablesError> {
     };
 }
 
+/// The policy method's action name: `Get`, `Put` or `Delete` and `what` (`TableBucketPolicy`, `TablePolicy`).
+fn policyActionOf(m: Method, bucketLevel: bool) -> StringView =>
+    if (isMethod(m, Method.Put)) (if (bucketLevel) "s3tables:PutTableBucketPolicy" else "s3tables:PutTablePolicy")
+        else if (isMethod(
+            m,
+            Method.Delete,
+        )) (if (bucketLevel) "s3tables:DeleteTableBucketPolicy" else "s3tables:DeleteTablePolicy")
+        else (if (bucketLevel) "s3tables:GetTableBucketPolicy" else "s3tables:GetTablePolicy");
+
 fn routeTablesSync(
     store: borrow mut ObjectStore,
     req: borrow S3Request,
     body: Slice<u8>,
+    caller: borrow TablesCaller,
+    credentials: Slice<Credential>,
 ) -> Result<TablesAnswer, TablesError> {
     let segs = pathSegments(req.rawPath.view())?;
     let m = req.method;
     if (segs.length == 0) { return Err(TablesError.NotImplemented); }
     let top = segs[0].view();
-    // The Iceberg REST catalog (ADR-0083 §5).
-    if (top == "iceberg".bytes()) { return icebergRoute(store, req, segs.view()[1..], body); }
+    // The Iceberg REST catalog (ADR-0083 §5), its calls authorized as S3 Tables' (ADR-0084 §3).
+    if (top == "iceberg".bytes()) { return icebergRoute(store, req, segs.view()[1..], body, caller); }
+    // Each call is authorized by its table bucket's and its table's policies before it runs (ADR-0084 §2).
     if (top == "get-table".bytes() && segs.length == 1) {
         if (!isMethod(m, Method.Get)) { return Err(TablesError.BadRequest); }
-        return getTable(store, req);
+        return getTable(store, req, caller);
     }
     if (top == "buckets".bytes()) {
+        // CreateTableBucket and ListTableBuckets name no table bucket: no policy applies.
         if (segs.length == 1) {
             if (isMethod(m, Method.Put)) { return createTableBucket(store, req, body); }
             if (isMethod(m, Method.Get)) { return listTableBuckets(store, req); }
             return Err(TablesError.BadRequest);
         }
         let bucket = bucketOfSegment(segs[1].view())?;
-        // Its policy, encryption, maintenance, replication and the rest: not done (ADR-0083 §6).
+        if (segs.length == 3 && segs[2].view() == "policy".bytes()) {
+            let _ = tableBucketRecord(store, bucket.view())?;
+            checkTables(store, caller, policyActionOf(m, true), bucket.view(), "".bytes())?;
+            return tablesPolicyCall(store, m, bucket.view(), TABLE_BUCKET_POLICY_KEY.bytes(), body, credentials);
+        }
+        // Its encryption, maintenance, replication and the rest: not done (ADR-0083 §6).
         if (segs.length > 2) { return Err(TablesError.NotImplemented); }
-        if (isMethod(m, Method.Get)) { return getTableBucket(store, req, bucket.view()); }
-        if (isMethod(m, Method.Delete)) { return deleteTableBucket(store, bucket.view()); }
+        if (isMethod(m, Method.Get)) {
+            checkTables(store, caller, "s3tables:GetTableBucket", bucket.view(), "".bytes())?;
+            return getTableBucket(store, req, bucket.view());
+        }
+        if (isMethod(m, Method.Delete)) {
+            checkTables(store, caller, "s3tables:DeleteTableBucket", bucket.view(), "".bytes())?;
+            return deleteTableBucket(store, bucket.view());
+        }
         return Err(TablesError.BadRequest);
     }
     if (top == "namespaces".bytes() && segs.length >= 2) {
         let bucket = bucketOfSegment(segs[1].view())?;
         if (segs.length == 2) {
-            if (isMethod(m, Method.Put)) { return createNamespace(store, req, bucket.view(), body); }
-            if (isMethod(m, Method.Get)) { return listNamespaces(store, req, bucket.view()); }
+            if (isMethod(m, Method.Put)) {
+                checkTables(store, caller, "s3tables:CreateNamespace", bucket.view(), "".bytes())?;
+                return createNamespace(store, req, bucket.view(), body);
+            }
+            if (isMethod(m, Method.Get)) {
+                checkTables(store, caller, "s3tables:ListNamespaces", bucket.view(), "".bytes())?;
+                return listNamespaces(store, req, bucket.view());
+            }
             return Err(TablesError.BadRequest);
         }
         if (segs.length > 3) { return Err(TablesError.NotImplemented); }
         let ns = segs[2].view();
-        if (isMethod(m, Method.Get)) { return getNamespace(store, req, bucket.view(), ns); }
-        if (isMethod(m, Method.Delete)) { return deleteNamespace(store, bucket.view(), ns); }
+        if (isMethod(m, Method.Get)) {
+            checkTables(store, caller, "s3tables:GetNamespace", bucket.view(), "".bytes())?;
+            return getNamespace(store, req, bucket.view(), ns);
+        }
+        if (isMethod(m, Method.Delete)) {
+            checkTables(store, caller, "s3tables:DeleteNamespace", bucket.view(), "".bytes())?;
+            return deleteNamespace(store, bucket.view(), ns);
+        }
         return Err(TablesError.BadRequest);
     }
     if (top == "tables".bytes() && segs.length >= 2) {
         let bucket = bucketOfSegment(segs[1].view())?;
         if (segs.length == 2) {
-            if (isMethod(m, Method.Get)) { return listTables(store, req, bucket.view()); }
+            if (isMethod(m, Method.Get)) {
+                checkTables(store, caller, "s3tables:ListTables", bucket.view(), "".bytes())?;
+                return listTables(store, req, bucket.view());
+            }
             return Err(TablesError.BadRequest);
         }
         let ns = segs[2].view();
         if (segs.length == 3) {
-            if (isMethod(m, Method.Put)) { return createTable(store, req, bucket.view(), ns, body); }
+            if (isMethod(m, Method.Put)) {
+                checkTables(store, caller, "s3tables:CreateTable", bucket.view(), "".bytes())?;
+                return createTable(store, req, bucket.view(), ns, body);
+            }
             return Err(TablesError.BadRequest);
         }
         let name = segs[3].view();
+        // The calls on one table: its id is its policy's key and its resource's.
+        let id = tableIdOf(store, bucket.view(), ns, name)?;
         if (segs.length == 4) {
-            if (isMethod(m, Method.Delete)) { return deleteTable(store, req, bucket.view(), ns, name); }
+            if (isMethod(m, Method.Delete)) {
+                checkTables(store, caller, "s3tables:DeleteTable", bucket.view(), id.view())?;
+                return deleteTable(store, req, bucket.view(), ns, name);
+            }
             return Err(TablesError.BadRequest);
         }
         let what = segs[4].view();
         if (segs.length == 5 && what == "rename".bytes() && isMethod(m, Method.Put)) {
+            checkTables(store, caller, "s3tables:RenameTable", bucket.view(), id.view())?;
             return renameTable(store, bucket.view(), ns, name, body);
         }
         if (segs.length == 5 && what == "metadata-location".bytes()) {
-            if (isMethod(m, Method.Get)) { return getTableMetadataLocation(store, bucket.view(), ns, name); }
+            if (isMethod(m, Method.Get)) {
+                checkTables(store, caller, "s3tables:GetTableMetadataLocation", bucket.view(), id.view())?;
+                return getTableMetadataLocation(store, bucket.view(), ns, name);
+            }
             if (isMethod(m, Method.Put)) {
+                checkTables(store, caller, "s3tables:UpdateTableMetadataLocation", bucket.view(), id.view())?;
                 return updateTableMetadataLocation(store, req, bucket.view(), ns, name, body);
             }
         }
-        // A table's policy, encryption, maintenance and the rest: not done (ADR-0083 §6).
+        if (segs.length == 5 && what == "policy".bytes()) {
+            checkTables(store, caller, policyActionOf(m, false), bucket.view(), id.view())?;
+            let key = tablePolicyKey(id.view())?;
+            return tablesPolicyCall(store, m, bucket.view(), key.view(), body, credentials);
+        }
+        // A table's encryption, maintenance and the rest: not done (ADR-0083 §6).
         return Err(TablesError.NotImplemented);
     }
     return Err(TablesError.NotImplemented);
 }
 
 /// The S3 Tables API's work under the store, on a worker thread, then a dropped table's objects removed.
-async fn routeTables(app: borrow S3App, req: borrow S3Request, body: Slice<u8>) -> Result<TablesAnswer, TablesError> {
+async fn routeTables(
+    app: borrow S3App,
+    req: borrow S3Request,
+    body: Slice<u8>,
+    who: borrow Requester,
+) -> Result<TablesAnswer, TablesError> {
     var answer = tablesNoContent();
+    let caller = TablesCaller {
+        principal: principalOf(app, who)?,
+        facts: policyFacts(req, false, app.secure, who.peer)?,
+    };
+    let callerRef = borrow caller;
     {
+        let credentials = app.credentials.get();
+        let keys = credentials.view();
         var guard = await lockStore(app)?;
         let store = guard.data();
-        answer = await Async.blocking(() => routeTablesSync(store, req, body))?;
+        answer = await Async.blocking(() => routeTablesSync(store, req, body, callerRef, keys))?;
     }
     if (answer.purgeId.length > 0) {
         let bucket = replace(mut answer.purgeBucket, Vector<u8>.create());
@@ -1296,7 +1383,7 @@ async fn serveTables(app: borrow S3App, req: borrow S3Request, exchange: borrow 
             if (who.key.isNull() || who.role.isSome() || headerOf(req, EXPRESS_TOKEN_FIELD).isSome()) {
                 Err(TablesError.Forbidden)
             } else {
-                await routeTables(app, req, body.view())
+                await routeTables(app, req, body.view(), borrow who)
             }
         }
         Err(_) => Err(TablesError.Forbidden),
@@ -1351,18 +1438,20 @@ fn tableWarehouseRefusal(req: borrow S3Request) -> Result<void, S3Fail> {
         }
         null => {}
     }
-    if (req.key.length > 0) { return Ok(); }
+    // A table's files are under its id (ADR-0084 §4): another key is no table's, and none is written.
+    if (req.key.length > 0) {
+        if (tableIdOfKey(req.key.bytes(), false).isNull()) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+        return Ok();
+    }
     let m = req.method;
     // CreateBucket of such a name: not S3's to make.
     if (isMethod(m, Method.Put) && req.query.length == 0) { return Err(S3Fail.Code(S3Code.InvalidBucketName)); }
     if (isMethod(m, Method.Head) && req.query.length == 0) { return Ok(); }
     if (isMethod(m, Method.Post) && req.onlyParams("delete")) { return Ok(); }
     if (isMethod(m, Method.Get) && (req.hasParam("list-type") || req.hasParam("uploads"))) {
-        // A listing names a prefix that cannot reach the catalog's keys.
+        // A listing names one table's prefix (ADR-0084 §4), which cannot reach the catalog's keys.
         let prefix = paramOf(req, "prefix") ?? "".bytes();
-        if (prefix.length == 0 || startsWithBytes(catalog, prefix) || startsWithBytes(prefix, catalog)) {
-            return Err(S3Fail.Code(S3Code.AccessDenied));
-        }
+        if (tableIdOfKey(prefix, true).isNull()) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
         return Ok();
     }
     return Err(S3Fail.Code(S3Code.NotImplemented));

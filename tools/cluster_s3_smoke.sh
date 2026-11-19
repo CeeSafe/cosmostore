@@ -404,6 +404,10 @@ ctarn=$(on 1 s3tables get-table --table-bucket-arn "$tba" --namespace sales --na
 check "get-table by its ARN through node 3" "$(on 3 s3tables get-table --table-arn "$ctarn" --query name --output text 2>&1)" orders
 on 2 s3tables create-table --table-bucket-arn "$tba" --namespace sales --name other --format ICEBERG > /dev/null 2>&1
 check "a rename onto a table there" "$(on 3 s3tables rename-table --table-bucket-arn "$tba" --namespace sales --name other --new-name orders 2>&1 | grep -o ConflictException | head -1)" ConflictException
+# A table bucket's policy put through one node decides a call through another, on the bucket's shard (ADR-0084).
+on 1 s3tables put-table-bucket-policy --table-bucket-arn "$tba" --resource-policy "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:DeleteTable\",\"Resource\":\"$tba/table/*\"}}" > /dev/null 2>&1
+check "a table bucket's policy through node 1, its Deny through node 2" "$(on 2 s3tables delete-table --table-bucket-arn "$tba" --namespace sales --name other 2>&1 | grep -o ForbiddenException | head -1)" ForbiddenException
+on 3 s3tables delete-table-bucket-policy --table-bucket-arn "$tba" > /dev/null 2>&1
 on 1 s3tables delete-table --table-bucket-arn "$tba" --namespace sales --name other > /dev/null 2>&1
 on 1 s3tables delete-table --table-bucket-arn "$tba" --namespace sales --name orders > /dev/null 2>&1
 check "its files gone with it" "$(on 2 s3api list-objects-v2 --bucket "$cwb" --prefix "$cpre/" --query 'length(Contents || `[]`)' 2>&1)" 0

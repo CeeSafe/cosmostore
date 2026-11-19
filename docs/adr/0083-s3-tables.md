@@ -91,10 +91,8 @@ S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR
      UUID's form of a hash of both. So CreateTableBucket is one write, which a cluster's shard commits as one.
    - **Names:** the store takes such a name past S3's 63 characters (up to 73: a valid bucket name and
      `--table-s3`), for these buckets alone.
-   - **Upgrading:** a general-purpose bucket named `<name>--table-s3` made before M9 (S3's names allowed it) is read
-     as table bucket `<name>`: hidden, its bucket calls refused, its `.s3tables/` keys read as records. Rename such a
-     bucket's objects into another bucket before upgrading. As for `--x-s3` names at M8, the server does not look for
-     one.
+   - **Upgrading:** a general-purpose bucket named `<name>--table-s3` made before M9 (S3's names allowed it) would be
+     read as table bucket `<name>`. The server does not start with one (ADR-0084 §5).
 3. **The catalog is objects, and its compare-and-set is a conditional write.**
    - **Where records live:** a namespace is the object `.s3tables/namespaces/<ns>`, and a table is
      `.s3tables/tables/<ns>/<name>`, in the table bucket's hidden bucket. Each is a small JSON record. A table's
@@ -149,10 +147,9 @@ S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR
    (an Iceberg schema given to the S3 Tables API itself) is taken and written as the first metadata file. Its members
    are AWS's service model's, by their wire names (`spec-id`, `source-id`, `field-id`, `order-id`, `null-order`); one
    it does not have, or a field `type` that is not a string, is refused.
-   - **No policy restricts S3 Tables** (M9's exit review, B6): no `s3tables:` action is authorized against a policy,
-     so every long-term key, and its `GetSessionToken` sessions, may make, change, drop and purge every table bucket,
-     whatever Deny statements it meets elsewhere. Anonymous requests, AssumeRole sessions and directory-bucket sessions
-     are refused. Policies for S3 Tables are a design of their own, for when they are wanted.
+   - **Policies** (M9's exit review, B6): table bucket and table policies, `s3tables:` actions decided by them, and a
+     table's data through S3 as `s3tables:GetTableData`/`PutTableData`, are ADR-0084's. Anonymous requests,
+     AssumeRole sessions and directory-bucket sessions are refused.
 7. **On a cluster** (slice 3):
    - **Routing:** the front routes a request signed for `s3tables` by the table bucket it names, to its hidden
      bucket's shard. It finds the name in CreateTableBucket's body, the ARN in the path, GetTable's query, or the

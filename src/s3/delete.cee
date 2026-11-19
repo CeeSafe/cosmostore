@@ -171,15 +171,51 @@ async fn deleteObjects(
     // Each key by the bucket's policy, read once (ADR-0043 §5): a refused key gets an error, the others go on.
     let bucket = req.bucket.view();
     let gate = await policyGate(app, who, bucket)?;
+    // In a table bucket's warehouse, each table's keys go only with its data's leave (`s3tables:PutTableData`), asked
+    // once per table; a key of no table is refused (ADR-0084 §4).
+    let warehouse = isTableWarehouseShaped(bucket.bytes());
+    var tablesRefused = Vector<Vector<u8>>.create();
+    if (warehouse) {
+        var asked = Vector<Vector<u8>>.create();
+        for (i in 0..request.targets.length) {
+            match (tableIdOfKey(request.targets[i].key.view(), false)) {
+                Some(id) => {
+                    var seen = false;
+                    for (k in 0..asked.length) {
+                        if (asked[k].view() == id) { seen = true; }
+                    }
+                    if (seen) { continue; }
+                    asked.push(copyBytes(id)?)?;
+                    if (!await tableDataAllowed(app, req, who, "s3tables:PutTableData", bucket.bytes(), id)?) {
+                        tablesRefused.push(copyBytes(id)?)?;
+                    }
+                }
+                null => {}
+            }
+        }
+    }
     var refused = Vector<bool>.create();
     var allowed = Vector<DeleteTarget>.create();
     for (i in 0..request.targets.length) {
         let t = borrow request.targets[i];
         let action = if (t.versionId.isSome()) "s3:DeleteObjectVersion" else "s3:DeleteObject";
         // Through a directory bucket's access point, a key outside its scope is refused too (ADR-0082 §3).
-        // A table bucket's catalog keys are not S3's to delete (ADR-0083 §2).
-        let catalog = isTableWarehouseShaped(bucket.bytes()) && startsWithBytes(t.key.view(), CATALOG_PREFIX.bytes());
-        let ok = !catalog && scopeAllowsKey(who, SCOPE_DELETE_OBJECT, t.key.view()) &&
+        // A table bucket's catalog keys are not S3's to delete (ADR-0083 §2), nor a key of no table, nor a table's
+        // whose policies refuse it (ADR-0084 §4).
+        var tableRefused = false;
+        if (warehouse) {
+            tableRefused = match (tableIdOfKey(t.key.view(), false)) {
+                Some(id) => {
+                    var hit = false;
+                    for (k in 0..tablesRefused.length) {
+                        if (tablesRefused[k].view() == id) { hit = true; }
+                    }
+                    hit
+                },
+                null => true,
+            };
+        }
+        let ok = !tableRefused && scopeAllowsKey(who, SCOPE_DELETE_OBJECT, t.key.view()) &&
             gateAllows(app, borrow gate, req, who, action, bucket, t.key.view())?;
         refused.push(!ok)?;
         // A version under governance retention goes only for a request that asks to bypass it and may

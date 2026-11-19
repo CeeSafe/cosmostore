@@ -3196,3 +3196,29 @@ Browser form uploads with a SigV4 POST policy.
 - **Checks:** 357 tests; the S3 smoke with PyIceberg's 23 checks; the cluster smoke's 132; and the SDK matrix (boto3,
   Go, JavaScript, Java, .NET), all passing.
 - **Next:** the owner's word on closing M9 and accepting ADR-0083.
+
+### 19 Nov 2026: B6 and B9 built, policies for S3 Tables (ADR-0084, proposed)
+
+- **The owner:** "Tackle those two findings you recorded." ADR-0084 is the design.
+- **Policies (B6):** table bucket policies and table policies, the six calls of AWS's model. They hold a bucket
+  policy's grammar, with `s3tables:` actions and `arn:aws:s3tables:` resources.
+  - **Where they are kept:** catalog objects (`.s3tables/policy`, and `.s3tables/table-policies/<id>`, so a rename
+    keeps a table's). No new record.
+  - **Every call is checked:** each S3 Tables and Iceberg call is authorized as `s3tables:<Call>` on its table
+    bucket or table. A Deny refuses a key, the policy calls are never refused to one, and a broken policy refuses.
+  - **A table's data:** an engine's S3 calls are `s3tables:GetTableData`/`PutTableData` on the table. DeleteObjects
+    asks once per table, and a copy's source is checked too.
+  - **Keys:** an object of a warehouse must be under a table's id, and a listing must name one table's prefix.
+- **Buckets made before M9 (B9):** `serve`, and each shard of a cluster node, refuse to start when a `--table-s3`
+  bucket holds a key no table bucket can. The message names the bucket and says how to move it with the release
+  before M9. The scan seeks past each table, so it reads a bucket's tables, not its objects.
+- **Checks:**
+  - Unit tests: 361, with `tablesPolicyGrammar`, `tablesPoliciesDecide`, `tableDataKeys` and
+    `tableBucketsMadeBeforeM9`.
+  - The S3 smoke covers both policies' Deny, a table's data refused, a malformed policy, the lockout guard and
+    Iceberg's 403, with PyIceberg's 23 checks.
+  - The cluster smoke's 133 include a policy put through one node deciding a call through another.
+  - **An upgrade, end to end:** the release before M9 makes `legacy--table-s3` with an object, and today's server
+    refuses to start, naming it. The old release moves the object out, and the server then starts; with a real
+    table bucket holding data, it restarts.
+- **Next:** the owner's word on ADR-0083 and ADR-0084, and on closing M9.

@@ -1,0 +1,292 @@
+// Policies for S3 Tables (ADR-0084): a table bucket's and a table's resource policies, the decision for an S3 Tables
+// or Iceberg call and for an engine's S3 calls on a table's files, and the check at startup for `--table-s3` buckets
+// that S3 made before M9.
+import web_core;
+import web_http;
+import web_server;
+
+/// A table bucket's policy, and each table's (by its id), as catalog objects (ADR-0084 §1).
+const TABLE_BUCKET_POLICY_KEY: StringView = ".s3tables/policy";
+const TABLE_POLICIES: StringView = ".s3tables/table-policies/";
+/// A resource policy's length at most, as AWS's model has it.
+const TABLES_MAX_POLICY: usize = 20480;
+/// The length of a table's id (a UUID's form): an object of a table's begins with it and `/`.
+const TABLE_ID_LENGTH: usize = 36;
+
+/// Who a request is, for the policies: its key (empty for none) and its facts for conditions.
+struct TablesCaller {
+    principal: Vector<u8>;
+    facts: PolicyFacts;
+}
+
+/// The access key of a requester, empty for none.
+fn principalOf(app: borrow S3App, who: borrow Requester) -> Result<Vector<u8>, AllocError> {
+    let credentials = app.credentials.get().view();
+    return match (who.key) {
+        Some(i) => if (i < credentials.length) copyBytes(credentials[i].accessKey.view()) else Ok(Vector<u8>.create()),
+        null => Ok(Vector<u8>.create()),
+    };
+}
+
+/// The policy calls, which a key is never refused, so it cannot lock itself out (ADR-0084 §2, as ADR-0043 §4).
+fn isTablesPolicyAction(action: StringView) -> bool =>
+    action == "s3tables:GetTableBucketPolicy" || action == "s3tables:PutTableBucketPolicy" ||
+        action == "s3tables:DeleteTableBucketPolicy" || action == "s3tables:GetTablePolicy" ||
+        action == "s3tables:PutTablePolicy" || action == "s3tables:DeleteTablePolicy";
+
+/// A table's policy's key: `.s3tables/table-policies/<id>`.
+fn tablePolicyKey(id: Slice<u8>) -> Result<Vector<u8>, AllocError> => catalogKey(TABLE_POLICIES, id, "".bytes());
+
+/// An object of the catalog as it is stored, null if there is none.
+fn readCatalogBytes(store: borrow ObjectStore, hidden: Slice<u8>, key: Slice<u8>) -> Result<Vector<u8>?, TablesError> {
+    match (store.headObject(catalogText(hidden), catalogText(key))) {
+        Ok(_) => {}
+        Err(StoreError.NoSuchKey) => { return Ok(null); }
+        Err(StoreError.NoSuchBucket) => { return Ok(null); }
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    }
+    return match (store.getObject(catalogText(hidden), catalogText(key))) {
+        Ok(b) => Ok(Some(b)),
+        Err(StoreError.NoSuchKey) => Ok(null),
+        Err(e) => Err(tablesStoreFail(e)),
+    };
+}
+
+/// Whether the policy kept at `key` (none: it does) lets the caller do `action` on `resource`: false for a Deny, or
+/// for a stored policy that no longer parses (ADR-0043 §9).
+fn policyLets(
+    store: borrow ObjectStore,
+    hidden: Slice<u8>,
+    key: Slice<u8>,
+    bucketName: Slice<u8>,
+    caller: borrow TablesCaller,
+    action: StringView,
+    resource: Slice<u8>,
+) -> Result<bool, TablesError> {
+    let document = match (readCatalogBytes(store, hidden, key)?) {
+        Some(d) => d,
+        null => { return Ok(true); }
+    };
+    let none = Vector<Credential>.create();
+    let policy = match (parseTablesPolicy(document.view(), bucketName, none.view(), false)) {
+        Ok(p) => p,
+        Err(S3Fail.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
+        Err(_) => { return Ok(false); }
+    };
+    let who: Slice<u8>? = if (caller.principal.length > 0) Some(caller.principal.view()) else null;
+    return Ok(match (decidePolicy(borrow policy, who, action, resource, borrow caller.facts)) {
+        PolicyDecision.Deny => false,
+        _ => true,
+    });
+}
+
+/// ForbiddenException unless the caller may do `action` on table bucket `bucketName`, or on its table `tableId` when
+/// one is given (ADR-0084 §2): the table bucket's policy, and the table's, refuse with a Deny; otherwise a key may.
+fn checkTables(
+    store: borrow ObjectStore,
+    caller: borrow TablesCaller,
+    action: StringView,
+    bucketName: Slice<u8>,
+    tableId: Slice<u8>,
+) -> Result<void, TablesError> {
+    if (isTablesPolicyAction(action)) { return Ok(); }
+    var resource = copyBytes(bucketName)?;
+    if (tableId.length > 0) {
+        resource.extend("/table/".bytes())?;
+        resource.extend(tableId)?;
+    }
+    let hidden = tableWarehouseBucket(bucketName)?;
+    if (!policyLets(
+        store,
+        hidden.view(),
+        TABLE_BUCKET_POLICY_KEY.bytes(),
+        bucketName,
+        caller,
+        action,
+        resource.view(),
+    )?) {
+        return Err(TablesError.Forbidden);
+    }
+    if (tableId.length > 0) {
+        let key = tablePolicyKey(tableId)?;
+        if (!policyLets(store, hidden.view(), key.view(), bucketName, caller, action, resource.view())?) {
+            return Err(TablesError.Forbidden);
+        }
+    }
+    return Ok();
+}
+
+/// A table's id by its namespace and name; NotFound if it is not there.
+fn tableIdOf(
+    store: borrow ObjectStore,
+    bucketName: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+) -> Result<Vector<u8>, TablesError> {
+    let rec = tableRecord(store, bucketName, ns, name)?;
+    return Ok(copyBytes(jsonMemberText(borrow rec.json, "id") ?? "".bytes())?);
+}
+
+// ---- The policy calls ----
+
+/// PutTableBucketPolicy and PutTablePolicy's body: `{"resourcePolicy": "<policy JSON>"}`, the policy checked as it
+/// will be read (its keys configured ones), at most TABLES_MAX_POLICY.
+fn putPolicyDocument(
+    body: Slice<u8>,
+    bucketName: Slice<u8>,
+    credentials: Slice<Credential>,
+) -> Result<Vector<u8>, TablesError> {
+    let j = tablesObject(body)?;
+    let document = copyBytes(jsonMemberText(borrow j, "resourcePolicy") ?? "".bytes())?;
+    if (document.length == 0 || document.length > TABLES_MAX_POLICY) { return Err(TablesError.BadRequest); }
+    return match (parseTablesPolicy(document.view(), bucketName, credentials, true)) {
+        Ok(_) => Ok(document),
+        Err(S3Fail.OutOfMemory(e)) => Err(TablesError.OutOfMemory(e)),
+        Err(S3Fail.Code(S3Code.NotImplemented)) => Err(TablesError.NotImplemented),
+        Err(_) => Err(TablesError.BadRequest),
+    };
+}
+
+/// A table bucket's or table's policy call (ADR-0084 §1): its policy kept at `key`, or read, or deleted.
+fn tablesPolicyCall(
+    store: borrow mut ObjectStore,
+    m: Method,
+    bucketName: Slice<u8>,
+    key: Slice<u8>,
+    body: Slice<u8>,
+    credentials: Slice<Credential>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucketName)?;
+    if (isMethod(m, Method.Put)) {
+        let document = putPolicyDocument(body, bucketName, credentials)?;
+        return match (store.putObject(
+            catalogText(hidden.view()),
+            catalogText(key),
+            "application/json",
+            document.view(),
+            PutCondition.None,
+        )) {
+            Ok(_) => Ok(tablesAnswer(200, Vector<u8>.create())),
+            Err(e) => Err(tablesStoreFail(e)),
+        };
+    }
+    if (isMethod(m, Method.Get)) {
+        let document = match (readCatalogBytes(store, hidden.view(), key)?) {
+            Some(d) => d,
+            null => { return Err(TablesError.NotFound); }
+        };
+        var answer = jsonObject();
+        jsonSet(mut answer, "resourcePolicy", Json.Text(document))?;
+        return tablesJson(borrow answer);
+    }
+    if (isMethod(m, Method.Delete)) {
+        return match (store.deleteObject(catalogText(hidden.view()), catalogText(key))) {
+            Ok() => Ok(tablesNoContent()),
+            Err(StoreError.NoSuchKey) => Ok(tablesNoContent()),
+            Err(e) => Err(tablesStoreFail(e)),
+        };
+    }
+    return Err(TablesError.BadRequest);
+}
+
+// ---- Table data through S3 (ADR-0084 §4) ----
+
+/// The table id a warehouse key or listing prefix begins with (`<id>/…`, or the id alone for a prefix); null if it
+/// begins with none.
+fn tableIdOfKey(key: Slice<u8>, prefix: bool) -> Slice<u8>? {
+    if (key.length < TABLE_ID_LENGTH || !uuidShaped(key[0..TABLE_ID_LENGTH])) { return null; }
+    if (key.length == TABLE_ID_LENGTH) { return if (prefix) Some(key) else null; }
+    if (key[TABLE_ID_LENGTH] != '/') { return null; }
+    return Some(key[0..TABLE_ID_LENGTH]);
+}
+
+/// Whether `who` may do `action` (`s3tables:GetTableData` or `PutTableData`) on table `id` of the hidden bucket
+/// `hidden`, by its table bucket's and table's policies.
+async fn tableDataAllowed(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    action: StringView,
+    hidden: Slice<u8>,
+    id: Slice<u8>,
+) -> Result<bool, S3Fail> {
+    if (!isTableWarehouseShaped(hidden)) { return Ok(true); }
+    let name = hidden[0..hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
+    let caller = TablesCaller {
+        principal: principalOf(app, who)?,
+        facts: policyFacts(req, false, app.secure, who.peer)?,
+    };
+    let callerRef = borrow caller;
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    return match (await Async.blocking(() => checkTables(store, callerRef, action, name, id))) {
+        Ok() => Ok(true),
+        Err(TablesError.Forbidden) => Ok(false),
+        Err(TablesError.OutOfMemory(e)) => Err(S3Fail.OutOfMemory(e)),
+        Err(_) => Err(S3Fail.Code(S3Code.InternalError)),
+    };
+}
+
+/// An S3 call into a table bucket's warehouse (after `tableWarehouseRefusal`): authorized as the table's data, a read
+/// as `s3tables:GetTableData` and anything else as `s3tables:PutTableData` (ADR-0084 §4). HeadBucket names no table;
+/// DeleteObjects' keys are checked one by one.
+async fn authorizeTableData(app: borrow S3App, req: borrow S3Request, who: borrow Requester) -> Result<void, S3Fail> {
+    let listing = req.key.length == 0;
+    let target = if (listing) paramOf(req, "prefix") ?? "".bytes() else req.key.bytes();
+    let id = match (tableIdOfKey(target, listing)) {
+        Some(i) => i,
+        null => { return Ok(); } // HeadBucket, DeleteObjects: what `tableWarehouseRefusal` let through
+    };
+    let read = isMethod(req.method, Method.Get) || isMethod(req.method, Method.Head);
+    let action = if (read) "s3tables:GetTableData" else "s3tables:PutTableData";
+    if (!await tableDataAllowed(app, req, who, action, req.bucket.bytes(), id)?) {
+        return Err(S3Fail.Code(S3Code.AccessDenied));
+    }
+    return Ok();
+}
+
+// ---- Table buckets made before M9 (ADR-0084 §5) ----
+
+/// A `--table-s3` bucket holding a key no table bucket can (neither `.s3tables/…` nor `<table id>/…`): one S3 made
+/// before M9. Null if there is none. Each table's keys are skipped with one seek, so this reads a bucket's tables.
+fn legacyTableBucket(store: borrow ObjectStore) -> Result<Vector<u8>?, StoreError> {
+    let all = store.listBucketInfo()?;
+    for (i in 0..all.length) {
+        let name = all[i].name.view();
+        if (!isTableWarehouseShaped(name)) { continue; }
+        let bucket = StringView.fromUtf8(name) ?? "";
+        var after = Vector<u8>.create();
+        var skipping = false;
+        while (true) {
+            let page = store.listObjects(bucket, "", "", after.view(), skipping, 1)?;
+            if (page.keys.length == 0) { break; }
+            let key = page.keys[0].view();
+            let catalog = CATALOG_PREFIX.bytes();
+            after.clear();
+            if (startsWithBytes(key, catalog)) {
+                after.extend(catalog)?;
+            } else {
+                match (tableIdOfKey(key, false)) {
+                    Some(id) => {
+                        after.extend(id)?;
+                        after.push('/')?;
+                    }
+                    null => { return Ok(Some(copyBytes(name)?)); }
+                }
+            }
+            skipping = true;
+        }
+    }
+    return Ok(null);
+}
+
+/// The message for a `--table-s3` bucket made before M9: why the server does not start, and what to do.
+fn legacyTableBucketMessage(name: Slice<u8>) -> Result<String, AllocError> {
+    var m = String.create();
+    m.append("bucket ")?;
+    m.append(StringView.fromUtf8(name) ?? "?")?;
+    m.append(
+        " was made by S3 before table buckets (M9), and a --table-s3 name is now a table bucket's (ADR-0084 §5): with the release before M9, copy its objects to another bucket and delete it",
+    )?;
+    return Ok(m);
+}

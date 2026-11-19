@@ -200,16 +200,20 @@ fn parsePrincipal<region a>(
     return Ok();
 }
 
-/// An action pattern: `*`, or `s3:` and a name of letters with `*` and `?`; kept in lower case.
-fn actionPattern(text: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
+/// An action pattern: `*`, or `s3:` and a name of letters with `*` and `?`; kept in lower case. A table bucket's or
+/// table's policy (`tables`) takes `s3tables:` actions only (ADR-0084 §1).
+fn actionPattern(text: Slice<u8>, tables: bool) -> Result<Vector<u8>, S3Fail> {
     var out = Vector<u8>.create();
     if (text == "*".bytes()) {
         out.push('*')?;
         return Ok(out);
     }
+    let tablesService = "s3tables:".bytes();
+    let isTables = text.length > tablesService.length && equalsIgnoreCase(text[0..tablesService.length], tablesService);
+    if (tables != isTables) { return Err(malformedPolicy()); }
     // `s3:`, or `s3express:` for a directory bucket's CreateSession and ListAllMyDirectoryBuckets (ADR-0080 §3).
     let express = "s3express:".bytes();
-    let service: usize = if (text.length > express.length && equalsIgnoreCase(
+    let service: usize = if (tables) tablesService.length else if (text.length > express.length && equalsIgnoreCase(
         text[0..express.length],
         express,
     )) express.length else 3;
@@ -255,6 +259,32 @@ fn policyArnTail(text: Slice<u8>) -> Slice<u8>? {
     let rest = text[account + 1..];
     if (!startsWithBytes(rest, kind)) { return null; }
     return Some(rest[kind.length..]);
+}
+
+/// A resource of a table bucket's or table's policy (ADR-0084 §1): `arn:aws:s3tables:<region>:<account>:bucket/`
+/// and this table bucket's name, or its tables' (`<name>/table/<id>`), with wildcards; kept after `bucket/`.
+fn tablesResourcePattern(text: Slice<u8>, bucket: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
+    let head = "arn:aws:s3tables:".bytes();
+    if (!startsWithBytes(text, head)) { return Err(malformedPolicy()); }
+    if (findBytes(text, "${".bytes(), 0).isSome()) { return Err(notImplemented()); } // policy variables
+    // The region and the account: any, as CosmoStore has one of each.
+    var at = head.length;
+    for (field in 0..2) {
+        let colon = pieceEnd(text, at, ':');
+        if (colon == text.length) { return Err(malformedPolicy()); }
+        at = colon + 1;
+    }
+    let kind = "bucket/".bytes();
+    let rest = text[at..];
+    if (!startsWithBytes(rest, kind)) { return Err(malformedPolicy()); }
+    let pattern = rest[kind.length..];
+    var tables = copyBytes(bucket)?;
+    tables.extend("/table/".bytes())?;
+    let fixed = literalPrefix(pattern);
+    let ours = pattern == bucket || startsWithBytes(fixed, tables.view()) ||
+        (fixed.length < pattern.length && startsWithBytes(tables.view(), fixed));
+    if (!ours) { return Err(malformedPolicy()); }
+    return Ok(copyBytes(pattern)?);
 }
 
 /// A resource pattern of this bucket, after `arn:aws:s3:::`: the bucket, or objects in it (ADR-0043 §3). A pattern
@@ -456,6 +486,7 @@ fn parseStatement<region a>(
     checkKeys: bool,
     identity: bool,
     accessPoint: Slice<u8>,
+    tables: bool,
 ) -> Result<PolicyStatement, S3Fail> {
     var st = PolicyStatement {
         allow: false,
@@ -512,13 +543,16 @@ fn parseStatement<region a>(
             st.notAction = field == 5;
             var raw = Vector<Vector<u8>>.create();
             policyStrings(r, mut raw)?;
-            for (i in 0..raw.length) { st.actions.push(actionPattern(raw[i].view())?)?; }
+            for (i in 0..raw.length) { st.actions.push(actionPattern(raw[i].view(), tables)?)?; }
         } else if (field == 6 || field == 7) {
             st.notResource = field == 7;
             var raw = Vector<Vector<u8>>.create();
             policyStrings(r, mut raw)?;
             for (i in 0..raw.length) {
-                let pattern = if (identity) identityResourcePattern(
+                let pattern = if (tables) tablesResourcePattern(
+                    raw[i].view(),
+                    bucket,
+                )? else if (identity) identityResourcePattern(
                     raw[i].view(),
                 )? else if (accessPoint.length > 0) accessPointResourcePattern(
                     raw[i].view(),
@@ -555,12 +589,29 @@ fn parseBucketPolicy(
     bucket: Slice<u8>,
     credentials: Slice<Credential>,
     checkKeys: bool,
-) -> Result<BucketPolicy, S3Fail> => parsePolicyDocument(json, bucket, credentials, checkKeys, false, "".bytes());
+) -> Result<BucketPolicy, S3Fail> => parsePolicyDocument(
+    json,
+    bucket,
+    credentials,
+    checkKeys,
+    false,
+    "".bytes(),
+    false,
+);
+
+/// A table bucket's or a table's policy (ADR-0084 §1): a bucket policy's grammar, its actions `s3tables:`, its
+/// resources table bucket `bucket`'s ARN and its tables', kept after `bucket/` (`<name>`, `<name>/table/<id>`).
+fn parseTablesPolicy(
+    json: Slice<u8>,
+    bucket: Slice<u8>,
+    credentials: Slice<Credential>,
+    checkKeys: bool,
+) -> Result<BucketPolicy, S3Fail> => parsePolicyDocument(json, bucket, credentials, checkKeys, false, "".bytes(), true);
 
 /// An identity policy's JSON (ADR-0075 §2): a role's, or a session's; no `Principal`, resources in any bucket.
 fn parseIdentityPolicy(json: Slice<u8>) -> Result<BucketPolicy, S3Fail> {
     let none = Vector<Credential>.create();
-    return parsePolicyDocument(json, "".bytes(), none.view(), false, true, "".bytes());
+    return parsePolicyDocument(json, "".bytes(), none.view(), false, true, "".bytes(), false);
 }
 
 /// An access point's policy (ADR-0076 §3): a bucket policy's grammar, its resources the access point's ARN
@@ -572,7 +623,7 @@ fn parseAccessPointPolicy(
     bucket: Slice<u8>,
     credentials: Slice<Credential>,
     checkKeys: bool,
-) -> Result<BucketPolicy, S3Fail> => parsePolicyDocument(json, bucket, credentials, checkKeys, false, name);
+) -> Result<BucketPolicy, S3Fail> => parsePolicyDocument(json, bucket, credentials, checkKeys, false, name, false);
 
 /// An access point policy's resource as a bucket policy's: `<bucket>` or `<bucket>/<key pattern>`. A directory
 /// bucket's access point is named by an `arn:aws:s3express:` ARN (ADR-0082 §2).
@@ -620,6 +671,7 @@ fn parsePolicyDocument(
     checkKeys: bool,
     identity: bool,
     accessPoint: Slice<u8>,
+    tables: bool,
 ) -> Result<BucketPolicy, S3Fail> {
     var policy = BucketPolicy { statements: Vector<PolicyStatement>.create(), denies: false };
     if (json.length == 0 || json.length > MAX_POLICY_BYTES) { return Err(malformedPolicy()); }
@@ -649,13 +701,17 @@ fn parsePolicyDocument(
             let _ = r.take('[');
             if (r.take(']')) { return Err(malformedPolicy()); }
             while (true) {
-                policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys, identity, accessPoint)?)?;
+                policy.statements.push(
+                    parseStatement(mut r, bucket, credentials, checkKeys, identity, accessPoint, tables)?,
+                )?;
                 if (r.take(',')) { continue; }
                 if (r.take(']')) { break; }
                 return Err(malformedPolicy());
             }
         } else {
-            policy.statements.push(parseStatement(mut r, bucket, credentials, checkKeys, identity, accessPoint)?)?;
+            policy.statements.push(
+                parseStatement(mut r, bucket, credentials, checkKeys, identity, accessPoint, tables)?,
+            )?;
         }
         if (r.take(',')) { continue; }
         if (r.take('}')) { break; }

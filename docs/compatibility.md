@@ -49,10 +49,18 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
   `.s3tables/` keys, and no bucket call). Policies, maintenance, encryption, tags, replication and the rest are
   NotImplemented. CreateTable takes an Iceberg `metadata` schema (not `schemaV2`), with only the members AWS's
   service model has. A metadata location ends `.metadata.json` (`.gz` is refused).
-  - **No policy restricts S3 Tables:** every long-term key (and its `GetSessionToken` sessions) may make, change, drop
-    and purge every table bucket. Anonymous requests and AssumeRole and directory-bucket sessions are refused.
-  - **Upgrading:** a general-purpose bucket named `<name>--table-s3`, made before M9, becomes table bucket `<name>`
-    and its bucket calls are refused: move its objects out before upgrading (ADR-0083 §2).
+  - **Policies** (ADR-0084): table bucket policies and table policies (`put-table-bucket-policy`,
+    `put-table-policy` and their get and delete). They hold `s3tables:` actions on `arn:aws:s3tables:` resources, with
+    a bucket policy's principals and conditions.
+    - **How they decide:** a Deny refuses a key; otherwise a key may. The policy calls are never refused to a key, so
+      it cannot lock itself out.
+    - **A table's data:** an engine's S3 calls on it are `s3tables:GetTableData` (reads) and `s3tables:PutTableData`
+      (writes and deletes).
+    - **Not taken:** anonymous requests, AssumeRole sessions and directory-bucket sessions.
+  - **A table's files** are under its id (`<warehouse>/…`). An object of no table, or a listing whose prefix is not
+    one table's, is refused.
+  - **Upgrading:** a general-purpose bucket named `<name>--table-s3`, made before M9, stops the server from
+    starting, which names it. Move its objects out with the release before M9 (ADR-0084 §5).
 - **The Iceberg REST catalog** (ADR-0083 §5): `<endpoint>/iceberg`, signed for `s3tables`, the `warehouse` a table
   bucket's ARN.
   - **PyIceberg:**

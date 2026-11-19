@@ -1230,6 +1230,24 @@ check "an Iceberg error in Iceberg's shape" "$(curl -s --aws-sigv4 "aws:amz:us-e
 check "get-table's namespaceId" "$(aws s3tables get-table --table-bucket-arn "$tarn" --namespace sales --name orders --query namespaceId --output text 2>&1)" "$(aws s3tables get-namespace --table-bucket-arn "$tarn" --namespace sales --query namespaceId --output text 2>&1)"
 check "a rename to nothing new" "$(code s3tables rename-table --table-bucket-arn "$tarn" --namespace sales --name orders)" BadRequestException
 check "a gzipped metadata location" "$(code s3tables update-table-metadata-location --table-bucket-arn "$tarn" --namespace sales --name orders --version-token "$ttok" --metadata-location "$twh/metadata/00002-b.metadata.json.gz")" BadRequestException
+# Policies for S3 Tables (ADR-0084): a table bucket's Deny stops a key; a table's stops its data through S3.
+check "a key outside every table" "$(code s3api put-object --bucket "$twb" --key loose.txt --body dir.txt)" AccessDenied
+tpol="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam:::user/$AWS_ACCESS_KEY_ID\"},\"Action\":\"s3tables:DeleteTable\",\"Resource\":\"$tarn/table/*\"}]}"
+aws s3tables put-table-bucket-policy --table-bucket-arn "$tarn" --resource-policy "$tpol" > /dev/null 2>&1 && pass "put-table-bucket-policy" || fail "put-table-bucket-policy"
+check "get-table-bucket-policy" "$(aws s3tables get-table-bucket-policy --table-bucket-arn "$tarn" --query resourcePolicy --output text 2>&1)" "$tpol"
+check "its Deny refuses the key" "$(code s3tables delete-table --table-bucket-arn "$tarn" --namespace sales --name orders)" ForbiddenException
+check "an S3 action in it" "$(code s3tables put-table-bucket-policy --table-bucket-arn "$tarn" --resource-policy '{"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"*"}}')" BadRequestException
+aws s3tables put-table-policy --table-bucket-arn "$tarn" --namespace sales --name orders --resource-policy "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:GetTableData\",\"Resource\":\"$tarn/table/*\"}}" > /dev/null 2>&1 && pass "put-table-policy" || fail "put-table-policy"
+check "its Deny refuses the table's data" "$(code s3api get-object --bucket "$twb" --key "$tpre/metadata/00001-a.metadata.json" dir.out)" AccessDenied
+aws s3api put-object --bucket "$twb" --key "$tpre/data/w.parquet" --body dir.txt > /dev/null 2>&1 && pass "writing it is another action" || fail "writing it is another action"
+aws s3tables delete-table-policy --table-bucket-arn "$tarn" --namespace sales --name orders > /dev/null 2>&1
+aws s3api get-object --bucket "$twb" --key "$tpre/metadata/00001-a.metadata.json" dir.out > /dev/null 2>&1 && pass "the table's data after its policy" || fail "the table's data after its policy"
+# A Deny of everything: the key keeps its policy calls (it cannot lock itself out); the Iceberg catalog refuses in its shape.
+aws s3tables put-table-bucket-policy --table-bucket-arn "$tarn" --resource-policy "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:*\",\"Resource\":[\"$tarn\",\"$tarn/table/*\"]}}" > /dev/null 2>&1
+check "everything refused" "$(code s3tables get-table --table-bucket-arn "$tarn" --namespace sales --name orders)" ForbiddenException
+check "the Iceberg catalog too" "$(curl -s --aws-sigv4 "aws:amz:us-east-1:s3tables" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" "$AWS_ENDPOINT_URL/iceberg/v1/config?warehouse=$tarn" | python3 -I -c 'import json,sys; e=json.load(sys.stdin)["error"]; print(e["code"], e["type"])')" "403 ForbiddenException"
+aws s3tables delete-table-bucket-policy --table-bucket-arn "$tarn" > /dev/null 2>&1 && pass "but not its policy calls" || fail "but not its policy calls"
+check "no policy now" "$(code s3tables get-table-bucket-policy --table-bucket-arn "$tarn")" NotFoundException
 check "nor is the warehouse bucket" "$(code s3api delete-bucket --bucket "$twb")" NotImplemented
 check "a --table-s3 name for a bucket" "$(code s3api create-bucket --bucket mine--table-s3)" InvalidBucketName
 aws s3tables rename-table --table-bucket-arn "$tarn" --namespace sales --name orders --new-name orders_v2 > /dev/null 2>&1

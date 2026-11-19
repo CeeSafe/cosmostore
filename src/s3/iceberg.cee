@@ -55,7 +55,11 @@ fn encodedSegment(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, A
 const ICEBERG_ENDPOINTS: StringView =
     "GET /v1/{prefix}/namespaces,POST /v1/{prefix}/namespaces,GET /v1/{prefix}/namespaces/{namespace},HEAD /v1/{prefix}/namespaces/{namespace},DELETE /v1/{prefix}/namespaces/{namespace},GET /v1/{prefix}/namespaces/{namespace}/tables,POST /v1/{prefix}/namespaces/{namespace}/tables,GET /v1/{prefix}/namespaces/{namespace}/tables/{table},HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table},POST /v1/{prefix}/namespaces/{namespace}/tables/{table},DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table},POST /v1/{prefix}/tables/rename";
 
-fn icebergConfig(store: borrow ObjectStore, req: borrow S3Request) -> Result<TablesAnswer, TablesError> {
+fn icebergConfig(
+    store: borrow ObjectStore,
+    req: borrow S3Request,
+    caller: borrow TablesCaller,
+) -> Result<TablesAnswer, TablesError> {
     let warehouse = paramOf(req, "warehouse") ?? "".bytes();
     var none = Vector<u8>.create();
     let name = match (tableBucketOfArn(warehouse, mut none)?) {
@@ -67,6 +71,7 @@ fn icebergConfig(store: borrow ObjectStore, req: borrow S3Request) -> Result<Tab
         Err(TablesError.NotFound) => { return icebergError(404, "NoSuchWarehouseException", "No such table bucket."); }
         Err(e) => { return Err(e); }
     }
+    checkTables(store, caller, "s3tables:GetTableBucket", name.view(), "".bytes())?;
     var prefix = Vector<u8>.create();
     encodedSegment(warehouse, mut prefix)?;
     var overrides = jsonObject();
@@ -1137,15 +1142,21 @@ fn icebergTable(
     ns: Slice<u8>,
     name: Slice<u8>,
     body: Slice<u8>,
+    caller: borrow TablesCaller,
 ) -> Result<TablesAnswer, TablesError> {
     let m = req.method;
     let hidden = tableWarehouseBucket(bucket)?;
     if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
-    if (isMethod(m, Method.Post)) { return icebergCommit(store, bucket, ns, name, body); }
     let rec = match (currentTable(store, bucket, ns, name)?) {
         Some(r) => r,
         null => { return noSuchTable(); }
     };
+    // A commit is UpdateTableMetadataLocation; a load and HEAD GetTableMetadataLocation; a drop DeleteTable.
+    let action = if (isMethod(m, Method.Post)) "s3tables:UpdateTableMetadataLocation"
+        else if (isMethod(m, Method.Delete)) "s3tables:DeleteTable"
+        else "s3tables:GetTableMetadataLocation";
+    checkTables(store, caller, action, bucket, jsonMemberText(borrow rec.json, "id") ?? "".bytes())?;
+    if (isMethod(m, Method.Post)) { return icebergCommit(store, bucket, ns, name, body); }
     if (isMethod(m, Method.Head)) { return Ok(tablesNoContent()); }
     if (isMethod(m, Method.Get)) {
         let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
@@ -1172,6 +1183,7 @@ fn icebergRename(
     store: borrow mut ObjectStore,
     bucket: Slice<u8>,
     body: Slice<u8>,
+    caller: borrow TablesCaller,
 ) -> Result<TablesAnswer, TablesError> {
     let j = match (parseJson(body)?) {
         Some(j) => j,
@@ -1189,6 +1201,12 @@ fn icebergRename(
         };
         from.push(ns)?;
         from.push(copyBytes(jsonMemberText(ident, "name") ?? "".bytes())?)?;
+    }
+    // RenameTable on the source table (ADR-0084 §3).
+    match (tableIdOf(store, bucket, from[0].view(), from[1].view())) {
+        Ok(id) => { checkTables(store, caller, "s3tables:RenameTable", bucket, id.view())?; }
+        Err(TablesError.NotFound) => { return noSuchTable(); }
+        Err(e) => { return Err(e); }
     }
     // A destination namespace that is not there is NoSuchNamespace (the spec's), not a missing table.
     let hidden = tableWarehouseBucket(bucket)?;
@@ -1213,11 +1231,12 @@ fn icebergRoute(
     req: borrow S3Request,
     segs: Slice<Vector<u8>>,
     body: Slice<u8>,
+    caller: borrow TablesCaller,
 ) -> Result<TablesAnswer, TablesError> {
     let m = req.method;
     if (segs.length < 2 || segs[0].view() != "v1".bytes()) { return icebergUnsupported(); }
     if (segs.length == 2 && segs[1].view() == "config".bytes() && isMethod(m, Method.Get)) {
-        return icebergConfig(store, req);
+        return icebergConfig(store, req, caller);
     }
     var none = Vector<u8>.create();
     let bucket = match (tableBucketOfArn(segs[1].view(), mut none)?) {
@@ -1229,27 +1248,45 @@ fn icebergRoute(
         Err(TablesError.NotFound) => { return icebergError(404, "NoSuchWarehouseException", "No such table bucket."); }
         Err(e) => { return Err(e); }
     }
+    // Each call is authorized as the S3 Tables call it is (ADR-0084 §3); a refusal is 403 in Iceberg's shape.
+    let b = bucket.view();
     let rest = segs[2..];
     if (rest.length == 2 && rest[0].view() == "tables".bytes() && rest[1].view() == "rename".bytes() &&
         isMethod(m, Method.Post)) {
-        return icebergRename(store, bucket.view(), body);
+        return icebergRename(store, b, body, caller);
     }
     if (rest.length == 0 || rest[0].view() != "namespaces".bytes()) { return icebergUnsupported(); }
     if (rest.length == 1) {
-        if (isMethod(m, Method.Get)) { return icebergListNamespaces(store, req, bucket.view()); }
-        if (isMethod(m, Method.Post)) { return icebergCreateNamespace(store, bucket.view(), body); }
+        if (isMethod(m, Method.Get)) {
+            checkTables(store, caller, "s3tables:ListNamespaces", b, "".bytes())?;
+            return icebergListNamespaces(store, req, b);
+        }
+        if (isMethod(m, Method.Post)) {
+            checkTables(store, caller, "s3tables:CreateNamespace", b, "".bytes())?;
+            return icebergCreateNamespace(store, b, body);
+        }
         return icebergUnsupported();
     }
     // A multi-level namespace (its parts joined by 0x1F) is not one here.
     let ns = rest[1].view();
     if (findBytes(ns, [0x1Fu8][..], 0).isSome()) { return noSuchNamespace(); }
-    if (rest.length == 2) { return icebergNamespace(store, m, bucket.view(), ns); }
+    if (rest.length == 2) {
+        let action = if (isMethod(m, Method.Delete)) "s3tables:DeleteNamespace" else "s3tables:GetNamespace";
+        checkTables(store, caller, action, b, "".bytes())?;
+        return icebergNamespace(store, m, b, ns);
+    }
     if (rest[2].view() != "tables".bytes()) { return icebergUnsupported(); }
     if (rest.length == 3) {
-        if (isMethod(m, Method.Get)) { return icebergListTables(store, bucket.view(), ns); }
-        if (isMethod(m, Method.Post)) { return icebergCreateTable(store, bucket.view(), ns, body); }
+        if (isMethod(m, Method.Get)) {
+            checkTables(store, caller, "s3tables:ListTables", b, "".bytes())?;
+            return icebergListTables(store, b, ns);
+        }
+        if (isMethod(m, Method.Post)) {
+            checkTables(store, caller, "s3tables:CreateTable", b, "".bytes())?;
+            return icebergCreateTable(store, b, ns, body);
+        }
         return icebergUnsupported();
     }
-    if (rest.length == 4) { return icebergTable(store, req, bucket.view(), ns, rest[3].view(), body); }
+    if (rest.length == 4) { return icebergTable(store, req, b, ns, rest[3].view(), body, caller); }
     return icebergUnsupported();
 }

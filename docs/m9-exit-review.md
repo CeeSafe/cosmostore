@@ -175,10 +175,10 @@ The reviewers' *memory* points were checked, as AWS's and Iceberg's pages could 
 | B3 a copy reads the catalog | A copy's or part copy's source under `.s3tables/` of a `--table-s3` bucket is AccessDenied, whatever the destination; checked on the shard that copies | S3 smoke: CopyObject and UploadPartCopy; `catalogObject` in `tableIdsAndCatalogKeys` |
 | B4 a commit stalls the server | set- and remove-properties sort the keys once (n log n); at most 1,000 requirements and updates a commit; the body at most 1 MiB | `jsonModelRefusesAndScales` (50,000 properties set twice and removed, under 2 s); `icebergUpdatesAsIcebergApplies` |
 | B5 8 MiB before authentication | 1 MiB, read only for a request signed by one of the server's keys, or with a session's token, dated within 15 minutes | S3 smoke: "an unknown key's body is not read" |
-| B6 no policy restricts S3 Tables | Recorded as not done: ADR-0083 §6, `docs/compatibility.md` | — |
+| B6 no policy restricts S3 Tables | Recorded at first; then built (ADR-0084): table bucket and table policies decide every call and a table's data | `tablesPoliciesDecide`; S3 smoke; cluster smoke |
 | B7 `set-location`'s boundary | The warehouse itself or under `<warehouse>/` (`withinWarehouse`), as for metadata locations | `tableIdsAndCatalogKeys`; `icebergUpdatesAsIcebergApplies` |
 | B8 renames, routing | A rename's destination must be absent when it is staged (`renameObjectTo`, checked as a conditional PUT's If-None-Match, so it sees uncommitted records on a shard); the front reads GetTable's `tableArn` first, as the shard does; a request presigned for `s3tables` takes S3 Tables' route (and is refused, as on `serve`) | `renameToAnAbsentDestination`; cluster smoke: "get-table by its ARN through node 3", "a rename onto a table there" |
-| B9 a `--table-s3` bucket made before M9 | An upgrade note (ADR-0083 §2, `docs/compatibility.md`), as for `--x-s3` at M8 | — |
+| B9 a `--table-s3` bucket made before M9 | Recorded at first; then built (ADR-0084 §5): the server and cluster nodes refuse to start, naming it | `tableBucketsMadeBeforeM9`; an upgrade from the release before M9, end to end |
 | C1 remove-snapshots | Its refs (main's with the current snapshot), snapshot-log entries and kept snapshots' parents go with it, as PyIceberg applies it | `icebergUpdatesAsIcebergApplies`; PyIceberg: "remove-snapshots", rows read after it |
 | C2 `last-updated-ms` | The commit's time when no snapshot sets it | the commit path; PyIceberg's commits |
 | C3 the catalog's errors | Every error on `/iceberg/…`, a bad signature's too, in `{"error":{…}}` | S3 smoke: "an Iceberg error in Iceberg's shape" |
@@ -228,3 +228,10 @@ Closing M9, and accepting ADR-0083, are the owner's decisions.
 **After the fixes:** every finding is closed with its test, B6 and B9 as recorded rules (no `s3tables:` policies; an
 upgrade note), and the C6 fix also corrected the S3 Tables API's spec and order names. M9's "done when" holds, and
 M9 can close on the owner's word.
+
+**B6 and B9 built** (the owner: "Tackle those two findings you recorded"; ADR-0084, proposed):
+- **B6:** table bucket and table policies decide every S3 Tables and Iceberg call, and an engine's S3 calls on a
+  table's data (`s3tables:GetTableData`/`PutTableData`).
+- **B9:** the server, and a cluster node, refuse to start with a `--table-s3` bucket that S3 made before M9, naming
+  it. That is checked end to end with the release before M9.
+- **Evidence:** `tablesPoliciesDecide`, `tableBucketsMadeBeforeM9`; the S3 and cluster smokes.
