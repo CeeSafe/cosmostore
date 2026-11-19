@@ -3760,3 +3760,13 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** the cluster smoke's SSE section, a sealed source replicated, and two refusals in one batch (163
   checks); 387 unit tests, the S3 smoke and the SDK matrix pass.
 - **Next:** M13's exit review.
+
+### 20 Nov 2026: M13's exit review (`docs/m13-exit-review.md`)
+
+- **Verdict: not yet.**
+  - **A1:** a request is decided by the shard leader's node, not by the node it reaches. A revocation depends on
+    which node leads (reproduced).
+  - **A2:** sealed replicas: SSE-KMS sources, and multipart replicas into an SSE-KMS default (reproduced).
+  - **A3:** files that differ during a rotation turn replicas into a permanent FAILED.
+  - **A4:** the two-refusals fix can still lose one after a timeout.
+- **Next:** the fixes.
