@@ -21,7 +21,9 @@ import { STSClient, GetSessionTokenCommand, AssumeRoleCommand } from "@aws-sdk/c
 import {
   S3TablesClient, CreateTableBucketCommand, ListTableBucketsCommand, CreateNamespaceCommand, CreateTableCommand,
   GetTableCommand, UpdateTableMetadataLocationCommand, RenameTableCommand, ListTablesCommand, DeleteTableCommand,
-  DeleteNamespaceCommand, DeleteTableBucketCommand,
+  DeleteNamespaceCommand, DeleteTableBucketCommand, PutTableBucketMaintenanceConfigurationCommand,
+  GetTableBucketMaintenanceConfigurationCommand, GetTableMaintenanceConfigurationCommand,
+  GetTableMaintenanceJobStatusCommand,
 } from "@aws-sdk/client-s3tables";
 import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -308,6 +310,16 @@ for (const sessions of [true, false]) {
     name: "orders", versionToken: got.versionToken, metadataLocation: wh + "/metadata/00002-j.metadata.json" }))), "ConflictException");
   await t.send(new RenameTableCommand({ tableBucketARN: arn, namespace: "sales", name: "orders", newName: "orders2" }));
   check("RenameTable", (await t.send(new ListTablesCommand({ tableBucketARN: arn }))).tables.map((x) => x.name), ["orders2"]);
+  // Maintenance (ADR-0086): a table bucket's configuration put and read back; compaction is not done.
+  await t.send(new PutTableBucketMaintenanceConfigurationCommand({ tableBucketARN: arn, type: "icebergUnreferencedFileRemoval",
+    value: { status: "enabled", settings: { icebergUnreferencedFileRemoval: { unreferencedDays: 4, nonCurrentDays: 9 } } } }));
+  const bm = await t.send(new GetTableBucketMaintenanceConfigurationCommand({ tableBucketARN: arn }));
+  check("GetTableBucketMaintenanceConfiguration",
+    bm.configuration.icebergUnreferencedFileRemoval.settings.icebergUnreferencedFileRemoval.unreferencedDays, 4);
+  const tm = await t.send(new GetTableMaintenanceConfigurationCommand({ tableBucketARN: arn, namespace: "sales", name: "orders2" }));
+  check("GetTableMaintenanceConfiguration: compaction off", tm.configuration.icebergCompaction.status, "disabled");
+  const js = await t.send(new GetTableMaintenanceJobStatusCommand({ tableBucketARN: arn, namespace: "sales", name: "orders2" }));
+  check("GetTableMaintenanceJobStatus", js.status.icebergCompaction.status, "Disabled");
   await t.send(new DeleteTableCommand({ tableBucketARN: arn, namespace: "sales", name: "orders2" }));
   await t.send(new DeleteNamespaceCommand({ tableBucketARN: arn, namespace: "sales" }));
   await t.send(new DeleteTableBucketCommand({ tableBucketARN: arn }));

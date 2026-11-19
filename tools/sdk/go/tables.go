@@ -49,6 +49,25 @@ func tables(ctx context.Context, cfg aws.Config) {
 		Name: aws.String("orders"), NewName: aws.String("orders2")}))
 	names := must(t.ListTables(ctx, &s3tables.ListTablesInput{TableBucketARN: arn}))
 	check("RenameTable", len(names.Tables) == 1 && aws.ToString(names.Tables[0].Name) == "orders2", true)
+	// Maintenance (ADR-0086): a table bucket's configuration put and read back; compaction is not done.
+	_, err = t.PutTableBucketMaintenanceConfiguration(ctx, &s3tables.PutTableBucketMaintenanceConfigurationInput{
+		TableBucketARN: arn, Type: tabletypes.TableBucketMaintenanceTypeIcebergUnreferencedFileRemoval,
+		Value: &tabletypes.TableBucketMaintenanceConfigurationValue{Status: tabletypes.MaintenanceStatusEnabled,
+			Settings: &tabletypes.TableBucketMaintenanceSettingsMemberIcebergUnreferencedFileRemoval{
+				Value: tabletypes.IcebergUnreferencedFileRemovalSettings{UnreferencedDays: aws.Int32(4), NonCurrentDays: aws.Int32(9)}}}})
+	check("PutTableBucketMaintenanceConfiguration", codeOf(err), "no error")
+	bm := must(t.GetTableBucketMaintenanceConfiguration(ctx, &s3tables.GetTableBucketMaintenanceConfigurationInput{TableBucketARN: arn}))
+	days := int32(0)
+	if s, ok := bm.Configuration["icebergUnreferencedFileRemoval"].Settings.(*tabletypes.TableBucketMaintenanceSettingsMemberIcebergUnreferencedFileRemoval); ok {
+		days = aws.ToInt32(s.Value.UnreferencedDays)
+	}
+	check("GetTableBucketMaintenanceConfiguration", days, int32(4))
+	tm := must(t.GetTableMaintenanceConfiguration(ctx, &s3tables.GetTableMaintenanceConfigurationInput{TableBucketARN: arn,
+		Namespace: aws.String("sales"), Name: aws.String("orders2")}))
+	check("GetTableMaintenanceConfiguration: compaction off", tm.Configuration["icebergCompaction"].Status, tabletypes.MaintenanceStatusDisabled)
+	js := must(t.GetTableMaintenanceJobStatus(ctx, &s3tables.GetTableMaintenanceJobStatusInput{TableBucketARN: arn,
+		Namespace: aws.String("sales"), Name: aws.String("orders2")}))
+	check("GetTableMaintenanceJobStatus", js.Status["icebergCompaction"].Status, tabletypes.JobStatusDisabled)
 	must(t.DeleteTable(ctx, &s3tables.DeleteTableInput{TableBucketARN: arn, Namespace: aws.String("sales"), Name: aws.String("orders2")}))
 	must(t.DeleteNamespace(ctx, &s3tables.DeleteNamespaceInput{TableBucketARN: arn, Namespace: aws.String("sales")}))
 	must(t.DeleteTableBucket(ctx, &s3tables.DeleteTableBucketInput{TableBucketARN: arn}))

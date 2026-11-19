@@ -3328,3 +3328,10 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** the cluster smoke's 134 pass, with nodes on a 24 s day. They include the maintenance check through
   node 2 (15), whose DeleteTableBucket retries the ConflictException of leftovers, as ADR-0083 §7 has it.
 - **Next:** slice 5, the SDK matrix and M10's exit review.
+
+### 19 Nov 2026: M10 slice 5, maintenance in the SDK matrix
+
+- **Each SDK's check:** Go, JavaScript, Java and .NET each put a table bucket's maintenance configuration and read it
+  back. Each reads a table's (compaction off) and its job status. boto3 does all of maintenance through
+  `maintenance_check.py`. All five pass.
+- **Next:** M10's exit review.

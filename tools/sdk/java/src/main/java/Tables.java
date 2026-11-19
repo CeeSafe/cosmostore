@@ -33,6 +33,17 @@ class Tables {
         t.renameTable(r -> r.tableBucketARN(arn).namespace("sales").name("orders").newName("orders2"));
         Check.check("RenameTable", t.listTables(r -> r.tableBucketARN(arn)).tables().stream().map(x -> x.name()).toList(),
             List.of("orders2"));
+        // Maintenance (ADR-0086): a table bucket's configuration put and read back; compaction is not done.
+        t.putTableBucketMaintenanceConfiguration(r -> r.tableBucketARN(arn).type("icebergUnreferencedFileRemoval")
+            .value(v -> v.status("enabled").settings(st -> st.icebergUnreferencedFileRemoval(u -> u.unreferencedDays(4).nonCurrentDays(9)))));
+        var bm = t.getTableBucketMaintenanceConfiguration(r -> r.tableBucketARN(arn));
+        Check.check("GetTableBucketMaintenanceConfiguration",
+            bm.configurationAsStrings().get("icebergUnreferencedFileRemoval").settings().icebergUnreferencedFileRemoval().unreferencedDays(), 4);
+        var tm = t.getTableMaintenanceConfiguration(r -> r.tableBucketARN(arn).namespace("sales").name("orders2"));
+        Check.check("GetTableMaintenanceConfiguration: compaction off",
+            tm.configurationAsStrings().get("icebergCompaction").statusAsString(), "disabled");
+        var js = t.getTableMaintenanceJobStatus(r -> r.tableBucketARN(arn).namespace("sales").name("orders2"));
+        Check.check("GetTableMaintenanceJobStatus", js.statusAsStrings().get("icebergCompaction").statusAsString(), "Disabled");
         t.deleteTable(r -> r.tableBucketARN(arn).namespace("sales").name("orders2"));
         t.deleteNamespace(r -> r.tableBucketARN(arn).namespace("sales"));
         t.deleteTableBucket(r -> r.tableBucketARN(arn));
