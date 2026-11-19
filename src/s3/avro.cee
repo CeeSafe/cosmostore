@@ -14,6 +14,10 @@ enum AvroError {
 /// How deep a schema or a value may nest, and how large a block may inflate to.
 const AVRO_MAX_DEPTH: usize = 64;
 const AVRO_MAX_BLOCK: usize = 67108864;
+/// How much a file's blocks may decode to in all (M10's exit review, B2): a manifest is a few MiB.
+const AVRO_MAX_FILE: usize = 67108864;
+/// i64's least, which a count may not be: its negation overflows (M10's exit review, B1).
+const AVRO_LEAST: i64 = -9223372036854775807 - 1;
 
 /// A named type (record, enum, fixed) a schema may refer to again by its name.
 struct AvroNamed {
@@ -39,6 +43,8 @@ struct AvroInput<region a> {
             if (this.at >= this.data.length || shift > 63) { return null; }
             let b = this.data[this.at];
             this.at += 1;
+            // The 10th byte holds the 64th bit only.
+            if (shift == 63 && b > 1) { return null; }
             value |= ((b & 0x7F) as u64) << shift;
             if ((b & 0x80) == 0) { break; }
             shift += 7;
@@ -53,6 +59,21 @@ struct AvroInput<region a> {
         let s = this.data[this.at..this.at + n];
         this.at += n;
         return Some(s);
+    }
+
+    /// A block count of an array, a map or the metadata: negative, then a byte size, for a block of that many; at
+    /// most the bytes left (each item takes one at least), so no count makes the reader loop or allocate past its
+    /// input; null for one that is not so.
+    fn blockCount(borrow mut this) -> usize? {
+        var count = this.long()?;
+        if (count == AVRO_LEAST) { return null; }
+        if (count < 0) {
+            count = -count;
+            let _ = this.long()?;
+        }
+        let n = checkedTruncate<usize>(count)?;
+        if (n > this.data.length - this.at) { return null; }
+        return Some(n);
     }
 
     /// A length-prefixed byte string (bytes and string).
@@ -72,6 +93,15 @@ fn memberItems<region a>(j: borrow(a) Json, key: StringView) -> borrow(a) Vector
     };
 }
 
+/// An object's object member's members; null if it has none or it is not an object.
+fn memberMembers<region a>(j: borrow(a) Json, key: StringView) -> borrow(a) Vector<JsonMember>? {
+    let m = jsonMember(j, key) ?? { return null; };
+    return match (m) {
+        Json.Object(ms) => Some(ms),
+        _ => null,
+    };
+}
+
 /// A type's name as a schema gives it: a string, or an object's `type`.
 fn avroTypeName(schema: borrow Json) -> Slice<u8>? => match (schema) {
     Json.Text(t) => Some(t.view()),
@@ -80,12 +110,19 @@ fn avroTypeName(schema: borrow Json) -> Slice<u8>? => match (schema) {
 };
 
 /// Every named type a schema defines, by its name (and its full name with a namespace), for references to it.
-fn collectAvroNames(schema: borrow Json, out: borrow mut Vector<AvroNamed>, depth: usize) -> Result<bool, AllocError> {
+/// `enclosing` is the namespace a type without its own inherits (Avro 1.11: the nearest enclosing one).
+fn collectAvroNames(
+    schema: borrow Json,
+    out: borrow mut Vector<AvroNamed>,
+    depth: usize,
+    enclosing: Slice<u8>,
+) -> Result<bool, AllocError> {
     if (depth > AVRO_MAX_DEPTH) { return Ok(false); }
+    var inner = copyBytes(enclosing)?;
     match (schema) {
         Json.Array(branches) => {
             for (i in 0..branches.length) {
-                if (!collectAvroNames(borrow branches[i], out, depth + 1)?) { return Ok(false); }
+                if (!collectAvroNames(borrow branches[i], out, depth + 1, enclosing)?) { return Ok(false); }
             }
         }
         Json.Object(_) => {
@@ -94,16 +131,26 @@ fn collectAvroNames(schema: borrow Json, out: borrow mut Vector<AvroNamed>, dept
                 kind == "error".bytes() || kind == "enum".bytes() || kind == "fixed".bytes()) {
                 let name = jsonMemberText(schema, "name") ?? "".bytes();
                 out.push(AvroNamed { name: copyBytes(name)?, schema: cloneJson(schema)? })?;
-                match (jsonMemberText(schema, "namespace")) {
-                    Some(ns) => {
-                        if (ns.length > 0 && findBytes(name, ".".bytes(), 0).isNull()) {
+                let dot = findBytes(name, ".".bytes(), 0);
+                match (dot) {
+                    Some(_) => {
+                        // A full name: its namespace is what is before its last dot.
+                        var last: usize = 0;
+                        for (i in 0..name.length) {
+                            if (name[i] == '.') { last = i; }
+                        }
+                        inner = copyBytes(name[0..last])?;
+                    }
+                    null => {
+                        let ns = jsonMemberText(schema, "namespace") ?? enclosing;
+                        inner = copyBytes(ns)?;
+                        if (ns.length > 0) {
                             var full = copyBytes(ns)?;
                             full.push('.')?;
                             full.extend(name)?;
                             out.push(AvroNamed { name: full, schema: cloneJson(schema)? })?;
                         }
                     }
-                    null => {}
                 }
             }
             if (kind == "record".bytes() || kind == "error".bytes()) {
@@ -114,7 +161,12 @@ fn collectAvroNames(schema: borrow Json, out: borrow mut Vector<AvroNamed>, dept
                                 for (i in 0..items.length) {
                                     match (jsonMember(borrow items[i], "type")) {
                                         Some(t) => {
-                                            if (!collectAvroNames(t, out, depth + 1)?) { return Ok(false); }
+                                            if (!collectAvroNames(
+                                                t,
+                                                out,
+                                                depth + 1,
+                                                inner.view(),
+                                            )?) { return Ok(false); }
                                         }
                                         null => { return Ok(false); }
                                     }
@@ -129,7 +181,7 @@ fn collectAvroNames(schema: borrow Json, out: borrow mut Vector<AvroNamed>, dept
             for (k in ["items", "values"]) {
                 match (jsonMember(schema, k)) {
                     Some(t) => {
-                        if (!collectAvroNames(t, out, depth + 1)?) { return Ok(false); }
+                        if (!collectAvroNames(t, out, depth + 1, inner.view())?) { return Ok(false); }
                     }
                     null => {}
                 }
@@ -138,7 +190,7 @@ fn collectAvroNames(schema: borrow Json, out: borrow mut Vector<AvroNamed>, dept
                 Some(t) => {
                     match (t) {
                         Json.Object(_) | Json.Array(_) => {
-                            if (!collectAvroNames(t, out, depth + 1)?) { return Ok(false); }
+                            if (!collectAvroNames(t, out, depth + 1, inner.view())?) { return Ok(false); }
                         }
                         _ => {}
                     }
@@ -155,14 +207,19 @@ fn namedSchema<region a>(names: borrow(a) Vector<AvroNamed>, name: Slice<u8>) ->
     for (i in 0..names.length) {
         if (names[i].name.view() == name) { return Some(borrow names[i].schema); }
     }
-    // A full name's last part, as a reference within the same namespace may give it.
+    // A full name's last part, as a reference within the same namespace may give it: one only, or none.
+    var found: usize? = null;
     for (i in 0..names.length) {
         let n = names[i].name.view();
         if (n.length > name.length && n[n.length - name.length..] == name && n[n.length - name.length - 1] == '.') {
-            return Some(borrow names[i].schema);
+            if (found.isSome()) { return null; }
+            found = Some(i);
         }
     }
-    return null;
+    return match (found) {
+        Some(i) => Some(borrow names[i].schema),
+        null => null,
+    };
 }
 
 /// One value of `schema`, decoded into the JSON model.
@@ -182,7 +239,6 @@ fn avroValue(
         }
         _ => {}
     }
-    let kind = avroTypeName(schema) ?? { return Err(AvroError.Malformed); };
     // `{"type": <a schema>}`: that schema.
     match (schema) {
         Json.Object(_) => {
@@ -198,6 +254,7 @@ fn avroValue(
         }
         _ => {}
     }
+    let kind = avroTypeName(schema) ?? { return Err(AvroError.Malformed); };
     if (kind == "null".bytes()) { return Ok(Json.Null); }
     if (kind == "boolean".bytes()) {
         let b = input.take(1) ?? { return Err(AvroError.Malformed); };
@@ -205,6 +262,7 @@ fn avroValue(
     }
     if (kind == "int".bytes() || kind == "long".bytes()) {
         let v = input.long() ?? { return Err(AvroError.Malformed); };
+        if (kind == "int".bytes() && checkedTruncate<i32>(v).isNull()) { return Err(AvroError.Malformed); }
         return Ok(jsonInteger(v)?);
     }
     if (kind == "float".bytes()) {
@@ -250,14 +308,9 @@ fn avroValue(
         var values = Vector<Json>.create();
         // Blocks of items, each its count (negative: then its size in bytes), to a count of 0.
         while (true) {
-            var count = input.long() ?? { return Err(AvroError.Malformed); };
+            let count = input.blockCount() ?? { return Err(AvroError.Malformed); };
             if (count == 0) { break; }
-            if (count < 0) {
-                count = -count;
-                let _ = input.long() ?? { return Err(AvroError.Malformed); };
-            }
-            if (count > truncate<i64>(input.data.length)) { return Err(AvroError.Malformed); }
-            for (n in 0..truncate<usize>(count)) {
+            for (n in 0..count) {
                 if (isMap) {
                     let key = copyBytes(input.lengthPrefixed() ?? { return Err(AvroError.Malformed); })?;
                     let v = avroValue(input, items, names, depth + 1)?;
@@ -284,13 +337,9 @@ fn readAvro(bytes: Slice<u8>) -> Result<AvroFile, AvroError> {
     // The metadata: a map of bytes.
     var metadata = Vector<JsonMember>.create();
     while (true) {
-        var count = input.long() ?? { return Err(AvroError.Malformed); };
+        let count = input.blockCount() ?? { return Err(AvroError.Malformed); };
         if (count == 0) { break; }
-        if (count < 0) {
-            count = -count;
-            let _ = input.long() ?? { return Err(AvroError.Malformed); };
-        }
-        for (n in 0..truncate<usize>(count)) {
+        for (n in 0..count) {
             let key = copyBytes(input.lengthPrefixed() ?? { return Err(AvroError.Malformed); })?;
             let value = copyBytes(input.lengthPrefixed() ?? { return Err(AvroError.Malformed); })?;
             metadata.push(JsonMember { key: key, value: Json.Text(value) })?;
@@ -311,8 +360,9 @@ fn readAvro(bytes: Slice<u8>) -> Result<AvroFile, AvroError> {
     if (codec.view() != "null".bytes() && codec.view() != "deflate".bytes()) { return Err(AvroError.Codec(codec)); }
     let schema = parseJson(schemaText.view())? ?? { return Err(AvroError.Malformed); };
     var names = Vector<AvroNamed>.create();
-    if (!collectAvroNames(borrow schema, mut names, 0)?) { return Err(AvroError.Malformed); }
+    if (!collectAvroNames(borrow schema, mut names, 0, "".bytes())?) { return Err(AvroError.Malformed); }
     var records = Vector<Json>.create();
+    var decoded: usize = 0;
     while (input.at < bytes.length) {
         let count = input.long() ?? { return Err(AvroError.Malformed); };
         let size = input.long() ?? { return Err(AvroError.Malformed); };
@@ -323,15 +373,21 @@ fn readAvro(bytes: Slice<u8>) -> Result<AvroFile, AvroError> {
         if (marker != sync.view()) { return Err(AvroError.Malformed); }
         var inflated = Vector<u8>.create();
         let block: Slice<u8> = if (codec.view() == "deflate".bytes()) {
-            match (inflate(raw, AVRO_MAX_BLOCK, mut inflated)) {
+            let left = AVRO_MAX_FILE - decoded;
+            match (inflate(raw, if (left < AVRO_MAX_BLOCK) left else AVRO_MAX_BLOCK, mut inflated)) {
                 Ok() => {}
                 Err(InflateError.OutOfMemory(e)) => { return Err(AvroError.OutOfMemory(e)); }
                 Err(_) => { return Err(AvroError.Malformed); }
             }
             inflated.view()
         } else raw;
+        // Each record takes a byte at least, and the file's blocks decode to AVRO_MAX_FILE at most (B2).
+        decoded += block.length;
+        if (decoded > AVRO_MAX_FILE) { return Err(AvroError.Malformed); }
+        let n = checkedTruncate<usize>(count) ?? { return Err(AvroError.Malformed); };
+        if (n > block.length) { return Err(AvroError.Malformed); }
         var b = AvroInput { data: block, at: 0 };
-        for (n in 0..checkedTruncate<usize>(count) ?? 0) {
+        for (k in 0..n) {
             records.push(avroValue(mut b, borrow schema, borrow names, 0)?)?;
         }
         if (b.at != block.length) { return Err(AvroError.Malformed); }

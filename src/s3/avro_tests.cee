@@ -80,3 +80,84 @@ fn avroRefusals() -> Result<void, TestFailure> {
     }
     return Ok();
 }
+
+/// Avro's zig-zag varint of `v`.
+fn zigzag(out: borrow mut Vector<u8>, v: i64) {
+    var u: u64 = if (v < 0) ((truncate<u64>(-(v + 1))) << 1) | 1 else truncate<u64>(v) << 1;
+    while (true) {
+        let b = truncate<u8>(u & 0x7F);
+        u >>= 7;
+        if (u == 0) {
+            out.push(b)!;
+            return;
+        }
+        out.push(b | 0x80)!;
+    }
+}
+
+fn lengthPrefixed(out: borrow mut Vector<u8>, text: Slice<u8>) {
+    zigzag(out, truncate<i64>(text.length));
+    out.extend(text)!;
+}
+
+/// An object container file of `schema`, codec null: its header (one metadata entry), then one block of `count`
+/// records whose bytes are `block`.
+fn avroContainer(schema: StringView, count: i64, block: Slice<u8>) -> Vector<u8> {
+    var out = copyBytes([0x4Fu8, 0x62, 0x6A, 0x01][..])!;
+    zigzag(mut out, 1);
+    lengthPrefixed(mut out, "avro.schema".bytes());
+    lengthPrefixed(mut out, schema.bytes());
+    zigzag(mut out, 0);
+    let sync = [7u8; 16];
+    out.extend(sync[..])!;
+    zigzag(mut out, count);
+    zigzag(mut out, truncate<i64>(block.length));
+    out.extend(block)!;
+    out.extend(sync[..])!;
+    return out;
+}
+
+@test
+fn avroRefusesHostileCounts() -> Result<void, TestFailure> {
+    // A well-formed one reads: two records of a long each.
+    var two = Vector<u8>.create();
+    zigzag(mut two, 5);
+    zigzag(mut two, -6);
+    Check.equalU64(2, readAvro(avroContainer("\"long\"", 2, two.view()).view())!.records.length as u64)?;
+    // i64's least as a metadata count: refused, not negated (M10's exit review, B1).
+    var least = copyBytes([0x4Fu8, 0x62, 0x6A, 0x01][..])!;
+    least.extend([0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01][..])!;
+    least.extend([0u8; 40][..])!;
+    Check.equalBytes("malformed".bytes(), avroRefusal(least.view()).bytes())?;
+    // The same as an array's block count.
+    var arrayMin = Vector<u8>.create();
+    arrayMin.extend([0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01][..])!;
+    arrayMin.extend([0u8; 8][..])!;
+    Check.equalBytes(
+        "malformed".bytes(),
+        avroRefusal(avroContainer("{\"type\":\"array\",\"items\":\"long\"}", 1, arrayMin.view()).view()).bytes(),
+    )?;
+    // A million records of no bytes each (B2): refused, not decoded.
+    Check.equalBytes("malformed".bytes(), avroRefusal(avroContainer("\"null\"", 1048576, [0u8][..]).view()).bytes())?;
+    // An array claiming more items than its bytes.
+    var big = Vector<u8>.create();
+    zigzag(mut big, 1000000);
+    zigzag(mut big, 1);
+    Check.equalBytes(
+        "malformed".bytes(),
+        avroRefusal(avroContainer("{\"type\":\"array\",\"items\":\"long\"}", 1, big.view()).view()).bytes(),
+    )?;
+    // An int past 32 bits, and a varint whose 10th byte holds more than the 64th bit.
+    var wide = Vector<u8>.create();
+    zigzag(mut wide, 4294967296);
+    Check.equalBytes("malformed".bytes(), avroRefusal(avroContainer("\"int\"", 1, wide.view()).view()).bytes())?;
+    let tenth = [0x80u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+    Check.equalBytes("malformed".bytes(), avroRefusal(avroContainer("\"long\"", 1, tenth[..]).view()).bytes())?;
+    // A type wrapped as `{"type": {…}}` reads as the type it wraps.
+    var one = Vector<u8>.create();
+    zigzag(mut one, 9);
+    let wrapped = avroContainer("{\"type\":{\"type\":\"long\"}}", 1, one.view());
+    let read = readAvro(wrapped.view())!;
+    Check.isTrue(jsonI64(borrow read.records[0]) == Some(9i64), "a wrapped type")?;
+    return Ok();
+}

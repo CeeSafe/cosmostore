@@ -56,12 +56,24 @@ fn snapshotsThatExpire() -> Result<void, TestFailure> {
     let m = parseJson(
         "{\"current-snapshot-id\":5,\"refs\":{\"main\":{\"snapshot-id\":5,\"type\":\"branch\"},\"t\":{\"snapshot-id\":2,\"type\":\"tag\"}},\"snapshots\":[{\"snapshot-id\":1,\"timestamp-ms\":100},{\"snapshot-id\":2,\"parent-snapshot-id\":1,\"timestamp-ms\":200},{\"snapshot-id\":3,\"parent-snapshot-id\":2,\"timestamp-ms\":300},{\"snapshot-id\":4,\"parent-snapshot-id\":3,\"timestamp-ms\":400},{\"snapshot-id\":5,\"parent-snapshot-id\":4,\"timestamp-ms\":500}]}".bytes(),
     )!!;
-    // Older than 450: 1 to 4; 4 and 5 are main's newest two, 2 a tag's head.
-    let gone = snapshotsToExpire(borrow m, 450, 2)!;
+    // At 1000 with a 550 ms age: 1 to 4 are older; 4 and 5 are main's newest two, 2 a tag's head.
+    let gone = snapshotsToExpire(borrow m, 1000, 550, 2)!;
     Check.equalU64(2, gone.length as u64)?;
     Check.isTrue(holdsId(gone.view(), 1) && holdsId(gone.view(), 3), "1 and 3")?;
-    Check.equalU64(0, snapshotsToExpire(borrow m, 50, 1)!.length as u64)?;
-    Check.equalU64(3, snapshotsToExpire(borrow m, 1000, 1)!.length as u64)?; // all but 5 and the tag's 2
+    Check.equalU64(0, snapshotsToExpire(borrow m, 1000, 950, 1)!.length as u64)?;
+    Check.equalU64(3, snapshotsToExpire(borrow m, 1000, 0, 1)!.length as u64)?; // all but 5 and the tag's 2
+    // A tag on 4, the current one's parent: main still keeps its newest three, 5, 4 and 3 (M10's exit review, A4).
+    let tagged = parseJson(
+        "{\"current-snapshot-id\":5,\"refs\":{\"main\":{\"snapshot-id\":5,\"type\":\"branch\"},\"t\":{\"snapshot-id\":4,\"type\":\"tag\"}},\"snapshots\":[{\"snapshot-id\":1,\"timestamp-ms\":100},{\"snapshot-id\":2,\"parent-snapshot-id\":1,\"timestamp-ms\":200},{\"snapshot-id\":3,\"parent-snapshot-id\":2,\"timestamp-ms\":300},{\"snapshot-id\":4,\"parent-snapshot-id\":3,\"timestamp-ms\":400},{\"snapshot-id\":5,\"parent-snapshot-id\":4,\"timestamp-ms\":500}]}".bytes(),
+    )!!;
+    let t = snapshotsToExpire(borrow tagged, 1000, 0, 3)!;
+    Check.isTrue(t.length == 2 && holdsId(t.view(), 1) && holdsId(t.view(), 2), "1 and 2 only")?;
+    // A second branch keeps its own minimum (its ref's `min-snapshots-to-keep`), not just its head (A5).
+    let branched = parseJson(
+        "{\"current-snapshot-id\":5,\"refs\":{\"main\":{\"snapshot-id\":5,\"type\":\"branch\"},\"dev\":{\"snapshot-id\":3,\"type\":\"branch\",\"min-snapshots-to-keep\":3}},\"snapshots\":[{\"snapshot-id\":1,\"timestamp-ms\":100},{\"snapshot-id\":2,\"parent-snapshot-id\":1,\"timestamp-ms\":200},{\"snapshot-id\":3,\"parent-snapshot-id\":2,\"timestamp-ms\":300},{\"snapshot-id\":4,\"parent-snapshot-id\":3,\"timestamp-ms\":400},{\"snapshot-id\":5,\"parent-snapshot-id\":4,\"timestamp-ms\":500}]}".bytes(),
+    )!!;
+    let b = snapshotsToExpire(borrow branched, 1000, 0, 1)!;
+    Check.isTrue(b.length == 1 && holdsId(b.view(), 4), "dev keeps 3, 2 and 1; main keeps 5")?;
     return Ok();
 }
 
@@ -143,51 +155,206 @@ fn snapshotManagementCommits() -> Result<void, TestFailure> {
     return Ok();
 }
 
+const OTHER_ID: StringView = "11111111-2222-4333-8444-555555555555";
+
+/// A path of the maintained table's warehouse, `<scheme>maint--table-s3/<id>/<rest>`.
+fn maintPath(scheme: StringView, id: StringView, rest: StringView) -> Vector<u8> {
+    var p = copyBytes(scheme.bytes())!;
+    p.extend("maint--table-s3/".bytes())!;
+    p.extend(id.bytes())!;
+    p.push('/')!;
+    p.extend(rest.bytes())!;
+    return p;
+}
+
+fn maintKey(id: StringView, rest: StringView) -> Vector<u8> {
+    var k = copyBytes(id.bytes())!;
+    k.push('/')!;
+    k.extend(rest.bytes())!;
+    return k;
+}
+
+fn putMaint(s: borrow mut ObjectStore, key: Slice<u8>) {
+    let _ = s.putObject("maint--table-s3", StringView.fromUtf8(key) ?? "", "", "x".bytes(), PutCondition.None)!;
+}
+
+fn maintTable() -> MaintainedTable =>
+    MaintainedTable {
+        bucket: copyBytes("maint".bytes())!,
+        ns: copyBytes("ns".bytes())!,
+        name: copyBytes("t".bytes())!,
+    };
+
+/// A run's references: the metadata's, then each path given.
+fn runReferences(run: borrow UnreferencedRun, paths: Slice<Vector<u8>>) -> References {
+    var refs = newReferences(run.hidden.view(), run.id.view())!;
+    metadataReferences(borrow run.metadata, run.location.view(), mut refs)!;
+    for (i in 0..paths.length) { refer(mut refs, paths[i].view(), 0)!; }
+    return refs;
+}
+
 @test
 fn unreferencedFilesNotedThenDeleted() -> Result<void, TestFailure> {
     let dir = maintainedStore("maint-unreferenced")?;
     var s = ObjectStore.open(dir.view(), storeConfig())!;
     let hidden = "maint--table-s3".bytes();
-    var live = copyBytes(MAINT_ID.bytes())!;
-    live.extend("/data/live.parquet".bytes())!;
-    var orphan = copyBytes(MAINT_ID.bytes())!;
-    orphan.extend("/data/orphan.parquet".bytes())!;
-    var back = copyBytes(MAINT_ID.bytes())!;
-    back.extend("/data/back.parquet".bytes())!;
-    for (k in [live.view(), orphan.view(), back.view()]) {
-        let _ = s.putObject("maint--table-s3", StringView.fromUtf8(k) ?? "", "", "x".bytes(), PutCondition.None)!;
-    }
-    let rec = tableRecord(borrow s, "maint".bytes(), "ns".bytes(), "t".bytes())!;
-    let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation")!)!;
-    let run = UnreferencedRun {
-        hidden: copyBytes(hidden)!,
-        id: copyBytes(MAINT_ID.bytes())!,
-        metadata: readMetadata(borrow s, hidden, location.view())!,
-        location: copyBytes(location.view())!,
-        days: 2,
-    };
-    // What the metadata references: its own file, and the live data file.
-    var referenced = Vector<Vector<u8>>.create();
-    let _ = metadataReferences(borrow run.metadata, hidden, location.view(), mut referenced)!;
-    let _ = sortedInsert(mut referenced, live.view())!;
+    let live = maintKey(MAINT_ID, "data/live.parquet");
+    let orphan = maintKey(MAINT_ID, "data/orphan.parquet");
+    let back = maintKey(MAINT_ID, "data/back.parquet");
+    let spaced = maintKey(MAINT_ID, "data/kind=a b/x.parquet");
+    for (k in [live.view(), orphan.view(), back.view(), spaced.view()]) { putMaint(mut s, k); }
+    let t = maintTable();
+    let run = unreferencedRun(borrow s, borrow t)!!;
+    // The live file by `s3a://`; the spaced one as Iceberg writes it, percent-encoded (A1, A3).
+    var paths = Vector<Vector<u8>>.create();
+    paths.push(maintPath("s3a://", MAINT_ID, "data/live.parquet"))!;
+    paths.push(maintPath("s3://", MAINT_ID, "data/kind=a%20b/x.parquet"))!;
+    var refs = runReferences(borrow run, paths.view());
+    Check.equalU64(0, refs.failure.length as u64)?;
+    Check.equalU64(1, refs.toRead.length as u64)?; // the snapshots' manifest list
     let day: i64 = 1000;
     // At 10 s: the orphan and `back` are noted, nothing deleted.
-    sweepUnreferenced(mut s, borrow run, borrow referenced, 10000, day)!;
-    Check.equalU64(4, catalogKeys(borrow s, hidden, MAINT_ID.bytes(), "".bytes(), 0)!.length as u64)?;
+    sweepUnreferenced(mut s, borrow run, mut refs, 10000, day)!;
+    Check.equalU64(5, catalogKeys(borrow s, hidden, MAINT_ID.bytes(), "".bytes(), 0)!.length as u64)?;
     // `back` is referenced again before its days are up: its note goes.
-    let _ = sortedInsert(mut referenced, back.view())!;
-    sweepUnreferenced(mut s, borrow run, borrow referenced, 11000, day)!;
-    // At 12 s, two days after its note: the orphan alone is deleted; the live and referenced files stay.
-    sweepUnreferenced(mut s, borrow run, borrow referenced, 12000, day)!;
+    paths.push(maintPath("s3://", MAINT_ID, "data/back.parquet"))!;
+    var again = runReferences(borrow run, paths.view());
+    sweepUnreferenced(mut s, borrow run, mut again, 11000, day)!;
+    // At 23 s, 13 days (the default 3 + 10) after its note: the orphan alone is deleted.
+    var last = runReferences(borrow run, paths.view());
+    sweepUnreferenced(mut s, borrow run, mut last, 23000, day)!;
     let left = catalogKeys(borrow s, hidden, MAINT_ID.bytes(), "".bytes(), 0)!;
-    Check.equalU64(3, left.length as u64)?;
+    Check.equalU64(4, left.length as u64)?;
     for (i in 0..left.length) { Check.isFalse(left[i].view() == orphan.view(), "the orphan is gone")?; }
-    // No notes are left.
     let notes = maintenanceDocument(borrow s, hidden, unreferencedNotesKey(MAINT_ID.bytes())!.view())!;
     Check.isTrue(match (borrow notes) {
         Json.Object(ms) => ms.length == 0,
         _ => false,
     }, "no notes")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+fn refusedReference(run: borrow UnreferencedRun, path: Vector<u8>) -> bool {
+    var paths = Vector<Vector<u8>>.create();
+    paths.push(path)!;
+    return runReferences(run, paths.view()).failure.length > 0;
+}
+
+fn refusedRunMetadata(run: borrow UnreferencedRun, metadata: StringView) -> bool {
+    var refs = newReferences(run.hidden.view(), run.id.view())!;
+    let m = parseJson(metadata.bytes())!!;
+    metadataReferences(borrow m, run.location.view(), mut refs)!;
+    return refs.failure.length > 0;
+}
+
+@test
+fn unreferencedRefusesWhatItCannotPlace() -> Result<void, TestFailure> {
+    let dir = maintainedStore("maint-unplaced")?;
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let t = maintTable();
+    let run = unreferencedRun(borrow s, borrow t)!!;
+    // A scheme not known, or a key of no table: the run ends, deleting nothing (A1).
+    Check.isTrue(refusedReference(borrow run, copyBytes("gs://maint--table-s3/x".bytes())!), "gs://")?;
+    Check.isTrue(refusedReference(borrow run, copyBytes("s3://maint--table-s3/loose/x".bytes())!), "no table's key")?;
+    Check.isTrue(refusedReference(borrow run, copyBytes("/tmp/x.parquet".bytes())!), "a local path")?;
+    // Another bucket's: no file of this table bucket, so nothing to keep.
+    Check.isFalse(refusedReference(borrow run, copyBytes("s3://elsewhere/x.parquet".bytes())!), "another bucket")?;
+    // Metadata: format 3, snapshots that are no list, a snapshot naming neither list nor manifests.
+    Check.isTrue(refusedRunMetadata(borrow run, "{\"format-version\":3,\"snapshots\":[]}"), "format 3")?;
+    Check.isTrue(refusedRunMetadata(borrow run, "{\"format-version\":2,\"snapshots\":{}}"), "no list")?;
+    Check.isTrue(
+        refusedRunMetadata(borrow run, "{\"format-version\":2,\"snapshots\":[{\"snapshot-id\":1}]}"),
+        "no manifests",
+    )?;
+    // Format 1's inline manifests are read, as manifests.
+    var refs = newReferences(run.hidden.view(), run.id.view())!;
+    var v1 = copyBytes("{\"format-version\":1,\"snapshots\":[{\"snapshot-id\":1,\"manifests\":[\"".bytes())!;
+    v1.extend(maintPath("s3n://", MAINT_ID, "metadata/m1.avro").view())!;
+    v1.extend("\"]}]}".bytes())!;
+    let m = parseJson(v1.view())!!;
+    metadataReferences(borrow m, run.location.view(), mut refs)!;
+    Check.isTrue(refs.failure.length == 0 && refs.toRead.length == 1 && !refs.toReadIsList[0], "a format 1 manifest")?;
+    // A Failed run's status says why.
+    failUnreferenced(mut s, borrow run, "A reference is not one this run can place: gs://x".bytes(), 5000)!;
+    let status = maintenanceDocument(
+        borrow s,
+        run.hidden.view(),
+        jobStatusKey(MAINT_ID.bytes(), UNREFERENCED_REMOVAL)!.view(),
+    )!;
+    Check.equalBytes("Failed".bytes(), jsonMemberText(borrow status, "status")!)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn unreferencedPinsOtherTables() -> Result<void, TestFailure> {
+    let dir = maintainedStore("maint-pins")?;
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = "maint--table-s3".bytes();
+    // Table ns.u (OTHER_ID) has an old file; ns.t references it (a clone, an `add_files`: A2).
+    let shared = maintKey(OTHER_ID, "data/shared.parquet");
+    putMaint(mut s, shared.view());
+    var u = jsonObject();
+    jsonSet(mut u, "id", jsonString(OTHER_ID.bytes())!)!;
+    jsonSet(
+        mut u,
+        "metadataLocation",
+        jsonString(maintPath("s3://", OTHER_ID, "metadata/00000-u.metadata.json").view())!,
+    )!;
+    let _ = writeRecord(mut s, hidden, ".s3tables/tables/ns/u".bytes(), borrow u, PutCondition.None)!;
+    let t = maintTable();
+    let run = unreferencedRun(borrow s, borrow t)!!;
+    var paths = Vector<Vector<u8>>.create();
+    paths.push(maintPath("s3://", OTHER_ID, "data/shared.parquet"))!;
+    var refs = runReferences(borrow run, paths.view());
+    Check.equalU64(1, refs.others.length as u64)?;
+    sweepUnreferenced(mut s, borrow run, mut refs, 10000, 1000)!;
+    // ns.u is pinned by ns.t: its run deletes nothing, and says why.
+    let uRun = UnreferencedRun {
+        hidden: copyBytes(hidden)!,
+        id: copyBytes(OTHER_ID.bytes())!,
+        ns: copyBytes("ns".bytes())!,
+        name: copyBytes("u".bytes())!,
+        metadata: Json.Null,
+        location: maintPath("s3://", OTHER_ID, "metadata/00000-u.metadata.json"),
+        days: 2,
+        failure: Vector<u8>.create(),
+    };
+    Check.equalBytes("ns.t".bytes(), pinnedBy(mut s, borrow uRun)!!.view())?;
+    var none = newReferences(hidden, OTHER_ID.bytes())!;
+    sweepUnreferenced(mut s, borrow uRun, mut none, 1000000, 1000)!;
+    Check.equalU64(1, catalogKeys(borrow s, hidden, OTHER_ID.bytes(), "".bytes(), 0)!.length as u64)?;
+    let status = maintenanceDocument(borrow s, hidden, jobStatusKey(OTHER_ID.bytes(), UNREFERENCED_REMOVAL)!.view())!;
+    Check.equalBytes("Failed".bytes(), jsonMemberText(borrow status, "status")!)?;
+    // Once ns.t is gone, its pin is stale and goes.
+    let _ = s.deleteObject("maint--table-s3", ".s3tables/tables/ns/t")!;
+    Check.isTrue(pinnedBy(mut s, borrow uRun)!.isNull(), "a stale pin")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+@test
+fn unreferencedSweepWaitsForACommitMeanwhile() -> Result<void, TestFailure> {
+    let dir = maintainedStore("maint-meanwhile")?;
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = "maint--table-s3".bytes();
+    let orphan = maintKey(MAINT_ID, "data/orphan.parquet");
+    putMaint(mut s, orphan.view());
+    let t = maintTable();
+    let run = unreferencedRun(borrow s, borrow t)!!;
+    // A commit after the run read the metadata: the sweep does nothing, not even a note (A6).
+    var rec = tableRecord(borrow s, "maint".bytes(), "ns".bytes(), "t".bytes())!;
+    jsonSet(
+        mut rec.json,
+        "metadataLocation",
+        jsonString(maintPath("s3://", MAINT_ID, "metadata/00001-x.metadata.json").view())!,
+    )!;
+    let _ = writeRecord(mut s, hidden, ".s3tables/tables/ns/t".bytes(), borrow rec.json, PutCondition.None)!;
+    var refs = runReferences(borrow run, Vector<Vector<u8>>.create().view());
+    sweepUnreferenced(mut s, borrow run, mut refs, 1000000, 1000)!;
+    Check.isTrue(readRecord(borrow s, hidden, unreferencedNotesKey(MAINT_ID.bytes())!.view())!.isNull(), "no notes")?;
+    Check.isTrue(s.headObject("maint--table-s3", StringView.fromUtf8(orphan.view()) ?? "").isOk(), "nothing deleted")?;
     removeTree(dir.view());
     return Ok();
 }

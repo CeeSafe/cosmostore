@@ -1,18 +1,27 @@
 // Unreferenced file removal (ADR-0086 §3): what a table's committed metadata references (its metadata files, every
-// snapshot's manifest list, their manifests, the data and delete files those name, its statistics files), and the
-// objects of its warehouse that nothing references, noted when first found and deleted once they stay so for
-// `unreferencedDays + nonCurrentDays`. A run that cannot read a manifest ends Failed and deletes nothing.
+// snapshot's manifest list or manifests, the data and delete files those name, its statistics files), and the objects
+// of its warehouse that nothing references, noted when first found and deleted once they stay so for
+// `unreferencedDays + nonCurrentDays`.
+//
+// Not knowing a reference never deletes a file (M10's exit review, A1 to A3, A6): a path this run cannot place (a
+// scheme it does not know, a key of no table, metadata of a format it does not read), a manifest it cannot read, or a
+// table whose metadata changed while it ran ends the run without deleting anything. A file of this table that another
+// table references pins this table (`shared/`), and a pinned table deletes nothing.
 import web_core;
 import web_transport;
 import web_http;
 import web_server;
 
 const MAINTENANCE_UNREFERENCED: StringView = ".s3tables/maintenance/unreferenced/";
+const MAINTENANCE_SHARED: StringView = ".s3tables/maintenance/shared/";
 /// A manifest list's or manifest's size at most, as read for a run.
 const MANIFEST_MAX_BYTES: usize = 268435456;
 
 fn unreferencedNotesKey(id: Slice<u8>) -> Result<Vector<u8>, AllocError> =>
     catalogKey(MAINTENANCE_UNREFERENCED, id, "".bytes());
+
+/// The pin table `of` has from table `by`: `shared/<of>/<by>`.
+fn sharedKey(of: Slice<u8>, by: Slice<u8>) -> Result<Vector<u8>, AllocError> => catalogKey(MAINTENANCE_SHARED, of, by);
 
 /// Inserts `key` into sorted `keys`; false if it was there.
 fn sortedInsert(keys: borrow mut Vector<Vector<u8>>, key: Slice<u8>) -> Result<bool, AllocError> {
@@ -28,20 +37,226 @@ fn sortedInsert(keys: borrow mut Vector<Vector<u8>>, key: Slice<u8>) -> Result<b
     return Ok(true);
 }
 
+/// Sorts and dedupes `keys`, for `sortedHolds` (which is true when a key is absent).
+fn sortKeys(keys: borrow mut Vector<Vector<u8>>) {
+    keys.sortBy((a, b) => compareBytes(a.view(), b.view()));
+    var w: usize = 0;
+    for (i in 0..keys.length) {
+        if (w > 0 && keys[w - 1].view() == keys[i].view()) { continue; }
+        if (w != i) { keys.swap(w, i); }
+        w += 1;
+    }
+    keys.truncate(w);
+}
+
+// ---- Where a reference points ----
+
+/// Where a path points: in this table bucket's hidden bucket, in another bucket (no file of ours), or somewhere this
+/// run cannot place.
+enum RefPlace {
+    Here,
+    Elsewhere,
+    Unknown,
+}
+
+/// The schemes an S3 path is written with (Iceberg's S3FileIO and Hadoop's take all three).
+fn schemeLength(path: Slice<u8>) -> usize {
+    for (s in ["s3://", "s3a://", "s3n://"]) {
+        if (startsWithBytes(path, s.bytes())) { return s.bytes().length; }
+    }
+    return 0;
+}
+
+fn refPlace(path: Slice<u8>, hidden: Slice<u8>) -> RefPlace {
+    let at = schemeLength(path);
+    if (at == 0) { return RefPlace.Unknown; }
+    let rest = path[at..];
+    let slash = pieceEnd(rest, 0, '/');
+    if (slash == 0 || slash >= rest.length - 1) { return RefPlace.Unknown; }
+    return if (rest[0..slash] == hidden) RefPlace.Here else RefPlace.Elsewhere;
+}
+
+/// The key a path names in its bucket (after `<scheme>://<bucket>/`); call for a path `refPlace` placed `Here`.
+fn refKey<region a>(path: Slice<a, u8>) -> Slice<a, u8> {
+    let rest = path[schemeLength(path)..];
+    return rest[pieceEnd(rest, 0, '/') + 1..];
+}
+
+/// What a run has found, as it reads.
+struct References {
+    hidden: Vector<u8>;
+    id: Vector<u8>;
+    /// The keys referenced in the hidden bucket (sorted once the run is done).
+    keys: Vector<Vector<u8>>;
+    /// The manifest lists and manifests to read, in the hidden bucket, and whether each is a list.
+    toRead: Vector<Vector<u8>>;
+    toReadIsList: Vector<bool>;
+    /// Every key queued to read, so each is read once.
+    queued: Vector<Vector<u8>>;
+    /// Other tables whose files this one references: their ids.
+    others: Vector<Vector<u8>>;
+    /// Why the run cannot go on; empty while it can.
+    failure: Vector<u8>;
+}
+
+fn newReferences(hidden: Slice<u8>, id: Slice<u8>) -> Result<References, AllocError> =>
+    Ok(References {
+        hidden: copyBytes(hidden)?,
+        id: copyBytes(id)?,
+        keys: Vector<Vector<u8>>.create(),
+        toRead: Vector<Vector<u8>>.create(),
+        toReadIsList: Vector<bool>.create(),
+        queued: Vector<Vector<u8>>.create(),
+        others: Vector<Vector<u8>>.create(),
+        failure: Vector<u8>.create(),
+    });
+
+/// Ends the run: `why`, and the path it is about (cut at 200 bytes).
+fn failRun(r: borrow mut References, why: StringView, path: Slice<u8>) -> Result<void, AllocError> {
+    if (r.failure.length > 0) { return Ok(); }
+    r.failure.extend(why.bytes())?;
+    if (path.length > 0) {
+        r.failure.extend(": ".bytes())?;
+        r.failure.extend(path[0..(if (path.length > 200) 200 else path.length)])?;
+    }
+    return r.failure.extend("; nothing was deleted.".bytes());
+}
+
+/// A reference: placed, and kept (`read`: 0 a file, 1 a manifest list to read, 2 a manifest to read). A path this run
+/// cannot place ends it; one into another table's prefix is kept and names that table.
+fn refer(r: borrow mut References, path: Slice<u8>, read: u8) -> Result<void, AllocError> {
+    match (refPlace(path, r.hidden.view())) {
+        RefPlace.Elsewhere => { return Ok(); } // another bucket's: no file of this table bucket
+        RefPlace.Unknown => { return failRun(r, "A reference is not one this run can place", path); }
+        RefPlace.Here => {}
+    }
+    let key = refKey(path);
+    match (tableIdOfKey(key, false)) {
+        Some(owner) => {
+            if (owner != r.id.view()) {
+                var known = false;
+                for (i in 0..r.others.length) {
+                    if (r.others[i].view() == owner) { known = true; }
+                }
+                if (!known) { r.others.push(copyBytes(owner)?)?; }
+            }
+        }
+        null => { return failRun(r, "A reference names a key of no table", path); }
+    }
+    r.keys.push(copyBytes(key)?)?;
+    if (read > 0 && sortedInsert(mut r.queued, key)?) {
+        r.toRead.push(copyBytes(key)?)?;
+        r.toReadIsList.push(read == 1)?;
+    }
+    return Ok();
+}
+
+/// Every `<member>` path of the objects in an array member of `m` (statistics files, the metadata log).
+fn referPathsOf(
+    r: borrow mut References,
+    m: borrow Json,
+    array: StringView,
+    member: StringView,
+) -> Result<void, AllocError> {
+    match (jsonMember(m, array)) {
+        Some(v) => {
+            match (v) {
+                Json.Array(items) => {
+                    for (i in 0..items.length) {
+                        match (jsonMemberText(borrow items[i], member)) {
+                            Some(p) => { refer(r, p, 0)?; }
+                            null => { failRun(r, "An entry of the metadata names no path", array.bytes())?; }
+                        }
+                    }
+                }
+                _ => { failRun(r, "The metadata's list is not one", array.bytes())?; }
+            }
+        }
+        null => {}
+    }
+    return Ok();
+}
+
+/// What the metadata itself references: its file, the metadata log, statistics files, and each snapshot's manifest
+/// list (format 2) or manifests (format 1's inline `manifests`). A snapshot with neither, or metadata of a format above
+/// 2, ends the run.
+fn metadataReferences(m: borrow Json, location: Slice<u8>, r: borrow mut References) -> Result<void, AllocError> {
+    let format = jsonMemberI64(m, "format-version") ?? 0;
+    if (format < 1 || format > 2) {
+        return failRun(r, "The table's metadata is of a format not read here", "".bytes());
+    }
+    refer(r, location, 0)?;
+    referPathsOf(r, m, "metadata-log", "metadata-file")?;
+    referPathsOf(r, m, "statistics", "statistics-path")?;
+    referPathsOf(r, m, "partition-statistics", "statistics-path")?;
+    let snaps = match (jsonMember(m, "snapshots")) {
+        Some(v) => match (v) {
+            Json.Array(items) => items,
+            _ => { return failRun(r, "The metadata's snapshots are not a list", "".bytes()); }
+        },
+        null => { return Ok(); }
+    };
+    for (i in 0..snaps.length) {
+        let s = borrow snaps[i];
+        match (jsonMemberText(s, "manifest-list")) {
+            Some(p) => { refer(r, p, 1)?; }
+            null => {
+                let manifests = memberItems(s, "manifests") ??
+                    { return failRun(r, "A snapshot names neither a manifest list nor manifests", "".bytes()); };
+                for (k in 0..manifests.length) {
+                    match (borrow manifests[k]) {
+                        Json.Text(p) => { refer(r, p.view(), 2)?; }
+                        _ => { return failRun(r, "A snapshot's manifests are not paths", "".bytes()); }
+                    }
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// The files a manifest list (its manifests, to read next) or a manifest (its data and delete files) names.
+fn manifestReferences(bytes: Slice<u8>, r: borrow mut References, isList: bool) -> Result<void, AvroError> {
+    let file = readAvro(bytes)?;
+    for (i in 0..file.records.length) {
+        let rec = borrow file.records[i];
+        let path = if (isList) jsonMemberText(rec, "manifest_path") else match (jsonMember(rec, "data_file")) {
+            Some(d) => jsonMemberText(d, "file_path"),
+            null => null,
+        };
+        match (path) {
+            Some(p) => { refer(r, p, if (isList) 2 else 0)?; }
+            null => { return Err(AvroError.Malformed); } // a record that names nothing: not a manifest read here
+        }
+    }
+    return Ok();
+}
+
+// ---- A run ----
+
 /// What a run starts from, read under the store.
 struct UnreferencedRun {
     hidden: Vector<u8>;
     id: Vector<u8>;
+    ns: Vector<u8>;
+    name: Vector<u8>;
     metadata: Json;
     location: Vector<u8>;
     /// `unreferencedDays + nonCurrentDays`, in days.
     days: i64;
+    /// Set when the metadata could not be read: the run ends Failed.
+    failure: Vector<u8>;
 }
 
-/// A run's start for a table, or null when its table bucket's removal is disabled or it has no metadata yet.
+/// A run's start for a table, or null when its table bucket's removal is disabled, it has no metadata yet, or it is
+/// gone.
 fn unreferencedRun(store: borrow ObjectStore, t: borrow MaintainedTable) -> Result<UnreferencedRun?, TablesError> {
     let hidden = tableWarehouseBucket(t.bucket.view())?;
-    let rec = tableRecord(store, t.bucket.view(), t.ns.view(), t.name.view())?;
+    let rec = match (tableRecord(store, t.bucket.view(), t.ns.view(), t.name.view())) {
+        Ok(r) => r,
+        Err(TablesError.NotFound) => { return Ok(null); }
+        Err(e) => { return Err(e); }
+    };
     let id = copyBytes(jsonMemberText(borrow rec.json, "id") ?? "".bytes())?;
     if (!uuidShaped(id.view())) { return Ok(null); }
     let document = maintenanceDocument(store, hidden.view(), MAINTENANCE_BUCKET_KEY.bytes())?;
@@ -49,10 +264,27 @@ fn unreferencedRun(store: borrow ObjectStore, t: borrow MaintainedTable) -> Resu
     if (!maintenanceEnabled(borrow value)) { return Ok(null); }
     let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
     if (location.length == 0) { return Ok(null); }
-    let metadata = readMetadata(store, hidden.view(), location.view())?;
+    var failure = Vector<u8>.create();
+    let metadata = match (readMetadata(store, hidden.view(), location.view())) {
+        Ok(m) => m,
+        Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
+        Err(_) => {
+            failure.extend("The table's metadata could not be read; nothing was deleted.".bytes())?;
+            Json.Null
+        }
+    };
     let days = (maintenanceSetting(borrow value, UNREFERENCED_REMOVAL, "unreferencedDays") ?? 3) +
         (maintenanceSetting(borrow value, UNREFERENCED_REMOVAL, "nonCurrentDays") ?? 10);
-    return Ok(Some(UnreferencedRun { hidden: hidden, id: id, metadata: metadata, location: location, days: days }));
+    return Ok(Some(UnreferencedRun {
+        hidden: hidden,
+        id: id,
+        ns: copyBytes(t.ns.view())?,
+        name: copyBytes(t.name.view())?,
+        metadata: metadata,
+        location: location,
+        days: days,
+        failure: failure,
+    }));
 }
 
 /// An object's bytes, read under the store; null if it is not there.
@@ -64,102 +296,104 @@ fn warehouseObject(store: borrow ObjectStore, hidden: Slice<u8>, key: Slice<u8>)
     };
 }
 
-/// Adds the key a path names in the hidden bucket (`s3://<hidden>/<key>`); a path elsewhere names nothing here.
-fn addReferenced(
-    referenced: borrow mut Vector<Vector<u8>>,
-    hidden: Slice<u8>,
-    path: Slice<u8>,
-) -> Result<bool, AllocError> {
-    return match (metadataKey(path, hidden)) {
-        Some(k) => sortedInsert(referenced, k),
-        null => Ok(false),
-    };
-}
-
-/// Every `<member>` path of the objects in an array member of `m` (statistics files, the metadata log).
-fn addPathsOf(
-    referenced: borrow mut Vector<Vector<u8>>,
-    hidden: Slice<u8>,
-    m: borrow Json,
-    array: StringView,
-    member: StringView,
-) -> Result<void, AllocError> {
-    let items = memberItems(m, array) ?? { return Ok(); };
-    for (i in 0..items.length) {
-        match (jsonMemberText(borrow items[i], member)) {
-            Some(p) => { let _ = addReferenced(referenced, hidden, p)?; }
-            null => {}
-        }
+/// A key's forms an engine may write it in or reference it by: percent-decoded, and with `//` made `/` (M10's exit
+/// review, A3). A key matching another's form is taken as referenced, never deleted.
+fn keyForms(key: Slice<u8>, out: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
+    var decoded = Vector<u8>.create();
+    if (percentDecodeInto(mut decoded, key, false)? && decoded.view() != key) { out.push(copyBytes(decoded.view())?)?; }
+    var collapsed = Vector<u8>.create();
+    for (i in 0..key.length) {
+        if (key[i] == '/' && collapsed.length > 0 && collapsed[collapsed.length - 1] == '/') { continue; }
+        collapsed.push(key[i])?;
     }
+    if (collapsed.view() != key) { out.push(collapsed)?; }
     return Ok();
 }
 
-/// What the metadata itself references (its file, the metadata log, statistics files, each snapshot's manifest
-/// list), added to `referenced`; the manifest lists, to read.
-fn metadataReferences(
-    m: borrow Json,
-    hidden: Slice<u8>,
-    location: Slice<u8>,
-    referenced: borrow mut Vector<Vector<u8>>,
-) -> Result<Vector<Vector<u8>>, AllocError> {
-    var lists = Vector<Vector<u8>>.create();
-    let _ = addReferenced(referenced, hidden, location)?;
-    addPathsOf(referenced, hidden, m, "metadata-log", "metadata-file")?;
-    addPathsOf(referenced, hidden, m, "statistics", "statistics-path")?;
-    addPathsOf(referenced, hidden, m, "partition-statistics", "statistics-path")?;
-    let snaps = memberItems(m, "snapshots") ?? { return Ok(lists); };
-    for (i in 0..snaps.length) {
-        match (jsonMemberText(borrow snaps[i], "manifest-list")) {
-            Some(p) => {
-                if (addReferenced(referenced, hidden, p)?) { lists.push(copyBytes(p)?)?; }
-            }
-            null => {}
-        }
-    }
-    return Ok(lists);
-}
-
-/// Why a run failed, for its job status.
-fn avroCodecFailure(e: borrow AvroError) -> bool => match (e) {
-    AvroError.Codec(_) => true,
-    _ => false,
-};
-
-/// The files a manifest list or manifest names (`field`, or `data_file.file_path`), added to `referenced`, and
-/// returned for a list (its manifests, to read next).
-fn manifestPaths(
-    bytes: Slice<u8>,
-    hidden: Slice<u8>,
-    referenced: borrow mut Vector<Vector<u8>>,
-    isList: bool,
-) -> Result<Vector<Vector<u8>>, AvroError> {
-    let file = readAvro(bytes)?;
-    var next = Vector<Vector<u8>>.create();
-    for (i in 0..file.records.length) {
-        let r = borrow file.records[i];
-        let path = if (isList) jsonMemberText(r, "manifest_path") else match (jsonMember(r, "data_file")) {
-            Some(d) => jsonMemberText(d, "file_path"),
-            null => null,
+/// Whether another table pins this one, under the store: a pin whose table is still there with the id it names. A pin
+/// whose table is gone is removed.
+fn pinnedBy(store: borrow mut ObjectStore, run: borrow UnreferencedRun) -> Result<Vector<u8>?, TablesError> {
+    var prefix = catalogKey(MAINTENANCE_SHARED, run.id.view(), "".bytes())?;
+    prefix.push('/')?;
+    let pins = catalogKeys(store, run.hidden.view(), prefix.view(), "".bytes(), 0)?;
+    let bucket = run.hidden.view()[0..run.hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
+    for (i in 0..pins.length) {
+        let by = pins[i].view()[prefix.length..];
+        let pin = match (readRecord(store, run.hidden.view(), pins[i].view())?) {
+            Some(p) => p,
+            null => { continue; }
         };
-        match (path) {
-            Some(p) => {
-                if (addReferenced(referenced, hidden, p)? && isList) { next.push(copyBytes(p)?)?; }
-            }
-            null => { return Err(AvroError.Malformed); } // a record that names nothing: not a manifest read here
+        let ns = jsonMemberText(borrow pin.json, "namespace") ?? "".bytes();
+        let name = jsonMemberText(borrow pin.json, "name") ?? "".bytes();
+        let still = match (tableRecord(store, bucket, ns, name)) {
+            Ok(rec) => jsonMemberText(borrow rec.json, "id") == Some(by),
+            Err(TablesError.NotFound) => false,
+            Err(e) => { return Err(e); }
+        };
+        if (still) {
+            var who = copyBytes(ns)?;
+            who.push('.')?;
+            who.extend(name)?;
+            return Ok(Some(who));
         }
+        removeCatalogObject(store, run.hidden.view(), pins[i].view())?;
     }
-    return Ok(next);
+    return Ok(null);
 }
 
-/// The sweep, under the store: each object of the warehouse nothing references is noted, or deleted once its note
-/// is `days` old; notes of files referenced again go. Then the job's status.
+/// The sweep, under the store. Nothing is done if the table is gone or its metadata changed since the run read it
+/// (the next pass reads it again). Other tables this one references are pinned. A table another pins deletes nothing.
+/// Otherwise each object of the warehouse nothing references is noted, or deleted once its note is `days` old, and
+/// notes of files referenced again go. Then the job's status.
 fn sweepUnreferenced(
     store: borrow mut ObjectStore,
     run: borrow UnreferencedRun,
-    referenced: borrow Vector<Vector<u8>>,
+    refs: borrow mut References,
     nowMs: i64,
     dayMs: i64,
 ) -> Result<void, TablesError> {
+    let bucket = run.hidden.view()[0..run.hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
+    match (tableRecord(store, bucket, run.ns.view(), run.name.view())) {
+        Ok(rec) => {
+            if (jsonMemberText(borrow rec.json, "id") != Some(run.id.view()) ||
+                jsonMemberText(borrow rec.json, "metadataLocation") != Some(run.location.view())) {
+                return Ok(); // it changed while the run read it: the next pass reads it again
+            }
+        }
+        Err(TablesError.NotFound) => { return Ok(); } // dropped: its records went with it
+        Err(e) => { return Err(e); }
+    }
+    // Pin the tables whose files this one references, so they keep them while it does.
+    for (i in 0..refs.others.length) {
+        var pin = jsonObject();
+        jsonSet(mut pin, "namespace", jsonString(run.ns.view())?)?;
+        jsonSet(mut pin, "name", jsonString(run.name.view())?)?;
+        jsonSet(mut pin, "at", jsonInteger(nowMs)?)?;
+        let key = sharedKey(refs.others[i].view(), run.id.view())?;
+        let _ = writeRecord(store, run.hidden.view(), key.view(), borrow pin, PutCondition.None)?;
+    }
+    match (pinnedBy(store, run)?) {
+        Some(who) => {
+            var message = copyBytes("This table's files are referenced by table ".bytes())?;
+            message.extend(who.view())?;
+            message.extend("; nothing was deleted.".bytes())?;
+            writeJobStatus(
+                store,
+                run.hidden.view(),
+                run.id.view(),
+                UNREFERENCED_REMOVAL,
+                "Failed",
+                catalogText(message.view()),
+                nowMs,
+            )?;
+            return Ok();
+        }
+        null => {}
+    }
+    sortKeys(mut refs.keys);
+    var forms = Vector<Vector<u8>>.create();
+    for (i in 0..refs.keys.length) { keyForms(refs.keys[i].view(), mut forms)?; }
+    sortKeys(mut forms);
     var prefix = copyBytes(run.id.view())?;
     prefix.push('/')?;
     let objects = catalogKeys(store, run.hidden.view(), prefix.view(), "".bytes(), 0)?;
@@ -169,7 +403,15 @@ fn sweepUnreferenced(
     var doomed = Vector<Vector<u8>>.create();
     for (i in 0..objects.length) {
         let key = objects[i].view();
-        if (!sortedHolds(referenced, key)) { continue; } // referenced (`sortedHolds` is true when absent)
+        // Referenced (`sortedHolds` is true when absent), as it is or in another form.
+        if (!sortedHolds(borrow refs.keys, key) || !sortedHolds(borrow forms, key)) { continue; }
+        var variants = Vector<Vector<u8>>.create();
+        keyForms(key, mut variants)?;
+        var formReferenced = false;
+        for (k in 0..variants.length) {
+            if (!sortedHolds(borrow refs.keys, variants[k].view())) { formReferenced = true; }
+        }
+        if (formReferenced) { continue; }
         let first = jsonMemberI64(borrow notes, textOfRef(key)) ?? nowMs;
         if (nowMs - first >= run.days * dayMs) {
             doomed.push(copyBytes(key)?)?;
@@ -177,7 +419,7 @@ fn sweepUnreferenced(
             kept.push(JsonMember { key: copyBytes(key)?, value: jsonInteger(first)? })?;
         }
     }
-    // Deleted only now: the committed metadata read for this run references none of them (ADR-0001's order).
+    // Deleted only now: the committed metadata, still the table's, references none of them (ADR-0001's order).
     var at: usize = 0;
     while (at < doomed.length) {
         let end = if (doomed.length - at > 1000) at + 1000 else doomed.length;
@@ -188,11 +430,7 @@ fn sweepUnreferenced(
         at = end;
     }
     if (kept.length == 0) {
-        match (store.deleteObject(catalogText(run.hidden.view()), catalogText(notesKey.view()))) {
-            Ok() => {}
-            Err(StoreError.NoSuchKey) => {}
-            Err(e) => { return Err(tablesStoreFail(e)); }
-        }
+        removeCatalogObject(store, run.hidden.view(), notesKey.view())?;
     } else {
         let document = Json.Object(kept);
         let _ = writeRecord(store, run.hidden.view(), notesKey.view(), borrow document, PutCondition.None)?;
@@ -201,8 +439,32 @@ fn sweepUnreferenced(
     return Ok();
 }
 
+/// A Failed run's status, under the store, unless the table went meanwhile.
+fn failUnreferenced(
+    store: borrow mut ObjectStore,
+    run: borrow UnreferencedRun,
+    why: Slice<u8>,
+    nowMs: i64,
+) -> Result<void, TablesError> {
+    let bucket = run.hidden.view()[0..run.hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
+    match (tableRecord(store, bucket, run.ns.view(), run.name.view())) {
+        Ok(_) => {}
+        Err(TablesError.NotFound) => { return Ok(); }
+        Err(e) => { return Err(e); }
+    }
+    return writeJobStatus(
+        store,
+        run.hidden.view(),
+        run.id.view(),
+        UNREFERENCED_REMOVAL,
+        "Failed",
+        catalogText(why),
+        nowMs,
+    );
+}
+
 /// Unreferenced file removal for one table (ADR-0086 §3): the store held for each read and for the sweep, the
-/// manifests decoded between.
+/// manifests decoded between. Running out of memory ends it with nothing deleted.
 async fn removeUnreferenced(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     t: borrow MaintainedTable,
@@ -218,91 +480,90 @@ async fn removeUnreferenced(
         let st = guard.data();
         started = match (await Async.blocking(() => unreferencedRun(st, t))) {
             Ok(r) => r,
-            Err(_) => { return Ok(); } // the table went, or its metadata does not read: next pass
+            Err(_) => { return Ok(); }
         };
     }
     let run = match (started) {
         Some(r) => r,
         null => { return Ok(); }
     };
-    var referenced = Vector<Vector<u8>>.create();
-    var failure: StringView = "";
-    {
-        let hidden = run.hidden.view();
-        let m = borrow run.metadata;
-        let lists = match (metadataReferences(m, hidden, run.location.view(), mut referenced)) {
-            Ok(l) => l,
+    var refs = match (newReferences(run.hidden.view(), run.id.view())) {
+        Ok(r) => r,
+        Err(_) => { return Ok(); }
+    };
+    if (run.failure.length > 0) {
+        if (refs.failure.extend(run.failure.view()).isErr()) { return Ok(); }
+    } else {
+        if (metadataReferences(borrow run.metadata, run.location.view(), mut refs).isErr()) { return Ok(); }
+    }
+    // Each manifest list, then each manifest it names (or a format 1 snapshot names): read under the store, decoded
+    // outside it.
+    var at: usize = 0;
+    while (at < refs.toRead.length && refs.failure.length == 0) {
+        let key = match (copyBytes(refs.toRead[at].view())) {
+            Ok(k) => k,
             Err(_) => { return Ok(); }
         };
-        // Each manifest list, then each manifest it names: read under the store, decoded outside it.
-        var queue = Vector<Vector<u8>>.create();
-        for (i in 0..lists.length) {
-            if (queue.push(copyBytes(lists[i].view()).ok() ?? Vector<u8>.create()).isErr()) { return Ok(); }
-        }
-        var listsLeft = lists.length;
-        var at: usize = 0;
-        while (at < queue.length && failure.length == 0) {
-            let path = copyBytes(queue[at].view()).ok() ?? Vector<u8>.create();
-            let isList = at < listsLeft;
-            at += 1;
-            let key = metadataKey(path.view(), hidden) ?? { continue; };
-            var bytes: Vector<u8>? = null;
-            {
-                var guard = match (await store.get().lock()) {
-                    Ok(g) => g,
-                    Err(_) => { return Err(NetError.Closed); }
-                };
-                let st = guard.data();
-                bytes = match (await Async.blocking(() => warehouseObject(st, hidden, key))) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        failure = "A manifest could not be read; nothing was deleted.";
-                        null
-                    }
-                };
-            }
-            let b = match (bytes) {
-                Some(b) => b,
-                null => {
-                    if (failure.length == 0) {
-                        failure = "A manifest the metadata names is missing; nothing was deleted.";
-                    }
-                    continue;
+        let isList = refs.toReadIsList[at];
+        at += 1;
+        var bytes: Vector<u8>? = null;
+        var unreadable = false;
+        {
+            var guard = match (await store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NetError.Closed); }
+            };
+            let st = guard.data();
+            let hidden = run.hidden.view();
+            let k = key.view();
+            bytes = match (await Async.blocking(() => warehouseObject(st, hidden, k))) {
+                Ok(b) => b,
+                Err(_) => {
+                    unreadable = true;
+                    null
                 }
             };
-            let bv = b.view();
-            match (await Async.blocking(() => manifestPaths(bv, hidden, mut referenced, isList))) {
-                Ok(next) => {
-                    for (k in 0..next.length) {
-                        if (queue.push(copyBytes(next[k].view()).ok() ?? Vector<u8>.create()).isErr()) { return Ok(); }
-                    }
-                }
-                Err(e) => {
-                    failure = if (avroCodecFailure(
-                        borrow e,
-                    )) "A manifest's codec is not one read here (null and deflate are); nothing was deleted."
-                        else "A manifest could not be read; nothing was deleted.";
+        }
+        let b = match (bytes) {
+            Some(b) => b,
+            null => {
+                let why =
+                    if (unreadable) "A manifest could not be read" else "A manifest the metadata names is missing";
+                if (failRun(mut refs, why, key.view()).isErr()) { return Ok(); }
+                continue;
+            }
+        };
+        let bv = b.view();
+        let r = borrow mut refs;
+        match (await Async.blocking(() => manifestReferences(bv, r, isList))) {
+            Ok() => {}
+            Err(AvroError.Codec(name)) => {
+                if (failRun(
+                    mut refs,
+                    "A manifest's codec is not one read here (null and deflate are)",
+                    name.view(),
+                ).isErr()) {
+                    return Ok();
                 }
             }
+            Err(AvroError.OutOfMemory(_)) => { return Ok(); }
+            Err(AvroError.Malformed) => {
+                if (failRun(mut refs, "A manifest could not be read", key.view()).isErr()) { return Ok(); }
+            }
         }
-        let _ = listsLeft;
     }
     var guard = match (await store.get().lock()) {
         Ok(g) => g,
         Err(_) => { return Err(NetError.Closed); }
     };
     let st = guard.data();
-    if (failure.length > 0) {
-        let hidden = run.hidden.view();
-        let id = run.id.view();
-        let message = failure;
-        let _ = await Async.blocking(
-            () => writeJobStatus(st, hidden, id, UNREFERENCED_REMOVAL, "Failed", message, nowMs),
-        );
+    let rr = borrow run;
+    if (refs.failure.length > 0) {
+        let why = refs.failure.view();
+        let _ = await Async.blocking(() => failUnreferenced(st, rr, why, nowMs));
         return Ok();
     }
-    let r = borrow run;
-    let refs = borrow referenced;
-    let _ = await Async.blocking(() => sweepUnreferenced(st, r, refs, nowMs, dayMs));
+    let found = borrow mut refs;
+    let _ = await Async.blocking(() => sweepUnreferenced(st, rr, found, nowMs, dayMs));
     return Ok();
 }

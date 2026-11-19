@@ -3348,3 +3348,23 @@ Browser form uploads with a SigV4 POST policy.
     decoder's memory (B2).
 - **Until A1 and B1 are fixed,** unreferenced removal (enabled by default) should not run on real tables.
 - **Next:** fix the findings, if the owner agrees.
+
+### 19 Nov 2026: M10's exit review findings closed (the owner: "continue")
+
+- **Unreferenced removal (A1 to A3, A6):** every reference is placed.
+  - `s3://`, `s3a://` and `s3n://` of the hidden bucket read the same, and another bucket's are passed by.
+  - Anything else ends the run Failed with nothing deleted: another scheme, a key of no table, metadata of format 3,
+    or a snapshot with neither a manifest list nor format 1's inline manifests, which are read.
+  - A reference into another table pins it, and a pinned table deletes nothing.
+  - A key matching a reference percent-decoded, or with `//` collapsed, is kept.
+  - The sweep does nothing if the table changed during the run.
+- **Expiry (A4, A5):** every branch keeps its newest `minSnapshotsToKeep`, and those within its age, with the ref's
+  own settings. The ancestry walk has a visited set of its own. `remove-snapshots` drops statistics entries (C1).
+- **The Avro reader (B1, B2, C5):** i64's least is refused before it is negated, and counts are bounded by the bytes
+  left. A file decodes to 64 MiB at most. Also inherited namespaces, a wrapped type, and 32-bit ints.
+- **The rest:** failures are recorded, compaction's stored value echoed, and the codec named.
+- **Checks:** 373 tests; the S3 smoke and the cluster smoke (134), with the maintenance check on both.
+- **CI on `7ec6a93`:** the perf gate failed, on large writes at c32, with the runner's noise at 2.00. The next commit,
+  `0a35dc0`, has the same server code (slice 5 changed only the SDK checks), and its perf gate passed, as did
+  `22bdd44`'s. So that was the runner's noise.
+- **Next:** the owner's word on ADR-0086 and on closing M10.

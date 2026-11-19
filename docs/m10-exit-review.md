@@ -108,6 +108,28 @@ Checked and right (both reviews):
 - **`maintenance-run`:** authorized.
 - **The cluster:** one job a request, signed and routed to the leader.
 
+## The findings, closed (the owner: "continue")
+
+| Finding | What closed it | Evidence |
+|---|---|---|
+| A1 references skipped | References are placed: `s3://`, `s3a://`, `s3n://` of this bucket read the same; another bucket's passed by. Anything else (another scheme, a key of no table, format 3, `snapshots` not a list, a snapshot with neither list nor manifests) ends the run Failed, nothing deleted. Format 1's inline `manifests` are read | `unreferencedRefusesWhatItCannotPlace`; `unreferencedFilesNotedThenDeleted` (an `s3a://` reference keeps its file) |
+| A2 other tables' files | A reference into another table's prefix pins it (`shared/<its id>/<this id>`). A pinned table deletes nothing while the pinning table is there; a stale pin goes | `unreferencedPinsOtherTables` |
+| A3 forms of a key | A key matching a referenced one percent-decoded, or with `//` made `/`, is referenced | `unreferencedFilesNotedThenDeleted` (`a%20b` keeps `a b`) |
+| A4 the walk stopping at a ref | A visited set of its own; refs' heads held apart | `snapshotsThatExpire` (a tag on the parent: main still keeps three) |
+| A5 other branches | Every branch keeps its newest `minSnapshotsToKeep`, and those younger than its age, honouring the ref's own `min-snapshots-to-keep` and `max-snapshot-age-ms`. `max-ref-age-ms` is not applied (refs never expire here; ADR-0086 §2) | `snapshotsThatExpire` (a `dev` branch keeps three) |
+| A6 a commit during the run | The sweep re-reads the table under the store: a table dropped or changed since the run read it gets nothing done | `unreferencedSweepWaitsForACommitMeanwhile` |
+| B1 i64's least | Refused before it is negated, in every block count (`blockCount`) | `avroRefusesHostileCounts` |
+| B2 memory | A count is at most the bytes left; a block's records at most its bytes; a file's blocks decode to 64 MiB at most | `avroRefusesHostileCounts` (the million records of no bytes, an array past its bytes) |
+| C1 statistics | `remove-snapshots` drops their `statistics` and `partition-statistics` entries | `snapshotManagementCommits`, the smokes |
+| C2 failures not recorded | A run whose metadata cannot be read records Failed. An allocation failure ends the run with nothing deleted, never an empty path. A dropped table gets no status | `unreferencedRefusesWhatItCannotPlace` |
+| C3 compaction's answer | The stored value is echoed | the SDK checks |
+| C4 the codec's name | The Failed message names it | `failRun` |
+| C5 the Avro reader | Inherited namespaces; an ambiguous short name refused; `{"type": {…}}` read; `int` checked to 32 bits; a varint's 10th byte checked | `avroRefusesHostileCounts` |
+| C6 leftovers | A dropped table gets no notes or status. References are sorted once (no O(n²)). Days are the wall clock's, and a cluster's nodes should share `--tables-day-seconds` (ADR-0086 §6) | the unit tests |
+
+**After the fixes:** 373 unit tests pass. The S3 smoke (the maintenance check's 15, PyIceberg's 23) and the cluster
+smoke (134, both checks through node 2) pass.
+
 ## Verdict
 
 **M10 should not close yet**, and unreferenced file removal, enabled by default, should not run on real tables until
@@ -122,3 +144,11 @@ manifests, metadata not of format 2, or a path that differs only by encoding. Th
 size budget, and checked counts. Then fix C, and run the smokes and the SDK matrix again.
 
 Closing M10 and accepting ADR-0086 are the owner's decisions.
+
+**After the fixes:** every finding is closed with its test.
+- **Unreferenced removal** deletes only what it can show no reference names: a reference it cannot place, a manifest
+  it cannot read, a pin from another table, or a commit during the run each leave the warehouse as it was.
+- **The Avro reader** refuses the counts and sizes that panicked it or ran it out of memory.
+- **Expiry** keeps what Iceberg's own keeps on every branch.
+
+M10's "done when" holds, and M10 can close on the owner's word.

@@ -41,8 +41,13 @@
    - **Storage:** configurations and job status are catalog objects (`.s3tables/maintenance/…`), so there is no new
      record.
 2. **Snapshot management**, per table, when enabled:
-   - **What may expire:** a snapshot older than `maxSnapshotAgeHours`.
-   - **What stays:** the head of any branch or tag, and the newest `minSnapshotsToKeep` of main's ancestry.
+   - **What stays**, as Iceberg's own expiry decides (M10's exit review, A4, A5):
+     - every ref's head, and the current snapshot;
+     - on each branch, its newest `minSnapshotsToKeep`, and those younger than `maxSnapshotAgeHours`. The ref's own
+       `min-snapshots-to-keep` and `max-snapshot-age-ms` win where it has them. The ancestry walk tracks what it
+       visited, so a cycle ends it and a ref's head on the way does not.
+   - **What expires:** a snapshot nothing keeps, once older than `maxSnapshotAgeHours`.
+   - **Refs:** a ref's `max-ref-age-ms` is not applied, so refs never expire here.
    - **The commit:** the expired snapshots are removed as a `remove-snapshots` commit, applied as ADR-0083 §5
      applies one. It is a new metadata file swapped in by If-Match. If another commit wins, the job stops and tries
      again next run.
@@ -58,8 +63,22 @@
      first noted now, and deleted only days later.
    - **The ordering rule:** a file is deleted only when the committed metadata no longer references it, as read in
      that run.
-   - **What stops a run:** any manifest it cannot read (a codec not taken, a damaged file, a schema it does not
-     know) ends the run as Failed, with nothing deleted. Not knowing a reference never deletes a file.
+   - **What stops a run:** not knowing a reference never deletes a file (M10's exit review, A1 to A3, A6). The run
+     ends as Failed, deleting nothing, on:
+     - any manifest it cannot read: a codec not taken (the message names it), a damaged file, or a schema it does
+       not know;
+     - a reference it cannot place: a scheme other than `s3://`, `s3a://` and `s3n://`, or a key of the hidden
+       bucket under no table's id;
+     - metadata of a format other than 1 and 2, `snapshots` that is not a list, or a snapshot naming neither a
+       manifest list nor (format 1) inline `manifests`.
+   - **References elsewhere:** one into another bucket names no file of this table bucket, and is passed by.
+   - **Forms of a key:** a key that matches a referenced one after percent-decoding, or with `//` made `/`, is taken
+     as referenced, never deleted.
+   - **Other tables' files:** a reference into another table's prefix pins that table. Its pin is an object
+     `.s3tables/maintenance/shared/<its id>/<this id>`. A pinned table's run deletes nothing (Failed, naming the
+     table that pins it) while the pinning table is there.
+   - **The sweep re-reads the table first.** If it was dropped, or its metadata changed since the run read it, the
+     sweep does nothing, and the next pass reads it again.
 4. **The readers**, in the S3 layer, with no C and no `unsafe`:
    - **An inflate decoder** (RFC 1951: stored, fixed and dynamic Huffman blocks), with an output limit.
    - **An Avro object container reader:**
@@ -68,6 +87,13 @@
      - **The data:** the binary encoding of the schema's types (null, boolean, int, long, float, double, bytes,
        string, record, enum, array, map, union, fixed), each record read into the JSON model.
    - **Other codecs:** snappy, zstandard and bzip2 make a run Failed, and its message names the codec.
+   - **Bounds** (M10's exit review, B1, B2):
+     - A count is at most the bytes left, so each item takes one at least. i64's least is refused before it is
+       negated.
+     - An `int` fits 32 bits, and a varint's 10th byte holds the 64th bit only.
+     - A file's blocks decode to 64 MiB at most in all.
+   - **Names:** a named type inherits its enclosing namespace, and a short name matching two full names is
+     refused.
 5. **When jobs run:**
    - **The loop:** beside the store's upkeep, a table maintenance pass runs every hour of a day (a day is 86,400 s,
      or `serve --tables-day-seconds` for tests, as `--inventory-day-seconds` is). Each pass runs each table's jobs
@@ -83,8 +109,8 @@
        request does not read its own writes.
      - **Per-job status:** each job's status is an object of its own, so two jobs never write over each other's.
      - **On `serve`** the call is taken too, to run a job now.
-6. **Not done:** compaction (refused when enabled), a job's per-ref settings (`max-snapshot-age-ms` on a branch), and
-   removing files outside a table's warehouse.
+6. **Not done:** compaction (refused when enabled), refs' `max-ref-age-ms`, and removing files outside a table's
+   warehouse. Days are the wall clock's; on a cluster each node should run with the same `--tables-day-seconds`.
 
 ## Slices
 

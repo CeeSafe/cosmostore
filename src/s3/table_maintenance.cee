@@ -200,7 +200,7 @@ fn getTableMaintenance(
     let key = tableMaintenanceKey(id)?;
     let document = maintenanceDocument(store, hidden.view(), key.view())?;
     var configuration = jsonObject();
-    jsonSet(mut configuration, COMPACTION, defaultMaintenance(COMPACTION)?)?;
+    jsonSet(mut configuration, COMPACTION, maintenanceValue(borrow document, COMPACTION)?)?;
     jsonSet(mut configuration, SNAPSHOT_MANAGEMENT, maintenanceValue(borrow document, SNAPSHOT_MANAGEMENT)?)?;
     var answer = jsonObject();
     var arn = Vector<u8>.create();
@@ -300,54 +300,81 @@ fn removeCatalogObject(store: borrow mut ObjectStore, hidden: Slice<u8>, key: Sl
 
 // ---- Snapshot management (ADR-0086 §2) ----
 
-/// The snapshots to expire: older than `cutoffMs`, and neither a ref's head nor among the newest `keep` of main's
-/// ancestry (from the current snapshot through each parent).
-fn snapshotsToExpire(m: borrow Json, cutoffMs: i64, keep: i64) -> Result<Vector<i64>, AllocError> {
-    var held = Vector<i64>.create();
-    match (jsonMember(m, "refs")) {
+/// A snapshot's id, time and parent, sorted by id for the ancestry walks.
+struct SnapshotInfo {
+    id: i64;
+    stamp: i64;
+    parent: i64;
+}
+
+fn snapshotAt(index: borrow Vector<SnapshotInfo>, id: i64) -> usize? {
+    var low: usize = 0;
+    var high = index.length;
+    while (low < high) {
+        let mid = low + (high - low) / 2;
+        if (index[mid].id == id) { return Some(mid); }
+        if (index[mid].id < id) { low = mid + 1; } else { high = mid; }
+    }
+    return null;
+}
+
+/// The snapshots to expire, as Iceberg's own expiry decides (M10's exit review, A4, A5):
+/// - every ref's head is kept;
+/// - each branch keeps its newest `min-snapshots-to-keep` (the ref's own, else `keep`), and those younger than its
+///   `max-snapshot-age-ms` (the ref's own, else `maxAgeMs`), walking its ancestry;
+/// - a snapshot none keeps expires once older than `maxAgeMs`.
+/// A ref's `max-ref-age-ms` is not applied: refs never expire here.
+fn snapshotsToExpire(m: borrow Json, nowMs: i64, maxAgeMs: i64, keep: i64) -> Result<Vector<i64>, AllocError> {
+    var index = Vector<SnapshotInfo>.create();
+    let items = memberItems(m, "snapshots") ?? { return Ok(Vector<i64>.create()); };
+    for (i in 0..items.length) {
+        let id = jsonMemberI64(borrow items[i], "snapshot-id") ?? { continue; };
+        index.push(SnapshotInfo {
+            id: id,
+            stamp: jsonMemberI64(borrow items[i], "timestamp-ms") ?? nowMs,
+            parent: jsonMemberI64(borrow items[i], "parent-snapshot-id") ?? -1,
+        })?;
+    }
+    index.sortBy((a, b) => if (a.id < b.id) -1 else if (a.id > b.id) 1 else 0);
+    var held = Vector<bool>.create();
+    for (i in 0..index.length) { held.push(false)?; }
+    // The current snapshot, whatever refs say.
+    match (snapshotAt(borrow index, jsonMemberI64(m, "current-snapshot-id") ?? -1)) {
+        Some(i) => { held[i] = true; }
+        null => {}
+    }
+    match (memberMembers(m, "refs")) {
         Some(refs) => {
-            match (refs) {
-                Json.Object(ms) => {
-                    for (i in 0..ms.length) {
-                        match (jsonMemberI64(borrow ms[i].value, "snapshot-id")) {
-                            Some(s) => { held.push(s)?; }
-                            null => {}
-                        }
-                    }
+            for (r in 0..refs.length) {
+                let ref = borrow refs[r].value;
+                let head = jsonMemberI64(ref, "snapshot-id") ?? { continue; };
+                match (snapshotAt(borrow index, head)) {
+                    Some(i) => { held[i] = true; }
+                    null => { continue; }
                 }
-                _ => {}
+                if (jsonMemberText(ref, "type") != Some("branch".bytes())) { continue; } // a tag: its head
+                let branchKeep = jsonMemberI64(ref, "min-snapshots-to-keep") ?? keep;
+                let cutoff = nowMs - (jsonMemberI64(ref, "max-snapshot-age-ms") ?? maxAgeMs);
+                // The branch's ancestry, each snapshot once (a cycle ends it).
+                var visited = Vector<bool>.create();
+                for (i in 0..index.length) { visited.push(false)?; }
+                var at = head;
+                var depth: i64 = 0;
+                while (true) {
+                    let i = snapshotAt(borrow index, at) ?? { break; };
+                    if (visited[i]) { break; }
+                    visited[i] = true;
+                    if (depth < branchKeep || index[i].stamp >= cutoff) { held[i] = true; }
+                    depth += 1;
+                    at = index[i].parent;
+                }
             }
         }
         null => {}
     }
-    let snapshots = match (jsonMember(m, "snapshots")) {
-        Some(s) => s,
-        null => { return Ok(Vector<i64>.create()); }
-    };
-    let items = match (snapshots) {
-        Json.Array(items) => items,
-        _ => { return Ok(Vector<i64>.create()); }
-    };
-    // Main's ancestry, newest first, the first `keep` held.
-    var at = jsonMemberI64(m, "current-snapshot-id") ?? -1;
-    var kept: i64 = 0;
-    while (at != -1 && kept < keep) {
-        held.push(at)?;
-        kept += 1;
-        var parent: i64 = -1;
-        for (i in 0..items.length) {
-            if (jsonMemberI64(borrow items[i], "snapshot-id") == Some(at)) {
-                parent = jsonMemberI64(borrow items[i], "parent-snapshot-id") ?? -1;
-            }
-        }
-        if (holdsId(held.view(), parent)) { break; } // a cycle: stop
-        at = parent;
-    }
     var gone = Vector<i64>.create();
-    for (i in 0..items.length) {
-        let id = jsonMemberI64(borrow items[i], "snapshot-id") ?? { continue; };
-        let stamp = jsonMemberI64(borrow items[i], "timestamp-ms") ?? { continue; };
-        if (stamp < cutoffMs && !holdsId(held.view(), id)) { gone.push(id)?; }
+    for (i in 0..index.length) {
+        if (!held[i] && index[i].stamp < nowMs - maxAgeMs) { gone.push(index[i].id)?; }
     }
     return Ok(gone);
 }
@@ -389,7 +416,7 @@ fn manageSnapshots(
             return Ok(true);
         }
     };
-    let gone = snapshotsToExpire(borrow m, nowMs - hours * hourMs, keep)?;
+    let gone = snapshotsToExpire(borrow m, nowMs, hours * hourMs, keep)?;
     if (gone.length > 0) {
         let previousStamp = jsonMemberI64(borrow m, "last-updated-ms") ?? 0;
         removeSnapshots(mut m, gone.view())?;
