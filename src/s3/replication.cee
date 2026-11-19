@@ -196,11 +196,19 @@ async fn putBucketReplication(
     verifySmallBody(req, xml.view(), true)?;
     let rules = parseReplication(xml.view())?;
     // A user or a session may replicate only into a bucket it may write itself (the M11 exit review's A1).
+    // Another endpoint's bucket is written with the operator's keys for it: the account's to name, not a user's or a
+    // session's (the M11 second reading's #2). A table bucket's warehouse is no one's destination (ADR-0083 §2).
+    let restricted = who.session || userOfRequester(app.credentials.get().view(), who).isSome();
     for (i in 0..rules.length) {
-        if (isRemoteDestination(rules[i].destination.view())) { continue; }
-        await authorizeDestination(app, req, who, "s3:ReplicateObject", rules[i].destination.view())?;
+        if (isTableWarehouseShaped(rules[i].destination.view())) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+        if (isRemoteDestination(rules[i].destination.view())) {
+            if (restricted) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+            continue;
+        }
+        let prefix = rules[i].prefix.view();
+        await authorizeDestination(app, req, who, "s3:ReplicateObject", rules[i].destination.view(), prefix)?;
         if (rules[i].deleteMarkers) {
-            await authorizeDestination(app, req, who, "s3:ReplicateDelete", rules[i].destination.view())?;
+            await authorizeDestination(app, req, who, "s3:ReplicateDelete", rules[i].destination.view(), prefix)?;
         }
     }
     var stored = Vector<u8>.create();

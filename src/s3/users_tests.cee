@@ -204,6 +204,43 @@ fn exitReviewRulesOfM11() -> Result<void, TestFailure> {
     Check.isTrue(parseBucketPolicy(typo.bytes(), "photos".bytes(), set.view(), true).isErr(), "a user not there")?;
     let other =
         "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam::999999999999:user/reader\"},\"Action\":\"s3:*\",\"Resource\":\"arn:aws:s3:::photos/*\"}}";
-    Check.isTrue(parseBucketPolicy(other.bytes(), "photos".bytes(), set.view(), false).isErr(), "another account")?;
+    Check.isTrue(parseBucketPolicy(other.bytes(), "photos".bytes(), set.view(), true).isErr(), "another account")?;
+    // Stored before the rule, it still reads, and names no user here.
+    Check.isTrue(parseBucketPolicy(other.bytes(), "photos".bytes(), set.view(), false).isOk(), "a stored one reads")?;
+    return Ok();
+}
+
+@test
+fn destinationsSeeEveryDenyUnderTheirPrefix() -> Result<void, TestFailure> {
+    // A pattern meets a prefix if some text it matches starts with it.
+    Check.isTrue(patternMeetsPrefix("bkt/secret/*".bytes(), "bkt/".bytes()), "a narrower Deny under the prefix")?;
+    Check.isTrue(patternMeetsPrefix("bkt/*".bytes(), "bkt/logs/".bytes()), "a wider one")?;
+    Check.isTrue(patternMeetsPrefix("b?t/x".bytes(), "bkt/".bytes()), "a ? in it")?;
+    Check.isFalse(patternMeetsPrefix("other/*".bytes(), "bkt/".bytes()), "another bucket")?;
+    Check.isFalse(patternMeetsPrefix("bkt/a".bytes(), "bkt/b".bytes()), "another key")?;
+    Check.isFalse(patternMeetsPrefix("bk".bytes(), "bkt/".bytes()), "shorter, no wildcard")?;
+    // The bucket's Deny of a user on `secret/` reaches replication into the whole bucket, whatever its conditions.
+    let none = Vector<Credential>.create();
+    let doc =
+        "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:user/five\"},\"Action\":[\"s3:ReplicateObject\",\"s3:PutObject\"],\"Resource\":\"arn:aws:s3:::bkt/secret/*\",\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}}";
+    let p = parseBucketPolicy(doc.bytes(), "bkt".bytes(), none.view(), false)!;
+    Check.isTrue(
+        denyReaches(borrow p, Some("AKIA5".bytes()), Some("five".bytes()), "s3:ReplicateObject", "bkt/".bytes()),
+        "five",
+    )?;
+    Check.isFalse(
+        denyReaches(borrow p, Some("AKIA6".bytes()), Some("six".bytes()), "s3:ReplicateObject", "bkt/".bytes()),
+        "six",
+    )?;
+    Check.isFalse(
+        denyReaches(borrow p, Some("AKIA5".bytes()), Some("five".bytes()), "s3:ReplicateObject", "bkt/public/".bytes()),
+        "beside it",
+    )?;
+    // The user's own Deny (an identity policy names no principal).
+    let mine = parseIdentityPolicy(
+        "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"},{\"Effect\":\"Deny\",\"Action\":\"s3:Replicate*\",\"Resource\":\"arn:aws:s3:::bkt/secret/*\"}]}".bytes(),
+    )!;
+    Check.isTrue(denyReaches(borrow mine, null, null, "s3:ReplicateObject", "s3:bkt/".bytes()), "its own Deny")?;
+    Check.isFalse(denyReaches(borrow mine, null, null, "s3:PutObject", "s3:bkt/".bytes()), "of another action")?;
     return Ok();
 }

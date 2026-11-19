@@ -58,15 +58,19 @@ open, so this takes ADR-0087's recommendation: a users file beside the credentia
    - **Through an access point** (amended after M11's exit review, A6), each side must allow, as on AWS: the access
      point, by the user's identity policy on the access point's ARN or the access point's policy; and the bucket, by
      the identity policy on the bucket's ARN or the bucket's policy. A Deny on either ARN, or in either policy,
-     refuses.
+     refuses. A role's session needs its policies to allow both ARNs.
    - **Fields that are calls of their own** (A4): a write's ACL needs `s3:PutObjectAcl`, its tags
-     `s3:PutObjectTagging`, its retention `s3:PutObjectRetention` and its legal hold `s3:PutObjectLegalHold`; a bucket
+     `s3:PutObjectTagging` (a copy that keeps its source's tags, `s3:GetObjectTagging` on the source too), its
+     retention `s3:PutObjectRetention` and its legal hold `s3:PutObjectLegalHold`; a bucket
      made with an ACL `s3:PutBucketAcl`, with object lock `s3:PutBucketObjectLockConfiguration` and
      `s3:PutBucketVersioning`. For every requester, as on AWS.
    - **Where the server writes for a configuration** (A1): a user's or a session's replication destination needs
      `s3:ReplicateObject` (and `s3:ReplicateDelete` with delete markers), and an inventory's or the logs' target
-     `s3:PutObject`, on the destination's objects, when the configuration is put. The account's keys may name any
-     bucket. A policy changed later is not read again at delivery: what a configuration may do is decided once.
+     `s3:PutObject`, on the destination's objects under the configuration's prefix, when it is put; and any Deny of
+     the requester's policies or the bucket's that could reach a key under that prefix refuses, its conditions taken
+     to hold. Users and sessions may not name another endpoint's bucket, and no one a table bucket's warehouse. The
+     account's keys may name any bucket. A policy changed later is not read again at delivery: what a configuration
+     may do is decided once.
    - **A table bucket's warehouse:** its data is decided as `s3tables:GetTableData`/`PutTableData`, and HeadBucket
      as `s3tables:GetTableBucket` (B5).
 3. **Identity policy grammar** (roles' and users'):
@@ -83,8 +87,8 @@ open, so this takes ADR-0087's recommendation: a users file beside the credentia
    - Another service's action or ARN is MalformedPolicy, and a role whose policy does not parse stops `serve` at
      start, as now.
    - **Principals:** resource policies take `arn:aws:iam::000000000000:user/<name>` beside the key ARNs they take
-     now. Another account's user is MalformedPolicy, and so is a user the users file does not have when the policy
-     is put (B2). A grant follows the name: a user removed and made again with that name has it again (AWS keys
+     now. Another account's user, or a user the users file does not have, is MalformedPolicy when the policy is put
+     (B2); a policy stored before this rule still reads. A grant follows the name: a user removed and made again with that name has it again (AWS keys
      principals by a unique id; CosmoStore's users have none).
 4. **STS:**
    - **GetSessionToken** by a user: the session is the user's, decided by the user's identity policy.

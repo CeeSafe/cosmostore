@@ -3505,3 +3505,15 @@ Browser form uploads with a SigV4 POST policy.
 - **Fixed:** A1 to A6, and B1, B2, B5 and B6, each with a test or a smoke check. B3 and B4 (Low) stay open.
 - **Tests:** 378 unit tests, the S3 smoke, the cluster smoke (138) and the SDK matrix pass.
 - **Next:** a second reading of the fixes by a fresh reviewer, then the owner's decisions on ADR-0088 and M11.
+
+### 19 Nov 2026: M11, a second reading of the fixes
+
+- **Seven more findings, all fixed:**
+  - a destination is checked on its prefix, against every Deny that could reach it;
+  - users and sessions may not replicate to another endpoint, and no one into a warehouse;
+  - role sessions are decided on the access point's ARN too;
+  - copied tags need the tagging actions;
+  - a key revoked mid-request is never the account's;
+  - a stored policy naming another account's user still reads.
+- **Tests:** 379 unit tests; the S3 smoke, the cluster smoke (138) and the SDK matrix pass.
+- **Next:** the owner's decisions on ADR-0088 and M11.

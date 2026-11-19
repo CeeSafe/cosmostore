@@ -159,3 +159,25 @@ The owner chose (a): the users file names the account's keys.
 - the SDK matrix (five SDKs).
 
 **Upgrade note:** a deployment already using `--users-file` must add an `account` line naming its account keys, or they are refused.
+
+## A second reading of the fixes (19 Nov 2026)
+
+A fresh reviewer read the fixes and probed a server built from them. It found A2, A3, A5, B1, B2 and B5 sound, and A4 and A6 sound for users.
+
+| # | Finding | Fix | Test |
+|---|---|---|---|
+| 1 | Medium (reproduced): a destination was checked on the literal `<bucket>/*`, so a Deny on a narrower prefix (`bkt/secret/*`) did not apply, and the rule's prefix was not checked | the destination is checked on its prefix (`<prefix>*`), and any Deny of the requester's policies or the bucket's that could reach a key under the prefix refuses, its conditions taken to hold | `destinationsSeeEveryDenyUnderTheirPrefix` |
+| 2 | Medium: another endpoint's destination skipped the check, so a user could write there with the operator's keys | users and sessions may not name one (AccessDenied) | (by reading) |
+| 3 | Medium-Low (reproduced): role sessions through an access point did not read the access point's ARN | a role's session's policies must allow the access point too | (by reading) |
+| 4 | Low-Medium: replication into a table warehouse on a cluster | refused for every requester (InvalidRequest), as inventory and logging already were | (by reading) |
+| 5 | Low (reproduced): CopyObject's default directive copied tags without the tagging actions | `s3:GetObjectTagging` on the source and `s3:PutObjectTagging` on the target when tags are copied | (by reading) |
+| 6 | Low: a key revoked mid-request was still the account's in S3 Tables, S3 Control and the stats check | `userOfRequester` returns a revoked place too (no user, no policy), and S3 Tables refuses it | (by reading) |
+| 7 | Low: a stored policy naming another account's user would read as malformed after the upgrade | the account is checked when a policy is put; a stored one reads, and names no user here | `exitReviewRulesOfM11` |
+
+**Still open, with B3 and B4:** grants follow a user's name, so a user removed and made again with that name has
+them again.
+
+**Upgrade notes:**
+- A deployment with a users file needs an `account` line naming its account keys.
+- Replication, inventory and logging configurations that users set before these fixes were not checked: re-put
+  them, or check them, after upgrading.

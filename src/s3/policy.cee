@@ -258,7 +258,9 @@ fn parsePrincipal<region a>(
                 let tail = if (colon < v.length) v[colon + 1..] else "".bytes();
                 let user = "user/".bytes();
                 if (startsWithBytes(tail, user) && userNameOk(tail[user.length..])) {
-                    if (v[iam.length..colon] != POLICY_ACCOUNT.bytes()) { return Err(malformedPolicy()); }
+                    // Checked when a policy is put: one stored before this rule still reads (it names no user here).
+                    if (checkKeys && v[iam.length..colon] != POLICY_ACCOUNT.bytes()) { return Err(malformedPolicy()); }
+                    if (v[iam.length..colon] != POLICY_ACCOUNT.bytes()) { continue; }
                     if (checkKeys && !configuredUser(credentials, tail[user.length..])) {
                         return Err(malformedPolicy());
                     }
@@ -1694,6 +1696,18 @@ fn gateDecision(
         // A user needs the access point to let it in, by its identity policy or the access point's, and then the
         // bucket to, below: each side allows, as AWS asks (the M11 exit review's A6).
         if (user.isSome() && !allowed && !pointIdentityAllows) { return Ok(PolicyDecision.Deny); }
+        // A role's session: its policies must allow the access point too, as they must the bucket (the M11 second
+        // reading's #3).
+        if (who.role.isSome()) {
+            let express = who.directoryAccessPoint.length > 0;
+            var pointCall = copyBytes(if (express) "s3expressap:".bytes() else "s3ap:".bytes())?;
+            pointCall.extend(who.accessPointName.view())?;
+            if (key.length > 0 && !express) {
+                pointCall.extend("/object/".bytes())?;
+                pointCall.extend(key)?;
+            }
+            if (!sessionAllows(app, req, who, identityAction, pointCall.view())?) { return Ok(PolicyDecision.Deny); }
+        }
     }
     if (isPolicyAction(action) && user.isNull()) {
         return Ok(if (anonymous) PolicyDecision.Deny else PolicyDecision.Allow);
@@ -1757,21 +1771,138 @@ async fn authorize(
     key: Slice<u8>,
 ) -> Result<void, S3Fail> => await authorizeVersion(app, req, who, action, bucket, key, null);
 
-/// Whether a user's or a session's configuration may name `bucket` as where the server writes for it: replication's
-/// destination, an inventory's or the logs' (the M11 exit review's A1). The requester must be allowed `action` on
-/// the bucket's objects, `s3:<bucket>/*`, as if it wrote them itself. The account's keys may name any bucket, as
-/// before: the account owns them all.
+/// Whether a user's or a session's configuration may name `bucket` as where the server writes for it, under `prefix`:
+/// replication's destination, an inventory's or the logs' (the M11 exit review's A1). The requester must be allowed
+/// `action` on the objects under the prefix, `s3:<bucket>/<prefix>*`, as if it wrote them itself, and no Deny of its
+/// policies or the bucket's may reach any key under it, whatever its conditions: what is decided once, when the
+/// configuration is put, must hold for every object the server writes later. The account's keys may name any bucket,
+/// as before: the account owns them all.
 async fn authorizeDestination(
     app: borrow S3App,
     req: borrow S3Request,
     who: borrow Requester,
     action: StringView,
     bucket: Slice<u8>,
+    prefix: Slice<u8>,
 ) -> Result<void, S3Fail> {
-    let user = userOfRequester(app.credentials.get().view(), who).isSome();
-    if (!user && !who.session) { return Ok(); }
+    let credentials = app.credentials.get().view();
+    let user = userOfRequester(credentials, who);
+    if (user.isNull() && !who.session) { return Ok(); }
     let name = StringView.fromUtf8(bucket) ?? { return Err(S3Fail.Code(S3Code.AccessDenied)); };
-    return await authorize(app, req, who, action, name, "*".bytes());
+    var keys = copyBytes(prefix)?;
+    keys.push('*')?;
+    await authorize(app, req, who, action, name, keys.view())?;
+    // A Deny anywhere under the prefix: the requester's own policies, then the bucket's.
+    var identityPrefix = copyBytes("s3:".bytes())?;
+    identityPrefix.extend(bucket)?;
+    identityPrefix.push('/')?;
+    identityPrefix.extend(prefix)?;
+    var policies = Vector<BucketPolicy>.create();
+    match (user) {
+        Some(u) => {
+            match (borrow u.policy) {
+                Some(p) => { policies.push(clonePolicy(p)?)?; }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    match (who.role) {
+        Some(r) => {
+            if (r < app.roles.length) { policies.push(clonePolicy(borrow app.roles[r].policy)?)?; }
+        }
+        null => {}
+    }
+    match (borrow who.sessionPolicy) {
+        Some(p) => { policies.push(clonePolicy(p)?)?; }
+        null => {}
+    }
+    for (k in 0..policies.length) {
+        if (denyReaches(borrow policies[k], null, null, action, identityPrefix.view())) {
+            return Err(S3Fail.Code(S3Code.AccessDenied));
+        }
+    }
+    let gate = await policyGate(app, who, name)?;
+    match (borrow gate.policy) {
+        PolicyGate.Closed | PolicyGate.Broken => { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+        PolicyGate.Read(policy) => {
+            var resourcePrefix = copyBytes(bucket)?;
+            resourcePrefix.push('/')?;
+            resourcePrefix.extend(prefix)?;
+            let principal = match (who.key) {
+                Some(i) => if (i < credentials.length) Some(credentials[i].accessKey.view()) else null,
+                null => null,
+            };
+            let userName: Slice<u8>? = match (user) {
+                Some(u) => Some(u.user.view()),
+                null => null,
+            };
+            if (denyReaches(policy, principal, userName, action, resourcePrefix.view())) {
+                return Err(S3Fail.Code(S3Code.AccessDenied));
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// Whether a Deny of `policy` that names this requester and action could refuse some resource starting with
+/// `prefix`, whatever its conditions (they are taken to hold): a NotResource Deny always could.
+fn denyReaches(
+    policy: borrow BucketPolicy,
+    who: Slice<u8>?,
+    user: Slice<u8>?,
+    action: StringView,
+    prefix: Slice<u8>,
+) -> bool {
+    for (s in 0..policy.statements.length) {
+        let st = borrow policy.statements[s];
+        if (st.allow) { continue; }
+        var principal = st.anyone;
+        match (who) {
+            Some(key) => {
+                for (i in 0..st.keys.length) {
+                    if (st.keys[i].view() == key) { principal = true; }
+                }
+            }
+            null => {}
+        }
+        match (user) {
+            Some(name) => {
+                for (i in 0..st.users.length) {
+                    if (st.users[i].view() == name) { principal = true; }
+                }
+            }
+            null => {}
+        }
+        // An identity policy's statements name no principal: they are the requester's own.
+        let identity = !st.anyone && st.keys.length == 0 && st.users.length == 0 && !st.notPrincipal;
+        if (!identity && principal == st.notPrincipal) { continue; }
+        var acts = false;
+        for (i in 0..st.actions.length) {
+            if (wildMatch(st.actions[i].view(), action.bytes(), true)) { acts = true; }
+        }
+        if (acts == st.notAction) { continue; }
+        if (st.notResource) { return true; }
+        for (i in 0..st.resources.length) {
+            if (patternMeetsPrefix(st.resources[i].view(), prefix)) { return true; }
+        }
+    }
+    return false;
+}
+
+/// Whether the pattern (`*` and `?`) matches some text that starts with `prefix`.
+fn patternMeetsPrefix(pattern: Slice<u8>, prefix: Slice<u8>) -> bool {
+    var i: usize = 0;
+    while (true) {
+        if (i == prefix.length) { return true; }
+        if (i == pattern.length) { return false; }
+        let c = pattern[i];
+        if (c == '*') { return true; }
+        if (c != '?' && c != prefix[i]) { return false; }
+        i += 1;
+    }
+    return false;
 }
 
 /// A write's fields that are calls of their own in S3's policies (the M11 exit review's A4): an ACL needs
