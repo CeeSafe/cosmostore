@@ -204,3 +204,7 @@ The owner asked for the Lows to be fixed before closing.
   examples. A narrower pattern does not match it.
 
 **Upgrade note:** every user line of a users file needs its id (`<name>:<id>`).
+
+## Closed (19 Nov 2026)
+
+The owner accepted ADR-0088, as amended, and closed M11 ("Accept and close").

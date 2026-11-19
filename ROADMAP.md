@@ -314,10 +314,13 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 
 ### M11: Identities
 
-The owner chose ADR-0087's item A (19 Nov 2026). ADR-0088 (proposed) designs it:
-- **The users file:** each user's name, its access keys and an identity policy, reloaded with the credentials file.
+**Closed 19 Nov 2026** (the owner: "Accept and close"; `docs/m11-exit-review.md`).
+
+The owner chose ADR-0087's item A (19 Nov 2026). ADR-0088 (accepted 19 Nov 2026) designs it:
+- **The users file:** `account` lines name the account's keys; each user's name and id, its access keys and an
+  identity policy; reloaded with the credentials file. With a users file, a key it names neither way is refused.
 - **The decision, as IAM's in one account:** a Deny anywhere refuses; an identity or resource Allow allows; otherwise
-  the request is refused. A key no user names is the account's, as now.
+  the request is refused.
 - **AssumeRole sessions** are taken by S3 Tables.
 - **Done when** a key restricted to one bucket's reads is refused everything else, through every SDK, on `serve` and
   on a cluster.
@@ -3524,3 +3527,14 @@ Browser form uploads with a SigV4 POST policy.
   users they name, so a user made again with an old name has none of the old one's grants.
 - **B3 and B4** are recorded as decided, unchanged, with the reasoning in `docs/m11-exit-review.md`.
 - **Tests:** 380 unit tests; the S3 smoke, the cluster smoke (138) and the SDK matrix pass.
+
+### 19 Nov 2026: M11 closed, ADR-0088 accepted
+
+- **The owner:** "Accept and close", after both readings' findings were fixed and the Lows fixed or decided.
+- **At closing (`490dd81`):** 380 unit tests, the S3 smoke, the cluster smoke (138) and the SDK matrix (boto3, Go,
+  JavaScript, Java, .NET) pass.
+- **Upgrade notes:**
+  - a users file needs an `account` line naming the account's keys, and an id on every user line
+    (`<name>:<id>`);
+  - replication, inventory and logging configurations users set before the fixes should be put again.
+- **Next:** M12, when the owner asks for one.

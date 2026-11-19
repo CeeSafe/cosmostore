@@ -1,6 +1,7 @@
 # ADR-0088: Identities, users and their identity policies (M11)
 
-**Status:** proposed, 19 Nov 2026. M11 is item A of ADR-0087 (the owner: "A."). Where users are defined was left
+**Status:** accepted, 19 Nov 2026 (the owner: "Accept and close"), as amended after M11's exit review. Proposed the
+same day. M11 is item A of ADR-0087 (the owner: "A."). Where users are defined was left
 open, so this takes ADR-0087's recommendation: a users file beside the credentials file.
 
 ## Context
@@ -25,7 +26,7 @@ open, so this takes ADR-0087's recommendation: a users file beside the credentia
   - The identity policy grammar and decision of roles (ADR-0075 §2, `parseIdentityPolicy`, `sessionAllows`).
   - The resource policies' decision (`gateDecision`, `checkTables`).
 
-## Decision (proposed)
+## Decision
 
 1. **The users file** (`serve --users-file`, `node --users-file`): `account <access key>[,<access key>…]` lines name
    the account's keys, and one user a line, `<name>:<id> <access key>[,<access key>…] <identity policy JSON>`; `#`
