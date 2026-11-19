@@ -1,6 +1,7 @@
 # ADR-0089: M12, what comes after identities (proposed)
 
-**Status:** proposed, 19 Nov 2026. The owner: "Continue to M12". M11 (identities, ADR-0088) closed the same day, and
+**Status:** decided, 19 Nov 2026: the owner chose A ("A: the long tail"), with archive classes refused; ADR-0090
+designs it. Proposed the same day. The owner: "Continue to M12". M11 (identities, ADR-0088) closed the same day, and
 ADR-0087 §3 named the long tail the next candidate.
 
 ## Context

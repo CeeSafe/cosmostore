@@ -312,6 +312,18 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 **Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
 (ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
+### M12: The long tail
+
+The owner chose ADR-0089's item A (19 Nov 2026), with archive classes refused. ADR-0090 (proposed) designs it:
+- **Storage classes:** recorded on the object and answered, or refused, never dropped (a fix: they are dropped
+  today).
+- **Lifecycle transitions** to the classes kept here, recorded, not moved.
+- **ListMultipartUploads' `delimiter`.**
+- **SHA-1 checksums.**
+- **A POST form's object lock fields.**
+- **SSE-KMS's encryption context.**
+- **Done when** each item, refused today, is taken and tested in the SDK matrix, on `serve` and on a cluster.
+
 ### M11: Identities
 
 **Closed 19 Nov 2026** (the owner: "Accept and close"; `docs/m11-exit-review.md`).
@@ -3552,3 +3564,14 @@ Browser form uploads with a SigV4 POST policy.
 - **CI:** `2a7fd1a`'s check failed in the S3 smoke's webhook retry section, which passed locally on the same code;
   `490dd81` and `e0fb06c` were still running.
 - **Next:** the owner's choice.
+
+### 19 Nov 2026: M12 is the long tail (ADR-0090, proposed)
+
+- **The owner:** "A: the long tail", with GLACIER and DEEP_ARCHIVE refused.
+- **ADR-0090 designs it, in five slices:**
+  1. storage classes, recorded or refused, never dropped;
+  2. lifecycle transitions;
+  3. ListMultipartUploads' `delimiter` and SHA-1 checksums;
+  4. a POST form's object lock fields and SSE-KMS's encryption context;
+  5. the cluster, the SDK matrix and the exit review.
+- **Next:** slice 1.
