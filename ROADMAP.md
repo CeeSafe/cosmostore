@@ -312,6 +312,15 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 **Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
 (ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
+### M10 (proposed)
+
+The owner: "propose M10" (19 Nov 2026). ADR-0085 (proposed) sets out three candidates:
+- **A, table maintenance** (snapshot management and unreferenced file removal), recommended.
+- **B, identities** (users and identity policies).
+- **C, the long tail** (lifecycle transitions, ListMultipartUploads' `delimiter`, SHA-1 checksums).
+
+Which one is the owner's choice.
+
 ---
 
 ## Part 3: First four weeks (concrete backlog)
@@ -3241,3 +3250,15 @@ Browser form uploads with a SigV4 POST policy.
   - all of it on `serve` and on a cluster, through the AWS CLI and every SDK of the matrix.
 - **Not done, and refused:** maintenance, encryption other than the server's, tags, replication, storage classes,
   metrics, record expiration, staged creates, nested namespaces, views, credential vending and AssumeRole sessions.
+
+### 19 Nov 2026: M10 proposed (ADR-0085)
+
+- **The owner:** "propose M10". ADR-0085 (proposed) gives three candidates, one to be M10:
+  - **A, table maintenance:** snapshot management and unreferenced file removal; compaction stays refused.
+  - **B, identities:** users and identity policies, and AssumeRole in S3 Tables.
+  - **C, the long tail.**
+- **Recommended: A.** It finishes M9, whose tables otherwise keep every file they ever wrote.
+  - Its cost is an Avro reader and an inflate decoder. PyIceberg deflates its manifests by default, and lib/std has
+    no decoder (checked).
+  - Whether the decoder is asked of CeeSafe or written here first is the owner's choice too.
+- **Next:** the owner's choice of item.
