@@ -1848,6 +1848,169 @@ async fn authorize(
     key: Slice<u8>,
 ) -> Result<void, S3Fail> => await authorizeVersion(app, req, who, action, bucket, key, null);
 
+/// Who a configuration is put by, as ADR-0094 §1 records it: `user <name> <id>` for a user or a GetSessionToken
+/// session's user, `role <name>` for an AssumeRole session's role (a session is decided as its parent); empty for the
+/// account's keys, whose configurations are the account's.
+fn requesterText(app: borrow S3App, who: borrow Requester) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    match (who.role) {
+        Some(r) => {
+            if (r < app.roles.length) {
+                out.extend("role ".bytes())?;
+                out.extend(app.roles[r].name.view())?;
+            }
+            return Ok(out);
+        }
+        null => {}
+    }
+    match (userOfRequester(app.credentials.get().view(), who)) {
+        Some(u) => {
+            if (u.userKey.length > 0) {
+                out.extend("user ".bytes())?;
+                out.extend(u.userKey.view())?;
+            }
+        }
+        null => {}
+    }
+    return Ok(out);
+}
+
+/// A request of no client, for a decision the server makes on its own (ADR-0094 §2): no headers, so no policy
+/// condition on a client's address, Referer or User-Agent holds for it.
+fn deliveryRequest() -> S3Request => S3Request {
+    method: Method.Put,
+    methodText: Vector<u8>.create(),
+    headers: Vector<HeaderPair>.create(),
+    rawPath: Vector<u8>.create(),
+    rawQuery: Vector<u8>.create(),
+    bucket: String.create(),
+    key: String.create(),
+    query: Vector<QueryParam>.create(),
+};
+
+/// Whether a write the server makes for a configuration is allowed as the requester it records (ADR-0094 §2): as a
+/// request of theirs to `action` on `bucket`/`key` would be, with `credentials` and `roles` as they are now and the
+/// destination bucket's policy (`policy`, none; `broken`, one that does not parse). The rules are a user's request's
+/// (ADR-0088 §2: a Deny in its identity policy or the bucket's refuses, else an Allow in either allows) and a role
+/// session's (ADR-0075 §3: its role's policy must allow, and the bucket's may deny). An empty requester is the
+/// account's, or a configuration put before M14: allowed. A user no users file has, or a role no roles file has, is
+/// refused. A write has no client, so a policy condition on a client's address, Referer or User-Agent holds for none.
+fn decideRecorded(
+    credentials: Slice<Credential>,
+    roles: Slice<StsRole>,
+    secure: bool,
+    policy: borrow BucketPolicy?,
+    broken: bool,
+    requester: Slice<u8>,
+    action: StringView,
+    bucket: StringView,
+    key: Slice<u8>,
+) -> Result<bool, AllocError> {
+    if (requester.length == 0) { return Ok(true); }
+    let userHead = "user ".bytes();
+    let roleHead = "role ".bytes();
+    var user: usize? = null;
+    var role: usize? = null;
+    if (startsWithBytes(requester, userHead)) {
+        let userKey = requester[userHead.length..];
+        for (i in 0..credentials.length) {
+            if (!credentials[i].revoked && credentials[i].userKey.view() == userKey) { user = Some(i); }
+        }
+    } else if (startsWithBytes(requester, roleHead)) {
+        let name = requester[roleHead.length..];
+        for (r in 0..roles.length) {
+            if (roles[r].name.view() == name) { role = Some(r); }
+        }
+    }
+    if (user.isNull() && role.isNull()) { return Ok(false); }
+    let req = deliveryRequest();
+    let facts = policyFacts(borrow req, false, secure, null)?;
+    let call = identityCallOf(action, bucket, key)?;
+    let identityAction = StringView.fromUtf8(call.action.view()) ?? action;
+    var identityAllows = false;
+    match (role) {
+        Some(r) => {
+            match (decidePolicy(borrow roles[r].policy, null, identityAction, call.target.view(), borrow facts)) {
+                PolicyDecision.Allow => { identityAllows = true; }
+                _ => { return Ok(false); }
+            }
+        }
+        null => {}
+    }
+    var principal: Slice<u8>? = null;
+    var userName: Slice<u8>? = null;
+    match (user) {
+        Some(i) => {
+            principal = Some(credentials[i].accessKey.view());
+            userName = Some(credentials[i].userKey.view());
+            match (borrow credentials[i].policy) {
+                Some(p) => {
+                    match (decidePolicy(p, null, identityAction, call.target.view(), borrow facts)) {
+                        PolicyDecision.Deny => { return Ok(false); }
+                        PolicyDecision.Allow => { identityAllows = true; }
+                        PolicyDecision.Neither => {}
+                    }
+                }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    if (broken) { return Ok(false); }
+    match (policy) {
+        Some(p) => {
+            var resource = copyBytes(bucket.bytes())?;
+            if (key.length > 0) {
+                resource.push('/')?;
+                resource.extend(key)?;
+            }
+            match (decidePolicyFor(p, principal, userName, action, resource.view(), borrow facts)) {
+                PolicyDecision.Deny => { return Ok(false); }
+                PolicyDecision.Allow => { return Ok(true); }
+                PolicyDecision.Neither => {}
+            }
+        }
+        null => {}
+    }
+    return Ok(identityAllows);
+}
+
+/// `decideRecorded` with the S3 server's own credentials, roles and the destination bucket's policy (a cluster's
+/// destination shard, ADR-0094 §4).
+async fn allowedAsRecorded(
+    app: borrow S3App,
+    requester: Slice<u8>,
+    action: StringView,
+    bucket: StringView,
+    key: Slice<u8>,
+) -> Result<bool, S3Fail> {
+    if (requester.length == 0) { return Ok(true); }
+    let stored = await storeBucketConfig(app, bucket, BUCKET_CONFIG_POLICY)?;
+    let credentials = app.credentials.get().view();
+    var policy: BucketPolicy? = null;
+    var broken = false;
+    if (stored.length > 0) {
+        match (parseBucketPolicy(stored.view(), bucket.bytes(), credentials, false)) {
+            Ok(p) => { policy = Some(p); }
+            Err(S3Fail.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
+            Err(_) => { broken = true; }
+        }
+    }
+    return Ok(
+        decideRecorded(
+            credentials,
+            app.roles.view(),
+            app.secure,
+            policy.asBorrow(),
+            broken,
+            requester,
+            action,
+            bucket,
+            key,
+        )?,
+    );
+}
+
 /// Whether a user's or a session's configuration may name `bucket` as where the server writes for it, under `prefix`:
 /// replication's destination, an inventory's or the logs' (the M11 exit review's A1). The requester must be allowed
 /// `action` on the objects under the prefix, `s3:<bucket>/<prefix>*`, as if it wrote them itself, and no Deny of its

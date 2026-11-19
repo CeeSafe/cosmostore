@@ -332,3 +332,65 @@ fn policiesNameUsersByTheirIds() -> Result<void, TestFailure> {
     )?;
     return Ok();
 }
+
+fn recordedRole(name: StringView, policy: StringView) -> StsRole =>
+    StsRole { name: copyBytes(name.bytes())!, maxSeconds: 3600, policy: parseIdentityPolicy(policy.bytes())! };
+
+/// A configuration's write decided as the requester it records (ADR-0094 §2), with the users, roles and policies of
+/// now: a user removed, or its policy narrowed, stops it; a role likewise; the bucket's Deny refuses and its Allow lets
+/// a user write; a condition on a client's address holds for no write.
+@test
+fn writesDecidedAsTheirRequester() -> Result<void, TestFailure> {
+    let putAll =
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:PutObject\",\"Resource\":\"arn:aws:s3:::dst/*\"}}";
+    let fromAddress =
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:PutObject\",\"Resource\":\"arn:aws:s3:::dst/*\",\"Condition\":{\"IpAddress\":{\"aws:SourceIp\":\"10.0.0.0/8\"}}}}";
+    var set = Vector<Credential>.create();
+    set.push(usersKey("AKIAWRITER1"))!;
+    set[0].user.extend("writer".bytes())!;
+    set[0].userKey.extend("writer W1".bytes())!;
+    set[0].policy = Some(parseIdentityPolicy(putAll.bytes())!);
+    var roles = Vector<StsRole>.create();
+    roles.push(recordedRole("auditor", putAll))!;
+    let none: BucketPolicy? = null;
+    let decide = (creds: Slice<Credential>, policy: borrow BucketPolicy?, broken: bool, requester: StringView) =>
+        decideRecorded(
+            creds,
+            roles.view(),
+            false,
+            policy,
+            broken,
+            requester.bytes(),
+            "s3:PutObject",
+            "dst",
+            "r/a".bytes(),
+        )!;
+    Check.isTrue(decide(set.view(), none.asBorrow(), false, ""), "the account's")?;
+    Check.isTrue(decide(set.view(), none.asBorrow(), false, "user writer W1"), "a user its policy allows")?;
+    Check.isFalse(decide(set.view(), none.asBorrow(), false, "user writer W2"), "a user made again (another id)")?;
+    Check.isTrue(decide(set.view(), none.asBorrow(), false, "role auditor"), "a role its policy allows")?;
+    Check.isFalse(decide(set.view(), none.asBorrow(), false, "role gone"), "a role no longer there")?;
+    Check.isFalse(decide(set.view(), none.asBorrow(), true, "user writer W1"), "a bucket policy that does not parse")?;
+    // The bucket's Deny of the user refuses; its Allow lets a user its own policy does not.
+    let deny = parseBucketPolicy(
+        "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:user/writer\"},\"Action\":\"s3:*\",\"Resource\":\"arn:aws:s3:::dst/*\"}}".bytes(),
+        "dst".bytes(),
+        set.view(),
+        false,
+    )!;
+    let denied: BucketPolicy? = Some(deny);
+    Check.isFalse(decide(set.view(), denied.asBorrow(), false, "user writer W1"), "the bucket's Deny")?;
+    // The user removed: refused, whatever it was allowed.
+    var removed = Vector<Credential>.create();
+    removed.push(usersKey("AKIAWRITER1"))!;
+    removed[0].revoked = true;
+    Check.isFalse(decide(removed.view(), none.asBorrow(), false, "user writer W1"), "a user removed")?;
+    // Its policy narrowed to a client's address: no write has one.
+    var narrowed = Vector<Credential>.create();
+    narrowed.push(usersKey("AKIAWRITER1"))!;
+    narrowed[0].user.extend("writer".bytes())!;
+    narrowed[0].userKey.extend("writer W1".bytes())!;
+    narrowed[0].policy = Some(parseIdentityPolicy(fromAddress.bytes())!);
+    Check.isFalse(decide(narrowed.view(), none.asBorrow(), false, "user writer W1"), "a condition on an address")?;
+    return Ok();
+}

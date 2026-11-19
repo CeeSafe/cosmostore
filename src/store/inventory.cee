@@ -23,13 +23,21 @@ struct InventoryConfig {
     allVersions: bool;
     filter: Vector<u8>;
     fields: u8;
+    /// Who put it, as ADR-0094 §1 records it (`user <name> <id>`, `role <name>`); empty for the account's, or one put
+    /// before M14.
+    requester: Vector<u8>;
 }
 
 /// Inventory v1: u8 version, u16 count, then per configuration the id, u8 enabled, the destination, the prefix, u8
-/// days, u8 all versions, the filter prefix (each text u16+bytes), u8 optional fields.
+/// days, u8 all versions, the filter prefix (each text u16+bytes), u8 optional fields. Version 2 (ADR-0094 §1),
+/// written only when a configuration has a requester, adds per configuration its requester (text u16+bytes).
 fn encodeInventory(configs: Slice<InventoryConfig>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
     if (configs.length == 0) { return Ok(); }
-    out.push(1)?;
+    var version: u8 = 1;
+    for (i in 0..configs.length) {
+        if (configs[i].requester.length > 0) { version = 2; }
+    }
+    out.push(version)?;
     out.pushLE(truncate<u16>(configs.length))?;
     for (i in 0..configs.length) {
         let c = borrow configs[i];
@@ -41,6 +49,7 @@ fn encodeInventory(configs: Slice<InventoryConfig>, out: borrow mut Vector<u8>) 
         out.push(if (c.allVersions) 1u8 else 0u8)?;
         pushText16(out, c.filter.view())?;
         out.push(c.fields)?;
+        if (version == 2) { pushText16(out, c.requester.view())?; }
     }
     return Ok();
 }
@@ -48,7 +57,8 @@ fn encodeInventory(configs: Slice<InventoryConfig>, out: borrow mut Vector<u8>) 
 fn decodeInventory(b: Slice<u8>) -> Result<Vector<InventoryConfig>, MetaFault> {
     var out = Vector<InventoryConfig>.create();
     if (b.length == 0) { return Ok(out); }
-    if (b[0] != 1) { return Err(MetaFault.BadVersion); }
+    if (b[0] != 1 && b[0] != 2) { return Err(MetaFault.BadVersion); }
+    let version = b[0];
     need(b, 1, 2)?;
     let n = b.readLE<u16>(1) as usize;
     if (n == 0 || n > MAX_INVENTORY_CONFIGS) { return Err(MetaFault.TooLong); }
@@ -68,6 +78,7 @@ fn decodeInventory(b: Slice<u8>) -> Result<Vector<InventoryConfig>, MetaFault> {
         need(b, at, 1)?;
         let fields = b[at];
         at += 1;
+        let requester = if (version == 2) readText16(b, mut at)? else Vector<u8>.create();
         if ((days != 1 && days != 7) || id.length == 0 || destination.length == 0) { return Err(MetaFault.TooLong); }
         out.push(InventoryConfig {
             id: id,
@@ -78,6 +89,7 @@ fn decodeInventory(b: Slice<u8>) -> Result<Vector<InventoryConfig>, MetaFault> {
             allVersions: allVersions,
             filter: filter,
             fields: fields,
+            requester: requester,
         })?;
     }
     if (at != b.length) { return Err(MetaFault.TooLong); }

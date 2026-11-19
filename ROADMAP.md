@@ -3835,3 +3835,16 @@ Browser form uploads with a SigV4 POST policy.
   3. on a cluster, the destination's shard decides;
   4. the exit review.
 - **Next:** slice 1.
+
+### 20 Nov 2026: M14 slice 1, the requester recorded and the decision as one (ADR-0094 §1, §2)
+
+- **The requester recorded:** replication (rules v3), inventory (v2) and logging (v2) configurations record who
+  put them: `user <name> <id>`, or `role <name>` for an AssumeRole session (a session as its parent). Each format
+  version is written only with a requester; the account's and older ones record none.
+- **`decideRecorded`:** a pure decision, with the credentials, roles and destination policy of now.
+  - **A user:** a Deny in its identity policy or the bucket's refuses; else an Allow in either allows.
+  - **A role:** its policy must allow, and the bucket's may deny.
+  - **Refused:** a user or role gone, and a bucket policy that does not parse.
+  - **No client:** a condition on a client's address holds for no write.
+- **Tests:** `configurationsRecordTheirRequester`, `writesDecidedAsTheirRequester`.
+- **Next:** slice 2, deciding each write on `serve`.
