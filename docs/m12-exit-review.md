@@ -127,3 +127,20 @@ The owner chose (a) for A3: lifecycle on each shard's leader.
   among `compatibility.md`'s refusals.
 - **B6:** the class is checked before the bucket is. S3's order is *memory*.
 - **SHA-1 speed:** it stays byte at a time (C3).
+
+## The Lows (19 Nov 2026)
+
+The owner asked for the three Lows to be fixed before closing.
+
+- **B3, replication's destination class:** a rule's `Destination/StorageClass` is taken.
+  - **Which classes:** one kept here, else InvalidStorageClass; STANDARD, or none, keeps the source's.
+  - **Kept and returned:** stored in replication rules v2, written only then, and returned by
+    GetBucketReplication.
+  - **Applied:** by every delivery (here, to another endpoint, and through a cluster's front), which sends or
+    writes the replica with that class.
+  - **Tests:** the S3 smoke's replica is STANDARD_IA by its rule.
+- **B6, the bucket first:** a write's class is checked after its bucket, so GLACIER to a bucket that is not there
+  is NoSuchBucket (S3 smoke).
+- **SHA-1's speed:** whole 64-byte blocks are compressed straight from the input. Only a block begun before, or
+  left at the end, is copied. The FIPS vectors, which feed a million bytes in pieces of 1000, and the padding
+  vectors pass.

@@ -3680,3 +3680,12 @@ Browser form uploads with a SigV4 POST policy.
   - C1 confirmed (no downgrade past M12), C2 and C3.
 - **Unchanged and recorded:** B3, B6, and SHA-1's speed.
 - **Tests:** 387 unit tests, the S3 smoke, the cluster smoke (146, lifecycle applied on a cluster) and the SDK matrix pass.
+
+### 19 Nov 2026: M12, the Lows
+
+- **The owner:** "Fix the Lows first".
+- **B3:** replication's `Destination/StorageClass` is taken (rules v2), and every delivery records the replica with
+  it.
+- **B6:** a write's class is checked after its bucket (NoSuchBucket first).
+- **SHA-1:** whole blocks straight from the input.
+- **Tests:** 387 unit tests, the S3 smoke, the cluster smoke (146) and the SDK matrix pass.

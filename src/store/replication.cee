@@ -21,13 +21,20 @@ struct ReplicationRule {
     deleteMarkers: bool;
     /// The destination bucket's name (its ARN's last part).
     destination: Vector<u8>;
+    /// The storage class its replicas get (ADR-0090 §1, the M12 exit review's B3); empty: the source's.
+    storageClass: Vector<u8>;
 }
 
 /// Replication v1: u8 version, u16 count, then per rule the id, u32 priority, u8 flags (1: enabled, 2: delete
-/// markers), the prefix and the destination (each text u16+bytes).
+/// markers), the prefix and the destination (each text u16+bytes). Version 2, written only when a rule gives its
+/// replicas a storage class, adds per rule that class (text u16+bytes, empty for the source's).
 fn encodeReplication(rules: Slice<ReplicationRule>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
     if (rules.length == 0) { return Ok(); }
-    out.push(1)?;
+    var version: u8 = 1;
+    for (i in 0..rules.length) {
+        if (rules[i].storageClass.length > 0) { version = 2; }
+    }
+    out.push(version)?;
     out.pushLE(truncate<u16>(rules.length))?;
     for (i in 0..rules.length) {
         let r = borrow rules[i];
@@ -36,6 +43,7 @@ fn encodeReplication(rules: Slice<ReplicationRule>, out: borrow mut Vector<u8>) 
         out.push((if (r.enabled) 1u8 else 0u8) | (if (r.deleteMarkers) 2u8 else 0u8))?;
         pushText16(out, r.prefix.view())?;
         pushText16(out, r.destination.view())?;
+        if (version == 2) { pushText16(out, r.storageClass.view())?; }
     }
     return Ok();
 }
@@ -43,7 +51,8 @@ fn encodeReplication(rules: Slice<ReplicationRule>, out: borrow mut Vector<u8>) 
 fn decodeReplication(b: Slice<u8>) -> Result<Vector<ReplicationRule>, MetaFault> {
     var out = Vector<ReplicationRule>.create();
     if (b.length == 0) { return Ok(out); }
-    if (b[0] != 1) { return Err(MetaFault.BadVersion); }
+    if (b[0] != 1 && b[0] != 2) { return Err(MetaFault.BadVersion); }
+    let version = b[0];
     need(b, 1, 2)?;
     let n = b.readLE<u16>(1) as usize;
     if (n == 0 || n > MAX_REPLICATION_RULES) { return Err(MetaFault.TooLong); }
@@ -57,6 +66,11 @@ fn decodeReplication(b: Slice<u8>) -> Result<Vector<ReplicationRule>, MetaFault>
         let prefix = readText16(b, mut at)?;
         let destination = readText16(b, mut at)?;
         if (destination.length == 0) { return Err(MetaFault.TooLong); }
+        var storageClass = Vector<u8>.create();
+        if (version == 2) {
+            storageClass = readText16(b, mut at)?;
+            if (!isStoredClassValue(storageClass.view())) { return Err(MetaFault.TooLong); }
+        }
         out.push(ReplicationRule {
             id: id,
             priority: priority,
@@ -64,6 +78,7 @@ fn decodeReplication(b: Slice<u8>) -> Result<Vector<ReplicationRule>, MetaFault>
             prefix: prefix,
             deleteMarkers: (flags & 2) != 0,
             destination: destination,
+            storageClass: storageClass,
         })?;
     }
     if (at != b.length) { return Err(MetaFault.TooLong); }
@@ -71,6 +86,22 @@ fn decodeReplication(b: Slice<u8>) -> Result<Vector<ReplicationRule>, MetaFault>
 }
 
 fn isReplicationValue(value: Slice<u8>) -> bool => decodeReplication(value).isOk();
+
+/// The storage class a replica to `destination` gets, by the rules the event names (`ruleIds`): the deciding rule's
+/// class, or empty for the source's.
+fn replicaClassFor<region a>(
+    rules: Slice<a, ReplicationRule>,
+    ruleIds: Slice<Vector<u8>>,
+    destination: Slice<u8>,
+) -> Slice<a, u8> {
+    for (i in 0..rules.length) {
+        if (rules[i].destination.view() != destination) { continue; }
+        for (k in 0..ruleIds.length) {
+            if (ruleIds[k].view() == rules[i].id.view()) { return rules[i].storageClass.view(); }
+        }
+    }
+    return "".bytes();
+}
 
 /// Whether a rule replicates an event of `kind` for `key` (ADR-0077 §2): new objects and completed uploads, delete
 /// markers if it says so, never a version's removal.

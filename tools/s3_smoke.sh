@@ -941,7 +941,7 @@ aws s3 rm --recursive s3://smoke/ap/ > /dev/null 2>&1
 # Replication (ADR-0077): new versions of rsrc go to rdst with their version ids and ETags.
 for b in rsrc rdst rplain; do aws s3api create-bucket --bucket $b > /dev/null 2>&1; done
 for b in rsrc rdst; do aws s3api put-bucket-versioning --bucket $b --versioning-configuration Status=Enabled > /dev/null 2>&1; done
-rconf='{"Role":"arn:aws:iam::000000000000:role/r","Rules":[{"ID":"all","Priority":1,"Status":"Enabled","Filter":{"Prefix":""},"DeleteMarkerReplication":{"Status":"Enabled"},"Destination":{"Bucket":"arn:aws:s3:::rdst"}}]}'
+rconf='{"Role":"arn:aws:iam::000000000000:role/r","Rules":[{"ID":"all","Priority":1,"Status":"Enabled","Filter":{"Prefix":""},"DeleteMarkerReplication":{"Status":"Enabled"},"Destination":{"Bucket":"arn:aws:s3:::rdst","StorageClass":"STANDARD_IA"}}]}'
 check "a destination without versioning" "$(code s3api put-bucket-replication --bucket rsrc --replication-configuration "${rconf/rdst/rplain}")" InvalidRequest
 aws s3api put-bucket-replication --bucket rsrc --replication-configuration "$rconf" > /dev/null 2>&1 && pass "put-bucket-replication" || fail "put-bucket-replication"
 check "get-bucket-replication" "$(aws s3api get-bucket-replication --bucket rsrc --query 'ReplicationConfiguration.Rules[0].Destination.Bucket' --output text 2>&1)" "arn:aws:s3:::rdst"
@@ -966,6 +966,8 @@ for k in r/small.txt r/multi.bin r/sealed.txt; do
     check "$k is a replica" "$(aws s3api head-object --bucket rdst --key "$k" --query ReplicationStatus --output text 2>&1)" REPLICA
 done
 check "a multipart ETag" "$(aws s3api head-object --bucket rdst --key r/multi.bin --query ETag --output text 2>&1 | grep -c -- '-2"')" 1
+check "replicas get the rule's storage class (M12 review B3)" "$(aws s3api head-object --bucket rdst --key r/multi.bin --query StorageClass --output text 2>&1)" STANDARD_IA
+check "and the rule returns it" "$(aws s3api get-bucket-replication --bucket rsrc --query 'ReplicationConfiguration.Rules[0].Destination.StorageClass' --output text 2>&1)" STANDARD_IA
 check "the multipart replica's bytes" "$(aws s3 cp s3://rdst/r/multi.bin - 2>/dev/null | cmp -s - r2.bin && echo same)" same
 check "the sealed replica reads" "$(aws s3 cp s3://rdst/r/sealed.txt - 2>&1)" "replicate me"
 check "and is sealed" "$(aws s3api head-object --bucket rdst --key r/sealed.txt --query ServerSideEncryption --output text 2>&1)" AES256
@@ -1387,6 +1389,7 @@ aws s3api put-object --bucket classes --key std --body dir.txt --storage-class S
 check "STANDARD is not named on the object" "$(aws s3api head-object --bucket classes --key std --query StorageClass --output text 2>&1)" None
 check "an archive class refused" "$(code s3api put-object --bucket classes --key g --body dir.txt --storage-class GLACIER)" InvalidStorageClass
 check "and an unknown one" "$(code s3api put-object --bucket classes --key g --body dir.txt --storage-class SHELF)" InvalidStorageClass
+check "a bucket that is not there, before the class (M12 review)" "$(code s3api put-object --bucket no-such-classes --key g --body dir.txt --storage-class GLACIER)" NoSuchBucket
 aws s3api copy-object --bucket classes --key ia --copy-source classes/ia --storage-class ONEZONE_IA > /dev/null 2>&1
 check "a copy onto itself changes only its class" "$(aws s3api head-object --bucket classes --key ia --query StorageClass --output text 2>&1)" ONEZONE_IA
 aws s3api copy-object --bucket classes --key copied --copy-source classes/ia > /dev/null 2>&1

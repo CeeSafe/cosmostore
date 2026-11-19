@@ -165,7 +165,7 @@ M7's calls (ADR-0072 to ADR-0077) are checked by the smoke script with the AWS C
 checks of boto3 (`s3`, `s3control` and `sts` clients): access logs delivered into a target bucket, a website's index
 and error document through `<bucket>.web.localhost`, an inventory's manifest and CSV, a session token and an assumed
 role signing S3 requests, an access point by alias and by ARN, and a replica keeping its source's version id and
-ETag; and what is refused rather than dropped (an inventory's `AccountId`, STS `PolicyArns`, a replication destination's `StorageClass` other than STANDARD, a replication priority
+ETag; and what is refused rather than dropped (an inventory's `AccountId`, STS `PolicyArns`, a replication priority
 given twice). The Go, JavaScript, Java and .NET SDKs run the same 33 (`tools/sdk/go/m7.go`, `tools/sdk/js/check.mjs`, `tools/sdk/java/src/main/java/M7.java`, `tools/sdk/dotnet/Program.cs`; .NET gives a configuration that is not there as an empty one, where the others give its error), and found two defects the CLI and boto3 had
 let pass: S3 Control's errors were S3's `<Error>` form, which its s3control client reads as UnknownError (now
 `<ErrorResponse><Error>`, ADR-0076 §1), and a replication rule with its `Status` after `DeleteMarkerReplication`,

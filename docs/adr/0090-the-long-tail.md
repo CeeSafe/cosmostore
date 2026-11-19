@@ -22,6 +22,8 @@ purpose bucket. Each item below is small, and each becomes a row of the support 
      - ListObjects (v1, v2), ListObjectVersions, ListParts and ListMultipartUploads, GetObjectAttributes and
        inventory reports give the object's own class.
    - **Directory buckets** keep `EXPRESS_ONEZONE` only.
+   - **Replication** (amended after M12's exit review): a rule's `Destination/StorageClass` is one of these, and its
+     replicas are recorded with it.
 2. **Lifecycle transitions** (ADR-0020, ADR-0042).
    - `Transition` and `NoncurrentVersionTransition` are taken, by days or date, to the classes of §1. They are
      refused for the archive classes.

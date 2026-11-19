@@ -39,6 +39,7 @@ fn parseReplication(xml: Slice<u8>) -> Result<Vector<ReplicationRule>, S3Fail> {
             prefix: Vector<u8>.create(),
             deleteMarkers: false,
             destination: Vector<u8>.create(),
+            storageClass: Vector<u8>.create(),
         };
         let _ = rawElement(r, "ID", mut rule.id)?;
         if (rule.id.length == 0) {
@@ -101,11 +102,17 @@ fn parseReplication(xml: Slice<u8>) -> Result<Vector<ReplicationRule>, S3Fail> {
             null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
         };
         let _ = rawElement(destination, "Bucket", mut arn)?;
-        // Replicas are stored as their sources are: a storage class of their own is not done (the M7 review's A2).
+        // The replicas' storage class (the M12 exit review's B3): one kept here, recorded on each replica, or
+        // InvalidStorageClass; STANDARD, or none, is the source's.
         var storageClass = Vector<u8>.create();
-        if (rawElement(destination, "StorageClass", mut storageClass)? &&
-            trimBlank(storageClass.view()) != "STANDARD".bytes()) {
-            return Err(S3Fail.Code(S3Code.NotImplemented));
+        if (rawElement(destination, "StorageClass", mut storageClass)?) {
+            let named = trimBlank(storageClass.view());
+            if (named != "STANDARD".bytes()) {
+                if (!isStoredClassValue(named) || named.length == 0) {
+                    return Err(S3Fail.Code(S3Code.InvalidStorageClass));
+                }
+                rule.storageClass.extend(named)?;
+            }
         }
         // A bucket here (`arn:aws:s3:::<bucket>`), or on another endpoint of `--replication-targets`
         // (`arn:cosmostore:s3::<target>:<bucket>`, kept as `<target>:<bucket>`, ADR-0077 §6).
@@ -162,7 +169,9 @@ fn replicationXml(rules: Slice<ReplicationRule>, out: borrow mut Vector<u8>) -> 
             if (isRemoteDestination(r.destination.view())) "arn:cosmostore:s3::".bytes() else "arn:aws:s3:::".bytes(),
         )?;
         appendXmlEscaped(out, r.destination.view())?;
-        out.extend("</Bucket></Destination></Rule>".bytes())?;
+        out.extend("</Bucket>".bytes())?;
+        if (r.storageClass.length > 0) { xmlTextElement(out, "StorageClass", r.storageClass.view())?; }
+        out.extend("</Destination></Rule>".bytes())?;
     }
     out.extend("</ReplicationConfiguration>".bytes())?;
     return Ok();
@@ -408,6 +417,22 @@ async fn replicateEvent(
             Ok(null) => { return Ok(true); }
             Err(_) => { return Ok(false); }
         };
+        // The rule's storage class for its replicas, if it gives one (the M12 exit review's B3).
+        let named = match (s.replicaClassOf(src, e.ruleIds.view(), destination)) {
+            Ok(c) => c,
+            Err(_) => { return Ok(false); }
+        };
+        if (named.length > 0) {
+            match (borrow mut source) {
+                Some(r) => {
+                    r.metadata = match (metadataReplace(r.metadata.view(), STORAGE_CLASS_FIELD.bytes(), named.view())) {
+                        Ok(b) => b,
+                        Err(_) => { return Ok(false); }
+                    };
+                }
+                null => {}
+            }
+        }
     }
     var r = match (source) {
         Some(r) => r,
