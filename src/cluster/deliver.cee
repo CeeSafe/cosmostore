@@ -185,15 +185,32 @@ async fn replicateOnCluster(
         Err(_) => { return Err(NodeFault.Net); }
     };
     let _held = gate.data();
-    var guard = match (await slot.store.get().lock()) {
-        Ok(g) => g,
-        Err(_) => { return Err(NodeFault.Net); }
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let id = e.versionId;
+        let k = e.key.view();
+        // Not noted (the journal failed): tried again, rather than reported done.
+        if ((await Async.blocking(() => st.noteReplicationFailure(src, k, id))).isErr()) { return Ok(false); }
+    }
+    // Proposed, and applied before the next refusal is noted: noting reads the bucket's list of failures and writes
+    // it back, and a second refusal of the batch would otherwise read it without this one and drop it (a replica
+    // refused reading COMPLETED; found with M13's cluster smoke). As the delivery record waits.
+    let proposed = match (await proposeStaged(shared, slot, null, "".bytes())?) {
+        Some(p) => p,
+        null => { return Ok(false); } // not leading any more: the next leader delivers it again
     };
-    let st = guard.data();
-    let id = e.versionId;
-    let k = e.key.view();
-    // Not noted (the journal failed): tried again, rather than reported done.
-    return Ok((await Async.blocking(() => st.noteReplicationFailure(src, k, id))).isOk());
+    var waited = 0u64;
+    while (true) {
+        let v = await viewOf(slot)?;
+        if (v.applied >= proposed.last || !v.leads || v.term != proposed.term) { break; }
+        if (waited >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { break; }
+        waited += FRONT_POLL_MS;
+    }
+    return Ok(true);
 }
 
 struct DeliveredBatch {

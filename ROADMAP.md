@@ -3745,3 +3745,18 @@ Browser form uploads with a SigV4 POST policy.
   - Node 1 logs its reload.
 - **CEESAFE_GAPS:** G37 (no nested pattern through a reference payload) and G38 (`class` reserved, and a field so
   named gets an unclear error), both checked on 0.54.0 and 0.77.1. G26 notes SHA-1 is still missing in 0.77.1.
+
+### 20 Nov 2026: M13 slice 2, SSE's keys on a node (ADR-0092 §2)
+
+- **The options:** `node --sse-key-file` and `--kms-key-file`, read at start as `serve`'s. Every shard's S3 server
+  seals and opens with them, and so does the delivery task.
+- **What works now:** SSE-S3 and SSE-KMS, with an encryption context, put through one node and read through the
+  others, and a bucket's default SSE-KMS. Before this a cluster refused SSE-S3 and SSE-KMS.
+- **A sealed source's replica:**
+  - it is sealed with SSE-S3 by the receiving shard, and keeps its source's id and ETag;
+  - a destination whose default is SSE-KMS still refuses it.
+- **A bug found and fixed** (before M13): two refusals in one delivery batch on a cluster lost one. The replica
+  refused read COMPLETED. Each noted refusal is now proposed and applied before the next.
+- **Tests:** the cluster smoke's SSE section, a sealed source replicated, and two refusals in one batch (163
+  checks); 387 unit tests, the S3 smoke and the SDK matrix pass.
+- **Next:** M13's exit review.

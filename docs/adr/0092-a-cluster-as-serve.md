@@ -39,6 +39,10 @@
      - **A node without the key:** it answers an object sealed under a key it does not have with InternalError, as
        `serve` does for a key its file lost.
      - **At start:** a node checks nothing against the others; ADR-0062's roster carries no keys.
+   - **A replica on a cluster** (found while building §2): replication goes through the node's own front, a sealed
+     source as its plaintext, marked SSE-S3. The receiving shard now seals it with SSE-S3, whose ETag is the
+     plaintext's MD5, as the source's (ADR-0078 §4 refused it while nodes had no keys). A destination bucket whose
+     default is SSE-KMS still refuses a replica, which reads FAILED: an SSE-KMS ETag would not be its source's.
    - **Not reloaded:** like `serve`'s, the key files are read at start. A new master key is a restart, as on
      `serve` (ADR-0046 §4).
 3. **Checked on a cluster:**
@@ -46,6 +50,13 @@
      restart; likewise a user removed from every node's users file.
    - **SSE:** SSE-S3 and SSE-KMS objects, with an encryption context, put through one node and read through the
      others; a bucket's default encryption; a sealed source replicated.
+
+## Found on the way
+
+- **A refused replica could read COMPLETED on a cluster** (before M13). Noting a refusal reads the bucket's list of
+  failures and writes it back. On a cluster the write applies only when Raft commits it, so a second refusal in one
+  delivery batch read the list without the first, and dropped it. The delivery task now proposes each noted refusal,
+  and waits for it to apply, as it does its delivery record. The cluster smoke checks two refusals in one batch.
 
 ## Slices
 

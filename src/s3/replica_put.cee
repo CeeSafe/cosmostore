@@ -120,8 +120,10 @@ fn replicaAsked(req: borrow S3Request, auth: borrow Authenticated, cluster: bool
     return Ok(Some(ReplicaAsk { versionId: id, md5: md5, parts: parts, extras: extras }));
 }
 
-/// Writes a replica PUT with `putReplica` (ADR-0077 §3): its body as a client's, unsealed (it is a sealed source's
-/// plaintext, and a bucket that seals refuses it), its metadata the request's, its id, MD5 and parts the source's.
+/// Writes a replica PUT with `putReplica` (ADR-0077 §3): its body as a client's (a sealed source's plaintext), its
+/// metadata the request's, its id, MD5 and parts the source's. A sealed source's replica, or one into a bucket that
+/// seals by default, is sealed with SSE-S3 here (ADR-0092 §2), whose ETag is the plaintext's MD5, as the source's;
+/// SSE-C, and SSE-KMS, whose ETag would not be the source's, are refused.
 /// A version with that id already there is answered as written.
 async fn putReplicaObject(
     app: borrow S3App,
@@ -130,20 +132,32 @@ async fn putReplicaObject(
     ask: ReplicaAsk,
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
-    match (await sseAskedFor(app, req)?) {
-        SseRequest.None => {}
-        _ => { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
-    }
     var spec = bodySpec(req, borrow auth)?;
     var contentType = String.create();
     contentTypeOf(req, mut contentType)?;
-    let metadata = metadataOf(req)?;
-    let writer = await startPutObject(app, req.bucket.view(), spec.size)?;
+    var metadata = metadataOf(req)?;
+    let asked = await sseAskedFor(app, req)?;
+    var sealer: SseSealer? = null;
+    match (asked) {
+        SseRequest.None => {}
+        SseRequest.Managed => {
+            match (newSeal(app.sseKeys.view(), app.kmsKeys.view(), borrow asked)?) {
+                Some(seal) => {
+                    metadataAdd(mut metadata, SSE_FIELD.bytes(), seal.field.view())?;
+                    sealer = Some(sealerOf(borrow seal, spec.size, null)?);
+                }
+                null => {}
+            }
+        }
+        _ => { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+    }
+    let storedSize = if (sealer.isSome()) sseStoredLength(spec.size) else spec.size;
+    let writer = await startPutObject(app, req.bucket.view(), storedSize)?;
     let storeAs = match (spec.checksumKind) {
         ChecksumAlgorithm.None => ChecksumAlgorithm.Crc64Nvme,
         _ => spec.checksumKind,
     };
-    let body = await receiveBody(app, auth, mut spec, writer, exchange, storeAs, null)?;
+    let body = await receiveBody(app, auth, mut spec, writer, exchange, storeAs, sealer)?;
     // A single PUT's MD5 is its body's: one that differs is not the source's bytes.
     if (ask.parts == 0 && body.finished.md5 != ask.md5) {
         var guard = await lockStore(app)?;

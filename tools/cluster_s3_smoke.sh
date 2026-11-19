@@ -75,12 +75,15 @@ printf 'hook http://127.0.0.1:%s/events\n' "$hookport" > targets
 printf 'far http://127.0.0.1:%s %s %s\n' "$((BASE + 11))" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" > reptargets
 # STS (ADR-0078 §2): the same token keys and roles on every node.
 printf 'sts1 %s\n' "$(head -c 32 /dev/urandom | base64)" > sts.keys
+# SSE's keys (ADR-0092 §2): the same files on every node.
+printf 'sse1 %s\n' "$(head -c 32 /dev/urandom | base64)" > sse.keys
+printf 'app-default %s\norders %s\n' "$(head -c 32 /dev/urandom | base64)" "$(head -c 32 /dev/urandom | base64)" > kms.keys
 cat > roles <<'ROLES'
 reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::alpha","arn:aws:s3:::alpha/*"]}]}
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --users-file users --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --tables-day-seconds 24 --lifecycle-seconds 2 --zone-id local-az1 >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --users-file users --sts-key-file sts.keys --roles-file roles --sse-key-file sse.keys --kms-key-file kms.keys --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --tables-day-seconds 24 --lifecycle-seconds 2 --zone-id local-az1 >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -234,12 +237,16 @@ head -c 75497472 /dev/urandom > r3.bin
 on 3 s3 cp r3.bin s3://rsrc/r/large.bin > /dev/null 2>&1
 on 3 s3api put-object --bucket rsrc --key f/small.txt --body r1.txt --metadata colour=blue > /dev/null 2>&1
 on 1 s3api put-object --bucket rsrc --key lost/x.txt --body r1.txt > /dev/null 2>&1
+# A second refusal in the same batch: each is noted, neither drops the other (found with M13's cluster smoke).
+on 2 s3api put-object --bucket rsrc --key lost/y.txt --body r1.txt > /dev/null 2>&1
+# A sealed source (ADR-0092 §2): the delivery task opens it with the node's keys, and its replica reads.
+on 2 s3api put-object --bucket rsrc --key r/sealed.txt --body r1.txt --server-side-encryption AES256 > /dev/null 2>&1
 status_of() { on "$1" s3api head-object --bucket rsrc --key "$2" --query ReplicationStatus --output text 2>/dev/null; }
 replicated() {
     for i in $(seq 1 80); do [ "$(status_of 3 "$1")" = COMPLETED ] && return 0; pause 0.25; done
     return 1
 }
-for k in r/small.txt r/multi.bin r/large.bin; do
+for k in r/small.txt r/multi.bin r/large.bin r/sealed.txt; do
     replicated "$k" && pass "$k replicated" || fail "$k replicated: $(status_of 3 "$k")"
     sv=$(on 1 s3api head-object --bucket rsrc --key "$k" --query '[VersionId,ETag]' --output text 2>&1)
     check "$k keeps its version id and ETag, read through node 2" "$(on 2 s3api head-object --bucket "$rdst" --key "$k" --query '[VersionId,ETag]' --output text 2>&1)" "$sv"
@@ -266,6 +273,8 @@ check "its ETag there" "$(on 2 s3api head-object --bucket faraway --key f/small.
 check "its metadata there" "$(on 2 s3api head-object --bucket faraway --key f/small.txt --query Metadata.colour --output text 2>&1)" blue
 for i in $(seq 1 60); do [ "$(status_of 2 lost/x.txt)" = FAILED ] && break; pause 0.25; done
 check "a destination that refuses: FAILED, through every node" "$(status_of 1 lost/x.txt) $(status_of 2 lost/x.txt) $(status_of 3 lost/x.txt)" "FAILED FAILED FAILED"
+for i in $(seq 1 60); do [ "$(status_of 2 lost/y.txt)" = FAILED ] && break; pause 0.25; done
+check "and a second refusal of the batch, FAILED too" "$(status_of 1 lost/x.txt) $(status_of 3 lost/y.txt)" "FAILED FAILED"
 
 # Access logs on a cluster (ADR-0078 §4): each request's line, queued on the node whose shard served it, delivered as
 # an object through that node's front, into a target that may be another shard's.
@@ -496,6 +505,21 @@ check "a SHA-1 checksum through node 3, returned through node 1" "$(on 1 s3api h
 on 1 s3api delete-bucket-lifecycle --bucket tail-c > /dev/null 2>&1
 for k in ia sha1; do on 2 s3api delete-object --bucket tail-c --key "$k" > /dev/null 2>&1; done
 on 3 s3api delete-bucket --bucket tail-c > /dev/null 2>&1
+# SSE on a cluster (ADR-0092 §2): SSE-S3 and SSE-KMS with an encryption context, put through one node, read through
+# the others; a bucket's default encryption.
+on 1 s3api create-bucket --bucket sse-c > /dev/null 2>&1
+printf 'sealed on a cluster' > sse.txt
+check "SSE-S3 through node 1" "$(on 1 s3api put-object --bucket sse-c --key s3 --body sse.txt --server-side-encryption AES256 --query ServerSideEncryption --output text 2>&1)" AES256
+check "read through node 2" "$(on 2 s3 cp s3://sse-c/s3 - 2>&1)" "sealed on a cluster"
+ctx=$(printf '{"team":"blue"}' | base64)
+check "SSE-KMS with a context through node 2" "$(on 2 s3api put-object --bucket sse-c --key kms --body sse.txt --server-side-encryption aws:kms --ssekms-key-id orders --ssekms-encryption-context "$ctx" --query '[SSEKMSKeyId,SSEKMSEncryptionContext]' --output text 2>&1 | tr '\t' ' ')" "orders $ctx"
+check "read through node 3" "$(on 3 s3 cp s3://sse-c/kms - 2>&1)" "sealed on a cluster"
+check "its key named through node 1" "$(on 1 s3api head-object --bucket sse-c --key kms --query SSEKMSKeyId --output text 2>&1)" orders
+on 3 s3api put-bucket-encryption --bucket sse-c --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}' > /dev/null 2>&1
+check "a bucket's default SSE-KMS, through node 1" "$(on 1 s3api put-object --bucket sse-c --key dflt --body sse.txt --query '[ServerSideEncryption,SSEKMSKeyId]' --output text 2>&1 | tr '\t' ' ')" "aws:kms app-default"
+for k in s3 kms dflt; do on 2 s3api delete-object --bucket sse-c --key "$k" > /dev/null 2>&1; done
+on 1 s3api delete-bucket-encryption --bucket sse-c > /dev/null 2>&1
+on 3 s3api delete-bucket --bucket sse-c > /dev/null 2>&1
 # Lifecycle runs on each shard's leader (the M12 exit review's A3): a rule dated in the past expires one object and
 # moves another, seen through other nodes.
 on 1 s3api create-bucket --bucket life-c > /dev/null 2>&1

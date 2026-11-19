@@ -64,8 +64,8 @@ struct NodeShared {
     domain: Vector<u8>;
     /// `--notify-targets` (ADR-0078 §4): the webhooks this node's leaders deliver to.
     notifyTargets: Vector<NotifyTarget>;
-    /// `--replication-targets` (ADR-0078 §4): the other endpoints replicas go to (no SSE keys: a cluster seals
-    /// nothing).
+    /// `--replication-targets` (ADR-0078 §4): the other endpoints replicas go to, with SSE's keys to open a sealed
+    /// source (ADR-0092 §2).
     replication: ReplicaContext;
     /// The node's front and its credentials: a replica into a bucket of the cluster goes through the front, signed
     /// with the current first key, as a client's write.
@@ -324,8 +324,14 @@ fn openNode(
                 Ok(Some(t)) => t,
                 _ => { return Err(textOf("the replication targets file cannot be read again")); }
             },
-            sseKeys: Vector<MasterKey>.create(),
-            kmsKeys: Vector<MasterKey>.create(),
+            sseKeys: match (copyKeys(sts.sseKeys.view())) {
+                Ok(k) => k,
+                Err(_) => { return Err(textOf("out of memory")); }
+            },
+            kmsKeys: match (copyKeys(sts.kmsKeys.view())) {
+                Ok(k) => k,
+                Err(_) => { return Err(textOf("out of memory")); }
+            },
         },
         frontUrl: match (copyBytes(sts.frontUrl.view())) {
             Ok(u) => u,
@@ -1194,6 +1200,8 @@ fn nodeCommand() -> i32 {
     // STS (ADR-0078 §2): read and checked before any shard opens; each shard's S3 server takes its own copy.
     var sts = NodeS3Setup {
         keys: Vector<MasterKey>.create(),
+        sseKeys: Vector<MasterKey>.create(),
+        kmsKeys: Vector<MasterKey>.create(),
         rolesText: Vector<u8>.create(),
         websiteDomain: Vector<u8>.create(),
         domain: Vector<u8>.create(),
@@ -1284,6 +1292,31 @@ fn nodeCommand() -> i32 {
             for (c in d.view().bytes()) {
                 if (sts.domain.push(if (c >= 'A' && c <= 'Z') c + 32 else c).isErr()) { return 1; }
             }
+        }
+        null => {}
+    }
+    // SSE's keys (ADR-0092 §2): read at start, as `serve` reads them; a file that does not read stops the node.
+    match (borrow args.sseKeys) {
+        Some(path) => {
+            sts.sseKeys = match (readSseKeys(path.view())) {
+                Ok(k) => k,
+                Err(message) => {
+                    Console.writeErrorLine(message.view());
+                    return 1;
+                }
+            };
+        }
+        null => {}
+    }
+    match (borrow args.kmsKeys) {
+        Some(path) => {
+            sts.kmsKeys = match (readSseKeys(path.view())) {
+                Ok(k) => k,
+                Err(message) => {
+                    Console.writeErrorLine(message.view());
+                    return 1;
+                }
+            };
         }
         null => {}
     }
@@ -1417,6 +1450,9 @@ struct ClusterArguments {
     segmentMb: u64?;
     /// STS on the node's S3 port (ADR-0078 §2): the token keys and the roles, the same files on every node.
     stsKeys: String?;
+    /// `--sse-key-file` and `--kms-key-file` (ADR-0092 §2).
+    sseKeys: String?;
+    kmsKeys: String?;
     roles: String?;
     /// Website hosting on the node's S3 port (ADR-0078 §3).
     websiteDomain: String?;
@@ -1453,6 +1489,8 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var clockSkewMs: i64? = null;
     var segmentMb: u64? = null;
     var stsKeys: String? = null;
+    var sseKeys: String? = null;
+    var kmsKeys: String? = null;
     var roles: String? = null;
     var websiteDomain: String? = null;
     var zoneId: String? = null;
@@ -1503,6 +1541,10 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             if (codeAfterSeconds.isNull()) { return null; }
         } else if (option == "--sts-key-file") {
             stsKeys = Some(textOf(value));
+        } else if (option == "--sse-key-file") {
+            sseKeys = Some(textOf(value));
+        } else if (option == "--kms-key-file") {
+            kmsKeys = Some(textOf(value));
         } else if (option == "--roles-file") {
             roles = Some(textOf(value));
         } else if (option == "--website-domain") {
@@ -1552,6 +1594,8 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 clockSkewMs: clockSkewMs,
                 segmentMb: segmentMb,
                 stsKeys: stsKeys,
+                sseKeys: sseKeys,
+                kmsKeys: kmsKeys,
                 roles: roles,
                 websiteDomain: websiteDomain,
                 zoneId: zoneId,
