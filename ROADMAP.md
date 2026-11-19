@@ -3152,3 +3152,24 @@ Browser form uploads with a SigV4 POST policy.
   failure that does not repeat is a "not confirmed" warning, with both reports in the job summary. Tested locally
   by forcing a failure: the three phases that failed both passes were confirmed, and a group that failed only
   the first pass was left out.
+
+### 19 Nov 2026: M9's exit review (`docs/m9-exit-review.md`)
+
+- **How it was checked:**
+  - **CI on `e5bb167`:** 351 tests, the smokes, the cluster smoke (130) and PyIceberg's 16 checks on `serve` and
+    through a node, all passed.
+  - Two reviews of the code by readers who had not written it: one of conformance (AWS's API, the Iceberg spec) and
+    one of security, which reproduced its findings against a server.
+- **Verdict: not yet.**
+  - **B1, High:** a browser form POST writes forged catalog records into a table bucket, and DeleteTable of a forged
+    record purged the whole catalog.
+  - **Into and out of the catalog:** log and inventory delivery write into it (B2), and a copy reads it from
+    another bucket (B3).
+  - **One request stalls the server:** a commit with many properties is O(n²) under the store's lock (B4), and
+    8 MiB is read before authentication (B5).
+  - **Metadata an Iceberg reader may refuse:** `remove-snapshots` leaves refs dangling (C1), `last-updated-ms`
+    (C2), the client's field ids unchecked (C4), `.gz` (C5). The catalog's errors are sometimes in S3 Tables' shape
+    (C3).
+  - **Smaller:** values silently ignored (C6), and more.
+  - **B6:** no policy restricts S3 Tables. That is to be recorded as not done, or built (a design question).
+- **Next:** fix the findings, each with a test, if the owner agrees.
