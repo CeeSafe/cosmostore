@@ -13,6 +13,11 @@ export AWS_REGION=us-east-1
 export AWS_EC2_METADATA_DISABLED=true
 export AWS_ENDPOINT_URL="http://127.0.0.1:$port"
 echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > "$work/credentials"
+# Users (ADR-0088): a user that may read the objects of `sdk-*-users` buckets, and nothing else.
+echo "AKIASDKUSER000000001 sdkuser/secret/0123456789abcdefgh" >> "$work/credentials"
+cat > "$work/users" <<'USERS'
+sdkuser AKIASDKUSER000000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::sdk-*-users/*"}}
+USERS
 # SSE-S3's master key (ADR-0046 §4).
 printf 'k1 %s\n' "$(head -c 32 /dev/urandom | base64)" > "$work/sse.keys"
 
@@ -23,7 +28,7 @@ cat > "$work/roles" <<'ROLES'
 reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::sdk-m7","arn:aws:s3:::sdk-m7/*"]}]}
 ROLES
 
-"$bin" serve "$work/store" "$port" "$work/credentials" localhost --sse-key-file "$work/sse.keys" --sts-key-file "$work/sts.keys" --roles-file "$work/roles" --access-log-seconds 2 --inventory-day-seconds 3 --website-domain web.localhost --zone-id local-az1 2> "$work/server.log" &
+"$bin" serve "$work/store" "$port" "$work/credentials" localhost --users-file "$work/users" --sse-key-file "$work/sse.keys" --sts-key-file "$work/sts.keys" --roles-file "$work/roles" --access-log-seconds 2 --inventory-day-seconds 3 --website-domain web.localhost --zone-id local-az1 2> "$work/server.log" &
 server=$!
 sleep 1
 

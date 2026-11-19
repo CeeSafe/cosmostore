@@ -151,6 +151,7 @@ func main() {
 	directory(ctx, cfg)
 	directoryAccessPoints(ctx, cfg, endpoint)
 	tables(ctx, cfg)
+	users(ctx, cfg)
 	if failed {
 		os.Exit(1)
 	}

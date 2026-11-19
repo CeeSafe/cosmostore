@@ -695,4 +695,16 @@ check("create_session", session["Credentials"]["AccessKeyId"][:4], "ASIA")
 check("wrong secret", code_of(lambda: boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
                                                        aws_secret_access_key="wrong").list_buckets()),
       "SignatureDoesNotMatch")
+
+# Users (ADR-0088): a user's key reads what its identity policy allows, and nothing else.
+client().create_bucket(Bucket="sdk-py-users")
+client().put_object(Bucket="sdk-py-users", Key="a", Body=b"read me")
+user = boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="AKIASDKUSER000000001",
+                    aws_secret_access_key="sdkuser/secret/0123456789abcdefgh",
+                    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
+check("a user reads", user.get_object(Bucket="sdk-py-users", Key="a")["Body"].read(), b"read me")
+check("a user writes nothing", code_of(lambda: user.put_object(Bucket="sdk-py-users", Key="b", Body=b"x")), "AccessDenied")
+check("nor lists every bucket", code_of(lambda: user.list_buckets()), "AccessDenied")
+client().delete_object(Bucket="sdk-py-users", Key="a")
+client().delete_bucket(Bucket="sdk-py-users")
 sys.exit(1 if failed else 0)

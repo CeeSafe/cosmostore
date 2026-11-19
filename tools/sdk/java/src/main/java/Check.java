@@ -144,6 +144,7 @@ public class Check {
         Directory.run(endpoint);
         DirectoryAccessPoints.run(endpoint);
         Tables.run(endpoint);
+        Users.run(endpoint);
         System.exit(failed ? 1 : 0);
     }
 }

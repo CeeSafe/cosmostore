@@ -404,6 +404,24 @@ foreach (var sessions in new[] { false })
     await d.DeleteObjectAsync(apBucket, "pub/a.txt");
     await d.DeleteBucketAsync(apBucket);
 }
+// Users (ADR-0088): a user's key reads what its identity policy allows, and nothing else.
+{
+    var owner = Client(true);
+    await owner.PutBucketAsync(new PutBucketRequest { BucketName = "sdk-net-users" });
+    await owner.PutObjectAsync(new PutObjectRequest { BucketName = "sdk-net-users", Key = "a", ContentBody = "read me" });
+    var user = new AmazonS3Client(new Amazon.Runtime.BasicAWSCredentials("AKIASDKUSER000000001", "sdkuser/secret/0123456789abcdefgh"),
+        new AmazonS3Config { ServiceURL = endpoint, ForcePathStyle = true, AuthenticationRegion = "us-east-1", MaxErrorRetry = 0 });
+    using (var userGot = await user.GetObjectAsync("sdk-net-users", "a"))
+    using (var userReader = new StreamReader(userGot.ResponseStream))
+    {
+        Check("a user reads", await userReader.ReadToEndAsync(), "read me");
+    }
+    Check("a user writes nothing", await CodeOf(() => user.PutObjectAsync(new PutObjectRequest { BucketName = "sdk-net-users", Key = "b", ContentBody = "x" })), "AccessDenied");
+    Check("nor lists every bucket", await CodeOf(() => user.ListBucketsAsync()), "AccessDenied");
+    await owner.DeleteObjectAsync("sdk-net-users", "a");
+    await owner.DeleteBucketAsync("sdk-net-users");
+}
+
 // S3 Tables (ADR-0083): table buckets, namespaces and tables, and the metadata location's compare-and-set.
 {
     var t = new Amazon.S3Tables.AmazonS3TablesClient(new Amazon.S3Tables.AmazonS3TablesConfig

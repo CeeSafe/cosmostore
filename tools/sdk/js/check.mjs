@@ -5,7 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import http from "node:http";
 import { gunzipSync } from "node:zlib";
 import {
-  S3Client, CreateBucketCommand, PutObjectCommand, GetObjectCommand, HeadObjectCommand, CopyObjectCommand,
+  S3Client, CreateBucketCommand, ListBucketsCommand, PutObjectCommand, GetObjectCommand, HeadObjectCommand, CopyObjectCommand,
   DeleteObjectsCommand, DeleteBucketCommand, ListObjectsV2Command, paginateListObjectsV2, HeadBucketCommand,
   PutBucketLoggingCommand, GetBucketLoggingCommand, PutBucketWebsiteCommand, GetBucketWebsiteCommand,
   DeleteBucketWebsiteCommand, PutBucketPolicyCommand, DeleteBucketPolicyCommand, PutBucketInventoryConfigurationCommand,
@@ -324,5 +324,20 @@ for (const sessions of [true, false]) {
   await t.send(new DeleteNamespaceCommand({ tableBucketARN: arn, namespace: "sales" }));
   await t.send(new DeleteTableBucketCommand({ tableBucketARN: arn }));
   check("DeleteTableBucket", (await t.send(new ListTableBucketsCommand({}))).tableBuckets ?? [], []);
+}
+
+// Users (ADR-0088): a user's key reads what its identity policy allows, and nothing else.
+{
+  const account = new S3Client({ endpoint, forcePathStyle: true, region: "us-east-1", maxAttempts: 1 });
+  await account.send(new CreateBucketCommand({ Bucket: "sdk-js-users" }));
+  await account.send(new PutObjectCommand({ Bucket: "sdk-js-users", Key: "a", Body: "read me" }));
+  const user = new S3Client({ endpoint, forcePathStyle: true, region: "us-east-1", maxAttempts: 1,
+    credentials: { accessKeyId: "AKIASDKUSER000000001", secretAccessKey: "sdkuser/secret/0123456789abcdefgh" } });
+  const got = await user.send(new GetObjectCommand({ Bucket: "sdk-js-users", Key: "a" }));
+  check("a user reads", await got.Body.transformToString(), "read me");
+  check("a user writes nothing", await codeOf(user.send(new PutObjectCommand({ Bucket: "sdk-js-users", Key: "b", Body: "x" }))), "AccessDenied");
+  check("nor lists every bucket", await codeOf(user.send(new ListBucketsCommand({}))), "AccessDenied");
+  await account.send(new DeleteObjectCommand({ Bucket: "sdk-js-users", Key: "a" }));
+  await account.send(new DeleteBucketCommand({ Bucket: "sdk-js-users" }));
 }
 process.exit(failed ? 1 : 0);

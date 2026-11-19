@@ -3474,3 +3474,10 @@ Browser form uploads with a SigV4 POST policy.
 - **CI on `6771a13`:** the perf gate failed on large writes at c32, confirmed in both passes, with the runner's noise
   at 2.00. A re-run of the same job on the same code passed, so that was the runner's noise.
 - **Next:** slice 4, the SDK matrix and M11's exit review.
+
+### 19 Nov 2026: M11 slice 4, users in the SDK matrix
+
+- **The matrix's server** has a user, `sdkuser`, that may read the objects of `sdk-*-users` buckets.
+- **Each SDK's check** (boto3, Go, JavaScript, Java, .NET): the user's key reads such an object, and its writes and
+  ListBuckets are AccessDenied. All five pass.
+- **Next:** M11's exit review.
