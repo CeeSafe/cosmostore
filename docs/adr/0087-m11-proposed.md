@@ -1,6 +1,6 @@
 # ADR-0087: M11, what comes after table maintenance (proposed)
 
-**Status:** proposed, 19 Nov 2026. The owner: "propose M11". M10 (table maintenance, ADR-0086) closed the same day;
+**Status:** decided, 19 Nov 2026: the owner chose A ("A."); where users live was left open, and ADR-0088 takes the recommended users file. Proposed the same day. The owner: "propose M11". M10 (table maintenance, ADR-0086) closed the same day;
 ADR-0085 §3 named identities the next candidate.
 
 ## Context

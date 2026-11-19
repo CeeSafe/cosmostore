@@ -312,6 +312,16 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 **Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
 (ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
+### M11: Identities
+
+The owner chose ADR-0087's item A (19 Nov 2026). ADR-0088 (proposed) designs it:
+- **The users file:** each user's name, its access keys and an identity policy, reloaded with the credentials file.
+- **The decision, as IAM's in one account:** a Deny anywhere refuses; an identity or resource Allow allows; otherwise
+  the request is refused. A key no user names is the account's, as now.
+- **AssumeRole sessions** are taken by S3 Tables.
+- **Done when** a key restricted to one bucket's reads is refused everything else, through every SDK, on `serve` and
+  on a cluster.
+
 ### M10: Table maintenance
 
 The owner chose ADR-0085's item A, "and write the decoder here first" (19 Nov 2026). ADR-0086 (accepted 19 Nov 2026)
@@ -3399,3 +3409,13 @@ Browser form uploads with a SigV4 POST policy.
   - An existing deployment changes nothing until it writes a users file.
 - **For A, the owner's choice too:** a users file (recommended), users in the credentials file, or the IAM API.
 - **Next:** the owner's choice.
+
+### 19 Nov 2026: M11 is identities (ADR-0088, proposed)
+
+- **The owner:** "A." Where users live was left open, so ADR-0088 takes ADR-0087's recommendation, a users file.
+- **ADR-0088 designs it,** in four slices:
+  1. the users file and S3's decision;
+  2. S3 Tables and STS;
+  3. the cluster;
+  4. the SDK matrix and the exit review.
+- **Next:** slice 1.
