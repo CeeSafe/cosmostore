@@ -665,7 +665,7 @@ async fn serveS3(
             }
             if (isMethod(m, Method.Put)) {
                 await authorize(app, borrow req, borrow who, "s3:PutReplicationConfiguration", bucket, none)?;
-                return await putBucketReplication(app, borrow req, auth, exchange);
+                return await putBucketReplication(app, borrow req, borrow who, auth, exchange);
             }
             if (isMethod(m, Method.Delete)) {
                 await authorize(app, borrow req, borrow who, "s3:PutReplicationConfiguration", bucket, none)?;
@@ -681,7 +681,7 @@ async fn serveS3(
                 Method.Get,
             )) "s3:GetInventoryConfiguration" else "s3:PutInventoryConfiguration";
             await authorize(app, borrow req, borrow who, action, bucket, none)?;
-            return await serveInventory(app, borrow req, auth, exchange);
+            return await serveInventory(app, borrow req, borrow who, auth, exchange);
         }
         // A bucket's website configuration (ADR-0073).
         if (req.hasParam("website")) {
@@ -709,7 +709,7 @@ async fn serveS3(
             }
             if (isMethod(m, Method.Put)) {
                 await authorize(app, borrow req, borrow who, "s3:PutBucketLogging", bucket, none)?;
-                return await putBucketLogging(app, borrow req, auth, exchange);
+                return await putBucketLogging(app, borrow req, borrow who, auth, exchange);
             }
             return Err(S3Fail.Code(S3Code.MethodNotAllowed));
         }
@@ -827,9 +827,27 @@ async fn serveS3(
                 return await putBucketVersioning(app, borrow req, auth, exchange);
             }
             if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-            var created = copyBytes("s3:".bytes())?;
+            // A directory bucket's is S3 Express's call (the M11 exit review's B1).
+            let expressBucket = isDirectoryShaped(bucket.bytes());
+            var created = copyBytes(if (expressBucket) "s3express:".bytes() else "s3:".bytes())?;
             created.extend(bucket.bytes())?;
-            if (!sessionAllows(app, borrow req, borrow who, "s3:CreateBucket", created.view())?) {
+            let creating = if (expressBucket) "s3express:CreateBucket" else "s3:CreateBucket";
+            if (!sessionAllows(app, borrow req, borrow who, creating, created.view())?) {
+                return Err(S3Fail.Code(S3Code.AccessDenied));
+            }
+            // A bucket made with an ACL or object lock: those calls' own actions too (the M11 exit review's A4).
+            if (asksAcl(borrow req) && !sessionAllows(
+                app,
+                borrow req,
+                borrow who,
+                "s3:PutBucketAcl",
+                created.view(),
+            )?) {
+                return Err(S3Fail.Code(S3Code.AccessDenied));
+            }
+            if (headerOf(borrow req, "x-amz-bucket-object-lock-enabled").isSome() &&
+                (!sessionAllows(app, borrow req, borrow who, "s3:PutBucketObjectLockConfiguration", created.view())? ||
+                    !sessionAllows(app, borrow req, borrow who, "s3:PutBucketVersioning", created.view())?)) {
                 return Err(S3Fail.Code(S3Code.AccessDenied));
             }
             return await createBucket(app, borrow req, auth, exchange);
@@ -969,6 +987,7 @@ async fn serveS3(
         }
         if (!req.onlyParams("")) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
         await authorizeObject(app, borrow req, borrow who, "s3:PutObject", "s3:PutObject")?;
+        await authorizeWriteHeaders(app, borrow req, borrow who)?;
         if (copying) { return await copyObject(app, borrow req, borrow who, exchange); }
         return await putObject(app, borrow req, auth, exchange);
     }
@@ -1026,6 +1045,7 @@ async fn serveS3(
     if (isMethod(m, Method.Post)) {
         if (req.hasParam("uploads") && req.onlyParams("uploads")) {
             await authorizeObject(app, borrow req, borrow who, "s3:PutObject", "s3:PutObject")?;
+            await authorizeWriteHeaders(app, borrow req, borrow who)?;
             return await createMultipartUpload(app, borrow req, exchange);
         }
         if (req.hasParam("uploadId") && req.onlyParams("uploadId")) {

@@ -27,15 +27,20 @@ open, so this takes ADR-0087's recommendation: a users file beside the credentia
 
 ## Decision (proposed)
 
-1. **The users file** (`serve --users-file`, `node --users-file`): one user a line, `<name> <access key>[,<access
-   key>…] <identity policy JSON>`, `#` for comments.
-   - **Names:** 1 to 64 of `A-Za-z0-9+=,.@_-`, as IAM's.
-   - **Keys:** each named key must be in the credentials file and belong to one user only. A key no user names is
-     the account's, as every key is now. So a deployment without a users file changes nothing.
+1. **The users file** (`serve --users-file`, `node --users-file`): `account <access key>[,<access key>…]` lines name
+   the account's keys, and one user a line, `<name> <access key>[,<access key>…] <identity policy JSON>`; `#` for
+   comments.
+   - **Names:** 1 to 64 of `A-Za-z0-9+=,.@_-`, as IAM's, unique ignoring case; `account` is not one.
+   - **Keys:** a key is named once in the file, as the account's or one user's. With a users file, a key it names
+     neither way is refused (InvalidAccessKeyId): removing a user's line, or emptying the file, takes its keys away
+     rather than giving them the account (fail closed; amended after M11's exit review, A2, by the owner's choice).
+     A key the users file names that the credentials file does not have is no one's, so removing a key from the
+     credentials file revokes it whatever the users file says (A3). Without a users file every key is the
+     account's, as before, so a deployment without one changes nothing.
    - **The policy:** an identity policy, `parseIdentityPolicy`'s grammar widened as §3 says. A user with several of
      AWS's policies writes their statements into one.
-   - **Reloads:** it is reloaded with the credentials file, whenever either changes. A file that does not read, or
-     names a key the credentials do not have, changes nothing and is reported, as ADR-0050's file is. Each key's
+   - **Reloads:** it is reloaded with the credentials file, whenever either changes. A file that does not read
+     changes nothing and is reported, with its line and the key, as ADR-0050's file is. Each key's
      place in the credential set then carries its user's name and parsed policy.
 2. **The decision for a user's request** (a key the users file names, or that key's GetSessionToken session):
    - **The policies:**
@@ -50,13 +55,37 @@ open, so this takes ADR-0087's recommendation: a users file beside the credentia
    - **Account-only:** the admin API and the stats endpoint (ADR-0054, ADR-0021) refuse users.
    - **A role's session** is decided as today, by its role's and session's policies with the resource's. With this,
      S3 Tables takes it too (ADR-0083 §6 is lifted).
+   - **Through an access point** (amended after M11's exit review, A6), each side must allow, as on AWS: the access
+     point, by the user's identity policy on the access point's ARN or the access point's policy; and the bucket, by
+     the identity policy on the bucket's ARN or the bucket's policy. A Deny on either ARN, or in either policy,
+     refuses.
+   - **Fields that are calls of their own** (A4): a write's ACL needs `s3:PutObjectAcl`, its tags
+     `s3:PutObjectTagging`, its retention `s3:PutObjectRetention` and its legal hold `s3:PutObjectLegalHold`; a bucket
+     made with an ACL `s3:PutBucketAcl`, with object lock `s3:PutBucketObjectLockConfiguration` and
+     `s3:PutBucketVersioning`. For every requester, as on AWS.
+   - **Where the server writes for a configuration** (A1): a user's or a session's replication destination needs
+     `s3:ReplicateObject` (and `s3:ReplicateDelete` with delete markers), and an inventory's or the logs' target
+     `s3:PutObject`, on the destination's objects, when the configuration is put. The account's keys may name any
+     bucket. A policy changed later is not read again at delivery: what a configuration may do is decided once.
+   - **A table bucket's warehouse:** its data is decided as `s3tables:GetTableData`/`PutTableData`, and HeadBucket
+     as `s3tables:GetTableBucket` (B5).
 3. **Identity policy grammar** (roles' and users'):
    - **Actions:** `s3:`, `s3express:`, `s3tables:`, `sts:`.
    - **Resources:** `*`, or the ARNs of §Context, with any region and account, matched by service and the part
-     after its prefix (`s3:bucket/key`, `s3express:bucket/name`, `s3tables:bucket/name/table/id`, `iam:role/name`).
+     after its prefix (`s3:bucket/key`, `s3ap:name[/object/key]`, `s3express:bucket`, `s3expressap:name`,
+     `s3tables:bucket/name/table/id`, `iam:role/name`).
+   - **Directory buckets are S3 Express's** (amended after M11's exit review, A5 and B1): an
+     `arn:aws:s3express:…:bucket/…` ARN matches directory buckets only, and `arn:aws:s3:::…` general purpose buckets
+     only. A directory bucket's management calls are `s3express:<call>` (CreateBucket, DeleteBucket, its policy,
+     encryption and lifecycle calls), and its objects and listings are granted by `s3express:CreateSession` on the
+     bucket, as AWS grants them through the session. A directory bucket's access point is `s3expressap:<name>`,
+     and S3 Control's calls on it `s3express:`.
    - Another service's action or ARN is MalformedPolicy, and a role whose policy does not parse stops `serve` at
      start, as now.
-   - **Principals:** resource policies take `arn:aws:iam::<account>:user/<name>` beside the key ARNs they take now.
+   - **Principals:** resource policies take `arn:aws:iam::000000000000:user/<name>` beside the key ARNs they take
+     now. Another account's user is MalformedPolicy, and so is a user the users file does not have when the policy
+     is put (B2). A grant follows the name: a user removed and made again with that name has it again (AWS keys
+     principals by a unique id; CosmoStore's users have none).
 4. **STS:**
    - **GetSessionToken** by a user: the session is the user's, decided by the user's identity policy.
    - **AssumeRole** by a user needs an identity Allow of `sts:AssumeRole` on `arn:aws:iam::<account>:role/<name>`.

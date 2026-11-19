@@ -1293,8 +1293,10 @@ usersport=$((port + 6))
 printf '%s\n' "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" "AKIAUSERREADER000001 reader/secret/0123456789abcdefgh" \
     "AKIAUSERINTERN000001 intern/secret/0123456789abcdefgh" "AKIAUSERANALYST00001 analyst/secret/0123456789abcdefg" \
     > "$work/users.credentials"
-cat > "$work/users.file" <<'USERS'
-# Each user: its name, its keys, its identity policy.
+# The account's keys, named (any key the file names neither as the account's nor a user's is refused); each user:
+# its name, its keys, its identity policy.
+echo "account $AWS_ACCESS_KEY_ID" > "$work/users.file"
+cat >> "$work/users.file" <<'USERS'
 reader AKIAUSERREADER000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
 intern AKIAUSERINTERN000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
 analyst AKIAUSERANALYST00001 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":["arn:aws:s3tables:*:*:bucket/lake","arn:aws:s3tables:*:*:bucket/lake/table/*"]},{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::000000000000:role/tablereader"}]}
@@ -1325,6 +1327,12 @@ ur s3api put-object --bucket team --key inbox/x.txt --body dir.txt > /dev/null 2
 check "the bucket's Deny wins over the user's Allow" "$(ucode ui s3api delete-object --bucket team --key a.txt)" AccessDenied
 ui s3api put-object --bucket team --key i.txt --body dir.txt > /dev/null 2>&1 && pass "the user's Allow does the rest" || fail "the user's Allow does the rest"
 check "the account's key is not narrowed" "$(ua s3api list-buckets --query 'length(Buckets)')" 2
+# The M11 exit review's A4 and A1: a write's ACL is a call of its own, and a user replicates only where it may write.
+check "an ACL on a write needs PutObjectAcl" "$(ucode ur s3api put-object --bucket team --key inbox/y.txt --body dir.txt --acl public-read)" AccessDenied
+ua s3api put-bucket-versioning --bucket other --versioning-configuration Status=Enabled > /dev/null 2>&1
+ui s3api put-bucket-versioning --bucket team --versioning-configuration Status=Enabled > /dev/null 2>&1
+check "a user replicates into no bucket it may not write" "$(ucode ui s3api put-bucket-replication --bucket team --replication-configuration '{"Role":"arn:aws:iam::000000000000:role/r","Rules":[{"Status":"Enabled","Priority":1,"Filter":{},"DeleteMarkerReplication":{"Status":"Disabled"},"Destination":{"Bucket":"arn:aws:s3:::other"}}]}')" AccessDenied
+check "nor logs into one" "$(ucode ui s3api put-bucket-logging --bucket team --bucket-logging-status '{"LoggingEnabled":{"TargetBucket":"other","TargetPrefix":"logs/"}}')" AccessDenied
 # The users file is reloaded with the credentials: the reader may now read the other bucket too.
 sed -i.bak 's#"arn:aws:s3:::team/\*"\]}}$#"arn:aws:s3:::team/*","arn:aws:s3:::other/*"]}}#' "$work/users.file"
 sleep 4
@@ -1350,6 +1358,11 @@ urole() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" AWS_ACCESS_KEY_ID="$rak
 check "a role's session reads a table" "$(urole s3tables get-table --table-bucket-arn "$lake" --namespace ns --name t --query name --output text 2>&1)" t
 check "and drops none" "$(ucode urole s3tables delete-table --table-bucket-arn "$lake" --namespace ns --name t)" ForbiddenException
 check "a user its policy does not let assume it" "$(ucode ui sts assume-role --role-arn arn:aws:iam::000000000000:role/tablereader --role-session-name smoke-session)" AccessDenied
+check "nor probe a table bucket's warehouse" "$(ucode ui s3api head-bucket --bucket "$lb")" 403
+# The M11 exit review's A2: a user's line removed, its key is refused, not the account's.
+sed -i.bak '/^intern /d' "$work/users.file"
+sleep 4
+check "a removed user's key is refused" "$(ucode ui s3api list-buckets)" InvalidAccessKeyId
 kill "$usersrv" 2>/dev/null
 
 # Deletes free the space.

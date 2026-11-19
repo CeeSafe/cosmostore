@@ -130,3 +130,32 @@ Checked and right (both reviews):
   (a) is the safer, and (b) changes nothing for deployments without users.
 
 Closing M11 and accepting ADR-0088 are the owner's decisions.
+
+## The fixes (19 Nov 2026)
+
+The owner chose (a): the users file names the account's keys.
+
+| Finding | Fix | Test |
+|---|---|---|
+| A1 | a user's or session's replication destination needs `s3:ReplicateObject` (`s3:ReplicateDelete` with delete markers), an inventory's or logs' target `s3:PutObject`, when put | S3 smoke: replication and logging into `other` refused |
+| A2 | `account <key>[,…]` lines; with a users file, a key named neither way is refused (InvalidAccessKeyId) | `usersFileAndKeys`; S3 smoke: a removed user's key refused |
+| A3 | a key the credentials file lacks is no one's, so its removal revokes it; errors name the key | `usersFileAndKeys` |
+| A4 | ACL, tags, retention and legal hold on writes (PUT, copy, multipart, POST form) need their own actions; CreateBucket's ACL and object lock too | S3 smoke: an ACL without `s3:PutObjectAcl` refused |
+| A5 | `arn:aws:s3express:…` ARNs are `s3express:`, matching directory buckets only | `exitReviewRulesOfM11` |
+| A6 | through an access point, a user needs the access point (identity on `s3ap:` or its policy) and the bucket to allow; a Deny on either refuses | (by reading; no access point in the users smoke) |
+| B1 | a directory bucket's calls are S3 Express's: management `s3express:<call>`, data `s3express:CreateSession`; S3 Control on its access points `s3express:`, `s3expressap:<name>` | `exitReviewRulesOfM11` |
+| B2 | a user principal must be of account `000000000000` and in the users file when the policy is put | `exitReviewRulesOfM11` |
+| B5 | HeadBucket on a warehouse needs `s3tables:GetTableBucket` | S3 smoke: the intern's probe refused |
+| B6 | a key revoked mid-request is refused, not the account's; user names unique ignoring case; a key named twice in one line | `usersFileAndKeys` |
+
+**Also:**
+- The cluster's own replication picks an account key, never a user's.
+- B3 (a key principal matching that key's user's role sessions) and B4 (no-resource calls matching ARN wildcards) stay open. Both are Low, and B3 predates M11.
+
+**Checked after the fixes:**
+- 378 unit tests;
+- the S3 smoke (all passed);
+- the cluster smoke (138, none failed);
+- the SDK matrix (five SDKs).
+
+**Upgrade note:** a deployment already using `--users-file` must add an `account` line naming its account keys, or they are refused.

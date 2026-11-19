@@ -3497,3 +3497,11 @@ Browser form uploads with a SigV4 POST policy.
 - **For the owner:** A2 and A3 need a rule. Either (a) the users file names the account's keys and any other key is
   refused, or (b) a reload that leaves a user's key unnamed is refused, and a removed key revoked.
 - **Next:** the owner's rule, then the fixes.
+
+### 19 Nov 2026: M11's exit review findings fixed (`docs/m11-exit-review.md`)
+
+- **The owner's rule, (a):** the users file names the account's keys (`account` lines), and with a users file a key
+  named neither way is refused. ADR-0088 §1 is amended.
+- **Fixed:** A1 to A6, and B1, B2, B5 and B6, each with a test or a smoke check. B3 and B4 (Low) stay open.
+- **Tests:** 378 unit tests, the S3 smoke, the cluster smoke (138) and the SDK matrix pass.
+- **Next:** a second reading of the fixes by a fresh reviewer, then the owner's decisions on ADR-0088 and M11.

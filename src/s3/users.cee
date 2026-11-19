@@ -1,6 +1,7 @@
-// Users (ADR-0088 §1): the users file names each user, its access keys and its identity policy. It is read with the
-// credentials file, and each key's place in a credential set then carries its user's name and parsed policy. A key no
-// user names is the account's.
+// Users (ADR-0088 §1): the users file names the account's keys and each user, its access keys and its identity
+// policy. It is read with the credentials file, and each key's place in a credential set then carries its user's name
+// and parsed policy. A key the file names neither as the account's nor a user's is refused: removing a user, or its
+// line, takes its keys away rather than giving them the account (fail closed, the M11 exit review's A2).
 
 /// One user of the file: its name, keys and identity policy's text.
 struct UserEntry {
@@ -9,7 +10,13 @@ struct UserEntry {
     policyText: Vector<u8>;
 }
 
-/// An IAM user name: 1 to 64 of `A-Za-z0-9+=,.@_-`.
+/// A users file: the account's keys (its `account` lines) and its users.
+struct UsersFile {
+    account: Vector<Vector<u8>>;
+    users: Vector<UserEntry>;
+}
+
+/// An IAM user name: 1 to 64 of `A-Za-z0-9+=,.@_-`. `account` (in any case) names the account's line, not a user.
 fn userNameOk(name: Slice<u8>) -> bool {
     if (name.length < 1 || name.length > 64) { return false; }
     for (c in name) {
@@ -17,10 +24,19 @@ fn userNameOk(name: Slice<u8>) -> bool {
             c == ',' || c == '.' || c == '@' || c == '_' || c == '-';
         if (!ok) { return false; }
     }
+    return !sameNameIgnoringCase(name, "account".bytes());
+}
+
+/// Whether two names are the same but for ASCII case: IAM's user names are unique ignoring case.
+fn sameNameIgnoringCase(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) { return false; }
+    for (i in 0..a.length) {
+        if (lowerAscii(a[i]) != lowerAscii(b[i])) { return false; }
+    }
     return true;
 }
 
-/// Why a users file is refused, with its line (1-based; 0 for the file).
+/// Why a users file is refused, with its line (1-based).
 fn usersFault(line: usize, why: StringView) -> String {
     var m = String.create();
     let _ = m.append("the users file, line ");
@@ -30,9 +46,54 @@ fn usersFault(line: usize, why: StringView) -> String {
     return m;
 }
 
-/// Parses a users file: `<name> <key>[,<key>…] <identity policy JSON>` a line, `#` lines for comments.
-fn parseUsersFile(text: Slice<u8>) -> Result<Vector<UserEntry>, String> {
-    var out = Vector<UserEntry>.create();
+/// Why a users file is refused for one key, named.
+fn usersKeyFault(line: usize, why: StringView, key: Slice<u8>) -> String {
+    var m = usersFault(line, why);
+    let _ = m.append(": ");
+    let _ = m.append(StringView.fromUtf8(key) ?? "?");
+    return m;
+}
+
+/// Whether `file` already names `key`, as the account's or a user's.
+fn namesKey(file: borrow UsersFile, key: Slice<u8>) -> bool {
+    for (k in 0..file.account.length) {
+        if (file.account[k].view() == key) { return true; }
+    }
+    for (u in 0..file.users.length) {
+        for (k in 0..file.users[u].keys.length) {
+            if (file.users[u].keys[k].view() == key) { return true; }
+        }
+    }
+    return false;
+}
+
+/// The keys of a `<key>[,<key>…]` list, each new to `file` and to the list; out-param `keys`.
+fn parseKeyList(
+    file: borrow UsersFile,
+    number: usize,
+    list: Slice<u8>,
+    keys: borrow mut Vector<Vector<u8>>,
+) -> Result<void, String> {
+    let text = StringView.fromUtf8(list) ?? { return Err(usersFault(number, "a key list is not UTF-8")); };
+    for (key in text.split(",")) {
+        if (key.length == 0) { return Err(usersFault(number, "an empty key")); }
+        if (namesKey(file, key.bytes())) { return Err(usersKeyFault(number, "a key named twice", key.bytes())); }
+        for (k in 0..keys.length) {
+            if (keys[k].view() == key.bytes()) {
+                return Err(usersKeyFault(number, "a key named twice", key.bytes()));
+            }
+        }
+        if (keys.push(copyBytes(key.bytes()).ok() ?? { return Err(textOf("out of memory")); }).isErr()) {
+            return Err(textOf("out of memory"));
+        }
+    }
+    return Ok();
+}
+
+/// Parses a users file: `account <key>[,<key>…]` lines for the account's keys, `<name> <key>[,<key>…] <identity
+/// policy JSON>` a user, `#` lines for comments. A key is named once in the file.
+fn parseUsersFile(text: Slice<u8>) -> Result<UsersFile, String> {
+    var out = UsersFile { account: Vector<Vector<u8>>.create(), users: Vector<UserEntry>.create() };
     var at: usize = 0;
     var number: usize = 0;
     while (at < text.length) {
@@ -45,8 +106,25 @@ fn parseUsersFile(text: Slice<u8>) -> Result<Vector<UserEntry>, String> {
         let space = pieceEnd(line, 0, ' ');
         if (space == line.length) { return Err(usersFault(number, "a user is `<name> <keys> <policy>`")); }
         let name = line[0..space];
-        if (!userNameOk(name)) { return Err(usersFault(number, "a user's name is 1 to 64 of A-Za-z0-9+=,.@_-")); }
         let rest = trimSpaces(line[space + 1..]);
+        if (name == "account".bytes()) {
+            if (pieceEnd(rest, 0, ' ') != rest.length) {
+                return Err(usersFault(number, "the account's keys are `account <key>[,<key>…]`"));
+            }
+            var keys = Vector<Vector<u8>>.create();
+            parseKeyList(borrow out, number, rest, borrow mut keys)?;
+            for (k in 0..keys.length) {
+                if (out.account.push(
+                    copyBytes(keys[k].view()).ok() ?? { return Err(textOf("out of memory")); },
+                ).isErr()) {
+                    return Err(textOf("out of memory"));
+                }
+            }
+            continue;
+        }
+        if (!userNameOk(name)) {
+            return Err(usersFault(number, "a user's name is 1 to 64 of A-Za-z0-9+=,.@_-, and not `account`"));
+        }
         let space2 = pieceEnd(rest, 0, ' ');
         if (space2 == rest.length) { return Err(usersFault(number, "a user is `<name> <keys> <policy>`")); }
         let policy = trimSpaces(rest[space2 + 1..]);
@@ -55,62 +133,58 @@ fn parseUsersFile(text: Slice<u8>) -> Result<Vector<UserEntry>, String> {
             Err(S3Fail.OutOfMemory(_)) => { return Err(textOf("out of memory")); }
             Err(_) => { return Err(usersFault(number, "the identity policy does not parse")); }
         }
+        for (i in 0..out.users.length) {
+            if (sameNameIgnoringCase(out.users[i].name.view(), name)) {
+                return Err(usersFault(number, "a user named twice (names are unique ignoring case)"));
+            }
+        }
         var entry = UserEntry {
             name: copyBytes(name).ok() ?? { return Err(textOf("out of memory")); },
             keys: Vector<Vector<u8>>.create(),
             policyText: copyBytes(policy).ok() ?? { return Err(textOf("out of memory")); },
         };
-        let keyList = StringView.fromUtf8(rest[0..space2]) ?? "";
-        for (key in keyList.split(",")) {
-            if (key.length == 0) { return Err(usersFault(number, "an empty key")); }
-            if (entry.keys.push(copyBytes(key.bytes()).ok() ?? { return Err(textOf("out of memory")); }).isErr()) {
-                return Err(textOf("out of memory"));
-            }
-        }
-        for (i in 0..out.length) {
-            if (out[i].name.view() == name) { return Err(usersFault(number, "a user named twice")); }
-        }
-        if (out.push(entry).isErr()) { return Err(textOf("out of memory")); }
+        parseKeyList(borrow out, number, rest[0..space2], borrow mut entry.keys)?;
+        if (out.users.push(entry).isErr()) { return Err(textOf("out of memory")); }
     }
     return Ok(out);
 }
 
-/// Gives each key of `set` its user (and none to a key no user names). A key the set does not accept, or one two
-/// users name, refuses the file.
-fn applyUsers(set: borrow mut Vector<Credential>, users: Slice<UserEntry>) -> Result<void, String> {
+/// Gives each key of `set` its place by the users file: the account's, a user's (its name and parsed policy), or,
+/// named by neither, refused (revoked in this set; the next reload decides it again). A key the file names that the
+/// credentials file does not have is no one's: removing a key from the credentials file revokes it, whatever the
+/// users file says (the M11 exit review's A3).
+fn applyUsers(set: borrow mut Vector<Credential>, file: borrow UsersFile) -> Result<void, String> {
     for (i in 0..set.length) {
         set[i].user.clear();
         set[i].policyText.clear();
         set[i].policy = null;
-    }
-    for (u in 0..users.length) {
-        for (k in 0..users[u].keys.length) {
-            let key = users[u].keys[k].view();
-            var at: usize? = null;
-            for (i in 0..set.length) {
-                if (!set[i].revoked && set[i].accessKey.view() == key) { at = Some(i); }
-            }
-            let i = match (at) {
-                Some(i) => i,
-                null => { return Err(usersFault(0, "a user names a key the credentials file does not have")); }
-            };
-            if (set[i].user.length > 0) { return Err(usersFault(0, "a key belongs to two users")); }
-            let policy = match (parseIdentityPolicy(users[u].policyText.view())) {
-                Ok(p) => p,
-                Err(_) => { return Err(textOf("out of memory")); }
-            };
-            if (set[i].user.extend(users[u].name.view()).isErr() ||
-                set[i].policyText.extend(users[u].policyText.view()).isErr()) {
-                return Err(textOf("out of memory"));
-            }
-            set[i].policy = Some(policy);
+        if (set[i].revoked) { continue; }
+        var named = false;
+        for (k in 0..file.account.length) {
+            if (file.account[k].view() == set[i].accessKey.view()) { named = true; }
         }
+        for (u in 0..file.users.length) {
+            for (k in 0..file.users[u].keys.length) {
+                if (file.users[u].keys[k].view() != set[i].accessKey.view()) { continue; }
+                named = true;
+                let policy = match (parseIdentityPolicy(file.users[u].policyText.view())) {
+                    Ok(p) => p,
+                    Err(_) => { return Err(textOf("out of memory")); }
+                };
+                if (set[i].user.extend(file.users[u].name.view()).isErr() ||
+                    set[i].policyText.extend(file.users[u].policyText.view()).isErr()) {
+                    return Err(textOf("out of memory"));
+                }
+                set[i].policy = Some(policy);
+            }
+        }
+        if (!named) { set[i].revoked = true; }
     }
     return Ok();
 }
 
 /// Reads and parses the users file at `path`.
-fn readUsers(path: StringView) -> Result<Vector<UserEntry>, String> {
+fn readUsers(path: StringView) -> Result<UsersFile, String> {
     let text = readSmallFile(path, "users file")?;
     return parseUsersFile(text.view());
 }

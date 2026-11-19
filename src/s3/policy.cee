@@ -196,6 +196,23 @@ fn configuredKey(credentials: Slice<Credential>, key: Slice<u8>) -> bool {
 }
 
 const POLICY_USER_ARN: StringView = "arn:aws:iam:::user/";
+/// The one account's id, in the ARNs of its users (ADR-0088 §3) and of STS's sessions.
+const POLICY_ACCOUNT: StringView = "000000000000";
+
+/// Whether the requester's key was revoked since its request was authenticated (a reload between the two): its
+/// place has no user any more, so it is refused rather than read as the account's (the M11 exit review's B6).
+fn revokedRequester(credentials: Slice<Credential>, who: borrow Requester) -> bool {
+    let i = who.key ?? { return false; };
+    return i >= credentials.length || credentials[i].revoked;
+}
+
+/// Whether a key of `credentials` belongs to the user `name`.
+fn configuredUser(credentials: Slice<Credential>, name: Slice<u8>) -> bool {
+    for (i in 0..credentials.length) {
+        if (!credentials[i].revoked && credentials[i].user.view() == name) { return true; }
+    }
+    return false;
+}
 const POLICY_S3_ARN: StringView = "arn:aws:s3:::";
 
 /// `Principal` or `NotPrincipal`: `"*"`, or `{"AWS": ...}` with `*` and user ARNs naming access keys (ADR-0043 §3).
@@ -232,13 +249,19 @@ fn parsePrincipal<region a>(
                 st.anyone = true;
                 continue;
             }
-            // A user of the account (ADR-0088 §3): `arn:aws:iam::<account>:user/<name>`.
+            // A user of the account (ADR-0088 §3): `arn:aws:iam::000000000000:user/<name>`. Another account's is not
+            // one, and a user the users file does not have is refused when the policy is put, as AWS refuses an
+            // unknown principal (the M11 exit review's B2).
             let iam = "arn:aws:iam::".bytes();
             if (startsWithBytes(v, iam) && !startsWithBytes(v, prefix)) {
                 let colon = pieceEnd(v, iam.length, ':');
                 let tail = if (colon < v.length) v[colon + 1..] else "".bytes();
                 let user = "user/".bytes();
                 if (startsWithBytes(tail, user) && userNameOk(tail[user.length..])) {
+                    if (v[iam.length..colon] != POLICY_ACCOUNT.bytes()) { return Err(malformedPolicy()); }
+                    if (checkKeys && !configuredUser(credentials, tail[user.length..])) {
+                        return Err(malformedPolicy());
+                    }
                     st.users.push(copyBytes(tail[user.length..])?)?;
                     continue;
                 }
@@ -754,10 +777,38 @@ fn identityResourcePattern(text: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
         out.extend(rest[kind.length..])?;
         return Ok(out);
     }
+    // A general purpose bucket's, `s3:`; a directory bucket's (`arn:aws:s3express:…:bucket/…`), `s3express:`, which
+    // matches only directory buckets (the M11 exit review's A5).
+    if (startsWithBytes(text, POLICY_S3_ARN.bytes())) {
+        let tail = text[POLICY_S3_ARN.length..];
+        if (tail.length == 0) { return Err(malformedPolicy()); }
+        out.extend("s3:".bytes())?;
+        out.extend(tail)?;
+        return Ok(out);
+    }
+    // A directory bucket's access point: `arn:aws:s3express:<region>:<account>:accesspoint/<name>`, kept as
+    // `s3expressap:<name>`.
+    let expressHead = "arn:aws:s3express:".bytes();
+    if (startsWithBytes(text, expressHead)) {
+        var at = expressHead.length;
+        for (field in 0..2) {
+            let colon = pieceEnd(text, at, ':');
+            if (colon == text.length) { return Err(malformedPolicy()); }
+            at = colon + 1;
+        }
+        let kind = "accesspoint/".bytes();
+        let rest = text[at..];
+        if (startsWithBytes(rest, kind)) {
+            if (rest.length == kind.length) { return Err(malformedPolicy()); }
+            out.extend("s3expressap:".bytes())?;
+            out.extend(rest[kind.length..])?;
+            return Ok(out);
+        }
+    }
     match (policyArnTail(text)) {
         Some(tail) => {
             if (tail.length == 0) { return Err(malformedPolicy()); }
-            out.extend("s3:".bytes())?;
+            out.extend("s3express:".bytes())?;
             out.extend(tail)?;
             return Ok(out);
         }
@@ -1317,6 +1368,8 @@ struct Requester {
     sessionPolicy: BucketPolicy?;
     /// A request through an access point (ADR-0076 §3): its policy, read as the bucket's, and its public-access block.
     accessPoint: bool;
+    /// The access point's name, as an identity policy names it (`s3ap:<name>`, ADR-0088 §3); empty without one.
+    accessPointName: Vector<u8>;
     accessPointPolicy: BucketPolicy?;
     accessPointBlock: u8;
     /// Through a directory bucket's access point (ADR-0082): its name, which its sessions are of, and its scope
@@ -1335,6 +1388,7 @@ fn requesterOf(key: usize?, peer: SocketAddress?) -> Requester =>
         role: null,
         sessionPolicy: null,
         accessPoint: false,
+        accessPointName: Vector<u8>.create(),
         accessPointPolicy: null,
         accessPointBlock: 0,
         directoryAccessPoint: Vector<u8>.create(),
@@ -1355,6 +1409,7 @@ fn sessionAllows(
     action: StringView,
     resource: Slice<u8>,
 ) -> Result<bool, AllocError> {
+    if (revokedRequester(app.credentials.get().view(), who)) { return Ok(false); }
     if (who.role.isNull()) {
         match (userOfRequester(app.credentials.get().view(), who)) {
             Some(u) => {
@@ -1477,6 +1532,56 @@ async fn policyGate(app: borrow S3App, who: borrow Requester, bucket: StringView
 
 /// What the bucket's policy and ACL say of `who` doing `action` on `bucket` or `bucket/key` (`key` empty: the
 /// bucket). Neither: an anonymous request that only the object's own ACL could still let in (ADR-0045 §4).
+/// A call as an identity policy names it (ADR-0088 §3): `s3:<bucket>[/<key>]` and its action. A directory bucket's is
+/// S3 Express's (the M11 exit review's A5, B1): its management calls are `s3express:<call>` on `s3express:<bucket>`,
+/// and every other call, of its objects or its listing, is granted by `s3express:CreateSession` on the bucket, as
+/// AWS grants them through the session.
+struct IdentityCall {
+    action: Vector<u8>;
+    target: Vector<u8>;
+}
+
+/// The management calls of a directory bucket, whose IAM actions are S3 Express's of the same name.
+const DIRECTORY_MANAGEMENT: [StringView; 8] = [
+    "s3:DeleteBucket",
+    "s3:PutBucketPolicy",
+    "s3:GetBucketPolicy",
+    "s3:DeleteBucketPolicy",
+    "s3:PutEncryptionConfiguration",
+    "s3:GetEncryptionConfiguration",
+    "s3:PutLifecycleConfiguration",
+    "s3:GetLifecycleConfiguration",
+];
+
+fn identityCallOf(action: StringView, bucket: StringView, key: Slice<u8>) -> Result<IdentityCall, AllocError> {
+    var call = IdentityCall { action: Vector<u8>.create(), target: Vector<u8>.create() };
+    if (!isDirectoryShaped(bucket.bytes())) {
+        call.action.extend(action.bytes())?;
+        call.target.extend("s3:".bytes())?;
+        call.target.extend(bucket.bytes())?;
+        if (key.length > 0) {
+            call.target.push('/')?;
+            call.target.extend(key)?;
+        }
+        return Ok(call);
+    }
+    call.target.extend("s3express:".bytes())?;
+    call.target.extend(bucket.bytes())?;
+    var managed = false;
+    for (m in DIRECTORY_MANAGEMENT) {
+        if (m == action) { managed = true; }
+    }
+    if (managed) {
+        call.action.extend("s3express:".bytes())?;
+        call.action.extend(action.bytes()["s3:".length..])?;
+    } else if (startsWithBytes(action.bytes(), "s3express:".bytes())) {
+        call.action.extend(action.bytes())?;
+    } else {
+        call.action.extend("s3express:CreateSession".bytes())?;
+    }
+    return Ok(call);
+}
+
 fn gateDecision(
     app: borrow S3App,
     gate: borrow AccessGate,
@@ -1493,16 +1598,13 @@ fn gateDecision(
         (who.role.isSome() || userOfRequester(app.credentials.get().view(), who).isSome())) {
         return Ok(PolicyDecision.Allow);
     }
-    // As an identity policy names it: `s3:<bucket>[/<key>]` (ADR-0088 §3).
-    var target = copyBytes("s3:".bytes())?;
-    target.extend(bucket.bytes())?;
-    if (key.length > 0) {
-        target.push('/')?;
-        target.extend(key)?;
-    }
+    // As an identity policy names it (ADR-0088 §3).
+    let call = identityCallOf(action, bucket, key)?;
+    let identityAction = StringView.fromUtf8(call.action.view()) ?? action;
+    let target = call.target.view();
     // A role session first: it may do only what its policies allow, whatever the bucket's say (ADR-0075 §3).
     if (who.role.isSome()) {
-        if (!sessionAllows(app, req, who, action, target.view())?) { return Ok(PolicyDecision.Deny); }
+        if (!sessionAllows(app, req, who, identityAction, target)?) { return Ok(PolicyDecision.Deny); }
     }
     // A user's identity policy: its Deny refuses; its Allow, or the bucket's policy's, lets it; neither refuses
     // (ADR-0088 §2).
@@ -1514,7 +1616,7 @@ fn gateDecision(
             match (borrow u.policy) {
                 Some(p) => {
                     let facts = policyFacts(req, isListingAction(action), app.secure, who.peer)?;
-                    match (decidePolicy(p, null, action, target.view(), borrow facts)) {
+                    match (decidePolicy(p, null, identityAction, target, borrow facts)) {
                         PolicyDecision.Deny => { return Ok(PolicyDecision.Deny); }
                         PolicyDecision.Allow => { identityAllows = true; }
                         PolicyDecision.Neither => {}
@@ -1529,6 +1631,35 @@ fn gateDecision(
         Some(u) => Some(u.user.view()),
         null => null,
     };
+    // Through an access point, a user's identity policy is read for it too, `s3ap:<name>[/object/<key>]`: its Deny
+    // refuses, and its Allow lets the user through the access point (the M11 exit review's A6).
+    var pointIdentityAllows = false;
+    if (who.accessPoint) {
+        match (user) {
+            Some(u) => {
+                match (borrow u.policy) {
+                    Some(p) => {
+                        let express = who.directoryAccessPoint.length > 0;
+                        var pointCall = copyBytes(if (express) "s3expressap:".bytes() else "s3ap:".bytes())?;
+                        pointCall.extend(who.accessPointName.view())?;
+                        // A directory bucket's access point is granted whole, as its bucket is (`CreateSession`).
+                        if (key.length > 0 && !express) {
+                            pointCall.extend("/object/".bytes())?;
+                            pointCall.extend(key)?;
+                        }
+                        let facts = policyFacts(req, isListingAction(action), app.secure, who.peer)?;
+                        match (decidePolicy(p, null, identityAction, pointCall.view(), borrow facts)) {
+                            PolicyDecision.Deny => { return Ok(PolicyDecision.Deny); }
+                            PolicyDecision.Allow => { pointIdentityAllows = true; }
+                            PolicyDecision.Neither => {}
+                        }
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+    }
     // Through an access point (ADR-0076 §3): its policy's Deny refuses; an anonymous request needs its Allow, which
     // a public policy under RestrictPublicBuckets does not give; then the bucket's say, as without one.
     if (who.accessPoint) {
@@ -1560,6 +1691,9 @@ fn gateDecision(
             null => {}
         }
         if (anonymous && !allowed) { return Ok(PolicyDecision.Deny); }
+        // A user needs the access point to let it in, by its identity policy or the access point's, and then the
+        // bucket to, below: each side allows, as AWS asks (the M11 exit review's A6).
+        if (user.isSome() && !allowed && !pointIdentityAllows) { return Ok(PolicyDecision.Deny); }
     }
     if (isPolicyAction(action) && user.isNull()) {
         return Ok(if (anonymous) PolicyDecision.Deny else PolicyDecision.Allow);
@@ -1623,6 +1757,70 @@ async fn authorize(
     key: Slice<u8>,
 ) -> Result<void, S3Fail> => await authorizeVersion(app, req, who, action, bucket, key, null);
 
+/// Whether a user's or a session's configuration may name `bucket` as where the server writes for it: replication's
+/// destination, an inventory's or the logs' (the M11 exit review's A1). The requester must be allowed `action` on
+/// the bucket's objects, `s3:<bucket>/*`, as if it wrote them itself. The account's keys may name any bucket, as
+/// before: the account owns them all.
+async fn authorizeDestination(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    action: StringView,
+    bucket: Slice<u8>,
+) -> Result<void, S3Fail> {
+    let user = userOfRequester(app.credentials.get().view(), who).isSome();
+    if (!user && !who.session) { return Ok(); }
+    let name = StringView.fromUtf8(bucket) ?? { return Err(S3Fail.Code(S3Code.AccessDenied)); };
+    return await authorize(app, req, who, action, name, "*".bytes());
+}
+
+/// A write's fields that are calls of their own in S3's policies (the M11 exit review's A4): an ACL needs
+/// `s3:PutObjectAcl`, tags `s3:PutObjectTagging`, a retention `s3:PutObjectRetention` and a legal hold
+/// `s3:PutObjectLegalHold`, as well as the write's own action.
+async fn authorizeWriteFields(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    acl: bool,
+    tags: bool,
+    bucket: StringView,
+    key: Slice<u8>,
+) -> Result<void, S3Fail> {
+    if (acl) { await authorize(app, req, who, "s3:PutObjectAcl", bucket, key)?; }
+    if (tags) { await authorize(app, req, who, "s3:PutObjectTagging", bucket, key)?; }
+    if (headerOf(
+        req,
+        "x-amz-object-lock-mode",
+    ).isSome() || headerOf(req, "x-amz-object-lock-retain-until-date").isSome()) {
+        await authorize(app, req, who, "s3:PutObjectRetention", bucket, key)?;
+    }
+    if (headerOf(req, "x-amz-object-lock-legal-hold").isSome()) {
+        await authorize(app, req, who, "s3:PutObjectLegalHold", bucket, key)?;
+    }
+    return Ok();
+}
+
+/// Whether a request's headers give an ACL: `x-amz-acl` or an `x-amz-grant-*`.
+fn asksAcl(req: borrow S3Request) -> bool {
+    for (name in [
+        "x-amz-acl", "x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp", "x-amz-grant-write-acp",
+        "x-amz-grant-full-control",
+    ]) {
+        if (headerOf(req, name).isSome()) { return true; }
+    }
+    return false;
+}
+
+/// `authorizeWriteFields` for a request's headers, on its own key.
+async fn authorizeWriteHeaders(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+) -> Result<void, S3Fail> {
+    let tags = headerOf(req, "x-amz-tagging").isSome();
+    return await authorizeWriteFields(app, req, who, asksAcl(req), tags, req.bucket.view(), req.key.view().bytes());
+}
+
 /// `authorize`, for the version `versionId` of the key when the action is on one: an anonymous request that the
 /// bucket's policy and ACL neither let in nor refuse may do what the version's own ACL grants everyone
 /// (ADR-0045 §4).
@@ -1635,6 +1833,8 @@ async fn authorizeVersion(
     key: Slice<u8>,
     versionId: [u8; 16]?,
 ) -> Result<void, S3Fail> {
+    // A key revoked since the request was authenticated has no user to decide it by: refused, not the account's.
+    if (revokedRequester(app.credentials.get().view(), who)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
     if (who.key.isSome() && who.role.isNull() && !who.accessPoint &&
         userOfRequester(app.credentials.get().view(), who).isNull() &&
         (app.denyBuckets.load() == 0 || isPolicyAction(action))) {

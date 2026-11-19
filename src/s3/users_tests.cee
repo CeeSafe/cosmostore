@@ -20,12 +20,14 @@ const READER_POLICY: StringView =
 @test
 fn usersFileAndKeys() -> Result<void, TestFailure> {
     var text = String.create();
-    text.append("# who may do what\n\nreader AKIAREADER1,AKIAREADER2 ")!;
+    text.append("# who may do what\n\naccount AKIAACCOUNT\nreader AKIAREADER1,AKIAREADER2 ")!;
     text.append(READER_POLICY)!;
     text.append("\n")!;
-    let users = parseUsersFile(text.bytes())!;
-    Check.equalU64(1, users.length as u64)?;
-    Check.equalU64(2, users[0].keys.length as u64)?;
+    let file = parseUsersFile(text.bytes())!;
+    Check.equalU64(1, file.account.length as u64)?;
+    Check.equalU64(1, file.users.length as u64)?;
+    Check.equalU64(2, file.users[0].keys.length as u64)?;
+    let any = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}";
     for (bad in [
         "reader",
         "reader AKIA1",
@@ -33,29 +35,45 @@ fn usersFileAndKeys() -> Result<void, TestFailure> {
         "reader AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
         "reader AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"ec2:*\",\"Resource\":\"*\"}}",
         "reader AKIA1, {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
+        "reader AKIA1,AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
+        "Account AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
+        "account AKIA1 {}",
+        "account AKIA1,",
     ]) {
         Check.isTrue(parseUsersFile(bad.bytes()).isErr(), bad)?;
     }
-    var twice = String.create();
-    twice.append("a AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}\n")!;
-    twice.append("a AKIA2 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}\n")!;
-    Check.isTrue(parseUsersFile(twice.bytes()).isErr(), "a user named twice")?;
-    // Given to keys: the reader's two; the account's key stays the account's.
+    // A user named twice, ignoring case; a key named twice, by two users or a user and the account.
+    for (pair in [["a AKIA1 ", "A AKIA2 "], ["a AKIA1 ", "b AKIA1 "], ["account AKIA1", "b AKIA1 "]]) {
+        var twice = String.create();
+        twice.append(pair[0])!;
+        if (pair[0] != "account AKIA1") { twice.append(any)!; }
+        twice.append("\n")!;
+        twice.append(pair[1])!;
+        twice.append(any)!;
+        Check.isTrue(parseUsersFile(twice.bytes()).isErr(), pair[1])?;
+    }
+    // Given to keys: the reader's two, the account's its own, and a key the file does not name refused.
     var set = Vector<Credential>.create();
-    for (k in ["AKIAACCOUNT", "AKIAREADER1", "AKIAREADER2"]) { set.push(usersKey(k))!; }
-    applyUsers(mut set, users.view())!;
+    for (k in ["AKIAACCOUNT", "AKIAREADER1", "AKIAREADER2", "AKIAFORMER"]) { set.push(usersKey(k))!; }
+    applyUsers(mut set, borrow file)!;
     Check.equalU64(0, set[0].user.length as u64)?;
+    Check.isFalse(set[0].revoked, "the account's key")?;
     Check.equalBytes("reader".bytes(), set[1].user.view())?;
     Check.isTrue(set[2].policy.isSome(), "its policy, parsed")?;
-    // A key the credentials do not have, or two users naming one key: the file is refused.
+    Check.isTrue(set[3].revoked, "a key the file does not name is refused, not the account's")?;
+    // A key the credentials file revoked stays revoked, though a user names it; the other keys are unchanged.
     var short = Vector<Credential>.create();
-    short.push(usersKey("AKIAREADER1"))!;
-    Check.isTrue(applyUsers(mut short, users.view()).isErr(), "a key not there")?;
-    var both = String.create();
-    both.append("a AKIAREADER1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}\n")!;
-    both.append("b AKIAREADER1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}\n")!;
-    let two = parseUsersFile(both.bytes())!;
-    Check.isTrue(applyUsers(mut set, two.view()).isErr(), "a key of two users")?;
+    for (k in ["AKIAACCOUNT", "AKIAREADER1"]) { short.push(usersKey(k))!; }
+    short[1].revoked = true;
+    applyUsers(mut short, borrow file)!;
+    Check.isTrue(short[1].revoked, "a revoked key, though named")?;
+    Check.isFalse(short[0].revoked, "the account's key, still")?;
+    // An empty users file names no key: every key is refused.
+    let empty = parseUsersFile("# nobody\n".bytes())!;
+    var all = Vector<Credential>.create();
+    all.push(usersKey("AKIAACCOUNT"))!;
+    applyUsers(mut all, borrow empty)!;
+    Check.isTrue(all[0].revoked, "an empty file refuses every key")?;
     return Ok();
 }
 
@@ -136,5 +154,56 @@ fn resourcePoliciesNameUsers() -> Result<void, TestFailure> {
     let bad =
         "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::0:user/bad/name\"},\"Action\":\"s3:*\",\"Resource\":\"arn:aws:s3:::photos/*\"}}";
     Check.isTrue(parseBucketPolicy(bad.bytes(), "photos".bytes(), none.view(), false).isErr(), "a name not a user's")?;
+    return Ok();
+}
+
+fn callOf(action: StringView, bucket: StringView, key: StringView) -> Vector<u8> {
+    let call = identityCallOf(action, bucket, key.bytes())!;
+    var out = copyBytes(call.action.view())!;
+    out.push(' ')!;
+    out.extend(call.target.view())!;
+    return out;
+}
+
+@test
+fn exitReviewRulesOfM11() -> Result<void, TestFailure> {
+    // A5: a directory bucket's ARN grants directory buckets only, not every bucket.
+    let express =
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3express:CreateSession\"],\"Resource\":\"arn:aws:s3express:us-east-1:000000000000:bucket/*\"}}";
+    Check.equalBytes("neither".bytes(), identityDecides(express, "s3:GetObject", "s3:victim/report.csv").view())?;
+    Check.equalBytes(
+        "allow".bytes(),
+        identityDecides(express, "s3express:CreateSession", "s3express:d--use1-az4--x-s3").view(),
+    )?;
+    // B1: a directory bucket's calls as S3 Express names them; a general purpose bucket's as S3's.
+    Check.equalBytes(
+        "s3express:CreateSession s3express:d--use1-az4--x-s3".bytes(),
+        callOf("s3:GetObject", "d--use1-az4--x-s3", "a").view(),
+    )?;
+    Check.equalBytes(
+        "s3express:DeleteBucket s3express:d--use1-az4--x-s3".bytes(),
+        callOf("s3:DeleteBucket", "d--use1-az4--x-s3", "").view(),
+    )?;
+    Check.equalBytes("s3:GetObject s3:photos/a".bytes(), callOf("s3:GetObject", "photos", "a").view())?;
+    let point =
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3express:CreateAccessPoint\",\"Resource\":\"arn:aws:s3express:us-east-1:000000000000:accesspoint/door--use1-az4--xa-s3\"}}";
+    Check.equalBytes(
+        "allow".bytes(),
+        identityDecides(point, "s3express:CreateAccessPoint", "s3expressap:door--use1-az4--xa-s3").view(),
+    )?;
+    Check.equalBytes("neither".bytes(), identityDecides(point, "s3express:CreateAccessPoint", "s3ap:door").view())?;
+    // B2: a user principal of another account, or one the users file does not have, is refused when put.
+    var set = Vector<Credential>.create();
+    set.push(usersKey("AKIAREADER1"))!;
+    set[0].user.extend("reader".bytes())!;
+    let named =
+        "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:user/reader\"},\"Action\":\"s3:*\",\"Resource\":\"arn:aws:s3:::photos/*\"}}";
+    Check.isTrue(parseBucketPolicy(named.bytes(), "photos".bytes(), set.view(), true).isOk(), "a user there")?;
+    let typo =
+        "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:user/raeder\"},\"Action\":\"s3:*\",\"Resource\":\"arn:aws:s3:::photos/*\"}}";
+    Check.isTrue(parseBucketPolicy(typo.bytes(), "photos".bytes(), set.view(), true).isErr(), "a user not there")?;
+    let other =
+        "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam::999999999999:user/reader\"},\"Action\":\"s3:*\",\"Resource\":\"arn:aws:s3:::photos/*\"}}";
+    Check.isTrue(parseBucketPolicy(other.bytes(), "photos".bytes(), set.view(), false).isErr(), "another account")?;
     return Ok();
 }

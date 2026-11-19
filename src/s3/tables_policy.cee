@@ -326,14 +326,22 @@ async fn tableDataAllowed(
 }
 
 /// An S3 call into a table bucket's warehouse (after `tableWarehouseRefusal`): authorized as the table's data, a read
-/// as `s3tables:GetTableData` and anything else as `s3tables:PutTableData` (ADR-0084 §4). HeadBucket names no table;
-/// DeleteObjects' keys are checked one by one.
+/// as `s3tables:GetTableData` and anything else as `s3tables:PutTableData` (ADR-0084 §4). HeadBucket names no table:
+/// `s3tables:GetTableBucket`. DeleteObjects' keys are checked one by one.
 async fn authorizeTableData(app: borrow S3App, req: borrow S3Request, who: borrow Requester) -> Result<void, S3Fail> {
     let listing = req.key.length == 0;
     let target = if (listing) paramOf(req, "prefix") ?? "".bytes() else req.key.bytes();
     let id = match (tableIdOfKey(target, listing)) {
         Some(i) => i,
-        null => { return Ok(); } // HeadBucket, DeleteObjects: what `tableWarehouseRefusal` let through
+        null => {
+            // HeadBucket: the table bucket's own, `s3tables:GetTableBucket`, not a probe anyone may make (the M11
+            // exit review's B5). DeleteObjects: its keys, one by one.
+            if (listing && isMethod(req.method, Method.Head) &&
+                !await tableDataAllowed(app, req, who, "s3tables:GetTableBucket", req.bucket.bytes(), "".bytes())?) {
+                return Err(S3Fail.Code(S3Code.AccessDenied));
+            }
+            return Ok();
+        }
     };
     let read = isMethod(req.method, Method.Get) || isMethod(req.method, Method.Head);
     let action = if (read) "s3tables:GetTableData" else "s3tables:PutTableData";

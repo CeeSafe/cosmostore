@@ -15,7 +15,9 @@ export AWS_ENDPOINT_URL="http://127.0.0.1:$port"
 echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > "$work/credentials"
 # Users (ADR-0088): a user that may read the objects of `sdk-*-users` buckets, and nothing else.
 echo "AKIASDKUSER000000001 sdkuser/secret/0123456789abcdefgh" >> "$work/credentials"
-cat > "$work/users" <<'USERS'
+# The account's key is named as the account's: a key the users file does not name is refused.
+echo "account $AWS_ACCESS_KEY_ID" > "$work/users"
+cat >> "$work/users" <<'USERS'
 sdkuser AKIASDKUSER000000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::sdk-*-users/*"}}
 USERS
 # SSE-S3's master key (ADR-0046 §4).
