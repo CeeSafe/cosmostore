@@ -1,6 +1,6 @@
 # ADR-0085: M10, what comes after S3 Tables (proposed)
 
-**Status:** proposed, 19 Nov 2026. The owner: "propose M10". M9 (S3 Tables, ADR-0083 and ADR-0084) closed the same
+**Status:** decided, 19 Nov 2026: the owner chose A, "and write the decoder here first". Proposed the same day. The owner: "propose M10". M9 (S3 Tables, ADR-0083 and ADR-0084) closed the same
 day.
 
 ## Context
@@ -59,11 +59,12 @@ day.
    their policies, kept as records of their own.
 4. **Not in M10:** S3 Metadata tables, S3 Vectors, compaction, and an Iceberg engine inside the server.
 
-## For the owner to decide
+## For the owner to decide (decided 19 Nov 2026)
 
-- **Which item is M10:** A (recommended), B or C.
+- **Which item is M10:** A (recommended), B or C. The owner: **A**.
 - **For A, the inflate decoder:** ask the CeeSafe repo for one in lib/std (CosmoStore's rule for a CeeSafe gap), or
-  write it in CosmoStore and move it to lib/std later.
+  write it in CosmoStore and move it to lib/std later. The owner: **write it here first**. It is still logged in
+  `CEESAFE_GAPS.md`, to move to lib/std later.
 
 ## Consequences
 

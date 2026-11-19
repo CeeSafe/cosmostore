@@ -312,14 +312,15 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 **Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
 (ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
-### M10 (proposed)
+### M10: Table maintenance
 
-The owner: "propose M10" (19 Nov 2026). ADR-0085 (proposed) sets out three candidates:
-- **A, table maintenance** (snapshot management and unreferenced file removal), recommended.
-- **B, identities** (users and identity policies).
-- **C, the long tail** (lifecycle transitions, ListMultipartUploads' `delimiter`, SHA-1 checksums).
-
-Which one is the owner's choice.
+The owner chose ADR-0085's item A, "and write the decoder here first" (19 Nov 2026). ADR-0086 (proposed) designs it:
+- **Snapshot management:** snapshots are expired by age, keeping refs' heads and the newest few.
+- **Unreferenced file removal:** files no snapshot references are noted, then deleted after
+  `unreferencedDays + nonCurrentDays`. A run that cannot read a manifest deletes nothing.
+- **The readers:** an inflate decoder and an Avro reader, with no C.
+- **Done when** a PyIceberg table appended to many times keeps its warehouse bounded and still reads back, on `serve`
+  and on a cluster.
 
 ---
 
@@ -3262,3 +3263,13 @@ Browser form uploads with a SigV4 POST policy.
     no decoder (checked).
   - Whether the decoder is asked of CeeSafe or written here first is the owner's choice too.
 - **Next:** the owner's choice of item.
+
+### 19 Nov 2026: M10 is table maintenance (ADR-0086, proposed)
+
+- **The owner:** "A, and write the decoder here first". ADR-0086 designs it, in five slices:
+  1. the inflate decoder and the Avro reader;
+  2. the calls and snapshot management;
+  3. unreferenced file removal;
+  4. the cluster;
+  5. PyIceberg end to end, and the exit review.
+- **Next:** slice 1.
