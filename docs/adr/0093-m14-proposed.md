@@ -1,6 +1,7 @@
 # ADR-0093: M14, what comes after a cluster as `serve` (proposed)
 
-**Status:** proposed, 20 Nov 2026. The owner: "continue", after M13 (a cluster as `serve`, ADR-0092) closed the
+**Status:** decided, 20 Nov 2026: the owner chose A ("A: decided at delivery"), a session's configuration decided
+as its parent; ADR-0094 designs it. Proposed the same day. The owner: "continue", after M13 (a cluster as `serve`, ADR-0092) closed the
 same day. ADR-0089 §3 and ADR-0091 §3 named configurations decided at delivery the next candidate.
 
 ## Context

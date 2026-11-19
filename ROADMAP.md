@@ -312,6 +312,17 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 **Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
 (ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
+### M14: Configurations decided at delivery
+
+The owner chose ADR-0093's item A (20 Nov 2026), a session's configuration decided as its parent. ADR-0094
+(proposed) designs it:
+- **The requester recorded:** each replication, inventory and logging configuration records the user or role that
+  put it.
+- **Decided at each write:** each replica, report and log object is authorized as that requester, with the policies
+  of that moment.
+- **Done when** a user removed, or a policy narrowed, stops its configurations' writes at the next one, on `serve`
+  and on a cluster.
+
 ### M13: A cluster as `serve`
 
 **Closed 20 Nov 2026** (the owner: "Accept and close"; `docs/m13-exit-review.md`).
@@ -3814,3 +3825,13 @@ Browser form uploads with a SigV4 POST policy.
   - **C, compaction for S3 Tables.**
 - **Why A:** since M11 and M13, taking a user away is immediate everywhere but in its configurations.
 - **Next:** the owner's choice.
+
+### 20 Nov 2026: M14 is configurations decided at delivery (ADR-0094, proposed)
+
+- **The owner:** "A: decided at delivery", and a session's configuration decided as its parent.
+- **ADR-0094's slices:**
+  1. the requester recorded, and the decision as one;
+  2. each write decided on `serve`, with a fault sweep;
+  3. on a cluster, the destination's shard decides;
+  4. the exit review.
+- **Next:** slice 1.
