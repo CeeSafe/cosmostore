@@ -235,3 +235,5 @@ M9 can close on the owner's word.
 - **B9:** the server, and a cluster node, refuse to start with a `--table-s3` bucket that S3 made before M9, naming
   it. That is checked end to end with the release before M9.
 - **Evidence:** `tablesPoliciesDecide`, `tableBucketsMadeBeforeM9`; the S3 and cluster smokes.
+
+**Closed** by the owner, 19 Nov 2026 ("close M9"), after accepting ADR-0083 and ADR-0084.

@@ -303,11 +303,14 @@ against CosmoStore (ADR-0079).
 
 ### M9: S3 Tables
 
-The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (proposed) designs it.
+The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19 Nov 2026) designs it.
 - **Table buckets:** each is a hidden bucket. Its catalog is objects, with conditional writes as the compare-and-set.
 - **The APIs:** the S3 Tables API (signed for `s3tables`), and the Iceberg REST catalog, which writes the metadata
   files itself.
 - **Done when** PyIceberg can create a table, append to it and read it back, on `serve` and on a cluster.
+
+**Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
+(ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
 ---
 
@@ -3228,3 +3231,13 @@ Browser form uploads with a SigV4 POST policy.
 - The owner: "I accept ADR-0083 and ADR-0084". S3 Tables and the Iceberg REST catalog, with their policies, are done:
   on `serve` and on a cluster, through PyIceberg and every SDK of the matrix, M9's exit review's findings closed.
 - **Next:** the owner's word on closing M9.
+
+### 19 Nov 2026: M9 closed
+
+- The owner: "close M9". **M9 (S3 Tables) is closed** (ADR-0083, ADR-0084; `docs/m9-exit-review.md`). It covers:
+  - the S3 Tables API (table buckets, namespaces and tables, the metadata location's compare-and-set);
+  - the Iceberg REST catalog, PyIceberg end to end;
+  - table bucket and table policies, over every call and a table's data;
+  - all of it on `serve` and on a cluster, through the AWS CLI and every SDK of the matrix.
+- **Not done, and refused:** maintenance, encryption other than the server's, tags, replication, storage classes,
+  metrics, record expiration, staged creates, nested namespaces, views, credential vending and AssumeRole sessions.
