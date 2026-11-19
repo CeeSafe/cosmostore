@@ -551,6 +551,58 @@ compiler; `--cflag -fbracket-depth=1024` passes.
 **Suggested.** Emit the runner flat: one block per test in sequence (or a table of test functions and a loop), so its
 depth is constant. CosmoStore's CI passes `--cflag -fbracket-depth=1024` until then.
 
+### G37: no nested pattern through a reference payload (P3, language)
+
+Found with CeeSafe 0.54.0 on 2026-11-19, while writing the Avro and Iceberg readers (ADR-0086); still so in 0.77.1.
+
+**Evidence.** A function returns `borrow(a) Node?`, an optional reference. Matching it with
+`Some(Node.Items(v)) => …` is N0205, "this payload is a reference ('borrow Node'): bind it and match on it
+separately" (type-system.md §15.2). The compiler then also reports `cannot find 'v' in this scope` at the arm's
+body, a follow-on error for a name the refused pattern would have bound.
+
+**Why it matters.** Code that walks a parsed document (JSON, Avro) reaches a member through an optional reference
+and wants one variant of it. Each such lookup needs a helper of its own, or a second `match` on a bound name:
+`src/s3/avro.cee`'s `memberItems` and `memberMembers` exist only for this.
+
+**Repro.**
+
+```
+enum Node { Items(Vector<u32>), Leaf(u32) }
+fn first<region a>(all: borrow(a) Vector<Node>) -> borrow(a) Node? {
+    if (all.length == 0) { return null; }
+    return Some(borrow all[0]);
+}
+fn items<region a>(all: borrow(a) Vector<Node>) -> borrow(a) Vector<u32>? => match (first(all)) {
+    Some(Node.Items(v)) => Some(v), // N0205, then N0200 "cannot find 'v'"
+    _ => null,
+};
+```
+
+**Suggested.**
+- **The pattern:** let a pattern match through a reference payload, binding the inner payload as a reference of
+  the same region (`v: borrow(a) Vector<u32>`). That is what the two-step form gives, and it moves nothing.
+- **The diagnostic:** without that, drop the follow-on N0200 for names a refused pattern would have bound.
+
+### G38: `class` is reserved but means nothing, and a field named so gets an unclear error (P3, diagnostics)
+
+Found with CeeSafe 0.54.0 on 2026-11-19, while giving lifecycle transitions a storage class (ADR-0090); still so in
+0.77.1.
+
+**Evidence.**
+- **`class`:** it is a reserved word (grammar.md §1.3), though CeeSafe has no classes. As a struct field, `class: u32`
+  is N0107 "expected a field, 'fn' or 'const' in struct, found 'class'", which does not say it is reserved. Only a
+  use of it in an expression says so (N0100 "… which is a reserved word: choose another name").
+- **`own`:** another reserved word an S3 store wants as a name (an object's owner). It cost the same detour.
+
+**Why it matters.** `class` is the natural name of S3's storage class (and of the type of anything), and the
+field-position error sends one looking for a syntax mistake.
+
+**Repro.** `struct T { class: u32; }` (N0107, no mention of the reserved word).
+
+**Suggested.**
+- **The error:** N0107 at a field, and at a parameter, should say the word is reserved, as N0100 does.
+- **The reserved list:** consider releasing words the language does not use (`class`).
+
 ## Not gaps (checked)
 
 Things that worked well and are worth keeping:

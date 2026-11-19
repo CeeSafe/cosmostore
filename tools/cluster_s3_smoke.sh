@@ -46,9 +46,10 @@ export AWS_ACCESS_KEY_ID=AKIACLUSTERSMOKE0001 AWS_SECRET_ACCESS_KEY=clustersmoke
 export AWS_MAX_ATTEMPTS=6 AWS_RETRY_MODE=standard
 echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > credentials
 # Users (ADR-0088 §5): the same users file on every node.
-printf '%s\n' "AKIACLUSTERREADER001 reader/secret/0123456789abcdefgh" "AKIACLUSTERANALYST01 analyst/secret/0123456789abcdefg" >> credentials
+printf '%s\n' "AKIACLUSTERREADER001 reader/secret/0123456789abcdefgh" "AKIACLUSTERANALYST01 analyst/secret/0123456789abcdefg" \
+    "AKIACLUSTERTEMPKEY01 temp/secret/0123456789abcdefghij" >> credentials
 # The account's key, named: a key the users file does not name is refused.
-echo "account $AWS_ACCESS_KEY_ID" > users
+echo "account $AWS_ACCESS_KEY_ID,AKIACLUSTERTEMPKEY01" > users
 cat >> users <<'USERS'
 reader:AIDACREADER01 AKIACLUSTERREADER001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::team-c","arn:aws:s3:::team-c/*"]}}
 analyst:AIDACANALYST1 AKIACLUSTERANALYST01 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":["arn:aws:s3tables:*:*:bucket/lake-c","arn:aws:s3tables:*:*:bucket/lake-c/table/*"]}}
@@ -462,6 +463,19 @@ check "and drops none, through node 2" "$(denied analyst 2 s3tables delete-table
 on 1 s3tables delete-table --table-bucket-arn "$lakec" --namespace ns --name t > /dev/null 2>&1
 on 1 s3tables delete-namespace --table-bucket-arn "$lakec" --namespace ns > /dev/null 2>&1
 for attempt in 1 2 3; do on 1 s3tables delete-table-bucket --table-bucket-arn "$lakec" > /dev/null 2>&1 && break; pause 0.5; done
+# Each node reloads its files (ADR-0092 §1): a key and a user removed are refused through every node, no restart.
+temp() { AWS_ACCESS_KEY_ID=AKIACLUSTERTEMPKEY01 AWS_SECRET_ACCESS_KEY=temp/secret/0123456789abcdefghij on "$@"; }
+errcodeof() { "$@" 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9]*\)).*/\1/p' | head -1; }
+temp 3 s3api list-buckets > /dev/null 2>&1 && pass "a second account key, through node 3" || fail "a second account key, through node 3"
+sed -i.bak '/^AKIACLUSTERTEMPKEY01 /d' credentials
+sed -i.bak 's/^account \(.*\),AKIACLUSTERTEMPKEY01$/account \1/; /^reader:/d' users
+sleep 5
+for n in 1 2 3; do
+    check "a key removed is refused through node $n, without a restart" "$(errcodeof temp "$n" s3api list-buckets)" InvalidAccessKeyId
+done
+check "and a user removed, through node 2" "$(errcodeof reader 2 s3api get-object --bucket team-c --key a.txt users.out)" InvalidAccessKeyId
+check "the account's key still, through node 1" "$(on 1 s3api head-bucket --bucket team-c > /dev/null 2>&1 && echo ok)" ok
+grep -q "credentials reloaded" log1 && pass "node 1 logs its reload" || fail "node 1 logs its reload"
 
 # The long tail on a cluster (ADR-0090 §7): each item through other nodes.
 on 1 s3api create-bucket --bucket tail-c > /dev/null 2>&1

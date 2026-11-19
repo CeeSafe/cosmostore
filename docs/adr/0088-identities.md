@@ -101,8 +101,8 @@ open, so this takes ADR-0087's recommendation: a users file beside the credentia
    - **GetSessionToken** by a user: the session is the user's, decided by the user's identity policy.
    - **AssumeRole** by a user needs an identity Allow of `sts:AssumeRole` on `arn:aws:iam::<account>:role/<name>`.
      The account's keys may assume any role, as now.
-5. **On a cluster:** every node takes the same users file, as the credentials file, read at start (a node does not
-   reload its credentials yet). A shard decides each request as
+5. **On a cluster:** every node takes the same users file, as the credentials file, and reloads it, as `serve` does
+   (ADR-0092 §1). A shard decides each request as
    `serve` does. The front's merged calls (ListBuckets, ListTableBuckets, ListDirectoryBuckets) are decided on the
    shards that answer them.
 

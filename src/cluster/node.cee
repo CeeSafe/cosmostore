@@ -944,6 +944,20 @@ fn peerHandler() -> Result<Box<dyn Handler<NodeApp> + Send + Share>, RouteError>
 }
 
 /// The peer port, the tick, and a sender per peer, until one fails.
+/// How often a node looks at its credentials and users files (ADR-0092 §1).
+const CREDENTIALS_EVERY_MS: u64 = 2000;
+
+/// The node's credentials and users files, reloaded as `serve` reloads its own whenever either changes: a key or a
+/// user removed is refused at the node's next request, without a restart (ADR-0092 §1).
+async fn credentialsForever(rotation: Rotation) -> Result<void, NodeFault> {
+    var r = rotation;
+    while (true) {
+        if (!(await frontPause(CREDENTIALS_EVERY_MS))) { return Err(NodeFault.Net); }
+        await reloadCredentialsIfChanged(mut r);
+    }
+    return Ok();
+}
+
 async fn runNode(
     shared: borrow Arc<NodeShared>,
     server: Server<NodeApp>,
@@ -951,6 +965,7 @@ async fn runNode(
     internals: Vector<InternalS3>,
     front: Server<FrontApp>?,
     frontAddress: SocketAddress,
+    rotation: Rotation?,
 ) -> Result<void, NodeFault> {
     let frontListener = match (front) {
         Some(_) => match (listenOn(frontAddress)) {
@@ -1026,6 +1041,11 @@ async fn runNode(
             }
             null => {}
         }
+        // The credentials and users files, reloaded when they change (ADR-0092 §1).
+        match (rotation) {
+            Some(r) => { s.spawn(async move () => await credentialsForever(r)); }
+            null => {}
+        }
         s.spawn(async () => await tickForever(node));
         s.spawn(async () => await fetchForever(node));
         s.spawn(async () => await rebalanceForever(node));
@@ -1080,6 +1100,8 @@ fn nodeCommand() -> i32 {
     // S3 on the node (ADR-0060): `--listen` and `--credentials`, both or neither.
     if (args.listen.isSome() != args.credentials.isSome()) { return 2; }
     var credentials: Arc<CredentialSets>? = null;
+    // The node's files, watched as `serve` watches its own (ADR-0092 §1).
+    var rotation: Rotation? = null;
     var frontAddress = SocketAddress.V4([127u8, 0, 0, 1], 0);
     match (borrow args.credentials) {
         Some(path) => {
@@ -1101,6 +1123,19 @@ fn nodeCommand() -> i32 {
                 },
                 Err(_) => { return 1; }
             };
+            match (borrow credentials) {
+                Some(sets) => {
+                    rotation = Some(Rotation {
+                        sets: sets.clone(),
+                        path: textOf(path.view()),
+                        modified: Fs.modifiedMillis(path.view()).ok() ?? 0,
+                        failed: 0,
+                        usersPath: textOf(usersPath),
+                        usersModified: if (usersPath.length == 0) 0 else Fs.modifiedMillis(usersPath).ok() ?? 0,
+                    });
+                }
+                null => {}
+            }
             let listenText = match (borrow args.listen) {
                 Some(l) => l.view(),
                 null => "",
@@ -1356,7 +1391,7 @@ fn nodeCommand() -> i32 {
             Err(_) => { return 1; }
         };
     }
-    match (Async.run(runNode(borrow arc, server, address, parts.internals, front, frontAddress))) {
+    match (Async.run(runNode(borrow arc, server, address, parts.internals, front, frontAddress, rotation))) {
         Ok(_) => { return 1; }
         Err(_) => { return 1; }
     }

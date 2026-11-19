@@ -3730,3 +3730,18 @@ Browser form uploads with a SigV4 POST policy.
   and `docs/compatibility.md` did not say so.
 - **ADR-0092's slices:** reloads on every node; `node --sse-key-file` and `--kms-key-file`; the exit review.
 - **Next:** slice 1.
+
+### 19 Nov 2026: M13 slice 1, each node reloads its files (ADR-0092 §1)
+
+- **The reload:** a node with `--credentials` runs `serve`'s `Rotation` on its one credential set every 2 seconds
+  (`credentialsForever`). Every shard's S3 server and the front read that set.
+- **It acts as `serve`'s:**
+  - a change to the credentials or users file reloads both;
+  - a file that does not read changes nothing and is reported once, in the node's log.
+- **Tests:** the cluster smoke's 153 checks.
+  - A second account key is refused through each of three nodes once it is removed from the files, without a
+    restart.
+  - So is a user removed from the users file, while the account's key still works.
+  - Node 1 logs its reload.
+- **CEESAFE_GAPS:** G37 (no nested pattern through a reference payload) and G38 (`class` reserved, and a field so
+  named gets an unclear error), both checked on 0.54.0 and 0.77.1. G26 notes SHA-1 is still missing in 0.77.1.
