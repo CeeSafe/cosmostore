@@ -144,3 +144,7 @@ The owner asked for the three Lows to be fixed before closing.
 - **SHA-1's speed:** whole 64-byte blocks are compressed straight from the input. Only a block begun before, or
   left at the end, is copied. The FIPS vectors, which feed a million bytes in pieces of 1000, and the padding
   vectors pass.
+
+## Closed (19 Nov 2026)
+
+The owner accepted ADR-0090, as amended, and closed M12 ("Accept and close").

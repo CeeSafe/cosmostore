@@ -314,7 +314,10 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 
 ### M12: The long tail
 
-The owner chose ADR-0089's item A (19 Nov 2026), with archive classes refused. ADR-0090 (proposed) designs it:
+**Closed 19 Nov 2026** (the owner: "Accept and close"; `docs/m12-exit-review.md`).
+
+The owner chose ADR-0089's item A (19 Nov 2026), with archive classes refused. ADR-0090 (accepted 19 Nov 2026)
+designs it:
 - **Storage classes:** recorded on the object and answered, or refused, never dropped (a fix: they are dropped
   today).
 - **Lifecycle transitions** to the classes kept here, recorded, not moved.
@@ -3689,3 +3692,13 @@ Browser form uploads with a SigV4 POST policy.
 - **B6:** a write's class is checked after its bucket (NoSuchBucket first).
 - **SHA-1:** whole blocks straight from the input.
 - **Tests:** 387 unit tests, the S3 smoke, the cluster smoke (146) and the SDK matrix pass.
+
+### 19 Nov 2026: M12 closed, ADR-0090 accepted
+
+- **The owner:** "Accept and close", after the exit review's findings and its Lows were fixed.
+- **At closing (`55c9c15`):** 387 unit tests, the S3 smoke, the cluster smoke (146) and the SDK matrix (boto3, Go,
+  JavaScript, Java, .NET) pass.
+- **No downgrade past M12:** a binary before it stops at SetTags format 4, lifecycle rules v3 and v4, replication
+  rules v2 or checksum code 5 ("bad record meta").
+- **Next:** M13, when the owner asks for one. ADR-0089's B (configurations decided at delivery) is the next
+  candidate.

@@ -1,6 +1,7 @@
 # ADR-0090: The long tail, what S3 clients meet refused (M12)
 
-**Status:** proposed, 19 Nov 2026. M12 is item A of ADR-0089 (the owner: "A: the long tail"); archive classes are
+**Status:** accepted, 19 Nov 2026 (the owner: "Accept and close"), as amended after M12's exit review. Proposed
+the same day. M12 is item A of ADR-0089 (the owner: "A: the long tail"); archive classes are
 refused (the owner's choice).
 
 ## Context
@@ -8,7 +9,7 @@ refused (the owner's choice).
 ADR-0089 lists what a client meets refused today, and one thing silently dropped: `x-amz-storage-class` on a general
 purpose bucket. Each item below is small, and each becomes a row of the support matrix, tested in the SDK matrix.
 
-## Decision (proposed)
+## Decision
 
 1. **Storage classes** (first, as a fix).
    - **Taken:** `STANDARD`, `REDUCED_REDUNDANCY`, `STANDARD_IA`, `ONEZONE_IA`, `INTELLIGENT_TIERING` and `GLACIER_IR`.
