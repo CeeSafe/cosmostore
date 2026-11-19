@@ -3481,3 +3481,19 @@ Browser form uploads with a SigV4 POST policy.
 - **Each SDK's check** (boto3, Go, JavaScript, Java, .NET): the user's key reads such an object, and its writes and
   ListBuckets are AccessDenied. All five pass.
 - **Next:** M11's exit review.
+
+### 19 Nov 2026: M11's exit review (`docs/m11-exit-review.md`)
+
+- **How it was checked:** two reviews by readers who had not written the code, security (six findings reproduced
+  against a server) and conformance with IAM.
+- **Verdict: not yet.**
+  - **A1:** a user writes into any bucket through its own bucket's replication. Also inventory and logging.
+  - **A2:** deleting a user's line makes its keys the account's.
+  - **A3:** a revocation is blocked while the users file names the key.
+  - **A4:** ACL, tagging and object lock headers need only PutObject.
+  - **A5:** an `s3express` ARN grants every bucket.
+  - **A6:** access point policies, a Deny ignored and an Allow ignored.
+  - **B:** directory buckets' `s3express:` actions, user principals never checked, and smaller points.
+- **For the owner:** A2 and A3 need a rule. Either (a) the users file names the account's keys and any other key is
+  refused, or (b) a reload that leaves a user's key unnamed is refused, and a removed key revoked.
+- **Next:** the owner's rule, then the fixes.
