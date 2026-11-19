@@ -236,6 +236,47 @@ fn pointsOf(store: borrow ObjectStore, bucket: Slice<u8>) -> Result<Vector<Acces
 /// `/v20180820/accesspoint[/<name>[/policy]]` with `x-amz-account-id` (ADR-0076 §1). Long-term keys and their
 /// `GetSessionToken` sessions only. On a cluster (ADR-0078 §5) the front routes each to the bucket's shard, and a
 /// CreateAccessPoint takes the alias the front claimed.
+/// An S3 Control call's action, and its resource as an identity policy names it (`s3ap:<name>`, or `s3:` for a
+/// listing: ADR-0088 §3).
+fn controlAction(
+    req: borrow S3Request,
+    resource: borrow mut Vector<u8>,
+    action: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let path = req.rawPath.view();
+    let m = req.method;
+    if (path == "/v20180820/accesspointfordirectory".bytes()) {
+        resource.extend("s3:".bytes())?;
+        return action.extend("s3express:ListAccessPointsForDirectoryBuckets".bytes());
+    }
+    let base = "/v20180820/accesspoint/".bytes();
+    if (!startsWithBytes(path, base)) {
+        resource.extend("s3:".bytes())?;
+        return action.extend("s3:ListAccessPoints".bytes());
+    }
+    let tail = path[base.length..];
+    let slash = pieceEnd(tail, 0, '/');
+    resource.extend("s3ap:".bytes())?;
+    resource.extend(tail[0..slash])?;
+    let what = tail[slash..];
+    let put = isMethod(m, Method.Put);
+    let delete = isMethod(m, Method.Delete);
+    if (what == "/policy".bytes()) {
+        let name =
+            if (put) "s3:PutAccessPointPolicy"
+                else if (delete) "s3:DeleteAccessPointPolicy"
+                else "s3:GetAccessPointPolicy";
+        return action.extend(name.bytes());
+    }
+    if (what == "/scope".bytes()) {
+        let name = if (put) "s3express:PutAccessPointScope" else if (delete) "s3express:DeleteAccessPointScope"
+            else "s3express:GetAccessPointScope";
+        return action.extend(name.bytes());
+    }
+    let name = if (put) "s3:CreateAccessPoint" else if (delete) "s3:DeleteAccessPoint" else "s3:GetAccessPoint";
+    return action.extend(name.bytes());
+}
+
 async fn serveControl(
     app: borrow S3App,
     req: borrow S3Request,
@@ -250,6 +291,14 @@ async fn serveControl(
         if (c < '0' || c > '9') { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
     }
     let path = req.rawPath.view();
+    // A user may make only the calls its identity policy allows (ADR-0088 §2): S3 Control has no resource policy here.
+    if (userOfRequester(app.credentials.get().view(), who).isSome()) {
+        var resource = Vector<u8>.create();
+        var action = Vector<u8>.create();
+        controlAction(req, mut resource, mut action)?;
+        let named = StringView.fromUtf8(action.view()) ?? "";
+        if (!sessionAllows(app, req, who, named, resource.view())?) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
+    }
     // ListAccessPointsForDirectoryBuckets (ADR-0082 §2).
     if (path == "/v20180820/accesspointfordirectory".bytes()) {
         if (!isMethod(req.method, Method.Get)) { return Err(S3Fail.Code(S3Code.MethodNotAllowed)); }

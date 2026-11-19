@@ -1,0 +1,140 @@
+// Users (ADR-0088): the users file, its users given to keys, the identity policy grammar of every service, and
+// resource policies that name a user.
+import web_core;
+import web_http;
+import web_server;
+
+fn usersKey(key: StringView) -> Credential => Credential {
+    accessKey: copyBytes(key.bytes())!,
+    secret: copyBytes("secret".bytes())!,
+    signing: SigningKeyCache.create(),
+    revoked: false,
+    user: Vector<u8>.create(),
+    policyText: Vector<u8>.create(),
+    policy: null,
+};
+
+const READER_POLICY: StringView =
+    "{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:ListBucket\"],\"Resource\":[\"arn:aws:s3:::photos\",\"arn:aws:s3:::photos/*\"]}}";
+
+@test
+fn usersFileAndKeys() -> Result<void, TestFailure> {
+    var text = String.create();
+    text.append("# who may do what\n\nreader AKIAREADER1,AKIAREADER2 ")!;
+    text.append(READER_POLICY)!;
+    text.append("\n")!;
+    let users = parseUsersFile(text.bytes())!;
+    Check.equalU64(1, users.length as u64)?;
+    Check.equalU64(2, users[0].keys.length as u64)?;
+    for (bad in [
+        "reader",
+        "reader AKIA1",
+        "bad/name AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
+        "reader AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
+        "reader AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"ec2:*\",\"Resource\":\"*\"}}",
+        "reader AKIA1, {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
+    ]) {
+        Check.isTrue(parseUsersFile(bad.bytes()).isErr(), bad)?;
+    }
+    var twice = String.create();
+    twice.append("a AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}\n")!;
+    twice.append("a AKIA2 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}\n")!;
+    Check.isTrue(parseUsersFile(twice.bytes()).isErr(), "a user named twice")?;
+    // Given to keys: the reader's two; the account's key stays the account's.
+    var set = Vector<Credential>.create();
+    for (k in ["AKIAACCOUNT", "AKIAREADER1", "AKIAREADER2"]) { set.push(usersKey(k))!; }
+    applyUsers(mut set, users.view())!;
+    Check.equalU64(0, set[0].user.length as u64)?;
+    Check.equalBytes("reader".bytes(), set[1].user.view())?;
+    Check.isTrue(set[2].policy.isSome(), "its policy, parsed")?;
+    // A key the credentials do not have, or two users naming one key: the file is refused.
+    var short = Vector<Credential>.create();
+    short.push(usersKey("AKIAREADER1"))!;
+    Check.isTrue(applyUsers(mut short, users.view()).isErr(), "a key not there")?;
+    var both = String.create();
+    both.append("a AKIAREADER1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}\n")!;
+    both.append("b AKIAREADER1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}\n")!;
+    let two = parseUsersFile(both.bytes())!;
+    Check.isTrue(applyUsers(mut set, two.view()).isErr(), "a key of two users")?;
+    return Ok();
+}
+
+fn identityDecides(policy: StringView, action: StringView, resource: StringView) -> Vector<u8> {
+    let p = parseIdentityPolicy(policy.bytes())!;
+    let req = bareRequest();
+    let facts = policyFacts(borrow req, false, false, null)!;
+    return copyBytes(decisionName(decidePolicy(borrow p, null, action, resource.bytes(), borrow facts)).bytes())!;
+}
+
+@test
+fn identityPoliciesOfEveryService() -> Result<void, TestFailure> {
+    // S3: objects of one bucket.
+    Check.equalBytes("allow".bytes(), identityDecides(READER_POLICY, "s3:GetObject", "s3:photos/a.jpg").view())?;
+    Check.equalBytes("neither".bytes(), identityDecides(READER_POLICY, "s3:GetObject", "s3:other/a.jpg").view())?;
+    Check.equalBytes("neither".bytes(), identityDecides(READER_POLICY, "s3:PutObject", "s3:photos/a.jpg").view())?;
+    // S3 Tables, a role, an access point: each its own namespace (ADR-0088 §3).
+    let tables =
+        "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3tables:*\",\"Resource\":\"arn:aws:s3tables:*:*:bucket/sales/table/*\"},{\"Effect\":\"Allow\",\"Action\":\"sts:AssumeRole\",\"Resource\":\"arn:aws:iam::000000000000:role/reader\"},{\"Effect\":\"Allow\",\"Action\":\"s3:GetAccessPoint\",\"Resource\":\"arn:aws:s3:us-east-1:000000000000:accesspoint/door\"}]}";
+    Check.equalBytes("allow".bytes(), identityDecides(tables, "s3tables:GetTable", "s3tables:sales/table/x").view())?;
+    Check.equalBytes("neither".bytes(), identityDecides(tables, "s3tables:GetTable", "s3tables:other/table/x").view())?;
+    Check.equalBytes("allow".bytes(), identityDecides(tables, "sts:AssumeRole", "iam:role/reader").view())?;
+    Check.equalBytes("neither".bytes(), identityDecides(tables, "sts:AssumeRole", "iam:role/admin").view())?;
+    Check.equalBytes("allow".bytes(), identityDecides(tables, "s3:GetAccessPoint", "s3ap:door").view())?;
+    // A bucket named `accesspoint` is not an access point's namespace.
+    Check.equalBytes("neither".bytes(), identityDecides(tables, "s3:GetAccessPoint", "s3:accesspoint/door").view())?;
+    // Another service's action or ARN is not taken.
+    for (bad in [
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"ec2:RunInstances\",\"Resource\":\"*\"}}",
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:ec2:::x\"}}",
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:iam::0:user/x\"}}",
+    ]) {
+        Check.isTrue(parseIdentityPolicy(bad.bytes()).isErr(), bad)?;
+    }
+    return Ok();
+}
+
+@test
+fn resourcePoliciesNameUsers() -> Result<void, TestFailure> {
+    let none = Vector<Credential>.create();
+    let doc =
+        "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:user/reader\"},\"Action\":\"s3:PutObject\",\"Resource\":\"arn:aws:s3:::photos/*\"},{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:user/intern\"},\"Action\":\"s3:*\",\"Resource\":\"arn:aws:s3:::photos/*\"}]}";
+    let p = parseBucketPolicy(doc.bytes(), "photos".bytes(), none.view(), false)!;
+    let req = bareRequest();
+    let facts = policyFacts(borrow req, false, false, null)!;
+    Check.equalBytes(
+        "allow".bytes(),
+        decisionName(
+            decidePolicyFor(
+                borrow p,
+                Some("AKIA1".bytes()),
+                Some("reader".bytes()),
+                "s3:PutObject",
+                "photos/a".bytes(),
+                borrow facts,
+            ),
+        ).bytes(),
+    )?;
+    Check.equalBytes(
+        "deny".bytes(),
+        decisionName(
+            decidePolicyFor(
+                borrow p,
+                Some("AKIA2".bytes()),
+                Some("intern".bytes()),
+                "s3:GetObject",
+                "photos/a".bytes(),
+                borrow facts,
+            ),
+        ).bytes(),
+    )?;
+    Check.equalBytes(
+        "neither".bytes(),
+        decisionName(
+            decidePolicyFor(borrow p, Some("AKIA3".bytes()), null, "s3:PutObject", "photos/a".bytes(), borrow facts),
+        ).bytes(),
+    )?;
+    let bad =
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::0:user/bad/name\"},\"Action\":\"s3:*\",\"Resource\":\"arn:aws:s3:::photos/*\"}}";
+    Check.isTrue(parseBucketPolicy(bad.bytes(), "photos".bytes(), none.view(), false).isErr(), "a name not a user's")?;
+    return Ok();
+}

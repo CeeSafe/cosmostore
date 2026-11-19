@@ -67,6 +67,10 @@ struct Rotation {
     sets: Arc<CredentialSets>;
     path: String;
     modified: i64;
+    /// The users file (`--users-file`, ADR-0088 §1), empty for none, and when it was last seen modified: a change to
+    /// either file reloads both.
+    usersPath: String;
+    usersModified: i64;
     /// The modification time of a file that did not read: it is tried again each round, and reported once.
     failed: i64;
 }
@@ -85,7 +89,11 @@ fn checkCredentials(r: borrow mut Rotation) -> RotationOutcome {
         Ok(m) => m,
         Err(_) => r.modified,
     };
-    if (modified == r.modified) { return RotationOutcome.Unchanged; }
+    let usersModified = if (r.usersPath.length == 0) 0 else match (Fs.modifiedMillis(r.usersPath.view())) {
+        Ok(m) => m,
+        Err(_) => r.usersModified,
+    };
+    if (modified == r.modified && usersModified == r.usersModified) { return RotationOutcome.Unchanged; }
     let fresh = match (readCredentials(r.path.view())) {
         Ok(f) => f,
         Err(message) => {
@@ -95,12 +103,33 @@ fn checkCredentials(r: borrow mut Rotation) -> RotationOutcome {
             return RotationOutcome.Failed(message);
         }
     };
-    r.modified = modified; // seen: a file that is the same keys, or a set that cannot be taken, is not read again
     let old = r.sets.get().view();
-    let next = match (nextCredentials(old, fresh.view())) {
+    var next = match (nextCredentials(old, fresh.view())) {
         Ok(n) => n,
         Err(_) => { return RotationOutcome.Failed(textOf("out of memory")); }
     };
+    // The users file, applied to the new set: one that does not read, or names a key the set does not accept,
+    // changes nothing, as a credentials file that does not read (ADR-0088 §1).
+    if (r.usersPath.length > 0) {
+        let users = match (readUsers(r.usersPath.view())) {
+            Ok(u) => u,
+            Err(message) => {
+                if (usersModified == r.failed) { return RotationOutcome.Unchanged; }
+                r.failed = usersModified;
+                return RotationOutcome.Failed(message);
+            }
+        };
+        match (applyUsers(mut next, users.view())) {
+            Ok() => {}
+            Err(message) => {
+                if (usersModified == r.failed) { return RotationOutcome.Unchanged; }
+                r.failed = usersModified;
+                return RotationOutcome.Failed(message);
+            }
+        }
+    }
+    r.modified = modified; // seen: a file that is the same keys, or a set that cannot be taken, is not read again
+    r.usersModified = usersModified;
     if (sameCredentials(old, next.view())) { return RotationOutcome.Unchanged; }
     var live: u64 = 0;
     var revoked: u64 = 0;
@@ -168,6 +197,17 @@ fn readSseKeys(path: StringView) -> Result<Vector<MasterKey>, String> {
             KeyFileFault.OutOfMemory => "out of memory",
         })),
     };
+}
+
+/// Reads the credentials file, and the users file when one is named (`usersPath` empty for none), its users applied
+/// to the keys (ADR-0088 §1).
+fn readCredentialsWithUsers(path: StringView, usersPath: StringView) -> Result<Vector<Credential>, String> {
+    var creds = readCredentials(path)?;
+    if (usersPath.length > 0) {
+        let users = readUsers(usersPath)?;
+        applyUsers(mut creds, users.view())?;
+    }
+    return Ok(creds);
 }
 
 fn readCredentials(path: StringView) -> Result<Vector<Credential>, String> {
@@ -837,6 +877,7 @@ fn serve() -> i32 {
     var stsKeysAt: usize = 0;
     var replicationTargetsAt: usize = 0;
     var rolesAt: usize = 0;
+    var usersAt: usize = 0;
     var perAddress: u64 = 0;
     var perKey: u64 = 0;
     var storeConfig = StoreConfig.defaults();
@@ -923,6 +964,9 @@ fn serve() -> i32 {
             replicationTargetsAt = at + 1;
         } else if (option == "--roles-file") {
             rolesAt = at + 1;
+        } else if (option == "--users-file") {
+            // Users, their keys and their identity policies (ADR-0088 §1).
+            usersAt = at + 1;
         } else if (option == "--rate-limit-address" || option == "--rate-limit-key") {
             match (value.parseInt<u64>()) {
                 Some(n) => {
@@ -951,7 +995,8 @@ fn serve() -> i32 {
         Some(a) => a,
         null => { usage(); }
     };
-    let firstCredentials = match (readCredentials(credentialsPath)) {
+    let usersPath = Process.argument(usersAt) ?? "";
+    let firstCredentials = match (readCredentialsWithUsers(credentialsPath, if (usersAt == 0) "" else usersPath)) {
         Ok(c) => c,
         Err(message) => { die(message.view()); }
     };
@@ -971,6 +1016,11 @@ fn serve() -> i32 {
             Err(_) => 0,
         },
         failed: 0,
+        usersPath: textOf(if (usersAt == 0) "" else usersPath),
+        usersModified: if (usersAt == 0) 0 else match (Fs.modifiedMillis(usersPath)) {
+            Ok(m) => m,
+            Err(_) => 0,
+        },
     };
     // The webhooks of event notifications (ADR-0048): once for the requests, once for the delivery task.
     let notifyTargets = readTargets(Process.argument(targetsAt) ?? "", targetsAt != 0);

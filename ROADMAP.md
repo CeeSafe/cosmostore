@@ -3419,3 +3419,28 @@ Browser form uploads with a SigV4 POST policy.
   3. the cluster;
   4. the SDK matrix and the exit review.
 - **Next:** slice 1.
+
+### 19 Nov 2026: M11 slice 1, users and S3's decision (ADR-0088 §1 to §3)
+
+- **The users file** (`serve --users-file`): each user's name, its keys and its identity policy.
+  - It is reloaded with the credentials file whenever either changes. A file that does not read, or names a key the
+    credentials do not have, changes nothing and is reported.
+  - Each key's place in the credential set carries its user and parsed policy. A key no user names is the
+    account's, as before.
+- **The decision for a user, as IAM's in one account:**
+  - A Deny in its identity policy, or in the bucket's or access point's policy, refuses.
+  - Otherwise an Allow in either allows: the resource policy's by the user's ARN, its key or `*`. Otherwise the
+    request is refused.
+  - **Calls with no resource policy** are decided by the identity policy alone: ListBuckets, CreateBucket,
+    ListDirectoryBuckets, and S3 Control's access point calls (each its own action, the access point
+    `s3ap:<name>`).
+  - **The policy calls** are a user's only by an Allow. The stats endpoint and admin API refuse users.
+- **The identity grammar** (roles' and users'):
+  - Actions of `s3:`, `s3express:`, `s3tables:` and `sts:`.
+  - Resources kept as `s3:`, `s3ap:`, `s3tables:` or `iam:` and their tail, any region and account.
+  - Resource policies name users (`arn:aws:iam::<account>:user/<name>`).
+- **Tests:** `usersFileAndKeys`, `identityPoliciesOfEveryService` and `resourcePoliciesNameUsers`; 376 in all.
+  - **The S3 smoke's users server**, 12 checks: a reader refused another bucket, writes, ListBuckets, CreateBucket
+    and policy calls. A bucket's Allow lets it write an inbox, and its Deny beats a user's Allow. The account's key
+    is not narrowed, and a reload of the users file takes effect.
+- **Next:** slice 2, S3 Tables and STS.

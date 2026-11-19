@@ -8,7 +8,7 @@ bin=$(cd "$(dirname "${1:-out/cosmostore}")" && pwd)/$(basename "${1:-out/cosmos
 port=${2:-9311}
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
-trap 'kill "$server" "$hook" "${limited:-}" "${remote:-}" "${maint:-}" 2>/dev/null; rm -rf "$work"' EXIT
+trap 'kill "$server" "$hook" "${limited:-}" "${remote:-}" "${maint:-}" "${usersrv:-}" 2>/dev/null; rm -rf "$work"' EXIT
 
 export AWS_ACCESS_KEY_ID=AKIASMOKETEST0000001
 export AWS_SECRET_ACCESS_KEY=smoke/secret/0123456789abcdefghijkl
@@ -1286,6 +1286,45 @@ if [ -n "${ICEBERG_PYTHON:-}" ]; then
     fi
     kill "$maint" 2>/dev/null
 fi
+
+# Users (ADR-0088): a server of its own with a users file, so the rotation checks above keep their own file.
+usersport=$((port + 6))
+printf '%s\n' "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" "AKIAUSERREADER000001 reader/secret/0123456789abcdefgh" \
+    "AKIAUSERINTERN000001 intern/secret/0123456789abcdefgh" > "$work/users.credentials"
+cat > "$work/users.file" <<'USERS'
+# Each user: its name, its keys, its identity policy.
+reader AKIAUSERREADER000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
+intern AKIAUSERINTERN000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
+USERS
+"$bin" serve "$work/users-store" "$usersport" "$work/users.credentials" localhost --users-file "$work/users.file" --maintain-seconds 2 2>> "$work/users.log" &
+usersrv=$!
+sleep 1
+ua() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" aws "$@"; }
+ur() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" AWS_ACCESS_KEY_ID=AKIAUSERREADER000001 AWS_SECRET_ACCESS_KEY=reader/secret/0123456789abcdefgh aws "$@"; }
+ui() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" AWS_ACCESS_KEY_ID=AKIAUSERINTERN000001 AWS_SECRET_ACCESS_KEY=intern/secret/0123456789abcdefgh aws "$@"; }
+ucode() { "$@" 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9]*\)).*/\1/p' | head -1; }
+ua s3api create-bucket --bucket team > /dev/null 2>&1
+ua s3api create-bucket --bucket other > /dev/null 2>&1
+ua s3api put-object --bucket team --key a.txt --body dir.txt > /dev/null 2>&1
+ua s3api put-object --bucket other --key b.txt --body dir.txt > /dev/null 2>&1
+ur s3api get-object --bucket team --key a.txt users.out > /dev/null 2>&1 && pass "a user reads what its policy allows" || fail "a user reads what its policy allows"
+check "not another bucket" "$(ucode ur s3api get-object --bucket other --key b.txt users.out)" AccessDenied
+check "nor writes" "$(ucode ur s3api put-object --bucket team --key c.txt --body dir.txt)" AccessDenied
+check "nor lists every bucket" "$(ucode ur s3api list-buckets)" AccessDenied
+check "nor makes a bucket" "$(ucode ur s3api create-bucket --bucket mine)" AccessDenied
+check "nor reads the bucket's policy" "$(ucode ur s3api get-bucket-policy --bucket team)" AccessDenied
+# The bucket's policy names users: its Allow lets the reader write an inbox; its Deny refuses the intern's deletes.
+ua s3api put-bucket-policy --bucket team --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/reader"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::team/inbox/*"},{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::000000000000:user/intern"},"Action":"s3:DeleteObject","Resource":"arn:aws:s3:::team/*"}]}' > /dev/null 2>&1
+ur s3api put-object --bucket team --key inbox/x.txt --body dir.txt > /dev/null 2>&1 && pass "the bucket's Allow lets a user write" || fail "the bucket's Allow lets a user write"
+check "the bucket's Deny wins over the user's Allow" "$(ucode ui s3api delete-object --bucket team --key a.txt)" AccessDenied
+ui s3api put-object --bucket team --key i.txt --body dir.txt > /dev/null 2>&1 && pass "the user's Allow does the rest" || fail "the user's Allow does the rest"
+check "the account's key is not narrowed" "$(ua s3api list-buckets --query 'length(Buckets)')" 2
+# The users file is reloaded with the credentials: the reader may now read the other bucket too.
+sed -i.bak 's#"arn:aws:s3:::team/\*"\]}}$#"arn:aws:s3:::team/*","arn:aws:s3:::other/*"]}}#' "$work/users.file"
+sleep 4
+ur s3api get-object --bucket other --key b.txt users.out > /dev/null 2>&1 && pass "a users file reloaded" || fail "a users file reloaded"
+check "its reload in the log" "$(grep -c 'credentials reloaded' "$work/users.log")" 1
+kill "$usersrv" 2>/dev/null
 
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1
