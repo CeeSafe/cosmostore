@@ -3538,3 +3538,17 @@ Browser form uploads with a SigV4 POST policy.
     (`<name>:<id>`);
   - replication, inventory and logging configurations users set before the fixes should be put again.
 - **Next:** M12, when the owner asks for one.
+
+### 19 Nov 2026: M12 proposed (ADR-0089)
+
+- **The owner:** "Continue to M12". ADR-0089 (proposed) gives three candidates, one to be M12:
+  - **A, the long tail** (recommended): storage classes, lifecycle transitions, ListMultipartUploads' `delimiter`,
+    SHA-1 checksums, a POST form's object lock fields, SSE-KMS's encryption context.
+  - **B, configurations decided at delivery:** replication, inventory and logging writes authorized as whoever put
+    them, at each write.
+  - **C, compaction for S3 Tables.**
+- **Found while writing it:** `x-amz-storage-class` on a general purpose bucket is accepted and dropped
+  (`GLACIER` answers 200). ADR-0089 asks to fix it now, whatever M12 is.
+- **CI:** `2a7fd1a`'s check failed in the S3 smoke's webhook retry section, which passed locally on the same code;
+  `490dd81` and `e0fb06c` were still running.
+- **Next:** the owner's choice.
