@@ -27,10 +27,13 @@
      nothing and is reported once, in the node's log, as on `serve`.
    - **What it reaches:** every shard's S3 server and the front read the same set, so one reload reaches all of a
      node's requests.
-   - **During a rollout:** each node decides the requests it receives by its own files, so the operator copies the
-     files to every node. While they differ, a request is decided by the files of the node it reaches. The front's
-     merged calls (ListBuckets and the like) are decided by the shards that answer them, each with its own node's
-     files.
+   - **During a rollout** (amended after M13's exit review, A1):
+     - **Two nodes check a request:** the node it reaches checks its key against its own set at the front, and the
+       node leading its shard checks it again in that shard's S3 server.
+     - **A key passes only if both know it:** a key removed from one node's file is refused through that node on
+       every shard, and on every shard that node leads, whichever node a request reaches.
+     - **A revocation needs every node's file:** it holds everywhere once every node has reloaded.
+     - **Sessions:** a session's request (STS's, S3 Express's) is checked by its parent, at the shard.
 2. **SSE's keys on a node:** `node --sse-key-file` and `node --kms-key-file`, as `serve`'s (ADR-0046, ADR-0055).
    - **Where they go:** every shard's S3 server seals and opens with them, and the delivery task opens sealed
      sources with them (replication, ADR-0078 §4).
@@ -41,8 +44,15 @@
      - **At start:** a node checks nothing against the others; ADR-0062's roster carries no keys.
    - **A replica on a cluster** (found while building §2): replication goes through the node's own front, a sealed
      source as its plaintext, marked SSE-S3. The receiving shard now seals it with SSE-S3, whose ETag is the
-     plaintext's MD5, as the source's (ADR-0078 §4 refused it while nodes had no keys). A destination bucket whose
-     default is SSE-KMS still refuses a replica, which reads FAILED: an SSE-KMS ETag would not be its source's.
+     plaintext's MD5, as the source's (ADR-0078 §4 refused it while nodes had no keys).
+     - **Refused, FAILED** (amended after M13's exit review, A2), through the cluster's own front:
+       - an SSE-KMS source, whose replica could not keep its encryption and ETag;
+       - a replica into a bucket whose default is SSE-KMS, single PUT or multipart.
+
+       To another endpoint, an SSE-KMS source's plaintext goes as before, sealed there by that endpoint's keys
+       (ADR-0077 §6).
+     - **Tried again** (A3), and logged: a replica the cluster's own front answers 401 or 403, and a sealed source
+       whose master key the delivering node has not, as a file not yet copied to every node.
    - **Not reloaded:** like `serve`'s, the key files are read at start. A new master key is a restart, as on
      `serve` (ADR-0046 §4).
 3. **Checked on a cluster:**

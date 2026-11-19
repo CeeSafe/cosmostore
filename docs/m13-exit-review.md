@@ -83,3 +83,16 @@ Checked and right:
   - on a timeout, try the batch again.
 
 Closing M13 and accepting ADR-0092 are the owner's decisions.
+
+## The fixes (20 Nov 2026)
+
+| Finding | Fix | Shown by |
+|---|---|---|
+| A1 | the front checks a request's access key against its own node's set (`frontKeyAccepted`): unknown or revoked is InvalidAccessKeyId, before it is forwarded; a session's request is checked at the shard, by its parent | the reviewer's repro: a key revoked in node 1's file only is refused through node 1 on all 8 shards |
+| A2 | an SSE-KMS source is refused up front and logged, through the cluster's own front (to another endpoint it goes as before, ADR-0077 §6); a replica's multipart upload completing as its source's version is refused when it would seal with SSE-KMS or SSE-C | the repro: SSE-KMS sources and replicas into an SSE-KMS default read FAILED; SSE-S3 ones COMPLETED with their source's ETag |
+| A3 | the cluster's own front answering 401 or 403, or a master key the delivering node has not: tried again, and logged | (by reading) |
+| A4 | before noting a refusal, every earlier entry applied (as a write waits); a noted refusal not applied in time is tried again, not reported done | the cluster smoke's two refusals in one batch |
+
+**Found while fixing:** a replica's CompleteMultipartUpload that answered a 4xx was tried for ever. The check for
+S3's "200 with an error in its body" matched any error body, and held the shard's whole delivery behind it. Only a
+200 is now read that way. This predates M13, and the repro showed it: three replicas PENDING after 40 s.

@@ -185,6 +185,16 @@ async fn replicateOnCluster(
         Err(_) => { return Err(NodeFault.Net); }
     };
     let _held = gate.data();
+    // Every earlier entry applied first, as a write waits (ADR-0060 §5): noting reads the list of failures, which an
+    // entry still in flight may change (the M13 exit review's A4). Not applied in time: tried again.
+    var before = 0u64;
+    while (true) {
+        let v = await viewOf(slot)?;
+        if (!v.leads) { return Ok(false); }
+        if (v.applied == v.last && v.coreLast == v.last) { break; }
+        if (before >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(false); }
+        before += FRONT_POLL_MS;
+    }
     {
         var guard = match (await slot.store.get().lock()) {
             Ok(g) => g,
@@ -206,11 +216,14 @@ async fn replicateOnCluster(
     var waited = 0u64;
     while (true) {
         let v = await viewOf(slot)?;
-        if (v.applied >= proposed.last || !v.leads || v.term != proposed.term) { break; }
-        if (waited >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { break; }
+        if (v.applied >= proposed.last) { return Ok(true); }
+        // Lost the lead, or not applied in time: the batch is tried again, and noting again is harmless (the list
+        // holds a version once), where reporting it done would let the next refusal drop it (A4).
+        if (!v.leads || v.term != proposed.term) { return Ok(false); }
+        if (waited >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(false); }
         waited += FRONT_POLL_MS;
     }
-    return Ok(true);
+    return Ok(false);
 }
 
 struct DeliveredBatch {

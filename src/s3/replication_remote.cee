@@ -289,6 +289,13 @@ enum RemoteOutcome {
     Refused,
 }
 
+/// `outcomeOf`, but a 401 or 403 of the cluster's own front is tried again (the M13 exit review's A3): its node may
+/// not have this node's key yet, during a rotation, and a refusal would be for good.
+fn outcomeFor(t: borrow ReplicationTarget, status: u16) -> RemoteOutcome {
+    if (t.id.view() == "self".bytes() && (status == 401 || status == 403)) { return RemoteOutcome.Again; }
+    return outcomeOf(status);
+}
+
 fn outcomeOf(status: u16) -> RemoteOutcome {
     if (status >= 200 && status < 300) { return RemoteOutcome.Done; }
     if (status == 0 || status >= 500 || status == 429 || status == 408) { return RemoteOutcome.Again; }
@@ -432,7 +439,7 @@ async fn sendRemote(
             if (!added) { return RemoteOutcome.Again; }
         }
         return match (await remoteCall(client, t, Method.Delete, path.view(), "".bytes(), extra.view(), mut none)) {
-            Ok(a) => outcomeOf(a.status),
+            Ok(a) => outcomeFor(t, a.status),
             Err(_) => RemoteOutcome.Again,
         };
     }
@@ -494,10 +501,28 @@ async fn sendRemote(
     match (envelope) {
         Some(field) => {
             if (isCustomerEnvelope(field)) { return RemoteOutcome.Refused; }
+            // An SSE-KMS source is not replicated through the cluster's own front, where a replica keeps its source's
+            // version and ETag (fidelity): sealed otherwise there, it could keep neither its encryption nor its ETag
+            // (the M13 exit review's A2). It reads FAILED. To another endpoint, its plaintext goes as before, sealed
+            // there by that endpoint's own keys (ADR-0077 §6).
+            if (fidelity && isKmsEnvelope(field)) {
+                let _ = await AsyncConsole.writeError("cosmostore: an SSE-KMS source is not replicated on a cluster\n");
+                return RemoteOutcome.Refused;
+            }
             let keys = if (isKmsEnvelope(field)) ctx.kmsKeys.view() else ctx.sseKeys.view();
             var dataKey = match (managedDataKey(keys, field)) {
                 Ok(k) => k,
-                Err(_) => { return RemoteOutcome.Refused; }
+                Err(_) => {
+                    // A master key this node has not: on the cluster's own front, perhaps a key file not yet copied
+                    // here; tried again rather than FAILED (A3).
+                    if (t.id.view() == "self".bytes()) {
+                        let _ = await AsyncConsole.writeError(
+                            "cosmostore: a sealed source's master key is not in this node's key file; trying again\n",
+                        );
+                        return RemoteOutcome.Again;
+                    }
+                    return RemoteOutcome.Refused;
+                }
             };
             stream = if (v.parts == 0) SseStream.single(borrow dataKey, v.size, 0) else match (SseStream.multipart(
                 borrow dataKey,
@@ -535,7 +560,7 @@ async fn sendRemote(
         if (!fidelityHeaders(borrow v, mut headers)) { return RemoteOutcome.Again; }
         body.left = v.size;
         return match (await remoteCall(client, t, Method.Put, path.view(), "".bytes(), headers.view(), mut body)) {
-            Ok(a) => if (body.broken) RemoteOutcome.Again else outcomeOf(a.status),
+            Ok(a) => if (body.broken) RemoteOutcome.Again else outcomeFor(t, a.status),
             Err(_) => RemoteOutcome.Again,
         };
     }
@@ -543,7 +568,7 @@ async fn sendRemote(
     if (v.parts == 0 || extras.partSizes.length != v.parts as usize) {
         body.left = v.size;
         return match (await remoteCall(client, t, Method.Put, path.view(), "".bytes(), headers.view(), mut body)) {
-            Ok(a) => if (body.broken) RemoteOutcome.Again else outcomeOf(a.status),
+            Ok(a) => if (body.broken) RemoteOutcome.Again else outcomeFor(t, a.status),
             Err(_) => RemoteOutcome.Again,
         };
     }
@@ -560,7 +585,7 @@ async fn sendRemote(
         Ok(a) => a,
         Err(_) => { return RemoteOutcome.Again; }
     };
-    match (outcomeOf(created.status)) {
+    match (outcomeFor(t, created.status)) {
         RemoteOutcome.Done => {}
         other => { return other; }
     }
@@ -602,7 +627,7 @@ async fn sendRemote(
                 break;
             }
         };
-        let o = if (body.broken) RemoteOutcome.Again else outcomeOf(sent.status);
+        let o = if (body.broken) RemoteOutcome.Again else outcomeFor(t, sent.status);
         match (o) {
             RemoteOutcome.Done => {}
             other => {
@@ -659,7 +684,13 @@ async fn sendRemote(
         Ok(a) => a,
         Err(_) => { return RemoteOutcome.Again; }
     };
-    // CompleteMultipartUpload may answer 200 with an error in its body.
-    if (findBytes(done.body.view(), "<Error>".bytes(), 0).isSome()) { return RemoteOutcome.Again; }
-    return outcomeOf(done.status);
+    // CompleteMultipartUpload may answer 200 with an error in its body: tried again. An error status is what it says:
+    // a 4xx refusal is FAILED, not tried for ever (which held the shard's whole delivery behind it; found with M13's
+    // exit review).
+    if (done.status == 200 && findBytes(
+        done.body.view(),
+        "<Error>".bytes(),
+        0,
+    ).isSome()) { return RemoteOutcome.Again; }
+    return outcomeFor(t, done.status);
 }

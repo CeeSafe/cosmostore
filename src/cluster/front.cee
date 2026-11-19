@@ -1038,6 +1038,62 @@ struct FrontApp {
 struct FrontHandler {}
 
 /// An S3 error answer the front makes itself (no leader, no such operation on a cluster).
+/// A raw message's header, by name, ignoring case.
+fn rawField<region a>(m: borrow(a) RawMessage, name: StringView) -> Slice<a, u8>? {
+    for (i in 0..m.names.length) {
+        if (Ascii.equalsIgnoringCase(m.names[i].view(), name)) { return Some(m.values[i].view()); }
+    }
+    return null;
+}
+
+/// Whether this node's credentials accept the long-term key a request is signed with (the M13 exit review's A1). An
+/// anonymous request, a session's (STS's or S3 Express's, whose parent the shard checks) and a node without S3 pass;
+/// a key this node does not have, or has revoked, does not.
+fn frontKeyAccepted(shared: borrow NodeShared, raw: borrow RawMessage) -> bool {
+    let sets = match (borrow shared.credentials) {
+        Some(c) => c,
+        null => { return true; }
+    };
+    if (rawField(raw, "x-amz-security-token").isSome() || rawField(raw, "x-amz-s3session-token").isSome()) {
+        return true;
+    }
+    let t = raw.target.view();
+    let q = indexOfFrom(t, "?".bytes(), 0) ?? t.length;
+    let query = if (q < t.length) t[q + 1..] else t[t.length..];
+    if (indexOfFrom(query, "X-Amz-Security-Token=".bytes(), 0).isSome()) { return true; }
+    var key = Vector<u8>.create();
+    match (rawField(raw, "authorization")) {
+        Some(a) => {
+            match (parseAuthorization(a)) {
+                Ok(h) => {
+                    if (key.extend(h.accessKey.view()).isErr()) { return false; }
+                }
+                Err(_) => { return true; } // not SigV4: the shard answers it
+            }
+        }
+        null => {
+            // A presigned URL's credential: `X-Amz-Credential=<key>%2F<scope>`.
+            let name = "X-Amz-Credential=".bytes();
+            match (indexOfFrom(query, name, 0)) {
+                Some(at) => {
+                    let from = at + name.length;
+                    var end = from;
+                    while (end < query.length && query[end] != '&' && query[end] != '%' && query[end] != '/') {
+                        end += 1;
+                    }
+                    if (key.extend(query[from..end]).isErr()) { return false; }
+                }
+                null => { return true; } // anonymous, or a POST form's (its fields are in the body)
+            }
+        }
+    }
+    let set = sets.get().view();
+    for (i in 0..set.length) {
+        if (!set[i].revoked && sameSignature(set[i].accessKey.view(), key.view())) { return true; }
+    }
+    return false;
+}
+
 fn frontError(code: StringView, status: u16) -> RawMessage {
     var m = statusOnly(status);
     var xml = Vector<u8>.create();
@@ -1108,6 +1164,12 @@ impl Handler<FrontApp> for FrontHandler {
             )) || Ascii.equalsIgnoringCase(name, LOG_DELIVERY_FIELD));
             if (!signedField && name.length >= 8 && Ascii.equalsIgnoringCase(name[0..8], "x-cosmo-")) { continue; }
             if (raw.addHeader(name, fields.value(i)).isErr()) { return Err(HandlerError.Internal); }
+        }
+        // The request's key, checked against this node's own set too (the M13 exit review's A1): the shard's leader,
+        // perhaps on another node, checks it against its own, so a key passes only when both nodes accept it, and a
+        // revocation in this node's file holds through it whichever node leads.
+        if (!frontKeyAccepted(shared, borrow raw)) {
+            return await relay(exchange, frontError("InvalidAccessKeyId", 403), false);
         }
         // The client's address, for the shard's S3 server: its policies' `aws:SourceIp` and its access log lines
         // (ADR-0078 §4) are the client's, not this front's.

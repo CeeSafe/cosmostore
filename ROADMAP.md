@@ -3770,3 +3770,19 @@ Browser form uploads with a SigV4 POST policy.
   - **A3:** files that differ during a rotation turn replicas into a permanent FAILED.
   - **A4:** the two-refusals fix can still lose one after a timeout.
 - **Next:** the fixes.
+
+### 20 Nov 2026: M13's exit review findings fixed
+
+- **A1:** the front checks a request's key against its own node's set, so a key passes only if both nodes know it.
+  The reviewer's repro: a key revoked on node 1 is refused through node 1 on all 8 shards.
+- **A2:** through the cluster's own front:
+  - SSE-KMS sources are refused up front;
+  - a replica's multipart completion that would seal with SSE-KMS or SSE-C is refused.
+
+  Each case now ends as it should: SSE-S3 sources keep their ETag, and the rest read FAILED.
+- **A3:** the own front's 401 and 403, and a missing master key, are tried again.
+- **A4:** noting a refusal waits for earlier entries, and a timeout retries the batch.
+- **Found while fixing (before M13):** a replica's CompleteMultipartUpload answered 4xx was tried for ever, and held
+  the shard's delivery. Only a 200 with an error body is retried now.
+- **Tests:** 387 unit tests, the S3 smoke, the cluster smoke (163) and the SDK matrix pass, and the reviewer's repro
+  on the final build.
