@@ -3653,3 +3653,18 @@ Browser form uploads with a SigV4 POST policy.
 - **The SDK matrix:** every SDK (boto3, Go, JavaScript, Java, .NET) records STANDARD_IA and is refused GLACIER.
   boto3 and JavaScript also put SHA-1 checksums, and boto3 a POST form under a legal hold. All pass.
 - **Next:** M12's exit review.
+
+### 19 Nov 2026: M12's exit review (`docs/m12-exit-review.md`)
+
+- **Verdict: not yet.**
+  - **A1:** one object near the metadata limit stops lifecycle for the whole server (reproduced).
+  - **A3:** lifecycle never runs on a cluster, so a cluster takes transitions and expirations it never applies.
+  - **Smaller:**
+    - directory buckets take transitions;
+    - transitions sync one by one;
+    - the 128 KB transition floor and its header are ignored;
+    - a POST form's checksum fields are ignored;
+    - REDUCED_REDUNDANCY is taken as a transition target;
+    - S3's checks between transitions are missing.
+- **For the owner:** A3. Either (a) lifecycle on each shard's leader, or (b) refused on a cluster until then.
+- **Next:** the fixes.
