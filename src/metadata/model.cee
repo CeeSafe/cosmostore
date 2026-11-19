@@ -335,13 +335,40 @@ fn encodeSetTagsMeta(
 /// (ADR-0045), or its object lock (ADR-0047).
 const SET_ACL_FORMAT: u8 = 2;
 const SET_LOCK_FORMAT: u8 = 3;
+/// A SetTags record that sets a version's storage class (ADR-0090 §2): a lifecycle transition.
+const SET_CLASS_FORMAT: u8 = 4;
+
+/// The storage classes an object may record (ADR-0090 §1), in S3's waterfall order: a transition only moves an
+/// object later in it. STANDARD is not recorded (an empty value).
+const STORED_STORAGE_CLASSES: [StringView; 5] =
+    ["REDUCED_REDUNDANCY", "STANDARD_IA", "INTELLIGENT_TIERING", "ONEZONE_IA", "GLACIER_IR"];
+
+/// Whether a stored class value is one an object may record: empty (STANDARD) or one of STORED_STORAGE_CLASSES.
+fn isStoredClassValue(value: Slice<u8>) -> bool {
+    if (value.length == 0) { return true; }
+    for (c in STORED_STORAGE_CLASSES) {
+        if (c.bytes() == value) { return true; }
+    }
+    return false;
+}
+
+/// A class's place in S3's waterfall: STANDARD and REDUCED_REDUNDANCY 0, then STANDARD_IA, INTELLIGENT_TIERING,
+/// ONEZONE_IA, GLACIER_IR.
+fn storageClassRank(value: Slice<u8>) -> u32 {
+    if (value.length == 0 || value == "STANDARD".bytes() || value == "REDUCED_REDUNDANCY".bytes()) { return 0; }
+    for (i in 1..STORED_STORAGE_CLASSES.length) {
+        if (STORED_STORAGE_CLASSES[i].bytes() == value) { return truncate<u32>(i); }
+    }
+    return 0;
+}
 
 /// The metadata field a SetTags record of `format` sets.
 fn setTagsField(format: u8) -> StringView =>
-    if (format == SET_ACL_FORMAT) ACL_FIELD else if (format == SET_LOCK_FORMAT) LOCK_FIELD else TAGS_FIELD;
+    if (format == SET_ACL_FORMAT) ACL_FIELD else if (format == SET_LOCK_FORMAT) LOCK_FIELD else if (format ==
+        SET_CLASS_FORMAT) STORAGE_CLASS_FIELD else TAGS_FIELD;
 
-/// SetTags meta v2 and v3: as v1 with format 2 or 3, and the last field is the version's ACL, or its object lock,
-/// as it is stored (empty: the private ACL; no lock) in place of its tags.
+/// SetTags meta v2, v3 and v4: as v1 with format 2, 3 or 4, and the last field is the version's ACL, its object lock,
+/// or its storage class, as it is stored (empty: the private ACL; no lock; STANDARD) in place of its tags.
 fn encodeSetFieldMeta(
     out: borrow mut Vector<u8>,
     format: u8,
@@ -375,7 +402,7 @@ fn decodeSetTagsMeta(bytes: Slice<u8>) -> Result<SetTagsMeta, MetaFault> {
     var at: usize = 0;
     need(bytes, at, 1)?;
     let format = bytes[at];
-    if (format == SET_ACL_FORMAT || format == SET_LOCK_FORMAT) {
+    if (format == SET_ACL_FORMAT || format == SET_LOCK_FORMAT || format == SET_CLASS_FORMAT) {
         at += 1;
     } else {
         checkVersion(bytes, mut at)?;
@@ -388,6 +415,7 @@ fn decodeSetTagsMeta(bytes: Slice<u8>) -> Result<SetTagsMeta, MetaFault> {
     if (at != bytes.length) { return Err(MetaFault.TooLong); }
     if (format == SET_ACL_FORMAT && !isAclValue(tags.view())) { return Err(MetaFault.TooLong); }
     if (format == SET_LOCK_FORMAT && decodeLock(tags.view()).isNull()) { return Err(MetaFault.TooLong); }
+    if (format == SET_CLASS_FORMAT && !isStoredClassValue(tags.view())) { return Err(MetaFault.TooLong); }
     return Ok(SetTagsMeta {
         bucket: bucket,
         key: key,

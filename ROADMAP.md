@@ -3586,3 +3586,42 @@ Browser form uploads with a SigV4 POST policy.
   dropped.
 - **A copy** takes the request's class, never the source's. A copy onto itself may change only its class.
 - **Tests:** the S3 smoke's nine storage class checks; 380 unit tests, both smokes and the SDK matrix pass.
+
+### 19 Nov 2026: M12 slice 2, lifecycle transitions (ADR-0090 §2)
+
+- **Taken:** `Transition` (by days or date) and `NoncurrentVersionTransition` (by days, keeping
+  `NewerNoncurrentVersions`), to STANDARD_IA, INTELLIGENT_TIERING, ONEZONE_IA, GLACIER_IR and REDUCED_REDUNDANCY;
+  up to 8 of each a rule.
+- **Refused:**
+  - GLACIER and DEEP_ARCHIVE (InvalidStorageClass);
+  - an infrequent access class before 30 days (InvalidArgument), as on S3.
+- **The lifecycle pass** moves a version along S3's waterfall, never back. Of the transitions due, the furthest
+  wins.
+- **The change is one SetTags record** of a new format (4) that sets the class, so it is kept through recovery and
+  checkpoints. The bytes do not move.
+- **The rules' stored format** gains a version 3, written only when a rule has a transition.
+- **Tests:**
+  - `lifecycleTransitionsRecordClasses`;
+  - `transitionCrashAtEveryByteIsConsistent`, the fault sweep for the new record format;
+  - four S3 smoke checks;
+  - 382 unit tests.
+
+### 19 Nov 2026: M12 slice 3, ListMultipartUploads' delimiter and SHA-1 checksums (ADR-0090 §3, §4)
+
+- **`delimiter`:**
+  - keys are rolled up into CommonPrefixes, each once and in key order;
+  - a common prefix counts toward `max-uploads` and is the next key marker;
+  - a key marker that is one skips its keys.
+- **SHA-1:**
+  - `x-amz-checksum-sha1` and `x-amz-checksum-algorithm: SHA1` are taken, checked, stored and returned;
+  - they are COMPOSITE for multipart, as SHA-256 is;
+  - checksum code 5 is new in the version extras format.
+- **SHA-1 is in plain CeeSafe** (`src/storage/checksums/sha1.cee`), as CRC-32 is. lib/std has none, even in 0.77.1
+  (CEESAFE_GAPS G26, updated). It is checked against FIPS 180's four vectors.
+- **Tests:** `uploadsGroupedByDelimiter`, `sha1MatchesFips180`, and four S3 smoke checks.
+- **Checked together with slice 2:**
+  - 384 unit tests;
+  - the S3 smoke and the cluster smoke (138);
+  - the SDK matrix, where boto3's and JavaScript's SHA-1 checks now expect it taken.
+- **One combined run** (tests beside both smokes and five SDKs at once) had 3 unit tests fail that pass alone. That
+  was contention on this machine, recorded here rather than dismissed.

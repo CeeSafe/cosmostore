@@ -425,7 +425,7 @@ fn parseCompleteBody(xml: Slice<u8>) -> Result<Vector<PartChoice>, S3Fail> {
             checksum: [0u8; 32],
             checksumLength: 0,
         };
-        let names = ["ChecksumCRC32", "ChecksumCRC32C", "ChecksumCRC64NVME", "ChecksumSHA256"];
+        let names = ["ChecksumCRC32", "ChecksumCRC32C", "ChecksumCRC64NVME", "ChecksumSHA256", "ChecksumSHA1"];
         for (name in names) {
             match (elementText(inner, name)) {
                 Some(text) => {
@@ -722,7 +722,8 @@ async fn listMultipartUploads(
     req: borrow S3Request,
     exchange: borrow mut Exchange,
 ) -> Result<void, S3Fail> {
-    if (paramOf(req, "delimiter").isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+    // A delimiter rolls keys up into common prefixes, as ListObjects does (ADR-0090 §3).
+    let delimiter = paramOf(req, "delimiter") ?? "".bytes();
     let urlEncoded = match (paramOf(req, "encoding-type")) {
         Some(t) => {
             if (t != "url".bytes()) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
@@ -742,7 +743,7 @@ async fn listMultipartUploads(
         null => {}
     }
     let bucket = req.bucket.view();
-    let listing = await storeListUploads(app, bucket, prefix, keyMarker, idMarker, maxUploads)?;
+    let listing = await storeListUploads(app, bucket, prefix, delimiter, keyMarker, idMarker, maxUploads)?;
     var body = Vector<u8>.create();
     xmlHead(mut body, "ListMultipartUploadsResult")?;
     xmlElement(mut body, "Bucket", bucket.bytes(), false)?;
@@ -750,11 +751,15 @@ async fn listMultipartUploads(
     xmlElement(mut body, "UploadIdMarker", paramOf(req, "upload-id-marker") ?? "".bytes(), false)?;
     let n = listing.uploads.length;
     var text = Vector<u8>.create();
-    if (listing.truncated && n > 0) {
-        xmlElement(mut body, "NextKeyMarker", listing.uploads[n - 1].key.view(), urlEncoded)?;
-        appendUploadId(mut text, borrow listing.uploads[n - 1].id)?;
-        xmlElement(mut body, "NextUploadIdMarker", text.view(), false)?;
+    if (listing.truncated && listing.nextKeyMarker.length > 0) {
+        xmlElement(mut body, "NextKeyMarker", listing.nextKeyMarker.view(), urlEncoded)?;
+        // The next upload id only when the page ended on an upload, not a common prefix.
+        if (n > 0 && listing.uploads[n - 1].key.view() == listing.nextKeyMarker.view()) {
+            appendUploadId(mut text, borrow listing.uploads[n - 1].id)?;
+            xmlElement(mut body, "NextUploadIdMarker", text.view(), false)?;
+        }
     }
+    if (delimiter.length > 0) { xmlElement(mut body, "Delimiter", delimiter, urlEncoded)?; }
     xmlElement(mut body, "Prefix", prefix, urlEncoded)?;
     xmlDecimal(mut body, "MaxUploads", maxUploads as u64)?;
     if (urlEncoded) { body.extend("<EncodingType>url</EncodingType>".bytes())?; }
@@ -776,6 +781,11 @@ async fn listMultipartUploads(
         appendIso8601(mut body, u.initiatedMillis)?;
         body.extend("</Initiated></Upload>".bytes())?;
     }
+    for (cp in listing.commonPrefixes.view()) {
+        body.extend("<CommonPrefixes>".bytes())?;
+        xmlElement(mut body, "Prefix", cp.view(), urlEncoded)?;
+        body.extend("</CommonPrefixes>".bytes())?;
+    }
     body.extend("</ListMultipartUploadsResult>".bytes())?;
     return await sendXml(exchange, borrow body);
 }
@@ -784,13 +794,16 @@ async fn storeListUploads(
     app: borrow S3App,
     bucket: StringView,
     prefix: Slice<u8>,
+    delimiter: Slice<u8>,
     keyMarker: Slice<u8>,
     idMarker: [u8; 16]?,
     maxUploads: usize,
 ) -> Result<UploadListing, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return match (await Async.blocking(() => store.listUploads(bucket, prefix, keyMarker, idMarker, maxUploads))) {
+    return match (await Async.blocking(
+        () => store.listUploadsGrouped(bucket, prefix, delimiter, keyMarker, idMarker, maxUploads),
+    )) {
         Ok(l) => Ok(l),
         Err(e) => Err(storeFail(e, 0)),
     };

@@ -164,6 +164,81 @@ fn filterInto(xml: Slice<u8>, rule: borrow mut LifecycleRule) -> Result<void, S3
     return Ok();
 }
 
+/// The most transitions of one kind a rule may have.
+const MAX_RULE_TRANSITIONS: usize = 8;
+
+/// A rule's `<Transition>`s (`noncurrent` false: by `Days` or `Date`) or `<NoncurrentVersionTransition>`s (by
+/// `NoncurrentDays`, keeping `NewerNoncurrentVersions`), each to a storage class kept here (ADR-0090 §2). GLACIER,
+/// DEEP_ARCHIVE and unknown classes are InvalidStorageClass; STANDARD_IA and ONEZONE_IA need 30 days, as on S3.
+fn parseTransitions(
+    inner: Slice<u8>,
+    noncurrent: bool,
+    out: borrow mut Vector<RuleTransition>,
+) -> Result<void, S3Fail> {
+    let open = if (noncurrent) "<NoncurrentVersionTransition>".bytes() else "<Transition>".bytes();
+    let close = if (noncurrent) "</NoncurrentVersionTransition>".bytes() else "</Transition>".bytes();
+    var at: usize = 0;
+    while (true) {
+        let start = match (findBytes(inner, open, at)) {
+            Some(s) => s + open.length,
+            null => { break; }
+        };
+        let end = match (findBytes(inner, close, start)) {
+            Some(e) => e,
+            null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        };
+        let block = inner[start..end];
+        at = end + close.length;
+        let named = elementText(block, "StorageClass") ?? { return Err(S3Fail.Code(S3Code.MalformedXML)); };
+        if (named.length == 0 || named == "STANDARD".bytes() || !isStoredClassValue(named)) {
+            return Err(S3Fail.Code(S3Code.InvalidStorageClass));
+        }
+        var t = RuleTransition { days: 0, date: 0, newer: 0, storageClass: copyBytes(named)? };
+        if (noncurrent) {
+            let days = elementText(block, "NoncurrentDays") ?? { return Err(S3Fail.Code(S3Code.MalformedXML)); };
+            t.days = match (parseDecimal(trimSpaces(days))) {
+                Some(v) => truncate<u32>(v.min(0xFFFFFFFF)),
+                null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+            };
+            match (elementText(block, "NewerNoncurrentVersions")) {
+                Some(n) => {
+                    let keep = positiveDecimal(n)?;
+                    if (keep > 100) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                    t.newer = truncate<u32>(keep);
+                }
+                null => {}
+            }
+        } else {
+            let days = elementText(block, "Days");
+            let date = elementText(block, "Date");
+            if (days.isSome() == date.isSome()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+            match (days) {
+                Some(d) => {
+                    t.days = match (parseDecimal(trimSpaces(d))) {
+                        Some(v) => truncate<u32>(v.min(0xFFFFFFFF)),
+                        null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+                    };
+                }
+                null => {}
+            }
+            match (date) {
+                Some(d) => {
+                    let seconds = parseIsoTime(d) ?? { return Err(S3Fail.Code(S3Code.InvalidArgument)); };
+                    if (seconds % 86400 != 0) { return Err(S3Fail.Code(S3Code.InvalidArgument)); } // midnight UTC
+                    t.date = seconds * 1000;
+                }
+                null => {}
+            }
+        }
+        // S3: the infrequent access classes take an object at least 30 days old.
+        let infrequent = named == "STANDARD_IA".bytes() || named == "ONEZONE_IA".bytes();
+        if (infrequent && t.date == 0 && t.days < 30) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        out.push(t)?;
+        if (out.length > MAX_RULE_TRANSITIONS) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    }
+    return Ok();
+}
+
 /// A LifecycleConfiguration document's rules, checked as S3 checks them.
 fn parseLifecycle(xml: Slice<u8>) -> Result<Vector<LifecycleRule>, S3Fail> {
     if (findBytes(xml, "<LifecycleConfiguration".bytes(), 0).isNull()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
@@ -180,11 +255,6 @@ fn parseLifecycle(xml: Slice<u8>) -> Result<Vector<LifecycleRule>, S3Fail> {
         };
         let inner = xml[start..end];
         at = end + 7;
-        // Actions CosmoStore does not have: storage classes.
-        let unsupported = ["<Transition>", "<NoncurrentVersionTransition>"];
-        for (u in unsupported) {
-            if (findBytes(inner, u.bytes(), 0).isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-        }
         var rule = LifecycleRule {
             id: Vector<u8>.create(),
             enabled: false,
@@ -201,6 +271,8 @@ fn parseLifecycle(xml: Slice<u8>) -> Result<Vector<LifecycleRule>, S3Fail> {
             expiredDeleteMarker: false,
             noncurrentDays: 0,
             newerNoncurrent: 0,
+            transitions: Vector<RuleTransition>.create(),
+            noncurrentTransitions: Vector<RuleTransition>.create(),
         };
         let _ = rawElement(inner, "ID", mut rule.id)?;
         if (rule.id.length > 255) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
@@ -287,10 +359,13 @@ fn parseLifecycle(xml: Slice<u8>) -> Result<Vector<LifecycleRule>, S3Fail> {
             }
             null => {}
         }
+        // Transitions (ADR-0090 §2): to the storage classes kept here, recorded, not moved.
+        parseTransitions(inner, false, mut rule.transitions)?;
+        parseTransitions(inner, true, mut rule.noncurrentTransitions)?;
         // S3: a delete marker has no tags to filter by.
         if (rule.expiredDeleteMarker && rule.tags.length > 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
         if (rule.expirationDays == 0 && rule.expirationDate == 0 && rule.abortDays == 0 && !rule.expiredDeleteMarker &&
-            rule.noncurrentDays == 0) {
+            rule.noncurrentDays == 0 && rule.transitions.length == 0 && rule.noncurrentTransitions.length == 0) {
             return Err(S3Fail.Code(S3Code.MalformedXML)); // a rule needs an action
         }
         rules.push(rule)?;
@@ -368,6 +443,25 @@ async fn getBucketLifecycle(
             body.extend(
                 "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>".bytes(),
             )?;
+        }
+        for (t in r.transitions.view()) {
+            body.extend("<Transition>".bytes())?;
+            if (t.date > 0) {
+                body.extend("<Date>".bytes())?;
+                appendIso8601(mut body, t.date)?;
+                body.extend("</Date>".bytes())?;
+            } else {
+                xmlDecimal(mut body, "Days", t.days as u64)?;
+            }
+            xmlElement(mut body, "StorageClass", t.storageClass.view(), false)?;
+            body.extend("</Transition>".bytes())?;
+        }
+        for (t in r.noncurrentTransitions.view()) {
+            body.extend("<NoncurrentVersionTransition>".bytes())?;
+            xmlDecimal(mut body, "NoncurrentDays", t.days as u64)?;
+            if (t.newer > 0) { xmlDecimal(mut body, "NewerNoncurrentVersions", t.newer as u64)?; }
+            xmlElement(mut body, "StorageClass", t.storageClass.view(), false)?;
+            body.extend("</NoncurrentVersionTransition>".bytes())?;
         }
         if (r.noncurrentDays > 0) {
             body.extend("<NoncurrentVersionExpiration>".bytes())?;

@@ -297,7 +297,9 @@ Workaround: `src/storage/checksums/crc32.cee` (moved from `src/s3/` with ADR-001
 (`"123456789"` gives `0xCBF43926`). No C, no `unsafe`; it is only slower than a hardware or slicing-by-8 version.
 
 Suggested: `Crc32` beside `Crc32c` in lib/std, with the same `create`/`update`/`finish`/`of`, and `Sha1` for S3's
-`x-amz-checksum-sha1` (refused with `NotImplemented` today).
+`x-amz-checksum-sha1`. Still missing in CeeSafe 0.77.1 (19 Nov 2026), so SHA-1 is now the same kind of workaround:
+`src/storage/checksums/sha1.cee`, FIPS 180-4 in plain CeeSafe, checked against FIPS 180's four vectors (ADR-0090
+§4).
 
 ### G27: `AsyncConsole.writeError` fails on `/dev/null` (P2)
 

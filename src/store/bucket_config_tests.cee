@@ -16,6 +16,8 @@ fn rule(id: StringView, prefix: StringView, days: u32) -> LifecycleRule => Lifec
     expiredDeleteMarker: false,
     noncurrentDays: 0,
     newerNoncurrent: 0,
+    transitions: Vector<RuleTransition>.create(),
+    noncurrentTransitions: Vector<RuleTransition>.create(),
 };
 
 @test
@@ -261,6 +263,109 @@ fn defaultEncryptionSurvivesReplayAndCheckpoints() -> Result<void, TestFailure> 
     }
     var s = ObjectStore.open(dir.view(), storeConfig())!;
     Check.equalU64(0, s.encryptedBucketCount())?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+fn transitionTo(days: u32, newer: u32, named: StringView) -> RuleTransition =>
+    RuleTransition { days: days, date: 0, newer: newer, storageClass: copyBytes(named.bytes())! };
+
+fn classOf(s: borrow ObjectStore, bucket: StringView, key: StringView, id: [u8; 16]?) -> Vector<u8> =>
+    storageClassIn(s.headObjectOf(bucket, key, id)!.metadata.view())!;
+
+/// Lifecycle transitions (ADR-0090 §2): a current object moves along S3's waterfall as its days pass, never back,
+/// and a noncurrent version by the days since it stopped being current; the class is a SetTags record, so it is kept
+/// through recovery.
+@test
+fn lifecycleTransitionsRecordClasses() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("lifecycle-transitions");
+    let now = Clock.unixMillis();
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        s.createBucket("bkt")!;
+        putText(mut s, "bkt", "a", "a");
+        putText(mut s, "bkt", "b", "b");
+        var rules = Vector<LifecycleRule>.create();
+        var tiers = rule("tiers", "", 0);
+        tiers.transitions.push(transitionTo(30, 0, "STANDARD_IA"))!;
+        tiers.transitions.push(transitionTo(90, 0, "GLACIER_IR"))!;
+        rules.push(tiers)!;
+        var blob = Vector<u8>.create();
+        encodeLifecycle(rules.view(), mut blob)!;
+        let back = decodeLifecycle(blob.view())!;
+        Check.equalU64(2, back[0].transitions.length as u64)?;
+        Check.equalBytes("GLACIER_IR".bytes(), back[0].transitions[1].storageClass.view())?;
+        s.setBucketConfig("bkt", BUCKET_CONFIG_LIFECYCLE, blob.view())!;
+        Check.equalU64(0, s.applyLifecycle(now)!.transitioned)?;
+        Check.equalU64(2, s.applyLifecycle(now + 31 * DAY_MILLIS)!.transitioned)?;
+        Check.equalBytes("STANDARD_IA".bytes(), classOf(borrow s, "bkt", "a", null).view())?;
+        Check.equalU64(0, s.applyLifecycle(now + 32 * DAY_MILLIS)!.transitioned)?;
+        Check.equalU64(2, s.applyLifecycle(now + 91 * DAY_MILLIS)!.transitioned)?;
+        Check.equalBytes("GLACIER_IR".bytes(), classOf(borrow s, "bkt", "b", null).view())?;
+        // Never back up the waterfall, and nothing more to do.
+        Check.equalU64(0, s.applyLifecycle(now + 400 * DAY_MILLIS)!.transitioned)?;
+        // A noncurrent version moves by the days since a newer one was written; the current one stays.
+        s.createBucket("ver")!;
+        setVersioning(mut s, "ver", VERSIONING_ENABLED);
+        let old = putVersion(mut s, "ver", "k", "one").versionId;
+        let _ = putVersion(mut s, "ver", "k", "two");
+        var noncurrent = rule("old", "", 0);
+        noncurrent.noncurrentTransitions.push(transitionTo(30, 0, "ONEZONE_IA"))!;
+        var one = Vector<LifecycleRule>.create();
+        one.push(noncurrent)!;
+        encodeLifecycle(one.view(), mut blob)!;
+        s.setBucketConfig("ver", BUCKET_CONFIG_LIFECYCLE, blob.view())!;
+        Check.equalU64(1, s.applyLifecycle(now + 31 * DAY_MILLIS)!.transitioned)?;
+        Check.equalBytes("ONEZONE_IA".bytes(), classOf(borrow s, "ver", "k", Some(old)).view())?;
+        Check.equalU64(0, classOf(borrow s, "ver", "k", null).length as u64)?;
+    }
+    // Recovery keeps the classes.
+    let s = ObjectStore.open(dir.view(), uploadConfig())!;
+    Check.equalBytes("GLACIER_IR".bytes(), classOf(borrow s, "bkt", "a", null).view())?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// A transition's record, cut at every byte (ADR-0004): recovery gives the version its old class or its new one,
+/// never anything else.
+@test
+fn transitionCrashAtEveryByteIsConsistent() -> Result<void, TestFailure> {
+    let source = scratchDirectory("transition-crash-source");
+    let now = Clock.unixMillis();
+    {
+        var s = ObjectStore.open(source.view(), storeConfig())!;
+        s.createBucket("bkt")!;             // record 1
+        putText(mut s, "bkt", "k", "body"); // 2
+        var rules = Vector<LifecycleRule>.create();
+        var tiers = rule("tiers", "", 0);
+        tiers.transitions.push(transitionTo(30, 0, "STANDARD_IA"))!;
+        rules.push(tiers)!;
+        var blob = Vector<u8>.create();
+        encodeLifecycle(rules.view(), mut blob)!;
+        s.setBucketConfig("bkt", BUCKET_CONFIG_LIFECYCLE, blob.view())!;           // 3
+        Check.equalU64(1, s.applyLifecycle(now + 31 * DAY_MILLIS)!.transitioned)?; // 4
+    }
+    let segment = segmentPath(source.view(), 1)!;
+    let whole = readWhole(segment.view());
+    let dir = scratchDirectory("transition-crash");
+    let target = segmentPath(dir.view(), 1)!;
+    var last: u64 = 0;
+    for (cut in SEGMENT_HEADER_LEN..whole.length + 1) {
+        writeWhole(target.view(), whole.view()[0..cut]);
+        let s = ObjectStore.open(dir.view(), storeConfig())!;
+        let records = s.recordsApplied();
+        Check.isTrue(records >= last, "recovery never goes backwards as the cut grows")?;
+        last = records;
+        if (records < 2) { continue; }
+        let named = classOf(borrow s, "bkt", "k", null);
+        if (records >= 4) {
+            Check.equalBytes("STANDARD_IA".bytes(), named.view())?;
+        } else {
+            Check.equalU64(0, named.length as u64)?;
+        }
+    }
+    Check.equalU64(4, last)?;
+    removeTree(source.view());
     removeTree(dir.view());
     return Ok();
 }

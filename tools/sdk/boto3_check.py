@@ -58,8 +58,10 @@ for algo in ["CRC32", "CRC32C", "SHA256", "CRC64NVME"]:
     key = "o/" + algo.lower()
     s3.put_object(Bucket=B, Key=key, Body=body, ChecksumAlgorithm=algo)
     check("put with " + algo, s3.get_object(Bucket=B, Key=key)["Body"].read() == body, True)
-check("SHA1 not implemented", code_of(lambda: s3.put_object(Bucket=B, Key="o/sha1", Body=b"x", ChecksumAlgorithm="SHA1")),
-      "NotImplemented")
+# SHA-1 is taken since ADR-0090 §4, and returned with checksum mode.
+s3.put_object(Bucket=B, Key="o/sha1", Body=b"abc", ChecksumAlgorithm="SHA1")
+check("SHA1 taken and returned", s3.head_object(Bucket=B, Key="o/sha1", ChecksumMode="ENABLED").get("ChecksumSHA1"),
+      "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=")
 got = s3.get_object(Bucket=B, Key="o/plain")
 check("get", got["Body"].read() == body, True)
 check("content type", got["ContentType"], "x/y")

@@ -257,6 +257,15 @@ struct LifecycleReport {
     /// Noncurrent versions removed, and delete markers removed that were their key's only version (ADR-0042).
     versionsExpired: u64;
     markersRemoved: u64;
+    /// Versions moved to another storage class by a transition (ADR-0090 §2).
+    transitioned: u64;
+}
+
+/// A version a transition moves: its key, id and new class.
+struct ClassMove {
+    key: Vector<u8>;
+    versionId: [u8; 16];
+    storageClass: Vector<u8>;
 }
 
 /// A live inline version that compaction copies.
@@ -1331,6 +1340,53 @@ fn lifecycleTakes(
         if (ruleMatches(r, key, v.size, tags.view())) { return true; }
     }
     return false;
+}
+
+/// The class a rule's transition moves this version to at `nowMillis` (ADR-0090 §2): of the transitions due, the one
+/// furthest along S3's waterfall, if it is further than the version's own class; empty for none. Current
+/// (`noncurrent` false): counted from `sinceMillis`, its modification time, or a date. Noncurrent: from when it
+/// stopped being current, with at least the transition's count of `newer` noncurrent versions kept.
+fn transitionTarget(
+    rules: Slice<LifecycleRule>,
+    key: Slice<u8>,
+    v: borrow ObjectVersion,
+    noncurrent: bool,
+    newer: u32,
+    sinceMillis: i64,
+    nowMillis: i64,
+) -> Result<Vector<u8>, AllocError> {
+    var best = Vector<u8>.create();
+    if (isDeleteMarker(v)) { return Ok(best); }
+    let present = storageClassIn(v.metadata.view())?;
+    var bestRank = storageClassRank(present.view());
+    for (i in 0..rules.length) {
+        let r = borrow rules[i];
+        let all = if (noncurrent) r.noncurrentTransitions.view() else r.transitions.view();
+        if (all.length == 0 || !r.enabled || !startsWithBytes(key, r.prefix.view())) { continue; }
+        var tags = Vector<u8>.create();
+        if (r.tags.length > 0) {
+            match (metadataValue(v.metadata.view(), TAGS_FIELD.bytes())) {
+                Ok(t) => { tags = t; }
+                Err(_) => {}
+            }
+        }
+        if (!ruleMatches(r, key, v.size, tags.view())) { continue; }
+        for (t in all) {
+            if (noncurrent && newer < t.newer) { continue; }
+            let at = if (t.date > 0) t.date else {
+                let d = sinceMillis + (t.days as i64) * DAY_MILLIS;
+                ((d + DAY_MILLIS - 1) / DAY_MILLIS) * DAY_MILLIS
+            };
+            if (nowMillis < at) { continue; }
+            let rank = storageClassRank(t.storageClass.view());
+            if (rank > bestRank) {
+                bestRank = rank;
+                best.clear();
+                best.extend(t.storageClass.view())?;
+            }
+        }
+    }
+    return Ok(best);
 }
 
 /// Whether some rule removes a delete marker that is its key's only version (ADR-0042 §3): one with
@@ -5147,6 +5203,19 @@ struct ObjectStore {
         keyMarker: Slice<u8>,
         idMarker: [u8; 16]?,
         maxUploads: usize,
+    ) -> Result<UploadListing, StoreError> =>
+        this.listUploadsGrouped(bucket, prefix, "".bytes(), keyMarker, idMarker, maxUploads);
+
+    /// `listUploads`, keys with `delimiter` after the prefix rolled up into common prefixes, as ListObjects rolls
+    /// them (ADR-0090 §3). A common prefix counts toward `maxUploads`, and a key marker that is one skips its keys.
+    fn listUploadsGrouped(
+        borrow this,
+        bucket: StringView,
+        prefix: Slice<u8>,
+        delimiter: Slice<u8>,
+        keyMarker: Slice<u8>,
+        idMarker: [u8; 16]?,
+        maxUploads: usize,
     ) -> Result<UploadListing, StoreError> {
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         let uploads = borrow this.state.uploads;
@@ -5195,13 +5264,40 @@ struct ObjectStore {
             let ib = uploads.keyAt(b).id;
             return compareBytes(ia[..], ib[..]);
         });
-        var listing = UploadListing { uploads: Vector<UploadSummary>.create(), truncated: false };
+        var listing = UploadListing {
+            uploads: Vector<UploadSummary>.create(),
+            commonPrefixes: Vector<Vector<u8>>.create(),
+            truncated: false,
+            nextKeyMarker: Vector<u8>.create(),
+        };
         for (m in matches.view()) {
-            if (listing.uploads.length == maxUploads) {
+            let u = uploads.valueAt(m);
+            // Rolled up: the key up to the first delimiter after the prefix.
+            if (delimiter.length > 0) {
+                match (findBytes(u.key.view(), delimiter, prefix.length)) {
+                    Some(d) => {
+                        let cp = u.key.view()[0..d + delimiter.length];
+                        if (keyMarker.length > 0 && compareBytes(cp, keyMarker) <= 0) { continue; }
+                        let n = listing.commonPrefixes.length;
+                        if (n > 0 && listing.commonPrefixes[n - 1].view() == cp) { continue; }
+                        if (listing.uploads.length + n == maxUploads) {
+                            listing.truncated = true;
+                            break;
+                        }
+                        listing.commonPrefixes.push(copyBytes(cp)?)?;
+                        listing.nextKeyMarker.clear();
+                        listing.nextKeyMarker.extend(cp)?;
+                        continue;
+                    }
+                    null => {}
+                }
+            }
+            if (listing.uploads.length + listing.commonPrefixes.length == maxUploads) {
                 listing.truncated = true;
                 break;
             }
-            let u = uploads.valueAt(m);
+            listing.nextKeyMarker.clear();
+            listing.nextKeyMarker.extend(u.key.view())?;
             listing.uploads.push(UploadSummary {
                 key: copyBytes(u.key.view())?,
                 id: uploads.keyAt(m).id,
@@ -5922,7 +6018,13 @@ struct ObjectStore {
         var compaction = CompactStats { segmentsRemoved: 0, bytesFreed: 0, relocated: 0, bytesCopied: 0 };
         if (withSteps) { compaction = this.compact(this.config.compactMaxCopyBytes)?; }
         let compacted = Clock.monotonicNanos();
-        var lifecycle = LifecycleReport { objectsExpired: 0, uploadsAborted: 0, versionsExpired: 0, markersRemoved: 0 };
+        var lifecycle = LifecycleReport {
+            objectsExpired: 0,
+            uploadsAborted: 0,
+            versionsExpired: 0,
+            markersRemoved: 0,
+            transitioned: 0,
+        };
         let lifecycleEvery = this.config.lifecycleEveryMillis;
         if (lifecycleEvery > 0 && now - this.lifecycleRan >= truncate<i64>(lifecycleEvery)) {
             lifecycle = this.applyLifecycle(now)?;
@@ -6054,7 +6156,13 @@ struct ObjectStore {
     /// by their rule, and so is a delete marker left as its key's only version. About LIFECYCLE_BATCH deletes per
     /// bucket and run, so the store's lock is never held long; the rest wait for the next.
     fn applyLifecycle(borrow mut this, nowMillis: i64) -> Result<LifecycleReport, StoreError> {
-        var report = LifecycleReport { objectsExpired: 0, uploadsAborted: 0, versionsExpired: 0, markersRemoved: 0 };
+        var report = LifecycleReport {
+            objectsExpired: 0,
+            uploadsAborted: 0,
+            versionsExpired: 0,
+            markersRemoved: 0,
+            transitioned: 0,
+        };
         var names = Vector<Vector<u8>>.create();
         for (i in 0..this.state.buckets.length()) {
             if (this.state.buckets.valueAt(i).lifecycle.length > 0) {
@@ -6075,6 +6183,13 @@ struct ObjectStore {
             let cut = lifecycleCutoffs(rules.view(), nowMillis);
             // What the rules delete: a key (its current object) or one version of it, by id (ADR-0042 §3).
             var targets = Vector<DeleteTarget>.create();
+            var moves = Vector<ClassMove>.create();
+            var transitions = false;
+            for (r in rules.view()) {
+                if (r.enabled && (r.transitions.length > 0 || r.noncurrentTransitions.length > 0)) {
+                    transitions = true;
+                }
+            }
             var objects: u64 = 0;
             var versions: u64 = 0;
             var markers: u64 = 0;
@@ -6093,7 +6208,7 @@ struct ObjectStore {
                     null => { break; }
                 };
                 cursor = this.state.index.next(i);
-                if (targets.length >= LIFECYCLE_BATCH) { break; }
+                if (targets.length + moves.length >= LIFECYCLE_BATCH) { break; }
                 let key = this.state.index.keyAt(i);
                 if (key.bucket != start.bucket) { break; }
                 let name = key.key.view();
@@ -6108,6 +6223,14 @@ struct ObjectStore {
                         targets.push(DeleteTarget { key: copyBytes(name)?, versionId: null, bypassGovernance: false })?;
                         objects += 1;
                         nullReplaced = suspended;
+                    } else if (transitions) {
+                        // Not expired: perhaps moved to another class (ADR-0090 §2).
+                        let to = transitionTarget(rules.view(), name, head, false, 0, head.mtimeMillis, nowMillis)?;
+                        if (to.length > 0) {
+                            moves.push(
+                                ClassMove { key: copyBytes(name)?, versionId: head.versionId, storageClass: to },
+                            )?;
+                        }
                     }
                 } else if (slot == NO_VERSION_SLOT) {
                     // A delete marker that is all its key has.
@@ -6139,6 +6262,11 @@ struct ObjectStore {
                             bypassGovernance: false,
                         })?;
                         versions += 1;
+                    } else if (transitions && !replaced) {
+                        let to = transitionTarget(rules.view(), name, v, true, newer, since, nowMillis)?;
+                        if (to.length > 0) {
+                            moves.push(ClassMove { key: copyBytes(name)?, versionId: v.versionId, storageClass: to })?;
+                        }
                     }
                     since = v.mtimeMillis;
                     newer += 1;
@@ -6150,6 +6278,23 @@ struct ObjectStore {
                 report.objectsExpired += objects;
                 report.versionsExpired += versions;
                 report.markersRemoved += markers;
+            }
+            // The transitions: each one SetTags record of the class format, which changes the version only if it is
+            // still there (a delete of this run may have taken it).
+            let bucketText = StringView.fromUtf8(bucketName) ?? "";
+            for (m in 0..moves.length) {
+                let keyText = StringView.fromUtf8(moves[m].key.view()) ?? { continue; };
+                match (this.setFieldOf(
+                    bucketText,
+                    keyText,
+                    Some(moves[m].versionId),
+                    moves[m].storageClass.view(),
+                    SET_CLASS_FORMAT,
+                )) {
+                    Ok() => { report.transitioned += 1; }
+                    Err(StoreError.NoSuchVersion) | Err(StoreError.NoSuchKey) | Err(StoreError.MethodNotAllowed) => {}
+                    Err(e) => { return Err(e); }
+                }
             }
             // Uploads that some rule aborts.
             var old = Vector<[u8; 16]>.create();

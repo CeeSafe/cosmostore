@@ -52,7 +52,7 @@ const put = await s3.send(new PutObjectCommand({ Bucket, Key: "o/plain", Body: b
 check("put ETag", put.ETag, `"${createHash("md5").update(body).digest("hex")}"`);
 for (const algo of ["CRC32", "CRC32C", "SHA256", "SHA1"]) {
   const r = await codeOf(s3.send(new PutObjectCommand({ Bucket, Key: "o/" + algo, Body: body, ChecksumAlgorithm: algo })));
-  check("put with " + algo, r, algo === "SHA1" ? "NotImplemented" : "no error");
+  check("put with " + algo, r, "no error"); // SHA-1 too, since ADR-0090 §4
 }
 const got = await s3.send(new GetObjectCommand({ Bucket, Key: "o/plain" }));
 check("get", (await bytes(got.Body)).equals(body), true);
