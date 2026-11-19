@@ -3273,3 +3273,17 @@ Browser form uploads with a SigV4 POST policy.
   4. the cluster;
   5. PyIceberg end to end, and the exit review.
 - **Next:** slice 1.
+
+### 19 Nov 2026: M10 slice 1, the inflate decoder and the Avro reader (ADR-0086 §4)
+
+- **Inflate** (`src/s3/inflate.cee`): RFC 1951's stored, fixed and dynamic blocks, as zlib's `puff` decodes them,
+  with an output limit. It is here until lib/std has one (G35 notes it).
+  - **Tested** with zlib's own streams: empty, stored, fixed, dynamic, mixed, and several blocks.
+  - **Refused:** a limit passed, a bad stored length, the reserved block type, a stream cut short, and a distance
+    before the start.
+- **Avro** (`src/s3/avro.cee`): object container files, the codecs `null` and `deflate`, and every type of the binary
+  encoding, named types included. Each record is read into the JSON model. Another codec is refused by its name.
+  - **Tested** against PyIceberg 0.12.0's own manifest list and manifest (`avro_fixtures.cee`, made from a table
+    appended twice). The paths each names are read exactly. A file damaged, cut short or not Avro is refused.
+- 365 tests pass.
+- **Next:** slice 2, the maintenance calls and snapshot management.

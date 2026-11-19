@@ -527,6 +527,11 @@ access logs and Parquet's codecs would want the same.
 **Suggested.** `Deflate.compress(level)` / `Inflate` streams in lib/std (or `lib/compress`), with `Gzip` framing and
 `Crc32` beside `Crc32c`; `web_ws` could then use it too.
 
+**Meanwhile (19 Nov 2026).** Table maintenance (ADR-0086) must read Iceberg manifests, which PyIceberg deflates by
+default. The owner chose to write the decoder here first: `src/s3/inflate.cee` is an RFC 1951 inflater (stored,
+fixed and dynamic blocks, an output limit), tested against zlib's streams (`inflateZlibStreams`, `inflateRefusals`).
+It is plain CeeSafe, with no C, and can move into lib/std as `Inflate` when lib/std takes this gap.
+
 ### G36: the generated test runner nests each test a level deeper (P1)
 
 **Evidence.** `ceesafec test` (0.54.0 and 0.56.0) emits one C function, `ceeF_ceesafeTestMain`, in which each test's

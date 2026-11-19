@@ -1,0 +1,82 @@
+// The Avro reader (ADR-0086 §4) against PyIceberg's own manifests (avro_fixtures.cee): their records read, the paths
+// they name found; files that are not Avro, or of a codec not taken, refused.
+
+fn fixtureBytes(chunks: Slice<StringView>) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    for (c in chunks) { out.extend(hexToBytes(c).view())!; }
+    return out;
+}
+
+fn avroMetadataValue<region a>(f: borrow(a) AvroFile, key: StringView) -> Slice<a, u8>? {
+    for (i in 0..f.metadata.length) {
+        if (f.metadata[i].key.view() == key.bytes()) {
+            return match (borrow f.metadata[i].value) {
+                Json.Text(t) => Some(t.view()),
+                _ => null,
+            };
+        }
+    }
+    return null;
+}
+
+@test
+fn avroReadsIcebergManifests() -> Result<void, TestFailure> {
+    let listBytes = fixtureBytes(AVRO_FIXTURE_LIST[..]);
+    let list = readAvro(listBytes.view())!;
+    Check.equalBytes("deflate".bytes(), avroMetadataValue(borrow list, "avro.codec")!)?;
+    Check.equalU64(AVRO_FIXTURE_LIST_ENTRIES.length as u64, list.records.length as u64)?;
+    for (i in 0..list.records.length) {
+        Check.equalBytes(
+            AVRO_FIXTURE_LIST_ENTRIES[i].bytes(),
+            jsonMemberText(borrow list.records[i], "manifest_path")!,
+        )?;
+        Check.isTrue(jsonMemberI64(borrow list.records[i], "added_snapshot_id").isSome(), "a 64-bit id")?;
+    }
+    let manifestBytes = fixtureBytes(AVRO_FIXTURE_MANIFEST[..]);
+    let manifest = readAvro(manifestBytes.view())!;
+    Check.equalU64(AVRO_FIXTURE_DATA_FILES.length as u64, manifest.records.length as u64)?;
+    for (i in 0..manifest.records.length) {
+        let entry = borrow manifest.records[i];
+        let dataFile = jsonMember(entry, "data_file")!;
+        Check.equalBytes(AVRO_FIXTURE_DATA_FILES[i].bytes(), jsonMemberText(dataFile, "file_path")!)?;
+        Check.isTrue(jsonMemberI64(entry, "status").isSome(), "its status")?;
+    }
+    return Ok();
+}
+
+fn avroRefusal(bytes: Slice<u8>) -> StringView => match (readAvro(bytes)) {
+    Ok(_) => "read",
+    Err(AvroError.Malformed) => "malformed",
+    Err(AvroError.Codec(_)) => "codec",
+    Err(AvroError.OutOfMemory(_)) => "memory",
+};
+
+@test
+fn avroRefusals() -> Result<void, TestFailure> {
+    let good = fixtureBytes(AVRO_FIXTURE_LIST[..]);
+    var notAvro = copyBytes(good.view())!;
+    notAvro[3] = 2;
+    Check.equalBytes("malformed".bytes(), avroRefusal(notAvro.view()).bytes())?;
+    // A byte of the compressed block changed: the stream, its records or the sync after it no longer read.
+    var damaged = copyBytes(good.view())!;
+    let at = damaged.length - 40;
+    damaged[at] = damaged[at] ^ 0x55;
+    Check.equalBytes("malformed".bytes(), avroRefusal(damaged.view()).bytes())?;
+    // Cut short.
+    Check.equalBytes("malformed".bytes(), avroRefusal(good.view()[0..good.length - 5]).bytes())?;
+    Check.equalBytes("malformed".bytes(), avroRefusal("".bytes()).bytes())?;
+    // Another codec: named, not guessed at.
+    var other = copyBytes(good.view())!;
+    match (findBytes(other.view(), "deflate".bytes(), 0)) {
+        Some(p) => {
+            let z = "zstdard".bytes();
+            for (i in 0..z.length) { other[p + i] = z[i]; }
+        }
+        null => { return Check.fail("the fixture names its codec"); }
+    }
+    match (readAvro(other.view())) {
+        Err(AvroError.Codec(name)) => { Check.equalBytes("zstdard".bytes(), name.view())?; }
+        _ => { return Check.fail("a codec not taken is named"); }
+    }
+    return Ok();
+}

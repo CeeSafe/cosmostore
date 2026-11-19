@@ -1,0 +1,107 @@
+// Inflate (ADR-0086 §4): raw deflate streams zlib made (Python's zlib, wbits -15), of each block kind, decoded to the
+// bytes they were made from; and streams that are not deflate, refused.
+
+fn hexToBytes(hex: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    let h = hex.bytes();
+    var i: usize = 0;
+    while (i + 1 < h.length) {
+        out.push((hexDigit(h[i]) * 16) + hexDigit(h[i + 1]))!;
+        i += 2;
+    }
+    return out;
+}
+
+fn hexDigit(c: u8) -> u8 => if (c >= '0' && c <= '9') c - '0' else if (c >= 'a' && c <= 'f') c - 'a' + 10 else 0;
+
+/// The test vectors' pseudo-random bytes: x = x * 1103515245 + 12345 (mod 2^32), each byte bits 16 to 23.
+fn lcgBytes(n: usize, seed: u32) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    var x = seed;
+    for (i in 0..n) {
+        x = truncate<u32>((x as u64) * 1103515245 + 12345);
+        out.push(truncate<u8>(x >> 16))!;
+    }
+    return out;
+}
+
+fn foxes(n: usize) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    for (i in 0..60) { out.extend("the quick brown fox jumps over the lazy dog ".bytes())!; }
+    out.truncate(n);
+    return out;
+}
+
+fn inflated(hex: StringView, limit: usize) -> Result<Vector<u8>, InflateError> {
+    let z = hexToBytes(hex);
+    var out = Vector<u8>.create();
+    inflate(z.view(), limit, mut out)?;
+    return Ok(out);
+}
+
+fn inflatesTo(hex: StringView, want: Slice<u8>) -> bool => match (inflated(hex, 1 << 20)) {
+    Ok(got) => got.view() == want,
+    Err(_) => false,
+};
+
+@test
+fn inflateZlibStreams() -> Result<void, TestFailure> {
+    Check.isTrue(inflatesTo("0300", "".bytes()), "empty")?;
+    Check.isTrue(
+        inflatesTo(
+            "01780087ffc67e816b4bfbe2fb54f6bddf7c1ce18701bf31de56720f4767668759aa883c59ea56137bd285a1d83c54552f37ae655bda027998cce31a768e5fd9998f1f3f36ee43784d0dfabea6dae4868edc296d4eff56e17020fb8fb1580590c509dc53cdaa3b489952d3529d069feab5c206139849b2011eac328831",
+            lcgBytes(120, 1).view(),
+        ),
+        "a stored block",
+    )?;
+    Check.isTrue(inflatesTo("cb48cdc9c957c8402701", "hello hello hello hello".bytes()), "fixed Huffman")?;
+    Check.isTrue(
+        inflatesTo(
+            "edcac91180201404d15426354514d78f086ed16b7932883e76f5cbc16b2dbd1b55273b16b5766a2873dc64bb4fcaef9eaafb5263dd17582c168bc562b158ecdf3e",
+            foxes(2640).view(),
+        ),
+        "dynamic Huffman, long matches",
+    )?;
+    var mixed = lcgBytes(100, 1);
+    mixed.extend(foxes(300).view())!;
+    mixed.extend(lcgBytes(60, 7).view())!;
+    Check.isTrue(
+        inflatesTo(
+            "3b56d798edfdfbd1ef906f7befd7c83c6c67dc6f782fac88df3d3dad3d7255874de4ab30e1ea4bad0b6fd88484ea9baf4b8dbec55439e3cc63a9b2bef89b33fbe5edcdde3957f8f2fedab7ecd693b6be3b9ab97effc31e1628fceedf18c13ae128e79de0b3abac3d669664a42a14966626672b2415e597e729a4e557286495e616142be497a5162980a47312ab2a1552f2d31546bada1cbf9249c2aa4a7a860bcf0aef137aeb9499764ee58ff2f55bbd0ad313b3d8a6e61deabac22c9ca171255cce26f65d5edc01af8982f1b1d68176878297880100",
+            mixed.view(),
+        ),
+        "literals and matches mixed",
+    )?;
+    var multi = foxes(200);
+    multi.extend(lcgBytes(40, 3).view())!;
+    Check.isTrue(
+        inflatesTo(
+            "2ac94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7833983552d000000ffff012800d7ff53c37d788eb44db7482f6d463d19e570244cbba0e358fc7874fa8cb1955cafb5321253fe93d1232c",
+            multi.view(),
+        ),
+        "several blocks, an empty stored one between (a full flush)",
+    )?;
+    return Ok();
+}
+
+fn refusedAs(hex: StringView, limit: usize, tooLarge: bool) -> bool => match (inflated(hex, limit)) {
+    Err(InflateError.TooLarge) => tooLarge,
+    Err(InflateError.Malformed) => !tooLarge,
+    _ => false,
+};
+
+@test
+fn inflateRefusals() -> Result<void, TestFailure> {
+    let dynamic =
+        "edcac91180201404d15426354514d78f086ed16b7932883e76f5cbc16b2dbd1b55273b16b5766a2873dc64bb4fcaef9eaafb5263dd17582c168bc562b158ecdf3e";
+    Check.isTrue(refusedAs(dynamic, 2639, true), "a byte past the limit")?;
+    Check.isTrue(inflated(dynamic, 2640).isOk(), "exactly the limit")?;
+    Check.isTrue(refusedAs("01780087ff", 1000, true) || refusedAs("01780087ff", 1000, false), "stored, cut short")?;
+    Check.isTrue(refusedAs("0178008800", 1000, false), "a stored length whose complement is wrong")?;
+    Check.isTrue(refusedAs("", 1000, false), "nothing")?;
+    Check.isTrue(refusedAs("07", 1000, false), "block type 3, reserved")?;
+    Check.isTrue(refusedAs("edcac91180201404d154", 1000, false), "a dynamic block cut short")?;
+    // A match reaching back before the start: a fixed block whose first code is a length.
+    Check.isTrue(refusedAs("0302", 1000, false), "a distance before the start")?;
+    return Ok();
+}
