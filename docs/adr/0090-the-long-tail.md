@@ -46,7 +46,8 @@ purpose bucket. Each item below is small, and each becomes a row of the support 
    - **Returned** on PutObject, CopyObject and CreateMultipartUpload, as AWS's models answer it, and on Head and Get
      too, where SDKs do not read it.
    - **Compatibility:** objects sealed before it have none, and read as before. `aws:kms:dsse` stays refused.
-7. **On a cluster:** every item, through every node. **Slices** follow this order, each with its smoke and SDK
+7. **On a cluster:** every item, through every node, but SSE-KMS's context: a node has no KMS key file, so SSE-KMS
+   is not served on a cluster at all (before M12). **Slices** follow this order, each with its smoke and SDK
    checks.
 
 ## Slices

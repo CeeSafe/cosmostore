@@ -340,4 +340,14 @@ for (const sessions of [true, false]) {
   await account.send(new DeleteObjectCommand({ Bucket: "sdk-js-users", Key: "a" }));
   await account.send(new DeleteBucketCommand({ Bucket: "sdk-js-users" }));
 }
+// The long tail (ADR-0090): storage classes recorded, or refused.
+{
+  const s3t = new S3Client({ endpoint, forcePathStyle: true, region: "us-east-1", maxAttempts: 1 });
+  await s3t.send(new CreateBucketCommand({ Bucket: "sdk-js-tail" }));
+  await s3t.send(new PutObjectCommand({ Bucket: "sdk-js-tail", Key: "ia", Body: "x", StorageClass: "STANDARD_IA" }));
+  check("a storage class recorded", (await s3t.send(new HeadObjectCommand({ Bucket: "sdk-js-tail", Key: "ia" }))).StorageClass, "STANDARD_IA");
+  check("an archive class refused", await codeOf(s3t.send(new PutObjectCommand({ Bucket: "sdk-js-tail", Key: "g", Body: "x", StorageClass: "GLACIER" }))), "InvalidStorageClass");
+  await s3t.send(new DeleteObjectCommand({ Bucket: "sdk-js-tail", Key: "ia" }));
+  await s3t.send(new DeleteBucketCommand({ Bucket: "sdk-js-tail" }));
+}
 process.exit(failed ? 1 : 0);

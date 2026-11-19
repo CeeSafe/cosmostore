@@ -152,6 +152,7 @@ func main() {
 	directoryAccessPoints(ctx, cfg, endpoint)
 	tables(ctx, cfg)
 	users(ctx, cfg)
+	longTail(ctx, cfg)
 	if failed {
 		os.Exit(1)
 	}

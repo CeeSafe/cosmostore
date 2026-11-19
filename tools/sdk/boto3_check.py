@@ -715,4 +715,12 @@ check("a user writes nothing", code_of(lambda: user.put_object(Bucket="sdk-py-us
 check("nor lists every bucket", code_of(lambda: user.list_buckets()), "AccessDenied")
 client().delete_object(Bucket="sdk-py-users", Key="a")
 client().delete_bucket(Bucket="sdk-py-users")
+# The long tail (ADR-0090): storage classes recorded, or refused.
+client().create_bucket(Bucket="sdk-py-tail")
+client().put_object(Bucket="sdk-py-tail", Key="ia", Body=b"x", StorageClass="STANDARD_IA")
+check("a storage class recorded", client().head_object(Bucket="sdk-py-tail", Key="ia").get("StorageClass"), "STANDARD_IA")
+check("an archive class refused", code_of(lambda: client().put_object(Bucket="sdk-py-tail", Key="g", Body=b"x", StorageClass="GLACIER")),
+      "InvalidStorageClass")
+client().delete_object(Bucket="sdk-py-tail", Key="ia")
+client().delete_bucket(Bucket="sdk-py-tail")
 sys.exit(1 if failed else 0)

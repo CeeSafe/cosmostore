@@ -404,6 +404,18 @@ foreach (var sessions in new[] { false })
     await d.DeleteObjectAsync(apBucket, "pub/a.txt");
     await d.DeleteBucketAsync(apBucket);
 }
+// The long tail (ADR-0090): storage classes recorded, or refused.
+{
+    var tail = Client(true);
+    await tail.PutBucketAsync(new PutBucketRequest { BucketName = "sdk-net-tail" });
+    await tail.PutObjectAsync(new PutObjectRequest { BucketName = "sdk-net-tail", Key = "ia", ContentBody = "x", StorageClass = S3StorageClass.StandardInfrequentAccess });
+    var tailHead = await tail.GetObjectMetadataAsync("sdk-net-tail", "ia");
+    Check("a storage class recorded", tailHead.StorageClass?.Value, "STANDARD_IA");
+    Check("an archive class refused", await CodeOf(() => tail.PutObjectAsync(new PutObjectRequest { BucketName = "sdk-net-tail", Key = "g", ContentBody = "x", StorageClass = S3StorageClass.Glacier })), "InvalidStorageClass");
+    await tail.DeleteObjectAsync("sdk-net-tail", "ia");
+    await tail.DeleteBucketAsync("sdk-net-tail");
+}
+
 // Users (ADR-0088): a user's key reads what its identity policy allows, and nothing else.
 {
     var owner = Client(true);

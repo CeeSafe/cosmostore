@@ -145,6 +145,7 @@ public class Check {
         DirectoryAccessPoints.run(endpoint);
         Tables.run(endpoint);
         Users.run(endpoint);
+        LongTail.run(endpoint);
         System.exit(failed ? 1 : 0);
     }
 }

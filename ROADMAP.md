@@ -3644,3 +3644,12 @@ Browser form uploads with a SigV4 POST policy.
   - three S3 smoke checks;
   - boto3's POST form under a legal hold;
   - 385 unit tests, the cluster smoke (138) and the SDK matrix.
+
+### 19 Nov 2026: M12 slice 5, the cluster and the SDK matrix (ADR-0090 §7)
+
+- **The cluster smoke:** a long tail section, each item put through one node and read through another (storage
+  class, listing, archive refused, transitions, the uploads' delimiter, SHA-1). 144 checks pass.
+- **Not on a cluster:** SSE-KMS's context, since a node has no KMS key file (before M12).
+- **The SDK matrix:** every SDK (boto3, Go, JavaScript, Java, .NET) records STANDARD_IA and is refused GLACIER.
+  boto3 and JavaScript also put SHA-1 checksums, and boto3 a POST form under a legal hold. All pass.
+- **Next:** M12's exit review.

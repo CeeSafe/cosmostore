@@ -458,6 +458,26 @@ on 1 s3tables delete-table --table-bucket-arn "$lakec" --namespace ns --name t >
 on 1 s3tables delete-namespace --table-bucket-arn "$lakec" --namespace ns > /dev/null 2>&1
 for attempt in 1 2 3; do on 1 s3tables delete-table-bucket --table-bucket-arn "$lakec" > /dev/null 2>&1 && break; pause 0.5; done
 
+# The long tail on a cluster (ADR-0090 §7): each item through other nodes.
+on 1 s3api create-bucket --bucket tail-c > /dev/null 2>&1
+on 2 s3api put-object --bucket tail-c --key ia --body one.txt --storage-class STANDARD_IA > /dev/null 2>&1
+check "a storage class through node 2, seen through node 3" "$(on 3 s3api head-object --bucket tail-c --key ia --query StorageClass --output text 2>&1)" STANDARD_IA
+check "and listed through node 1" "$(on 1 s3api list-objects-v2 --bucket tail-c --query 'Contents[0].StorageClass' --output text 2>&1)" STANDARD_IA
+check "an archive class refused through node 3" "$(code 3 s3api put-object --bucket tail-c --key g --body one.txt --storage-class GLACIER)" InvalidStorageClass
+on 1 s3api put-bucket-lifecycle-configuration --bucket tail-c --lifecycle-configuration '{"Rules":[{"ID":"tiers","Status":"Enabled","Filter":{},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"}]}]}' > /dev/null 2>&1
+check "lifecycle transitions through node 1, read through node 2" "$(on 2 s3api get-bucket-lifecycle-configuration --bucket tail-c --query 'Rules[0].Transitions[0].StorageClass' --output text 2>&1)" STANDARD_IA
+tu1=$(on 3 s3api create-multipart-upload --bucket tail-c --key logs/a --query UploadId --output text 2>&1)
+tu2=$(on 1 s3api create-multipart-upload --bucket tail-c --key top --query UploadId --output text 2>&1)
+check "uploads rolled up by a delimiter, through node 2" "$(on 2 s3api list-multipart-uploads --bucket tail-c --delimiter / --query '[CommonPrefixes[0].Prefix,Uploads[0].Key]' --output text 2>&1)" "logs/	top"
+on 1 s3api abort-multipart-upload --bucket tail-c --key logs/a --upload-id "$tu1" > /dev/null 2>&1
+on 2 s3api abort-multipart-upload --bucket tail-c --key top --upload-id "$tu2" > /dev/null 2>&1
+printf 'abc' > sha1.txt
+on 3 s3api put-object --bucket tail-c --key sha1 --body sha1.txt --checksum-algorithm SHA1 > /dev/null 2>&1
+check "a SHA-1 checksum through node 3, returned through node 1" "$(on 1 s3api head-object --bucket tail-c --key sha1 --checksum-mode ENABLED --query ChecksumSHA1 --output text 2>&1)" "qZk+NkcGgWq6PiVxeFDCbJzQ2J0="
+on 1 s3api delete-bucket-lifecycle --bucket tail-c > /dev/null 2>&1
+for k in ia sha1; do on 2 s3api delete-object --bucket tail-c --key "$k" > /dev/null 2>&1; done
+on 3 s3api delete-bucket --bucket tail-c > /dev/null 2>&1
+
 # Event notifications on a cluster (ADR-0078 §4): the shard's leader delivers, and a new one goes on.
 keys() { python3 -c 'import json,sys
 print(" ".join(json.loads(l)["Records"][0]["s3"]["object"]["key"] for l in open(sys.argv[1]) if l.strip()))' hook.out; }
