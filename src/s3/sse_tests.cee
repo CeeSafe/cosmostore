@@ -79,6 +79,7 @@ fn sseEnvelopeAsText() -> Result<void, TestFailure> {
         keyId: copyBytes("key-2026_11".bytes())!,
         nonce: [0u8; 12],
         wrapped: [0u8; 48],
+        context: Vector<u8>.create(),
     };
     for (i in 0..12) { e.nonce[i] = truncate<u8>(i * 17); }
     for (i in 0..48) { e.wrapped[i] = truncate<u8>(255 - i); }
@@ -101,6 +102,7 @@ fn sseEnvelopeAsText() -> Result<void, TestFailure> {
         keyId: copyBytes("-".bytes())!,
         nonce: [7u8; 12],
         wrapped: [9u8; 48],
+        context: Vector<u8>.create(),
     };
     var ctext = Vector<u8>.create();
     encodeEnvelope(borrow c, mut ctext)!;
@@ -232,7 +234,9 @@ fn sseRequestFields() -> Result<void, TestFailure> {
     Check.equalBytes("InvalidArgument".bytes(), sseKmsAnswer("aws:kms", "a key", "", "", "", "").view())?;
     Check.equalBytes("InvalidArgument".bytes(), sseKmsAnswer("AES256", "orders", "", "", "", "").view())?;
     Check.equalBytes("InvalidArgument".bytes(), sseKmsAnswer("", "orders", "", "", "", "").view())?;
-    Check.equalBytes("NotImplemented".bytes(), sseKmsAnswer("aws:kms", "", "e30=", "", "", "").view())?;
+    // An encryption context is taken since ADR-0090 §6 (`e30=` is `{}`); one that is not JSON is refused.
+    Check.equalBytes("kms:".bytes(), sseKmsAnswer("aws:kms", "", "e30=", "", "", "").view())?;
+    Check.equalBytes("InvalidArgument".bytes(), sseKmsAnswer("aws:kms", "", "bm90IGpzb24=", "", "", "").view())?;
     Check.equalBytes("NotImplemented".bytes(), sseAnswer("aws:kms:dsse", "", "", "").view())?;
     Check.equalBytes("InvalidArgument".bytes(), sseAnswer("AES128", "", "", "").view())?;
     Check.equalBytes("customer".bytes(), sseAnswer("", "AES256", zeros, md5).view())?;
@@ -408,6 +412,7 @@ fn sseWrapsDataKeys() -> Result<void, TestFailure> {
         keyId: copyBytes("k1".bytes())!,
         nonce: nonce,
         wrapped: wrapped,
+        context: Vector<u8>.create(),
     };
     match (unwrapDataKey(borrow master, borrow e)) {
         Some(k) => { Check.equalBytes(dataKey[..], k[..])?; }
@@ -495,6 +500,7 @@ fn sseManagedKeysRotate() -> Result<void, TestFailure> {
         keyId: copyBytes("-".bytes())!,
         nonce: [0u8; 12],
         wrapped: [0u8; 48],
+        context: Vector<u8>.create(),
     };
     var field = Vector<u8>.create();
     encodeEnvelope(borrow c, mut field)!;
@@ -513,6 +519,7 @@ fn putSealed(s: borrow mut ObjectStore, key: StringView, text: Slice<u8>, stored
         keyId: copyBytes("k1".bytes())!,
         nonce: [0u8; 12],
         wrapped: [0u8; 48],
+        context: Vector<u8>.create(),
     };
     var field = Vector<u8>.create();
     encodeEnvelope(borrow e, mut field)!;
@@ -798,14 +805,16 @@ fn sseKmsSealsUnderNamedKeys() -> Result<void, TestFailure> {
     var masterKeys = Vector<MasterKey>.create();
     masterKeys.push(sseKeyOf("orders", 77))!;
     // No name: the KMS key file's first key; a name: that key; the envelope is SSE-KMS's and names it.
-    let byDefault = SseRequest.Kms(KmsKeyName { length: 0, bytes: [0u8; 32] });
+    let byDefault = SseRequest.Kms(KmsKeyName { length: 0, bytes: [0u8; 32], context: Vector<u8>.create() });
     let first = match (newSeal(masterKeys.view(), kmsKeys.view(), borrow byDefault)) {
         Ok(Some(s)) => s,
         _ => { return Check.fail("no SSE-KMS seal"); }
     };
     Check.isTrue(startsWithBytes(first.field.view(), "v1.kms.app-default.".bytes()), "the first key")?;
     Check.isTrue(first.kms && !first.customer, "SSE-KMS")?;
-    let named = SseRequest.Kms(kmsKeyNameOf("orders".bytes()) ?? KmsKeyName { length: 0, bytes: [0u8; 32] });
+    let named = SseRequest.Kms(
+        kmsKeyNameOf("orders".bytes()) ?? KmsKeyName { length: 0, bytes: [0u8; 32], context: Vector<u8>.create() },
+    );
     let seal = match (newSeal(masterKeys.view(), kmsKeys.view(), borrow named)) {
         Ok(Some(s)) => s,
         _ => { return Check.fail("no SSE-KMS seal"); }
@@ -818,7 +827,9 @@ fn sseKmsSealsUnderNamedKeys() -> Result<void, TestFailure> {
     // SSE-S3's master key of the same id does not open it: the mode is the wrapping's associated data.
     Check.isTrue(sseKeyFaultIs(managedDataKey(masterKeys.view(), seal.field.view()), SseKeyFault.Broken), "apart")?;
     // A name the file does not have, and no KMS key file at all.
-    let unknown = SseRequest.Kms(kmsKeyNameOf("nobody".bytes()) ?? KmsKeyName { length: 0, bytes: [0u8; 32] });
+    let unknown = SseRequest.Kms(
+        kmsKeyNameOf("nobody".bytes()) ?? KmsKeyName { length: 0, bytes: [0u8; 32], context: Vector<u8>.create() },
+    );
     Check.isTrue(newSeal(masterKeys.view(), kmsKeys.view(), borrow unknown).isErr(), "unknown key")?;
     let none = Vector<MasterKey>.create();
     Check.isTrue(newSeal(masterKeys.view(), none.view(), borrow byDefault).isErr(), "no KMS keys")?;
@@ -826,5 +837,46 @@ fn sseKmsSealsUnderNamedKeys() -> Result<void, TestFailure> {
     let sealer = sealerOf(borrow seal, 3, null)!;
     let md5 = Md5.of("abc".bytes());
     Check.isTrue(sealedEtag(borrow sealer, md5)[..] != md5[..], "not the MD5")?;
+    return Ok();
+}
+
+/// SSE-KMS's encryption context (ADR-0090 §6): taken as base64 of a JSON object of strings, kept in the envelope
+/// under the data key's seal, so an envelope whose context was changed does not open.
+@test
+fn kmsEncryptionContextIsSealed() -> Result<void, TestFailure> {
+    // {"team":"blue"}
+    let context = "eyJ0ZWFtIjoiYmx1ZSJ9";
+    Check.isTrue(encryptionContextOk(context.bytes())!, "a JSON object of strings")?;
+    for (bad in ["", "not base64!", "WzFd" /* [1] */, "eyJ0ZWFtIjoxfQ==" /* {"team":1} */]) {
+        Check.isFalse(encryptionContextOk(bad.bytes())!, bad)?;
+    }
+    let asked = sseOfFields(Some("aws:kms".bytes()), null, Some(context.bytes()), null, null, null).ok() ?? {
+        return Check.fail("the context taken");
+    };
+    var keys = Vector<MasterKey>.create();
+    keys.push(sseKeyOf("orders", 7))!;
+    let none = Vector<MasterKey>.create();
+    let seal = (newSeal(none.view(), keys.view(), borrow asked).ok() ?? null) ?? { return Check.fail("sealed"); };
+    let e = decodeEnvelope(seal.field.view())! ?? { return Check.fail("decoded"); };
+    Check.equalBytes(context.bytes(), e.context.view())?;
+    Check.isTrue(unwrapDataKey(borrow keys[0].key, borrow e).isSome(), "it opens")?;
+    // Another context in the same envelope: the seal does not open.
+    var changed = copyBytes(seal.field.view())!;
+    let last = changed.length - 2;
+    changed[last] = if (changed[last] == 'J') 'K' else 'J';
+    match (decodeEnvelope(changed.view())!) {
+        Some(t) => { Check.isTrue(unwrapDataKey(borrow keys[0].key, borrow t).isNull(), "a changed context")?; }
+        null => {}
+    }
+    // Without a context, the envelope is the five pieces it was.
+    let plain = sseOfFields(Some("aws:kms".bytes()), null, null, null, null, null).ok() ?? {
+        return Check.fail("no context");
+    };
+    let old = (newSeal(none.view(), keys.view(), borrow plain).ok() ?? null) ?? { return Check.fail("sealed"); };
+    var dots: usize = 0;
+    for (c in old.field.view()) {
+        if (c == '.') { dots += 1; }
+    }
+    Check.equalU64(4, dots as u64)?;
     return Ok();
 }

@@ -665,6 +665,13 @@ cmp -s got.bin want.bin && pass "SSE-KMS range" || fail "SSE-KMS range"
 check "SSE-KMS's ETag is not the MD5" "$([ "$(aws s3api head-object --bucket smoke --key sse/kms --query ETag --output text)" = "\"$(md5 -q sse.txt 2>/dev/null || md5sum sse.txt | cut -d' ' -f1)\"" ] && echo md5 || echo other)" other
 check "SSE-KMS, a key there is not" "$(code s3api put-object --bucket smoke --key sse/kms3 --body sse.txt --server-side-encryption aws:kms --ssekms-key-id nobody)" InvalidArgument
 check "SSE-KMS:DSSE" "$(code s3api put-object --bucket smoke --key sse/kms3 --body sse.txt --server-side-encryption aws:kms:dsse)" NotImplemented
+# SSE-KMS's encryption context (ADR-0090 §6): base64 JSON, kept under the data key's seal and returned.
+ctx=$(printf '{"team":"blue"}' | base64)
+# PutObject's answer carries the context, as botocore models it (HeadObject's and GetObject's do not).
+check "SSE-KMS with an encryption context, returned" "$(aws s3api put-object --bucket smoke --key sse/ctx --body sse.txt --server-side-encryption aws:kms --ssekms-encryption-context "$ctx" --query '[SSEKMSKeyId,SSEKMSEncryptionContext]' --output text 2>&1 | tr '\t' ' ')" "app-default $ctx"
+aws s3api get-object --bucket smoke --key sse/ctx got.txt > /dev/null 2>&1
+cmp -s got.txt sse.txt && pass "and read" || fail "and read"
+check "a context that is not JSON refused" "$(code s3api put-object --bucket smoke --key sse/ctx2 --body sse.txt --server-side-encryption aws:kms --ssekms-encryption-context bm90IGpzb24=)" InvalidArgument
 aws s3 cp --only-show-errors cp.bin s3://smoke/sse/kmsmp.bin --sse aws:kms --sse-kms-key-id orders > /dev/null 2>&1 || fail "SSE-KMS multipart cp"
 aws s3 cp --only-show-errors s3://smoke/sse/kmsmp.bin got.bin > /dev/null 2>&1
 cmp -s got.bin cp.bin && pass "SSE-KMS multipart both ways" || fail "SSE-KMS multipart both ways"

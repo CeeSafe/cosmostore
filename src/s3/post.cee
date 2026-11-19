@@ -563,6 +563,14 @@ async fn postObject(
     let formAcl = fieldOf(borrow fields, "acl").isSome();
     let formTags = fieldOf(borrow fields, "tagging").isSome();
     await authorizeWriteFields(app, req, borrow who, formAcl, formTags, req.bucket.view(), key.view())?;
+    // Its object lock fields, as PutObject's headers (ADR-0090 §5): their own actions too (ADR-0088 §2).
+    if (fieldOf(borrow fields, "x-amz-object-lock-mode").isSome() ||
+        fieldOf(borrow fields, "x-amz-object-lock-retain-until-date").isSome()) {
+        await authorize(app, req, borrow who, "s3:PutObjectRetention", req.bucket.view(), key.view())?;
+    }
+    if (fieldOf(borrow fields, "x-amz-object-lock-legal-hold").isSome()) {
+        await authorize(app, req, borrow who, "s3:PutObjectLegalHold", req.bucket.view(), key.view())?;
+    }
     let policyText = fieldOf(borrow fields, "policy") ?? "".bytes();
     var json = Vector<u8>.create();
     if (!decodeBase64(policyText, mut json)?) { return Err(S3Fail.Code(S3Code.InvalidPolicyDocument)); }
@@ -626,6 +634,26 @@ async fn postObject(
     // The form's canned ACL (ADR-0045 §3).
     match (fieldOf(borrow fields, "acl")) {
         Some(name) => { metadata = await withAcl(app, req.bucket.view(), cannedAcl(trimBlank(name))?, metadata)?; }
+        null => {}
+    }
+    // The form's object lock (ADR-0090 §5), as PutObject's fields: InvalidRequest in a bucket without object lock.
+    // Without them the store gives the bucket's default retention, if it has one.
+    match (lockOfFields(
+        fieldOf(borrow fields, "x-amz-object-lock-mode"),
+        fieldOf(borrow fields, "x-amz-object-lock-retain-until-date"),
+        fieldOf(borrow fields, "x-amz-object-lock-legal-hold"),
+        Clock.unixMillis(),
+    )?) {
+        Some(l) => {
+            let config = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_OBJECT_LOCK)?;
+            if (config.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            var text = Vector<u8>.create();
+            encodeLock(l, mut text)?;
+            metadata = match (metadataReplace(metadata.view(), LOCK_FIELD.bytes(), text.view())) {
+                Ok(b) => b,
+                Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+            };
+        }
         null => {}
     }
     if (metadata.length > MAX_METADATA_BYTES) { return Err(S3Fail.Code(S3Code.MetadataTooLarge)); }

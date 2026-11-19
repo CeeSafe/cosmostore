@@ -3625,3 +3625,22 @@ Browser form uploads with a SigV4 POST policy.
   - the SDK matrix, where boto3's and JavaScript's SHA-1 checks now expect it taken.
 - **One combined run** (tests beside both smokes and five SDKs at once) had 3 unit tests fail that pass alone. That
   was contention on this machine, recorded here rather than dismissed.
+
+### 19 Nov 2026: M12 slice 4, a POST form's object lock fields and SSE-KMS's encryption context (ADR-0090 §5, §6)
+
+- **POST:**
+  - the form's `x-amz-object-lock-mode`, `-retain-until-date` and `-legal-hold` act as PutObject's headers;
+  - they are InvalidRequest in a bucket without object lock;
+  - they are authorized as `s3:PutObjectRetention` and `s3:PutObjectLegalHold`.
+- **SSE-KMS:**
+  - `x-amz-server-side-encryption-context` is taken: base64 of a JSON object of strings, at most 4 KB;
+  - it is kept in the envelope's sixth piece and authenticated by the data key's seal;
+  - it is returned on PutObject, CopyObject and CreateMultipartUpload, as botocore models it, and on Head and Get.
+- **Unchanged:** an envelope without a context keeps its five pieces, so older objects read as before.
+- **Not added:** S3's default `aws:s3:arn` pair (ADR-0090 §6).
+- **Tests:**
+  - `kmsEncryptionContextIsSealed` (a changed context does not open);
+  - `sseRequestFields` updated;
+  - three S3 smoke checks;
+  - boto3's POST form under a legal hold;
+  - 385 unit tests, the cluster smoke (138) and the SDK matrix.

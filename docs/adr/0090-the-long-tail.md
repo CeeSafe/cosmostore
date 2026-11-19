@@ -31,16 +31,20 @@ purpose bucket. Each item below is small, and each becomes a row of the support 
 3. **ListMultipartUploads' `delimiter`:** CommonPrefixes, grouped as ListObjects groups keys, with `prefix` and the
    key and upload id markers.
 4. **SHA-1 checksums:** `x-amz-checksum-sha1` is checked, stored and returned (`x-amz-checksum-mode`), and composite
-   for multipart, as SHA-256 is. It uses lib/std's SHA-1, which `src/storage/checksums/checksums.cee` pins.
+   for multipart, as SHA-256 is. lib/std has no SHA-1 (CEESAFE_GAPS G26, still so in 0.77.1), so it is FIPS 180-4 in
+   plain CeeSafe (`src/storage/checksums/sha1.cee`), as CRC-32 is, checked against FIPS 180's vectors.
 5. **A POST form's object lock fields:** `x-amz-object-lock-mode`, `x-amz-object-lock-retain-until-date` and
    `x-amz-object-lock-legal-hold`, as the headers of PutObject (ADR-0047). They are authorized as
    `s3:PutObjectRetention` and `s3:PutObjectLegalHold` (ADR-0088 §2).
 6. **SSE-KMS's encryption context** (ADR-0055).
-   - **Taken:** `x-amz-server-side-encryption-context`, base64 JSON of string pairs, with S3's default context (the
-     bucket's ARN) added.
-   - **Where it is kept:** in the data key's envelope, as authenticated data of its seal, so a stored context cannot
-     be changed without the key failing to open.
-   - **Returned** on Head and Get.
+   - **Taken:** `x-amz-server-side-encryption-context`, base64 of a JSON object of strings, at most 4 KB, kept and
+     returned as the request gave it. S3 also adds its default pair, `aws:s3:arn` (the bucket's or the object's ARN);
+     CosmoStore does not, since its KMS is a local key file that no one else asks about. A client that compares the
+     context it gets back with the one it sent sees them equal here, and on AWS sees the extra pair.
+   - **Where it is kept:** in the data key's envelope (`v1.kms.<key>.<nonce>.<wrapped>.<context>`), as authenticated
+     data of its seal, so a stored context cannot be changed without the key failing to open.
+   - **Returned** on PutObject, CopyObject and CreateMultipartUpload, as AWS's models answer it, and on Head and Get
+     too, where SDKs do not read it.
    - **Compatibility:** objects sealed before it have none, and read as before. `aws:kms:dsse` stays refused.
 7. **On a cluster:** every item, through every node. **Slices** follow this order, each with its smoke and SDK
    checks.

@@ -398,6 +398,12 @@ copy_version = s3.head_object(Bucket=L, Key="copy")["VersionId"]
 check("a held version, with a bypass", code_of(lambda: s3.delete_object(Bucket=L, Key="copy", VersionId=copy_version, BypassGovernanceRetention=True)), "AccessDenied")
 s3.put_object_legal_hold(Bucket=L, Key="copy", LegalHold={"Status": "OFF"})
 check("the hold taken off", s3.get_object_legal_hold(Bucket=L, Key="copy")["LegalHold"]["Status"], "OFF")
+# A POST form's object lock fields (ADR-0090 §5), as PutObject's headers.
+held = s3.generate_presigned_post(L, "posted", Fields={"x-amz-object-lock-legal-hold": "ON"},
+                                  Conditions=[{"x-amz-object-lock-legal-hold": "ON"}], ExpiresIn=60)
+status, _, _ = post_form(held["url"], held["fields"], "p.txt", b"posted under a hold")
+check("a POST form's legal hold", (status, s3.head_object(Bucket=L, Key="posted").get("ObjectLockLegalHoldStatus")), (204, "ON"))
+s3.put_object_legal_hold(Bucket=L, Key="posted", LegalHold={"Status": "OFF"})
 s3.put_object_lock_configuration(Bucket=L, ObjectLockConfiguration={"ObjectLockEnabled": "Enabled",
     "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Years": 1}}})
 check("the default retention", s3.get_object_lock_configuration(Bucket=L)["ObjectLockConfiguration"]["Rule"]["DefaultRetention"], {"Mode": "GOVERNANCE", "Years": 1})

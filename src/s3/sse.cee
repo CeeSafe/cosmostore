@@ -435,16 +435,30 @@ fn sseModeText(customer: bool) -> StringView => if (customer) "c" else "s3";
 /// An envelope's mode, as its text holds it: `s3`, `c` or `kms` (ADR-0055).
 fn envelopeMode(e: borrow SseEnvelope) -> StringView => if (e.kms) "kms" else sseModeText(e.customer);
 
+/// What the data key's seal authenticates: the envelope's mode, and, with an encryption context, `.` and it.
+fn envelopeAad(e: borrow SseEnvelope) -> Result<Vector<u8>, AllocError> {
+    var aad = copyBytes(envelopeMode(e).bytes())?;
+    if (e.context.length > 0) {
+        aad.push('.')?;
+        aad.extend(e.context.view())?;
+    }
+    return Ok(aad);
+}
+
 /// A data key sealed under `master` (a master key, or the request's key for SSE-C) with `nonce`, which must be
 /// random: the envelope's last two fields.
-fn wrapDataKey(master: borrow [u8; 32], mode: StringView, dataKey: borrow [u8; 32], nonce: [u8; 12]) -> [u8; 48]? {
+fn wrapDataKey(master: borrow [u8; 32], mode: StringView, dataKey: borrow [u8; 32], nonce: [u8; 12]) -> [u8; 48]? =>
+    wrapDataKeyWith(master, mode.bytes(), dataKey, nonce);
+
+/// `wrapDataKey`, its seal authenticating `aad`.
+fn wrapDataKeyWith(master: borrow [u8; 32], aad: Slice<u8>, dataKey: borrow [u8; 32], nonce: [u8; 12]) -> [u8; 48]? {
     let cipher = match (sseCipher(master)) {
         Some(c) => c,
         null => { return null; }
     };
     var sealed = [0u8; 32];
     for (i in 0..32) { sealed[i] = dataKey[i]; }
-    let tag = cipher.seal(nonce, mode.bytes(), mut sealed[..]);
+    let tag = cipher.seal(nonce, aad, mut sealed[..]);
     var wrapped = [0u8; 48];
     for (i in 0..32) { wrapped[i] = sealed[i]; }
     for (i in 0..16) { wrapped[32 + i] = tag[i]; }
@@ -461,7 +475,8 @@ fn unwrapDataKey(master: borrow [u8; 32], e: borrow SseEnvelope) -> [u8; 32]? {
     var tag = [0u8; 16];
     for (i in 0..32) { key[i] = e.wrapped[i]; }
     for (i in 0..16) { tag[i] = e.wrapped[32 + i]; }
-    if (!cipher.open(e.nonce, envelopeMode(e).bytes(), mut key[..], tag)) { return null; }
+    let aad = envelopeAad(e).ok() ?? { return null; };
+    if (!cipher.open(e.nonce, aad.view(), mut key[..], tag)) { return null; }
     return key;
 }
 
@@ -476,6 +491,9 @@ struct SseEnvelope {
     keyId: Vector<u8>;
     nonce: [u8; 12];
     wrapped: [u8; 48];
+    /// SSE-KMS's encryption context (ADR-0090 §6), base64 as the request gave it; empty for none. The data key's seal
+    /// covers it, so a stored context cannot be changed without the key failing to open.
+    context: Vector<u8>;
 }
 
 fn isKeyId(id: Slice<u8>) -> bool {
@@ -498,6 +516,10 @@ fn encodeEnvelope(e: borrow SseEnvelope, out: borrow mut Vector<u8>) -> Result<v
     appendHexBytes(out, e.nonce[..])?;
     out.push('.')?;
     appendHexBytes(out, e.wrapped[..])?;
+    if (e.context.length > 0) {
+        out.push('.')?;
+        out.extend(e.context.view())?;
+    }
     return Ok();
 }
 
@@ -515,16 +537,17 @@ fn hexInto(text: Slice<u8>, out: SliceMut<u8>) -> bool {
 
 /// A stored envelope; null for a field that is not one.
 fn decodeEnvelope(text: Slice<u8>) -> Result<SseEnvelope?, AllocError> {
-    var pieces = [0usize; 6];
+    // Five pieces, or six for SSE-KMS with an encryption context (ADR-0090 §6).
+    var pieces = [0usize; 7];
     var count: usize = 1;
     for (i in 0..text.length) {
         if (text[i] != '.') { continue; }
-        if (count == 5) { return Ok(null); }
+        if (count == 6) { return Ok(null); }
         pieces[count] = i + 1;
         count += 1;
     }
-    if (count != 5) { return Ok(null); }
-    pieces[5] = text.length + 1;
+    if (count != 5 && count != 6) { return Ok(null); }
+    pieces[count] = text.length + 1;
     if (text[pieces[0]..pieces[1] - 1] != "v1".bytes()) { return Ok(null); }
     let mode = text[pieces[1]..pieces[2] - 1];
     let customer = mode == "c".bytes();
@@ -538,9 +561,15 @@ fn decodeEnvelope(text: Slice<u8>) -> Result<SseEnvelope?, AllocError> {
         keyId: copyBytes(id)?,
         nonce: [0u8; 12],
         wrapped: [0u8; 48],
+        context: Vector<u8>.create(),
     };
     if (!hexInto(text[pieces[3]..pieces[4] - 1], mut e.nonce[..])) { return Ok(null); }
     if (!hexInto(text[pieces[4]..pieces[5] - 1], mut e.wrapped[..])) { return Ok(null); }
+    if (count == 6) {
+        let context = text[pieces[5]..pieces[6] - 1];
+        if (!kms || context.length == 0 || !isBase64Text(context)) { return Ok(null); }
+        e.context.extend(context)?;
+    }
     return Ok(Some(e));
 }
 
@@ -625,6 +654,8 @@ enum SseRequest {
 struct KmsKeyName {
     length: usize;
     bytes: [u8; 32];
+    /// The request's encryption context (ADR-0090 §6), base64 as given; empty for none.
+    context: Vector<u8>;
 
     fn view(borrow this) -> Slice<u8> => this.bytes[0..this.length];
 }
@@ -638,14 +669,47 @@ fn kmsKeyNameOf(text: Slice<u8>) -> KmsKeyName? {
     }
     let id = t[from..];
     if (!isKeyId(id)) { return null; }
-    var name = KmsKeyName { length: id.length, bytes: [0u8; 32] };
+    var name = KmsKeyName { length: id.length, bytes: [0u8; 32], context: Vector<u8>.create() };
     for (i in 0..id.length) { name.bytes[i] = id[i]; }
     return name;
 }
 
+/// The most bytes of an encryption context, as base64.
+const MAX_ENCRYPTION_CONTEXT: usize = 4096;
+
+/// Whether `text` is only base64's characters.
+fn isBase64Text(text: Slice<u8>) -> bool {
+    for (c in text) {
+        let ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' ||
+            c == '=';
+        if (!ok) { return false; }
+    }
+    return true;
+}
+
+/// Whether an encryption context is S3's: base64 of a JSON object whose members are all strings, at most
+/// MAX_ENCRYPTION_CONTEXT bytes.
+fn encryptionContextOk(text: Slice<u8>) -> Result<bool, AllocError> {
+    if (text.length == 0 || text.length > MAX_ENCRYPTION_CONTEXT || !isBase64Text(text)) { return Ok(false); }
+    var json = Vector<u8>.create();
+    if (!decodeBase64(text, mut json)?) { return Ok(false); }
+    var r = JsonReader { text: json.view(), at: 0 };
+    if (!r.take('{')) { return Ok(false); }
+    if (r.take('}')) { r.skipSpace(); return Ok(r.at == json.length); }
+    var piece = Vector<u8>.create();
+    while (true) {
+        if (!r.string(mut piece)? || !r.take(':') || !r.string(mut piece)?) { return Ok(false); }
+        if (r.take(',')) { continue; }
+        if (r.take('}')) { break; }
+        return Ok(false);
+    }
+    r.skipSpace();
+    return Ok(r.at == json.length);
+}
+
 /// The encryption a request's fields ask for: the SSE-S3 field (`AES256`, or `aws:kms` with the KMS key's id), or
-/// the three customer fields (the algorithm, the key in base64 and its MD5 in base64), not both. An encryption
-/// context and `aws:kms:dsse` are NotImplemented (ADR-0055).
+/// the three customer fields (the algorithm, the key in base64 and its MD5 in base64), not both. SSE-KMS's encryption
+/// context is taken (ADR-0090 §6); `aws:kms:dsse` is NotImplemented (ADR-0055).
 fn sseOfFields(
     managed: Slice<u8>?,
     kmsKeyId: Slice<u8>?,
@@ -667,14 +731,20 @@ fn sseOfFields(
             if (customer) { return Err(invalid); }
             if (trimBlank(m) == "AES256".bytes()) { return Ok(SseRequest.Managed); }
             if (kms) {
-                if (context.isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-                return match (kmsKeyId) {
-                    Some(id) => match (kmsKeyNameOf(id)) {
-                        Some(name) => Ok(SseRequest.Kms(name)),
-                        null => Err(invalid),
-                    },
-                    null => Ok(SseRequest.Kms(KmsKeyName { length: 0, bytes: [0u8; 32] })),
+                var name = match (kmsKeyId) {
+                    Some(id) => kmsKeyNameOf(id) ?? { return Err(invalid); },
+                    null => KmsKeyName { length: 0, bytes: [0u8; 32], context: Vector<u8>.create() },
                 };
+                // The encryption context (ADR-0090 §6): base64 of a JSON object of strings, kept as given.
+                match (context) {
+                    Some(c) => {
+                        let text = trimBlank(c);
+                        if (!encryptionContextOk(text)?) { return Err(invalid); }
+                        name.context.extend(text)?;
+                    }
+                    null => {}
+                }
+                return Ok(SseRequest.Kms(name));
             }
             if (trimBlank(m) == "aws:kms:dsse".bytes()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
             return Err(invalid);
@@ -838,7 +908,12 @@ fn sseAnswerOf(exchange: borrow mut Exchange, envelope: Slice<u8>, customer: [u8
     if (isKmsEnvelope(envelope)) {
         exchange.header(SSE_FIELD, "aws:kms".bytes())?;
         match (decodeEnvelope(envelope)?) {
-            Some(e) => { exchange.header("x-amz-server-side-encryption-aws-kms-key-id", e.keyId.view())?; }
+            Some(e) => {
+                exchange.header("x-amz-server-side-encryption-aws-kms-key-id", e.keyId.view())?;
+                if (e.context.length > 0) {
+                    exchange.header("x-amz-server-side-encryption-context", e.context.view())?;
+                }
+            }
             null => {}
         }
         return Ok();
@@ -878,13 +953,31 @@ struct NewSeal {
 }
 
 /// A new object's data key wrapped under `wrapping` (a master key, or the request's for SSE-C).
-fn newSealUnder(wrapping: borrow [u8; 32], customer: bool, kms: bool, keyId: Slice<u8>) -> Result<NewSeal, S3Fail> {
+fn newSealUnder(wrapping: borrow [u8; 32], customer: bool, kms: bool, keyId: Slice<u8>) -> Result<NewSeal, S3Fail> =>
+    newSealWith(wrapping, customer, kms, keyId, "".bytes());
+
+/// `newSealUnder`, with SSE-KMS's encryption context (empty for none) in the envelope and under its seal.
+fn newSealWith(
+    wrapping: borrow [u8; 32],
+    customer: bool,
+    kms: bool,
+    keyId: Slice<u8>,
+    context: Slice<u8>,
+) -> Result<NewSeal, S3Fail> {
     let failed = S3Fail.Code(S3Code.InternalError);
     var dataKey = [0u8; 32];
     var nonce = [0u8; 12];
     if (Random.fill(mut dataKey[..]).isErr() || Random.fill(mut nonce[..]).isErr()) { return Err(failed); }
-    var e = SseEnvelope { customer: customer, kms: kms, keyId: copyBytes(keyId)?, nonce: nonce, wrapped: [0u8; 48] };
-    e.wrapped = match (wrapDataKey(wrapping, envelopeMode(borrow e), borrow dataKey, nonce)) {
+    var e = SseEnvelope {
+        customer: customer,
+        kms: kms,
+        keyId: copyBytes(keyId)?,
+        nonce: nonce,
+        wrapped: [0u8; 48],
+        context: copyBytes(context)?,
+    };
+    let aad = envelopeAad(borrow e)?;
+    e.wrapped = match (wrapDataKeyWith(wrapping, aad.view(), borrow dataKey, nonce)) {
         Some(w) => w,
         null => { return Err(failed); }
     };
@@ -908,10 +1001,11 @@ fn newManagedSeal(keys: Slice<MasterKey>) -> Result<NewSeal, S3Fail> {
 /// Without a KMS key file, NotImplemented, as before; a name the file does not have is InvalidArgument.
 fn newKmsSeal(kmsKeys: Slice<MasterKey>, name: borrow KmsKeyName) -> Result<NewSeal, S3Fail> {
     if (kmsKeys.length == 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
-    if (name.length == 0) { return newSealUnder(borrow kmsKeys[0].key, false, true, kmsKeys[0].id.view()); }
+    let context = name.context.view();
+    if (name.length == 0) { return newSealWith(borrow kmsKeys[0].key, false, true, kmsKeys[0].id.view(), context); }
     for (i in 0..kmsKeys.length) {
         if (kmsKeys[i].id.view() == name.view()) {
-            return newSealUnder(borrow kmsKeys[i].key, false, true, kmsKeys[i].id.view());
+            return newSealWith(borrow kmsKeys[i].key, false, true, kmsKeys[i].id.view(), context);
         }
     }
     return Err(S3Fail.Code(S3Code.InvalidArgument));
@@ -1010,7 +1104,9 @@ fn defaultOfStored(stored: Slice<u8>) -> SseRequest {
     if (stored.length == 0) { return SseRequest.None; }
     if (startsWithBytes(stored, "aws:kms".bytes())) {
         let id = if (stored.length > 8) stored[8..] else "".bytes();
-        return SseRequest.Kms(kmsKeyNameOf(id) ?? KmsKeyName { length: 0, bytes: [0u8; 32] });
+        return SseRequest.Kms(
+            kmsKeyNameOf(id) ?? KmsKeyName { length: 0, bytes: [0u8; 32], context: Vector<u8>.create() },
+        );
     }
     return SseRequest.Managed;
 }
