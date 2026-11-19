@@ -280,7 +280,12 @@ loglines() {
     on 1 s3 cp --recursive "s3://$logsb/in/" logsdir/ > /dev/null 2>&1
     cat logsdir/* 2>/dev/null
 }
-for i in $(seq 1 40); do [ "$(loglines | grep -c 'REST.PUT.OBJECT seen')" = 3 ] && break; pause 0.5; done
+# Both kinds of line: the GET's may land in a later log object than the PUTs'.
+for i in $(seq 1 40); do
+    got=$(loglines)
+    [ "$(printf '%s\n' "$got" | grep -c 'REST.PUT.OBJECT seen')" = 3 ] && [ "$(printf '%s\n' "$got" | grep -c 'REST.GET.OBJECT seen1')" = 1 ] && break
+    pause 0.5
+done
 check "the three PUTs through three nodes, in its access log" "$(loglines | grep -c 'REST.PUT.OBJECT seen')" 3
 check "and the GET" "$(loglines | grep -c 'REST.GET.OBJECT seen1')" 1
 check "a line names its bucket and requester" "$(loglines | grep 'REST.PUT.OBJECT seen2' | awk '{ print $2, $6 }')" "logged $AWS_ACCESS_KEY_ID"
