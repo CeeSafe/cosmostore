@@ -1,6 +1,6 @@
 # ADR-0083: S3 Tables and the Iceberg REST catalog (M9)
 
-**Status:** proposed, 19 Nov 2026. All four slices built the same day. The owner: "Next we need s3 tables iceberg". ADR-0079 §1 item 2 and §4 sketched
+**Status:** accepted, 19 Nov 2026 (the owner: "I accept ADR-0083 and ADR-0084"). Proposed the same day. All four slices built the same day. The owner: "Next we need s3 tables iceberg". ADR-0079 §1 item 2 and §4 sketched
 S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR is that design, as M9's one item.
 
 ## Context
@@ -71,7 +71,7 @@ S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR
   - A JSON reader (policies, ADR-0043), with no JSON value model.
   - Hidden reserved bucket names (directory buckets, ADR-0080).
 
-## Decision (proposed)
+## Decision
 
 1. **Routing by the signature's service.**
    - A request signed for `s3tables` is S3 Tables': the table bucket calls on the paths above, and the Iceberg REST

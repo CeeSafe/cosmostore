@@ -1,6 +1,6 @@
 # ADR-0084: Policies for S3 Tables, and table buckets made before M9
 
-**Status:** proposed, 19 Nov 2026. The owner, on M9's exit review's B6 and B9 (recorded then as not done): "Tackle
+**Status:** accepted, 19 Nov 2026 (the owner: "I accept ADR-0083 and ADR-0084"). Proposed the same day. The owner, on M9's exit review's B6 and B9 (recorded then as not done): "Tackle
 those two findings you recorded."
 
 ## Context
@@ -31,7 +31,7 @@ those two findings you recorded."
   - A key may do what no Deny refuses, and an anonymous request needs an Allow. The policy calls themselves are never
     refused to a key (ADR-0043 §4), so a key cannot lock itself out.
 
-## Decision (proposed)
+## Decision
 
 1. **Table bucket policies and table policies** (B6), with the six calls above.
    - **The grammar** is a bucket policy's (ADR-0043 §3):

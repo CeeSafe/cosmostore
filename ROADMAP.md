@@ -3222,3 +3222,9 @@ Browser form uploads with a SigV4 POST policy.
     refuses to start, naming it. The old release moves the object out, and the server then starts; with a real
     table bucket holding data, it restarts.
 - **Next:** the owner's word on ADR-0083 and ADR-0084, and on closing M9.
+
+### 19 Nov 2026: ADR-0083 and ADR-0084 accepted
+
+- The owner: "I accept ADR-0083 and ADR-0084". S3 Tables and the Iceberg REST catalog, with their policies, are done:
+  on `serve` and on a cluster, through PyIceberg and every SDK of the matrix, M9's exit review's findings closed.
+- **Next:** the owner's word on closing M9.
