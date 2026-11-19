@@ -45,6 +45,12 @@ pause() { perl -e "select(undef, undef, undef, $1)"; }
 export AWS_ACCESS_KEY_ID=AKIACLUSTERSMOKE0001 AWS_SECRET_ACCESS_KEY=clustersmokesecret0123456789 AWS_DEFAULT_REGION=us-east-1
 export AWS_MAX_ATTEMPTS=6 AWS_RETRY_MODE=standard
 echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > credentials
+# Users (ADR-0088 §5): the same users file on every node.
+printf '%s\n' "AKIACLUSTERREADER001 reader/secret/0123456789abcdefgh" "AKIACLUSTERANALYST01 analyst/secret/0123456789abcdefg" >> credentials
+cat > users <<'USERS'
+reader AKIACLUSTERREADER001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::team-c","arn:aws:s3:::team-c/*"]}}
+analyst AKIACLUSTERANALYST01 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":["arn:aws:s3tables:*:*:bucket/lake-c","arn:aws:s3tables:*:*:bucket/lake-c/table/*"]}}
+USERS
 head -c 32 /dev/urandom | base64 > cluster.key
 cat > cluster.conf <<EOF
 cluster 00c1a55e5e0c1a55
@@ -71,7 +77,7 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --tables-day-seconds 24 --zone-id local-az1 >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --users-file users --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --tables-day-seconds 24 --zone-id local-az1 >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -428,6 +434,27 @@ if [ -n "${ICEBERG_PYTHON:-}" ]; then
 fi
 for t in tables-a tables-b; do on 3 s3tables delete-table-bucket --table-bucket-arn "arn:aws:s3tables:us-east-1:000000000000:bucket/$t" > /dev/null 2>&1; done
 check "deleted through node 3" "$(on 1 s3tables list-table-buckets --query 'length(tableBuckets)' 2>&1)" 0
+
+# Users on a cluster (ADR-0088 §5): each shard decides a user's request as `serve` does, through any node.
+reader() { AWS_ACCESS_KEY_ID=AKIACLUSTERREADER001 AWS_SECRET_ACCESS_KEY=reader/secret/0123456789abcdefgh on "$@"; }
+analyst() { AWS_ACCESS_KEY_ID=AKIACLUSTERANALYST01 AWS_SECRET_ACCESS_KEY=analyst/secret/0123456789abcdefg on "$@"; }
+denied() { "$@" 2>&1 | grep -o 'AccessDenied\|ForbiddenException' | head -1; }
+on 1 s3api create-bucket --bucket team-c > /dev/null 2>&1
+on 1 s3api create-bucket --bucket other-c > /dev/null 2>&1
+on 2 s3api put-object --bucket team-c --key a.txt --body one.txt > /dev/null 2>&1
+on 2 s3api put-object --bucket other-c --key a.txt --body one.txt > /dev/null 2>&1
+reader 2 s3api get-object --bucket team-c --key a.txt users.out > /dev/null 2>&1 && pass "a user reads through node 2" || fail "a user reads through node 2"
+check "not writes, through node 3" "$(denied reader 3 s3api put-object --bucket team-c --key b.txt --body one.txt)" AccessDenied
+check "nor another bucket, through node 1" "$(denied reader 1 s3api get-object --bucket other-c --key a.txt users.out)" AccessDenied
+check "nor every bucket, merged on the front" "$(denied reader 1 s3api list-buckets)" AccessDenied
+lakec=$(on 1 s3tables create-table-bucket --name lake-c --query arn --output text 2>&1)
+on 2 s3tables create-namespace --table-bucket-arn "$lakec" --namespace ns > /dev/null 2>&1
+on 3 s3tables create-table --table-bucket-arn "$lakec" --namespace ns --name t --format ICEBERG > /dev/null 2>&1
+check "a user reads a table through node 3" "$(analyst 3 s3tables get-table --table-bucket-arn "$lakec" --namespace ns --name t --query name --output text 2>&1)" t
+check "and drops none, through node 2" "$(denied analyst 2 s3tables delete-table --table-bucket-arn "$lakec" --namespace ns --name t)" ForbiddenException
+on 1 s3tables delete-table --table-bucket-arn "$lakec" --namespace ns --name t > /dev/null 2>&1
+on 1 s3tables delete-namespace --table-bucket-arn "$lakec" --namespace ns > /dev/null 2>&1
+for attempt in 1 2 3; do on 1 s3tables delete-table-bucket --table-bucket-arn "$lakec" > /dev/null 2>&1 && break; pause 0.5; done
 
 # Event notifications on a cluster (ADR-0078 §4): the shard's leader delivers, and a new one goes on.
 keys() { python3 -c 'import json,sys

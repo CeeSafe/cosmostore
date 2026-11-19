@@ -3461,3 +3461,16 @@ Browser form uploads with a SigV4 POST policy.
     refused writes, drops and ListTableBuckets. In the role it assumes, reads are taken and drops refused. Another
     user may not assume the role.
 - **Next:** slice 3, the cluster.
+
+### 19 Nov 2026: M11 slice 3, users on a cluster (ADR-0088 §5)
+
+- **`node --users-file`:** every node takes the same file, read with its credentials at start. The node does not
+  reload its credentials yet, so neither does it reload its users.
+- **Each shard decides** a user's request as `serve` does. The front's merged calls are decided by the shards that
+  answer them.
+- **Tests:** the cluster smoke's 140 pass. A user reads through node 2, and is refused writes through node 3,
+  another bucket through node 1, and ListBuckets merged on the front. Another reads a table through node 3 and
+  drops none through node 2.
+- **CI on `6771a13`:** the perf gate failed on large writes at c32, confirmed in both passes, with the runner's noise
+  at 2.00. A re-run of the same job on the same code passed, so that was the runner's noise.
+- **Next:** slice 4, the SDK matrix and M11's exit review.
