@@ -1,6 +1,7 @@
 # ADR-0092: A cluster as `serve`: reloaded keys and users, SSE's keys (M13)
 
-**Status:** proposed, 19 Nov 2026. M13 is item A of ADR-0091 (the owner: "A. - Each node watches its own files").
+**Status:** accepted, 20 Nov 2026 (the owner: "Accept and close"), as amended after M13's exit review. Proposed
+19 Nov 2026. M13 is item A of ADR-0091 (the owner: "A. - Each node watches its own files").
 
 ## Context
 
@@ -19,7 +20,7 @@
   - **The result:** SSE-S3 is refused (InvalidRequest) and SSE-KMS is NotImplemented on a cluster. SSE-C, which
     brings its key, works. `docs/compatibility.md` does not say so.
 
-## Decision (proposed)
+## Decision
 
 1. **Each node reloads its files** (the owner's choice: each node watches its own).
    - **How:** a node with `--credentials` runs `serve`'s `Rotation` on its one credential set, every 2 seconds,

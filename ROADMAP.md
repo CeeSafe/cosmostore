@@ -314,7 +314,10 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 
 ### M13: A cluster as `serve`
 
-The owner chose ADR-0091's item A (19 Nov 2026), each node watching its own files. ADR-0092 (proposed) designs it:
+**Closed 20 Nov 2026** (the owner: "Accept and close"; `docs/m13-exit-review.md`).
+
+The owner chose ADR-0091's item A (19 Nov 2026), each node watching its own files. ADR-0092 (accepted 20 Nov 2026)
+designs it:
 - **Reloads:** each node reloads its credentials and users files as `serve` does, so a revocation needs no
   restart.
 - **SSE:** `node --sse-key-file` and `--kms-key-file`, so SSE-S3 and SSE-KMS work on a cluster.
@@ -3786,3 +3789,17 @@ Browser form uploads with a SigV4 POST policy.
   the shard's delivery. Only a 200 with an error body is retried now.
 - **Tests:** 387 unit tests, the S3 smoke, the cluster smoke (163) and the SDK matrix pass, and the reviewer's repro
   on the final build.
+
+### 20 Nov 2026: M13 closed, ADR-0092 accepted
+
+- **The owner:** "Accept and close".
+- **At closing (`9625144`):** 387 unit tests, the S3 smoke, the cluster smoke (163) and the SDK matrix pass.
+- **What a cluster now does as `serve` does:**
+  - reloads its keys and users on every node, a request passing only if both the node it reaches and its shard's
+    leader accept its key;
+  - SSE-S3 and SSE-KMS through any node.
+- **Found and fixed on the way, before M13:**
+  - two refusals in one delivery batch lost one;
+  - a replica's Complete answered 4xx was retried for ever.
+- **Next:** M14, when the owner asks for one. ADR-0091's B (configurations decided at delivery) is the next
+  candidate.

@@ -96,3 +96,11 @@ Closing M13 and accepting ADR-0092 are the owner's decisions.
 **Found while fixing:** a replica's CompleteMultipartUpload that answered a 4xx was tried for ever. The check for
 S3's "200 with an error in its body" matched any error body, and held the shard's whole delivery behind it. Only a
 200 is now read that way. This predates M13, and the repro showed it: three replicas PENDING after 40 s.
+
+## Closed (20 Nov 2026)
+
+The owner accepted ADR-0092, as amended, and closed M13 ("Accept and close").
+
+**Still recorded, Low:**
+- nothing checks at start that the nodes' files match;
+- master keys' copies are not wiped, as on `serve`.
