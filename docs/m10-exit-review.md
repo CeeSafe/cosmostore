@@ -152,3 +152,5 @@ Closing M10 and accepting ADR-0086 are the owner's decisions.
 - **Expiry** keeps what Iceberg's own keeps on every branch.
 
 M10's "done when" holds, and M10 can close on the owner's word.
+
+**Closed** by the owner, 19 Nov 2026 ("Accept and close"), with ADR-0086 accepted.

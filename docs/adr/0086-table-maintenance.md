@@ -1,6 +1,6 @@
 # ADR-0086: Table maintenance, snapshot management and unreferenced file removal (M10)
 
-**Status:** proposed, 19 Nov 2026. M10 is item A of ADR-0085 (the owner: "A, and write the decoder here first").
+**Status:** accepted, 19 Nov 2026 (the owner: "Accept and close"). Proposed the same day. M10 is item A of ADR-0085 (the owner: "A, and write the decoder here first").
 
 ## Context
 
@@ -29,7 +29,7 @@
   (`--maintain-seconds`), and a purge of a warehouse prefix. It has no Avro reader, and no inflate decoder:
   lib/std has none (G35). The owner chose to write the decoder here first.
 
-## Decision (proposed)
+## Decision
 
 1. **The calls**, as AWS's model has them:
    - **Configuration:** Put/GetTableBucketMaintenanceConfiguration for `icebergUnreferencedFileRemoval`, and

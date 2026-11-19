@@ -314,13 +314,18 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 
 ### M10: Table maintenance
 
-The owner chose ADR-0085's item A, "and write the decoder here first" (19 Nov 2026). ADR-0086 (proposed) designs it:
+The owner chose ADR-0085's item A, "and write the decoder here first" (19 Nov 2026). ADR-0086 (accepted 19 Nov 2026)
+designs it:
 - **Snapshot management:** snapshots are expired by age, keeping refs' heads and the newest few.
 - **Unreferenced file removal:** files no snapshot references are noted, then deleted after
   `unreferencedDays + nonCurrentDays`. A run that cannot read a manifest deletes nothing.
 - **The readers:** an inflate decoder and an Avro reader, with no C.
 - **Done when** a PyIceberg table appended to many times keeps its warehouse bounded and still reads back, on `serve`
   and on a cluster.
+
+**Closed 19 Nov 2026** (`docs/m10-exit-review.md`): snapshot management and unreferenced file removal on `serve` and on
+a cluster (ADR-0086), with an inflate decoder and an Avro reader. The exit review's findings are closed: removal
+deletes only what no reference names.
 
 ---
 
@@ -3368,3 +3373,15 @@ Browser form uploads with a SigV4 POST policy.
   `0a35dc0`, has the same server code (slice 5 changed only the SDK checks), and its perf gate passed, as did
   `22bdd44`'s. So that was the runner's noise.
 - **Next:** the owner's word on ADR-0086 and on closing M10.
+
+### 19 Nov 2026: ADR-0086 accepted; M10 closed
+
+- **The owner:** "Accept and close". CI on `cd20007` passed: 373 tests, the smokes with the maintenance check and
+  PyIceberg, and the perf gate. All five SDKs pass on the fixed build.
+- **M10 (table maintenance) is closed** (ADR-0085, ADR-0086; `docs/m10-exit-review.md`). It covers:
+  - the maintenance calls and job status;
+  - snapshot management, as Iceberg's own expiry keeps;
+  - unreferenced file removal that fails safe;
+  - all of it on `serve` and on a cluster, through PyIceberg and every SDK of the matrix.
+- **Not done, and refused:** compaction, and refs' `max-ref-age-ms`.
+- **Next:** M11, when the owner proposes one; ADR-0085's item B (identities) was named the next candidate.
