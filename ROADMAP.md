@@ -3335,3 +3335,16 @@ Browser form uploads with a SigV4 POST policy.
   back. Each reads a table's (compaction off) and its job status. boto3 does all of maintenance through
   `maintenance_check.py`. All five pass.
 - **Next:** M10's exit review.
+
+### 19 Nov 2026: M10's exit review (`docs/m10-exit-review.md`)
+
+- **How it was checked:** the tests, both smokes and the SDK matrix pass. Two reviews by readers who had not written
+  the code: safety (reproducing three findings) and conformance (AWS's model, Avro 1.11, RFC 1951).
+- **Verdict: not yet.**
+  - **A1:** a reference unreferenced removal cannot place is skipped, and its files are then deleted: `s3a://`,
+    `s3n://`, v1 inline manifests.
+  - **B1:** a crafted manifest's count panics the server every hourly pass.
+  - **Also:** other tables' paths (A2), encoded paths (A3), expiry's walk and other branches (A4, A5), and the
+    decoder's memory (B2).
+- **Until A1 and B1 are fixed,** unreferenced removal (enabled by default) should not run on real tables.
+- **Next:** fix the findings, if the owner agrees.
