@@ -3385,3 +3385,17 @@ Browser form uploads with a SigV4 POST policy.
   - all of it on `serve` and on a cluster, through PyIceberg and every SDK of the matrix.
 - **Not done, and refused:** compaction, and refs' `max-ref-age-ms`.
 - **Next:** M11, when the owner proposes one; ADR-0085's item B (identities) was named the next candidate.
+
+### 19 Nov 2026: M11 proposed (ADR-0087)
+
+- **The owner:** "propose M11". ADR-0087 (proposed) gives three candidates, one to be M11:
+  - **A, identities:** users, their keys and identity policies, decided with resource policies as IAM does in one
+    account. AssumeRole in S3 Tables.
+  - **B, the long tail:** lifecycle transitions, ListMultipartUploads' `delimiter`, SHA-1, the rest.
+  - **C, compaction for S3 Tables:** Parquet.
+- **Recommended: A.** Every deployment past one application needs a key that can do less than everything.
+  - It stands on roles' identity policies, ADR-0043's and ADR-0084's resource policies, and ADR-0050's reloaded
+    file.
+  - An existing deployment changes nothing until it writes a users file.
+- **For A, the owner's choice too:** a users file (recommended), users in the credentials file, or the IAM API.
+- **Next:** the owner's choice.
