@@ -38,8 +38,7 @@ configuration is decided as its parent (the owner's choice).
      - **Any requester** that is denied, or not allowed.
 3. **A refused write is reported, not retried:**
    - **A replica:** its source's status FAILED, as a destination's refusal is (ADR-0077 §7).
-   - **An inventory report or a log object:** it is not written. The refusal is logged once per configuration and
-     run, and counted in the stats.
+   - **An inventory report or a log object:** it is not written. The refusal is logged.
    - **Later writes:** each is decided again. One a user's policy allows once more goes through.
 4. **On a cluster,** the destination's shard decides.
    - **How it learns the requester:** the delivering node sends it with the write, in a field the front passes only
@@ -47,11 +46,20 @@ configuration is decided as its parent (the owner's choice).
    - **What decides:** the shard's S3 server decides that write as the requester, with its own node's credentials
      and policies. A field without the stamp is dropped by the front, as the cluster's other fields are.
 
+## Durability (slice 2)
+
+- **No new record kind:** a refused replica is noted FAILED with the bucket configuration record a destination's
+  refusal already uses (ADR-0077 §7), whose crash behaviour the journal's sweeps cover.
+- **A crash between the decision and the note:** the event is still in the outbox, so it is delivered again after
+  recovery and decided again, with the same result. A crash after the note leaves FAILED, and the event delivered.
+- **What is not swept:** a fault injected between the decision and the note is not. The ordering above is why it
+  needs no sweep of its own.
+
 ## Slices
 
 1. Record the requester (§1), and the decision as a requester (§2), with unit tests.
-2. Decide at each write on `serve` (§3): replication, inventory and logs, with the S3 smoke's checks of a user
-   removed and a policy narrowed, and a fault sweep of the replication path (ADR-0004).
+2. Decide at each write on `serve` (§3): replication, inventory and logs, with the S3 smoke's checks of a policy
+   narrowed under a running server. No new record kind, so no fault sweep of its own (Durability, above).
 3. On a cluster (§4), with the cluster smoke's checks.
 4. The SDK matrix where it applies, and the exit review.
 

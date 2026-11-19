@@ -400,6 +400,7 @@ async fn replicateEvent(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     e: borrow OutboxEvent,
     destination: Slice<u8>,
+    decider: borrow RecordedDecider,
 ) -> Result<bool, NetError> {
     let src = StringView.fromUtf8(e.bucket.view()) ?? "";
     let key = StringView.fromUtf8(e.key.view()) ?? "";
@@ -412,6 +413,24 @@ async fn replicateEvent(
             Err(err) => { return Err(NetErrors.fromAsync(err)); }
         };
         let s = guard.data();
+        // Decided as the rule's requester, with the policies of now (ADR-0094 §3): refused, the source reads FAILED,
+        // as a destination's refusal does.
+        let ruleIds = e.ruleIds.view();
+        let action = if (e.kind == EVENT_MARKER) "s3:ReplicateDelete" else "s3:ReplicateObject";
+        let keyBytes = e.key.view();
+        let allowed = await Async.blocking(
+            () => replicaAllowed(s, decider, src, ruleIds, destination, action, dst, keyBytes),
+        );
+        if (!allowed) {
+            let noted = await Async.blocking(() => s.noteReplicationFailure(src, keyBytes, id));
+            if (noted.isErr()) { return Ok(false); }
+            let _ = await AsyncConsole.writeError("cosmostore: a replica was refused as its rule's requester: ");
+            let _ = await AsyncConsole.writeError(src);
+            let _ = await AsyncConsole.writeError("/");
+            let _ = await AsyncConsole.writeError(key);
+            let _ = await AsyncConsole.writeError("\n");
+            return Ok(true);
+        }
         if (e.kind == EVENT_MARKER) {
             let marked = await Async.blocking(() => s.putReplicaMarker(dst, key, id));
             return Ok(await replicationOutcome(marked, e));
@@ -464,6 +483,27 @@ async fn replicateEvent(
         () => t.putReplica(dst, key, id, md5, parts, contentType, meta, extras, borrow finished),
     );
     return Ok(await replicationOutcome(put, e));
+}
+
+/// Whether a replica is allowed as its rule's requester (ADR-0094 §3), under the store's lock.
+fn replicaAllowed(
+    s: borrow ObjectStore,
+    decider: borrow RecordedDecider,
+    source: StringView,
+    ruleIds: Slice<Vector<u8>>,
+    destination: Slice<u8>,
+    action: StringView,
+    dst: StringView,
+    key: Slice<u8>,
+) -> bool {
+    let requester = match (s.replicaRequesterOf(source, ruleIds, destination)) {
+        Ok(r) => r,
+        Err(_) => { return false; }
+    };
+    return match (decidedIn(decider, s, requester.view(), action, dst, key)) {
+        Ok(a) => a,
+        Err(_) => false,
+    };
 }
 
 async fn replicationOutcome(r: Result<bool, StoreError>, e: borrow OutboxEvent) -> bool {

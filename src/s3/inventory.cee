@@ -600,6 +600,7 @@ struct InventoryRun {
 async fn inventoryForever(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     w: borrow InventoryWriter,
+    decider: borrow RecordedDecider,
 ) -> Result<ServerReport, NetError> {
     var runs = Vector<InventoryRun>.create();
     let every =
@@ -651,6 +652,26 @@ async fn inventoryForever(
                 let now = Clock.unixMillis();
                 let period = truncate<i64>(w.dayMs * (c.days as u64));
                 if (runs[at].lastMs > 0 && now - runs[at].lastMs < period) { continue; }
+                // Decided first as its configuration's requester (ADR-0094 §3), on the report's keys: refused, it is not
+                // written this period, and said so.
+                var reportBase = Vector<u8>.create();
+                if (inventoryBase(c, source, mut reportBase).isErr()) { continue; }
+                let destinationName = StringView.fromUtf8(c.destination.view()) ?? "";
+                let requester = c.requester.view();
+                let baseKeys = reportBase.view();
+                let allowed = await Async.blocking(
+                    () => decidedIn(decider, st, requester, "s3:PutObject", destinationName, baseKeys),
+                );
+                match (allowed) {
+                    Ok(true) => {}
+                    _ => {
+                        let _ = await AsyncConsole.writeError(
+                            "cosmostore: an inventory report was refused as its configuration's requester\n",
+                        );
+                        runs[at].lastMs = now;
+                        continue;
+                    }
+                }
                 let written = await Async.blocking(() => writeReport(st, source, c, now));
                 match (written) {
                     Ok(true) => { runs[at].lastMs = now; }

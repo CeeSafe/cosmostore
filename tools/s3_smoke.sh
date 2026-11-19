@@ -1302,6 +1302,7 @@ fi
 usersport=$((port + 6))
 printf '%s\n' "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" "AKIAUSERREADER000001 reader/secret/0123456789abcdefgh" \
     "AKIAUSERINTERN000001 intern/secret/0123456789abcdefgh" "AKIAUSERANALYST00001 analyst/secret/0123456789abcdefg" \
+    "AKIAUSERWRITER000001 writer/secret/0123456789abcdefgh" \
     > "$work/users.credentials"
 # The account's keys, named (any key the file names neither as the account's nor a user's is refused); each user:
 # its name and id, its keys, its identity policy.
@@ -1309,12 +1310,13 @@ echo "account $AWS_ACCESS_KEY_ID" > "$work/users.file"
 cat >> "$work/users.file" <<'USERS'
 reader:AIDAREADER0001 AKIAUSERREADER000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
 intern:AIDAINTERN0001 AKIAUSERINTERN000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
+writer:AIDAWRITER0001 AKIAUSERWRITER000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":["arn:aws:s3:::wsrc","arn:aws:s3:::wsrc/*","arn:aws:s3:::wdst","arn:aws:s3:::wdst/*"]}}
 analyst:AIDAANALYST001 AKIAUSERANALYST00001 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":["arn:aws:s3tables:*:*:bucket/lake","arn:aws:s3tables:*:*:bucket/lake/table/*"]},{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::000000000000:role/tablereader"}]}
 USERS
 cat > "$work/users.roles" <<'ROLES'
 tablereader 3600 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":"*"}}
 ROLES
-"$bin" serve "$work/users-store" "$usersport" "$work/users.credentials" localhost --users-file "$work/users.file" --maintain-seconds 2 --sts-key-file "$work/sts.keys" --roles-file "$work/users.roles" 2>> "$work/users.log" &
+"$bin" serve "$work/users-store" "$usersport" "$work/users.credentials" localhost --users-file "$work/users.file" --maintain-seconds 2 --access-log-seconds 2 --sts-key-file "$work/sts.keys" --roles-file "$work/users.roles" 2>> "$work/users.log" &
 usersrv=$!
 sleep 1
 ua() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" aws "$@"; }
@@ -1343,11 +1345,29 @@ ua s3api put-bucket-versioning --bucket other --versioning-configuration Status=
 ui s3api put-bucket-versioning --bucket team --versioning-configuration Status=Enabled > /dev/null 2>&1
 check "a user replicates into no bucket it may not write" "$(ucode ui s3api put-bucket-replication --bucket team --replication-configuration '{"Role":"arn:aws:iam::000000000000:role/r","Rules":[{"Status":"Enabled","Priority":1,"Filter":{},"DeleteMarkerReplication":{"Status":"Disabled"},"Destination":{"Bucket":"arn:aws:s3:::other"}}]}')" AccessDenied
 check "nor logs into one" "$(ucode ui s3api put-bucket-logging --bucket team --bucket-logging-status '{"LoggingEnabled":{"TargetBucket":"other","TargetPrefix":"logs/"}}')" AccessDenied
+# Configurations decided at delivery (ADR-0094): the writer's replication and logs go while its policy allows them,
+# and stop at the next write once it is narrowed, though the configurations stay.
+uw() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" AWS_ACCESS_KEY_ID=AKIAUSERWRITER000001 AWS_SECRET_ACCESS_KEY=writer/secret/0123456789abcdefgh aws "$@"; }
+for b in wsrc wdst; do ua s3api create-bucket --bucket $b > /dev/null 2>&1; ua s3api put-bucket-versioning --bucket $b --versioning-configuration Status=Enabled > /dev/null 2>&1; done
+uw s3api put-bucket-replication --bucket wsrc --replication-configuration '{"Role":"arn:aws:iam::000000000000:role/r","Rules":[{"ID":"w","Status":"Enabled","Priority":1,"Filter":{},"DeleteMarkerReplication":{"Status":"Disabled"},"Destination":{"Bucket":"arn:aws:s3:::wdst"}}]}' > /dev/null 2>&1 && pass "a user's replication put" || fail "a user's replication put"
+uw s3api put-bucket-logging --bucket wsrc --bucket-logging-status '{"LoggingEnabled":{"TargetBucket":"wdst","TargetPrefix":"logs/"}}' > /dev/null 2>&1 && pass "and its logging" || fail "and its logging"
+uw s3api put-object --bucket wsrc --key one.txt --body dir.txt > /dev/null 2>&1
+wstatus() { ua s3api head-object --bucket wsrc --key "$1" --query ReplicationStatus --output text 2>/dev/null; }
+for i in $(seq 1 40); do [ "$(wstatus one.txt)" = COMPLETED ] && break; sleep 0.25; done
+check "replicated while its policy allows it" "$(wstatus one.txt)" COMPLETED
+sed -i.bak 's#"arn:aws:s3:::wsrc","arn:aws:s3:::wsrc/\*","arn:aws:s3:::wdst","arn:aws:s3:::wdst/\*"#"arn:aws:s3:::wsrc","arn:aws:s3:::wsrc/*"#' "$work/users.file"
+sleep 4
+uw s3api put-object --bucket wsrc --key two.txt --body dir.txt > /dev/null 2>&1
+for i in $(seq 1 40); do [ "$(wstatus two.txt)" = FAILED ] && break; sleep 0.25; done
+check "its policy narrowed, the next replica is refused as its requester (FAILED)" "$(wstatus two.txt)" FAILED
+for i in $(seq 1 30); do grep -q "an access log was refused as its configuration's requester" "$work/users.log" && break; sleep 0.5; done
+grep -q "an access log was refused as its configuration's requester" "$work/users.log" && pass "and its log objects are refused" || fail "and its log objects are refused"
 # The users file is reloaded with the credentials: the reader may now read the other bucket too.
 sed -i.bak 's#"arn:aws:s3:::team/\*"\]}}$#"arn:aws:s3:::team/*","arn:aws:s3:::other/*"]}}#' "$work/users.file"
 sleep 4
 ur s3api get-object --bucket other --key b.txt users.out > /dev/null 2>&1 && pass "a users file reloaded" || fail "a users file reloaded"
-check "its reload in the log" "$(grep -c 'credentials reloaded' "$work/users.log")" 1
+# Two reloads: the writer's policy narrowed (ADR-0094's checks, above), then this one.
+check "its reload in the log" "$(grep -c 'credentials reloaded' "$work/users.log")" 2
 # S3 Tables and STS for users (ADR-0088 §2, §4): the analyst reads table bucket `lake` and its data, nothing else.
 uan() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" AWS_ACCESS_KEY_ID=AKIAUSERANALYST00001 AWS_SECRET_ACCESS_KEY=analyst/secret/0123456789abcdefg aws "$@"; }
 lake=$(ua s3tables create-table-bucket --name lake --query arn --output text 2>&1)

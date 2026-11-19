@@ -3848,3 +3848,22 @@ Browser form uploads with a SigV4 POST policy.
   - **No client:** a condition on a client's address holds for no write.
 - **Tests:** `configurationsRecordTheirRequester`, `writesDecidedAsTheirRequester`.
 - **Next:** slice 2, deciding each write on `serve`.
+
+### 20 Nov 2026: M14 slice 2, each write decided on `serve` (ADR-0094 §3)
+
+- **What decides:** `serve`'s writers decide each write as its configuration's requester (`RecordedDecider`), with
+  the credentials as reloaded, the roles, and the destination bucket's policy.
+- **Replicas** (`s3:ReplicateObject`, a delete marker `s3:ReplicateDelete`): refused, the source reads FAILED, and
+  the refusal is logged.
+- **Log objects** (`s3:PutObject`): refused, the lines are dropped, and it is logged. A log entry now carries its
+  configuration's requester, and batches are kept by it.
+- **Inventory reports** (`s3:PutObject` on the report's keys): refused, the report is not written that period, and
+  it is logged.
+- **Durability:** no new record kind. A crash before the FAILED note leaves the event to be decided again
+  (ADR-0094's Durability).
+- **Tests (the S3 smoke's users server):**
+  - the writer user's replication and logging go while its policy allows;
+  - once its policy is narrowed under the running server, the next replica reads FAILED and its log objects are
+    refused.
+- **All pass:** 389 unit tests, the S3 smoke, the cluster smoke (163) and the SDK matrix.
+- **Next:** slice 3, on a cluster.

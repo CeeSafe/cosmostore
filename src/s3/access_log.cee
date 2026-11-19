@@ -15,6 +15,8 @@ struct AccessLogEntry {
     target: Vector<u8>;
     prefix: Vector<u8>;
     line: Vector<u8>;
+    /// Who put the logging configuration (ADR-0094 §1): its log objects are written as that requester.
+    requester: Vector<u8>;
 }
 
 /// The queue, as requests see it.
@@ -36,6 +38,7 @@ struct AccessLogBatch {
     prefix: Vector<u8>;
     bytes: Vector<u8>;
     since: i64;
+    requester: Vector<u8>;
 }
 
 // --- The configuration (PutBucketLogging, GetBucketLogging) ---
@@ -357,7 +360,7 @@ async fn queueAccessLine(
         micros,
     );
     if (made.isErr() || log.lines.trySend(
-        AccessLogEntry { target: target.bucket, prefix: target.prefix, line: line },
+        AccessLogEntry { target: target.bucket, prefix: target.prefix, line: line, requester: target.requester },
     ).isErr()) {
         let _ = log.dropped.fetchAdd(1);
     }
@@ -387,15 +390,41 @@ fn logObjectKey(prefix: Slice<u8>, millis: i64, out: borrow mut Vector<u8>) -> R
     return Ok();
 }
 
-/// Writes one target's lines as an object of its bucket; false when the bucket is gone or the write failed.
-fn deliverLogObject(store: borrow mut ObjectStore, batch: borrow AccessLogBatch, millis: i64) -> bool {
+/// What became of a log object.
+enum LogDelivery {
+    Written,
+    Failed,
+    /// Its configuration's requester may not write it any more (ADR-0094 §3).
+    Refused,
+}
+
+/// Writes one target's lines as an object of its bucket, decided first as its configuration's requester (ADR-0094
+/// §3); Failed when the bucket is gone or the write failed.
+fn deliverLogObject(
+    store: borrow mut ObjectStore,
+    batch: borrow AccessLogBatch,
+    millis: i64,
+    decider: borrow RecordedDecider,
+) -> LogDelivery {
     // A table bucket's warehouse takes no logs (a target set before that was refused, or on another shard).
-    if (isTableWarehouseShaped(batch.target.view())) { return false; }
+    if (isTableWarehouseShaped(batch.target.view())) { return LogDelivery.Failed; }
     var key = Vector<u8>.create();
-    if (logObjectKey(batch.prefix.view(), millis, mut key).isErr()) { return false; }
+    if (logObjectKey(batch.prefix.view(), millis, mut key).isErr()) { return LogDelivery.Failed; }
     let bucket = StringView.fromUtf8(batch.target.view()) ?? "";
     let name = StringView.fromUtf8(key.view()) ?? "";
-    return store.putObject(bucket, name, "text/plain", batch.bytes.view(), PutCondition.None).isOk();
+    match (decidedIn(decider, store, batch.requester.view(), "s3:PutObject", bucket, key.view())) {
+        Ok(true) => {}
+        Ok(false) => { return LogDelivery.Refused; }
+        Err(_) => { return LogDelivery.Failed; }
+    }
+    return if (store.putObject(
+        bucket,
+        name,
+        "text/plain",
+        batch.bytes.view(),
+        PutCondition.None,
+    ).isOk()) LogDelivery.Written
+        else LogDelivery.Failed;
 }
 
 /// The lines queued since the last call, into their targets' batches.
@@ -407,11 +436,20 @@ fn gatherLines(w: borrow AccessLogWriter, batches: borrow mut Vector<AccessLogBa
         };
         var at = batches.length;
         for (i in 0..batches.length) {
-            if (batches[i].target.view() == e.target.view() && batches[i].prefix.view() == e.prefix.view()) { at = i; }
+            if (batches[i].target.view() == e.target.view() && batches[i].prefix.view() == e.prefix.view() &&
+                batches[i].requester.view() == e.requester.view()) {
+                at = i;
+            }
         }
         if (at == batches.length) {
             let made = batches.push(
-                AccessLogBatch { target: e.target, prefix: e.prefix, bytes: Vector<u8>.create(), since: now },
+                AccessLogBatch {
+                    target: e.target,
+                    prefix: e.prefix,
+                    bytes: Vector<u8>.create(),
+                    since: now,
+                    requester: e.requester,
+                },
             );
             if (made.isErr()) { continue; }
         }
@@ -434,6 +472,7 @@ fn nextDue(batches: borrow mut Vector<AccessLogBatch>, now: i64, everyMs: u64) -
 async fn accessLogForever(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     w: borrow AccessLogWriter,
+    decider: borrow RecordedDecider,
 ) -> Result<ServerReport, NetError> {
     var batches = Vector<AccessLogBatch>.create();
     var failing = false;
@@ -446,15 +485,25 @@ async fn accessLogForever(
                 Some(b) => b,
                 null => { break; }
             };
-            var done = false;
+            var outcome = LogDelivery.Failed;
             {
                 var guard = match (await store.get().lock()) {
                     Ok(g) => g,
                     Err(_) => { return Err(NetError.Closed); }
                 };
                 let st = guard.data();
-                done = await Async.blocking(() => deliverLogObject(st, borrow batch, now));
+                outcome = await Async.blocking(() => deliverLogObject(st, borrow batch, now, decider));
             }
+            let done = match (outcome) {
+                LogDelivery.Written => true,
+                LogDelivery.Refused => {
+                    let _ = await AsyncConsole.writeError(
+                        "cosmostore: an access log was refused as its configuration's requester; its lines are dropped\n",
+                    );
+                    true
+                }
+                LogDelivery.Failed => false,
+            };
             if (!done && !failing) {
                 let _ = await AsyncConsole.writeError(
                     "cosmostore: an access log could not be delivered to its target bucket; its lines are lost\n",
