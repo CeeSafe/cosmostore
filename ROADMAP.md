@@ -3138,3 +3138,10 @@ Browser form uploads with a SigV4 POST policy.
   failed. CI now makes PyIceberg's venv on Python 3.13 (`actions/setup-python`) and pins `pyiceberg[pyarrow]==0.12.0`,
   the version checked here.
 - **All of M9 is built** (ADR-0083, proposed): accepting it, and closing M9, are the owner's decisions.
+- **CI on `81aab62`:**
+  - **The correctness job passed:** the tests, the smokes, and PyIceberg on `serve` and through a cluster node.
+  - **The perf gate failed:** small GETs and large writes at c32, ops/s 0.51 and 0.70, the runner's noise at 1.80
+    and 2.45.
+  - **Why it is noise:** slices 3 and 4 change nothing on `serve`'s request path (the cluster front, CreateBucket's
+    name check, a store accessor), and the same gate on binfadel passed (base `8f18b6e` against `81aab62`, 3
+    rounds). At c32, small GETs were p99 1.02 and ops/s 0.99; large writes 1.03 and 1.01.
