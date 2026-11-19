@@ -1369,6 +1369,26 @@ sleep 4
 check "a user made again has not the old one's grants" "$(ucode ur s3api put-object --bucket team --key inbox/z.txt --body dir.txt)" AccessDenied
 kill "$usersrv" 2>/dev/null
 
+# Storage classes (ADR-0090 §1): recorded on the object and answered, or refused; never dropped.
+aws s3api create-bucket --bucket classes > /dev/null 2>&1
+aws s3api put-object --bucket classes --key ia --body dir.txt --storage-class STANDARD_IA > /dev/null 2>&1
+check "a storage class recorded" "$(aws s3api head-object --bucket classes --key ia --query StorageClass --output text 2>&1)" STANDARD_IA
+check "and listed" "$(aws s3api list-objects-v2 --bucket classes --query 'Contents[0].StorageClass' --output text 2>&1)" STANDARD_IA
+check "and in its versions" "$(aws s3api list-object-versions --bucket classes --query 'Versions[0].StorageClass' --output text 2>&1)" STANDARD_IA
+aws s3api put-object --bucket classes --key std --body dir.txt --storage-class STANDARD > /dev/null 2>&1
+check "STANDARD is not named on the object" "$(aws s3api head-object --bucket classes --key std --query StorageClass --output text 2>&1)" None
+check "an archive class refused" "$(code s3api put-object --bucket classes --key g --body dir.txt --storage-class GLACIER)" InvalidStorageClass
+check "and an unknown one" "$(code s3api put-object --bucket classes --key g --body dir.txt --storage-class SHELF)" InvalidStorageClass
+aws s3api copy-object --bucket classes --key ia --copy-source classes/ia --storage-class ONEZONE_IA > /dev/null 2>&1
+check "a copy onto itself changes only its class" "$(aws s3api head-object --bucket classes --key ia --query StorageClass --output text 2>&1)" ONEZONE_IA
+aws s3api copy-object --bucket classes --key copied --copy-source classes/ia > /dev/null 2>&1
+check "a copy takes the request's class, not the source's" "$(aws s3api head-object --bucket classes --key copied --query StorageClass --output text 2>&1)" None
+up=$(aws s3api create-multipart-upload --bucket classes --key mp --storage-class GLACIER_IR --query UploadId --output text 2>&1)
+check "an upload's class listed" "$(aws s3api list-multipart-uploads --bucket classes --query 'Uploads[0].StorageClass' --output text 2>&1)" GLACIER_IR
+aws s3api abort-multipart-upload --bucket classes --key mp --upload-id "$up" > /dev/null 2>&1
+for k in ia std copied; do aws s3api delete-object --bucket classes --key "$k" > /dev/null 2>&1; done
+aws s3api delete-bucket --bucket classes > /dev/null 2>&1
+
 # Deletes free the space.
 aws s3 rm --recursive s3://smoke/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket smoke > /dev/null 2>&1 && pass "delete-bucket" || fail "delete-bucket"

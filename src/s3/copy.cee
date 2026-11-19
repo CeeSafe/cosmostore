@@ -500,8 +500,13 @@ async fn copyObject(
         SseRequest.None => false,
         _ => true,
     };
-    if (!replace && !resealing && src.bucket.view() == req.bucket.view() && src.key.view() == req.key.view()) {
-        return Err(S3Fail.Code(S3Code.InvalidRequest)); // a copy onto itself must change something
+    // A copy's storage class is the request's, STANDARD if it names none, never the source's, as on S3 (ADR-0090 §1).
+    let classAsked = headerOf(req, STORAGE_CLASS_FIELD) ?? "".bytes();
+    let classStored = classAsked.length > 0 && storesStorageClass(req.bucket.bytes(), classAsked)?;
+    // A copy onto itself must change something: its metadata, its encryption or its storage class.
+    if (!replace && !resealing && classAsked.length == 0 && src.bucket.view() == req.bucket.view() &&
+        src.key.view() == req.key.view()) {
+        return Err(S3Fail.Code(S3Code.InvalidRequest));
     }
     await authorizeSource(app, req, who, borrow src)?;
     let plan = await openCopy(app, req, borrow src, CopyTarget.Object, [0u8; 16])?;
@@ -518,6 +523,14 @@ async fn copyObject(
         appendUtf8(mut contentType, plan.source.contentType.view())?;
         metadata.extend(plan.source.metadata.view())?;
     }
+    metadata = match (metadataReplace(
+        metadata.view(),
+        STORAGE_CLASS_FIELD.bytes(),
+        if (classStored) classAsked else "".bytes(),
+    )) {
+        Ok(b) => b,
+        Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
+    };
     // Tags follow `x-amz-tagging-directive`, apart from the metadata directive: COPY (the default) keeps the source's,
     // REPLACE takes `x-amz-tagging` (ADR-0017).
     let tagsReplaced = match (headerOf(req, "x-amz-tagging-directive")) {

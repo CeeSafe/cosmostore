@@ -3575,3 +3575,14 @@ Browser form uploads with a SigV4 POST policy.
   4. a POST form's object lock fields and SSE-KMS's encryption context;
   5. the cluster, the SDK matrix and the exit review.
 - **Next:** slice 1.
+
+### 19 Nov 2026: M12 slice 1, storage classes (ADR-0090 §1)
+
+- **Taken:** `x-amz-storage-class` on PutObject, CopyObject, CreateMultipartUpload and a POST form. It is recorded on
+  the object (a stored field, absent for STANDARD), with its bytes where they are.
+- **Answered:** in HeadObject and GetObject, ListObjects, ListObjectVersions, ListParts, ListMultipartUploads,
+  GetObjectAttributes, inventory reports and replicas.
+- **Refused (InvalidStorageClass):** GLACIER, DEEP_ARCHIVE and unknown names. Until now every class was taken and
+  dropped.
+- **A copy** takes the request's class, never the source's. A copy onto itself may change only its class.
+- **Tests:** the S3 smoke's nine storage class checks; 380 unit tests, both smokes and the SDK matrix pass.

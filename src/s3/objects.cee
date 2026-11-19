@@ -141,11 +141,27 @@ fn inDirectoryBucket(bucket: StringView) -> bool => isDirectoryShaped(bucket.byt
 /// The storage class an object of the bucket shows: a directory bucket's is `EXPRESS_ONEZONE` (ADR-0080 §7).
 fn storageClassOf(bucket: Slice<u8>) -> StringView => if (isDirectoryShaped(bucket)) "EXPRESS_ONEZONE" else "STANDARD";
 
-/// `<StorageClass>…</StorageClass>` for an object of the bucket.
-fn xmlStorageClass(out: borrow mut Vector<u8>, bucket: Slice<u8>) -> Result<void, AllocError> {
+/// `<StorageClass>…</StorageClass>` for an object of the bucket: its stored class (ADR-0090 §1), or the bucket's.
+fn xmlStorageClass(out: borrow mut Vector<u8>, bucket: Slice<u8>, stored: Slice<u8>) -> Result<void, AllocError> {
     out.extend("<StorageClass>".bytes())?;
-    out.extend(storageClassOf(bucket).bytes())?;
+    out.extend(if (stored.length > 0) stored else storageClassOf(bucket).bytes())?;
     return out.extend("</StorageClass>".bytes());
+}
+
+/// The storage classes kept here (ADR-0090 §1): recorded on the object, its bytes where they are, so it reads as
+/// STANDARD does. GLACIER and DEEP_ARCHIVE, whose reads need RestoreObject, are refused, as is any other name.
+const TAKEN_STORAGE_CLASSES: [StringView; 6] =
+    ["STANDARD", "REDUCED_REDUNDANCY", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING", "GLACIER_IR"];
+
+/// Whether the class a write asks for is stored: not the bucket's own (STANDARD, or a directory bucket's
+/// EXPRESS_ONEZONE), which S3 does not name; InvalidStorageClass for one not kept here.
+fn storesStorageClass(bucket: Slice<u8>, asked: Slice<u8>) -> Result<bool, S3Fail> {
+    if (asked == storageClassOf(bucket).bytes()) { return Ok(false); }
+    if (isDirectoryShaped(bucket)) { return Err(S3Fail.Code(S3Code.InvalidStorageClass)); }
+    for (c in TAKEN_STORAGE_CLASSES) {
+        if (c.bytes() == asked) { return Ok(true); }
+    }
+    return Err(S3Fail.Code(S3Code.InvalidStorageClass));
 }
 
 /// `"hex"`, or `"hex-N"` for a multipart object of N parts; a directory bucket's object's `directoryEtag`.
@@ -672,6 +688,9 @@ fn metadataOf(req: borrow S3Request) -> Result<Vector<u8>, S3Fail> {
             if (kept.length > 0) { metadataAdd(mut blob, name, kept.view())?; }
         } else if (listed(STORED_HEADERS, name)) {
             metadataAdd(mut blob, name, value)?;
+        } else if (name == STORAGE_CLASS_FIELD.bytes()) {
+            // Recorded, or refused; never dropped (ADR-0090 §1).
+            if (storesStorageClass(req.bucket.bytes(), value)?) { metadataAdd(mut blob, name, value)?; }
         } else if (name == REPLICA_FIELD.bytes() && value == "REPLICA".bytes()) {
             // A replica sent by another server's replication (ADR-0077 §6): it is not replicated again.
             metadataAdd(mut blob, name, value)?;
@@ -1501,7 +1520,10 @@ async fn getObjectAttributes(
         body.extend(parts.view())?;
         body.extend("</ObjectParts>".bytes())?;
     }
-    if (listedTrimmed(names, "StorageClass")) { xmlStorageClass(mut body, req.bucket.bytes())?; }
+    if (listedTrimmed(names, "StorageClass")) {
+        let stored = storageClassIn(info.metadata.view())?;
+        xmlStorageClass(mut body, req.bucket.bytes(), stored.view())?;
+    }
     if (listedTrimmed(names, "ObjectSize")) { xmlDecimal(mut body, "ObjectSize", info.size)?; }
     body.extend("</GetObjectAttributesResponse>".bytes())?;
     return await sendXml(exchange, borrow body);
