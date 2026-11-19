@@ -3803,3 +3803,14 @@ Browser form uploads with a SigV4 POST policy.
   - a replica's Complete answered 4xx was retried for ever.
 - **Next:** M14, when the owner asks for one. ADR-0091's B (configurations decided at delivery) is the next
   candidate.
+
+### 20 Nov 2026: M14 proposed (ADR-0093)
+
+- **The owner:** "continue". ADR-0093 (proposed) gives three candidates, one to be M14:
+  - **A, configurations decided at delivery** (recommended): each replica, report and log object authorized as
+    whoever put its configuration, when it is written.
+  - **B, a cluster that knows its files match:** a digest of each node's files in the handshake, and differences
+    reported.
+  - **C, compaction for S3 Tables.**
+- **Why A:** since M11 and M13, taking a user away is immediate everywhere but in its configurations.
+- **Next:** the owner's choice.
