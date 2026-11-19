@@ -3702,3 +3702,14 @@ Browser form uploads with a SigV4 POST policy.
   rules v2 or checksum code 5 ("bad record meta").
 - **Next:** M13, when the owner asks for one. ADR-0089's B (configurations decided at delivery) is the next
   candidate.
+
+### 19 Nov 2026: M13 proposed (ADR-0091)
+
+- **The owner:** "propose M13". ADR-0091 (proposed) gives three candidates, one to be M13:
+  - **A, a cluster as `serve`** (recommended): nodes reload their credentials and users files, so a revocation needs
+    no restart, and `node --kms-key-file` serves SSE-KMS.
+  - **B, configurations decided at delivery:** replication, inventory and logging writes authorized as whoever put
+    them.
+  - **C, compaction for S3 Tables.**
+- **Why A first:** revoking a key on a cluster takes every node's restart today.
+- **Next:** the owner's choice.
