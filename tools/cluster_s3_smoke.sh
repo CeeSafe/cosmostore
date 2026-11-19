@@ -71,7 +71,7 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --zone-id local-az1 >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --tables-day-seconds 24 --zone-id local-az1 >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -418,6 +418,12 @@ if [ -n "${ICEBERG_PYTHON:-}" ]; then
         pass "PyIceberg through node 2: $(grep -c '^ok' iceberg.out) checks"
     else
         fail "PyIceberg through node 2"; cat iceberg.out
+    fi
+    # Table maintenance (ADR-0086 §5): each table's jobs asked for by its shard's leader, through its front.
+    if "$ICEBERG_PYTHON" "$OLDPWD/tools/maintenance_check.py" "http://127.0.0.1:$((BASE + 12))" 24 > maintenance.out 2>&1; then
+        pass "table maintenance through node 2: $(grep -c '^ok' maintenance.out) checks"
+    else
+        fail "table maintenance through node 2"; cat maintenance.out
     fi
 fi
 for t in tables-a tables-b; do on 3 s3tables delete-table-bucket --table-bucket-arn "arn:aws:s3tables:us-east-1:000000000000:bucket/$t" > /dev/null 2>&1; done

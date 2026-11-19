@@ -115,5 +115,13 @@ table.append(pa.table({"id": [6], "item": ["row 6"]}, schema=schema))
 check("and it takes appends", catalog.load_table("ns.t").scan().to_arrow().num_rows, 7)
 catalog.purge_table("ns.t")
 catalog.drop_namespace("ns")
-tables.delete_table_bucket(tableBucketARN=arn)
+# Its maintenance configuration is left over: on a cluster that is deleted with the first DeleteTableBucket, which
+# answers ConflictException, and a retry deletes the bucket (ADR-0083 §7).
+for attempt in range(3):
+    try:
+        tables.delete_table_bucket(tableBucketARN=arn)
+        break
+    except tables.exceptions.ConflictException:
+        time.sleep(0.5)
+check("the table bucket deleted", "maint-check" in [b["name"] for b in tables.list_table_buckets()["tableBuckets"]], False)
 sys.exit(1 if failed else 0)

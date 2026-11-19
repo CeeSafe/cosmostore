@@ -3314,3 +3314,17 @@ Browser form uploads with a SigV4 POST policy.
     appended six times is expired to its two newest snapshots, and an orphan and the expired manifest lists are
     removed. Every row reads back, and it takes appends after.
 - **Next:** slice 4, the cluster.
+
+### 19 Nov 2026: M10 slice 4, table maintenance on a cluster (ADR-0086 §5)
+
+- **How it runs:** every hour of a day, a node lists the tables of each shard it leads. It asks for each table's two
+  jobs through its own front, signed for `s3tables` (`tablesMaintenanceClusterForever`). Each job is then a shard's
+  write, behind its gate and committed by Raft, as inventory's are on a cluster.
+- **The call:** `POST /tables/<arn>/<ns>/<name>/maintenance-run?type=<job>`, CosmoStore's own. It is authorized as
+  `s3tables:PutTableMaintenanceConfiguration`, runs one job a request, and is taken on `serve` too.
+- **Per-job status:** each job's status is now an object of its own, since a shard's request does not read its own
+  writes.
+- **`node --tables-day-seconds`**, as on `serve`.
+- **Tests:** the cluster smoke's 134 pass, with nodes on a 24 s day. They include the maintenance check through
+  node 2 (15), whose DeleteTableBucket retries the ConflictException of leftovers, as ADR-0083 §7 has it.
+- **Next:** slice 5, the SDK matrix and M10's exit review.

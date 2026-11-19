@@ -75,7 +75,14 @@
    - **How it holds the store:** snapshot management holds the store for one table's run (one metadata file read
      and one written). Unreferenced file removal holds it for each manifest list's or manifest's read, decodes it
      outside, then holds it for the sweep.
-   - **On a cluster:** a shard's leader runs the pass for that shard's table buckets (ADR-0058 §8).
+   - **On a cluster:** every hour of a day, a node lists the tables of each shard it leads from that shard's store.
+     It then asks for each table's jobs through its own front, as a client would (ADR-0058 §8, as inventory does on
+     a cluster). So each job is a shard's write, behind the shard's gate and committed by Raft.
+     - **The call:** `POST /tables/<arn>/<ns>/<name>/maintenance-run?type=<job>`, CosmoStore's own, signed for
+       `s3tables` and authorized as `s3tables:PutTableMaintenanceConfiguration`. It runs one job, since a shard's
+       request does not read its own writes.
+     - **Per-job status:** each job's status is an object of its own, so two jobs never write over each other's.
+     - **On `serve`** the call is taken too, to run a job now.
 6. **Not done:** compaction (refused when enabled), a job's per-ref settings (`max-snapshot-age-ms` on a branch), and
    removing files outside a table's warehouse.
 

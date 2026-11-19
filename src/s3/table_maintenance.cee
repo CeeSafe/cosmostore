@@ -142,7 +142,10 @@ fn maintenanceValueOf(body: Slice<u8>, kind: StringView) -> Result<Json, TablesE
 fn tableMaintenanceKey(id: Slice<u8>) -> Result<Vector<u8>, AllocError> =>
     catalogKey(MAINTENANCE_TABLES, id, "".bytes());
 
-fn jobStatusKey(id: Slice<u8>) -> Result<Vector<u8>, AllocError> => catalogKey(MAINTENANCE_STATUS, id, "".bytes());
+/// A job's status for a table: one object for each job, so two jobs run in one shard request (whose reads do not see
+/// its own writes) never write over each other's.
+fn jobStatusKey(id: Slice<u8>, kind: StringView) -> Result<Vector<u8>, AllocError> =>
+    catalogKey(MAINTENANCE_STATUS, id, kind.bytes());
 
 /// PutTableBucketMaintenanceConfiguration and PutTableMaintenanceConfiguration: one type's value into the document at
 /// `key`.
@@ -219,14 +222,12 @@ fn writeJobStatus(
     failure: StringView,
     nowMs: i64,
 ) -> Result<void, TablesError> {
-    let key = jobStatusKey(id)?;
-    var document = maintenanceDocument(store, hidden, key.view())?;
+    let key = jobStatusKey(id, kind)?;
     var entry = jsonObject();
     jsonSet(mut entry, "status", jsonString(status.bytes())?)?;
     jsonSet(mut entry, "lastRunTimestamp", jsonInteger(nowMs)?)?;
     if (failure.length > 0) { jsonSet(mut entry, "failureMessage", jsonString(failure.bytes())?)?; }
-    jsonSet(mut document, kind, entry)?;
-    let _ = writeRecord(store, hidden, key.view(), borrow document, PutCondition.None)?;
+    let _ = writeRecord(store, hidden, key.view(), borrow entry, PutCondition.None)?;
     return Ok();
 }
 
@@ -239,8 +240,6 @@ fn getJobStatus(
     id: Slice<u8>,
 ) -> Result<TablesAnswer, TablesError> {
     let hidden = tableWarehouseBucket(bucketName)?;
-    let key = jobStatusKey(id)?;
-    let recorded = maintenanceDocument(store, hidden.view(), key.view())?;
     let tableKey = tableMaintenanceKey(id)?;
     let tableDoc = maintenanceDocument(store, hidden.view(), tableKey.view())?;
     let bucketDoc = maintenanceDocument(store, hidden.view(), MAINTENANCE_BUCKET_KEY.bytes())?;
@@ -251,8 +250,10 @@ fn getJobStatus(
         if (!maintenanceEnabled(borrow value)) {
             jsonSet(mut entry, "status", jsonString("Disabled".bytes())?)?;
         } else {
-            match (jsonMember(borrow recorded, kind)) {
-                Some(r) => {
+            let statusKey = jobStatusKey(id, kind)?;
+            match (readRecord(store, hidden.view(), statusKey.view())?) {
+                Some(rec) => {
+                    let r = borrow rec.json;
                     jsonSet(mut entry, "status", jsonString(jsonMemberText(r, "status") ?? "Not_Yet_Run".bytes())?)?;
                     match (jsonMemberI64(r, "lastRunTimestamp")) {
                         Some(t) => { jsonSet(mut entry, "lastRunTimestamp", isoText(t)?)?; }
@@ -283,7 +284,8 @@ fn removeTableMaintenance(
     id: Slice<u8>,
 ) -> Result<void, TablesError> {
     removeCatalogObject(store, hidden, tableMaintenanceKey(id)?.view())?;
-    removeCatalogObject(store, hidden, jobStatusKey(id)?.view())?;
+    removeCatalogObject(store, hidden, jobStatusKey(id, SNAPSHOT_MANAGEMENT)?.view())?;
+    removeCatalogObject(store, hidden, jobStatusKey(id, UNREFERENCED_REMOVAL)?.view())?;
     return removeCatalogObject(store, hidden, unreferencedNotesKey(id)?.view());
 }
 
@@ -408,6 +410,52 @@ fn manageSnapshots(
     }
     writeJobStatus(store, hidden.view(), id.view(), SNAPSHOT_MANAGEMENT, "Successful", "", nowMs)?;
     return Ok(true);
+}
+
+// ---- One job, asked for (ADR-0086 §5) ----
+
+/// `POST /tables/<arn>/<ns>/<name>/maintenance-run?type=<job>`, CosmoStore's own: the job run for the table now,
+/// authorized as `s3tables:PutTableMaintenanceConfiguration`. A cluster node asks each table of the shards it leads
+/// so, through its front, which makes the job's writes a shard's write; one job a request, as a request does not
+/// read its own writes.
+async fn runMaintenance(
+    app: borrow S3App,
+    req: borrow S3Request,
+    caller: borrow TablesCaller,
+    segs: Slice<Vector<u8>>,
+) -> Result<TablesAnswer, TablesError> {
+    let bucket = bucketOfSegment(segs[1].view())?;
+    let t = MaintainedTable { bucket: bucket, ns: copyBytes(segs[2].view())?, name: copyBytes(segs[3].view())? };
+    let kind = paramOf(req, "type") ?? "".bytes();
+    if (kind != SNAPSHOT_MANAGEMENT.bytes() && kind != UNREFERENCED_REMOVAL.bytes()) {
+        return Err(TablesError.BadRequest);
+    }
+    let dayMs = truncate<i64>(app.tablesDayMs);
+    let tr = borrow t;
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        await Async.blocking(() => maintenanceRunAllowed(store, caller, tr))?;
+        if (kind == SNAPSHOT_MANAGEMENT.bytes()) {
+            let now = Clock.unixMillis();
+            await Async.blocking(() => maintainTable(store, tr, now, dayMs))?;
+            return Ok(tablesNoContent());
+        }
+    }
+    match (await removeUnreferenced(borrow app.store, tr, Clock.unixMillis(), dayMs)) {
+        Ok() => {}
+        Err(_) => { return Err(TablesError.Internal); }
+    }
+    return Ok(tablesNoContent());
+}
+
+fn maintenanceRunAllowed(
+    store: borrow ObjectStore,
+    caller: borrow TablesCaller,
+    t: borrow MaintainedTable,
+) -> Result<void, TablesError> {
+    let id = tableIdOf(store, t.bucket.view(), t.ns.view(), t.name.view())?;
+    return checkTables(store, caller, "s3tables:PutTableMaintenanceConfiguration", t.bucket.view(), id.view());
 }
 
 // ---- The pass (ADR-0086 §5) ----
