@@ -26,6 +26,108 @@ fn icebergNewTableMetadata() -> Result<void, TestFailure> {
     return Ok();
 }
 
+fn refusedMetadata(text: StringView) -> bool {
+    let request = jsonOf(text);
+    return newTableMetadata(borrow request, "s3://w--table-s3/id".bytes())!.isNull();
+}
+
+@test
+fn icebergCreateChecksIds() -> Result<void, TestFailure> {
+    // Field ids given once each and above 0; a spec's and an order's columns the schema's (M9's exit review, C4).
+    for (bad in [
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"},{\"id\":1,\"name\":\"b\",\"required\":true,\"type\":\"long\"}]}}",
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}",
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":{\"type\":\"list\",\"element-id\":1,\"element\":\"string\",\"element-required\":false}}]}}",
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[]}}",
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]},\"partition-spec\":{\"fields\":[{\"source-id\":9,\"field-id\":1000,\"name\":\"x\",\"transform\":\"identity\"}]}}",
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]},\"partition-spec\":{\"fields\":[{\"source-id\":1,\"field-id\":5,\"name\":\"x\",\"transform\":\"identity\"}]}}",
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]},\"write-order\":{\"order-id\":0,\"fields\":[{\"source-id\":2,\"transform\":\"identity\",\"direction\":\"asc\",\"null-order\":\"nulls-first\"}]}}",
+    ]) {
+        Check.isTrue(refusedMetadata(bad), bad)?;
+    }
+    // A spec field without its id gets the next; a sorted order is order 1, whatever id it came with.
+    let request = jsonOf(
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"},{\"id\":2,\"name\":\"b\",\"required\":false,\"type\":\"string\"}]},\"partition-spec\":{\"fields\":[{\"source-id\":1,\"field-id\":1003,\"name\":\"x\",\"transform\":\"identity\"},{\"source-id\":2,\"name\":\"y\",\"transform\":\"identity\"}]},\"write-order\":{\"order-id\":0,\"fields\":[{\"source-id\":2,\"transform\":\"identity\",\"direction\":\"asc\",\"null-order\":\"nulls-first\"}]}}",
+    );
+    let m = newTableMetadata(borrow request, "s3://w--table-s3/id".bytes())!!;
+    Check.isTrue(jsonMemberI64(borrow m, "last-partition-id") == Some(1004i64), "assigned after 1003")?;
+    Check.isTrue(jsonMemberI64(borrow m, "default-sort-order-id") == Some(1i64), "a sorted order is 1")?;
+    return Ok();
+}
+
+fn applied(m: borrow mut Json, updates: StringView) -> bool {
+    let u = jsonOf(updates);
+    return applyUpdates(m, borrow u, "s3://w--table-s3/id".bytes())!.isNull();
+}
+
+@test
+fn icebergUpdatesAsIcebergApplies() -> Result<void, TestFailure> {
+    let request = jsonOf(
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}",
+    );
+    var m = newTableMetadata(borrow request, "s3://w--table-s3/id".bytes())!!;
+    // Two snapshots, the second's parent the first; main at the second, a tag at the first.
+    Check.isTrue(applied(
+        mut m,
+        "[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":11,\"parent-snapshot-id\":null,\"sequence-number\":1,\"timestamp-ms\":1000,\"manifest-list\":\"s3://w--table-s3/id/m1.avro\",\"summary\":{\"operation\":\"append\"}}},{\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",\"type\":\"branch\",\"snapshot-id\":11},{\"action\":\"set-snapshot-ref\",\"ref-name\":\"t1\",\"type\":\"tag\",\"snapshot-id\":11}]",
+    ), "a first snapshot, its parent null (C8)")?;
+    // A second whose sequence number is not above the last, with a parent: refused; with a null parent, taken.
+    var old = cloneJson(borrow m)!;
+    Check.isFalse(applied(
+        mut old,
+        "[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":12,\"parent-snapshot-id\":11,\"sequence-number\":1,\"timestamp-ms\":2000,\"manifest-list\":\"s3://w--table-s3/id/m2.avro\"}}]",
+    ), "an old sequence number")?;
+    Check.isTrue(applied(
+        mut m,
+        "[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":12,\"parent-snapshot-id\":11,\"sequence-number\":2,\"timestamp-ms\":2000,\"manifest-list\":\"s3://w--table-s3/id/m2.avro\"}},{\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",\"type\":\"branch\",\"snapshot-id\":12}]",
+    ), "a second")?;
+    Check.equalU64(2, arrayLength(borrow m, "snapshot-log") as u64)?;
+    // Removing the first takes its tag and log entry with it, and the second's parent (C1).
+    Check.isTrue(applied(mut m, "[{\"action\":\"remove-snapshots\",\"snapshot-ids\":[11]}]"), "removed")?;
+    Check.isTrue(jsonMember(jsonMember(borrow m, "refs")!, "t1").isNull(), "its tag")?;
+    Check.isTrue(jsonMember(jsonMember(borrow m, "refs")!, "main").isSome(), "main stays")?;
+    Check.equalU64(1, arrayLength(borrow m, "snapshot-log") as u64)?;
+    Check.isTrue(jsonMemberI64(borrow m, "current-snapshot-id") == Some(12i64), "current stays")?;
+    let snaps = jsonMember(borrow m, "snapshots")!;
+    let kept = match (snaps) {
+        Json.Array(items) => jsonMember(borrow items[0], "parent-snapshot-id").isNull(),
+        _ => false,
+    };
+    Check.isTrue(kept, "no parent left dangling")?;
+    // Removing main's snapshot: main goes, and the current snapshot is none.
+    Check.isTrue(applied(mut m, "[{\"action\":\"remove-snapshots\",\"snapshot-ids\":[12]}]"), "main's")?;
+    Check.isTrue(jsonMember(jsonMember(borrow m, "refs")!, "main").isNull(), "main gone")?;
+    Check.isTrue(jsonMemberI64(borrow m, "current-snapshot-id") == Some(-1i64), "no current")?;
+    // `-1` is the last added by this commit: none added is refused (C7).
+    for (bad in [
+        "[{\"action\":\"set-current-schema\",\"schema-id\":-1}]",
+        "[{\"action\":\"set-default-spec\",\"spec-id\":-1}]",
+        "[{\"action\":\"set-default-sort-order\",\"sort-order-id\":-1}]",
+        "[{\"action\":\"set-location\",\"location\":\"s3://w--table-s3/idX\"}]",
+        "[{\"action\":\"set-properties\",\"updates\":{\"k\":1}}]",
+        "[{\"action\":\"remove-properties\",\"removals\":[1]}]",
+    ]) {
+        var copy = cloneJson(borrow m)!;
+        Check.isFalse(applied(mut copy, bad), bad)?;
+    }
+    Check.isTrue(applied(mut m, "[{\"action\":\"set-location\",\"location\":\"s3://w--table-s3/id/x\"}]"), "inside")?;
+    // Properties on metadata that had none (an engine's file) are kept, not dropped (C6).
+    jsonRemove(mut m, "properties".bytes());
+    Check.isTrue(applied(mut m, "[{\"action\":\"set-properties\",\"updates\":{\"k\":\"v\"}}]"), "set")?;
+    Check.equalBytes("v".bytes(), jsonMemberText(jsonMember(borrow m, "properties")!, "k")!)?;
+    // No more than ICEBERG_MAX_CHANGES updates in a commit (B4).
+    var many = Vector<u8>.create();
+    many.push('[')!;
+    for (i in 0..1001) {
+        if (i > 0) { many.push(',')!; }
+        many.extend("{\"action\":\"set-properties\",\"updates\":{\"k\":\"v\"}}".bytes())!;
+    }
+    many.push(']')!;
+    let tooMany = parseJson(many.view())!!;
+    Check.isTrue(applyUpdates(mut m, borrow tooMany, "s3://w--table-s3/id".bytes())!.isSome(), "too many")?;
+    return Ok();
+}
+
 @test
 fn icebergRequirementsAndUpdates() -> Result<void, TestFailure> {
     let request = jsonOf(

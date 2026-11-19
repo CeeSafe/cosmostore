@@ -1215,6 +1215,21 @@ check "update-table-metadata-location" "$(aws s3tables update-table-metadata-loc
 check "with a token no longer current" "$(code s3tables update-table-metadata-location --table-bucket-arn "$tarn" --namespace sales --name orders --version-token "$ttok" --metadata-location "$twh/metadata/00002-b.metadata.json")" ConflictException
 check "outside its warehouse" "$(code s3tables update-table-metadata-location --table-bucket-arn "$tarn" --namespace sales --name orders --version-token "$ttok" --metadata-location s3://elsewhere/x.metadata.json)" BadRequestException
 check "the catalog is not S3's" "$(code s3api get-object --bucket "$twb" --key .s3tables/bucket dir.out)" AccessDenied
+# M9's exit review: no way into the catalog or out of it by S3's other calls (B1 to B3).
+check "no form upload into a warehouse" "$(curl -s -o /dev/null -w '%{http_code}' --form-string 'key=.s3tables/tables/sales/evil' -F 'file=@dir.txt' "$AWS_ENDPOINT_URL/$twb")" 403
+check "nor a copy out of its catalog" "$(code s3api copy-object --bucket smoke --key stolen --copy-source "$twb/.s3tables/tables/sales/orders")" AccessDenied
+check "nor a part copied out of it" "$(up=$(aws s3api create-multipart-upload --bucket smoke --key stolen-part --query UploadId --output text 2>&1); code s3api upload-part-copy --bucket smoke --key stolen-part --upload-id "$up" --part-number 1 --copy-source "$twb/.s3tables/tables/sales/orders")" AccessDenied
+check "no access logs into a warehouse" "$(code s3api put-bucket-logging --bucket smoke --bucket-logging-status "{\"LoggingEnabled\":{\"TargetBucket\":\"$twb\",\"TargetPrefix\":\".s3tables/namespaces/\"}}")" InvalidTargetBucketForLogging
+check "no inventory into a warehouse" "$(code s3api put-bucket-inventory-configuration --bucket smoke --id inv-t --inventory-configuration "{\"Id\":\"inv-t\",\"IsEnabled\":true,\"IncludedObjectVersions\":\"Current\",\"Schedule\":{\"Frequency\":\"Daily\"},\"Destination\":{\"S3BucketDestination\":{\"Bucket\":\"arn:aws:s3:::$twb\",\"Format\":\"CSV\",\"Prefix\":\".s3tables\"}}}")" InvalidArgument
+check "no access point on a warehouse" "$(apcode s3control create-access-point --account-id 000000000000 --name smoke-tables-ap --bucket "$twb")" InvalidRequest
+# A body is read only for a request one of the server's keys signed (B5): an unknown key's is refused before it.
+check "an unknown key's body is not read" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "x-amz-date: $(date -u +%Y%m%dT%H%M%SZ)" -H "Authorization: AWS4-HMAC-SHA256 Credential=NOKEY/$(date -u +%Y%m%d)/us-east-1/s3tables/aws4_request, SignedHeaders=host;x-amz-date, Signature=00" --data-binary @dir.txt "$AWS_ENDPOINT_URL/buckets")" 403
+# The Iceberg catalog's errors are in its shape (C3), a bad signature's too.
+check "an Iceberg error in Iceberg's shape" "$(curl -s --aws-sigv4 "aws:amz:us-east-1:s3tables" --user "$AWS_ACCESS_KEY_ID:wrong" "$AWS_ENDPOINT_URL/iceberg/v1/config?warehouse=$tarn" | python3 -I -c 'import json,sys; e=json.load(sys.stdin)["error"]; print(e["code"], e["type"])')" "403 ForbiddenException"
+# GetTable names its namespace's id (C9); a rename names something new.
+check "get-table's namespaceId" "$(aws s3tables get-table --table-bucket-arn "$tarn" --namespace sales --name orders --query namespaceId --output text 2>&1)" "$(aws s3tables get-namespace --table-bucket-arn "$tarn" --namespace sales --query namespaceId --output text 2>&1)"
+check "a rename to nothing new" "$(code s3tables rename-table --table-bucket-arn "$tarn" --namespace sales --name orders)" BadRequestException
+check "a gzipped metadata location" "$(code s3tables update-table-metadata-location --table-bucket-arn "$tarn" --namespace sales --name orders --version-token "$ttok" --metadata-location "$twh/metadata/00002-b.metadata.json.gz")" BadRequestException
 check "nor is the warehouse bucket" "$(code s3api delete-bucket --bucket "$twb")" NotImplemented
 check "a --table-s3 name for a bucket" "$(code s3api create-bucket --bucket mine--table-s3)" InvalidBucketName
 aws s3tables rename-table --table-bucket-arn "$tarn" --namespace sales --name orders --new-name orders_v2 > /dev/null 2>&1

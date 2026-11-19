@@ -42,7 +42,120 @@ fn jsonModel() -> Result<void, TestFailure> {
     out.clear();
     writeJson(mut out, borrow copy)!;
     Check.equalBytes("{\"t\":\"a\\nb\"}".bytes(), out.view())?;
-    Check.isTrue(parseJsonInteger("-9223372036854775808".bytes()).isNull(), "past i64 (kept as text)")?;
+    Check.isTrue(parseJsonInteger("-9223372036854775808".bytes()) == Some(-9223372036854775807 - 1), "i64's least")?;
+    Check.isTrue(parseJsonInteger("9223372036854775807".bytes()) == Some(9223372036854775807i64), "its most")?;
+    Check.isTrue(parseJsonInteger("9223372036854775808".bytes()).isNull(), "past i64 (kept as text)")?;
+    Check.isTrue(parseJsonInteger("-9223372036854775809".bytes()).isNull(), "below it")?;
+    return Ok();
+}
+
+@test
+fn jsonModelRefusesAndScales() -> Result<void, TestFailure> {
+    // Leading zeros, a key twice, and strings that are not UTF-8 are not JSON (M9's exit review, C10).
+    for (bad in ["0123", "-01", "[00]", "{\"a\":1,\"a\":2}", "{\"b\":1,\"a\":2,\"b\":3}"]) {
+        Check.isTrue(parseJson(bad.bytes())!.isNull(), bad)?;
+    }
+    for (good in ["0", "-0", "0.5", "-0e1", "{\"a\":1,\"b\":{\"a\":2}}"]) {
+        Check.isTrue(parseJson(good.bytes())!.isSome(), good)?;
+    }
+    Check.isTrue(parseJson([0x22u8, 0xFF, 0x22][..])!.isNull(), "a string not UTF-8")?;
+    Check.isTrue(parseJson([0x7Bu8, 0x22, 0xC3, 0x22, 0x3A, 0x31, 0x7D][..])!.isNull(), "a key not UTF-8")?;
+    // Set many members at once, in log n each (B4): replaced in place, new ones after in their order.
+    var o = parseJson("{\"x\":\"1\",\"y\":\"2\"}".bytes())!!;
+    let changes = parseJson("{\"z\":\"3\",\"y\":\"two\",\"a\":\"4\"}".bytes())!!;
+    jsonSetAll(mut o, borrow changes)!;
+    var out = Vector<u8>.create();
+    writeJson(mut out, borrow o)!;
+    Check.equalBytes("{\"x\":\"1\",\"y\":\"two\",\"z\":\"3\",\"a\":\"4\"}".bytes(), out.view())?;
+    var gone = Vector<Vector<u8>>.create();
+    gone.push(copyBytes("z".bytes())!)!;
+    gone.push(copyBytes("x".bytes())!)!;
+    gone.push(copyBytes("none".bytes())!)!;
+    jsonRemoveAll(mut o, mut gone);
+    out.clear();
+    writeJson(mut out, borrow o)!;
+    Check.equalBytes("{\"y\":\"two\",\"a\":\"4\"}".bytes(), out.view())?;
+    // 50,000 properties set, then all removed: n log n, not n² (the review measured 60,000 at 2.4 s before).
+    var many = jsonObject();
+    var members = Vector<JsonMember>.create();
+    var keys = Vector<Vector<u8>>.create();
+    for (i in 0..50000) {
+        var k = copyBytes("p".bytes())!;
+        appendDecimal(mut k, truncate<u64>(i))!;
+        members.push(JsonMember { key: copyBytes(k.view())!, value: jsonString("v".bytes())! })!;
+        keys.push(k)!;
+    }
+    let big = Json.Object(members);
+    let started = Clock.unixMillis();
+    jsonSetAll(mut many, borrow big)!;
+    jsonSetAll(mut many, borrow big)!;
+    Check.equalU64(50000, match (borrow many) {
+        Json.Object(ms) => ms.length as u64,
+        _ => 0,
+    })?;
+    jsonRemoveAll(mut many, mut keys);
+    Check.equalU64(0, match (borrow many) {
+        Json.Object(ms) => ms.length as u64,
+        _ => 1,
+    })?;
+    Check.isTrue(Clock.unixMillis() - started < 2000, "quick")?;
+    return Ok();
+}
+
+@test
+fn tableIdsAndCatalogKeys() -> Result<void, TestFailure> {
+    // A purge reaches only a UUID's prefix (B1): never `.s3tables` or another prefix a forged record would name.
+    Check.isTrue(uuidShaped("0f8e9a2b-1c3d-4e5f-8a7b-6c5d4e3f2a1b".bytes()), "a table's id")?;
+    for (bad in [
+        ".s3tables",
+        "",
+        "0f8e9a2b-1c3d-4e5f-8a7b-6c5d4e3f2a1",
+        "0f8e9a2b-1c3d-4e5f-8a7b-6c5d4e3f2a1bc",
+        "0F8E9A2B-1C3D-4E5F-8A7B-6C5D4E3F2A1B",
+        "0f8e9a2b-1c3d-4e5f-8a7b/6c5d4e3f2a1b",
+        "0f8e9a2bx1c3d-4e5f-8a7b-6c5d4e3f2a1b",
+    ]) {
+        Check.isFalse(uuidShaped(bad.bytes()), bad)?;
+    }
+    let hidden = "002b2b5256073c200d64b94c800f0b93--table-s3".bytes();
+    Check.isTrue(catalogObject(hidden, ".s3tables/tables/ns/t".bytes()), "a catalog record")?;
+    Check.isFalse(catalogObject(hidden, "id/data/a.parquet".bytes()), "a warehouse's object")?;
+    Check.isFalse(catalogObject("plain".bytes(), ".s3tables/tables/ns/t".bytes()), "another bucket's key")?;
+    // The warehouse's boundary (B7): itself or under `<warehouse>/`, not a sibling that shares its id as a prefix.
+    let w = "s3://w--table-s3/id".bytes();
+    Check.isTrue(withinWarehouse(w, w) && withinWarehouse("s3://w--table-s3/id/x".bytes(), w), "within")?;
+    Check.isFalse(withinWarehouse("s3://w--table-s3/idX".bytes(), w), "a sibling")?;
+    Check.isFalse(withinWarehouse("s3://w--table-s3/i".bytes(), w), "shorter")?;
+    // A gzipped metadata file is not read here, so it is not taken (C5).
+    Check.isFalse(metadataLocationOk("s3://w--table-s3/id/metadata/00001-a.metadata.json.gz".bytes(), w), ".gz")?;
+    Check.isFalse(metadataLocationOk("s3://w--table-s3/idX/00001-a.metadata.json".bytes(), w), "beside it")?;
+    return Ok();
+}
+
+fn createRequestRefused(metadata: StringView) -> bool {
+    let md = parseJson(metadata.bytes())!!;
+    return createRequestOfMetadata(borrow md).isErr();
+}
+
+@test
+fn createTableMetadataShapes() -> Result<void, TestFailure> {
+    // CreateTable's `metadata` takes AWS's shapes' members only (C6): another, or a type not a string, is refused.
+    let ok =
+        "{\"iceberg\":{\"schema\":{\"fields\":[{\"id\":1,\"name\":\"a\",\"type\":\"long\",\"required\":true}]},\"partitionSpec\":{\"spec-id\":0,\"fields\":[{\"source-id\":1,\"transform\":\"identity\",\"name\":\"a\",\"field-id\":1000}]},\"writeOrder\":{\"order-id\":1,\"fields\":[{\"source-id\":1,\"transform\":\"identity\",\"direction\":\"asc\",\"null-order\":\"nulls-first\"}]},\"properties\":{\"k\":\"v\"}}}";
+    Check.isFalse(createRequestRefused(ok), "AWS's shapes")?;
+    for (bad in [
+        "{\"iceberg\":{\"schema\":{\"fields\":[{\"name\":\"a\",\"type\":\"long\",\"doc\":\"d\"}]}}}",
+        "{\"iceberg\":{\"schema\":{\"fields\":[{\"name\":\"a\",\"type\":{\"type\":\"list\"}}]}}}",
+        "{\"iceberg\":{\"schema\":{\"fields\":[{\"name\":\"a\"}]}}}",
+        "{\"iceberg\":{\"schema\":{\"fields\":[{\"name\":\"a\",\"type\":\"long\",\"required\":\"yes\"}]}}}",
+        "{\"iceberg\":{\"schema\":{\"fields\":[]},\"other\":1}}",
+        "{\"iceberg\":{\"schema\":{\"fields\":[]}},\"more\":1}",
+        "{\"iceberg\":{\"schema\":{\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]},\"partitionSpec\":{\"spec-id\":3,\"fields\":[]}}}",
+        "{\"iceberg\":{\"schema\":{\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]},\"partitionSpec\":{\"fields\":[{\"source-id\":1,\"name\":\"a\"}]}}}",
+        "{\"iceberg\":{\"schema\":{\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]},\"writeOrder\":{\"fields\":[]}}}",
+    ]) {
+        Check.isTrue(createRequestRefused(bad), bad)?;
+    }
     return Ok();
 }
 

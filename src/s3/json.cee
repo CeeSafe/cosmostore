@@ -107,6 +107,8 @@ struct JsonParser<region a> {
         let digits = this.at;
         while (this.at < this.text.length && this.text[this.at] >= '0' && this.text[this.at] <= '9') { this.at += 1; }
         if (this.at == digits) { return Ok(null); }
+        // No leading zeros (`0123` is not JSON).
+        if (this.at - digits > 1 && this.text[digits] == '0') { return Ok(null); }
         if (this.at < this.text.length && this.text[this.at] == '.') {
             this.at += 1;
             let f = this.at;
@@ -147,7 +149,7 @@ struct JsonParser<region a> {
                 if (this.at >= this.text.length || this.text[this.at] != '"') { return Ok(null); }
                 this.at += 1;
                 var key = Vector<u8>.create();
-                if (!this.quoted(mut key)?) { return Ok(null); }
+                if (!this.quoted(mut key)? || StringView.fromUtf8(key.view()).isNull()) { return Ok(null); }
                 this.space();
                 if (this.at >= this.text.length || this.text[this.at] != ':') { return Ok(null); }
                 this.at += 1;
@@ -160,7 +162,11 @@ struct JsonParser<region a> {
                 if (this.at >= this.text.length) { return Ok(null); }
                 let n = this.text[this.at];
                 this.at += 1;
-                if (n == '}') { return Ok(Some(Json.Object(members))); }
+                if (n == '}') {
+                    // A key twice is refused: readers and writers would take different copies.
+                    if (hasDuplicateKey(borrow members)?) { return Ok(null); }
+                    return Ok(Some(Json.Object(members)));
+                }
                 if (n != ',') { return Ok(null); }
             }
         }
@@ -189,7 +195,7 @@ struct JsonParser<region a> {
         if (c == '"') {
             this.at += 1;
             var s = Vector<u8>.create();
-            if (!this.quoted(mut s)?) { return Ok(null); }
+            if (!this.quoted(mut s)? || StringView.fromUtf8(s.view()).isNull()) { return Ok(null); }
             return Ok(Some(Json.Text(s)));
         }
         if (this.literal("true")) { return Ok(Some(Json.Bool(true))); }
@@ -199,7 +205,39 @@ struct JsonParser<region a> {
     }
 }
 
-/// A whole document; null if it is not JSON (or nests deeper than JSON_MAX_DEPTH).
+/// An object's members' indexes, in the order of their keys: sorted once, so a key is found in log n.
+fn sortedKeyOrder(ms: borrow Vector<JsonMember>) -> Result<Vector<usize>, AllocError> {
+    var order = Vector<usize>.create();
+    order.reserve(ms.length)?;
+    for (i in 0..ms.length) { order.push(i)?; }
+    order.sortBy((a, b) => compareBytes(ms[a].key.view(), ms[b].key.view()));
+    return Ok(order);
+}
+
+/// The member whose key is `key`, by `order` (`sortedKeyOrder`); null if there is none.
+fn findSorted(ms: borrow Vector<JsonMember>, order: borrow Vector<usize>, key: Slice<u8>) -> usize? {
+    var low: usize = 0;
+    var high = order.length;
+    while (low < high) {
+        let mid = low + (high - low) / 2;
+        let c = compareBytes(ms[order[mid]].key.view(), key);
+        if (c == 0) { return Some(order[mid]); }
+        if (c < 0) { low = mid + 1; } else { high = mid; }
+    }
+    return null;
+}
+
+fn hasDuplicateKey(ms: borrow Vector<JsonMember>) -> Result<bool, AllocError> {
+    if (ms.length < 2) { return Ok(false); }
+    let order = sortedKeyOrder(ms)?;
+    for (i in 1..order.length) {
+        if (ms[order[i - 1]].key.view() == ms[order[i]].key.view()) { return Ok(true); }
+    }
+    return Ok(false);
+}
+
+/// A whole document; null if it is not JSON (or nests deeper than JSON_MAX_DEPTH, holds a key twice in an object, or
+/// a string that is not UTF-8).
 fn parseJson(text: Slice<u8>) -> Result<Json?, AllocError> {
     var p = JsonParser { text: text, at: 0 };
     let v = match (p.value(0)?) {
@@ -245,29 +283,27 @@ fn jsonMemberI64(j: borrow Json, key: StringView) -> i64? => match (jsonMember(j
     null => null,
 };
 
+/// An integer's text as an i64, the whole range (-2^63 to 2^63 - 1); null if it is not one that fits.
 fn parseJsonInteger(t: Slice<u8>) -> i64? {
-    if (t.length == 0 || t.length > 20) { return null; }
+    if (t.length == 0) { return null; }
     let negative = t[0] == '-';
     let digits = if (negative) t[1..] else t;
-    if (digits.length == 0) { return null; }
-    var v: i64 = 0;
+    // 19 digits fit a u64 whatever they are.
+    if (digits.length == 0 || digits.length > 19) { return null; }
+    var v: u64 = 0;
     for (c in digits) {
         if (c < '0' || c > '9') { return null; }
-        v = match (checkedMul(v, 10)) {
-            Some(x) => x,
-            null => { return null; }
-        };
-        v = match (checkedAdd(v, (c - '0') as i64)) {
-            Some(x) => x,
-            null => { return null; }
+        v = v * 10 + (c - '0') as u64;
+    }
+    if (negative) {
+        if (v == 9223372036854775808) { return Some(-9223372036854775807 - 1); }
+        return match (checkedTruncate<i64>(v)) {
+            Some(x) => Some(-x),
+            null => null,
         };
     }
-    return Some(if (negative) -v else v);
+    return checkedTruncate<i64>(v);
 }
-
-fn checkedMul(a: i64, b: i64) -> i64? => if (a > 922337203685477580) null else Some(a * b);
-
-fn checkedAdd(a: i64, b: i64) -> i64? => if (a > 9223372036854775807 - b) null else Some(a + b);
 
 // ---- Editing ----
 
@@ -299,6 +335,56 @@ fn jsonSet(j: borrow mut Json, key: StringView, value: Json) -> Result<void, All
         _ => {}
     }
     return Ok();
+}
+
+/// Sets each member of object `changes` in object `j`, replacing those there, new ones after in their order: the keys
+/// sorted once, so many changes cost n log n, not n² (a commit's set-properties). Nothing if either is no object.
+fn jsonSetAll(j: borrow mut Json, changes: borrow Json) -> Result<void, AllocError> {
+    let cs = match (changes) {
+        Json.Object(cs) => cs,
+        _ => { return Ok(); }
+    };
+    match (j) {
+        Json.Object(ms) => {
+            // Where each change goes, found before anything moves: a member's index, or none for a new one.
+            var at = Vector<usize?>.create();
+            {
+                let order = sortedKeyOrder(ms)?;
+                for (i in 0..cs.length) { at.push(findSorted(ms, borrow order, cs[i].key.view()))?; }
+            }
+            for (i in 0..cs.length) {
+                let value = cloneJson(borrow cs[i].value)?;
+                match (at[i]) {
+                    Some(k) => { ms[k].value = value; }
+                    null => { ms.push(JsonMember { key: copyBytes(cs[i].key.view())?, value: value })?; }
+                }
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// Removes every member whose key is one of `keys`, the keys sorted once (n log n).
+fn jsonRemoveAll(j: borrow mut Json, keys: borrow mut Vector<Vector<u8>>) {
+    keys.sortBy((a, b) => compareBytes(a.view(), b.view()));
+    match (j) {
+        Json.Object(ms) => { ms.retain((m) => sortedHolds(keys, m.key.view())); }
+        _ => {}
+    }
+}
+
+/// Whether sorted `keys` lacks `key` (what `retain` keeps).
+fn sortedHolds(keys: borrow Vector<Vector<u8>>, key: Slice<u8>) -> bool {
+    var low: usize = 0;
+    var high = keys.length;
+    while (low < high) {
+        let mid = low + (high - low) / 2;
+        let c = compareBytes(keys[mid].view(), key);
+        if (c == 0) { return false; }
+        if (c < 0) { low = mid + 1; } else { high = mid; }
+    }
+    return true;
 }
 
 fn jsonRemove(j: borrow mut Json, key: Slice<u8>) {

@@ -78,7 +78,10 @@ S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR
      catalog under `/iceberg/v1/…`.
    - Every other request is S3's as before, so a bucket named `buckets` or `tables` is unchanged.
    - S3 Tables' answers and errors are REST-JSON: the body `{"message"}`, with `x-amzn-ErrorType`. The Iceberg
-     catalog's are its own, `{"error":{…}}`.
+     catalog's are its own, `{"error":{…}}`, whatever part of a call failed (its signature too).
+   - **The body** (at most 1 MiB) is read and hashed before the signature is checked, since these clients send no
+     `x-amz-content-sha256`. So it is read only for an Authorization field dated within 15 minutes, by one of the
+     server's keys or with a session's token: a client with no key cannot make the server hold one.
 2. **A table bucket is a hidden bucket.**
    - Table bucket `<name>` is the store bucket `<name>--table-s3`, its warehouse. CreateTableBucket makes it, and
      DeleteTableBucket deletes it once it has no namespaces.
@@ -88,6 +91,10 @@ S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR
      UUID's form of a hash of both. So CreateTableBucket is one write, which a cluster's shard commits as one.
    - **Names:** the store takes such a name past S3's 63 characters (up to 73: a valid bucket name and
      `--table-s3`), for these buckets alone.
+   - **Upgrading:** a general-purpose bucket named `<name>--table-s3` made before M9 (S3's names allowed it) is read
+     as table bucket `<name>`: hidden, its bucket calls refused, its `.s3tables/` keys read as records. Rename such a
+     bucket's objects into another bucket before upgrading. As for `--x-s3` names at M8, the server does not look for
+     one.
 3. **The catalog is objects, and its compare-and-set is a conditional write.**
    - **Where records live:** a namespace is the object `.s3tables/namespaces/<ns>`, and a table is
      `.s3tables/tables/<ns>/<name>`, in the table bucket's hidden bucket. Each is a small JSON record. A table's
@@ -99,30 +106,53 @@ S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR
    - **Renames:** RenameTable is RenameObject's atomic move of the record (ADR-0081). The id and warehouse are kept.
    - **Deletes:** DeleteTable deletes the record, if its `versionToken` matches when one is given, then the objects
      under the table's warehouse prefix. DeleteNamespace refuses a namespace that has tables (409).
-   - **Reserved keys:** S3 calls on a hidden bucket may not touch `.s3tables/` keys.
+   - **Reserved keys:** S3 calls on a hidden bucket may not touch `.s3tables/` keys. Nor may anything else that
+     writes or reads objects: a browser form upload (none on a hidden bucket), a copy's or a part copy's source
+     (whatever its destination), access-log and inventory delivery (a hidden bucket is no target or destination), and
+     an access point (none on a hidden bucket).
+   - **A purge** empties only a prefix of a UUID's form, `<id>/`: a record whose id were anything else (forged or
+     damaged) purges nothing.
 4. **The warehouse.**
    - A table's `warehouseLocation` is `s3://<name>--table-s3/<table id>/`, and its metadata location must begin
-     with it and end `.metadata.json` (or `.metadata.json.gz`).
+     with it and end `.metadata.json`. A gzipped `.metadata.json.gz` is refused: the catalog does not read one.
+     `set-location` stays within it too: the warehouse itself or under `<warehouse>/`.
    - The engine reads and writes there with the S3 API and its own keys, through this server's endpoint
      (`s3.endpoint`).
 5. **The Iceberg REST catalog** (`/iceberg/v1`, the `{prefix}` a table bucket's ARN):
    - **Its calls:** `GET /config`, and namespaces: list, create, load, HEAD and drop, with the `owner` property
      only. Tables: list, create, load, HEAD, drop with `purgeRequested=true`, and commit. Rename.
-     - **Create:** writes `<warehouse>/metadata/00000-<uuid>.metadata.json` (format version 2).
+     - **Create:** writes `<warehouse>/metadata/00000-<uuid>.metadata.json` (format version 2). The schema's field
+       ids must each be given once, above 0. A spec's fields without a `field-id` are given the next after 999 or
+       the highest given, and a spec's and an order's `source-id`s must name the schema's columns. An order with
+       fields is order 1, the unsorted one 0. Otherwise 400.
      - **Commit:** checks every requirement against the current metadata, applies the updates and writes
        `<warehouse>/metadata/<n>-<uuid>.metadata.json`. Then it swaps the record's location by If-Match. A swap
-       that loses is 409 CommitFailedException, which an engine retries.
+       that loses is 409 CommitFailedException, which an engine retries; its file is removed, as is a create's that
+       lost its name. A commit with no updates writes nothing and answers the current metadata. An `identifier`
+       given must be the path's table. At most 1,000 requirements and 1,000 updates.
    - **Updates taken:** assign-uuid, upgrade-format-version (to 2), add-schema, set-current-schema, add-spec,
      set-default-spec, add-sort-order, set-default-sort-order, add-snapshot, set-snapshot-ref, remove-snapshots,
      remove-snapshot-ref, set-location (within the warehouse), set-properties and remove-properties. An unknown
-     update or requirement is 400.
+     update or requirement is 400. They apply as PyIceberg's `update_table_metadata` (and Java's builder) applies them:
+     - `-1` in set-current-schema, set-default-spec and set-default-sort-order is the last one this commit added
+       (400 if it added none).
+     - remove-snapshots also removes the refs that name a removed snapshot (main's with the current snapshot), their
+       snapshot-log entries, and a kept snapshot's parent if it was removed.
+     - `last-updated-ms` is a snapshot's time where one sets it, else the commit's time.
+     - A property is a string; a metadata file without `properties` gains them.
    - **Not taken (as AWS):** staged creates, `purgeRequested=false`, nested namespaces, views, OAuth and
      credential vending.
    - **What it needs:** a JSON value model (parse, edit, write), which the S3 layer gains for this.
 6. **Not done, refused (NotImplemented):** maintenance configurations, table bucket and table policies (as S3
    Control: long-term keys and their `GetSessionToken` sessions), encryption other than the server's default,
    tags, replication, storage classes, metrics, logging, record expiration and migration. CreateTable's `metadata`
-   (an Iceberg schema given to the S3 Tables API itself) is taken and written as the first metadata file.
+   (an Iceberg schema given to the S3 Tables API itself) is taken and written as the first metadata file. Its members
+   are AWS's service model's, by their wire names (`spec-id`, `source-id`, `field-id`, `order-id`, `null-order`); one
+   it does not have, or a field `type` that is not a string, is refused.
+   - **No policy restricts S3 Tables** (M9's exit review, B6): no `s3tables:` action is authorized against a policy,
+     so every long-term key, and its `GetSessionToken` sessions, may make, change, drop and purge every table bucket,
+     whatever Deny statements it meets elsewhere. Anonymous requests, AssumeRole sessions and directory-bucket sessions
+     are refused. Policies for S3 Tables are a design of their own, for when they are wanted.
 7. **On a cluster** (slice 3):
    - **Routing:** the front routes a request signed for `s3tables` by the table bucket it names, to its hidden
      bucket's shard. It finds the name in CreateTableBucket's body, the ARN in the path, GetTable's query, or the

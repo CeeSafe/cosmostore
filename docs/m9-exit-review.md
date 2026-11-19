@@ -162,6 +162,52 @@ Checked and right (both reviews):
 The SDK matrix (as for M7 and M8: run by hand, `tools/sdk/`). No chaos run takes a table bucket: its data and its
 catalog are objects, which the store's fault sweeps cover, and M9 adds no journal record or checkpoint format.
 
+## The findings, closed (the owner: "Fill all findings")
+
+The reviewers' *memory* points were checked, as AWS's and Iceberg's pages could not be fetched here, against:
+- botocore's `s3tables` service model (the AWS CLI's, 2.34.13), for AWS's shapes, names and patterns;
+- PyIceberg 0.12.0's `update_table_metadata`, which follows Java's `TableMetadata` builder.
+
+| Finding | What closed it | Evidence |
+|---|---|---|
+| B1 a form POST forges records | No form upload into a `--table-s3` bucket (AccessDenied); a purge empties only a prefix of a UUID's form | S3 smoke: "no form upload into a warehouse"; `tableIdsAndCatalogKeys` |
+| B2 logs and inventory into the catalog | Neither takes a `--table-s3` bucket as target or destination, and delivery refuses one (a target on another shard is not checked when set) | S3 smoke: both refused |
+| B3 a copy reads the catalog | A copy's or part copy's source under `.s3tables/` of a `--table-s3` bucket is AccessDenied, whatever the destination; checked on the shard that copies | S3 smoke: CopyObject and UploadPartCopy; `catalogObject` in `tableIdsAndCatalogKeys` |
+| B4 a commit stalls the server | set- and remove-properties sort the keys once (n log n); at most 1,000 requirements and updates a commit; the body at most 1 MiB | `jsonModelRefusesAndScales` (50,000 properties set twice and removed, under 2 s); `icebergUpdatesAsIcebergApplies` |
+| B5 8 MiB before authentication | 1 MiB, read only for a request signed by one of the server's keys, or with a session's token, dated within 15 minutes | S3 smoke: "an unknown key's body is not read" |
+| B6 no policy restricts S3 Tables | Recorded as not done: ADR-0083 §6, `docs/compatibility.md` | — |
+| B7 `set-location`'s boundary | The warehouse itself or under `<warehouse>/` (`withinWarehouse`), as for metadata locations | `tableIdsAndCatalogKeys`; `icebergUpdatesAsIcebergApplies` |
+| B8 renames, routing | A rename's destination must be absent when it is staged (`renameObjectTo`, checked as a conditional PUT's If-None-Match, so it sees uncommitted records on a shard); the front reads GetTable's `tableArn` first, as the shard does; a request presigned for `s3tables` takes S3 Tables' route (and is refused, as on `serve`) | `renameToAnAbsentDestination`; cluster smoke: "get-table by its ARN through node 3", "a rename onto a table there" |
+| B9 a `--table-s3` bucket made before M9 | An upgrade note (ADR-0083 §2, `docs/compatibility.md`), as for `--x-s3` at M8 | — |
+| C1 remove-snapshots | Its refs (main's with the current snapshot), snapshot-log entries and kept snapshots' parents go with it, as PyIceberg applies it | `icebergUpdatesAsIcebergApplies`; PyIceberg: "remove-snapshots", rows read after it |
+| C2 `last-updated-ms` | The commit's time when no snapshot sets it | the commit path; PyIceberg's commits |
+| C3 the catalog's errors | Every error on `/iceberg/…`, a bad signature's too, in `{"error":{…}}` | S3 smoke: "an Iceberg error in Iceberg's shape" |
+| C4 a create's ids | Field ids given once each, above 0; spec fields without an id given the next; a spec's and an order's columns the schema's; a sorted order is order 1 | `icebergCreateChecksIds` |
+| C5 `.gz` | Refused | `tableIdsAndCatalogKeys`; S3 smoke |
+| C6 values ignored | `owner` kept and given back; properties on metadata without them; a commit's `identifier` checked; CreateTable's `metadata` takes the model's members only, a non-string `type` refused. add-schema's `last-column-id` is left as PyIceberg applies it (the max of the table's and the schema's) | `createTableMetadataShapes`; PyIceberg: "its owner kept", "a commit naming another table" |
+| C7 `-1` | The last added by the commit; 400 if none | `icebergUpdatesAsIcebergApplies` |
+| C8 add-snapshot | A `null` parent is none. A v2 snapshot without `sequence-number` is still taken, as PyIceberg takes it | `icebergUpdatesAsIcebergApplies` |
+| C9 names and fields | `namespaceId` in GetTable and ListTables (botocore's model has it); a rename naming neither a new name nor a new namespace is 400; Iceberg's rename into a missing namespace is NoSuchNamespace. Names left as they are: the model's pattern is `[0-9a-z_]*`, with no rule for the last character, and a rename onto itself stays ConflictException | S3 smoke: "get-table's namespaceId", "a rename to nothing new"; PyIceberg |
+| C10 the JSON model | Leading zeros, a key twice, and strings not UTF-8 refused; the whole i64 range read | `jsonModel`, `jsonModelRefusesAndScales` |
+| C11 leftovers | A commit with no updates writes nothing; a create or commit that loses removes its file; a purge that fails after the record is gone still answers the drop (DeleteTableBucket removes what is left) | PyIceberg: "a commit that changes nothing writes no file" |
+
+**Found while fixing C6:** CreateTable's `metadata` was read by camelCase names (`sourceId`, `fieldId`, `orderId`,
+`nullOrder`, `specId`). botocore sends the model's `locationName`s, Iceberg's own kebab-case names. So since slice 1,
+every partition field's `source-id` was silently 0, and an order's id and null order were the defaults. The PyIceberg
+check compared only the spec's field names, so it passed. The names are now the model's, and the check compares
+each field's name, source and transform.
+
+**Left as they are:**
+- GetTable by a table's ARN reads the bucket's table records until it finds the id: linear in the tables, not
+  quadratic, and under the store's lock, as ListTables is. An index of ids would be a second record to keep in step.
+- A body over 1 MiB, from a key of the server's, is refused in S3's XML shape, before the request is known to be the
+  catalog's.
+
+**After the fixes** (ceesafec 0.54.0, CeeSafe.Web at CI's `ccda03a`):
+- 357 unit tests pass.
+- The S3 smoke passes with PyIceberg's 23 checks, and the cluster smoke's 132 pass with PyIceberg through node 2.
+- The SDK matrix passes: boto3, Go, JavaScript, Java and .NET.
+
 ## Verdict
 
 **M9 should not close yet.**
@@ -178,3 +224,7 @@ The recommendation:
 - Choose B9's rule, then run the smokes, PyIceberg and the SDK matrix again.
 
 Closing M9, and accepting ADR-0083, are the owner's decisions.
+
+**After the fixes:** every finding is closed with its test, B6 and B9 as recorded rules (no `s3tables:` policies; an
+upgrade note), and the C6 fix also corrected the S3 Tables API's spec and order names. M9's "done when" holds, and
+M9 can close on the owner's word.

@@ -399,6 +399,12 @@ cwb=${cwh#s3://}; cwb=${cwb%%/*}; cpre=${cwh#s3://*/}
 on 3 s3api put-object --bucket "$cwb" --key "$cpre/metadata/00001-a.metadata.json" --body dir.txt > /dev/null 2>&1
 check "update-table-metadata-location through node 2" "$(on 2 s3tables update-table-metadata-location --table-bucket-arn "$tba" --namespace sales --name orders --version-token "$ctok" --metadata-location "$cwh/metadata/00001-a.metadata.json" --query metadataLocation --output text 2>&1)" "$cwh/metadata/00001-a.metadata.json"
 check "a stale token through node 3" "$(on 3 s3tables update-table-metadata-location --table-bucket-arn "$tba" --namespace sales --name orders --version-token "$ctok" --metadata-location "$cwh/metadata/00002-b.metadata.json" 2>&1 | grep -o ConflictException | head -1)" ConflictException
+# GetTable by the table's ARN, routed by it (M9's exit review, B8); a rename onto a table there refused on the shard.
+ctarn=$(on 1 s3tables get-table --table-bucket-arn "$tba" --namespace sales --name orders --query tableARN --output text 2>&1)
+check "get-table by its ARN through node 3" "$(on 3 s3tables get-table --table-arn "$ctarn" --query name --output text 2>&1)" orders
+on 2 s3tables create-table --table-bucket-arn "$tba" --namespace sales --name other --format ICEBERG > /dev/null 2>&1
+check "a rename onto a table there" "$(on 3 s3tables rename-table --table-bucket-arn "$tba" --namespace sales --name other --new-name orders 2>&1 | grep -o ConflictException | head -1)" ConflictException
+on 1 s3tables delete-table --table-bucket-arn "$tba" --namespace sales --name other > /dev/null 2>&1
 on 1 s3tables delete-table --table-bucket-arn "$tba" --namespace sales --name orders > /dev/null 2>&1
 check "its files gone with it" "$(on 2 s3api list-objects-v2 --bucket "$cwb" --prefix "$cpre/" --query 'length(Contents || `[]`)' 2>&1)" 0
 on 2 s3tables delete-namespace --table-bucket-arn "$tba" --namespace sales > /dev/null 2>&1

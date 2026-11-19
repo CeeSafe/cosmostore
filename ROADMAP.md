@@ -3173,3 +3173,26 @@ Browser form uploads with a SigV4 POST policy.
   - **Smaller:** values silently ignored (C6), and more.
   - **B6:** no policy restricts S3 Tables. That is to be recorded as not done, or built (a design question).
 - **Next:** fix the findings, each with a test, if the owner agrees.
+
+### 19 Nov 2026: M9's exit review findings closed (the owner: "Fill all findings")
+
+- **Into and out of the catalog:**
+  - No form upload into a table bucket's warehouse, and a purge empties only a UUID's prefix (B1).
+  - No access logs, inventory or access point on a warehouse (B2).
+  - No copy or part copy whose source is a catalog record (B3).
+- **Load:** properties set and removed in n log n, at most 1,000 changes a commit, and a 1 MiB body read only for one
+  of the server's keys (B4, B5).
+- **Iceberg metadata as PyIceberg applies it:** remove-snapshots' refs and log, `last-updated-ms`, `-1` as the last
+  added, a create's ids checked, no `.gz`, no file for an empty commit, `owner` kept, errors in Iceberg's shape
+  (C1 to C11).
+- **A rename's destination must be absent** on the shard when staged (B8). GetTable is routed by `tableArn` first.
+- **Recorded, not built:** no `s3tables:` policies (B6), and an upgrade note for `--table-s3` buckets made before M9
+  (B9).
+- **Found while fixing:** CreateTable's `metadata` read camelCase names where botocore sends `source-id`,
+  `field-id`, `order-id`, `null-order` and `spec-id`, so every partition field's source was 0. Fixed, and the
+  PyIceberg check now compares sources.
+- **The reviewers' memory points** were checked against botocore's `s3tables` model and PyIceberg 0.12.0's update code,
+  since web pages could not be fetched here.
+- **Checks:** 357 tests; the S3 smoke with PyIceberg's 23 checks; the cluster smoke's 132; and the SDK matrix (boto3,
+  Go, JavaScript, Java, .NET), all passing.
+- **Next:** the owner's word on closing M9 and accepting ADR-0083.

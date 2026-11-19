@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PyIceberg against CosmoStore's Iceberg REST catalog (ADR-0083 §5): a table made, appended to twice and read back,
-a stale commit refused, a rename and a drop.
+a stale commit refused, commits that change nothing or name another table, a snapshot expired, a rename and a drop.
 
 usage: tools/iceberg_check.py ENDPOINT     with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY set to a key of the server's
        (needs pyiceberg with pyarrow, and boto3)
@@ -12,7 +12,7 @@ import boto3
 import pyarrow as pa
 from botocore.config import Config
 from pyiceberg.catalog import load_catalog
-from pyiceberg.exceptions import NoSuchTableError, TableAlreadyExistsError
+from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError, TableAlreadyExistsError
 
 endpoint = sys.argv[1]
 failed = False
@@ -46,8 +46,9 @@ catalog = load_catalog(
         "s3.force-virtual-addressing": "false",
     },
 )
-catalog.create_namespace("sales")
+catalog.create_namespace("sales", {"owner": "ana"})
 check("list_namespaces", catalog.list_namespaces(), [("sales",)])
+check("its owner kept", catalog.load_namespace_properties("sales"), {"owner": "ana"})
 schema = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("item", pa.string())])
 table = catalog.create_table("sales.orders", schema=schema)
 check("create_table: its location is its warehouse", table.location().startswith("s3://"), True)
@@ -73,6 +74,18 @@ raw = catalog._session.post(url, json={"requirements": [{"type": "assert-ref-sna
 check("a commit whose requirement does not hold", (raw.status_code, raw.json()["error"]["type"]), (409, "CommitFailedException"))
 raw = catalog._session.post(url, json={"requirements": [], "updates": [{"action": "set-statistics", "snapshot-id": 1}]})
 check("an update not done here", raw.status_code, 400)
+current = catalog.load_table("sales.orders").metadata_location
+raw = catalog._session.post(url, json={"requirements": [], "updates": []})
+check("a commit that changes nothing writes no file", (raw.status_code, raw.json()["metadata-location"]), (200, current))
+raw = catalog._session.post(url, json={"identifier": {"namespace": ["sales"], "name": "other"}, "requirements": [],
+                                       "updates": [{"action": "set-properties", "updates": {"k": "v"}}]})
+check("a commit naming another table", raw.status_code, 400)
+# The first snapshot expired: the table still loads and reads, its later snapshots' parent dropped with it.
+raw = catalog._session.post(url, json={"requirements": [], "updates": [{"action": "remove-snapshots", "snapshot-ids": [old_snapshot]}]})
+check("remove-snapshots", raw.status_code, 200)
+after = catalog.load_table("sales.orders")
+check("the snapshot is gone", old_snapshot in [s.snapshot_id for s in after.snapshots()], False)
+check("rows after it", after.scan().to_arrow().num_rows, 4)
 table = catalog.load_table("sales.orders")
 with table.transaction() as tx:
     tx.set_properties(owner="check")
@@ -85,8 +98,14 @@ tables.create_table(tableBucketARN=arn, namespace="sales", name="events", format
     "partitionSpec": {"fields": [{"sourceId": 1, "transform": "day", "name": "at_day"}]}}})
 events = catalog.load_table("sales.events")
 check("an S3 Tables API table's schema", [f.name for f in events.schema().fields], ["at", "kind"])
-check("and its partition spec", [f.name for f in events.spec().fields], ["at_day"])
+check("and its partition spec", [(f.name, f.source_id, str(f.transform)) for f in events.spec().fields],
+      [("at_day", 1, "day")])
 catalog.purge_table("sales.events")
+try:
+    catalog.rename_table("sales.orders", "nowhere.orders")
+    check("a rename into a namespace not there", "renamed", "NoSuchNamespaceError")
+except NoSuchNamespaceError:
+    check("a rename into a namespace not there", "NoSuchNamespaceError", "NoSuchNamespaceError")
 catalog.rename_table("sales.orders", "sales.orders_v2")
 check("rename_table", catalog.list_tables("sales"), [("sales", "orders_v2")])
 check("rows after the rename", catalog.load_table("sales.orders_v2").scan().to_arrow().num_rows, 4)

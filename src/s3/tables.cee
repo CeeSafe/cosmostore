@@ -12,7 +12,10 @@ const CATALOG_PREFIX: StringView = ".s3tables/";
 const CATALOG_NAMESPACES: StringView = ".s3tables/namespaces/";
 const CATALOG_TABLES: StringView = ".s3tables/tables/";
 const TABLES_ACCOUNT: StringView = "000000000000";
-const TABLES_MAX_BODY: usize = 8388608;
+/// A request's body at most: S3 Tables' are small, and an Iceberg commit's a few KiB (ADR-0083 §1).
+const TABLES_MAX_BODY: usize = 1048576;
+/// A commit's requirements and updates at most, each (ADR-0083 §5).
+const ICEBERG_MAX_CHANGES: usize = 1000;
 
 /// S3 Tables' errors (REST-JSON: the type in `x-amzn-ErrorType`, a message in the body).
 enum TablesError {
@@ -98,6 +101,10 @@ fn isTableWarehouseShaped(name: Slice<u8>) -> bool {
     let suffix = TABLE_BUCKET_SUFFIX.bytes();
     return name.length > suffix.length && name[name.length - suffix.length..] == suffix;
 }
+
+/// Whether `key` of `bucket` is a table bucket's catalog record, which only S3 Tables' own calls read or write.
+fn catalogObject(bucket: Slice<u8>, key: Slice<u8>) -> bool =>
+    isTableWarehouseShaped(bucket) && startsWithBytes(key, CATALOG_PREFIX.bytes());
 
 /// A table bucket's name: 3 to 63 of a-z, 0-9 and `-`, beginning and ending with a letter or digit, without S3's
 /// reserved prefixes and suffixes.
@@ -197,6 +204,19 @@ fn tableBucketOfArn(arn: Slice<u8>, tableId: borrow mut Vector<u8>) -> Result<Ve
     }
     if (!tableBucketNameOk(name)) { return Ok(null); }
     return Ok(Some(copyBytes(name)?));
+}
+
+/// Whether `id` has a UUID's form (8-4-4-4-12 lowercase hex): what a table's id is, so its warehouse prefix
+/// `<id>/` is no other table's and not the catalog's.
+fn uuidShaped(id: Slice<u8>) -> bool {
+    if (id.length != 36) { return false; }
+    for (i in 0..id.length) {
+        let c = id[i];
+        let dash = i == 8 || i == 13 || i == 18 || i == 23;
+        if (dash != (c == '-')) { return false; }
+        if (!dash && !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { return false; }
+    }
+    return true;
 }
 
 fn newUuid(out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
@@ -682,11 +702,21 @@ fn tableRecord(
     };
 }
 
+/// A namespace's id, from its record; empty if it has none.
+fn namespaceIdOf(store: borrow ObjectStore, hidden: Slice<u8>, ns: Slice<u8>) -> Result<Vector<u8>, TablesError> {
+    let key = catalogKey(CATALOG_NAMESPACES, ns, "".bytes())?;
+    return match (readRecord(store, hidden, key.view())?) {
+        Some(r) => Ok(copyBytes(jsonMemberText(borrow r.json, "id") ?? "".bytes())?),
+        null => Ok(Vector<u8>.create()),
+    };
+}
+
 fn tableView(
     req: borrow S3Request,
     bucketName: Slice<u8>,
     bucketRec: borrow Json,
     ns: Slice<u8>,
+    nsId: Slice<u8>,
     name: Slice<u8>,
     rec: borrow CatalogRecord,
     full: bool,
@@ -697,6 +727,7 @@ fn tableView(
     jsonSet(mut j, "modifiedAt", isoText(jsonMemberI64(borrow rec.json, "modifiedAt") ?? 0)?)?;
     jsonSet(mut j, "name", jsonString(name)?)?;
     jsonSet(mut j, "namespace", namespaceArray(ns)?)?;
+    if (nsId.length > 0) { jsonSet(mut j, "namespaceId", jsonString(nsId)?)?; }
     var arn = Vector<u8>.create();
     tableArn(req, bucketName, id, mut arn)?;
     jsonSet(mut j, "tableARN", Json.Text(arn))?;
@@ -763,7 +794,14 @@ fn createTable(
         let hiddenView = hidden.view();
         let keyView = key.view();
         let recRef = borrow rec;
-        generation = (writeRecord(store, hiddenView, keyView, recRef, PutCondition.IfAbsent))?;
+        generation = match (writeRecord(store, hiddenView, keyView, recRef, PutCondition.IfAbsent)) {
+            Ok(g) => g,
+            Err(e) => {
+                // Another create won the name: its first metadata file is no table's.
+                removeMetadataFile(store, hiddenView, jsonMemberText(recRef, "metadataLocation") ?? "".bytes());
+                return Err(e);
+            }
+        };
     }
     var answer = jsonObject();
     var arn = Vector<u8>.create();
@@ -821,7 +859,17 @@ fn getTable(store: borrow mut ObjectStore, req: borrow S3Request) -> Result<Tabl
         if (name.length == 0) { return Err(TablesError.NotFound); }
     }
     let rec = tableRecord(store, bucketName.view(), ns.view(), name.view())?;
-    let view = tableView(req, bucketName.view(), borrow bucketRec.json, ns.view(), name.view(), borrow rec, true)?;
+    let nsId = namespaceIdOf(store, hidden.view(), ns.view())?;
+    let view = tableView(
+        req,
+        bucketName.view(),
+        borrow bucketRec.json,
+        ns.view(),
+        nsId.view(),
+        name.view(),
+        borrow rec,
+        true,
+    )?;
     return tablesJson(borrow view);
 }
 
@@ -850,6 +898,9 @@ fn listTables(
     var last = Vector<u8>.create();
     var more = false;
     let head = CATALOG_TABLES.bytes().length;
+    // The namespace's id, read once for each run of its tables (keys come in namespace order).
+    var nsOfId = Vector<u8>.create();
+    var nsId = Vector<u8>.create();
     for (i in 0..keys.length) {
         let rest = keys[i].view()[head..];
         let slash = pieceEnd(rest, 0, '/');
@@ -860,9 +911,16 @@ fn listTables(
             more = true;
             break;
         }
+        if (i == 0 || nsOfId.view() != ns) {
+            nsOfId = copyBytes(ns)?;
+            nsId = namespaceIdOf(store, hidden.view(), ns)?;
+        }
         match (readRecord(store, hidden.view(), keys[i].view())?) {
             Some(r) => {
-                jsonPush(mut list, tableView(req, bucketName, borrow bucketRec.json, ns, name, borrow r, false)?)?;
+                jsonPush(
+                    mut list,
+                    tableView(req, bucketName, borrow bucketRec.json, ns, nsId.view(), name, borrow r, false)?,
+                )?;
                 shown += 1;
                 last = copyBytes(keys[i].view())?;
             }
@@ -894,7 +952,9 @@ fn purgePage(
 }
 
 /// Removes every object of a table's warehouse prefix (its id), a page at a time, the store let go between pages.
+/// Only an id of a UUID's form: the prefix is then this table's alone, never the catalog's or another table's.
 async fn purgeWarehouse(app: borrow S3App, hidden: Slice<u8>, id: Slice<u8>) -> Result<void, TablesError> {
+    if (!uuidShaped(id)) { return Ok(); }
     var prefix = copyBytes(id)?;
     prefix.push('/')?;
     var after = Vector<u8>.create();
@@ -952,6 +1012,10 @@ fn renameTable(
     body: Slice<u8>,
 ) -> Result<TablesAnswer, TablesError> {
     let j = tablesObject(body)?;
+    // A rename names a new name, a new namespace or both.
+    if (jsonMember(borrow j, "newName").isNull() && jsonMember(borrow j, "newNamespaceName").isNull()) {
+        return Err(TablesError.BadRequest);
+    }
     let newName = copyBytes(jsonMemberText(borrow j, "newName") ?? name)?;
     let newNs = copyBytes(jsonMemberText(borrow j, "newNamespaceName") ?? ns)?;
     if (!tableNameOk(newName.view(), false) || !tableNameOk(newNs.view(), true)) { return Err(TablesError.BadRequest); }
@@ -972,8 +1036,9 @@ fn renameTable(
     let f = catalogText(from.view());
     let t = catalogText(to.view());
     let generation = rec.generation;
-    // The record moves whole, by one Rename record (ADR-0081): its id and warehouse stay.
-    match ((store.renameObject(bucket, f, t, generation, "".bytes()))) {
+    // The record moves whole, by one Rename record (ADR-0081): its id and warehouse stay. The destination must still
+    // be absent when the rename is staged: on a cluster another rename to it may be staged and not yet applied.
+    match ((store.renameObjectTo(bucket, f, t, generation, "".bytes(), true))) {
         Ok() => {}
         Err(e) => { return Err(tablesStoreFail(e)); }
     }
@@ -998,17 +1063,17 @@ fn getTableMetadataLocation(
     return tablesJson(borrow answer);
 }
 
-/// Whether `location` lies in the table's warehouse and names a metadata file.
+/// Whether `location` is `warehouse` itself or lies under `<warehouse>/` (not a sibling like `<warehouse>X`).
+fn withinWarehouse(location: Slice<u8>, warehouse: Slice<u8>) -> bool =>
+    location == warehouse || (location.length > warehouse.length && startsWithBytes(location, warehouse) &&
+        location[warehouse.length] == '/');
+
+/// Whether `location` lies in the table's warehouse and names a metadata file the catalog can read: `.metadata.json`
+/// (a gzipped `.metadata.json.gz` is not read here, so it is refused rather than taken and failing on load).
 fn metadataLocationOk(location: Slice<u8>, warehouse: Slice<u8>) -> bool {
-    var inside = Vector<u8>.create();
-    let _ = inside.extend(warehouse);
-    let _ = inside.push('/');
-    if (!startsWithBytes(location, inside.view())) { return false; }
-    for (end in [".metadata.json", ".metadata.json.gz"]) {
-        let e = end.bytes();
-        if (location.length > e.length && location[location.length - e.length..] == e) { return true; }
-    }
-    return false;
+    if (location == warehouse || !withinWarehouse(location, warehouse)) { return false; }
+    let e = ".metadata.json".bytes();
+    return location.length > e.length && location[location.length - e.length..] == e;
 }
 
 /// UpdateTableMetadataLocation: the compare-and-set (ADR-0083 §3). The record is written only if it is still the
@@ -1150,14 +1215,67 @@ async fn routeTables(app: borrow S3App, req: borrow S3Request, body: Slice<u8>) 
     if (answer.purgeId.length > 0) {
         let bucket = replace(mut answer.purgeBucket, Vector<u8>.create());
         let id = replace(mut answer.purgeId, Vector<u8>.create());
-        await purgeWarehouse(app, bucket.view(), id.view())?;
+        // The table is gone once its record is: a purge cut short leaves objects that DeleteTableBucket removes
+        // (ADR-0083 §7), so it does not turn the drop's answer into an error.
+        match (await purgeWarehouse(app, bucket.view(), id.view())) {
+            Ok() => {}
+            Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
+            Err(_) => {}
+        }
     }
     return Ok(answer);
 }
 
+/// Whether a request may have its body read before its signature is checked (ADR-0083 §1): a SigV4 Authorization
+/// field dated within 15 minutes, by one of the server's keys or with a session's token. So a client with no key
+/// cannot make the server hold a body.
+fn tablesMayRead(req: borrow S3Request, credentials: Slice<Credential>, now: i64) -> bool {
+    let value = match (headerOf(req, "authorization")) {
+        Some(v) => v,
+        null => { return false; }
+    };
+    let auth = match (parseAuthorization(value)) {
+        Ok(a) => a,
+        Err(_) => { return false; }
+    };
+    let when = match (parseAmzDate(headerOf(req, "x-amz-date") ?? "".bytes())) {
+        Some(w) => w,
+        null => { return false; }
+    };
+    let skew = if (when > now) when - now else now - when;
+    if (skew > 900) { return false; }
+    if (headerOf(req, "x-amz-security-token").isSome()) { return true; }
+    for (i in 0..credentials.length) {
+        if (!credentials[i].revoked && credentials[i].accessKey.view() == auth.accessKey.view()) { return true; }
+    }
+    return false;
+}
+
+/// Whether a request is the Iceberg REST catalog's (`/iceberg/…`), whose errors have its own shape.
+fn icebergPath(req: borrow S3Request) -> bool {
+    let p = req.rawPath.view();
+    let head = "/iceberg".bytes();
+    return startsWithBytes(p, head) && (p.length == head.length || p[head.length] == '/');
+}
+
+/// An S3 Tables error as the Iceberg REST catalog gives one (`{"error":{…}}`), for a call of its that failed
+/// outside its own handlers' answers.
+fn icebergErrorOf(e: borrow TablesError) -> Result<TablesAnswer, TablesError> => match (e) {
+    TablesError.BadRequest => icebergError(400, "BadRequestException", "The request is invalid."),
+    TablesError.Forbidden => icebergError(403, "ForbiddenException", "Access denied."),
+    TablesError.NotFound => icebergError(404, "NotFoundException", "The specified resource was not found."),
+    TablesError.Conflict => icebergError(409, "CommitFailedException", "The table changed since it was read."),
+    TablesError.NotImplemented => icebergUnsupported(),
+    _ => icebergError(500, "InternalServerError", "An internal error occurred."),
+};
+
 /// A request signed for `s3tables` (ADR-0083 §1): its body read and hashed first, as S3 Tables' clients send no
 /// `x-amz-content-sha256`; long-term keys and their `GetSessionToken` sessions only.
 async fn serveTables(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    if (!tablesMayRead(req, app.credentials.get().view(), Clock.unixMillis() / 1000)) {
+        let refused: Result<TablesAnswer, TablesError> = Err(TablesError.Forbidden);
+        return await sendTablesAnswer(req, exchange, refused);
+    }
     let unsigned = Authenticated { payload: PayloadMode.Unsigned, signer: null, key: null, session: null };
     let body = await readSmallBody(unsigned, exchange, TABLES_MAX_BODY)?;
     var hash = Vector<u8>.create();
@@ -1182,6 +1300,20 @@ async fn serveTables(app: borrow S3App, req: borrow S3Request, exchange: borrow 
             }
         }
         Err(_) => Err(TablesError.Forbidden),
+    };
+    return await sendTablesAnswer(req, exchange, answer);
+}
+
+async fn sendTablesAnswer(
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+    result: Result<TablesAnswer, TablesError>,
+) -> Result<void, S3Fail> {
+    // The Iceberg catalog's errors in its own shape (ADR-0083 §1), whatever part of the call failed.
+    let answer: Result<TablesAnswer, TablesError> = match (result) {
+        Err(TablesError.OutOfMemory(e)) => Err(TablesError.OutOfMemory(e)),
+        Err(e) => if (icebergPath(req)) icebergErrorOf(borrow e) else Err(e),
+        Ok(a) => Ok(a),
     };
     match (answer) {
         Ok(a) => {
@@ -1236,19 +1368,29 @@ fn tableWarehouseRefusal(req: borrow S3Request) -> Result<void, S3Fail> {
     return Err(S3Fail.Code(S3Code.NotImplemented));
 }
 
-/// CreateTable's `metadata` (`{"iceberg":{"schema","partitionSpec","writeOrder","properties"}}`, AWS's camelCase
-/// shapes) as an Iceberg CreateTableRequest. `schemaV2` (nested types) is not done.
+/// CreateTable's `metadata` (`{"iceberg":{"schema","partitionSpec","writeOrder","properties"}}`) as an Iceberg
+/// CreateTableRequest. Its members are named on the wire as AWS's service model's `locationName`s: a spec's and an
+/// order's are Iceberg's own (`spec-id`, `source-id`, `field-id`, `order-id`, `null-order`), not camelCase. `schemaV2`
+/// (nested types) is not done.
 fn createRequestOfMetadata(md: borrow Json) -> Result<Json, TablesError> {
     let ice = match (jsonMember(md, "iceberg")) {
         Some(i) => i,
         null => { return Err(TablesError.BadRequest); }
     };
     if (jsonMember(ice, "schemaV2").isSome()) { return Err(TablesError.NotImplemented); }
+    // Only the members AWS's shapes have (its service model): another is refused, not dropped.
+    if (!onlyMembers(md, ["iceberg"][..]) ||
+        !onlyMembers(ice, ["schema", "partitionSpec", "writeOrder", "properties"][..])) {
+        return Err(TablesError.BadRequest);
+    }
     let fields = match (jsonMember(ice, "schema")) {
-        Some(s) => match (jsonMember(s, "fields")) {
-            Some(f) => f,
-            null => { return Err(TablesError.BadRequest); }
-        },
+        Some(s) => {
+            if (!onlyMembers(s, ["fields"][..])) { return Err(TablesError.BadRequest); }
+            match (jsonMember(s, "fields")) {
+                Some(f) => f,
+                null => { return Err(TablesError.BadRequest); }
+            }
+        }
         null => { return Err(TablesError.BadRequest); }
     };
     var out = jsonArray();
@@ -1256,21 +1398,26 @@ fn createRequestOfMetadata(md: borrow Json) -> Result<Json, TablesError> {
         Json.Array(items) => {
             for (i in 0..items.length) {
                 let f = borrow items[i];
+                // SchemaField: `name` and `type` (a string), `id` and `required` optional.
+                if (!onlyMembers(f, ["id", "name", "type", "required"][..])) { return Err(TablesError.BadRequest); }
+                let name = jsonMemberText(f, "name") ?? "".bytes();
+                let kind = jsonMemberText(f, "type") ?? "".bytes();
+                if (name.length == 0 || kind.length == 0) { return Err(TablesError.BadRequest); }
                 var g = jsonObject();
                 jsonSet(mut g, "id", jsonInteger(jsonMemberI64(f, "id") ?? (truncate<i64>(i) + 1))?)?;
-                jsonSet(mut g, "name", jsonString(jsonMemberText(f, "name") ?? "".bytes())?)?;
+                jsonSet(mut g, "name", jsonString(name)?)?;
                 var required = false;
                 match (jsonMember(f, "required")) {
                     Some(v) => {
                         match (v) {
                             Json.Bool(b) => { required = b; }
-                            _ => {}
+                            _ => { return Err(TablesError.BadRequest); }
                         }
                     }
                     null => {}
                 }
                 jsonSet(mut g, "required", Json.Bool(required))?;
-                jsonSet(mut g, "type", jsonString(jsonMemberText(f, "type") ?? "".bytes())?)?;
+                jsonSet(mut g, "type", jsonString(kind)?)?;
                 jsonPush(mut out, g)?;
             }
         }
@@ -1283,6 +1430,11 @@ fn createRequestOfMetadata(md: borrow Json) -> Result<Json, TablesError> {
     jsonSet(mut request, "schema", schema)?;
     match (jsonMember(ice, "partitionSpec")) {
         Some(ps) => {
+            // The table's first spec is spec 0, whatever else `specId` would name.
+            if (!onlyMembers(ps, ["fields", "spec-id"][..]) || (jsonMemberI64(ps, "spec-id") ?? 0) != 0 ||
+                (jsonMember(ps, "spec-id").isSome() && jsonMemberI64(ps, "spec-id").isNull())) {
+                return Err(TablesError.BadRequest);
+            }
             var specFields = jsonArray();
             match (jsonMember(ps, "fields")) {
                 Some(fs) => {
@@ -1290,12 +1442,17 @@ fn createRequestOfMetadata(md: borrow Json) -> Result<Json, TablesError> {
                         Json.Array(items) => {
                             for (i in 0..items.length) {
                                 let f = borrow items[i];
+                                if (!onlyMembers(f, ["source-id", "transform", "name", "field-id"][..]) ||
+                                    jsonMemberI64(f, "source-id").isNull() || jsonMemberText(f, "transform").isNull() ||
+                                    jsonMemberText(f, "name").isNull()) {
+                                    return Err(TablesError.BadRequest);
+                                }
                                 var g = jsonObject();
-                                jsonSet(mut g, "source-id", jsonInteger(jsonMemberI64(f, "sourceId") ?? 0)?)?;
+                                jsonSet(mut g, "source-id", jsonInteger(jsonMemberI64(f, "source-id") ?? 0)?)?;
                                 jsonSet(
                                     mut g,
                                     "field-id",
-                                    jsonInteger(jsonMemberI64(f, "fieldId") ?? (1000 + truncate<i64>(i)))?,
+                                    jsonInteger(jsonMemberI64(f, "field-id") ?? (1000 + truncate<i64>(i)))?,
                                 )?;
                                 jsonSet(mut g, "name", jsonString(jsonMemberText(f, "name") ?? "".bytes())?)?;
                                 jsonSet(
@@ -1319,6 +1476,9 @@ fn createRequestOfMetadata(md: borrow Json) -> Result<Json, TablesError> {
     }
     match (jsonMember(ice, "writeOrder")) {
         Some(wo) => {
+            if (!onlyMembers(wo, ["order-id", "fields"][..]) || jsonMemberI64(wo, "order-id").isNull()) {
+                return Err(TablesError.BadRequest);
+            }
             var orderFields = jsonArray();
             match (jsonMember(wo, "fields")) {
                 Some(fs) => {
@@ -1326,8 +1486,16 @@ fn createRequestOfMetadata(md: borrow Json) -> Result<Json, TablesError> {
                         Json.Array(items) => {
                             for (i in 0..items.length) {
                                 let f = borrow items[i];
+                                if (!onlyMembers(f, ["source-id", "transform", "direction", "null-order"][..]) ||
+                                    jsonMemberI64(f, "source-id").isNull() || jsonMemberText(f, "transform").isNull() ||
+                                    jsonMemberText(
+                                        f,
+                                        "direction",
+                                    ).isNull() || jsonMemberText(f, "null-order").isNull()) {
+                                    return Err(TablesError.BadRequest);
+                                }
                                 var g = jsonObject();
-                                jsonSet(mut g, "source-id", jsonInteger(jsonMemberI64(f, "sourceId") ?? 0)?)?;
+                                jsonSet(mut g, "source-id", jsonInteger(jsonMemberI64(f, "source-id") ?? 0)?)?;
                                 jsonSet(
                                     mut g,
                                     "transform",
@@ -1341,7 +1509,7 @@ fn createRequestOfMetadata(md: borrow Json) -> Result<Json, TablesError> {
                                 jsonSet(
                                     mut g,
                                     "null-order",
-                                    jsonString(jsonMemberText(f, "nullOrder") ?? "nulls-first".bytes())?,
+                                    jsonString(jsonMemberText(f, "null-order") ?? "nulls-first".bytes())?,
                                 )?;
                                 jsonPush(mut orderFields, g)?;
                             }
@@ -1352,7 +1520,7 @@ fn createRequestOfMetadata(md: borrow Json) -> Result<Json, TablesError> {
                 null => {}
             }
             var order = jsonObject();
-            let orderId = jsonMemberI64(wo, "orderId") ?? (if (orderFields_len(borrow orderFields) > 0) 1i64 else 0i64);
+            let orderId = jsonMemberI64(wo, "order-id") ?? 0;
             jsonSet(mut order, "order-id", jsonInteger(orderId)?)?;
             jsonSet(mut order, "fields", orderFields)?;
             jsonSet(mut request, "write-order", order)?;
@@ -1366,7 +1534,19 @@ fn createRequestOfMetadata(md: borrow Json) -> Result<Json, TablesError> {
     return Ok(request);
 }
 
-fn orderFields_len(j: borrow Json) -> usize => match (j) {
-    Json.Array(items) => items.length,
-    _ => 0,
-};
+/// Whether object `j` has no member but `allowed`'s (true for no object: its own check says what it must be).
+fn onlyMembers(j: borrow Json, allowed: Slice<StringView>) -> bool {
+    match (j) {
+        Json.Object(ms) => {
+            for (i in 0..ms.length) {
+                var known = false;
+                for (a in allowed) {
+                    if (ms[i].key.view() == a.bytes()) { known = true; }
+                }
+                if (!known) { return false; }
+            }
+        }
+        _ => {}
+    }
+    return true;
+}

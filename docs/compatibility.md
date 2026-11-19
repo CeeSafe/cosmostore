@@ -47,7 +47,12 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
   versionToken (ConflictException when it is not current). A table's `warehouseLocation` is
   `s3://<name>--table-s3/<table id>`, which an engine reads and writes with S3's calls (not the catalog's
   `.s3tables/` keys, and no bucket call). Policies, maintenance, encryption, tags, replication and the rest are
-  NotImplemented. CreateTable takes an Iceberg `metadata` schema (not `schemaV2`).
+  NotImplemented. CreateTable takes an Iceberg `metadata` schema (not `schemaV2`), with only the members AWS's
+  service model has. A metadata location ends `.metadata.json` (`.gz` is refused).
+  - **No policy restricts S3 Tables:** every long-term key (and its `GetSessionToken` sessions) may make, change, drop
+    and purge every table bucket. Anonymous requests and AssumeRole and directory-bucket sessions are refused.
+  - **Upgrading:** a general-purpose bucket named `<name>--table-s3`, made before M9, becomes table bucket `<name>`
+    and its bucket calls are refused: move its objects out before upgrading (ADR-0083 §2).
 - **The Iceberg REST catalog** (ADR-0083 §5): `<endpoint>/iceberg`, signed for `s3tables`, the `warehouse` a table
   bucket's ARN.
   - **PyIceberg:**
@@ -58,7 +63,8 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
       (`purge_table`, as S3 Tables drops only with `purgeRequested=true`). Its stale commits are refused with 409
       and retried.
     - Checked by `tools/iceberg_check.py`.
-  - **Not taken:** staged creates, nested namespaces, views, credential vending, and statistics updates.
+  - **Not taken:** staged creates, nested namespaces, views, credential vending, statistics updates, and namespace
+    properties other than `owner` (which is kept). A commit takes at most 1,000 requirements and 1,000 updates.
   - **On a cluster** as on `serve`: each table bucket's calls go to its shard.
   - **SDKs:** the S3 Tables API is checked with boto3, the AWS CLI, Go, JavaScript, Java and .NET. Each makes,
     lists and deletes a table bucket, a namespace and a table, gets a table by its ARN, swaps its metadata location,
