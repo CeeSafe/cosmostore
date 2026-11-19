@@ -81,6 +81,52 @@ struct BucketPolicy {
 
 fn malformedPolicy() -> S3Fail => S3Fail.Code(S3Code.MalformedPolicy);
 
+fn cloneVectors(v: borrow Vector<Vector<u8>>) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    for (i in 0..v.length) { out.push(copyBytes(v[i].view())?)?; }
+    return Ok(out);
+}
+
+/// A copy of a parsed policy, for a check that runs on a worker thread (ADR-0088 §2).
+fn clonePolicy(p: borrow BucketPolicy) -> Result<BucketPolicy, AllocError> {
+    var statements = Vector<PolicyStatement>.create();
+    for (i in 0..p.statements.length) {
+        let st = borrow p.statements[i];
+        var tests = Vector<PolicyTest>.create();
+        for (t in 0..st.tests.length) {
+            let test = borrow st.tests[t];
+            var ranges = Vector<IpRange>.create();
+            for (r in 0..test.ranges.length) {
+                let range = borrow test.ranges[r];
+                ranges.push(IpRange { v6: range.v6, bytes: range.bytes, bits: range.bits })?;
+            }
+            var numbers = Vector<u64>.create();
+            numbers.extend(test.numbers.view())?;
+            tests.push(PolicyTest {
+                op: test.op,
+                negated: test.negated,
+                key: test.key,
+                values: cloneVectors(borrow test.values)?,
+                ranges: ranges,
+                numbers: numbers,
+            })?;
+        }
+        statements.push(PolicyStatement {
+            allow: st.allow,
+            keys: cloneVectors(borrow st.keys)?,
+            users: cloneVectors(borrow st.users)?,
+            anyone: st.anyone,
+            notPrincipal: st.notPrincipal,
+            actions: cloneVectors(borrow st.actions)?,
+            notAction: st.notAction,
+            resources: cloneVectors(borrow st.resources)?,
+            notResource: st.notResource,
+            tests: tests,
+        })?;
+    }
+    return Ok(BucketPolicy { statements: statements, denies: p.denies });
+}
+
 fn notImplemented() -> S3Fail => S3Fail.Code(S3Code.NotImplemented);
 
 // ---- The document ----
@@ -1441,6 +1487,12 @@ fn gateDecision(
     key: Slice<u8>,
 ) -> Result<PolicyDecision, AllocError> {
     let anonymous = who.key.isNull();
+    // A table bucket's warehouse: a user's or a role session's request was decided as its table's data
+    // (`s3tables:GetTableData`/`PutTableData`, ADR-0084 §4) before it came here, not as S3's on a hidden bucket.
+    if (isTableWarehouseShaped(bucket.bytes()) &&
+        (who.role.isSome() || userOfRequester(app.credentials.get().view(), who).isSome())) {
+        return Ok(PolicyDecision.Allow);
+    }
     // As an identity policy names it: `s3:<bucket>[/<key>]` (ADR-0088 §3).
     var target = copyBytes("s3:".bytes())?;
     target.extend(bucket.bytes())?;

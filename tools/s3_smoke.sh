@@ -853,11 +853,12 @@ check "get-bucket-logging" "$(aws s3api get-bucket-logging --bucket smoke --quer
 printf 'logged' > logged.txt
 aws s3api put-object --bucket smoke --key logged.txt --body logged.txt > /dev/null 2>&1
 code s3api get-object --bucket smoke --key not-here notthere.out > /dev/null
+# Both lines, which may come in one log object or in two deliveries 2 s apart.
 for i in $(seq 1 40); do
-    [ "$(aws s3api list-objects-v2 --bucket smokelogs --prefix access/ --query 'length(Contents)' --output text 2>/dev/null)" -ge 1 ] 2>/dev/null && break
+    rm -rf logs.got && mkdir logs.got && aws s3 cp --recursive s3://smokelogs/access/ logs.got/ > /dev/null 2>&1
+    [ "$(cat logs.got/* 2>/dev/null | grep -c 'REST.PUT.OBJECT logged.txt\|REST.GET.OBJECT not-here')" -ge 2 ] && break
     sleep 0.25
 done
-rm -rf logs.got && mkdir logs.got && aws s3 cp --recursive s3://smokelogs/access/ logs.got/ > /dev/null 2>&1
 check "the log object is delivered" "$(ls logs.got | wc -l | tr -d ' ' | awk '{ print ($1 >= 1) ? "yes" : "no" }')" yes
 check "it has the PUT's line" "$(cat logs.got/* | grep -c '^cosmostore smoke \[.*REST.PUT.OBJECT logged.txt "PUT /smoke/logged.txt HTTP/1.1" 200 ')" 1
 check "and the missing key's, with its error" "$(cat logs.got/* | grep -c 'REST.GET.OBJECT not-here .* 404 NoSuchKey ')" 1
@@ -1290,13 +1291,18 @@ fi
 # Users (ADR-0088): a server of its own with a users file, so the rotation checks above keep their own file.
 usersport=$((port + 6))
 printf '%s\n' "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" "AKIAUSERREADER000001 reader/secret/0123456789abcdefgh" \
-    "AKIAUSERINTERN000001 intern/secret/0123456789abcdefgh" > "$work/users.credentials"
+    "AKIAUSERINTERN000001 intern/secret/0123456789abcdefgh" "AKIAUSERANALYST00001 analyst/secret/0123456789abcdefg" \
+    > "$work/users.credentials"
 cat > "$work/users.file" <<'USERS'
 # Each user: its name, its keys, its identity policy.
 reader AKIAUSERREADER000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
 intern AKIAUSERINTERN000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
+analyst AKIAUSERANALYST00001 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":["arn:aws:s3tables:*:*:bucket/lake","arn:aws:s3tables:*:*:bucket/lake/table/*"]},{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::000000000000:role/tablereader"}]}
 USERS
-"$bin" serve "$work/users-store" "$usersport" "$work/users.credentials" localhost --users-file "$work/users.file" --maintain-seconds 2 2>> "$work/users.log" &
+cat > "$work/users.roles" <<'ROLES'
+tablereader 3600 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":"*"}}
+ROLES
+"$bin" serve "$work/users-store" "$usersport" "$work/users.credentials" localhost --users-file "$work/users.file" --maintain-seconds 2 --sts-key-file "$work/sts.keys" --roles-file "$work/users.roles" 2>> "$work/users.log" &
 usersrv=$!
 sleep 1
 ua() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" aws "$@"; }
@@ -1324,6 +1330,26 @@ sed -i.bak 's#"arn:aws:s3:::team/\*"\]}}$#"arn:aws:s3:::team/*","arn:aws:s3:::ot
 sleep 4
 ur s3api get-object --bucket other --key b.txt users.out > /dev/null 2>&1 && pass "a users file reloaded" || fail "a users file reloaded"
 check "its reload in the log" "$(grep -c 'credentials reloaded' "$work/users.log")" 1
+# S3 Tables and STS for users (ADR-0088 §2, §4): the analyst reads table bucket `lake` and its data, nothing else.
+uan() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" AWS_ACCESS_KEY_ID=AKIAUSERANALYST00001 AWS_SECRET_ACCESS_KEY=analyst/secret/0123456789abcdefg aws "$@"; }
+lake=$(ua s3tables create-table-bucket --name lake --query arn --output text 2>&1)
+ua s3tables create-namespace --table-bucket-arn "$lake" --namespace ns > /dev/null 2>&1
+ua s3tables create-table --table-bucket-arn "$lake" --namespace ns --name t --format ICEBERG > /dev/null 2>&1
+lwh=$(ua s3tables get-table --table-bucket-arn "$lake" --namespace ns --name t --query warehouseLocation --output text 2>&1)
+lb=${lwh#s3://}; lb=${lb%%/*}; lp=${lwh#s3://*/}
+ua s3api put-object --bucket "$lb" --key "$lp/data/a.parquet" --body dir.txt > /dev/null 2>&1
+check "a user reads a table its policy allows" "$(uan s3tables get-table --table-bucket-arn "$lake" --namespace ns --name t --query name --output text 2>&1)" t
+check "and its data" "$(uan s3api get-object --bucket "$lb" --key "$lp/data/a.parquet" users.out > /dev/null 2>&1 && echo read)" read
+check "not writing its data" "$(ucode uan s3api put-object --bucket "$lb" --key "$lp/data/b.parquet" --body dir.txt)" AccessDenied
+check "nor dropping it" "$(ucode uan s3tables delete-table --table-bucket-arn "$lake" --namespace ns --name t)" ForbiddenException
+check "nor listing every table bucket" "$(ucode uan s3tables list-table-buckets)" ForbiddenException
+# A role it may assume; its session reads tables and drops none. Another user may not assume it.
+rcreds=$(uan sts assume-role --role-arn arn:aws:iam::000000000000:role/tablereader --role-session-name smoke-session --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)
+read -r rak rsk rst <<< "$rcreds"
+urole() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" AWS_ACCESS_KEY_ID="$rak" AWS_SECRET_ACCESS_KEY="$rsk" AWS_SESSION_TOKEN="$rst" aws "$@"; }
+check "a role's session reads a table" "$(urole s3tables get-table --table-bucket-arn "$lake" --namespace ns --name t --query name --output text 2>&1)" t
+check "and drops none" "$(ucode urole s3tables delete-table --table-bucket-arn "$lake" --namespace ns --name t)" ForbiddenException
+check "a user its policy does not let assume it" "$(ucode ui sts assume-role --role-arn arn:aws:iam::000000000000:role/tablereader --role-session-name smoke-session)" AccessDenied
 kill "$usersrv" 2>/dev/null
 
 # Deletes free the space.

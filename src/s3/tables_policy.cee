@@ -17,6 +17,73 @@ const TABLE_ID_LENGTH: usize = 36;
 struct TablesCaller {
     principal: Vector<u8>;
     facts: PolicyFacts;
+    /// The user it is (ADR-0088), and a copy of that user's identity policy; empty and none for an account's key.
+    user: Vector<u8>;
+    userPolicy: BucketPolicy?;
+    /// A role's session (ADR-0075): copies of its role's policy and its session's, each of which must allow.
+    role: bool;
+    rolePolicy: BucketPolicy?;
+    sessionPolicy: BucketPolicy?;
+}
+
+fn clonedPolicy(p: borrow BucketPolicy?) -> Result<BucketPolicy?, AllocError> => match (p) {
+    Some(x) => Ok(Some(clonePolicy(x)?)),
+    null => Ok(null),
+};
+
+/// A requester as S3 Tables decides it: its key, and its user's or role's identity policies (ADR-0088 §2).
+fn tablesCallerOf(app: borrow S3App, req: borrow S3Request, who: borrow Requester) -> Result<TablesCaller, AllocError> {
+    let credentials = app.credentials.get().view();
+    let user = if (who.role.isNull()) userOfRequester(credentials, who) else null;
+    return Ok(TablesCaller {
+        principal: principalOf(app, who)?,
+        facts: policyFacts(req, false, app.secure, who.peer)?,
+        user: match (user) {
+            Some(u) => copyBytes(u.user.view())?,
+            null => Vector<u8>.create(),
+        },
+        userPolicy: match (user) {
+            Some(u) => clonedPolicy(u.policy.asBorrow())?,
+            null => null,
+        },
+        role: who.role.isSome(),
+        rolePolicy: match (who.role) {
+            Some(r) => if (r < app.roles.length) Some(clonePolicy(borrow app.roles[r].policy)?) else null,
+            null => null,
+        },
+        sessionPolicy: clonedPolicy(who.sessionPolicy.asBorrow())?,
+    });
+}
+
+/// What the caller's identity policies say of `action` on `resource` (`s3tables:<bucket>[/table/<id>]`): a role's
+/// session Allow only when its role's and its session's policies both allow, else Deny; a user's its policy's say;
+/// Neither for an account's key.
+fn identityVerdict(caller: borrow TablesCaller, action: StringView, resource: Slice<u8>) -> PolicyDecision {
+    if (caller.role) {
+        match (borrow caller.rolePolicy) {
+            Some(p) => {
+                match (decidePolicy(p, null, action, resource, borrow caller.facts)) {
+                    PolicyDecision.Allow => {}
+                    _ => { return PolicyDecision.Deny; }
+                }
+            }
+            null => { return PolicyDecision.Deny; }
+        }
+        match (borrow caller.sessionPolicy) {
+            Some(p) => {
+                match (decidePolicy(p, null, action, resource, borrow caller.facts)) {
+                    PolicyDecision.Allow => {}
+                    _ => { return PolicyDecision.Deny; }
+                }
+            }
+            null => {}
+        }
+        return PolicyDecision.Allow;
+    }
+    return match (borrow caller.userPolicy) {
+        Some(p) => decidePolicy(p, null, action, resource, borrow caller.facts),
+        null => if (caller.user.length > 0) PolicyDecision.Deny else PolicyDecision.Neither,
+    };
 }
 
 /// The access key of a requester, empty for none.
@@ -54,7 +121,7 @@ fn readCatalogBytes(store: borrow ObjectStore, hidden: Slice<u8>, key: Slice<u8>
 
 /// Whether the policy kept at `key` (none: it does) lets the caller do `action` on `resource`: false for a Deny, or
 /// for a stored policy that no longer parses (ADR-0043 §9).
-fn policyLets(
+fn policyVerdict(
     store: borrow ObjectStore,
     hidden: Slice<u8>,
     key: Slice<u8>,
@@ -62,22 +129,20 @@ fn policyLets(
     caller: borrow TablesCaller,
     action: StringView,
     resource: Slice<u8>,
-) -> Result<bool, TablesError> {
+) -> Result<PolicyDecision, TablesError> {
     let document = match (readCatalogBytes(store, hidden, key)?) {
         Some(d) => d,
-        null => { return Ok(true); }
+        null => { return Ok(PolicyDecision.Neither); }
     };
     let none = Vector<Credential>.create();
     let policy = match (parseTablesPolicy(document.view(), bucketName, none.view(), false)) {
         Ok(p) => p,
         Err(S3Fail.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
-        Err(_) => { return Ok(false); }
+        Err(_) => { return Ok(PolicyDecision.Deny); } // a stored policy that no longer parses refuses (ADR-0043 §9)
     };
     let who: Slice<u8>? = if (caller.principal.length > 0) Some(caller.principal.view()) else null;
-    return Ok(match (decidePolicy(borrow policy, who, action, resource, borrow caller.facts)) {
-        PolicyDecision.Deny => false,
-        _ => true,
-    });
+    let user: Slice<u8>? = if (caller.user.length > 0) Some(caller.user.view()) else null;
+    return Ok(decidePolicyFor(borrow policy, who, user, action, resource, borrow caller.facts));
 }
 
 /// ForbiddenException unless the caller may do `action` on table bucket `bucketName`, or on its table `tableId` when
@@ -89,14 +154,25 @@ fn checkTables(
     bucketName: Slice<u8>,
     tableId: Slice<u8>,
 ) -> Result<void, TablesError> {
-    if (isTablesPolicyAction(action)) { return Ok(); }
+    let account = !caller.role && caller.user.length == 0;
+    // The policy calls are never refused to the account's keys (ADR-0084 §2); a user or a role needs an Allow.
+    if (account && isTablesPolicyAction(action)) { return Ok(); }
     var resource = copyBytes(bucketName)?;
     if (tableId.length > 0) {
         resource.extend("/table/".bytes())?;
         resource.extend(tableId)?;
     }
+    // The identity policies first (ADR-0088 §2), on `s3tables:<bucket>[/table/<id>]`.
+    var named = copyBytes("s3tables:".bytes())?;
+    named.extend(resource.view())?;
+    let identity = identityVerdict(caller, action, named.view());
+    match (identity) {
+        PolicyDecision.Deny => { return Err(TablesError.Forbidden); }
+        _ => {}
+    }
     let hidden = tableWarehouseBucket(bucketName)?;
-    if (!policyLets(
+    var resourceAllows = false;
+    match (policyVerdict(
         store,
         hidden.view(),
         TABLE_BUCKET_POLICY_KEY.bytes(),
@@ -105,15 +181,40 @@ fn checkTables(
         action,
         resource.view(),
     )?) {
-        return Err(TablesError.Forbidden);
+        PolicyDecision.Deny => { return Err(TablesError.Forbidden); }
+        PolicyDecision.Allow => { resourceAllows = true; }
+        PolicyDecision.Neither => {}
     }
     if (tableId.length > 0) {
         let key = tablePolicyKey(tableId)?;
-        if (!policyLets(store, hidden.view(), key.view(), bucketName, caller, action, resource.view())?) {
-            return Err(TablesError.Forbidden);
+        match (policyVerdict(store, hidden.view(), key.view(), bucketName, caller, action, resource.view())?) {
+            PolicyDecision.Deny => { return Err(TablesError.Forbidden); }
+            PolicyDecision.Allow => { resourceAllows = true; }
+            PolicyDecision.Neither => {}
         }
     }
-    return Ok();
+    // An account's key may do what nothing denies; a role's session what its policies allow; a user what its policy
+    // or a resource policy allows.
+    if (account || caller.role) { return Ok(); }
+    let identityAllows = match (identity) {
+        PolicyDecision.Allow => true,
+        _ => false,
+    };
+    return if (identityAllows || resourceAllows) Ok() else Err(TablesError.Forbidden);
+}
+
+/// For a call that names no table bucket a policy could be kept on (CreateTableBucket, ListTableBuckets): a user or a
+/// role's session needs its identity policies' Allow; an account's key may (ADR-0088 §2).
+fn checkTablesIdentity(
+    caller: borrow TablesCaller,
+    action: StringView,
+    resource: Slice<u8>,
+) -> Result<void, TablesError> {
+    if (!caller.role && caller.user.length == 0) { return Ok(); }
+    return match (identityVerdict(caller, action, resource)) {
+        PolicyDecision.Allow => Ok(),
+        _ => Err(TablesError.Forbidden),
+    };
 }
 
 /// A table's id by its namespace and name; NotFound if it is not there.
@@ -212,10 +313,7 @@ async fn tableDataAllowed(
 ) -> Result<bool, S3Fail> {
     if (!isTableWarehouseShaped(hidden)) { return Ok(true); }
     let name = hidden[0..hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
-    let caller = TablesCaller {
-        principal: principalOf(app, who)?,
-        facts: policyFacts(req, false, app.secure, who.peer)?,
-    };
+    let caller = tablesCallerOf(app, req, who)?;
     let callerRef = borrow caller;
     var guard = await lockStore(app)?;
     let store = guard.data();

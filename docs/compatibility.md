@@ -56,7 +56,8 @@ on a fresh store and ends with fsck. Updated 13 Nov 2026, when every row was run
       it cannot lock itself out.
     - **A table's data:** an engine's S3 calls on it are `s3tables:GetTableData` (reads) and `s3tables:PutTableData`
       (writes and deletes).
-    - **Not taken:** anonymous requests, AssumeRole sessions and directory-bucket sessions.
+    - **Not taken:** anonymous requests and directory-bucket sessions. Users and AssumeRole sessions are decided by
+      their identity policies with these (ADR-0088).
   - **Maintenance** (ADR-0086): Put/Get of a table bucket's and a table's maintenance configurations, and the job
     status, with AWS's defaults until they are set.
     - **Snapshot management:** expires snapshots older than `maxSnapshotAgeHours`. It keeps every ref's head and the

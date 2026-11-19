@@ -1180,8 +1180,17 @@ fn routeTablesSync(
     if (top == "buckets".bytes()) {
         // CreateTableBucket and ListTableBuckets name no table bucket: no policy applies.
         if (segs.length == 1) {
-            if (isMethod(m, Method.Put)) { return createTableBucket(store, req, body); }
-            if (isMethod(m, Method.Get)) { return listTableBuckets(store, req); }
+            if (isMethod(m, Method.Put)) {
+                let j = tablesObject(body)?;
+                var named = copyBytes("s3tables:".bytes())?;
+                named.extend(jsonMemberText(borrow j, "name") ?? "".bytes())?;
+                checkTablesIdentity(caller, "s3tables:CreateTableBucket", named.view())?;
+                return createTableBucket(store, req, body);
+            }
+            if (isMethod(m, Method.Get)) {
+                checkTablesIdentity(caller, "s3tables:ListTableBuckets", "s3tables:".bytes())?;
+                return listTableBuckets(store, req);
+            }
             return Err(TablesError.BadRequest);
         }
         let bucket = bucketOfSegment(segs[1].view())?;
@@ -1334,10 +1343,7 @@ async fn routeTables(
     who: borrow Requester,
 ) -> Result<TablesAnswer, TablesError> {
     var answer = tablesNoContent();
-    let caller = TablesCaller {
-        principal: principalOf(app, who)?,
-        facts: policyFacts(req, false, app.secure, who.peer)?,
-    };
+    let caller = tablesCallerOf(app, req, who)?;
     let callerRef = borrow caller;
     // CosmoStore's own call: one table's maintenance job, now (ADR-0086 §5), as a cluster node asks its shards.
     let segs = pathSegments(req.rawPath.view())?;
@@ -1410,7 +1416,7 @@ fn icebergErrorOf(e: borrow TablesError) -> Result<TablesAnswer, TablesError> =>
 };
 
 /// A request signed for `s3tables` (ADR-0083 §1): its body read and hashed first, as S3 Tables' clients send no
-/// `x-amz-content-sha256`; long-term keys and their `GetSessionToken` sessions only.
+/// `x-amz-content-sha256`; keys, their `GetSessionToken` sessions, and roles' sessions (ADR-0088 §2).
 async fn serveTables(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
     if (!tablesMayRead(req, app.credentials.get().view(), Clock.unixMillis() / 1000)) {
         let refused: Result<TablesAnswer, TablesError> = Err(TablesError.Forbidden);
@@ -1433,7 +1439,8 @@ async fn serveTables(app: borrow S3App, req: borrow S3Request, exchange: borrow 
                 Some(s) => sessionRequester(app, auth.key, null, s)?,
                 null => requesterOf(auth.key, null),
             };
-            if (who.key.isNull() || who.role.isSome() || headerOf(req, EXPRESS_TOKEN_FIELD).isSome()) {
+            // A role's session is decided by its policies (ADR-0088 §2), as a user is.
+            if (who.key.isNull() || headerOf(req, EXPRESS_TOKEN_FIELD).isSome()) {
                 Err(TablesError.Forbidden)
             } else {
                 await routeTables(app, req, body.view(), borrow who)

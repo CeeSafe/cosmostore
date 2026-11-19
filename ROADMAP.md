@@ -3444,3 +3444,20 @@ Browser form uploads with a SigV4 POST policy.
     and policy calls. A bucket's Allow lets it write an inbox, and its Deny beats a user's Allow. The account's key
     is not narrowed, and a reload of the users file takes effect.
 - **Next:** slice 2, S3 Tables and STS.
+
+### 19 Nov 2026: M11 slice 2, S3 Tables and STS for users and roles (ADR-0088 §2, §4)
+
+- **S3 Tables:** each call is decided with the requester's identity policies too.
+  - A user needs its identity policy's Allow, or a table bucket's or table's naming it. A Deny in either refuses.
+  - A role's session needs its role's and its session's Allow, so S3 Tables now takes AssumeRole sessions.
+  - CreateTableBucket and ListTableBuckets are decided by the identity alone.
+  - An engine's S3 calls into a warehouse, by a user or a role's session, are decided as the table's data
+    (`s3tables:GetTableData`/`PutTableData`), not as S3's on a hidden bucket.
+- **AssumeRole** by a user needs `sts:AssumeRole` on the role's ARN. The account's keys may assume any, and a user's
+  GetSessionToken session is the user's.
+- **Copies:** the checks that run on a worker thread take copies of the identity policies (`clonePolicy`).
+- **Tests:** `tablesDecideUsersAndRoles`; 377 in all.
+  - **The smoke's users server**, 8 more checks: an analyst reads table bucket `lake`, its table and its data, and is
+    refused writes, drops and ListTableBuckets. In the role it assumes, reads are taken and drops refused. Another
+    user may not assume the role.
+- **Next:** slice 3, the cluster.

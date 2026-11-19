@@ -149,7 +149,8 @@ S3 Tables for when Iceberg engines are meant to run against CosmoStore. This ADR
    it does not have, or a field `type` that is not a string, is refused.
    - **Policies** (M9's exit review, B6): table bucket and table policies, `s3tables:` actions decided by them, and a
      table's data through S3 as `s3tables:GetTableData`/`PutTableData`, are ADR-0084's. Anonymous requests,
-     AssumeRole sessions and directory-bucket sessions are refused.
+     directory-bucket sessions are refused; AssumeRole sessions, and users, are decided by their identity policies
+     (ADR-0088).
 7. **On a cluster** (slice 3):
    - **Routing:** the front routes a request signed for `s3tables` by the table bucket it names, to its hidden
      bucket's shard. It finds the name in CreateTableBucket's body, the ARN in the path, GetTable's query, or the

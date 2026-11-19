@@ -40,6 +40,11 @@ fn tablesCaller(key: StringView) -> TablesCaller {
     return TablesCaller {
         principal: copyBytes(key.bytes())!,
         facts: policyFacts(borrow req, false, false, null)!,
+        user: Vector<u8>.create(),
+        userPolicy: null,
+        role: false,
+        rolePolicy: null,
+        sessionPolicy: null,
     };
 }
 
@@ -135,6 +140,76 @@ fn tableBucketsMadeBeforeM9() -> Result<void, TestFailure> {
     Check.equalBytes("sales--table-s3".bytes(), legacyTableBucket(borrow s)!!.view())?;
     let message = legacyTableBucketMessage("sales--table-s3".bytes())!;
     Check.isTrue(findBytes(message.bytes(), "release before M9".bytes(), 0).isSome(), "says what to do")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+fn identityCaller(user: StringView, policy: StringView, role: bool, session: StringView) -> TablesCaller {
+    let req = bareRequest();
+    var c = TablesCaller {
+        principal: copyBytes("AKIAUSER".bytes())!,
+        facts: policyFacts(borrow req, false, false, null)!,
+        user: copyBytes(user.bytes())!,
+        userPolicy: null,
+        role: role,
+        rolePolicy: null,
+        sessionPolicy: null,
+    };
+    let p = parseIdentityPolicy(policy.bytes())!;
+    if (role) {
+        c.rolePolicy = Some(p);
+        if (session.length > 0) { c.sessionPolicy = Some(parseIdentityPolicy(session.bytes())!); }
+    } else {
+        c.userPolicy = Some(p);
+    }
+    return c;
+}
+
+fn callerLets(store: borrow ObjectStore, c: borrow TablesCaller, action: StringView) -> bool =>
+    checkTables(store, c, action, "sales".bytes(), POLICY_TABLE_ID.bytes()).isOk();
+
+@test
+fn tablesDecideUsersAndRoles() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("tables-identities");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("sales--table-s3")!;
+    let reads =
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3tables:Get*\",\"Resource\":\"arn:aws:s3tables:*:*:bucket/sales/table/*\"}}";
+    // A user: its identity policy's Allow, or a resource policy's; nothing else (ADR-0088 §2).
+    let analyst = identityCaller("analyst", reads, false, "");
+    Check.isTrue(callerLets(borrow s, borrow analyst, "s3tables:GetTable"), "its Allow")?;
+    Check.isFalse(callerLets(borrow s, borrow analyst, "s3tables:DeleteTable"), "nothing allows a drop")?;
+    Check.isFalse(callerLets(borrow s, borrow analyst, "s3tables:PutTableBucketPolicy"), "nor its policy calls")?;
+    putPolicy(
+        mut s,
+        TABLE_BUCKET_POLICY_KEY,
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:user/analyst\"},\"Action\":\"s3tables:DeleteTable\",\"Resource\":\"arn:aws:s3tables:us-east-1:0:bucket/sales/table/*\"}}",
+    );
+    Check.isTrue(callerLets(borrow s, borrow analyst, "s3tables:DeleteTable"), "the bucket's Allow")?;
+    // Its own Deny wins over the bucket's Allow.
+    let denied = identityCaller(
+        "analyst",
+        "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3tables:*\",\"Resource\":\"*\"},{\"Effect\":\"Deny\",\"Action\":\"s3tables:DeleteTable\",\"Resource\":\"*\"}]}",
+        false,
+        "",
+    );
+    Check.isFalse(callerLets(borrow s, borrow denied, "s3tables:DeleteTable"), "its own Deny")?;
+    // A role's session: its role's and its session's policies must each allow.
+    let everything = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3tables:*\",\"Resource\":\"*\"}}";
+    let role = identityCaller("", everything, true, "");
+    Check.isTrue(callerLets(borrow s, borrow role, "s3tables:UpdateTableMetadataLocation"), "a role's")?;
+    let narrowed = identityCaller("", everything, true, reads);
+    Check.isTrue(callerLets(borrow s, borrow narrowed, "s3tables:GetTable"), "the session allows reads")?;
+    Check.isFalse(callerLets(borrow s, borrow narrowed, "s3tables:UpdateTableMetadataLocation"), "not writes")?;
+    // Calls that name no table bucket: the identity's Allow alone.
+    Check.isTrue(
+        checkTablesIdentity(borrow analyst, "s3tables:ListTableBuckets", "s3tables:".bytes()).isErr(),
+        "no list",
+    )?;
+    Check.isTrue(
+        checkTablesIdentity(borrow role, "s3tables:CreateTableBucket", "s3tables:new".bytes()).isOk(),
+        "a role may",
+    )?;
     removeTree(dir.view());
     return Ok();
 }
