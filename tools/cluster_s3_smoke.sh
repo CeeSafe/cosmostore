@@ -79,7 +79,7 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --users-file users --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --tables-day-seconds 24 --zone-id local-az1 >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --users-file users --sts-key-file sts.keys --roles-file roles --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --tables-day-seconds 24 --lifecycle-seconds 2 --zone-id local-az1 >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -477,6 +477,21 @@ check "a SHA-1 checksum through node 3, returned through node 1" "$(on 1 s3api h
 on 1 s3api delete-bucket-lifecycle --bucket tail-c > /dev/null 2>&1
 for k in ia sha1; do on 2 s3api delete-object --bucket tail-c --key "$k" > /dev/null 2>&1; done
 on 3 s3api delete-bucket --bucket tail-c > /dev/null 2>&1
+# Lifecycle runs on each shard's leader (the M12 exit review's A3): a rule dated in the past expires one object and
+# moves another, seen through other nodes.
+on 1 s3api create-bucket --bucket life-c > /dev/null 2>&1
+on 2 s3api put-object --bucket life-c --key exp/a --body one.txt > /dev/null 2>&1
+on 3 s3api put-object --bucket life-c --key mv/b --body one.txt > /dev/null 2>&1
+on 1 s3api put-bucket-lifecycle-configuration --bucket life-c --lifecycle-configuration '{"Rules":[{"ID":"e","Status":"Enabled","Filter":{"Prefix":"exp/"},"Expiration":{"Date":"2020-01-01T00:00:00Z"}},{"ID":"t","Status":"Enabled","Filter":{"And":{"Prefix":"mv/","ObjectSizeGreaterThan":0}},"Transitions":[{"Date":"2020-01-01T00:00:00Z","StorageClass":"STANDARD_IA"}]}]}' > /dev/null 2>&1
+for i in $(seq 1 30); do
+    [ "$(on 2 s3api head-object --bucket life-c --key mv/b --query StorageClass --output text 2>&1)" = STANDARD_IA ] && break
+    sleep 1
+done
+check "a transition applied on a cluster, seen through node 2" "$(on 2 s3api head-object --bucket life-c --key mv/b --query StorageClass --output text 2>&1)" STANDARD_IA
+check "and an expiration, seen through node 3" "$(code 3 s3api head-object --bucket life-c --key exp/a)" 404
+on 1 s3api delete-bucket-lifecycle --bucket life-c > /dev/null 2>&1
+on 2 s3api delete-object --bucket life-c --key mv/b > /dev/null 2>&1
+on 3 s3api delete-bucket --bucket life-c > /dev/null 2>&1
 
 # Event notifications on a cluster (ADR-0078 §4): the shard's leader delivers, and a new one goes on.
 keys() { python3 -c 'import json,sys

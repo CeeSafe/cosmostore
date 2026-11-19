@@ -28,6 +28,13 @@ purpose bucket. Each item below is small, and each becomes a row of the support 
    - A transition rewrites the object's metadata with its new class, in the store's metadata update, journaled as
      tags are. It does not move bytes.
    - GetBucketLifecycleConfiguration returns the rules as put.
+   - **Amended after M12's exit review:**
+     - S3's checks between one rule's transitions;
+     - REDUCED_REDUNDANCY refused as a target;
+     - S3's 128 KB floor, unless the rule filters by size;
+     - `x-amz-transition-default-minimum-object-size` taken, kept and answered;
+     - directory buckets take no transitions;
+     - a version without room in its metadata for the class is skipped.
 3. **ListMultipartUploads' `delimiter`:** CommonPrefixes, grouped as ListObjects groups keys, with `prefix` and the
    key and upload id markers.
 4. **SHA-1 checksums:** `x-amz-checksum-sha1` is checked, stored and returned (`x-amz-checksum-mode`), and composite
@@ -47,7 +54,8 @@ purpose bucket. Each item below is small, and each becomes a row of the support 
      too, where SDKs do not read it.
    - **Compatibility:** objects sealed before it have none, and read as before. `aws:kms:dsse` stays refused.
 7. **On a cluster:** every item, through every node, but SSE-KMS's context: a node has no KMS key file, so SSE-KMS
-   is not served on a cluster at all (before M12). **Slices** follow this order, each with its smoke and SDK
+   is not served on a cluster at all (before M12). Lifecycle rules, expirations included, run on each shard's
+   leader as a write (amended after M12's exit review, A3, by the owner's choice; `node --lifecycle-seconds`). **Slices** follow this order, each with its smoke and SDK
    checks.
 
 ## Slices

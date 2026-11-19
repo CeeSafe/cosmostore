@@ -287,6 +287,8 @@ fn lifecycleTransitionsRecordClasses() -> Result<void, TestFailure> {
         putText(mut s, "bkt", "b", "b");
         var rules = Vector<LifecycleRule>.create();
         var tiers = rule("tiers", "", 0);
+        tiers.hasSizeAbove = true;
+        tiers.hasSizeAbove = true; // a size filter: S3's 128 KB floor does not apply
         tiers.transitions.push(transitionTo(30, 0, "STANDARD_IA"))!;
         tiers.transitions.push(transitionTo(90, 0, "GLACIER_IR"))!;
         rules.push(tiers)!;
@@ -304,12 +306,28 @@ fn lifecycleTransitionsRecordClasses() -> Result<void, TestFailure> {
         Check.equalBytes("GLACIER_IR".bytes(), classOf(borrow s, "bkt", "b", null).view())?;
         // Never back up the waterfall, and nothing more to do.
         Check.equalU64(0, s.applyLifecycle(now + 400 * DAY_MILLIS)!.transitioned)?;
+        // Without a size filter, S3's floor: objects under 128 KB stay where they are.
+        s.createBucket("floor")!;
+        putText(mut s, "floor", "tiny", "t");
+        let _ = s.putObject("floor", "large", "", patterned(200000, 3).view(), PutCondition.None)!;
+        var floor = Vector<LifecycleRule>.create();
+        var plain = rule("plain", "", 0);
+        plain.transitions.push(transitionTo(30, 0, "STANDARD_IA"))!;
+        floor.push(plain)!;
+        encodeLifecycleWith(floor.view(), true, mut blob)!;
+        Check.isTrue(lifecycleAll128k(blob.view()), "the bucket's minimum kept")?;
+        Check.equalU64(1, decodeLifecycle(blob.view())!.length as u64)?;
+        s.setBucketConfig("floor", BUCKET_CONFIG_LIFECYCLE, blob.view())!;
+        Check.equalU64(1, s.applyLifecycle(now + 31 * DAY_MILLIS)!.transitioned)?;
+        Check.equalU64(0, classOf(borrow s, "floor", "tiny", null).length as u64)?;
+        Check.equalBytes("STANDARD_IA".bytes(), classOf(borrow s, "floor", "large", null).view())?;
         // A noncurrent version moves by the days since a newer one was written; the current one stays.
         s.createBucket("ver")!;
         setVersioning(mut s, "ver", VERSIONING_ENABLED);
         let old = putVersion(mut s, "ver", "k", "one").versionId;
         let _ = putVersion(mut s, "ver", "k", "two");
         var noncurrent = rule("old", "", 0);
+        noncurrent.hasSizeAbove = true;
         noncurrent.noncurrentTransitions.push(transitionTo(30, 0, "ONEZONE_IA"))!;
         var one = Vector<LifecycleRule>.create();
         one.push(noncurrent)!;
@@ -319,9 +337,15 @@ fn lifecycleTransitionsRecordClasses() -> Result<void, TestFailure> {
         Check.equalBytes("ONEZONE_IA".bytes(), classOf(borrow s, "ver", "k", Some(old)).view())?;
         Check.equalU64(0, classOf(borrow s, "ver", "k", null).length as u64)?;
     }
-    // Recovery keeps the classes.
+    // Recovery keeps the classes, from the journal and from a checkpoint (the M12 exit review's C2).
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        Check.equalBytes("GLACIER_IR".bytes(), classOf(borrow s, "bkt", "a", null).view())?;
+        Check.isTrue(s.checkpoint()!, "a checkpoint")?;
+    }
     let s = ObjectStore.open(dir.view(), uploadConfig())!;
     Check.equalBytes("GLACIER_IR".bytes(), classOf(borrow s, "bkt", "a", null).view())?;
+    Check.equalBytes("STANDARD_IA".bytes(), classOf(borrow s, "floor", "large", null).view())?;
     removeTree(dir.view());
     return Ok();
 }
@@ -338,6 +362,8 @@ fn transitionCrashAtEveryByteIsConsistent() -> Result<void, TestFailure> {
         putText(mut s, "bkt", "k", "body"); // 2
         var rules = Vector<LifecycleRule>.create();
         var tiers = rule("tiers", "", 0);
+        tiers.hasSizeAbove = true;
+        tiers.hasSizeAbove = true; // a size filter: S3's 128 KB floor does not apply
         tiers.transitions.push(transitionTo(30, 0, "STANDARD_IA"))!;
         rules.push(tiers)!;
         var blob = Vector<u8>.create();
@@ -366,6 +392,46 @@ fn transitionCrashAtEveryByteIsConsistent() -> Result<void, TestFailure> {
     }
     Check.equalU64(4, last)?;
     removeTree(source.view());
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// One version with no room in its metadata for a storage class (the M12 exit review's A1) is skipped by its
+/// transition; the run goes on, and another bucket's objects still expire.
+@test
+fn lifecycleSkipsAVersionWithNoRoomForItsClass() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("lifecycle-full-metadata");
+    var s = ObjectStore.open(dir.view(), uploadConfig())!;
+    s.createBucket("aaa")!;
+    s.createBucket("zzz")!;
+    var meta = Vector<u8>.create();
+    var big = Vector<u8>.create();
+    big.resize(MAX_METADATA_BYTES - 40, 'x')!;
+    metadataAdd(mut meta, "cache-control".bytes(), big.view())!;
+    Check.isTrue(meta.length <= MAX_METADATA_BYTES, "the object is within the limit")?;
+    var w = s.newWriter()!;
+    w.write("f".bytes())!;
+    let obj = w.finish()!;
+    let _ = s.putFinishedWith("aaa", "full", "", meta.view(), "".bytes(), borrow obj, PutCondition.None)!;
+    putText(mut s, "aaa", "small", "s");
+    putText(mut s, "zzz", "old", "o");
+    var moved = Vector<LifecycleRule>.create();
+    var tiers = rule("tiers", "", 0);
+    tiers.hasSizeAbove = true;
+    tiers.transitions.push(transitionTo(30, 0, "GLACIER_IR"))!;
+    moved.push(tiers)!;
+    var blob = Vector<u8>.create();
+    encodeLifecycle(moved.view(), mut blob)!;
+    s.setBucketConfig("aaa", BUCKET_CONFIG_LIFECYCLE, blob.view())!;
+    var expire = Vector<LifecycleRule>.create();
+    expire.push(rule("old", "", 1))!;
+    encodeLifecycle(expire.view(), mut blob)!;
+    s.setBucketConfig("zzz", BUCKET_CONFIG_LIFECYCLE, blob.view())!;
+    let report = s.applyLifecycle(Clock.unixMillis() + 31 * DAY_MILLIS)!;
+    Check.equalU64(1, report.transitioned)?;   // the small one; the full one is skipped
+    Check.equalU64(1, report.objectsExpired)?; // the other bucket's object still expires
+    Check.equalU64(0, classOf(borrow s, "aaa", "full", null).length as u64)?;
+    Check.equalBytes("GLACIER_IR".bytes(), classOf(borrow s, "aaa", "small", null).view())?;
     removeTree(dir.view());
     return Ok();
 }

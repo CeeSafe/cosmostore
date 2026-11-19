@@ -165,6 +165,14 @@ status, text, _ = post_form(post["url"], post["fields"], "hello.txt", b"posted b
 check("POST object", status, 204)
 got = s3.get_object(Bucket=B, Key="post/hello.txt")
 check("POST object stored", (got["Body"].read(), got["ContentType"], got["Metadata"]), (b"posted bytes", "text/plain", {"note": "hi"}))
+# A POST form's checksum fields are checked (the M12 exit review's A6): SHA-1 of "abc", then a wrong one.
+summed = s3.generate_presigned_post(B, "post/summed", Fields={"x-amz-checksum-sha1": "qZk+NkcGgWq6PiVxeFDCbJzQ2J0="},
+                                    Conditions=[{"x-amz-checksum-sha1": "qZk+NkcGgWq6PiVxeFDCbJzQ2J0="}], ExpiresIn=60)
+status, _, _ = post_form(summed["url"], summed["fields"], "s", b"abc")
+check("a POST form's checksum taken", (status, s3.head_object(Bucket=B, Key="post/summed", ChecksumMode="ENABLED").get("ChecksumSHA1")),
+      (204, "qZk+NkcGgWq6PiVxeFDCbJzQ2J0="))
+status, text, _ = post_form(summed["url"], summed["fields"], "s", b"abd")
+check("a POST form's wrong checksum refused", (status, "BadDigest" in text), (400, True))
 created = s3.generate_presigned_post(B, "post/created", Fields={"success_action_status": "201"},
                                      Conditions=[{"success_action_status": "201"}], ExpiresIn=60)
 status, text, _ = post_form(created["url"], created["fields"], "x", b"x")

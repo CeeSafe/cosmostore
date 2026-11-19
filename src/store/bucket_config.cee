@@ -276,13 +276,24 @@ struct RuleTransition {
 /// noncurrent versions, adds per rule: u32 noncurrent days, u32 newer noncurrent versions. Version 3 (ADR-0090 §2),
 /// written only when a rule has a transition, adds after those: u8 transition count and each (u32 days, i64 date,
 /// u32 newer, u16+bytes class), then the noncurrent transitions the same way.
-fn encodeLifecycle(rules: Slice<LifecycleRule>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+fn encodeLifecycle(rules: Slice<LifecycleRule>, out: borrow mut Vector<u8>) -> Result<void, AllocError> =>
+    encodeLifecycleWith(rules, false, out);
+
+/// `encodeLifecycle`, with the bucket's `x-amz-transition-default-minimum-object-size`: `all128k` for
+/// `all_storage_classes_128K`. Version 4 (the M12 exit review's A5), written only then, is version 3 and a last byte,
+/// 1.
+fn encodeLifecycleWith(
+    rules: Slice<LifecycleRule>,
+    all128k: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
     out.clear();
     var version: u8 = 1;
     for (r in rules) {
         if (r.noncurrentDays > 0 && version < 2) { version = 2; }
         if (r.transitions.length > 0 || r.noncurrentTransitions.length > 0) { version = 3; }
     }
+    if (all128k) { version = 4; }
     out.pushLE(version)?;
     out.pushLE(truncate<u16>(rules.length))?;
     for (r in rules) {
@@ -306,13 +317,21 @@ fn encodeLifecycle(rules: Slice<LifecycleRule>, out: borrow mut Vector<u8>) -> R
             out.pushLE(r.noncurrentDays)?;
             out.pushLE(r.newerNoncurrent)?;
         }
-        if (version == 3) {
+        if (version >= 3) {
             encodeTransitions(r.transitions.view(), out)?;
             encodeTransitions(r.noncurrentTransitions.view(), out)?;
         }
     }
+    if (version == 4) { out.pushLE(1u8)?; }
     return Ok();
 }
+
+/// Whether a lifecycle blob was put with `all_storage_classes_128K` (version 4).
+fn lifecycleAll128k(blob: Slice<u8>) -> bool => blob.length > 0 && blob[0] == 4;
+
+/// The size under which an object does not transition, unless its rule filters by size (S3's default for the
+/// classes kept here, whichever `x-amz-transition-default-minimum-object-size` the bucket has).
+const TRANSITION_MINIMUM_BYTES: u64 = 131072;
 
 fn encodeTransitions(all: Slice<RuleTransition>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
     out.pushLE(truncate<u8>(all.length))?;
@@ -347,7 +366,7 @@ fn decodeLifecycle(blob: Slice<u8>) -> Result<Vector<LifecycleRule>, MetaFault> 
     var at: usize = 0;
     need(blob, at, 3)?;
     let version = blob[0];
-    if (version < 1 || version > 3) { return Err(MetaFault.BadVersion); }
+    if (version < 1 || version > 4) { return Err(MetaFault.BadVersion); }
     let count = blob.readLE<u16>(1);
     at = 3;
     for (i in 0..count) {
@@ -374,7 +393,7 @@ fn decodeLifecycle(blob: Slice<u8>) -> Result<Vector<LifecycleRule>, MetaFault> 
         }
         var transitions = Vector<RuleTransition>.create();
         var noncurrentTransitions = Vector<RuleTransition>.create();
-        if (version == 3) {
+        if (version >= 3) {
             transitions = decodeTransitions(blob, mut at)?;
             noncurrentTransitions = decodeTransitions(blob, mut at)?;
         }
@@ -397,6 +416,11 @@ fn decodeLifecycle(blob: Slice<u8>) -> Result<Vector<LifecycleRule>, MetaFault> 
             transitions: transitions,
             noncurrentTransitions: noncurrentTransitions,
         })?;
+    }
+    if (version == 4) {
+        need(blob, at, 1)?;
+        if (blob[at] != 1) { return Err(MetaFault.TooLong); }
+        at += 1;
     }
     if (at != blob.length) { return Err(MetaFault.TooLong); }
     return Ok(rules);

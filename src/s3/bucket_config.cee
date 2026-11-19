@@ -164,6 +164,42 @@ fn filterInto(xml: Slice<u8>, rule: borrow mut LifecycleRule) -> Result<void, S3
     return Ok();
 }
 
+/// The bucket-wide minimum size for transitions, as S3 names it (the M12 exit review's A5).
+const TRANSITION_MINIMUM_FIELD: StringView = "x-amz-transition-default-minimum-object-size";
+
+fn transitionMinimumName(all128k: bool) -> StringView =>
+    if (all128k) "all_storage_classes_128K" else "varies_by_storage_class";
+
+/// S3's checks of one rule's transitions (the M12 exit review's B2): all by Days or all by Date; each class once; in
+/// the waterfall's order as their times grow; 30 days in an infrequent access class before the next; and an
+/// expiration after them all.
+fn checkTransitionOrder(all: Slice<RuleTransition>, expirationDays: u32, expirationDate: i64) -> Result<void, S3Fail> {
+    let invalid = S3Fail.Code(S3Code.InvalidArgument);
+    for (i in 0..all.length) {
+        let a = borrow all[i];
+        if ((a.date > 0) != (all[0].date > 0)) { return Err(invalid); }
+        if (expirationDays > 0 && a.date == 0 && expirationDays <= a.days) { return Err(invalid); }
+        if (expirationDate > 0 && a.date > 0 && expirationDate <= a.date) { return Err(invalid); }
+        for (j in 0..all.length) {
+            if (i == j) { continue; }
+            let b = borrow all[j];
+            if (a.storageClass.view() == b.storageClass.view()) { return Err(invalid); }
+            let aAt = if (a.date > 0) a.date else a.days as i64;
+            let bAt = if (b.date > 0) b.date else b.days as i64;
+            if (aAt == bAt) { return Err(invalid); }
+            // Later in time, later in the waterfall.
+            if (aAt < bAt && storageClassRank(a.storageClass.view()) >= storageClassRank(b.storageClass.view())) {
+                return Err(invalid);
+            }
+            // From an infrequent access class, 30 days before the next transition (by days).
+            let infrequent = a.storageClass.view() == "STANDARD_IA".bytes() ||
+                a.storageClass.view() == "ONEZONE_IA".bytes();
+            if (infrequent && a.date == 0 && b.days > a.days && b.days - a.days < 30) { return Err(invalid); }
+        }
+    }
+    return Ok();
+}
+
 /// The most transitions of one kind a rule may have.
 const MAX_RULE_TRANSITIONS: usize = 8;
 
@@ -190,7 +226,9 @@ fn parseTransitions(
         let block = inner[start..end];
         at = end + close.length;
         let named = elementText(block, "StorageClass") ?? { return Err(S3Fail.Code(S3Code.MalformedXML)); };
-        if (named.length == 0 || named == "STANDARD".bytes() || !isStoredClassValue(named)) {
+        // S3's TransitionStorageClass: not STANDARD, nor REDUCED_REDUNDANCY (the M12 exit review's B1).
+        if (named.length == 0 || named == "STANDARD".bytes() || named == "REDUCED_REDUNDANCY".bytes() ||
+            !isStoredClassValue(named)) {
             return Err(S3Fail.Code(S3Code.InvalidStorageClass));
         }
         var t = RuleTransition { days: 0, date: 0, newer: 0, storageClass: copyBytes(named)? };
@@ -362,6 +400,8 @@ fn parseLifecycle(xml: Slice<u8>) -> Result<Vector<LifecycleRule>, S3Fail> {
         // Transitions (ADR-0090 §2): to the storage classes kept here, recorded, not moved.
         parseTransitions(inner, false, mut rule.transitions)?;
         parseTransitions(inner, true, mut rule.noncurrentTransitions)?;
+        checkTransitionOrder(rule.transitions.view(), rule.expirationDays, rule.expirationDate)?;
+        checkTransitionOrder(rule.noncurrentTransitions.view(), rule.noncurrentDays, 0)?;
         // S3: a delete marker has no tags to filter by.
         if (rule.expiredDeleteMarker && rule.tags.length > 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
         if (rule.expirationDays == 0 && rule.expirationDate == 0 && rule.abortDays == 0 && !rule.expiredDeleteMarker &&
@@ -423,6 +463,7 @@ async fn getBucketLifecycle(
         Ok(r) => r,
         Err(_) => { return Err(S3Fail.Code(S3Code.InternalError)); }
     };
+    exchange.header(TRANSITION_MINIMUM_FIELD, transitionMinimumName(lifecycleAll128k(stored.view())).bytes())?;
     var body = Vector<u8>.create();
     xmlHead(mut body, "LifecycleConfiguration")?;
     for (i in 0..rules.length) {
@@ -490,18 +531,34 @@ async fn putBucketLifecycle(
     verifySmallBody(req, xml.view(), true)?;
     let rules = parseLifecycle(xml.view())?;
     // A directory bucket's rules expire objects and abort uploads, by prefix and size (ADR-0080 §6): no tag filters,
-    // nothing of versions.
+    // nothing of versions, and no transitions, its objects being EXPRESS_ONEZONE (the M12 exit review's A2).
     if (inDirectoryBucket(req.bucket.view())) {
         for (i in 0..rules.length) {
             let r = borrow rules[i];
-            if (r.tags.length > 0 || r.expiredDeleteMarker || r.noncurrentDays > 0 || r.newerNoncurrent > 0) {
+            if (r.tags.length > 0 || r.expiredDeleteMarker || r.noncurrentDays > 0 || r.newerNoncurrent > 0 ||
+                r.transitions.length > 0 || r.noncurrentTransitions.length > 0) {
                 return Err(S3Fail.Code(S3Code.NotImplemented));
             }
         }
     }
+    // `x-amz-transition-default-minimum-object-size` (the M12 exit review's A5): either of S3's two values, kept and
+    // answered; for the classes kept here both mean S3's 128 KB floor.
+    let all128k = match (headerOf(req, TRANSITION_MINIMUM_FIELD)) {
+        Some(v) => {
+            if (v == "all_storage_classes_128K".bytes()) {
+                true
+            } else if (v == "varies_by_storage_class".bytes()) {
+                false
+            } else {
+                return Err(S3Fail.Code(S3Code.InvalidArgument));
+            }
+        }
+        null => false,
+    };
     var blob = Vector<u8>.create();
-    encodeLifecycle(rules.view(), mut blob)?;
+    encodeLifecycleWith(rules.view(), all128k, mut blob)?;
     await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_LIFECYCLE, blob.view())?;
+    exchange.header(TRANSITION_MINIMUM_FIELD, transitionMinimumName(all128k).bytes())?;
     await exchange.send(Status.ok(), "".bytes())?;
     return Ok();
 }

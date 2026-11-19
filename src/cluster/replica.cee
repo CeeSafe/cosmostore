@@ -120,6 +120,25 @@ struct ShardReplica {
         } else {
             let _ = store.compact(0)?;
         }
+        // Lifecycle rules (the M12 exit review's A3): the leader applies them, as a write, so the deletes, aborts and
+        // transitions are entries every replica applies; a follower's would be its own.
+        let now = Clock.unixMillis();
+        if (this.core.isLeader() && store.lifecycleDue(now)) {
+            match (this.beginWrite(store)) {
+                Ok(before) => {
+                    // What a run persisted is proposed even if it stopped partway, so the journal and the core
+                    // agree; a run that failed is tried again at the next upkeep.
+                    let ran = store.applyLifecycleNoted(now);
+                    let _ = this.finishWrite(store, before)?;
+                    match (ran) {
+                        Ok(_) => {}
+                        Err(StoreError.NotLeader) => {}
+                        Err(e) => { return Err(e); }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
         // Extents no one names any more, and none of the unapplied entries (ADR-0061 §4); whole copies of coded
         // extents decoded for reads an hour ago (ADR-0064 §5).
         let _ = store.sweepRaftOrphans(Clock.unixMillis())?;

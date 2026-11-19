@@ -449,7 +449,7 @@ fn isPostObject(req: borrow S3Request) -> bool {
     return equalsIgnoreCase(trimSpaces(ct[0..semi]), "multipart/form-data".bytes());
 }
 
-/// One step of a POST file, on a worker thread: checksummed for its stored CRC64NVME, sealed if the object is
+/// One step of a POST file, on a worker thread: checksummed for its stored checksum, sealed if the object is
 /// (ADR-0046), and written.
 fn postStep(
     writer: borrow mut ObjectWriter,
@@ -677,8 +677,39 @@ async fn postObject(
         null => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
     };
     // The file, streamed into a writer; the size is checked as it grows, and against the minimum at the end.
+    // The form's checksum fields (the M12 exit review's A6), as PutObject's headers: `x-amz-checksum-algorithm`, or an
+    // `x-amz-checksum-<name>` value the file must match; CRC64NVME without them.
+    var algorithm = ChecksumAlgorithm.Crc64Nvme;
+    var expected = Vector<u8>.create();
+    var named = false;
+    match (fieldOf(borrow fields, "x-amz-checksum-algorithm")) {
+        Some(t) => {
+            algorithm = match (checksumFromName(t)) {
+                Ok(a) => a,
+                Err(code) => { return Err(S3Fail.Code(code)); }
+            };
+            named = true;
+        }
+        null => {}
+    }
+    for (i in 0..fields.length) {
+        let kind = match (checksumKindOf(fields[i].name.view())) {
+            Ok(Some(k)) => k,
+            Ok(null) => { continue; }
+            Err(code) => { return Err(S3Fail.Code(code)); }
+        };
+        if ((named || expected.length > 0) && !sameAlgorithm(kind, algorithm)) {
+            return Err(S3Fail.Code(S3Code.InvalidRequest));
+        }
+        algorithm = kind;
+        named = true;
+        if (!decodeBase64(trimBlank(fields[i].value.view()), mut expected)? ||
+            expected.length != checksumLength(kind)) {
+            return Err(S3Fail.Code(S3Code.InvalidRequest));
+        }
+    }
     var writer = await startPut(app, bucket, 0)?;
-    var sum = RunningChecksum.create(ChecksumAlgorithm.Crc64Nvme);
+    var sum = RunningChecksum.create(algorithm);
     var size: u64 = 0;
     var ended = false;
     while (!ended) {
@@ -738,8 +769,12 @@ async fn postObject(
     }
     var checksum = Vector<u8>.create();
     sum.finishInto(mut checksum)?;
+    if (expected.length > 0 && expected.view() != checksum.view()) {
+        await discardPut(app, borrow finished)?;
+        return Err(S3Fail.Code(S3Code.BadDigest));
+    }
     var extras = Vector<u8>.create();
-    singlePartExtras(ChecksumAlgorithm.Crc64Nvme, checksum.view(), mut extras)?;
+    singlePartExtras(algorithm, checksum.view(), mut extras)?;
     let outcome = await commitPut(
         app,
         bucket,

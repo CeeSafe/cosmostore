@@ -3668,3 +3668,15 @@ Browser form uploads with a SigV4 POST policy.
     - S3's checks between transitions are missing.
 - **For the owner:** A3. Either (a) lifecycle on each shard's leader, or (b) refused on a cluster until then.
 - **Next:** the fixes.
+
+### 19 Nov 2026: M12's exit review findings fixed
+
+- **The owner's choice for A3:** lifecycle on each shard's leader, as a write. Expirations run on a cluster now too;
+  they did not before M12.
+- **Fixed:**
+  - A1, one version no longer stops lifecycle;
+  - A2, A4, A5 (the 128 KB floor and its header) and A6 (a POST form's checksum fields);
+  - B1, B2, B4, B5 and B7;
+  - C1 confirmed (no downgrade past M12), C2 and C3.
+- **Unchanged and recorded:** B3, B6, and SHA-1's speed.
+- **Tests:** 387 unit tests, the S3 smoke, the cluster smoke (146, lifecycle applied on a cluster) and the SDK matrix pass.

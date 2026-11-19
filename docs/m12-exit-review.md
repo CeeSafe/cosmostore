@@ -100,3 +100,30 @@ Checked and right (both reviews):
 - **(b)** refuse lifecycle configurations on a cluster until (a), with `compatibility.md` saying so.
 
 Closing M12 and accepting ADR-0090 are the owner's decisions.
+
+## The fixes (19 Nov 2026)
+
+The owner chose (a) for A3: lifecycle on each shard's leader.
+
+| Finding | Fix | Test |
+|---|---|---|
+| A1 | a version whose metadata has no room for the class is skipped (`transitionTarget` checks first, the run tolerates MetadataTooLarge); one version never stops the run | `lifecycleSkipsAVersionWithNoRoomForItsClass` |
+| A2 | a directory bucket's rules take no transitions (NotImplemented) | S3 smoke |
+| A3 | each shard's leader runs the lifecycle rules when due, as a write (`beginWrite`, the run, `finishWrite`, which proposes even a partial run's entries); `node --lifecycle-seconds` (an hour by default) | cluster smoke: an expiration and a transition applied, seen through other nodes |
+| A4 | a run's transitions are staged and synced with one commit (`stageFieldOf`) | the lifecycle tests |
+| A5 | `x-amz-transition-default-minimum-object-size` taken (either value, else InvalidArgument), kept (rules v4) and answered on Put and Get; S3's 128 KB floor applies unless the rule filters by size | `lifecycleTransitionsRecordClasses`; S3 smoke |
+| A6 | a POST form's `x-amz-checksum-algorithm` and `x-amz-checksum-<name>` are taken: the file is checksummed with it, a wrong value is BadDigest, and the object stores that checksum | boto3 |
+| B1 | REDUCED_REDUNDANCY is InvalidStorageClass as a transition target | S3 smoke |
+| B2 | one rule's transitions: all Days or all Date, each class once, in waterfall order, 30 days after an infrequent access class, expiration after them (InvalidArgument) | S3 smoke |
+| B4 | a copy onto itself whose class does not change is InvalidRequest | S3 smoke |
+| B5 | `compatibility.md` says bucket keys' header is NotImplemented | |
+| B7 | PutObject's answer has `x-amz-checksum-type: FULL_OBJECT` | |
+| C1 | confirmed: a binary before M12 stops at a record it cannot decode ("bad record meta"); a torn tail is the journal's CRC's, before any record is decoded. No downgrade past M12. | |
+| C2 | the transition test also takes a checkpoint and reopens from it | `lifecycleTransitionsRecordClasses` |
+| C3 | SHA-1 vectors at 55, 56, 63, 64 and 65 bytes (Python's hashlib) | `sha1PadsAtEveryEdge` |
+
+**Not changed:**
+- **B3:** replication's destination class stays NotImplemented, a refusal. It is now a candidate, and is now listed
+  among `compatibility.md`'s refusals.
+- **B6:** the class is checked before the bucket is. S3's order is *memory*.
+- **SHA-1 speed:** it stays byte at a time (C3).

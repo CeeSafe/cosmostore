@@ -1110,6 +1110,7 @@ express() { python3 -I "$here/s3_raw.py" express "$AWS_ENDPOINT_URL" "$@"; }
 check "a ReadOnly session reads" "$(express "$rk" "$rs" "$rt" GET "/$dir/a/b.txt")" "200 in a directory"
 check "but does not write" "$(express "$rk" "$rs" "$rt" PUT "/$dir/a/no.txt" | cut -d' ' -f1)" 403
 aws s3api create-bucket --bucket other--local-az1--x-s3 --create-bucket-configuration "$dirconf" > /dev/null 2>&1
+check "a directory bucket takes no transition (M12 review A2)" "$(code s3api put-bucket-lifecycle-configuration --bucket other--local-az1--x-s3 --lifecycle-configuration '{"Rules":[{"ID":"t","Status":"Enabled","Filter":{"Prefix":""},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"}]}]}')" NotImplemented
 check "nor reach another directory bucket" "$(express "$rk" "$rs" "$rt" GET "/other--local-az1--x-s3?list-type=2" | cut -d' ' -f1)" 403
 aws s3api delete-bucket --bucket other--local-az1--x-s3 > /dev/null 2>&1
 check "a changed token" "$(express "$rk" "$rs" "${rt%????}AAAA" GET "/$dir/a/b.txt" | cut -d' ' -f1)" 400
@@ -1389,6 +1390,7 @@ check "and an unknown one" "$(code s3api put-object --bucket classes --key g --b
 aws s3api copy-object --bucket classes --key ia --copy-source classes/ia --storage-class ONEZONE_IA > /dev/null 2>&1
 check "a copy onto itself changes only its class" "$(aws s3api head-object --bucket classes --key ia --query StorageClass --output text 2>&1)" ONEZONE_IA
 aws s3api copy-object --bucket classes --key copied --copy-source classes/ia > /dev/null 2>&1
+check "a copy onto itself of the class it has refused (M12 review B4)" "$(code s3api copy-object --bucket classes --key ia --copy-source classes/ia --storage-class ONEZONE_IA)" InvalidRequest
 check "a copy takes the request's class, not the source's" "$(aws s3api head-object --bucket classes --key copied --query StorageClass --output text 2>&1)" None
 up=$(aws s3api create-multipart-upload --bucket classes --key mp --storage-class GLACIER_IR --query UploadId --output text 2>&1)
 check "an upload's class listed" "$(aws s3api list-multipart-uploads --bucket classes --query 'Uploads[0].StorageClass' --output text 2>&1)" GLACIER_IR
@@ -1399,6 +1401,13 @@ aws s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-config
 check "and returned" "$(aws s3api get-bucket-lifecycle-configuration --bucket classes --query 'Rules[0].[Transitions[1].StorageClass,NoncurrentVersionTransitions[0].NewerNoncurrentVersions]' --output text 2>&1)" "GLACIER_IR	2"
 check "a transition to an archive class refused" "$(code s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-configuration '{"Rules":[{"ID":"g","Status":"Enabled","Filter":{},"Transitions":[{"Days":30,"StorageClass":"GLACIER"}]}]}')" InvalidStorageClass
 check "and to infrequent access before 30 days" "$(code s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-configuration '{"Rules":[{"ID":"i","Status":"Enabled","Filter":{},"Transitions":[{"Days":7,"StorageClass":"STANDARD_IA"}]}]}')" InvalidArgument
+check "the bucket's transition minimum answered" "$(aws s3api get-bucket-lifecycle-configuration --bucket classes --query TransitionDefaultMinimumObjectSize --output text 2>&1)" varies_by_storage_class
+check "a transition minimum S3 has not refused" "$(code s3api put-bucket-lifecycle-configuration --bucket classes --transition-default-minimum-object-size bogus --lifecycle-configuration '{"Rules":[{"ID":"tiers","Status":"Enabled","Filter":{},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"}]}]}')" InvalidArgument
+aws s3api put-bucket-lifecycle-configuration --bucket classes --transition-default-minimum-object-size all_storage_classes_128K --lifecycle-configuration '{"Rules":[{"ID":"tiers","Status":"Enabled","Filter":{},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"}]}]}' > /dev/null 2>&1
+check "and its other value kept" "$(aws s3api get-bucket-lifecycle-configuration --bucket classes --query TransitionDefaultMinimumObjectSize --output text 2>&1)" all_storage_classes_128K
+check "REDUCED_REDUNDANCY is no transition's (M12 review B1)" "$(code s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-configuration '{"Rules":[{"ID":"r","Status":"Enabled","Filter":{},"Transitions":[{"Days":30,"StorageClass":"REDUCED_REDUNDANCY"}]}]}')" InvalidStorageClass
+check "transitions out of the waterfall's order refused (B2)" "$(code s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-configuration '{"Rules":[{"ID":"o","Status":"Enabled","Filter":{},"Transitions":[{"Days":30,"StorageClass":"GLACIER_IR"},{"Days":60,"StorageClass":"STANDARD_IA"}]}]}')" InvalidArgument
+check "and an expiration before a transition" "$(code s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-configuration '{"Rules":[{"ID":"e","Status":"Enabled","Filter":{},"Expiration":{"Days":10},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"}]}]}')" InvalidArgument
 aws s3api delete-bucket-lifecycle --bucket classes > /dev/null 2>&1
 # ListMultipartUploads' delimiter (ADR-0090 §3) and SHA-1 checksums (§4).
 u1=$(aws s3api create-multipart-upload --bucket classes --key logs/a --query UploadId --output text 2>&1)

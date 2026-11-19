@@ -1371,6 +1371,8 @@ fn transitionTarget(
             }
         }
         if (!ruleMatches(r, key, v.size, tags.view())) { continue; }
+        // S3's floor: an object under 128 KB does not transition, unless its rule filters by size.
+        if (!r.hasSizeAbove && !r.hasSizeBelow && v.size < TRANSITION_MINIMUM_BYTES) { continue; }
         for (t in all) {
             if (noncurrent && newer < t.newer) { continue; }
             let at = if (t.date > 0) t.date else {
@@ -1379,6 +1381,9 @@ fn transitionTarget(
             };
             if (nowMillis < at) { continue; }
             let rank = storageClassRank(t.storageClass.view());
+            // A version whose metadata has no room for the class stays as it is: it is skipped, not a run's error
+            // (the M12 exit review's A1).
+            if (rank > bestRank && !classFits(v.metadata.view(), t.storageClass.view())) { continue; }
             if (rank > bestRank) {
                 bestRank = rank;
                 best.clear();
@@ -1388,6 +1393,16 @@ fn transitionTarget(
     }
     return Ok(best);
 }
+
+/// Whether a version's metadata has room for `storageClass` within MAX_METADATA_BYTES.
+fn classFits(metadata: Slice<u8>, storageClass: Slice<u8>) -> bool => match (metadataReplace(
+    metadata,
+    STORAGE_CLASS_FIELD.bytes(),
+    storageClass,
+)) {
+    Ok(b) => b.length <= MAX_METADATA_BYTES,
+    Err(_) => false,
+};
 
 /// Whether some rule removes a delete marker that is its key's only version (ADR-0042 §3): one with
 /// `ExpiredObjectDeleteMarker`, or an `Expiration` that has passed since the marker was written.
@@ -3330,8 +3345,23 @@ struct ObjectStore {
         tags: Slice<u8>,
         format: u8,
     ) -> Result<void, StoreError> {
-        let field = setTagsField(format);
         this.commitStaged()?;
+        this.stageFieldOf(bucket, key, id, tags, format)?;
+        this.commitStaged()?;
+        return Ok();
+    }
+
+    /// `setFieldOf`'s record, staged: it is synced, and applied, with the next commit of the batch. The version is
+    /// found as the index has it now, so a batch stages each version once (the lifecycle's transitions, ADR-0090 §2).
+    fn stageFieldOf(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16]?,
+        tags: Slice<u8>,
+        format: u8,
+    ) -> Result<void, StoreError> {
+        let field = setTagsField(format);
         this.checkWritable()?;
         if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
@@ -3359,14 +3389,13 @@ struct ObjectStore {
             }
             null => { return Err(StoreError.NoSuchKey); }
         }
-        this.scratch.clear();
+        var meta = Vector<u8>.create();
         if (format != META_FORMAT_VERSION) {
-            encodeSetFieldMeta(mut this.scratch, format, bucket.bytes(), key.bytes(), versionId, generation, tags)?;
+            encodeSetFieldMeta(mut meta, format, bucket.bytes(), key.bytes(), versionId, generation, tags)?;
         } else {
-            encodeSetTagsMeta(mut this.scratch, bucket.bytes(), key.bytes(), versionId, generation, tags)?;
+            encodeSetTagsMeta(mut meta, bucket.bytes(), key.bytes(), versionId, generation, tags)?;
         }
-        let empty = [0u8; 1];
-        this.commitOne(RecordType.SetTags, empty[0..0])?;
+        let _ = this.stageMetaRecord(RecordType.SetTags, meta)?;
         return Ok();
     }
 
@@ -6155,6 +6184,20 @@ struct ObjectStore {
     /// with versioning (ADR-0042) an expired current object gets a delete marker, noncurrent versions are removed
     /// by their rule, and so is a delete marker left as its key's only version. About LIFECYCLE_BATCH deletes per
     /// bucket and run, so the store's lock is never held long; the rest wait for the next.
+    /// Whether the lifecycle rules are due at `nowMillis`, by the store's interval (a shard's leader runs them itself,
+    /// as a write: the M12 exit review's A3).
+    fn lifecycleDue(borrow this, nowMillis: i64) -> bool {
+        let every = this.config.lifecycleEveryMillis;
+        return every > 0 && nowMillis - this.lifecycleRan >= truncate<i64>(every);
+    }
+
+    /// The lifecycle rules applied, and the time noted for `lifecycleDue`.
+    fn applyLifecycleNoted(borrow mut this, nowMillis: i64) -> Result<LifecycleReport, StoreError> {
+        let report = this.applyLifecycle(nowMillis)?;
+        this.lifecycleRan = nowMillis;
+        return Ok(report);
+    }
+
     fn applyLifecycle(borrow mut this, nowMillis: i64) -> Result<LifecycleReport, StoreError> {
         var report = LifecycleReport {
             objectsExpired: 0,
@@ -6279,22 +6322,28 @@ struct ObjectStore {
                 report.versionsExpired += versions;
                 report.markersRemoved += markers;
             }
-            // The transitions: each one SetTags record of the class format, which changes the version only if it is
-            // still there (a delete of this run may have taken it).
+            // The transitions: each one SetTags record of the class format, staged, and all synced with one commit
+            // (the M12 exit review's A4). A version a delete of this run took, or one without room for the field, is
+            // skipped: one version never stops the run for every bucket (A1).
             let bucketText = StringView.fromUtf8(bucketName) ?? "";
+            var staged: u64 = 0;
             for (m in 0..moves.length) {
                 let keyText = StringView.fromUtf8(moves[m].key.view()) ?? { continue; };
-                match (this.setFieldOf(
+                match (this.stageFieldOf(
                     bucketText,
                     keyText,
                     Some(moves[m].versionId),
                     moves[m].storageClass.view(),
                     SET_CLASS_FORMAT,
                 )) {
-                    Ok() => { report.transitioned += 1; }
-                    Err(StoreError.NoSuchVersion) | Err(StoreError.NoSuchKey) | Err(StoreError.MethodNotAllowed) => {}
+                    Ok() => { staged += 1; }
+                    Err(StoreError.NoSuchVersion) | Err(StoreError.NoSuchKey) | Err(StoreError.MethodNotAllowed) | Err(StoreError.MetadataTooLarge) => {}
                     Err(e) => { return Err(e); }
                 }
+            }
+            if (staged > 0) {
+                this.commitStaged()?;
+                report.transitioned += staged;
             }
             // Uploads that some rule aborts.
             var old = Vector<[u8; 16]>.create();
