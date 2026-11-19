@@ -10,6 +10,7 @@ fn usersKey(key: StringView) -> Credential => Credential {
     signing: SigningKeyCache.create(),
     revoked: false,
     user: Vector<u8>.create(),
+    userKey: Vector<u8>.create(),
     policyText: Vector<u8>.create(),
     policy: null,
 };
@@ -20,7 +21,7 @@ const READER_POLICY: StringView =
 @test
 fn usersFileAndKeys() -> Result<void, TestFailure> {
     var text = String.create();
-    text.append("# who may do what\n\naccount AKIAACCOUNT\nreader AKIAREADER1,AKIAREADER2 ")!;
+    text.append("# who may do what\n\naccount AKIAACCOUNT\nreader:R1 AKIAREADER1,AKIAREADER2 ")!;
     text.append(READER_POLICY)!;
     text.append("\n")!;
     let file = parseUsersFile(text.bytes())!;
@@ -30,20 +31,20 @@ fn usersFileAndKeys() -> Result<void, TestFailure> {
     let any = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}";
     for (bad in [
         "reader",
-        "reader AKIA1",
-        "bad/name AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
-        "reader AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
-        "reader AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"ec2:*\",\"Resource\":\"*\"}}",
-        "reader AKIA1, {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
-        "reader AKIA1,AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
-        "Account AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
+        "reader:R1 AKIA1",
+        "bad/name:X1 AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
+        "reader:R1 AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
+        "reader:R1 AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"ec2:*\",\"Resource\":\"*\"}}",
+        "reader:R1 AKIA1, {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
+        "reader:R1 AKIA1,AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
+        "Account:C1 AKIA1 {\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}",
         "account AKIA1 {}",
         "account AKIA1,",
     ]) {
         Check.isTrue(parseUsersFile(bad.bytes()).isErr(), bad)?;
     }
     // A user named twice, ignoring case; a key named twice, by two users or a user and the account.
-    for (pair in [["a AKIA1 ", "A AKIA2 "], ["a AKIA1 ", "b AKIA1 "], ["account AKIA1", "b AKIA1 "]]) {
+    for (pair in [["a:A1 AKIA1 ", "A:A2 AKIA2 "], ["a:A1 AKIA1 ", "b:B1 AKIA1 "], ["account AKIA1", "b:B1 AKIA1 "]]) {
         var twice = String.create();
         twice.append(pair[0])!;
         if (pair[0] != "account AKIA1") { twice.append(any)!; }
@@ -242,5 +243,92 @@ fn destinationsSeeEveryDenyUnderTheirPrefix() -> Result<void, TestFailure> {
     )!;
     Check.isTrue(denyReaches(borrow mine, null, null, "s3:ReplicateObject", "s3:bkt/".bytes()), "its own Deny")?;
     Check.isFalse(denyReaches(borrow mine, null, null, "s3:PutObject", "s3:bkt/".bytes()), "of another action")?;
+    return Ok();
+}
+
+@test
+fn policiesNameUsersByTheirIds() -> Result<void, TestFailure> {
+    // A user's id is part of its line; two users have two ids.
+    for (bad in ["reader AKIA1 {}", "reader: AKIA1 {}", "reader:R-1 AKIA1 {}"]) {
+        Check.isTrue(parseUsersFile(bad.bytes()).isErr(), bad)?;
+    }
+    let any = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}}";
+    var twins = String.create();
+    twins.append("a:SAME AKIA1 ")!;
+    twins.append(any)!;
+    twins.append("\nb:SAME AKIA2 ")!;
+    twins.append(any)!;
+    Check.isTrue(parseUsersFile(twins.bytes()).isErr(), "two users with one id")?;
+    // A policy put while reader is R1 names R1: stored with it, and read back with it.
+    var first = Vector<Credential>.create();
+    first.push(usersKey("AKIAREADER1"))!;
+    first[0].user.extend("reader".bytes())!;
+    first[0].userKey.extend("reader R1".bytes())!;
+    let doc =
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:user/reader\"},\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::photos/*\"}}";
+    let put = parseBucketPolicy(doc.bytes(), "photos".bytes(), first.view(), true)!;
+    let stored = withUserIds(doc.bytes(), borrow put, first.view())!;
+    Check.equalBytes(doc.bytes(), storedPolicyText(stored.view()))?;
+    let read = parseBucketPolicy(stored.view(), "photos".bytes(), first.view(), false)!;
+    let req = bareRequest();
+    let facts = policyFacts(borrow req, false, false, null)!;
+    let decide = (userKey: StringView) => decisionName(
+        decidePolicyFor(
+            borrow read,
+            Some("AKIAX".bytes()),
+            Some(userKey.bytes()),
+            "s3:GetObject",
+            "photos/a".bytes(),
+            borrow facts,
+        ),
+    );
+    Check.equalBytes("allow".bytes(), decide("reader R1").bytes())?;
+    // reader removed and made again (R2): the old grant is not the new reader's.
+    Check.equalBytes("neither".bytes(), decide("reader R2").bytes())?;
+    // A policy stored before ids names no one in an Allow, and the name's every user in a Deny.
+    let oldDeny =
+        "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:user/reader\"},\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::photos/*\"}}";
+    let denied = parseBucketPolicy(oldDeny.bytes(), "photos".bytes(), first.view(), false)!;
+    Check.equalBytes(
+        "deny".bytes(),
+        decisionName(
+            decidePolicyFor(
+                borrow denied,
+                Some("AKIAX".bytes()),
+                Some("reader R2".bytes()),
+                "s3:GetObject",
+                "photos/a".bytes(),
+                borrow facts,
+            ),
+        ).bytes(),
+    )?;
+    Check.equalBytes(
+        "neither".bytes(),
+        decisionName(
+            decidePolicyFor(
+                borrow denied,
+                Some("AKIAX".bytes()),
+                Some("readers R3".bytes()),
+                "s3:GetObject",
+                "photos/a".bytes(),
+                borrow facts,
+            ),
+        ).bytes(),
+    )?;
+    // A policy stored before ids names no one.
+    let old = parseBucketPolicy(doc.bytes(), "photos".bytes(), first.view(), false)!;
+    Check.equalBytes(
+        "neither".bytes(),
+        decisionName(
+            decidePolicyFor(
+                borrow old,
+                Some("AKIAX".bytes()),
+                Some("reader R1".bytes()),
+                "s3:GetObject",
+                "photos/a".bytes(),
+                borrow facts,
+            ),
+        ).bytes(),
+    )?;
     return Ok();
 }

@@ -18,7 +18,7 @@ echo "AKIASDKUSER000000001 sdkuser/secret/0123456789abcdefgh" >> "$work/credenti
 # The account's key is named as the account's: a key the users file does not name is refused.
 echo "account $AWS_ACCESS_KEY_ID" > "$work/users"
 cat >> "$work/users" <<'USERS'
-sdkuser AKIASDKUSER000000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::sdk-*-users/*"}}
+sdkuser:AIDASDKUSER01 AKIASDKUSER000000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::sdk-*-users/*"}}
 USERS
 # SSE-S3's master key (ADR-0046 §4).
 printf 'k1 %s\n' "$(head -c 32 /dev/urandom | base64)" > "$work/sse.keys"

@@ -1294,12 +1294,12 @@ printf '%s\n' "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" "AKIAUSERREADER000001 
     "AKIAUSERINTERN000001 intern/secret/0123456789abcdefgh" "AKIAUSERANALYST00001 analyst/secret/0123456789abcdefg" \
     > "$work/users.credentials"
 # The account's keys, named (any key the file names neither as the account's nor a user's is refused); each user:
-# its name, its keys, its identity policy.
+# its name and id, its keys, its identity policy.
 echo "account $AWS_ACCESS_KEY_ID" > "$work/users.file"
 cat >> "$work/users.file" <<'USERS'
-reader AKIAUSERREADER000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
-intern AKIAUSERINTERN000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
-analyst AKIAUSERANALYST00001 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":["arn:aws:s3tables:*:*:bucket/lake","arn:aws:s3tables:*:*:bucket/lake/table/*"]},{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::000000000000:role/tablereader"}]}
+reader:AIDAREADER0001 AKIAUSERREADER000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
+intern:AIDAINTERN0001 AKIAUSERINTERN000001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":["arn:aws:s3:::team","arn:aws:s3:::team/*"]}}
+analyst:AIDAANALYST001 AKIAUSERANALYST00001 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":["arn:aws:s3tables:*:*:bucket/lake","arn:aws:s3tables:*:*:bucket/lake/table/*"]},{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::000000000000:role/tablereader"}]}
 USERS
 cat > "$work/users.roles" <<'ROLES'
 tablereader 3600 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":"*"}}
@@ -1360,9 +1360,13 @@ check "and drops none" "$(ucode urole s3tables delete-table --table-bucket-arn "
 check "a user its policy does not let assume it" "$(ucode ui sts assume-role --role-arn arn:aws:iam::000000000000:role/tablereader --role-session-name smoke-session)" AccessDenied
 check "nor probe a table bucket's warehouse" "$(ucode ui s3api head-bucket --bucket "$lb")" 403
 # The M11 exit review's A2: a user's line removed, its key is refused, not the account's.
-sed -i.bak '/^intern /d' "$work/users.file"
+sed -i.bak '/^intern:/d' "$work/users.file"
 sleep 4
 check "a removed user's key is refused" "$(ucode ui s3api list-buckets)" InvalidAccessKeyId
+# A user made again with its name has a new id, and not the old one's grants (the bucket's Allow of reader's inbox).
+sed -i.bak 's/^reader:AIDAREADER0001 /reader:AIDAREADER0002 /' "$work/users.file"
+sleep 4
+check "a user made again has not the old one's grants" "$(ucode ur s3api put-object --bucket team --key inbox/z.txt --body dir.txt)" AccessDenied
 kill "$usersrv" 2>/dev/null
 
 # Deletes free the space.

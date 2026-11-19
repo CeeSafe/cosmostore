@@ -3517,3 +3517,10 @@ Browser form uploads with a SigV4 POST policy.
   - a stored policy naming another account's user still reads.
 - **Tests:** 379 unit tests; the S3 smoke, the cluster smoke (138) and the SDK matrix pass.
 - **Next:** the owner's decisions on ADR-0088 and M11.
+
+### 19 Nov 2026: M11, the Lows
+
+- **User ids** (the owner's choice): `<name>:<id>` in the users file, and resource policies store the ids of the
+  users they name, so a user made again with an old name has none of the old one's grants.
+- **B3 and B4** are recorded as decided, unchanged, with the reasoning in `docs/m11-exit-review.md`.
+- **Tests:** 380 unit tests; the S3 smoke, the cluster smoke (138) and the SDK matrix pass.

@@ -3,9 +3,12 @@
 // and parsed policy. A key the file names neither as the account's nor a user's is refused: removing a user, or its
 // line, takes its keys away rather than giving them the account (fail closed, the M11 exit review's A2).
 
-/// One user of the file: its name, keys and identity policy's text.
+/// One user of the file: its name, its id, keys and identity policy's text.
 struct UserEntry {
     name: Vector<u8>;
+    /// Unique in the file and for the user's life: a user removed and made again with its name is given a new one, so
+    /// policies that named the old user do not name it (as AWS's unique ids).
+    id: Vector<u8>;
     keys: Vector<Vector<u8>>;
     policyText: Vector<u8>;
 }
@@ -32,6 +35,15 @@ fn sameNameIgnoringCase(a: Slice<u8>, b: Slice<u8>) -> bool {
     if (a.length != b.length) { return false; }
     for (i in 0..a.length) {
         if (lowerAscii(a[i]) != lowerAscii(b[i])) { return false; }
+    }
+    return true;
+}
+
+/// A user's id: 1 to 128 of `A-Za-z0-9`.
+fn userIdOk(id: Slice<u8>) -> bool {
+    if (id.length < 1 || id.length > 128) { return false; }
+    for (c in id) {
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) { return false; }
     }
     return true;
 }
@@ -90,8 +102,8 @@ fn parseKeyList(
     return Ok();
 }
 
-/// Parses a users file: `account <key>[,<key>…]` lines for the account's keys, `<name> <key>[,<key>…] <identity
-/// policy JSON>` a user, `#` lines for comments. A key is named once in the file.
+/// Parses a users file: `account <key>[,<key>…]` lines for the account's keys, `<name>:<id> <key>[,<key>…]
+/// <identity policy JSON>` a user, `#` lines for comments. A key is named once in the file, an id once.
 fn parseUsersFile(text: Slice<u8>) -> Result<UsersFile, String> {
     var out = UsersFile { account: Vector<Vector<u8>>.create(), users: Vector<UserEntry>.create() };
     var at: usize = 0;
@@ -105,9 +117,9 @@ fn parseUsersFile(text: Slice<u8>) -> Result<UsersFile, String> {
         if (line.length == 0 || line[0] == '#') { continue; }
         let space = pieceEnd(line, 0, ' ');
         if (space == line.length) { return Err(usersFault(number, "a user is `<name> <keys> <policy>`")); }
-        let name = line[0..space];
+        let head = line[0..space];
         let rest = trimSpaces(line[space + 1..]);
-        if (name == "account".bytes()) {
+        if (head == "account".bytes()) {
             if (pieceEnd(rest, 0, ' ') != rest.length) {
                 return Err(usersFault(number, "the account's keys are `account <key>[,<key>…]`"));
             }
@@ -122,8 +134,18 @@ fn parseUsersFile(text: Slice<u8>) -> Result<UsersFile, String> {
             }
             continue;
         }
+        // `<name>:<id>`.
+        let colon = pieceEnd(head, 0, ':');
+        if (colon == head.length || !userIdOk(head[colon + 1..])) {
+            return Err(usersFault(number, "a user is `<name>:<id>`, its id 1 to 128 of A-Za-z0-9"));
+        }
+        let id = head[colon + 1..];
+        let name = head[0..colon];
         if (!userNameOk(name)) {
             return Err(usersFault(number, "a user's name is 1 to 64 of A-Za-z0-9+=,.@_-, and not `account`"));
+        }
+        for (i in 0..out.users.length) {
+            if (out.users[i].id.view() == id) { return Err(usersFault(number, "two users with one id")); }
         }
         let space2 = pieceEnd(rest, 0, ' ');
         if (space2 == rest.length) { return Err(usersFault(number, "a user is `<name> <keys> <policy>`")); }
@@ -140,6 +162,7 @@ fn parseUsersFile(text: Slice<u8>) -> Result<UsersFile, String> {
         }
         var entry = UserEntry {
             name: copyBytes(name).ok() ?? { return Err(textOf("out of memory")); },
+            id: copyBytes(id).ok() ?? { return Err(textOf("out of memory")); },
             keys: Vector<Vector<u8>>.create(),
             policyText: copyBytes(policy).ok() ?? { return Err(textOf("out of memory")); },
         };
@@ -156,6 +179,7 @@ fn parseUsersFile(text: Slice<u8>) -> Result<UsersFile, String> {
 fn applyUsers(set: borrow mut Vector<Credential>, file: borrow UsersFile) -> Result<void, String> {
     for (i in 0..set.length) {
         set[i].user.clear();
+        set[i].userKey.clear();
         set[i].policyText.clear();
         set[i].policy = null;
         if (set[i].revoked) { continue; }
@@ -172,6 +196,8 @@ fn applyUsers(set: borrow mut Vector<Credential>, file: borrow UsersFile) -> Res
                     Err(_) => { return Err(textOf("out of memory")); }
                 };
                 if (set[i].user.extend(file.users[u].name.view()).isErr() ||
+                    set[i].userKey.extend(file.users[u].name.view()).isErr() || set[i].userKey.push(' ').isErr() ||
+                    set[i].userKey.extend(file.users[u].id.view()).isErr() ||
                     set[i].policyText.extend(file.users[u].policyText.view()).isErr()) {
                     return Err(textOf("out of memory"));
                 }

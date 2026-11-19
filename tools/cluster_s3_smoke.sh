@@ -50,8 +50,8 @@ printf '%s\n' "AKIACLUSTERREADER001 reader/secret/0123456789abcdefgh" "AKIACLUST
 # The account's key, named: a key the users file does not name is refused.
 echo "account $AWS_ACCESS_KEY_ID" > users
 cat >> users <<'USERS'
-reader AKIACLUSTERREADER001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::team-c","arn:aws:s3:::team-c/*"]}}
-analyst AKIACLUSTERANALYST01 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":["arn:aws:s3tables:*:*:bucket/lake-c","arn:aws:s3tables:*:*:bucket/lake-c/table/*"]}}
+reader:AIDACREADER01 AKIACLUSTERREADER001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::team-c","arn:aws:s3:::team-c/*"]}}
+analyst:AIDACANALYST1 AKIACLUSTERANALYST01 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":["arn:aws:s3tables:*:*:bucket/lake-c","arn:aws:s3tables:*:*:bucket/lake-c/table/*"]}}
 USERS
 head -c 32 /dev/urandom | base64 > cluster.key
 cat > cluster.conf <<EOF

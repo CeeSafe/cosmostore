@@ -839,7 +839,84 @@ fn identityResourcePattern(text: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
     return Err(malformedPolicy());
 }
 
+/// A stored resource policy is its document as written, then, when it names users, a NUL (which JSON cannot hold)
+/// and a `<name> <id>` line for each, the ids those users had when it was put (the owner's choice after M11's exit
+/// review: a user principal is the user it named, not whoever has the name later). The document as written.
+fn storedPolicyText(stored: Slice<u8>) -> Slice<u8> => stored[0..pieceEnd(stored, 0, 0)];
+
+/// A document, as it is stored: with the ids of the users its statements name, as `credentials` have them now.
+fn withUserIds(
+    json: Slice<u8>,
+    policy: borrow BucketPolicy,
+    credentials: Slice<Credential>,
+) -> Result<Vector<u8>, AllocError> {
+    var out = copyBytes(json)?;
+    var lines = Vector<u8>.create();
+    for (s in 0..policy.statements.length) {
+        for (u in 0..policy.statements[s].users.length) {
+            let name = policy.statements[s].users[u].view();
+            for (i in 0..credentials.length) {
+                if (credentials[i].revoked || credentials[i].user.view() != name) { continue; }
+                let key = credentials[i].userKey.view();
+                if (findLine(lines.view(), key)) { break; }
+                lines.extend(key)?;
+                lines.push('\n')?;
+                break;
+            }
+        }
+    }
+    if (lines.length > 0) {
+        out.push(0)?;
+        out.extend(lines.view())?;
+    }
+    return Ok(out);
+}
+
+/// Whether `lines` (each ended by `\n`) holds `line`.
+fn findLine(lines: Slice<u8>, line: Slice<u8>) -> bool {
+    var at: usize = 0;
+    while (at < lines.length) {
+        let end = pieceEnd(lines, at, '\n');
+        if (lines[at..end] == line) { return true; }
+        at = end + 1;
+    }
+    return false;
+}
+
 fn parsePolicyDocument(
+    stored: Slice<u8>,
+    bucket: Slice<u8>,
+    credentials: Slice<Credential>,
+    checkKeys: bool,
+    identity: bool,
+    accessPoint: Slice<u8>,
+    tables: bool,
+) -> Result<BucketPolicy, S3Fail> {
+    let json = storedPolicyText(stored);
+    var policy = parsePolicyText(json, bucket, credentials, checkKeys, identity, accessPoint, tables)?;
+    // Each user principal becomes `<name> <id>`, by the ids stored with it; one with none (a policy being put, or one
+    // put before ids) stays a bare name, which no requester's `<name> <id>` matches.
+    let ids = if (json.length < stored.length) stored[json.length + 1..] else "".bytes();
+    for (s in 0..policy.statements.length) {
+        for (u in 0..policy.statements[s].users.length) {
+            var at: usize = 0;
+            while (at < ids.length) {
+                let end = pieceEnd(ids, at, '\n');
+                let line = ids[at..end];
+                let space = pieceEnd(line, 0, ' ');
+                if (line[0..space] == policy.statements[s].users[u].view()) {
+                    policy.statements[s].users[u].clear();
+                    policy.statements[s].users[u].extend(line)?;
+                    break;
+                }
+                at = end + 1;
+            }
+        }
+    }
+    return Ok(policy);
+}
+
+fn parsePolicyText(
     json: Slice<u8>,
     bucket: Slice<u8>,
     credentials: Slice<Credential>,
@@ -1270,7 +1347,7 @@ fn statementApplies(
     match (user) {
         Some(name) => {
             for (i in 0..st.users.length) {
-                if (st.users[i].view() == name) { principal = true; }
+                if (userPrincipalMatches(st.users[i].view(), name, !st.allow)) { principal = true; }
             }
         }
         null => {}
@@ -1630,7 +1707,7 @@ fn gateDecision(
         null => {}
     }
     let userName: Slice<u8>? = match (user) {
-        Some(u) => Some(u.user.view()),
+        Some(u) => Some(u.userKey.view()),
         null => null,
     };
     // Through an access point, a user's identity policy is read for it too, `s3ap:<name>[/object/<key>]`: its Deny
@@ -1834,7 +1911,7 @@ async fn authorizeDestination(
                 null => null,
             };
             let userName: Slice<u8>? = match (user) {
-                Some(u) => Some(u.user.view()),
+                Some(u) => Some(u.userKey.view()),
                 null => null,
             };
             if (denyReaches(policy, principal, userName, action, resourcePrefix.view())) {
@@ -1870,7 +1947,7 @@ fn denyReaches(
         match (user) {
             Some(name) => {
                 for (i in 0..st.users.length) {
-                    if (st.users[i].view() == name) { principal = true; }
+                    if (userPrincipalMatches(st.users[i].view(), name, true)) { principal = true; }
                 }
             }
             null => {}
@@ -1889,6 +1966,16 @@ fn denyReaches(
         }
     }
     return false;
+}
+
+/// Whether a statement's user principal names the requester `<name> <id>`: the same name and id. A bare name (a
+/// policy stored before ids) names no one in an Allow, and every user of that name in a Deny, so neither grants nor
+/// lets go of what it did not mean to.
+fn userPrincipalMatches(principal: Slice<u8>, requester: Slice<u8>, deny: bool) -> bool {
+    if (principal == requester) { return true; }
+    if (!deny || pieceEnd(principal, 0, ' ') != principal.length) { return false; }
+    return requester.length > principal.length && requester[0..principal.length] == principal &&
+        requester[principal.length] == ' ';
 }
 
 /// Whether the pattern (`*` and `?`) matches some text that starts with `prefix`.
@@ -2059,7 +2146,7 @@ async fn getBucketPolicy(
     let document = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_POLICY)?;
     if (document.length == 0) { return Err(S3Fail.Code(S3Code.NoSuchBucketPolicy)); }
     exchange.header("content-type", "application/json".bytes())?;
-    await exchange.send(Status.ok(), document.view())?;
+    await exchange.send(Status.ok(), storedPolicyText(document.view()))?;
     return Ok();
 }
 
@@ -2077,7 +2164,8 @@ async fn putBucketPolicy(
         let block = await storeBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_PUBLIC_ACCESS)?;
         if (publicAccessHas(block.view(), PUBLIC_ACCESS_BLOCK_POLICY)) { return Err(S3Fail.Code(S3Code.AccessDenied)); }
     }
-    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_POLICY, json.view())?;
+    let stored = withUserIds(json.view(), borrow policy, app.credentials.get().view())?;
+    await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_POLICY, stored.view())?;
     await recountPolicies(app)?;
     await exchange.send(Status.noContent(), "".bytes())?;
     return Ok();

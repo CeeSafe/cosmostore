@@ -181,3 +181,26 @@ them again.
 - A deployment with a users file needs an `account` line naming its account keys.
 - Replication, inventory and logging configurations that users set before these fixes were not checked: re-put
   them, or check them, after upgrading.
+
+## The Lows (19 Nov 2026)
+
+The owner asked for the Lows to be fixed before closing.
+
+- **Grants following a user's name:** fixed by user ids, the owner's choice.
+  - **The users file:** a user is `<name>:<id>`, and its id is unique and never reused.
+  - **Saving a policy:** a bucket's, access point's or table's policy stores the ids of the users it names after its
+    text, behind a NUL.
+  - **Matching:** a user principal matches that name and id only, so a user made again with an old name gets a new
+    id and not the old one's grants.
+  - **Before ids:** a policy stored before ids names users in its Denies only.
+  - **Tests:** `policiesNameUsersByTheirIds`; S3 smoke: "a user made again has not the old one's grants".
+  - **The store:** a stored policy may now be eight times the 20 KB document, for the ids. The record's format does
+    not change.
+- **B3, decided:** unchanged, by the owner's decision. It is ADR-0075's rule: a role's session is its key narrowed.
+  - A key-named Allow gives a session nothing its role's policy does not, since the role's policy decides it first.
+  - A key-named Deny still reaches it, the stricter way.
+- **B4, decided:** unchanged, by the owner's decision. A call with no resource type (ListBuckets, ListTableBuckets)
+  is matched only by patterns that cover the whole service (`arn:aws:s3:::*`, `…:bucket/*`), as in AWS's own
+  examples. A narrower pattern does not match it.
+
+**Upgrade note:** every user line of a users file needs its id (`<name>:<id>`).

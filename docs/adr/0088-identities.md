@@ -28,9 +28,11 @@ open, so this takes ADR-0087's recommendation: a users file beside the credentia
 ## Decision (proposed)
 
 1. **The users file** (`serve --users-file`, `node --users-file`): `account <access key>[,<access key>…]` lines name
-   the account's keys, and one user a line, `<name> <access key>[,<access key>…] <identity policy JSON>`; `#` for
-   comments.
+   the account's keys, and one user a line, `<name>:<id> <access key>[,<access key>…] <identity policy JSON>`; `#`
+   for comments.
    - **Names:** 1 to 64 of `A-Za-z0-9+=,.@_-`, as IAM's, unique ignoring case; `account` is not one.
+   - **Ids:** 1 to 128 of `A-Za-z0-9`, unique in the file, and never given again: a user removed and made again
+     with its name gets a new one (as AWS's unique ids, `AIDA…`; the owner's choice after M11's exit review).
    - **Keys:** a key is named once in the file, as the account's or one user's. With a users file, a key it names
      neither way is refused (InvalidAccessKeyId): removing a user's line, or emptying the file, takes its keys away
      rather than giving them the account (fail closed; amended after M11's exit review, A2, by the owner's choice).
@@ -88,8 +90,12 @@ open, so this takes ADR-0087's recommendation: a users file beside the credentia
      start, as now.
    - **Principals:** resource policies take `arn:aws:iam::000000000000:user/<name>` beside the key ARNs they take
      now. Another account's user, or a user the users file does not have, is MalformedPolicy when the policy is put
-     (B2); a policy stored before this rule still reads. A grant follows the name: a user removed and made again with that name has it again (AWS keys
-     principals by a unique id; CosmoStore's users have none).
+     (B2); a policy stored before this rule still reads.
+   - **A user principal is the user it named:** when a bucket's, an access point's or a table's policy is put, the
+     ids of the users it names are stored after its text (behind a NUL, which JSON cannot hold), and it names a user
+     only with that name and id. A user made again with an old name has a new id, so not the old one's grants, as on
+     AWS. GetBucketPolicy and the others return the text as written. A policy stored before ids names a user by name
+     in a Deny only: its Allows name no one, so neither grants nor lets go of more than they meant.
 4. **STS:**
    - **GetSessionToken** by a user: the session is the user's, decided by the user's identity policy.
    - **AssumeRole** by a user needs an identity Allow of `sts:AssumeRole` on `arn:aws:iam::<account>:role/<name>`.
