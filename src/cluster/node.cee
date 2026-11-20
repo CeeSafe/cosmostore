@@ -449,6 +449,7 @@ fn tickOf(
     store: borrow mut ObjectStore,
     maintain: bool,
     sseKeys: Slice<MasterKey>,
+    iamShard: bool,
 ) -> Result<Vector<RaftMessage>, StoreError> {
     r.tick()?;
     var out = Vector<RaftMessage>.create();
@@ -457,6 +458,8 @@ fn tickOf(
         r.maintain(store)?;
         // The leader's re-wrap round (ADR-0100 §4), with the node's SSE-S3 keys as they are now.
         let _ = r.rewrap(store, sseKeys)?;
+        // The IAM API's hidden bucket, made by its shard's leader (ADR-0104 §3).
+        if (iamShard) { r.ensureBucket(store, IAM_BUCKET)?; }
         r.drain(store, mut out)?;
     }
     return Ok(out);
@@ -576,7 +579,8 @@ async fn tickForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
                 borrow held[0],
             ) == gate) held
                 else held[0..0];
-            let ticked = await Async.blocking(() => tickOf(r, st, maintain, keys));
+            let iamShard = slot.shard == shardOfBucket(borrow shared.file, IAM_BUCKET.bytes());
+            let ticked = await Async.blocking(() => tickOf(r, st, maintain, keys, iamShard));
             let t3 = Clock.unixMillis();
             if (t3 - t0 > SLOW_TICK_MS) { await noteSlowTick(slot.shard, t1 - t0, t2 - t1, t3 - t2); }
             match (ticked) {
@@ -852,6 +856,9 @@ impl Handler<NodeApp> for PeerHandler {
         let path = request.path();
         let isRaft = request.method() == Method.Post && path == "/raft";
         let isStatus = request.method() == Method.Get && path == "/cluster/status";
+        // The IAM API's records, for a node that holds no replica of their shard (ADR-0104 §4): signed as a peer's,
+        // as they hold secrets.
+        let isIam = request.method() == Method.Get && path == "/cluster/iam";
         // A client's S3 request forwarded by another node to this one as the shard's leader (ADR-0060 §4).
         let isS3 = request.method() == Method.Post && path == "/s3";
         // An extent pushed by a leader, or asked for by a replica that lacks it (ADR-0061 §2, §3).
@@ -865,7 +872,8 @@ impl Handler<NodeApp> for PeerHandler {
         let isPiece = request.method() == Method.Post && path == "/piece-fetch";
         // An access point's name claimed, let go or looked up in group 0, by another node's front (ADR-0078 §5).
         let isClaim = request.method() == Method.Post && path == CLAIM_PATH;
-        if (!isRaft && !isStatus && !isS3 && !isExtent && !isFetch && !isActive && !isRecord && !isPiece && !isClaim) {
+        if (!isRaft && !isStatus && !isIam && !isS3 && !isExtent && !isFetch && !isActive && !isRecord && !isPiece &&
+            !isClaim) {
             return await exchange.send(Status.notFound(), "".bytes());
         }
         // The body, whole: a batch is decoded only once its signature holds.
@@ -885,7 +893,7 @@ impl Handler<NodeApp> for PeerHandler {
             nonce: headerCopy(request, "x-cosmo-nonce"),
             signature: headerCopy(request, "x-cosmo-signature"),
         };
-        let method = if (isStatus) "GET" else "POST";
+        let method = if (isStatus || isIam) "GET" else "POST";
         var checked: Result<u32, PeerRefusal> = Err(PeerRefusal.Malformed);
         {
             var guard = match (await shared.nonces.lock()) {
@@ -934,6 +942,12 @@ impl Handler<NodeApp> for PeerHandler {
                 Err(_) => 500u16,
             };
             return await exchange.send(statusOf(status), "".bytes());
+        }
+        if (isIam) {
+            return match (await localIamRecord(shared)) {
+                Some(bytes) => await exchange.send(Status.ok(), bytes.view()),
+                null => await exchange.send(Status.notFound(), "".bytes()),
+            };
         }
         if (isStatus) {
             let text = match (await statusText(shared)) {
@@ -1047,8 +1061,9 @@ async fn credentialsForever(rotation: Rotation, shared: borrow NodeShared) -> Re
         // Every fifth cycle (10 s): whether every node holds this node's first SSE-S3 key, for its leaders' re-wraps.
         cycle += 1;
         if (cycle % 5 == 0) { shared.rewrapTag.store(await rewrapGate(shared)); }
-        let none: IamSnapshot? = null; // a cluster's IAM records: slice 4
-        await reloadCredentialsIfChanged(mut r, none.asBorrow());
+        // The IAM API's records, from the node's replica of their shard or a peer's (ADR-0104 §4).
+        let iam = await nodeIamSnapshot(shared);
+        await reloadCredentialsIfChanged(mut r, iam.asBorrow());
         await reloadNodeKeysIfChanged(mut r, shared);
         await reloadTargetsIfChanged(mut r);
     }
@@ -1086,6 +1101,66 @@ async fn everyStatus(shared: borrow NodeShared) -> Vector<Vector<u8>>? {
         if (status != 200 || all.push(answer).isErr()) { return null; }
     }
     return Some(all);
+}
+
+// ---- The IAM API's records on a cluster (ADR-0104 §4) ----
+
+/// The records from this node's replica of their shard, as `<generation>\n<record>`; null when it holds none, or they
+/// do not read.
+async fn localIamRecord(shared: borrow NodeShared) -> Vector<u8>? {
+    let snapshot = await localIamSnapshot(shared) ?? { return null; };
+    var out = Vector<u8>.create();
+    if (appendDecimal(mut out, snapshot.generation).isErr() || out.push(0x0A).isErr()) { return null; }
+    let bytes = encodeIamState(borrow snapshot.state).ok() ?? { return null; };
+    if (out.extend(bytes.view()).isErr()) { return null; }
+    return Some(out);
+}
+
+/// The records from this node's replica of their shard, if it holds one.
+async fn localIamSnapshot(shared: borrow NodeShared) -> IamSnapshot? {
+    let shard = shardOfBucket(borrow shared.file, IAM_BUCKET.bytes());
+    let at = slotOf(shared, shard) ?? { return null; };
+    return await readIamSnapshot(borrow shared.slots[at].store);
+}
+
+/// The records as every node's sets take them: from its own replica of their shard, or else from a peer that holds
+/// one (signed, as status asks are). Null when none answers: the sets in use stay.
+async fn nodeIamSnapshot(shared: borrow NodeShared) -> IamSnapshot? {
+    match (await localIamSnapshot(shared)) {
+        Some(s) => { return Some(s); }
+        null => {}
+    }
+    for (i in 0..shared.file.nodes.length) {
+        if (shared.file.nodes[i].id == shared.id) { continue; }
+        var url = textOf("http://");
+        if (appendPeerAddress(mut url, shared.file.nodes[i].peer).isErr() || url.append("/cluster/iam").isErr()) {
+            return null;
+        }
+        var answer = Vector<u8>.create();
+        let status = match (await askPathWith(
+            borrow shared.file,
+            shared.secret.view(),
+            url.view(),
+            "/cluster/iam",
+            mut answer,
+        )) {
+            Ok(s) => s,
+            Err(_) => 0u16,
+        };
+        if (status != 200) { continue; }
+        let text = answer.view();
+        var end: usize = 0;
+        while (end < text.length && text[end] != 0x0A) { end += 1; }
+        if (end >= text.length) { continue; }
+        let generation = (StringView.fromUtf8(text[0..end]) ?? "").parseInt<u64>() ?? { continue; };
+        let state = match (decodeIamState(text[end + 1..])) {
+            Ok(Some(s)) => s,
+            _ => { continue; }
+        };
+        for (k in 0..answer.length) { answer[k] = 0; } // the records hold secrets
+        return Some(IamSnapshot { state: state, generation: generation });
+    }
+    return null;
 }
 
 /// What still needs the keys `ids` (envelopes of `mode`) across the cluster (ADR-0100 §4, as the M17 exit review
@@ -1854,6 +1929,9 @@ fn nodeCommand() -> i32 {
     } && match (peerHandler()) {
         Ok(h) => server.router().get("/cluster/status", h).isOk(),
         Err(_) => false,
+    } && match (peerHandler()) {
+        Ok(h) => server.router().get("/cluster/iam", h).isOk(),
+        Err(_) => false,
     };
     let routedS3 = match (peerHandler()) {
         Ok(h) => server.router().post("/s3", h).isOk(),
@@ -2249,6 +2327,15 @@ async fn askStatusWith(
     secret: Slice<u8>,
     url: StringView,
     answer: borrow mut Vector<u8>,
+) -> Result<u16, NodeFault> => await askPathWith(file, secret, url, "/cluster/status", answer);
+
+/// A signed GET of a peer's `path` (`/cluster/status`, `/cluster/iam`), as the operator.
+async fn askPathWith(
+    file: borrow ClusterFile,
+    secret: Slice<u8>,
+    url: StringView,
+    path: StringView,
+    answer: borrow mut Vector<u8>,
 ) -> Result<u16, NodeFault> {
     var options = ClientOptions.defaults();
     options.totalMs = 10000;
@@ -2267,7 +2354,7 @@ async fn askStatusWith(
         secret,
         0,
         "GET",
-        "/cluster/status",
+        path,
         "".bytes(),
         Clock.unixMillis(),
     )) {

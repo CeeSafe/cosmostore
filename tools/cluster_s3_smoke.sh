@@ -630,5 +630,24 @@ pause 4
 check "the key in use removed: the running nodes do not take it" "$(running "SSE key file reload waits: .*node has the key first\|SSE key file reload waits: [0-9]* versions.*(sse2)")" 1
 cp sse.keys.sse2 sse.keys
 
+# The IAM API on a cluster (ADR-0104 §3, §4): a user made through node 1, its records in their shard; every node takes
+# them within its 2 s reload, from its own replica or a peer's.
+check "iam create-user through node 1" "$(on 1 iam create-user --user-name ops --query User.UserName --output text 2>&1)" ops
+opskey=$(on 1 iam create-access-key --user-name ops --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>&1)
+on 1 iam put-user-policy --user-name ops --policy-name lists --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*"}}' > /dev/null 2>&1
+check "the user listed through node 2" "$(on 2 iam list-users --query 'Users[?UserName==`ops`].UserName' --output text 2>&1)" ops
+ops() { AWS_ACCESS_KEY_ID="$(echo "$opskey" | cut -f1)" AWS_SECRET_ACCESS_KEY="$(echo "$opskey" | cut -f2)" on "$@"; }
+for n in 1 2 3; do
+    [ -n "${PIDS[$n]}" ] || continue
+    for i in $(seq 1 30); do [ "$(ops "$n" s3api list-buckets --query 'length(Buckets) > `0`' --output text 2>&1)" = True ] && break; pause 0.5; done
+    check "its key works through node $n" "$(ops "$n" s3api list-buckets --query 'length(Buckets) > `0`' --output text 2>&1)" True
+done
+check "and no more than its policy" "$(code 2 s3api list-objects-v2 --bucket alpha --max-keys 1 >/dev/null; AWS_ACCESS_KEY_ID="$(echo "$opskey" | cut -f1)" AWS_SECRET_ACCESS_KEY="$(echo "$opskey" | cut -f2)" code 3 s3api list-objects-v2 --bucket alpha)" AccessDenied
+on 1 iam delete-access-key --user-name ops --access-key-id "$(echo "$opskey" | cut -f1)" > /dev/null 2>&1
+on 1 iam delete-user-policy --user-name ops --policy-name lists > /dev/null 2>&1
+check "the user deleted through node 3" "$(code 3 iam delete-user --user-name ops)" ""
+for i in $(seq 1 30); do [ "$(ops 2 s3api list-buckets 2>&1 | grep -c InvalidAccessKeyId)" = 1 ] && break; pause 0.5; done
+check "its key refused through node 2 after" "$(ops 2 s3api list-buckets 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9]*\)).*/\1/p')" InvalidAccessKeyId
+
 echo "cluster s3 smoke: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]

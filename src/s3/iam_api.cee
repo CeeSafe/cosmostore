@@ -115,8 +115,11 @@ enum IamCall {
 
 /// What a change came to.
 enum IamOutcome {
-    /// Done: the user it was about, as it is now (for CreateUser and CreateAccessKey's answers), and the key made.
-    Done(IamUser?, IamKey?),
+    /// Done: the user it was about, as it is now (for CreateUser and CreateAccessKey's answers), the key made, and the
+    /// role made (CreateRole's answer: on a cluster the record is not read back until it commits).
+    Done(IamUser?, IamKey?, IamRole?),
+    /// The records' bucket is not made yet (a cluster's shard leader makes it, ADR-0104 §3): try again.
+    NotReady,
     NoSuchEntity,
     EntityAlreadyExists,
     LimitExceeded,
@@ -187,6 +190,7 @@ fn applyIamCall(
     let snapshot = iamSnapshotOf(store) ?? { return Err(StoreError.DataCorrupt); };
     var state = snapshot.state;
     var made: IamKey? = null;
+    var madeRole: IamRole? = null;
     var about: usize? = null;
     match (call) {
         IamCall.CreateUser(name) => {
@@ -295,6 +299,14 @@ fn applyIamCall(
             if (jsonMember(borrow doc, "Statement").isNull()) { return Ok(IamOutcome.MalformedPolicyDocument); }
             var id = copyBytes("AROA".bytes())?;
             if (!randomText(mut id, 17, IAM_ID_CHARS)?) { return Err(StoreError.DataCorrupt); }
+            madeRole = Some(IamRole {
+                name: copyBytes(name.view())?,
+                id: copyBytes(id.view())?,
+                createdMs: nowMs,
+                trust: copyBytes(trust.view())?,
+                policies: Vector<IamPolicy>.create(),
+                maxSeconds: *seconds,
+            });
             state.roles.push(IamRole {
                 name: copyBytes(name.view())?,
                 id: id,
@@ -330,7 +342,12 @@ fn applyIamCall(
         }
     }
     let bytes = encodeIamState(borrow state)?;
-    if (!store.bucketExists(IAM_BUCKET)?) { store.createBucket(IAM_BUCKET)?; }
+    // On `serve` the bucket is made here; on a cluster its shard's leader makes it (ADR-0104 §3), as a bucket made in
+    // this request would not be seen by its write: until then, try again.
+    if (!store.bucketExists(IAM_BUCKET)?) {
+        if (store.appliesOnCommit()) { return Ok(IamOutcome.NotReady); }
+        store.createBucket(IAM_BUCKET)?;
+    }
     let condition = if (snapshot.generation == 0) PutCondition.IfAbsent else PutCondition.IfGeneration(
         snapshot.generation,
     );
@@ -343,7 +360,7 @@ fn applyIamCall(
         Some(u) => Some(copyUser(borrow state.users[u])?),
         null => null,
     };
-    return Ok(IamOutcome.Done(user, made));
+    return Ok(IamOutcome.Done(user, made, madeRole));
 }
 
 // ---- The calls ----
@@ -543,7 +560,14 @@ async fn serveIam(
         }
     }
     return match (outcome) {
-        IamOutcome.Done(user, key) => await iamDone(exchange, a, user, key, requestId),
+        IamOutcome.Done(user, key, _) => await iamDone(exchange, a, user, key, requestId),
+        IamOutcome.NotReady => await iamError(
+            exchange,
+            503,
+            "ServiceUnavailable",
+            "The IAM records are not ready yet; try again.",
+            requestId,
+        ),
         IamOutcome.NoSuchEntity => await iamError(
             exchange,
             404,
@@ -881,22 +905,24 @@ async fn serveIamRole(
         }
     }
     return match (outcome) {
-        IamOutcome.Done(_, _) => {
-            if (a == "CreateRole".bytes()) {
-                let after = await readIamSnapshot(borrow app.store) ?? {
-                    return await iamAnswer(exchange, a, "".bytes(), requestId);
-                };
-                match (roleAtIam(borrow after.state, name)) {
-                    Some(r) => {
-                        result.extend("<Role>".bytes())?;
-                        appendRole(mut result, borrow after.state.roles[r])?;
-                        result.extend("</Role>".bytes())?;
-                    }
-                    null => {}
+        IamOutcome.Done(_, _, role) => {
+            match (role) {
+                Some(r) => {
+                    result.extend("<Role>".bytes())?;
+                    appendRole(mut result, borrow r)?;
+                    result.extend("</Role>".bytes())?;
                 }
+                null => {}
             }
             await iamAnswer(exchange, a, result.view(), requestId)
         },
+        IamOutcome.NotReady => await iamError(
+            exchange,
+            503,
+            "ServiceUnavailable",
+            "The IAM records are not ready yet; try again.",
+            requestId,
+        ),
         IamOutcome.NoSuchEntity => await iamError(
             exchange,
             404,

@@ -4530,3 +4530,20 @@ Browser form uploads with a SigV4 POST policy.
     work.
   - 421 unit tests, both smokes (182) and the SDK matrix pass.
 - **Next:** slice 4, a cluster.
+
+### 21 Nov 2026: M19 slice 4, the IAM API on a cluster (ADR-0104 §3, §4)
+
+- **The front** sends a `POST /` signed for `iam` to the shard of `_cosmostore-iam` (STS's still to shard 0).
+- **That shard's leader makes the hidden bucket** at its upkeep, as a write (`ShardReplica.ensureBucket`).
+  - **Why:** a leader's writes apply when they commit, so a bucket made in a request is not seen by that request's
+    own write. The first run on a cluster failed so, with NoSuchBucket.
+  - **Until it is made:** a call answers 503 ServiceUnavailable, which SDKs retry.
+  - **`CreateRole`'s answer** comes from the call, not a read back.
+- **Every node's sets:**
+  - from its own replica of the records' shard, or else from a peer's;
+  - the peer endpoint is `/cluster/iam`, signed as peers' requests are, as the records hold secrets;
+  - each node reloads every 2 s.
+- **Tests:** the cluster smoke makes a user, key and policy through node 1; the user is listed through node 2; the
+  key works through every node and no further than its policy; the user is deleted through node 3 and its key
+  refused after (190). The S3 smoke, the SDK matrix and 421 unit tests pass.
+- **Next:** slice 5, the exit review.

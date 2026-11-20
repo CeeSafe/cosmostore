@@ -224,6 +224,17 @@ fn clusterS3App(
     });
 }
 
+/// Whether a raw request's signature is for `service` (its credential scope's fourth part).
+fn signedForService(raw: borrow RawMessage, service: StringView) -> bool {
+    for (i in 0..raw.names.length) {
+        if (!Ascii.equalsIgnoringCase(raw.names[i].view(), "authorization")) { continue; }
+        var wanted = copyBytes("/".bytes()).ok() ?? { return false; };
+        if (wanted.extend(service.bytes()).isErr() || wanted.extend("/aws4_request".bytes()).isErr()) { return false; }
+        return findBytes(raw.values[i].view(), wanted.view(), 0).isSome();
+    }
+    return false;
+}
+
 /// The node's shared key set, or one of its own for `keys` when the node made none.
 fn sharedOr(sets: borrow Arc<KeySets>?, keys: Slice<MasterKey>) -> Result<Arc<KeySets>, AllocError> => match (sets) {
     Some(s) => Ok(s.clone()),
@@ -1306,7 +1317,8 @@ impl Handler<FrontApp> for FrontHandler {
                 borrow raw,
             ) else if (method == Method.Post) await routeRequest(
                 shared,
-                0,
+                // IAM's calls go to the shard holding its records (ADR-0104 §3); STS's to shard 0's.
+                if (signedForService(borrow raw, "iam")) shardOfBucket(borrow shared.file, IAM_BUCKET.bytes()) else 0,
                 borrow raw,
             ) else Ok(frontError("NotImplemented", 501))
         } else await routeRequest(shared, shardOfBucket(borrow shared.file, routed), borrow raw);
