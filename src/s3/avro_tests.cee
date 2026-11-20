@@ -161,3 +161,60 @@ fn avroRefusesHostileCounts() -> Result<void, TestFailure> {
     Check.isTrue(jsonI64(borrow read.records[0]) == Some(9i64), "a wrapped type")?;
     return Ok();
 }
+
+/// The writer (ADR-0098 §3): PyIceberg's manifest list and manifest, read, written back (null codec) and read again,
+/// give the same records and metadata; a record that does not fit its schema is refused.
+@test
+fn avroFilesWrittenBackReadTheSame() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("avro-written");
+    var which = 0;
+    for (rows in [AVRO_FIXTURE_LIST[..], AVRO_FIXTURE_MANIFEST[..]]) {
+        let bytes = fixtureBytes(rows);
+        let first = readAvro(bytes.view()).ok() ?? { return Check.fail("the fixture reads"); };
+        let written = writeAvro(first.metadata.view(), first.records.view())!!;
+        let again = readAvro(written.view()).ok() ?? { return Check.fail("the written file reads"); };
+        Check.equalU64(first.records.length as u64, again.records.length as u64)?;
+        for (i in 0..first.records.length) {
+            var a = Vector<u8>.create();
+            var b = Vector<u8>.create();
+            writeJson(mut a, borrow first.records[i])!;
+            writeJson(mut b, borrow again.records[i])!;
+            Check.equalBytes(a.view(), b.view())?;
+        }
+        for (i in 0..first.metadata.length) {
+            if (first.metadata[i].key.view() == "avro.codec".bytes()) { continue; }
+            var found = false;
+            for (j in 0..again.metadata.length) {
+                if (again.metadata[j].key.view() == first.metadata[i].key.view()) {
+                    var a = Vector<u8>.create();
+                    var b = Vector<u8>.create();
+                    writeJson(mut a, borrow first.metadata[i].value)!;
+                    writeJson(mut b, borrow again.metadata[j].value)!;
+                    Check.equalBytes(a.view(), b.view())?;
+                    found = true;
+                }
+            }
+            Check.isTrue(found, "a metadata entry written back")?;
+        }
+        // For PyIceberg to read (ADR-0098 slice 2's check).
+        var path = textOf(dir.view());
+        path.append(if (which == 0) "/list.avro" else "/manifest.avro")!;
+        DurableFile.createNew(path.view())!.writeAt(written.view(), 0)!;
+        which += 1;
+    }
+    // A record that does not fit: a manifest list's record with its path a number.
+    let list = readAvro(fixtureBytes(AVRO_FIXTURE_LIST[..]).view()).ok()!;
+    var broken = Vector<Json>.create();
+    var record = cloneJson(borrow list.records[0])!;
+    match (borrow mut record) {
+        Json.Object(members) => {
+            for (i in 0..members.length) {
+                if (members[i].key.view() == "manifest_path".bytes()) { members[i].value = jsonInteger(7)!; }
+            }
+        }
+        _ => {}
+    }
+    broken.push(record)!;
+    Check.isTrue(writeAvro(list.metadata.view(), broken.view())!.isNull(), "a record that does not fit")?;
+    return Ok();
+}

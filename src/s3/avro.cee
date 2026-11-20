@@ -1,8 +1,9 @@
 // Avro object container files (ADR-0086 §4), as Iceberg's manifest lists and manifests are: the header (magic, the
 // metadata map with `avro.schema` and `avro.codec`, the sync marker), then blocks of records, each block `null` or
 // `deflate`-compressed. Each record is decoded by the writer's schema into the JSON model (json.cee): records as
-// objects, arrays and maps as arrays and objects, enums as their symbol, bytes and fixed as text holding the raw bytes,
-// and floats and doubles as null (their values are not needed here).
+// objects, arrays and maps as arrays and objects, enums as their symbol, and bytes, fixed, floats and doubles as text
+// holding their raw bytes (a float's 4, a double's 8, little-endian), so a record read is written back as it was
+// (`writeAvro`, ADR-0098 §3).
 
 /// Why a file could not be read: not Avro, or a codec not taken (its name).
 enum AvroError {
@@ -265,13 +266,9 @@ fn avroValue(
         if (kind == "int".bytes() && checkedTruncate<i32>(v).isNull()) { return Err(AvroError.Malformed); }
         return Ok(jsonInteger(v)?);
     }
-    if (kind == "float".bytes()) {
-        let _ = input.take(4) ?? { return Err(AvroError.Malformed); };
-        return Ok(Json.Null);
-    }
-    if (kind == "double".bytes()) {
-        let _ = input.take(8) ?? { return Err(AvroError.Malformed); };
-        return Ok(Json.Null);
+    if (kind == "float".bytes() || kind == "double".bytes()) {
+        let raw = input.take(if (kind == "float".bytes()) 4 else 8) ?? { return Err(AvroError.Malformed); };
+        return Ok(Json.Text(copyBytes(raw)?));
     }
     if (kind == "bytes".bytes() || kind == "string".bytes()) {
         let s = input.lengthPrefixed() ?? { return Err(AvroError.Malformed); };
@@ -393,4 +390,239 @@ fn readAvro(bytes: Slice<u8>) -> Result<AvroFile, AvroError> {
         if (b.at != block.length) { return Err(AvroError.Malformed); }
     }
     return Ok(AvroFile { records: records, metadata: metadata });
+}
+
+// ---- Writing (ADR-0098 §3) ----
+
+/// A file of `records`, by the schema in `metadata`'s `avro.schema` (its other entries, Iceberg's among them, written
+/// as given), with the null codec, in one block; null when the schema does not parse or a record does not fit it.
+fn writeAvro(metadata: Slice<JsonMember>, records: Slice<Json>) -> Result<Vector<u8>?, AllocError> {
+    var schemaText: Slice<u8>? = null;
+    for (i in 0..metadata.length) {
+        if (metadata[i].key.view() == "avro.schema".bytes()) {
+            match (borrow metadata[i].value) {
+                Json.Text(t) => { schemaText = Some(t.view()); }
+                _ => {}
+            }
+        }
+    }
+    let schema = parseJson(schemaText ?? { return Ok(null); })? ?? { return Ok(null); };
+    var names = Vector<AvroNamed>.create();
+    if (!collectAvroNames(borrow schema, mut names, 0, "".bytes())?) { return Ok(null); }
+    var block = Vector<u8>.create();
+    for (i in 0..records.length) {
+        if (!(writeAvroValue(mut block, borrow records[i], borrow schema, borrow names, 0)?)) { return Ok(null); }
+    }
+    var out = Vector<u8>.create();
+    out.extend([0x4Fu8, 0x62, 0x6A, 0x01][..])?;
+    // The metadata, as one block of a map of bytes; the codec is always null here.
+    var entries: i64 = 1;
+    for (i in 0..metadata.length) {
+        if (metadata[i].key.view() != "avro.codec".bytes()) { entries += 1; }
+    }
+    writeAvroLong(mut out, entries)?;
+    for (i in 0..metadata.length) {
+        let k = metadata[i].key.view();
+        if (k == "avro.codec".bytes()) { continue; }
+        let v = match (borrow metadata[i].value) {
+            Json.Text(t) => t.view(),
+            _ => { return Ok(null); }
+        };
+        writeAvroBytes(mut out, k)?;
+        writeAvroBytes(mut out, v)?;
+    }
+    writeAvroBytes(mut out, "avro.codec".bytes())?;
+    writeAvroBytes(mut out, "null".bytes())?;
+    writeAvroLong(mut out, 0)?;
+    var sync = [0u8; 16];
+    if (Random.fill(mut sync[..]).isErr()) { return Ok(null); }
+    out.extend(sync[..])?;
+    if (records.length > 0) {
+        writeAvroLong(mut out, truncate<i64>(records.length))?;
+        writeAvroLong(mut out, truncate<i64>(block.length))?;
+        out.extend(block.view())?;
+        out.extend(sync[..])?;
+    }
+    return Ok(Some(out));
+}
+
+fn writeAvroLong(out: borrow mut Vector<u8>, v: i64) -> Result<void, AllocError> => writeZigzag(out, v);
+
+fn writeAvroBytes(out: borrow mut Vector<u8>, b: Slice<u8>) -> Result<void, AllocError> {
+    writeAvroLong(out, truncate<i64>(b.length))?;
+    out.extend(b)?;
+    return Ok();
+}
+
+/// A value by its schema; false when it does not fit.
+fn writeAvroValue(
+    out: borrow mut Vector<u8>,
+    v: borrow Json,
+    schema: borrow Json,
+    names: borrow Vector<AvroNamed>,
+    depth: usize,
+) -> Result<bool, AllocError> {
+    if (depth > AVRO_MAX_DEPTH) { return Ok(false); }
+    match (schema) {
+        // A union: the first branch the value fits.
+        Json.Array(branches) => {
+            for (i in 0..branches.length) {
+                if (avroFits(v, borrow branches[i], names, depth + 1)) {
+                    writeAvroLong(out, truncate<i64>(i))?;
+                    return writeAvroValue(out, v, borrow branches[i], names, depth + 1);
+                }
+            }
+            return Ok(false);
+        }
+        _ => {}
+    }
+    match (avroInner(schema)) {
+        Some(inner) => { return writeAvroValue(out, v, inner, names, depth + 1); }
+        null => {}
+    }
+    let kind = avroTypeName(schema) ?? { return Ok(false); };
+    if (kind == "null".bytes()) { return Ok(isJsonNull(v)); }
+    if (kind == "boolean".bytes()) {
+        return match (v) {
+            Json.Bool(b) => {
+                out.push(if (*b) 1 else 0)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        };
+    }
+    if (kind == "int".bytes() || kind == "long".bytes()) {
+        let n = jsonI64(v) ?? { return Ok(false); };
+        if (kind == "int".bytes() && checkedTruncate<i32>(n).isNull()) { return Ok(false); }
+        writeAvroLong(out, n)?;
+        return Ok(true);
+    }
+    let text: Slice<u8>? = match (v) {
+        Json.Text(t) => Some(t.view()),
+        _ => null,
+    };
+    if (kind == "float".bytes() || kind == "double".bytes() || kind == "fixed".bytes()) {
+        let t = text ?? { return Ok(false); };
+        let size = if (kind == "float".bytes()) 4 else if (kind == "double".bytes()) 8
+            else truncate<usize>(jsonMemberI64(schema, "size") ?? -1);
+        if (t.length != size) { return Ok(false); }
+        out.extend(t)?;
+        return Ok(true);
+    }
+    if (kind == "bytes".bytes() || kind == "string".bytes()) {
+        writeAvroBytes(out, text ?? { return Ok(false); })?;
+        return Ok(true);
+    }
+    if (kind == "enum".bytes()) {
+        let t = text ?? { return Ok(false); };
+        let symbols = memberItems(schema, "symbols") ?? { return Ok(false); };
+        for (i in 0..symbols.length) {
+            match (borrow symbols[i]) {
+                Json.Text(s) => {
+                    if (s.view() == t) {
+                        writeAvroLong(out, truncate<i64>(i))?;
+                        return Ok(true);
+                    }
+                }
+                _ => {}
+            }
+        }
+        return Ok(false);
+    }
+    if (kind == "record".bytes() || kind == "error".bytes()) {
+        let fields = memberItems(schema, "fields") ?? { return Ok(false); };
+        let none = Json.Null;
+        for (i in 0..fields.length) {
+            let f = borrow fields[i];
+            let name = jsonMemberText(f, "name") ?? { return Ok(false); };
+            let t = jsonMember(f, "type") ?? { return Ok(false); };
+            // A field the value lacks is written as null, which only a union with null takes.
+            let value = jsonMember(v, StringView.fromUtf8(name) ?? "") ?? borrow none;
+            if (!(writeAvroValue(out, value, t, names, depth + 1)?)) { return Ok(false); }
+        }
+        return Ok(true);
+    }
+    if (kind == "array".bytes()) {
+        let items = jsonMember(schema, "items") ?? { return Ok(false); };
+        let values = match (v) {
+            Json.Array(a) => a,
+            _ => { return Ok(false); }
+        };
+        if (values.length > 0) {
+            writeAvroLong(out, truncate<i64>(values.length))?;
+            for (i in 0..values.length) {
+                if (!(writeAvroValue(out, borrow values[i], items, names, depth + 1)?)) { return Ok(false); }
+            }
+        }
+        writeAvroLong(out, 0)?;
+        return Ok(true);
+    }
+    if (kind == "map".bytes()) {
+        let items = jsonMember(schema, "values") ?? { return Ok(false); };
+        let members = match (v) {
+            Json.Object(m) => m,
+            _ => { return Ok(false); }
+        };
+        if (members.length > 0) {
+            writeAvroLong(out, truncate<i64>(members.length))?;
+            for (i in 0..members.length) {
+                writeAvroBytes(out, members[i].key.view())?;
+                if (!(writeAvroValue(out, borrow members[i].value, items, names, depth + 1)?)) { return Ok(false); }
+            }
+        }
+        writeAvroLong(out, 0)?;
+        return Ok(true);
+    }
+    return match (namedSchema(names, kind)) {
+        Some(named) => writeAvroValue(out, v, named, names, depth + 1),
+        null => Ok(false),
+    };
+}
+
+/// `{"type": <a schema>}`'s schema, when the type is not a name.
+fn avroInner(schema: borrow Json) -> borrow(schema) Json? {
+    match (schema) {
+        Json.Object(_) => {
+            match (jsonMember(schema, "type")) {
+                Some(inner) => {
+                    match (inner) {
+                        Json.Object(_) | Json.Array(_) => { return Some(inner); }
+                        _ => {}
+                    }
+                }
+                null => {}
+            }
+        }
+        _ => {}
+    }
+    return null;
+}
+
+fn isJsonNull(v: borrow Json) -> bool => match (v) {
+    Json.Null => true,
+    _ => false,
+};
+
+/// Whether a value fits a union's branch, by its kind (a union's branches differ in kind, by Avro's rule).
+fn avroFits(v: borrow Json, schema: borrow Json, names: borrow Vector<AvroNamed>, depth: usize) -> bool {
+    if (depth > AVRO_MAX_DEPTH) { return false; }
+    match (avroInner(schema)) {
+        Some(inner) => { return avroFits(v, inner, names, depth + 1); }
+        null => {}
+    }
+    let kind = avroTypeName(schema) ?? { return false; };
+    return match (v) {
+        Json.Null => kind == "null".bytes(),
+        Json.Bool(_) => kind == "boolean".bytes(),
+        Json.Number(_) => kind == "int".bytes() || kind == "long".bytes(),
+        Json.Text(t) => if (kind == "float".bytes()) t.length == 4 else if (kind == "double".bytes()) t.length == 8
+            else if (kind == "fixed".bytes()) truncate<i64>(t.length) == (jsonMemberI64(schema, "size") ?? -1)
+            else kind == "bytes".bytes() || kind == "string".bytes() || kind == "enum".bytes(),
+        Json.Array(_) => kind == "array".bytes(),
+        Json.Object(_) => if (kind == "record".bytes() || kind == "error".bytes() || kind == "map".bytes()) true
+            else match (namedSchema(names, kind)) {
+                Some(named) => avroFits(v, named, names, depth + 1),
+                null => false,
+            },
+    };
 }

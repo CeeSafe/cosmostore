@@ -4103,3 +4103,12 @@ Browser form uploads with a SigV4 POST policy.
   - another schema does not join.
 - **A bug caught:** a test caught an underflow on a file shorter than its footer, now refused.
 - **Checks:** 397 unit tests and the S3 smoke pass.
+
+### 20 Nov 2026: M16 slice 2, an Avro writer (ADR-0098 §3)
+
+- **`writeAvro`** (`src/s3/avro.cee`): a file of records by the schema in its metadata, with Iceberg's metadata
+  entries kept, the null codec and one block. A record that does not fit is refused, not written.
+- **The reader keeps floats and doubles** as their raw bytes, as it keeps bytes and fixed, where it gave null. A
+  record read is written back as it was.
+- **Tests:** `avroFilesWrittenBackReadTheSame`. PyIceberg's manifest list and manifest are read, written back and
+  read again the same, and PyIceberg 0.12.0 reads the written files.
