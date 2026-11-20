@@ -575,9 +575,60 @@ fn decodeEnvelope(text: Slice<u8>) -> Result<SseEnvelope?, AllocError> {
 
 // ---- The key file (ADR-0046 §4) ----
 
+/// A master key's bytes copied out of its cells for one use, zeroed when dropped (ADR-0100 §5).
+struct KeyBytes {
+    b: [u8; 32];
+
+    drop {
+        for (i in 0..32) { this.b[i] = 0; }
+    }
+}
+
+/// A master key: its id, and its bytes in atomic cells, so a key removed can be wiped where a reader without a lock
+/// may still see it (ADR-0100 §5; arrays hold only Copy types, CEESAFE_GAPS G41, so four fields). Every copy is
+/// wiped when it is dropped.
 struct MasterKey {
     id: Vector<u8>;
-    key: [u8; 32];
+    private c0: AtomicU64;
+    private c1: AtomicU64;
+    private c2: AtomicU64;
+    private c3: AtomicU64;
+
+    /// A key of `raw`'s 32 bytes.
+    fn create(id: Vector<u8>, raw: Slice<u8>) -> MasterKey => MasterKey {
+        id: id,
+        c0: AtomicU64.create(raw.readLE<u64>(0)),
+        c1: AtomicU64.create(raw.readLE<u64>(8)),
+        c2: AtomicU64.create(raw.readLE<u64>(16)),
+        c3: AtomicU64.create(raw.readLE<u64>(24)),
+    };
+
+    /// Its bytes, for one use.
+    fn material(borrow this) -> KeyBytes {
+        var out = KeyBytes { b: [0u8; 32] };
+        let words = [this.c0.load(), this.c1.load(), this.c2.load(), this.c3.load()];
+        for (i in 0..4) {
+            for (j in 0..8) { out.b[i * 8 + j] = truncate<u8>(words[i] >> (j * 8) as u64); }
+        }
+        return out;
+    }
+
+    /// The same id and bytes.
+    fn sameAs(borrow this, other: borrow MasterKey) -> bool =>
+        this.id.view() == other.id.view() && this.c0.load() == other.c0.load() && this.c1.load() == other.c1.load() &&
+            this.c2.load() == other.c2.load() && this.c3.load() == other.c3.load();
+
+    /// Its bytes zeroed.
+    fn wipe(borrow this) {
+        this.c0.store(0);
+        this.c1.store(0);
+        this.c2.store(0);
+        this.c3.store(0);
+    }
+
+    drop {
+        this.wipe();
+    }
 }
 
 /// The most key sets a server takes in its life: the first, and a reload for each of the others.
@@ -606,12 +657,32 @@ struct KeySets {
         };
     }
 
-    /// Makes `next` the current set; false when every cell is used. One task calls this, the upkeep.
+    /// Makes `next` the current set; false when every cell is used. One task calls this, the upkeep. Then every
+    /// earlier set's copy of a key `next` does not hold is wiped (ADR-0100 §5): a reader still on an earlier set gets
+    /// zeros for it, and fails to open what only it opened, which by then is nothing (ADR-0096 §3).
     fn replace(borrow this, next: Vector<MasterKey>) -> bool {
         let at = this.current.load() as usize + 1;
         if (at >= this.sets.length) { return false; }
         if (this.sets[at].set(next).isErr()) { return false; }
         this.current.store(at as u64);
+        let now = match (this.sets[at].get()) {
+            Some(s) => s.view(),
+            null => { return true; }
+        };
+        for (c in 0..at) {
+            match (this.sets[c].get()) {
+                Some(old) => {
+                    for (k in 0..old.length) {
+                        var kept = false;
+                        for (n in 0..now.length) {
+                            if (old[k].sameAs(borrow now[n])) { kept = true; }
+                        }
+                        if (!kept) { old[k].wipe(); }
+                    }
+                }
+                null => {}
+            }
+        }
         return true;
     }
 }
@@ -681,14 +752,14 @@ fn parseKeyFile(text: Slice<u8>) -> Result<Vector<MasterKey>, KeyFileFault> {
             Err(e) => { return Err(keyFileOom(e)); }
         };
         if (!decoded || raw.length != SSE_KEY_BYTES) { return Err(KeyFileFault.BadKey); }
-        var key = MasterKey {
-            id: match (copyBytes(id)) {
+        let key = MasterKey.create(
+            match (copyBytes(id)) {
                 Ok(c) => c,
                 Err(e) => { return Err(keyFileOom(e)); }
             },
-            key: [0u8; 32],
-        };
-        for (i in 0..SSE_KEY_BYTES) { key.key[i] = raw[i]; }
+            raw.view(),
+        );
+        for (i in 0..raw.length) { raw[i] = 0; }
         match (keys.push(key)) {
             Ok() => {}
             Err(e) => { return Err(keyFileOom(e)); }
@@ -1056,7 +1127,8 @@ fn newSealWith(
 /// SSE-S3 for a new object: a random data key, wrapped under the first master key with a random nonce.
 fn newManagedSeal(keys: Slice<MasterKey>) -> Result<NewSeal, S3Fail> {
     if (keys.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); } // `serve` has no key file
-    return newSealUnder(borrow keys[0].key, false, false, keys[0].id.view());
+    let m = keys[0].material();
+    return newSealUnder(borrow m.b, false, false, keys[0].id.view());
 }
 
 /// SSE-KMS for a new object (ADR-0055): its data key wrapped under the KMS key named, or the KMS key file's first.
@@ -1064,10 +1136,14 @@ fn newManagedSeal(keys: Slice<MasterKey>) -> Result<NewSeal, S3Fail> {
 fn newKmsSeal(kmsKeys: Slice<MasterKey>, name: borrow KmsKeyName) -> Result<NewSeal, S3Fail> {
     if (kmsKeys.length == 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
     let context = name.context.view();
-    if (name.length == 0) { return newSealWith(borrow kmsKeys[0].key, false, true, kmsKeys[0].id.view(), context); }
+    if (name.length == 0) {
+        let m = kmsKeys[0].material();
+        return newSealWith(borrow m.b, false, true, kmsKeys[0].id.view(), context);
+    }
     for (i in 0..kmsKeys.length) {
         if (kmsKeys[i].id.view() == name.view()) {
-            return newSealWith(borrow kmsKeys[i].key, false, true, kmsKeys[i].id.view(), context);
+            let m = kmsKeys[i].material();
+            return newSealWith(borrow m.b, false, true, kmsKeys[i].id.view(), context);
         }
     }
     return Err(S3Fail.Code(S3Code.InvalidArgument));
@@ -1307,7 +1383,8 @@ fn managedDataKey(keys: Slice<MasterKey>, field: Slice<u8>) -> Result<[u8; 32], 
     if (e.customer) { return Err(SseKeyFault.Customer); }
     for (i in 0..keys.length) {
         if (keys[i].id.view() == e.keyId.view()) {
-            return match (unwrapDataKey(borrow keys[i].key, borrow e)) {
+            let m = keys[i].material();
+            return match (unwrapDataKey(borrow m.b, borrow e)) {
                 Some(k) => Ok(k),
                 null => Err(SseKeyFault.Broken),
             };
@@ -1477,7 +1554,8 @@ fn rewrapRound(
                 continue;
             }
         };
-        var dataKey = match (unwrapDataKey(borrow keys[from].key, borrow e)) {
+        let old = keys[from].material();
+        var dataKey = match (unwrapDataKey(borrow old.b, borrow e)) {
             Some(d) => d,
             null => {
                 round.unopened += 1;
@@ -1498,7 +1576,8 @@ fn rewrapRound(
             context: Vector<u8>.create(),
         };
         let aad = envelopeAad(borrow next)?;
-        let wrapped = wrapDataKeyWith(borrow first.key, aad.view(), borrow dataKey, nonce);
+        let firstBytes = first.material();
+        let wrapped = wrapDataKeyWith(borrow firstBytes.b, aad.view(), borrow dataKey, nonce);
         for (b in 0..32) { dataKey[b] = 0; }
         next.wrapped = wrapped ?? { continue; };
         var field = Vector<u8>.create();

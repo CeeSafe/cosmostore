@@ -4277,3 +4277,15 @@ Browser form uploads with a SigV4 POST policy.
   - 178 checks in all.
 - **Checks:** the S3 smoke, the SDK matrix and 407 unit tests pass.
 - **Next:** slice 5, key bytes wiped.
+
+### 20 Nov 2026: M17 slice 5, key bytes wiped (ADR-0100 §5)
+
+- **`MasterKey`'s bytes live in four atomic cells** (an array cannot hold atomics: CEESAFE_GAPS G41).
+  - **Reading one:** a reader takes `material()`, a `KeyBytes` that zeroes itself when dropped.
+  - **Dropping one:** every `MasterKey` copy is wiped in its `drop`.
+- **`KeySets.replace`** wipes every earlier set's copy of a key the new set does not hold. A reader still on an
+  earlier set then fails to open only what that key alone opened, which by then is nothing.
+- **Also wiped:** a node's start-time copies, once the shared sets hold the keys, and the key file's decoded bytes.
+  This fixes M15's B2.
+- **Tests:** `removedKeysAreWiped`. 408 unit tests, both smokes (178 on the cluster) and the SDK matrix pass.
+- **Next:** slice 6, the exit review.

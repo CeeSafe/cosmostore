@@ -156,9 +156,9 @@ fn sseKeyFile() -> Result<void, TestFailure> {
     };
     Check.equalU64(2, keys.length as u64)?;
     Check.equalBytes("k2".bytes(), keys[0].id.view())?;
-    Check.equalBytes([0xFFu8; 32][..], keys[0].key[..])?;
+    Check.equalBytes([0xFFu8; 32][..], keys[0].material().b[..])?;
     Check.equalBytes("k1".bytes(), keys[1].id.view())?;
-    Check.equalBytes([0u8; 32][..], keys[1].key[..])?;
+    Check.equalBytes([0u8; 32][..], keys[1].material().b[..])?;
     Check.equalBytes("empty".bytes(), keyFileAnswer("").bytes())?;
     Check.equalBytes("empty".bytes(), keyFileAnswer("# nothing\n\n").bytes())?;
     Check.equalBytes("line".bytes(), keyFileAnswer("justanid\n").bytes())?;
@@ -431,9 +431,9 @@ fn sseWrapsDataKeys() -> Result<void, TestFailure> {
 }
 
 fn sseKeyOf(id: StringView, fill: u8) -> MasterKey {
-    var key = MasterKey { id: copyBytes(id.bytes())!, key: [0u8; 32] };
-    for (i in 0..32) { key.key[i] = fill + truncate<u8>(i); }
-    return key;
+    var raw = [0u8; 32];
+    for (i in 0..32) { raw[i] = fill + truncate<u8>(i); }
+    return MasterKey.create(copyBytes(id.bytes())!, raw[..]);
 }
 
 fn sseKeyFaultIs(answer: Result<[u8; 32], SseKeyFault>, expected: SseKeyFault) -> bool => match (answer) {
@@ -859,13 +859,14 @@ fn kmsEncryptionContextIsSealed() -> Result<void, TestFailure> {
     let seal = (newSeal(none.view(), keys.view(), borrow asked).ok() ?? null) ?? { return Check.fail("sealed"); };
     let e = decodeEnvelope(seal.field.view())! ?? { return Check.fail("decoded"); };
     Check.equalBytes(context.bytes(), e.context.view())?;
-    Check.isTrue(unwrapDataKey(borrow keys[0].key, borrow e).isSome(), "it opens")?;
+    let k0 = keys[0].material();
+    Check.isTrue(unwrapDataKey(borrow k0.b, borrow e).isSome(), "it opens")?;
     // Another context in the same envelope: the seal does not open.
     var changed = copyBytes(seal.field.view())!;
     let last = changed.length - 2;
     changed[last] = if (changed[last] == 'J') 'K' else 'J';
     match (decodeEnvelope(changed.view())!) {
-        Some(t) => { Check.isTrue(unwrapDataKey(borrow keys[0].key, borrow t).isNull(), "a changed context")?; }
+        Some(t) => { Check.isTrue(unwrapDataKey(borrow k0.b, borrow t).isNull(), "a changed context")?; }
         null => {}
     }
     // Without a context, the envelope is the five pieces it was.
@@ -987,9 +988,34 @@ fn rewrapRoundsKeepTheDataKey() -> Result<void, TestFailure> {
     let field = copyBytes(metadataFind(s.headObject("bkt", "k")!.metadata.view(), SSE_FIELD.bytes())!)!;
     Check.isTrue(startsWithBytes(field.view(), "v1.s3.k3.".bytes()), "under the first key")?;
     let e = decodeEnvelope(field.view())!!;
-    let opened = unwrapDataKey(borrow keys[0].key, borrow e)!;
+    let first = keys[0].material();
+    let opened = unwrapDataKey(borrow first.b, borrow e)!;
     Check.equalBytes(sealed.dataKey[..], opened[..])?;
     // A second round has nothing to move.
     Check.equalU64(0, rewrapRound(mut s, keys.view(), borrow none)!.moved)?;
+    return Ok();
+}
+
+/// A key removed is wiped (ADR-0100 §5): replacing a set zeroes every earlier set's copy of a key the new set does
+/// not hold, and leaves a key it keeps, and the new set, as they were.
+@test
+fn removedKeysAreWiped() -> Result<void, TestFailure> {
+    var first = Vector<MasterKey>.create();
+    first.push(sseKeyOf("k2", 2))!;
+    first.push(sseKeyOf("k1", 1))!;
+    let sets = KeySets.create(first)!;
+    let before = sets.view();
+    let k2 = before[0].material();
+    Check.isFalse(k2.b[..] == [0u8; 32][..], "a key's bytes")?;
+    var next = Vector<MasterKey>.create();
+    next.push(sseKeyOf("k3", 3))!;
+    next.push(sseKeyOf("k1", 1))!;
+    Check.isTrue(sets.replace(next), "replaced")?;
+    Check.equalBytes([0u8; 32][..], before[0].material().b[..])?;
+    Check.equalBytes(sseKeyOf("k1", 1).material().b[..], before[1].material().b[..])?;
+    let now = sets.view();
+    Check.equalBytes(sseKeyOf("k3", 3).material().b[..], now[0].material().b[..])?;
+    // The copy taken before the wipe is the caller's, and it keeps its bytes until it is dropped.
+    Check.equalBytes(sseKeyOf("k2", 2).material().b[..], k2.b[..])?;
     return Ok();
 }

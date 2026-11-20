@@ -649,6 +649,27 @@ PyIceberg and Spark), snappy, or deflate/gzip.
 - then their compressors, at least a fast level;
 - all streaming, with a bound on the output (against decompression bombs).
 
+### G41: an array cannot hold atomics, or any type that is not Copy (P3, language)
+
+**Found:** CosmoStore M17 slice 5, 20 Nov 2026 (ceesafec 0.54.0).
+
+**What happens.** A master key's 32 bytes were to live in `[AtomicU64; 4]`, so a key removed could be wiped while
+readers without a lock still see its set. That is refused:
+
+```
+error[N0259]: array and slice elements must be Copy types in v0; 'AtomicU64' is not Copy
+```
+
+- **The workaround:** four named fields (`c0` to `c3`) and code that names each one. It works, but every loop over
+  the cells is written out four times.
+- **Why it matters here:** atomics are how CeeSafe shares mutable bytes without a lock, and fixed groups of them
+  are common: words of a key, counters by kind.
+
+**Repro.** `struct K { cells: [AtomicU64; 4]; }`
+
+**Suggested.** Arrays of non-Copy element types, built by a literal or `[T; N].fill(f)`, read by index through a
+reference. They need no Copy to be read in place.
+
 ## Not gaps (checked)
 
 Things that worked well and are worth keeping:
