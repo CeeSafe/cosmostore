@@ -324,11 +324,11 @@ fn openNode(
                 Ok(Some(t)) => t,
                 _ => { return Err(textOf("the replication targets file cannot be read again")); }
             },
-            sseKeys: match (copyKeys(sts.sseKeys.view())) {
+            sseKeys: match (sharedOr(sts.sseSets.asBorrow(), sts.sseKeys.view())) {
                 Ok(k) => k,
                 Err(_) => { return Err(textOf("out of memory")); }
             },
-            kmsKeys: match (copyKeys(sts.kmsKeys.view())) {
+            kmsKeys: match (sharedOr(sts.kmsSets.asBorrow(), sts.kmsKeys.view())) {
                 Ok(k) => k,
                 Err(_) => { return Err(textOf("out of memory")); }
             },
@@ -955,13 +955,61 @@ const CREDENTIALS_EVERY_MS: u64 = 2000;
 
 /// The node's credentials and users files, reloaded as `serve` reloads its own whenever either changes: a key or a
 /// user removed is refused at the node's next request, without a restart (ADR-0092 §1).
-async fn credentialsForever(rotation: Rotation) -> Result<void, NodeFault> {
+async fn credentialsForever(rotation: Rotation, shared: borrow NodeShared) -> Result<void, NodeFault> {
     var r = rotation;
     while (true) {
         if (!(await frontPause(CREDENTIALS_EVERY_MS))) { return Err(NodeFault.Net); }
         await reloadCredentialsIfChanged(mut r);
+        await reloadNodeKeysIfChanged(mut r, shared);
     }
     return Ok();
+}
+
+/// A master key's removal refused on a node that holds only some of the shards: it cannot know the others need none.
+async fn refuseUncounted(k: borrow mut KeyRotation, modified: i64, held: usize, shards: u32) {
+    k.failed = modified;
+    var line = String.create();
+    let _ = line.append("cosmostore: ");
+    let _ = line.append(keyFileWhat(k.kind));
+    let _ = line.append(" reload refused: it removes a key, and this node holds ");
+    let _ = line.appendNumber(held as u64);
+    let _ = line.append(" of the ");
+    let _ = line.appendNumber(shards as u64);
+    let _ = line.append(" shards, so it cannot count the versions sealed under it\n");
+    let _ = await AsyncConsole.writeError(line.view());
+}
+
+/// The node's key files reloaded (ADR-0096 §3, §6): a removed key is checked against every shard store the node holds.
+async fn reloadNodeKeysIfChanged(r: borrow mut Rotation, shared: borrow NodeShared) {
+    for (i in 0..r.keyFiles.length) {
+        let k = borrow mut r.keyFiles[i];
+        match (await Async.blocking(() => keyFileChange(k))) {
+            KeyChange.Unchanged => {}
+            KeyChange.Failed(message) => {
+                let _ = await AsyncConsole.writeError(
+                    "cosmostore: a key file reload failed, keeping the keys in use: ",
+                );
+                let _ = await AsyncConsole.writeError(message.view());
+                let _ = await AsyncConsole.writeError("\n");
+            }
+            KeyChange.Fresh(fresh, dropped, modified) => {
+                let mode = keyFileMode(k.kind);
+                var inUse: u64 = 0;
+                if (mode.length > 0 && dropped.length > 0) {
+                    // A shard this node holds no replica of cannot be counted here, so a removal is refused unless
+                    // the node holds every shard (fail closed).
+                    if (shared.slots.length < shared.file.shards as usize) {
+                        await refuseUncounted(k, modified, shared.slots.length, shared.file.shards);
+                        continue;
+                    }
+                    for (s in 0..shared.slots.length) {
+                        inUse += await sealedIn(borrow shared.slots[s].store, mode, dropped.view());
+                    }
+                }
+                await applyKeyFile(k, fresh, borrow dropped, modified, inUse);
+            }
+        }
+    }
 }
 
 async fn runNode(
@@ -1049,7 +1097,7 @@ async fn runNode(
         }
         // The credentials and users files, reloaded when they change (ADR-0092 §1).
         match (rotation) {
-            Some(r) => { s.spawn(async move () => await credentialsForever(r)); }
+            Some(r) => { s.spawn(async move () => await credentialsForever(r, node)); }
             null => {}
         }
         s.spawn(async () => await tickForever(node));
@@ -1139,6 +1187,7 @@ fn nodeCommand() -> i32 {
                         usersPath: textOf(usersPath),
                         usersModified: if (usersPath.length == 0) 0 else Fs.modifiedMillis(usersPath).ok() ?? 0,
                         roles: null,
+                        keyFiles: Vector<KeyRotation>.create(),
                     });
                 }
                 null => {}
@@ -1203,6 +1252,9 @@ fn nodeCommand() -> i32 {
         keys: Vector<MasterKey>.create(),
         sseKeys: Vector<MasterKey>.create(),
         kmsKeys: Vector<MasterKey>.create(),
+        stsSets: null,
+        sseSets: null,
+        kmsSets: null,
         rolesText: Vector<u8>.create(),
         roleSets: null,
         websiteDomain: Vector<u8>.create(),
@@ -1334,6 +1386,56 @@ fn nodeCommand() -> i32 {
         }
         null => {}
     }
+    // The key files' sets, shared by every shard's S3 server and the delivery task, and reloaded (ADR-0096 §3, §6).
+    let made = match (sharedKeys(match (copyKeys(sts.keys.view())) {
+        Ok(k) => k,
+        Err(_) => { return 1; }
+    })) {
+        Ok(a) => a,
+        Err(_) => { return 1; }
+    };
+    let sseMade = match (sharedKeys(match (copyKeys(sts.sseKeys.view())) {
+        Ok(k) => k,
+        Err(_) => { return 1; }
+    })) {
+        Ok(a) => a,
+        Err(_) => { return 1; }
+    };
+    let kmsMade = match (sharedKeys(match (copyKeys(sts.kmsKeys.view())) {
+        Ok(k) => k,
+        Err(_) => { return 1; }
+    })) {
+        Ok(a) => a,
+        Err(_) => { return 1; }
+    };
+    match (borrow mut rotation) {
+        Some(r) => {
+            for (kind in [KEY_FILE_STS, KEY_FILE_SSE, KEY_FILE_KMS]) {
+                let given =
+                    if (kind == KEY_FILE_STS) borrow args.stsKeys else if (kind == KEY_FILE_SSE) borrow args.sseKeys
+                        else borrow args.kmsKeys;
+                match (given) {
+                    Some(path) => {
+                        let sets = if (kind == KEY_FILE_STS) made.clone() else if (kind == KEY_FILE_SSE) sseMade.clone()
+                            else kmsMade.clone();
+                        let pushed = r.keyFiles.push(KeyRotation {
+                            sets: sets,
+                            path: textOf(path.view()),
+                            kind: kind,
+                            modified: Fs.modifiedMillis(path.view()).ok() ?? 0,
+                            failed: 0,
+                        });
+                        if (pushed.isErr()) { return 1; }
+                    }
+                    null => {}
+                }
+            }
+        }
+        null => {}
+    }
+    sts.stsSets = Some(made);
+    sts.sseSets = Some(sseMade);
+    sts.kmsSets = Some(kmsMade);
     match (borrow args.roles) {
         Some(path) => {
             if (args.stsKeys.isNull()) {

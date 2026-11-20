@@ -75,6 +75,163 @@ struct Rotation {
     failed: i64;
     /// The roles file, reloaded beside them (ADR-0096 §1); none without `--roles-file`.
     roles: RoleRotation?;
+    /// The STS, SSE-S3 and KMS key files given, reloaded beside them (ADR-0096 §3, §4).
+    keyFiles: Vector<KeyRotation>;
+}
+
+/// A key file and its set (ADR-0096 §3, §4). `mode` is the envelopes' (`s3`, `kms`) a key of it seals, or empty for
+/// STS's, whose keys seal tokens: a key of those may be removed, which revokes them.
+struct KeyRotation {
+    sets: Arc<KeySets>;
+    path: String;
+    /// KEY_FILE_STS, KEY_FILE_SSE or KEY_FILE_KMS.
+    kind: u8;
+    modified: i64;
+    failed: i64;
+}
+
+const KEY_FILE_STS: u8 = 0;
+const KEY_FILE_SSE: u8 = 1;
+const KEY_FILE_KMS: u8 = 2;
+
+/// The file's name in what the server says of it.
+fn keyFileWhat(kind: u8) -> StringView =>
+    if (kind == KEY_FILE_STS) "STS key file" else if (kind == KEY_FILE_SSE) "SSE key file" else "KMS key file";
+
+/// The envelopes' mode a key of the file seals (`s3`, `kms`); empty for STS's, whose keys seal tokens.
+fn keyFileMode(kind: u8) -> StringView => if (kind == KEY_FILE_SSE) "s3" else if (kind == KEY_FILE_KMS) "kms" else "";
+
+/// What a key file's change asks: nothing, a file that does not read, or new keys and the ids of those it drops.
+enum KeyChange {
+    Unchanged,
+    Failed(String),
+    Fresh(Vector<MasterKey>, Vector<Vector<u8>>, i64),
+}
+
+/// Reads a key file again if its modification time changed (on a worker thread): its keys, and the ids of the current
+/// ones it no longer has.
+fn keyFileChange(k: borrow mut KeyRotation) -> KeyChange {
+    let modified = Fs.modifiedMillis(k.path.view()).ok() ?? k.modified;
+    if (modified == k.modified || modified == k.failed) { return KeyChange.Unchanged; }
+    let fresh = match (readSseKeys(k.path.view())) {
+        Ok(f) => f,
+        Err(message) => {
+            k.failed = modified;
+            return KeyChange.Failed(message);
+        }
+    };
+    var dropped = Vector<Vector<u8>>.create();
+    let current = k.sets.get().view();
+    for (i in 0..current.length) {
+        var kept = false;
+        for (j in 0..fresh.length) {
+            if (fresh[j].id.view() == current[i].id.view()) { kept = true; }
+        }
+        if (!kept) {
+            match (copyBytes(current[i].id.view())) {
+                Ok(id) => {
+                    if (dropped.push(id).isErr()) { return KeyChange.Failed(textOf("out of memory")); }
+                }
+                Err(_) => { return KeyChange.Failed(textOf("out of memory")); }
+            }
+        }
+    }
+    return KeyChange.Fresh(fresh, dropped, modified);
+}
+
+/// How many of a store's versions and uploads are sealed under one of `ids` with envelopes of `mode`.
+async fn sealedIn(store: borrow Arc<AsyncMutex<ObjectStore>>, mode: StringView, ids: Slice<Vector<u8>>) -> u64 {
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return 0; }
+    };
+    let s = guard.data();
+    var n: u64 = 0;
+    for (i in 0..ids.length) {
+        var prefix = Vector<u8>.create();
+        let built = prefix.extend(
+            "v1.".bytes(),
+        ).isOk() && prefix.extend(mode.bytes()).isOk() && prefix.push('.').isOk() &&
+            prefix.extend(ids[i].view()).isOk() && prefix.push('.').isOk();
+        if (!built) { return 1; } // out of memory: not known to be unused, so kept
+        let p = prefix.view();
+        let counted = await Async.blocking(() => s.countFieldPrefix(SSE_FIELD.bytes(), p));
+        n += counted.ok() ?? 1;
+    }
+    return n;
+}
+
+/// The new keys made the current set, unless a key they drop still seals `inUse` versions (ADR-0096 §3, the owner's
+/// choice): then the reload is refused, said once with the key and the count, and the keys in use stay.
+async fn applyKeyFile(
+    k: borrow mut KeyRotation,
+    fresh: Vector<MasterKey>,
+    dropped: borrow Vector<Vector<u8>>,
+    modified: i64,
+    inUse: u64,
+) {
+    if (inUse > 0) {
+        k.failed = modified;
+        var line = String.create();
+        let _ = line.append("cosmostore: ");
+        let _ = line.append(keyFileWhat(k.kind));
+        let _ = line.append(" reload refused: ");
+        let _ = line.appendNumber(inUse);
+        let _ = line.append(" versions are still sealed under the key it removes (");
+        let _ = line.append(StringView.fromUtf8(dropped[0].view()) ?? "?");
+        let _ = line.append("); re-seal them (CopyObject onto itself) first\n");
+        let _ = await AsyncConsole.writeError(line.view());
+        return;
+    }
+    let count = fresh.length;
+    let installed = await Async.blocking(() => installKeys(k, borrow fresh));
+    if (!installed) {
+        k.failed = modified;
+        let _ = await AsyncConsole.writeError(
+            "cosmostore: a key file was reloaded too many times; restart to reload\n",
+        );
+        return;
+    }
+    k.modified = modified;
+    var line = String.create();
+    let _ = line.append("cosmostore: ");
+    let _ = line.append(keyFileWhat(k.kind));
+    let _ = line.append(" reloaded: ");
+    let _ = line.appendNumber(count as u64);
+    let _ = line.append(" keys\n");
+    let _ = await AsyncConsole.writeError(line.view());
+}
+
+/// The keys made the current set, on a worker thread (the set's cell is a lock); false when every cell is used.
+fn installKeys(k: borrow KeyRotation, fresh: borrow Vector<MasterKey>) -> bool {
+    let copied = copyKeys(fresh.view()).ok() ?? { return false; };
+    return k.sets.get().replace(copied);
+}
+
+/// `serve`'s key files reloaded, a removed key checked against its one store.
+async fn reloadKeysIfChanged(r: borrow mut Rotation, store: borrow Arc<AsyncMutex<ObjectStore>>) {
+    for (i in 0..r.keyFiles.length) {
+        let k = borrow mut r.keyFiles[i];
+        match (await Async.blocking(() => keyFileChange(k))) {
+            KeyChange.Unchanged => {}
+            KeyChange.Failed(message) => {
+                let _ = await AsyncConsole.writeError(
+                    "cosmostore: a key file reload failed, keeping the keys in use: ",
+                );
+                let _ = await AsyncConsole.writeError(message.view());
+                let _ = await AsyncConsole.writeError("\n");
+            }
+            KeyChange.Fresh(fresh, dropped, modified) => {
+                let mode = keyFileMode(k.kind);
+                let inUse = if (mode.length > 0 && dropped.length > 0) await sealedIn(
+                    store,
+                    mode,
+                    dropped.view(),
+                ) else 0;
+                await applyKeyFile(k, fresh, borrow dropped, modified, inUse);
+            }
+        }
+    }
 }
 
 /// The roles file and its sets (ADR-0096 §1, §2), reloaded as the credentials file is.
@@ -510,6 +667,7 @@ async fn maintainForever(
         }
         await upkeep(store);
         await reloadCredentialsIfChanged(rotation);
+        await reloadKeysIfChanged(rotation, store);
     }
     return Err(NetError.Closed);
 }
@@ -530,6 +688,7 @@ async fn maintainAndReload(
         await upkeep(store);
         await reloadIfChanged(config, watch);
         await reloadCredentialsIfChanged(rotation);
+        await reloadKeysIfChanged(rotation, store);
     }
     return Err(NetError.Closed);
 }
@@ -1100,6 +1259,7 @@ fn serve() -> i32 {
             Err(_) => 0,
         },
         roles: null,
+        keyFiles: Vector<KeyRotation>.create(),
     };
     // The webhooks of event notifications (ADR-0048): once for the requests, once for the delivery task.
     let notifyTargets = readTargets(Process.argument(targetsAt) ?? "", targetsAt != 0);
@@ -1122,8 +1282,14 @@ fn serve() -> i32 {
         tables: TablesMaintainer { dayMs: tablesDaySeconds * 1000 },
         replication: ReplicaContext {
             targets: Vector<ReplicationTarget>.create(),
-            sseKeys: Vector<MasterKey>.create(),
-            kmsKeys: Vector<MasterKey>.create(),
+            sseKeys: match (sharedKeys(Vector<MasterKey>.create())) {
+                Ok(k) => k,
+                Err(_) => { die("out of memory"); }
+            },
+            kmsKeys: match (sharedKeys(Vector<MasterKey>.create())) {
+                Ok(k) => k,
+                Err(_) => { die("out of memory"); }
+            },
         },
         decider: RecordedDecider.none(),
     };
@@ -1177,14 +1343,17 @@ fn serve() -> i32 {
             }
         }
     }
-    auditWriter.replication.sseKeys = match (copyKeys(sseKeys.view())) {
+    // The key sets, shared by the S3 server and the writers, and reloaded (ADR-0096 §1, §3).
+    let sseSets = match (sharedKeys(sseKeys)) {
         Ok(k) => k,
         Err(_) => { die("out of memory"); }
     };
-    auditWriter.replication.kmsKeys = match (copyKeys(kmsKeys.view())) {
+    let kmsSets = match (sharedKeys(kmsKeys)) {
         Ok(k) => k,
         Err(_) => { die("out of memory"); }
     };
+    auditWriter.replication.sseKeys = sseSets.clone();
+    auditWriter.replication.kmsKeys = kmsSets.clone();
     // STS's token keys and its roles (ADR-0075).
     var stsKeys = Vector<MasterKey>.create();
     if (stsKeysAt != 0) {
@@ -1192,6 +1361,32 @@ fn serve() -> i32 {
             Ok(k) => k,
             Err(message) => { die(message.view()); }
         };
+    }
+    let stsSets = match (sharedKeys(stsKeys)) {
+        Ok(k) => k,
+        Err(_) => { die("out of memory"); }
+    };
+    // The key files given, reloaded with the credentials (ADR-0096 §3, §4).
+    for (file in [
+        [sseKeysAt as u64, KEY_FILE_SSE as u64],
+        [kmsKeysAt as u64, KEY_FILE_KMS as u64],
+        [stsKeysAt as u64, KEY_FILE_STS as u64],
+    ]) {
+        if (file[0] == 0) { continue; }
+        let path = Process.argument(file[0] as usize) ?? "";
+        let kind = truncate<u8>(file[1]);
+        let sets =
+            if (kind == KEY_FILE_SSE) sseSets.clone()
+                else if (kind == KEY_FILE_KMS) kmsSets.clone()
+                else stsSets.clone();
+        let added = rotation.keyFiles.push(KeyRotation {
+            sets: sets,
+            path: textOf(path),
+            kind: kind,
+            modified: Fs.modifiedMillis(path).ok() ?? 0,
+            failed: 0,
+        });
+        if (added.isErr()) { die("out of memory"); }
     }
     var roles = Vector<StsRole>.create();
     if (rolesAt != 0) {
@@ -1331,11 +1526,11 @@ fn serve() -> i32 {
         denyBuckets: AtomicU64.create(policies.denies),
         secure: tls.isSome(),
         notifyTargets: notifyTargets,
-        sseKeys: sseKeys,
-        stsKeys: stsKeys,
+        sseKeys: sseSets.clone(),
+        stsKeys: stsSets.clone(),
         replicationTargetIds: replicationTargetIds,
         roles: roleSets.clone(),
-        kmsKeys: kmsKeys,
+        kmsKeys: kmsSets.clone(),
         corsBuckets: AtomicU64.create(corsBuckets),
         accessLog: Some(AccessLog { lines: accessLines, dropped: AtomicU64.create(0) }),
         loggingBuckets: AtomicU64.create(loggingBuckets),

@@ -246,3 +246,31 @@ fn bucketAclSurvivesAndGoesWithTheBucket() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// The versions and uploads sealed under a master key are counted from memory (ADR-0096 §3): every version of a key,
+/// not only its latest, and an upload in progress.
+@test
+fn versionsSealedUnderAKeyAreCounted() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("sealed-count");
+    var s = ObjectStore.open(dir.view(), uploadConfig())!;
+    s.createBucket("bkt")!;
+    setVersioning(mut s, "bkt", VERSIONING_ENABLED);
+    for (envelope in ["v1.s3.k2.00.00", "v1.s3.k2.00.11", "v1.s3.k1.00.00", "v1.kms.k2.00.00"]) {
+        var meta = Vector<u8>.create();
+        metadataAdd(mut meta, SSE_FIELD.bytes(), envelope.bytes())!;
+        var w = s.newWriter()!;
+        w.write("sealed".bytes())!;
+        let obj = w.finish()!;
+        let key = if (envelope == "v1.s3.k1.00.00") "other" else "same";
+        let _ = s.putFinishedWith("bkt", key, "text/plain", meta.view(), "".bytes(), borrow obj, PutCondition.None)!;
+    }
+    putText(mut s, "bkt", "plain", "not sealed");
+    var meta = Vector<u8>.create();
+    metadataAdd(mut meta, SSE_FIELD.bytes(), "v1.s3.k2.00.22".bytes())!;
+    let _ = s.createUploadWith("bkt", "multi", "a/b", meta.view(), ChecksumAlgorithm.None, ChecksumType.FullObject)!;
+    Check.equalU64(3, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k2.".bytes())!)?;
+    Check.equalU64(1, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k1.".bytes())!)?;
+    Check.equalU64(1, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.kms.k2.".bytes())!)?;
+    Check.equalU64(0, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k9.".bytes())!)?;
+    return Ok();
+}

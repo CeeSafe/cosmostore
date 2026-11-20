@@ -792,6 +792,24 @@ check "the use after it" "$(quota GET quota) $(quotaxml)" "200 0</MaxBytes><MaxO
 aws s3 rm --recursive s3://quota/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket quota > /dev/null 2>&1 && pass "delete-bucket after a quota" || fail "delete-bucket after a quota"
 
+# Key files reloaded (ADR-0096 §3): a key added first seals what is new, the old ones still open what they sealed; a
+# reload that removes a key stored versions still need is refused, and says how many.
+cp "$work/sse.keys" "$work/sse.keys.kept"
+{ printf 'k3 %s\n' "$(head -c 32 /dev/urandom | base64)"; cat "$work/sse.keys.kept"; } > "$work/sse.keys"
+sleep 4
+grep -q "SSE key file reloaded: 3 keys" "$work/server.log" && pass "an SSE key added, without a restart" || fail "an SSE key added, without a restart"
+check "an SSE-S3 put after the key added" "$(aws s3api put-object --bucket smoke --key sse/after-k3.txt --body sse.txt --server-side-encryption AES256 --query ServerSideEncryption --output text)" AES256
+check "its read" "$(aws s3api get-object --bucket smoke --key sse/after-k3.txt "$work/k3.out" > /dev/null 2>&1 && cmp -s sse.txt "$work/k3.out" && echo same)" same
+check "a version the old key sealed still reads" "$(aws s3api get-object --bucket smoke --key sse/small.txt "$work/k2.out" > /dev/null 2>&1 && cmp -s sse.txt "$work/k2.out" && echo same)" same
+grep -v '^k2 ' "$work/sse.keys" > "$work/sse.keys.next" && mv "$work/sse.keys.next" "$work/sse.keys"
+sleep 4
+grep -q "SSE key file reload refused: [0-9]* versions are still sealed under the key it removes (k2)" "$work/server.log" && pass "removing a key in use refused" || fail "removing a key in use refused"
+check "the key kept opens its versions" "$(aws s3api get-object --bucket smoke --key sse/small.txt "$work/k2.out" > /dev/null 2>&1 && cmp -s sse.txt "$work/k2.out" && echo same)" same
+# Put k2 back, for the checks after.
+cp "$work/sse.keys" "$work/sse.keys.k3"
+{ grep '^k3 ' "$work/sse.keys.k3"; cat "$work/sse.keys.kept"; } > "$work/sse.keys"
+sleep 4
+
 # Credential rotation (ADR-0050): the credentials file is read again when it changes, within an upkeep round (2 s).
 second() { ( export AWS_ACCESS_KEY_ID=AKIASMOKETEST0000002; export AWS_SECRET_ACCESS_KEY="$1"; shift; "$@" ); }
 check "a key the file does not have" "$(second second/secret/one code s3api list-buckets)" InvalidAccessKeyId

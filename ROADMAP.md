@@ -3964,3 +3964,21 @@ Browser form uploads with a SigV4 POST policy.
   - the S3 smoke empties the roles file under a running server, and the role's session is refused;
   - 391 unit tests, the cluster smoke (167) and the SDK matrix pass.
 - **Next:** slice 2, the key files.
+
+### 20 Nov 2026: M15 slice 2, the key files reloaded (ADR-0096 §3, §4)
+
+- **`KeySets`:** the STS, SSE-S3 and KMS key files are each one set, shared by the S3 server and the writers, and on a
+  node by every shard's server and the delivery task. They reload as the credentials do (`Rotation.keyFiles`).
+- **A master key added** first in its file seals what is new at once; the old ones still open what they sealed.
+- **A master key removed while needed:**
+  - the reload is refused and logged with the key and the count of versions and uploads sealed under it;
+  - the count comes from the index in memory (`ObjectStore.countFieldPrefix`), so a reload reads no object.
+- **An STS key removed:** taken, and the tokens it sealed with it.
+- **On a cluster, fail closed:** a node that holds only some of the shards cannot count the others, so it refuses a
+  master key's removal and says how many it holds. For the exit review: slice 4's digests, or asking the shards'
+  leaders, could count them.
+- **Tests:**
+  - `versionsSealedUnderAKeyAreCounted`;
+  - the S3 smoke adds a key, reads old and new objects, and is refused the removal of the key in use;
+  - 392 unit tests, the cluster smoke (167) and the SDK matrix pass.
+- **Next:** slice 3, the target files.

@@ -580,6 +580,46 @@ struct MasterKey {
     key: [u8; 32];
 }
 
+/// The most key sets a server takes in its life: the first, and a reload for each of the others.
+const MAX_KEY_SETS: usize = 4096;
+
+/// A key file's keys, and the sets that replaced them as the file changed (ADR-0096 §1, §3): read without a lock, each
+/// set written once, `current` naming it. A key is looked up by its id, and the first seals what is new.
+struct KeySets {
+    sets: Vector<OnceLock<Vector<MasterKey>>>;
+    current: AtomicU64;
+    none: Vector<MasterKey>;
+
+    fn create(first: Vector<MasterKey>) -> Result<KeySets, AllocError> {
+        var sets = Vector<OnceLock<Vector<MasterKey>>>.create();
+        sets.reserve(MAX_KEY_SETS)?;
+        for (i in 0..MAX_KEY_SETS) { sets.push(OnceLock<Vector<MasterKey>>.create())?; }
+        let _ = sets[0].set(first);
+        return Ok(KeySets { sets: sets, current: AtomicU64.create(0), none: Vector<MasterKey>.create() });
+    }
+
+    fn view(borrow this) -> Slice<MasterKey> {
+        let at = this.current.load() as usize;
+        return match (this.sets[at].get()) {
+            Some(set) => set.view(),
+            null => this.none.view(),
+        };
+    }
+
+    /// Makes `next` the current set; false when every cell is used. One task calls this, the upkeep.
+    fn replace(borrow this, next: Vector<MasterKey>) -> bool {
+        let at = this.current.load() as usize + 1;
+        if (at >= this.sets.length) { return false; }
+        if (this.sets[at].set(next).isErr()) { return false; }
+        this.current.store(at as u64);
+        return true;
+    }
+}
+
+/// A key set, shared: empty when its file is not given.
+fn sharedKeys(keys: Vector<MasterKey>) -> Result<Arc<KeySets>, AllocError> =>
+    Arc<KeySets>.create(KeySets.create(keys)?);
+
 enum KeyFileFault {
     /// No key at all.
     Empty,
@@ -1070,7 +1110,9 @@ async fn sseAskedFor(app: borrow S3App, req: borrow S3Request) -> Result<SseRequ
 /// A bucket's default encryption (ADR-0046 §5): SSE-S3, SSE-KMS, or none. Read under the lock, without I/O. A
 /// directory bucket's objects are always sealed (ADR-0080 §3): with none set, SSE-S3 when this server has its keys.
 async fn bucketDefaultSse(app: borrow S3App, bucket: StringView) -> Result<SseRequest, S3Fail> {
-    let fallback = if (inDirectoryBucket(bucket) && app.sseKeys.length > 0) SseRequest.Managed else SseRequest.None;
+    let fallback = if (inDirectoryBucket(
+        bucket,
+    ) && app.sseKeys.get().view().length > 0) SseRequest.Managed else SseRequest.None;
     if (app.encryptedBuckets.load() == 0) { return Ok(fallback); }
     var guard = await lockStore(app)?;
     let store = guard.data();
@@ -1193,17 +1235,18 @@ async fn putBucketEncryption(
     // NotImplemented, as SSE-KMS is without it) and, when it names one, a key the file has.
     match (defaultOfStored(stored.view())) {
         SseRequest.Kms(name) => {
-            if (app.kmsKeys.length == 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
+            if (app.kmsKeys.get().view().length == 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
             if (name.length > 0) {
                 var found = false;
-                for (i in 0..app.kmsKeys.length) {
-                    if (app.kmsKeys[i].id.view() == name.view()) { found = true; }
+                let kmsKeys = app.kmsKeys.get().view();
+                for (i in 0..kmsKeys.length) {
+                    if (kmsKeys[i].id.view() == name.view()) { found = true; }
                 }
                 if (!found) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
             }
         }
         _ => {
-            if (app.sseKeys.length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
+            if (app.sseKeys.get().view().length == 0) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
         }
     }
     await storeSetBucketConfig(app, req.bucket.view(), BUCKET_CONFIG_ENCRYPTION, stored.view())?;
@@ -1272,7 +1315,7 @@ async fn sealedDataKey(app: borrow S3App, field: Slice<u8>, customer: [u8; 32]?)
     }
     if (customer.isSome()) { return Err(S3Fail.Code(S3Code.InvalidRequest)); }
     // SSE-S3's master keys and SSE-KMS's keys are apart: an id names a key of its own kind (ADR-0055).
-    let keys = if (isKmsEnvelope(field)) app.kmsKeys.view() else app.sseKeys.view();
+    let keys = if (isKmsEnvelope(field)) app.kmsKeys.get().view() else app.sseKeys.get().view();
     return match (managedDataKey(keys, field)) {
         Ok(k) => Ok(k),
         Err(SseKeyFault.Customer) => Err(S3Fail.Code(S3Code.InvalidRequest)),
