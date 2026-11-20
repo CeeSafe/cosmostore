@@ -334,7 +334,12 @@ fn policiesNameUsersByTheirIds() -> Result<void, TestFailure> {
 }
 
 fn recordedRole(name: StringView, policy: StringView) -> StsRole =>
-    StsRole { name: copyBytes(name.bytes())!, maxSeconds: 3600, policy: parseIdentityPolicy(policy.bytes())! };
+    StsRole {
+        name: copyBytes(name.bytes())!,
+        maxSeconds: 3600,
+        policy: parseIdentityPolicy(policy.bytes())!,
+        removed: false,
+    };
 
 /// A configuration's write decided as the requester it records (ADR-0094 §2), with the users, roles and policies of
 /// now: a user removed, or its policy narrowed, stops it; a role likewise; the bucket's Deny refuses and its Allow lets
@@ -415,6 +420,51 @@ fn writesDecidedAsTheirRequester() -> Result<void, TestFailure> {
     Check.isFalse(
         decide(narrowed.view(), nullAllowed.asBorrow(), false, "user writer W1"),
         "a Null Allow does not apply",
+    )?;
+    return Ok();
+}
+
+/// The roles file reloaded (ADR-0096 §2): every role keeps its place, one the file no longer has is marked removed,
+/// one it changed takes its new policy, and a new one goes after the others.
+@test
+fn rolesReloadKeepTheirPlaces() -> Result<void, TestFailure> {
+    let readAll = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}}";
+    let putAll = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:PutObject\",\"Resource\":\"*\"}}";
+    var old = Vector<StsRole>.create();
+    old.push(recordedRole("reader", readAll))!;
+    old.push(recordedRole("writer", readAll))!;
+    var fresh = Vector<StsRole>.create();
+    fresh.push(recordedRole("auditor", readAll))!;
+    fresh.push(recordedRole("writer", putAll))!;
+    let next = nextRoles(old.view(), fresh.view())!;
+    Check.equalU64(3, next.length as u64)?;
+    Check.equalBytes("reader".bytes(), next[0].name.view())?;
+    Check.isTrue(next[0].removed, "a role the file no longer has")?;
+    Check.equalBytes("writer".bytes(), next[1].name.view())?;
+    Check.isFalse(next[1].removed, "a role still there")?;
+    let req = bareRequest();
+    let facts = policyFacts(borrow req, false, false, null)!;
+    Check.equalBytes(
+        "allow".bytes(),
+        decisionName(decidePolicy(borrow next[1].policy, null, "s3:PutObject", "s3:b/k".bytes(), borrow facts)).bytes(),
+    )?;
+    Check.equalBytes("auditor".bytes(), next[2].name.view())?;
+    // A role removed is no requester's any more.
+    let creds = Vector<Credential>.create();
+    let none: BucketPolicy? = null;
+    Check.isFalse(
+        decideRecorded(
+            creds.view(),
+            next.view(),
+            false,
+            none.asBorrow(),
+            false,
+            "role reader".bytes(),
+            "s3:GetObject",
+            "b",
+            "k".bytes(),
+        )!,
+        "a removed role's write",
     )?;
     return Ok();
 }

@@ -3948,3 +3948,19 @@ Browser form uploads with a SigV4 POST policy.
   4. the cluster's digests;
   5. the exit review.
 - **Next:** slice 1.
+
+### 20 Nov 2026: M15 slice 1, the roles file reloaded (ADR-0096 §1, §2)
+
+- **`RoleSets`:** roles keep their places across reloads, as credentials do; one the file no longer has is marked
+  removed.
+  - **On `serve`:** the S3 server and the writers share one set.
+  - **On a node:** every shard's S3 server shares one.
+- **The reload:** it rides with the credentials' (`Rotation.roles`), so `serve`'s upkeep and the node's 2 s task
+  reload it. A file that does not read is reported once.
+- **A role removed:** its sessions' next requests are refused (InvalidToken), and its configurations' writes too
+  (ADR-0094).
+- **Tests:**
+  - `rolesReloadKeepTheirPlaces`;
+  - the S3 smoke empties the roles file under a running server, and the role's session is refused;
+  - 391 unit tests, the cluster smoke (167) and the SDK matrix pass.
+- **Next:** slice 2, the key files.

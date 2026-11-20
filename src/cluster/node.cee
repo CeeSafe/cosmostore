@@ -1138,6 +1138,7 @@ fn nodeCommand() -> i32 {
                         failed: 0,
                         usersPath: textOf(usersPath),
                         usersModified: if (usersPath.length == 0) 0 else Fs.modifiedMillis(usersPath).ok() ?? 0,
+                        roles: null,
                     });
                 }
                 null => {}
@@ -1203,6 +1204,7 @@ fn nodeCommand() -> i32 {
         sseKeys: Vector<MasterKey>.create(),
         kmsKeys: Vector<MasterKey>.create(),
         rolesText: Vector<u8>.create(),
+        roleSets: null,
         websiteDomain: Vector<u8>.create(),
         domain: Vector<u8>.create(),
         notifyTargetsText: Vector<u8>.create(),
@@ -1345,12 +1347,35 @@ fn nodeCommand() -> i32 {
                     return 1;
                 }
             };
-            if (parseRolesFile(sts.rolesText.view()).isErr()) {
-                Console.writeErrorLine(
-                    "cosmostore: the roles file has a line that is not `<name> <max seconds> <policy JSON>`, or a policy CosmoStore does not take",
-                );
-                return 1;
+            let parsedRoles = match (parseRolesFile(sts.rolesText.view())) {
+                Ok(r) => r,
+                Err(_) => {
+                    Console.writeErrorLine(
+                        "cosmostore: the roles file has a line that is not `<name> <max seconds> <policy JSON>`, or a policy CosmoStore does not take",
+                    );
+                    return 1;
+                }
+            };
+            // One set for every shard's S3 server, reloaded by the node's task with its credentials (ADR-0096 §1, §6).
+            let sets = match (RoleSets.create(parsedRoles)) {
+                Ok(s) => match (Arc<RoleSets>.create(s)) {
+                    Ok(a) => a,
+                    Err(_) => { return 1; }
+                },
+                Err(_) => { return 1; }
+            };
+            match (borrow mut rotation) {
+                Some(r) => {
+                    r.roles = Some(RoleRotation {
+                        sets: sets.clone(),
+                        path: textOf(path.view()),
+                        modified: Fs.modifiedMillis(path.view()).ok() ?? 0,
+                        failed: 0,
+                    });
+                }
+                null => {}
             }
+            sts.roleSets = Some(sets);
         }
         null => {}
     }

@@ -73,6 +73,60 @@ struct Rotation {
     usersModified: i64;
     /// The modification time of a file that did not read: it is tried again each round, and reported once.
     failed: i64;
+    /// The roles file, reloaded beside them (ADR-0096 §1); none without `--roles-file`.
+    roles: RoleRotation?;
+}
+
+/// The roles file and its sets (ADR-0096 §1, §2), reloaded as the credentials file is.
+struct RoleRotation {
+    sets: Arc<RoleSets>;
+    path: String;
+    modified: i64;
+    failed: i64;
+}
+
+/// Reads the roles file again if its modification time changed: its roles become the current set, each in its place,
+/// one the file no longer has marked removed. A file that does not read changes nothing, and is reported once.
+fn checkRoles(r: borrow mut RoleRotation) -> RotationOutcome {
+    let modified = match (Fs.modifiedMillis(r.path.view())) {
+        Ok(m) => m,
+        Err(_) => r.modified,
+    };
+    if (modified == r.modified) { return RotationOutcome.Unchanged; }
+    let text = match (readSmallFile(r.path.view(), "roles file")) {
+        Ok(t) => t,
+        Err(message) => {
+            if (modified == r.failed) { return RotationOutcome.Unchanged; }
+            r.failed = modified;
+            return RotationOutcome.Failed(message);
+        }
+    };
+    let fresh = match (parseRolesFile(text.view())) {
+        Ok(f) => f,
+        Err(_) => {
+            if (modified == r.failed) { return RotationOutcome.Unchanged; }
+            r.failed = modified;
+            return RotationOutcome.Failed(textOf("the roles file has a line that is not a role"));
+        }
+    };
+    r.modified = modified;
+    let next = match (nextRoles(r.sets.get().view(), fresh.view())) {
+        Ok(n) => n,
+        Err(_) => { return RotationOutcome.Failed(textOf("out of memory")); }
+    };
+    var live: u64 = 0;
+    var removed: u64 = 0;
+    for (i in 0..next.length) {
+        if (next[i].removed) {
+            removed += 1;
+        } else {
+            live += 1;
+        }
+    }
+    if (!r.sets.get().replace(next)) {
+        return RotationOutcome.Failed(textOf("the roles were reloaded too many times; restart to reload"));
+    }
+    return RotationOutcome.Reloaded(live, removed);
 }
 
 enum RotationOutcome {
@@ -147,6 +201,30 @@ fn checkCredentials(r: borrow mut Rotation) -> RotationOutcome {
 }
 
 async fn reloadCredentialsIfChanged(r: borrow mut Rotation) {
+    match (borrow mut r.roles) {
+        Some(roles) => {
+            match (await Async.blocking(() => checkRoles(roles))) {
+                RotationOutcome.Unchanged => {}
+                RotationOutcome.Reloaded(live, removed) => {
+                    var line = String.create();
+                    let _ = line.append("cosmostore: roles reloaded: ");
+                    let _ = line.appendNumber(live);
+                    let _ = line.append(" roles, ");
+                    let _ = line.appendNumber(removed);
+                    let _ = line.append(" removed\n");
+                    let _ = await AsyncConsole.writeError(line.view());
+                }
+                RotationOutcome.Failed(message) => {
+                    let _ = await AsyncConsole.writeError(
+                        "cosmostore: roles reload failed, keeping the roles in use: ",
+                    );
+                    let _ = await AsyncConsole.writeError(message.view());
+                    let _ = await AsyncConsole.writeError("\n");
+                }
+            }
+        }
+        null => {}
+    }
     let outcome = await Async.blocking(() => checkCredentials(r));
     match (outcome) {
         RotationOutcome.Unchanged => {}
@@ -1021,6 +1099,7 @@ fn serve() -> i32 {
             Ok(m) => m,
             Err(_) => 0,
         },
+        roles: null,
     };
     // The webhooks of event notifications (ADR-0048): once for the requests, once for the delivery task.
     let notifyTargets = readTargets(Process.argument(targetsAt) ?? "", targetsAt != 0);
@@ -1135,13 +1214,28 @@ fn serve() -> i32 {
         };
         if (stsKeysAt == 0) { die("--roles-file needs --sts-key-file"); }
     }
+    // The roles, shared by the S3 server and the writers, reloaded with their places (ADR-0096 §1).
+    let roleSets = match (RoleSets.create(roles)) {
+        Ok(sets) => match (Arc<RoleSets>.create(sets)) {
+            Ok(a) => a,
+            Err(_) => { die("out of memory"); }
+        },
+        Err(_) => { die("out of memory"); }
+    };
+    // The roles file, reloaded with the credentials (ADR-0096 §1).
+    if (rolesAt != 0) {
+        let rolesPath = Process.argument(rolesAt) ?? "";
+        rotation.roles = Some(RoleRotation {
+            sets: roleSets.clone(),
+            path: textOf(rolesPath),
+            modified: Fs.modifiedMillis(rolesPath).ok() ?? 0,
+            failed: 0,
+        });
+    }
     // The writers decide a configuration's writes as its requester (ADR-0094 §3), with the credentials as reloaded.
     auditWriter.decider = RecordedDecider {
         credentials: Some(credentials.clone()),
-        roles: match (copyRoles(roles.view())) {
-            Ok(r) => r,
-            Err(_) => { die("out of memory"); }
-        },
+        roles: Some(roleSets.clone()),
         secure: certAt > 0,
     };
     // TLS before the store opens, so a bad certificate costs no recovery.
@@ -1240,7 +1334,7 @@ fn serve() -> i32 {
         sseKeys: sseKeys,
         stsKeys: stsKeys,
         replicationTargetIds: replicationTargetIds,
-        roles: roles,
+        roles: roleSets.clone(),
         kmsKeys: kmsKeys,
         corsBuckets: AtomicU64.create(corsBuckets),
         accessLog: Some(AccessLog { lines: accessLines, dropped: AtomicU64.create(0) }),

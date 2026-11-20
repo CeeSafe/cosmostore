@@ -32,6 +32,91 @@ struct StsRole {
     name: Vector<u8>;
     maxSeconds: u64;
     policy: BucketPolicy;
+    /// The roles file no longer has it (ADR-0096 §2): its sessions and its configurations' writes are refused. Its
+    /// place stays, so a place taken from one set means the same role in the next.
+    removed: bool;
+}
+
+/// The most role sets a server takes in its life: the first, and a reload for each of the others.
+const MAX_ROLE_SETS: usize = 4096;
+
+/// The roles, and the sets that replaced them as the roles file changed (ADR-0096 §1, §2), as the credential sets are
+/// (ADR-0050): read without a lock, each set written once, `current` naming it; a role's place is the same in every
+/// set.
+struct RoleSets {
+    sets: Vector<OnceLock<Vector<StsRole>>>;
+    current: AtomicU64;
+    none: Vector<StsRole>;
+
+    fn create(first: Vector<StsRole>) -> Result<RoleSets, AllocError> {
+        var sets = Vector<OnceLock<Vector<StsRole>>>.create();
+        sets.reserve(MAX_ROLE_SETS)?;
+        for (i in 0..MAX_ROLE_SETS) { sets.push(OnceLock<Vector<StsRole>>.create())?; }
+        let _ = sets[0].set(first);
+        return Ok(RoleSets { sets: sets, current: AtomicU64.create(0), none: Vector<StsRole>.create() });
+    }
+
+    /// The current set.
+    fn view(borrow this) -> Slice<StsRole> {
+        let at = this.current.load() as usize;
+        return match (this.sets[at].get()) {
+            Some(set) => set.view(),
+            null => this.none.view(),
+        };
+    }
+
+    /// Makes `next` the current set; false when every cell is used. One task calls this, the upkeep.
+    fn replace(borrow this, next: Vector<StsRole>) -> bool {
+        let at = this.current.load() as usize + 1;
+        if (at >= this.sets.length) { return false; }
+        if (this.sets[at].set(next).isErr()) { return false; }
+        this.current.store(at as u64);
+        return true;
+    }
+}
+
+/// The set that follows `old` when the file holds `fresh`: every role of `old` in its place, with the file's seconds
+/// and policy, or removed if the file no longer has it; then the file's new roles, in its order.
+fn nextRoles(old: Slice<StsRole>, fresh: Slice<StsRole>) -> Result<Vector<StsRole>, AllocError> {
+    var out = Vector<StsRole>.create();
+    for (i in 0..old.length) {
+        var found: usize? = null;
+        for (j in 0..fresh.length) {
+            if (fresh[j].name.view() == old[i].name.view()) { found = Some(j); }
+        }
+        match (found) {
+            Some(j) => {
+                out.push(StsRole {
+                    name: copyBytes(fresh[j].name.view())?,
+                    maxSeconds: fresh[j].maxSeconds,
+                    policy: clonePolicy(borrow fresh[j].policy)?,
+                    removed: false,
+                })?;
+            }
+            null => {
+                out.push(StsRole {
+                    name: copyBytes(old[i].name.view())?,
+                    maxSeconds: old[i].maxSeconds,
+                    policy: clonePolicy(borrow old[i].policy)?,
+                    removed: true,
+                })?;
+            }
+        }
+    }
+    for (j in 0..fresh.length) {
+        var known = false;
+        for (i in 0..out.length) {
+            if (out[i].name.view() == fresh[j].name.view()) { known = true; }
+        }
+        if (known) { continue; }
+        out.push(StsRole {
+            name: copyBytes(fresh[j].name.view())?,
+            maxSeconds: fresh[j].maxSeconds,
+            policy: clonePolicy(borrow fresh[j].policy)?,
+            removed: false,
+        })?;
+    }
+    return Ok(out);
 }
 
 // ---- The token ----
@@ -218,7 +303,7 @@ fn parseRolesFile(text: Slice<u8>) -> Result<Vector<StsRole>, RolesFault> {
             Ok(n) => n,
             Err(_) => { return Err(RolesFault.OutOfMemory); }
         };
-        if (out.push(StsRole { name: named, maxSeconds: seconds, policy: policy }).isErr()) {
+        if (out.push(StsRole { name: named, maxSeconds: seconds, policy: policy, removed: false }).isErr()) {
             return Err(RolesFault.OutOfMemory);
         }
     }
@@ -226,8 +311,9 @@ fn parseRolesFile(text: Slice<u8>) -> Result<Vector<StsRole>, RolesFault> {
 }
 
 fn roleAt(app: borrow S3App, name: Slice<u8>) -> usize? {
-    for (i in 0..app.roles.length) {
-        if (app.roles[i].name.view() == name) { return Some(i); }
+    let roles = app.roles.get().view();
+    for (i in 0..roles.length) {
+        if (!roles[i].removed && roles[i].name.view() == name) { return Some(i); }
     }
     return null;
 }
@@ -449,7 +535,7 @@ async fn serveSts(
             }
         };
         session.role.extend(name)?;
-        maxSeconds = app.roles[role].maxSeconds;
+        maxSeconds = app.roles.get().view()[role].maxSeconds;
         seconds = 3600;
         if (!formValue(body.view(), "RoleSessionName", mut session.name)? || session.name.length < 2 ||
             !roleNameOk(session.name.view())) {

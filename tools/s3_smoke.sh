@@ -1398,6 +1398,14 @@ urole() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" AWS_ACCESS_KEY_ID="$rak
 check "a role's session reads a table" "$(urole s3tables get-table --table-bucket-arn "$lake" --namespace ns --name t --query name --output text 2>&1)" t
 check "and drops none" "$(ucode urole s3tables delete-table --table-bucket-arn "$lake" --namespace ns --name t)" ForbiddenException
 check "a user its policy does not let assume it" "$(ucode ui sts assume-role --role-arn arn:aws:iam::000000000000:role/tablereader --role-session-name smoke-session)" AccessDenied
+# The roles file reloaded (ADR-0096 §1): the role removed, its session's next request is refused, no restart.
+cp "$work/users.roles" "$work/users.roles.kept"
+: > "$work/users.roles"
+sleep 4
+# Through S3, whose error names its code (S3 Tables answers it as a bare 400).
+check "a role removed refuses its session, without a restart" "$(ucode urole s3api list-objects-v2 --bucket team)" InvalidToken
+grep -q "roles reloaded" "$work/users.log" && pass "the roles reload logged" || fail "the roles reload logged"
+cp "$work/users.roles.kept" "$work/users.roles"
 check "nor probe a table bucket's warehouse" "$(ucode ui s3api head-bucket --bucket "$lb")" 403
 # The M11 exit review's A2: a user's line removed, its key is refused, not the account's.
 sed -i.bak '/^intern:/d' "$work/users.file"

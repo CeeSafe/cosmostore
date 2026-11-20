@@ -1521,9 +1521,10 @@ fn sessionAllows(
         Some(r) => r,
         null => { return Ok(true); }
     };
-    if (role >= app.roles.length) { return Ok(false); }
+    let roles = app.roles.get().view();
+    if (role >= roles.length || roles[role].removed) { return Ok(false); }
     let facts = policyFacts(req, isListingAction(action), app.secure, who.peer)?;
-    match (decidePolicy(borrow app.roles[role].policy, null, action, resource, borrow facts)) {
+    match (decidePolicy(borrow roles[role].policy, null, action, resource, borrow facts)) {
         PolicyDecision.Allow => {}
         _ => { return Ok(false); }
     }
@@ -1870,7 +1871,8 @@ fn requesterText(app: borrow S3App, who: borrow Requester) -> Result<Vector<u8>,
     match (who.role) {
         Some(r) => {
             out.extend("role ".bytes())?;
-            if (r < app.roles.length) { out.extend(app.roles[r].name.view())?; }
+            let roles = app.roles.get().view();
+            if (r < roles.length) { out.extend(roles[r].name.view())?; }
             return Ok(out);
         }
         null => {}
@@ -1932,7 +1934,7 @@ fn decideRecorded(
         let name = requester[roleHead.length..];
         if (name.length == 0) { return Ok(false); }
         for (r in 0..roles.length) {
-            if (roles[r].name.view() == name) { role = Some(r); }
+            if (!roles[r].removed && roles[r].name.view() == name) { role = Some(r); }
         }
     }
     if (user.isNull() && role.isNull()) { return Ok(false); }
@@ -1993,11 +1995,11 @@ fn decideRecorded(
 /// the roles, and whether requests come over TLS.
 struct RecordedDecider {
     credentials: Arc<CredentialSets>?;
-    roles: Vector<StsRole>;
+    /// The roles as they are reloaded (ADR-0096 §1).
+    roles: Arc<RoleSets>?;
     secure: bool;
 
-    fn none() -> RecordedDecider =>
-        RecordedDecider { credentials: null, roles: Vector<StsRole>.create(), secure: false };
+    fn none() -> RecordedDecider => RecordedDecider { credentials: null, roles: null, secure: false };
 }
 
 /// Copies of the roles, for a writer that decides as them.
@@ -2009,6 +2011,7 @@ fn copyRoles(roles: Slice<StsRole>) -> Result<Vector<StsRole>, AllocError> {
                 name: copyBytes(r.name.view())?,
                 maxSeconds: r.maxSeconds,
                 policy: clonePolicy(borrow r.policy)?,
+                removed: r.removed,
             },
         )?;
     }
@@ -2044,9 +2047,14 @@ fn decidedIn(
             Err(_) => { broken = true; }
         }
     }
+    let noRoles = Vector<StsRole>.create();
+    let roles = match (borrow d.roles) {
+        Some(r) => r.get().view(),
+        null => noRoles.view(),
+    };
     return decideRecorded(
         credentials,
-        d.roles.view(),
+        roles,
         d.secure,
         policy.asBorrow(),
         broken,
@@ -2081,7 +2089,7 @@ async fn allowedAsRecorded(
     return Ok(
         decideRecorded(
             credentials,
-            app.roles.view(),
+            app.roles.get().view(),
             app.secure,
             policy.asBorrow(),
             broken,
@@ -2131,7 +2139,8 @@ async fn authorizeDestination(
     }
     match (who.role) {
         Some(r) => {
-            if (r < app.roles.length) { policies.push(clonePolicy(borrow app.roles[r].policy)?)?; }
+            let roles = app.roles.get().view();
+            if (r < roles.length) { policies.push(clonePolicy(borrow roles[r].policy)?)?; }
         }
         null => {}
     }
