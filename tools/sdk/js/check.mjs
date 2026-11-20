@@ -317,9 +317,9 @@ for (const sessions of [true, false]) {
   check("GetTableBucketMaintenanceConfiguration",
     bm.configuration.icebergUnreferencedFileRemoval.settings.icebergUnreferencedFileRemoval.unreferencedDays, 4);
   const tm = await t.send(new GetTableMaintenanceConfigurationCommand({ tableBucketARN: arn, namespace: "sales", name: "orders2" }));
-  check("GetTableMaintenanceConfiguration: compaction off", tm.configuration.icebergCompaction.status, "disabled");
+  check("GetTableMaintenanceConfiguration: compaction on by default", tm.configuration.icebergCompaction.status, "enabled");
   const js = await t.send(new GetTableMaintenanceJobStatusCommand({ tableBucketARN: arn, namespace: "sales", name: "orders2" }));
-  check("GetTableMaintenanceJobStatus", js.status.icebergCompaction.status, "Disabled");
+  check("GetTableMaintenanceJobStatus", js.status.icebergCompaction.status, "Not_Yet_Run");
   await t.send(new DeleteTableCommand({ tableBucketARN: arn, namespace: "sales", name: "orders2" }));
   await t.send(new DeleteNamespaceCommand({ tableBucketARN: arn, namespace: "sales" }));
   await t.send(new DeleteTableBucketCommand({ tableBucketARN: arn }));

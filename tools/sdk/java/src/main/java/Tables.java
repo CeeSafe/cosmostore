@@ -40,10 +40,10 @@ class Tables {
         Check.check("GetTableBucketMaintenanceConfiguration",
             bm.configurationAsStrings().get("icebergUnreferencedFileRemoval").settings().icebergUnreferencedFileRemoval().unreferencedDays(), 4);
         var tm = t.getTableMaintenanceConfiguration(r -> r.tableBucketARN(arn).namespace("sales").name("orders2"));
-        Check.check("GetTableMaintenanceConfiguration: compaction off",
-            tm.configurationAsStrings().get("icebergCompaction").statusAsString(), "disabled");
+        Check.check("GetTableMaintenanceConfiguration: compaction on by default",
+            tm.configurationAsStrings().get("icebergCompaction").statusAsString(), "enabled");
         var js = t.getTableMaintenanceJobStatus(r -> r.tableBucketARN(arn).namespace("sales").name("orders2"));
-        Check.check("GetTableMaintenanceJobStatus", js.statusAsStrings().get("icebergCompaction").statusAsString(), "Disabled");
+        Check.check("GetTableMaintenanceJobStatus", js.statusAsStrings().get("icebergCompaction").statusAsString(), "Not_Yet_Run");
         t.deleteTable(r -> r.tableBucketARN(arn).namespace("sales").name("orders2"));
         t.deleteNamespace(r -> r.tableBucketARN(arn).namespace("sales"));
         t.deleteTableBucket(r -> r.tableBucketARN(arn));

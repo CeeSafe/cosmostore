@@ -64,10 +64,10 @@ func tables(ctx context.Context, cfg aws.Config) {
 	check("GetTableBucketMaintenanceConfiguration", days, int32(4))
 	tm := must(t.GetTableMaintenanceConfiguration(ctx, &s3tables.GetTableMaintenanceConfigurationInput{TableBucketARN: arn,
 		Namespace: aws.String("sales"), Name: aws.String("orders2")}))
-	check("GetTableMaintenanceConfiguration: compaction off", tm.Configuration["icebergCompaction"].Status, tabletypes.MaintenanceStatusDisabled)
+	check("GetTableMaintenanceConfiguration: compaction on by default", tm.Configuration["icebergCompaction"].Status, tabletypes.MaintenanceStatusEnabled)
 	js := must(t.GetTableMaintenanceJobStatus(ctx, &s3tables.GetTableMaintenanceJobStatusInput{TableBucketARN: arn,
 		Namespace: aws.String("sales"), Name: aws.String("orders2")}))
-	check("GetTableMaintenanceJobStatus", js.Status["icebergCompaction"].Status, tabletypes.JobStatusDisabled)
+	check("GetTableMaintenanceJobStatus", js.Status["icebergCompaction"].Status, tabletypes.JobStatusNotYetRun)
 	must(t.DeleteTable(ctx, &s3tables.DeleteTableInput{TableBucketARN: arn, Namespace: aws.String("sales"), Name: aws.String("orders2")}))
 	must(t.DeleteNamespace(ctx, &s3tables.DeleteNamespaceInput{TableBucketARN: arn, Namespace: aws.String("sales")}))
 	must(t.DeleteTableBucket(ctx, &s3tables.DeleteTableBucketInput{TableBucketARN: arn}))

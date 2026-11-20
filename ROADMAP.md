@@ -4112,3 +4112,38 @@ Browser form uploads with a SigV4 POST policy.
   record read is written back as it was.
 - **Tests:** `avroFilesWrittenBackReadTheSame`. PyIceberg's manifest list and manifest are read, written back and
   read again the same, and PyIceberg 0.12.0 reads the written files.
+
+### 20 Nov 2026: M16 slice 3, compaction on `serve` (ADR-0098 §2 to §4)
+
+- **`src/s3/table_compaction.cee`:**
+  - **The plan, under the store's lock:**
+    - the current snapshot's manifests are read;
+    - the partitions with a live delete file are found, and left;
+    - the candidates are live Parquet data files of the table's bucket, not sealed, of the size their manifest
+      says, under 75% of the target;
+    - they are grouped by spec, partition and shape, and packed into bins.
+  - **Each bin:** its readers are pinned under the lock, its bytes copied without it, its file put under it.
+  - **The commit:** one `replace` snapshot.
+    - **The manifests:** those that held inputs are rewritten (inputs DELETED, the rest EXISTING, inherited
+      sequence numbers made explicit). A new manifest holds the joined files ADDED, at the largest of their
+      inputs' data sequence numbers.
+    - **The new files' metrics:** counts summed; least and greatest bounds for ints, longs, dates, times,
+      timestamps, strings, binary and booleans.
+    - **The swap:** through `swapMetadata`. If the table changed meanwhile, everything the run wrote is deleted.
+- **The pass:** each table is compacted before its unreferenced files are removed. `maintenance-run` takes
+  `icebergCompaction`.
+- **The configuration:**
+  - compaction is enabled by default, as on AWS;
+  - `sort` and `z-order` are `Failed`, with why;
+  - ADR-0086 §1's "always disabled" is gone.
+- **`tools/compaction_check.py`** (in the S3 smoke with `ICEBERG_PYTHON`, 22 checks):
+  - six one-row files become one of six row groups, read the same by PyIceberg and pyarrow, with the right count
+    and bounds;
+  - a partitioned table is compacted per partition;
+  - `sort` is refused;
+  - a position delete in one partition leaves that partition alone, and the delete still applies after.
+- **Changed checks:** the maintenance check, the S3 smoke and the four SDK checks now expect compaction on by
+  default.
+- **Tests:** 397 unit tests, the S3 smoke (PyIceberg 23, maintenance 14, compaction 22), the cluster smoke (172)
+  and the SDK matrix pass.
+- **Next:** slice 4, a cluster's shard leaders.

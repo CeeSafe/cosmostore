@@ -1303,11 +1303,11 @@ check "a --table-s3 name for a bucket" "$(code s3api create-bucket --bucket mine
 aws s3tables rename-table --table-bucket-arn "$tarn" --namespace sales --name orders --new-name orders_v2 > /dev/null 2>&1
 check "rename-table" "$(aws s3tables list-tables --table-bucket-arn "$tarn" --namespace sales --query 'tables[].name' --output text 2>&1)" orders_v2
 check "a namespace with tables" "$(code s3tables delete-namespace --table-bucket-arn "$tarn" --namespace sales)" ConflictException
-# Maintenance (ADR-0086): its configurations through the CLI; compaction is not done.
+# Maintenance (ADR-0086): its configurations through the CLI; compaction (ADR-0098) is taken.
 aws s3tables put-table-bucket-maintenance-configuration --table-bucket-arn "$tarn" --type icebergUnreferencedFileRemoval --value 'status=enabled,settings={icebergUnreferencedFileRemoval={unreferencedDays=4,nonCurrentDays=10}}' > /dev/null 2>&1 && pass "put-table-bucket-maintenance-configuration" || fail "put-table-bucket-maintenance-configuration"
 check "get-table-bucket-maintenance-configuration" "$(aws s3tables get-table-bucket-maintenance-configuration --table-bucket-arn "$tarn" --query 'configuration.icebergUnreferencedFileRemoval.settings.icebergUnreferencedFileRemoval.unreferencedDays' --output text 2>&1)" 4
-check "compaction is not done" "$(code s3tables put-table-maintenance-configuration --table-bucket-arn "$tarn" --namespace sales --name orders_v2 --type icebergCompaction --value 'status=enabled,settings={icebergCompaction={targetFileSizeMB=128}}')" NotImplemented
-check "get-table-maintenance-job-status" "$(aws s3tables get-table-maintenance-job-status --table-bucket-arn "$tarn" --namespace sales --name orders_v2 --query 'status.icebergCompaction.status' --output text 2>&1)" Disabled
+aws s3tables put-table-maintenance-configuration --table-bucket-arn "$tarn" --namespace sales --name orders_v2 --type icebergCompaction --value 'status=enabled,settings={icebergCompaction={targetFileSizeMB=128}}' > /dev/null 2>&1 && pass "compaction's configuration taken" || fail "compaction's configuration taken"
+check "get-table-maintenance-job-status" "$(aws s3tables get-table-maintenance-job-status --table-bucket-arn "$tarn" --namespace sales --name orders_v2 --query 'status.icebergCompaction.status' --output text 2>&1)" Not_Yet_Run
 aws s3tables delete-table --table-bucket-arn "$tarn" --namespace sales --name orders_v2 > /dev/null 2>&1
 check "delete-table removes its files" "$(aws s3api list-objects-v2 --bucket "$twb" --prefix "$tpre/" --query 'length(Contents || `[]`)' 2>&1)" 0
 aws s3tables delete-namespace --table-bucket-arn "$tarn" --namespace sales > /dev/null 2>&1
@@ -1335,6 +1335,17 @@ if [ -n "${ICEBERG_PYTHON:-}" ]; then
         fail "table maintenance"; cat maintenance.out
     fi
     kill "$maint" 2>/dev/null
+    # Compaction (ADR-0098) through PyIceberg, on another server of its own.
+    compactport=$((port + 7))
+    "$bin" serve "$work/compact-store" "$compactport" "$work/credentials" localhost --tables-day-seconds 12 2>> "$work/compact.log" &
+    compactsrv=$!
+    sleep 1
+    if "$ICEBERG_PYTHON" "$here/compaction_check.py" "http://127.0.0.1:$compactport" 12 > compaction.out 2>&1; then
+        pass "compaction: $(grep -c '^ok' compaction.out) checks"
+    else
+        fail "compaction"; cat compaction.out
+    fi
+    kill "$compactsrv" 2>/dev/null
 fi
 
 # Users (ADR-0088): a server of its own with a users file, so the rotation checks above keep their own file.

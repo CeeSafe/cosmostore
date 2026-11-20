@@ -50,20 +50,17 @@ catalog = load_catalog("cosmo", **{
 catalog.create_namespace("ns")
 schema = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("item", pa.string())])
 table = catalog.create_table("ns.t", schema=schema)
+# Compaction (ADR-0098) is on by default; off here, so the snapshots counted below are the appends'.
+tables.put_table_maintenance_configuration(tableBucketARN=arn, namespace="ns", name="t", type="icebergCompaction",
+                                           value={"status": "disabled"})
 for i in range(6):
     table.append(pa.table({"id": [i], "item": ["row %d" % i]}, schema=schema))
 check("six snapshots", len(catalog.load_table("ns.t").snapshots()), 6)
 
-# The configurations: AWS's defaults until set; compaction is not done here.
+# The configurations: AWS's defaults until set (compaction's own check is tools/compaction_check.py).
 got = tables.get_table_maintenance_configuration(tableBucketARN=arn, namespace="ns", name="t")["configuration"]
 check("snapshot management on by default", got["icebergSnapshotManagement"]["status"], "enabled")
-check("compaction off", got["icebergCompaction"]["status"], "disabled")
-try:
-    tables.put_table_maintenance_configuration(tableBucketARN=arn, namespace="ns", name="t", type="icebergCompaction",
-                                               value={"status": "enabled"})
-    check("compaction enabled", "taken", "refused")
-except Exception as e:
-    check("compaction enabled", "NotImplemented" in str(e), True)
+check("compaction as set", got["icebergCompaction"]["status"], "disabled")
 
 # Keep the two newest; expire the rest after an hour (a 24th of the day).
 tables.put_table_maintenance_configuration(tableBucketARN=arn, namespace="ns", name="t", type="icebergSnapshotManagement",

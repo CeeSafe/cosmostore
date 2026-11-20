@@ -30,10 +30,9 @@ fn defaultMaintenance(kind: StringView) -> Result<Json, AllocError> {
         jsonSet(mut s, "unreferencedDays", jsonInteger(3)?)?;
         jsonSet(mut s, "nonCurrentDays", jsonInteger(10)?)?;
     } else {
-        // Compaction is not done here: disabled, whatever is asked (ADR-0086 §1).
+        // Compaction, binpack by copying row groups (ADR-0098): enabled, as AWS's default is.
         jsonSet(mut s, "targetFileSizeMB", jsonInteger(512)?)?;
         jsonSet(mut s, "strategy", jsonString("auto".bytes())?)?;
-        status = "disabled".bytes();
     }
     var settings = jsonObject();
     jsonSet(mut settings, kind, s)?;
@@ -135,7 +134,6 @@ fn maintenanceValueOf(body: Slice<u8>, kind: StringView) -> Result<Json, TablesE
         }
         null => {}
     }
-    if (kind == COMPACTION && maintenanceEnabled(borrow value)) { return Err(TablesError.NotImplemented); }
     return Ok(value);
 }
 
@@ -454,7 +452,7 @@ async fn runMaintenance(
     let bucket = bucketOfSegment(segs[1].view())?;
     let t = MaintainedTable { bucket: bucket, ns: copyBytes(segs[2].view())?, name: copyBytes(segs[3].view())? };
     let kind = paramOf(req, "type") ?? "".bytes();
-    if (kind != SNAPSHOT_MANAGEMENT.bytes() && kind != UNREFERENCED_REMOVAL.bytes()) {
+    if (kind != SNAPSHOT_MANAGEMENT.bytes() && kind != UNREFERENCED_REMOVAL.bytes() && kind != COMPACTION.bytes()) {
         return Err(TablesError.BadRequest);
     }
     let dayMs = truncate<i64>(app.tablesDayMs);
@@ -468,6 +466,13 @@ async fn runMaintenance(
             await Async.blocking(() => maintainTable(store, tr, now, dayMs))?;
             return Ok(tablesNoContent());
         }
+    }
+    if (kind == COMPACTION.bytes()) {
+        match (await compactTable(borrow app.store, tr, Clock.unixMillis())) {
+            Ok() => {}
+            Err(_) => { return Err(TablesError.Internal); }
+        }
+        return Ok(tablesNoContent());
     }
     match (await removeUnreferenced(borrow app.store, tr, Clock.unixMillis(), dayMs)) {
         Ok() => {}
@@ -565,7 +570,9 @@ async fn tablesMaintenanceForever(
                 let now = Clock.unixMillis();
                 let _ = await Async.blocking(() => maintainTable(st, t, now, dayMs));
             }
-            // Then its unreferenced files, the store held for each read (ADR-0086 §3).
+            // Then its compaction, a bin at a time (ADR-0098 §4), and its unreferenced files, the store held for each
+            // read (ADR-0086 §3).
+            await compactTable(store, t, Clock.unixMillis())?;
             await removeUnreferenced(store, t, Clock.unixMillis(), dayMs)?;
         }
     }

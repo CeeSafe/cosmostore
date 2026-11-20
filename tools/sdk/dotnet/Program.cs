@@ -482,9 +482,9 @@ foreach (var sessions in new[] { false })
     var bm = await t.GetTableBucketMaintenanceConfigurationAsync(new Amazon.S3Tables.Model.GetTableBucketMaintenanceConfigurationRequest { TableBucketARN = arn });
     Check("GetTableBucketMaintenanceConfiguration", bm.Configuration["icebergUnreferencedFileRemoval"].Settings.IcebergUnreferencedFileRemoval.UnreferencedDays ?? 0, 4);
     var tm = await t.GetTableMaintenanceConfigurationAsync(new Amazon.S3Tables.Model.GetTableMaintenanceConfigurationRequest { TableBucketARN = arn, Namespace = "sales", Name = "orders2" });
-    Check("GetTableMaintenanceConfiguration: compaction off", tm.Configuration["icebergCompaction"].Status.Value, "disabled");
+    Check("GetTableMaintenanceConfiguration: compaction on by default", tm.Configuration["icebergCompaction"].Status.Value, "enabled");
     var jobs = await t.GetTableMaintenanceJobStatusAsync(new Amazon.S3Tables.Model.GetTableMaintenanceJobStatusRequest { TableBucketARN = arn, Namespace = "sales", Name = "orders2" });
-    Check("GetTableMaintenanceJobStatus", jobs.Status["icebergCompaction"].Status.Value, "Disabled");
+    Check("GetTableMaintenanceJobStatus", jobs.Status["icebergCompaction"].Status.Value, "Not_Yet_Run");
     await t.DeleteTableAsync(new Amazon.S3Tables.Model.DeleteTableRequest { TableBucketARN = arn, Namespace = "sales", Name = "orders2" });
     await t.DeleteNamespaceAsync(new Amazon.S3Tables.Model.DeleteNamespaceRequest { TableBucketARN = arn, Namespace = "sales" });
     await t.DeleteTableBucketAsync(new Amazon.S3Tables.Model.DeleteTableBucketRequest { TableBucketARN = arn });
