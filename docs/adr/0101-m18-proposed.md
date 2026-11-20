@@ -1,6 +1,7 @@
 # ADR-0101: M18, what comes after key rotation (proposed)
 
-**Status:** proposed, 20 Nov 2026. The owner: "propose M18". M17 (key rotation without re-sealing, ADR-0100) closed
+**Status:** decided, 20 Nov 2026: the owner chose A ("A: archive classes"), with AWS's restore times scaled; ADR-0102
+designs it. Proposed the same day. The owner: "propose M18". M17 (key rotation without re-sealing, ADR-0100) closed
 the same day.
 
 ## Context

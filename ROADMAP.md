@@ -312,6 +312,16 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 **Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
 (ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
+### M18: Archive storage classes
+
+The owner chose ADR-0101's item A (20 Nov 2026), with AWS's restore times scaled. ADR-0102 (proposed) designs it:
+- **The classes:** GLACIER and DEEP_ARCHIVE are taken on writes and transitions. An archived version's reads are
+  InvalidObjectState until it is restored.
+- **RestoreObject:** it records when a restore is ready and when it expires (a metadata-only record), and each request
+  is decided by them.
+- **Done when** a version is archived by lifecycle, restored with RestoreObject, read, and archived again after its
+  days, on `serve` and a cluster, through the SDKs.
+
 ### M17: Key rotation without re-sealing
 
 **Closed 20 Nov 2026** (the owner: "Accept and close"; `docs/m17-exit-review.md`).
@@ -4331,3 +4341,15 @@ Browser form uploads with a SigV4 POST policy.
   - **C:** compaction that re-encodes.
 - **For A, the owner decides the default restore times:** AWS's scaled by `--restore-scale` (recommended), or
   immediate.
+
+### 20 Nov 2026: M18 is archive storage classes (ADR-0102, proposed)
+
+- **The owner:** "A: archive classes", and "AWS's, scaled" for restore times.
+- **ADR-0102 (proposed):**
+  - GLACIER and DEEP_ARCHIVE stored;
+  - archived reads are 403 InvalidObjectState;
+  - a restore is a SetTags format 6 holding its ready and expiry times, decided at each request (no background
+    job);
+  - RestoreObject answers 202, 409 or 200;
+  - `--restore-hour-seconds` scales the times.
+- **Next:** slice 1, the classes.
