@@ -3883,3 +3883,13 @@ Browser form uploads with a SigV4 POST policy.
 - **All pass:** the S3 smoke and the SDK matrix. Of 389 unit tests, `snapshotsFaultsCrash` timed out once under a
   load average of 60 to 73 (other runs on this machine), and passed twice alone.
 - **Next:** M14's exit review.
+
+### 20 Nov 2026: M14's exit review (`docs/m14-exit-review.md`)
+
+- **Verdict: not yet.**
+  - **A1:** an inventory report passes a Deny on a narrower key (reproduced).
+  - **A2:** a refused multipart replica on a cluster leaves its upload.
+  - **A3:** pending replicas can be written as the account's after the configuration changes.
+  - **Smaller:** client conditions at delivery, two fail-open defaults, the ADR's field name, and a refused replica
+    whose body is cut.
+- **Next:** the fixes.
