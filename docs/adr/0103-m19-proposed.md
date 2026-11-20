@@ -1,6 +1,7 @@
 # ADR-0103: M19, what comes after archive storage classes (proposed)
 
-**Status:** proposed, 20 Nov 2026. The owner: "propose M19". M18 (archive storage classes, ADR-0102) closed the same
+**Status:** decided, 20 Nov 2026: the owner chose A ("A: IAM API"), the files and the store side by side with each
+name once; ADR-0104 designs it. Proposed the same day. The owner: "propose M19". M18 (archive storage classes, ADR-0102) closed the same
 day.
 
 ## Context

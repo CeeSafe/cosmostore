@@ -312,6 +312,16 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 **Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
 (ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
+### M19: The IAM API, a subset
+
+The owner chose ADR-0103's item A (20 Nov 2026), the files' users and roles beside the API's, each name once.
+ADR-0104 (proposed) designs it:
+- **Users, access keys, inline user policies and roles** are made through `iam` calls and kept in the store.
+- **The credential and role sets** are built from the files and the store's records together, live at once on
+  `serve` and within 2 s on every node.
+- **Done when** the AWS CLI's `iam` and the SDKs make a user, give it a key and a policy, and that key works on S3,
+  on `serve` and a cluster.
+
 ### M18: Archive storage classes
 
 **Closed 20 Nov 2026** (the owner: "Accept and close"; `docs/m18-exit-review.md`).
@@ -4443,3 +4453,15 @@ Browser form uploads with a SigV4 POST policy.
   - **C:** compaction that re-encodes.
 - **For A, the owner decides the store's users beside the files':** both, a name once (recommended), or the store
   only, the files a seed.
+
+### 20 Nov 2026: M19 is the IAM API, a subset (ADR-0104, proposed)
+
+- **The owner:** "A: IAM API", and "Both, a name once" for the store's users beside the files'.
+- **ADR-0104 (proposed):**
+  - the calls through `iam` signing, kept as records in `_cosmostore-iam`;
+  - the sets built from the files and the records, rebuilt after each IAM write (`serve`) or on the records'
+    generation (a node, 2 s);
+  - the files' entries read-only to the API;
+  - DeleteConflict as on AWS;
+  - API roles' trust policies enforced at AssumeRole.
+- **Next:** slice 1, the records and the sets.
