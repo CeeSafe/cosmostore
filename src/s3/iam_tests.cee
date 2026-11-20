@@ -1,0 +1,155 @@
+// The IAM API's records (ADR-0104): the record's round trip, and the API's users, keys and roles merged with the
+// files', a name once.
+
+fn iamPolicy(name: StringView, action: StringView) -> IamPolicy {
+    var text = textOf("{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"");
+    text.append(action)!;
+    text.append("\",\"Resource\":\"*\"}}")!;
+    return IamPolicy { name: copyBytes(name.bytes())!, text: copyBytes(text.bytes())! };
+}
+
+fn iamUserOf(name: StringView, key: StringView, active: bool) -> IamUser {
+    var keys = Vector<IamKey>.create();
+    keys.push(
+        IamKey {
+            accessKey: copyBytes(key.bytes())!,
+            secret: copyBytes("s3cret/key".bytes())!,
+            active: active,
+            createdMs: 5,
+        },
+    )!;
+    var policies = Vector<IamPolicy>.create();
+    policies.push(iamPolicy("reads", "s3:GetObject"))!;
+    policies.push(iamPolicy("lists", "s3:ListBucket"))!;
+    var id = textOf("AIDA");
+    id.append(name)!;
+    return IamUser {
+        name: copyBytes(name.bytes())!,
+        id: copyBytes(id.bytes())!,
+        createdMs: 3,
+        keys: keys,
+        policies: policies,
+    };
+}
+
+fn sampleIam() -> IamState {
+    var s = IamState.empty();
+    s.users.push(iamUserOf("alice", "AKIAALICE00000000001", true))!;
+    s.users.push(iamUserOf("bob", "AKIABOB0000000000001", false))!;
+    var policies = Vector<IamPolicy>.create();
+    policies.push(iamPolicy("all", "s3:*"))!;
+    s.roles.push(IamRole {
+        name: copyBytes("deployer".bytes())!,
+        id: copyBytes("AROADEPLOYER".bytes())!,
+        createdMs: 4,
+        trust: copyBytes("{\"Version\":\"2012-10-17\",\"Statement\":[]}".bytes())!,
+        policies: policies,
+        maxSeconds: 3600,
+    })!;
+    return s;
+}
+
+/// The record is read back as written.
+@test
+fn iamStatesRoundTrip() -> Result<void, TestFailure> {
+    let s = sampleIam();
+    let bytes = encodeIamState(borrow s)!;
+    let back = decodeIamState(bytes.view())!!;
+    Check.equalBytes(bytes.view(), encodeIamState(borrow back)!.view())?;
+    Check.equalU64(2, back.users.length as u64)?;
+    Check.isFalse(back.users[1].keys[0].active, "an inactive key stays so")?;
+    Check.isTrue(decodeIamState("{\"version\":2}".bytes())!.isNull(), "a version this does not read")?;
+    return Ok();
+}
+
+/// The API's active keys after the file's; its users, with their joined policies, after the file's, whose names give
+/// way; without a users file, the file's keys are the account's; and the roles likewise.
+@test
+fn iamRecordsMergeWithTheFiles() -> Result<void, TestFailure> {
+    let iam = sampleIam();
+    let fileKeys = parseCredentials("AKIAACCOUNT000000001 account/secret\nAKIAFILEALICE0000001 file/secret\n".bytes())!;
+    var keys = withIamKeys(fileKeys, borrow iam)!;
+    Check.equalU64(3, keys.length as u64)?; // bob's key is inactive
+    Check.equalBytes("AKIAALICE00000000001".bytes(), keys[2].accessKey.view())?;
+    // Without a users file: the file's keys are the account's.
+    var skipped = Vector<Vector<u8>>.create();
+    let users = withIamUsers(null, keys.view(), borrow iam, mut skipped).ok()!!;
+    Check.equalU64(2, users.account.length as u64)?;
+    Check.isTrue(applyUsers(mut keys, borrow users).isOk(), "users applied")?;
+    Check.equalBytes("".bytes(), keys[0].user.view())?;
+    Check.isFalse(keys[0].revoked, "an account key")?;
+    Check.equalBytes("alice".bytes(), keys[2].user.view())?;
+    Check.isTrue(findBytes(keys[2].policyText.view(), "s3:ListBucket".bytes(), 0).isSome(), "both policies joined")?;
+    // A users file naming alice: the API's alice is kept, the file's skipped.
+    var fileText = textOf("account AKIAACCOUNT000000001\nalice:AIDAFILEALICE AKIAFILEALICE0000001 ");
+    fileText.append(READER_POLICY)!;
+    fileText.append("\n")!;
+    let file = parseUsersFile(fileText.bytes()).ok()!;
+    var skipped2 = Vector<Vector<u8>>.create();
+    let merged = withIamUsers(Some(file), keys.view(), borrow iam, mut skipped2).ok()!!;
+    Check.equalU64(1, skipped2.length as u64)?;
+    Check.equalU64(2, merged.users.length as u64)?; // the API's alice and bob
+    // Roles: a file role named as the API's gives way.
+    var fileRoles = Vector<StsRole>.create();
+    fileRoles.push(
+        StsRole {
+            name: copyBytes("deployer".bytes())!,
+            maxSeconds: 900,
+            policy: parseIdentityPolicy(READER_POLICY.bytes())!,
+            removed: false,
+        },
+    )!;
+    fileRoles.push(
+        StsRole {
+            name: copyBytes("reader".bytes())!,
+            maxSeconds: 900,
+            policy: parseIdentityPolicy(READER_POLICY.bytes())!,
+            removed: false,
+        },
+    )!;
+    var skipped3 = Vector<Vector<u8>>.create();
+    let roles = withIamRoles(fileRoles, borrow iam, mut skipped3)!;
+    Check.equalU64(2, roles.length as u64)?;
+    Check.equalBytes("reader".bytes(), roles[0].name.view())?;
+    Check.equalBytes("deployer".bytes(), roles[1].name.view())?;
+    Check.equalU64(3600, roles[1].maxSeconds)?;
+    return Ok();
+}
+
+/// A user made with no policy yet (CreateUser, then CreateAccessKey) is in the set, allowed nothing.
+@test
+fn iamUsersWithoutPoliciesAreAllowedNothing() -> Result<void, TestFailure> {
+    var iam = IamState.empty();
+    var user = iamUserOf("carol", "AKIACAROL00000000001", true);
+    user.policies = Vector<IamPolicy>.create();
+    iam.users.push(user)!;
+    let fileKeys = parseCredentials("AKIAACCOUNT000000001 account/secret\n".bytes())!;
+    var keys = withIamKeys(fileKeys, borrow iam)!;
+    var skipped = Vector<Vector<u8>>.create();
+    let users = withIamUsers(null, keys.view(), borrow iam, mut skipped).ok()!!;
+    Check.isTrue(applyUsers(mut keys, borrow users).isOk(), "a user with no policy applied")?;
+    Check.equalBytes("carol".bytes(), keys[1].user.view())?;
+    Check.isFalse(keys[1].revoked, "its key works")?;
+    return Ok();
+}
+
+/// The records read from a store: none there is an empty state of generation 0; a record that does not decode is no
+/// snapshot (the sets in use stay); a record written is read with its generation.
+@test
+fn iamSnapshotsComeFromTheStore() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("iam-snapshot");
+    var s = ObjectStore.open(dir.view(), spaceConfig(0, 0))!;
+    let none = iamSnapshotOf(borrow s)!;
+    Check.equalU64(0, none.generation)?;
+    Check.equalU64(0, none.state.users.length as u64)?;
+    s.createBucket(IAM_BUCKET)!;
+    let _ = s.putObject(IAM_BUCKET, IAM_STATE_KEY, "application/json", "not json".bytes(), PutCondition.None)!;
+    Check.isTrue(iamSnapshotOf(borrow s).isNull(), "a record that does not decode")?;
+    let state = sampleIam();
+    let bytes = encodeIamState(borrow state)!;
+    let _ = s.putObject(IAM_BUCKET, IAM_STATE_KEY, "application/json", bytes.view(), PutCondition.None)!;
+    let read = iamSnapshotOf(borrow s)!;
+    Check.isTrue(read.generation > 0, "a generation")?;
+    Check.equalU64(2, read.state.users.length as u64)?;
+    return Ok();
+}

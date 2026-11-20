@@ -1,0 +1,349 @@
+// The IAM API's records (ADR-0104): users with their access keys and inline policies, and roles with their trust and
+// inline policies, kept in one record of the hidden bucket `_cosmostore-iam`, and merged with the users and roles
+// files into the credential and role sets (§4). The files stay the operator's: a name in both keeps the API's, and the
+// file's entry is skipped (§5).
+
+/// The hidden bucket the records live in, and the record.
+const IAM_BUCKET: StringView = "_cosmostore-iam";
+const IAM_STATE_KEY: StringView = "state";
+/// A user holds two access keys at most, as on AWS.
+const IAM_MAX_KEYS: usize = 2;
+
+struct IamKey {
+    accessKey: Vector<u8>;
+    secret: Vector<u8>;
+    active: bool;
+    createdMs: i64;
+}
+
+/// An inline policy: its name and its document, as given.
+struct IamPolicy {
+    name: Vector<u8>;
+    text: Vector<u8>;
+}
+
+struct IamUser {
+    name: Vector<u8>;
+    id: Vector<u8>;
+    createdMs: i64;
+    keys: Vector<IamKey>;
+    policies: Vector<IamPolicy>;
+}
+
+struct IamRole {
+    name: Vector<u8>;
+    id: Vector<u8>;
+    createdMs: i64;
+    /// Its trust policy (`AssumeRolePolicyDocument`), as given.
+    trust: Vector<u8>;
+    policies: Vector<IamPolicy>;
+    maxSeconds: u64;
+}
+
+/// Everything the API has made.
+struct IamState {
+    users: Vector<IamUser>;
+    roles: Vector<IamRole>;
+
+    fn empty() -> IamState => IamState { users: Vector<IamUser>.create(), roles: Vector<IamRole>.create() };
+}
+
+// ---- The record ----
+
+fn policiesJson(policies: Slice<IamPolicy>) -> Result<Json, AllocError> {
+    var out = jsonArray();
+    for (i in 0..policies.length) {
+        var p = jsonObject();
+        jsonSet(mut p, "name", Json.Text(copyBytes(policies[i].name.view())?))?;
+        jsonSet(mut p, "text", Json.Text(copyBytes(policies[i].text.view())?))?;
+        jsonPush(mut out, p)?;
+    }
+    return Ok(out);
+}
+
+/// The record's JSON.
+fn encodeIamState(s: borrow IamState) -> Result<Vector<u8>, AllocError> {
+    var users = jsonArray();
+    for (i in 0..s.users.length) {
+        let u = borrow s.users[i];
+        var keys = jsonArray();
+        for (k in 0..u.keys.length) {
+            var key = jsonObject();
+            jsonSet(mut key, "accessKey", Json.Text(copyBytes(u.keys[k].accessKey.view())?))?;
+            jsonSet(mut key, "secret", Json.Text(copyBytes(u.keys[k].secret.view())?))?;
+            jsonSet(mut key, "active", Json.Bool(u.keys[k].active))?;
+            jsonSet(mut key, "created", jsonInteger(u.keys[k].createdMs)?)?;
+            jsonPush(mut keys, key)?;
+        }
+        var user = jsonObject();
+        jsonSet(mut user, "name", Json.Text(copyBytes(u.name.view())?))?;
+        jsonSet(mut user, "id", Json.Text(copyBytes(u.id.view())?))?;
+        jsonSet(mut user, "created", jsonInteger(u.createdMs)?)?;
+        jsonSet(mut user, "keys", keys)?;
+        jsonSet(mut user, "policies", policiesJson(u.policies.view())?)?;
+        jsonPush(mut users, user)?;
+    }
+    var roles = jsonArray();
+    for (i in 0..s.roles.length) {
+        let r = borrow s.roles[i];
+        var role = jsonObject();
+        jsonSet(mut role, "name", Json.Text(copyBytes(r.name.view())?))?;
+        jsonSet(mut role, "id", Json.Text(copyBytes(r.id.view())?))?;
+        jsonSet(mut role, "created", jsonInteger(r.createdMs)?)?;
+        jsonSet(mut role, "trust", Json.Text(copyBytes(r.trust.view())?))?;
+        jsonSet(mut role, "maxSeconds", jsonInteger(truncate<i64>(r.maxSeconds))?)?;
+        jsonSet(mut role, "policies", policiesJson(r.policies.view())?)?;
+        jsonPush(mut roles, role)?;
+    }
+    var root = jsonObject();
+    jsonSet(mut root, "version", jsonInteger(1)?)?;
+    jsonSet(mut root, "users", users)?;
+    jsonSet(mut root, "roles", roles)?;
+    var out = Vector<u8>.create();
+    writeJson(mut out, borrow root)?;
+    return Ok(out);
+}
+
+/// A boolean member's value, if it is one.
+fn jsonMemberBool(j: borrow Json, key: StringView) -> bool? {
+    let v = jsonMember(j, key) ?? { return null; };
+    return match (v) {
+        Json.Bool(b) => Some(*b),
+        _ => null,
+    };
+}
+
+fn textMember(j: borrow Json, key: StringView) -> Result<Vector<u8>?, AllocError> => match (jsonMemberText(j, key)) {
+    Some(t) => Ok(Some(copyBytes(t)?)),
+    null => Ok(null),
+};
+
+fn policiesOf(j: borrow Json) -> Result<Vector<IamPolicy>?, AllocError> {
+    var out = Vector<IamPolicy>.create();
+    let items = memberItems(j, "policies") ?? { return Ok(null); };
+    for (i in 0..items.length) {
+        let name = textMember(borrow items[i], "name")? ?? { return Ok(null); };
+        let text = textMember(borrow items[i], "text")? ?? { return Ok(null); };
+        out.push(IamPolicy { name: name, text: text })?;
+    }
+    return Ok(Some(out));
+}
+
+/// The record read back; null when it is not one this reads.
+fn decodeIamState(bytes: Slice<u8>) -> Result<IamState?, AllocError> {
+    let root = parseJson(bytes)? ?? { return Ok(null); };
+    if (jsonMemberI64(borrow root, "version") != Some(1i64)) { return Ok(null); }
+    var out = IamState.empty();
+    let users = memberItems(borrow root, "users") ?? { return Ok(null); };
+    for (i in 0..users.length) {
+        let u = borrow users[i];
+        var keys = Vector<IamKey>.create();
+        let items = memberItems(u, "keys") ?? { return Ok(null); };
+        for (k in 0..items.length) {
+            let key = borrow items[k];
+            keys.push(IamKey {
+                accessKey: textMember(key, "accessKey")? ?? { return Ok(null); },
+                secret: textMember(key, "secret")? ?? { return Ok(null); },
+                active: jsonMemberBool(key, "active") ?? { return Ok(null); },
+                createdMs: jsonMemberI64(key, "created") ?? 0,
+            })?;
+        }
+        out.users.push(IamUser {
+            name: textMember(u, "name")? ?? { return Ok(null); },
+            id: textMember(u, "id")? ?? { return Ok(null); },
+            createdMs: jsonMemberI64(u, "created") ?? 0,
+            keys: keys,
+            policies: policiesOf(u)? ?? { return Ok(null); },
+        })?;
+    }
+    let roles = memberItems(borrow root, "roles") ?? { return Ok(null); };
+    for (i in 0..roles.length) {
+        let r = borrow roles[i];
+        out.roles.push(IamRole {
+            name: textMember(r, "name")? ?? { return Ok(null); },
+            id: textMember(r, "id")? ?? { return Ok(null); },
+            createdMs: jsonMemberI64(r, "created") ?? 0,
+            trust: textMember(r, "trust")? ?? { return Ok(null); },
+            policies: policiesOf(r)? ?? { return Ok(null); },
+            maxSeconds: truncate<u64>(jsonMemberI64(r, "maxSeconds") ?? 3600),
+        })?;
+    }
+    return Ok(Some(out));
+}
+
+// ---- Merged with the files (ADR-0104 §4, §5) ----
+
+/// What a user or role with no policy yet is given: a statement that allows only an action no request asks, so it is
+/// allowed nothing by its own policy, as on AWS, while a bucket policy may still grant it (an explicit Deny would not
+/// let it). A policy's statements cannot be empty (the policy parser refuses `[]`, as S3 does).
+const IAM_NO_POLICY: StringView =
+    "{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:CosmoStoreNoPolicy\",\"Resource\":\"*\"}}";
+
+/// A policy document joining the statements of `policies` (a user's or role's inline ones); IAM_NO_POLICY for none.
+fn joinedPolicy(policies: Slice<IamPolicy>) -> Result<Vector<u8>?, AllocError> {
+    if (policies.length == 0) { return Ok(Some(copyBytes(IAM_NO_POLICY.bytes())?)); }
+    var statements = jsonArray();
+    for (i in 0..policies.length) {
+        let doc = parseJson(policies[i].text.view())? ?? { return Ok(null); };
+        let member = jsonMember(borrow doc, "Statement") ?? { return Ok(null); };
+        match (member) {
+            Json.Array(items) => {
+                for (k in 0..items.length) { jsonPush(mut statements, cloneJson(borrow items[k])?)?; }
+            }
+            _ => { jsonPush(mut statements, cloneJson(member)?)?; }
+        }
+    }
+    var root = jsonObject();
+    jsonSet(mut root, "Version", Json.Text(copyBytes("2012-10-17".bytes())?))?;
+    jsonSet(mut root, "Statement", statements)?;
+    var out = Vector<u8>.create();
+    writeJson(mut out, borrow root)?;
+    return Ok(Some(out));
+}
+
+/// The credentials file's keys and the API's active keys, in that order.
+fn withIamKeys(fileKeys: Vector<Credential>, iam: borrow IamState) -> Result<Vector<Credential>, AllocError> {
+    var out = fileKeys;
+    for (u in 0..iam.users.length) {
+        for (k in 0..iam.users[u].keys.length) {
+            let key = borrow iam.users[u].keys[k];
+            if (!key.active) { continue; }
+            var known = false;
+            for (i in 0..out.length) {
+                if (out[i].accessKey.view() == key.accessKey.view()) { known = true; }
+            }
+            if (known) { continue; } // a key the file has too: the file's
+            out.push(Credential {
+                accessKey: copyBytes(key.accessKey.view())?,
+                secret: copyBytes(key.secret.view())?,
+                signing: SigningKeyCache.create(),
+                revoked: false,
+                user: Vector<u8>.create(),
+                userKey: Vector<u8>.create(),
+                policyText: Vector<u8>.create(),
+                policy: null,
+            })?;
+        }
+    }
+    return Ok(out);
+}
+
+/// Whether an API user holds `key`, active or not.
+fn iamHoldsKey(iam: borrow IamState, key: Slice<u8>) -> bool {
+    for (u in 0..iam.users.length) {
+        for (k in 0..iam.users[u].keys.length) {
+            if (iam.users[u].keys[k].accessKey.view() == key) { return true; }
+        }
+    }
+    return false;
+}
+
+/// The users the sets are decided by: the users file's, or, without one, the credentials file's keys as the account's;
+/// then the API's users, whose names the file's give way to (ADR-0104 §5). `skipped` names the file's users left
+/// out. Null when the API has no users and there is no users file: every key is then the account's, as before.
+fn withIamUsers(
+    file: UsersFile?,
+    fileKeys: Slice<Credential>,
+    iam: borrow IamState,
+    skipped: borrow mut Vector<Vector<u8>>,
+) -> Result<UsersFile?, String> {
+    if (iam.users.length == 0) { return Ok(file); }
+    let oom = textOf("out of memory");
+    var out = match (file) {
+        Some(f) => f,
+        null => {
+            // The credentials file's keys, never an API user's: those are the user's (the slice's test found a set's
+            // whole list taken for the account's).
+            var account = Vector<Vector<u8>>.create();
+            for (i in 0..fileKeys.length) {
+                if (iamHoldsKey(iam, fileKeys[i].accessKey.view())) { continue; }
+                match (copyBytes(fileKeys[i].accessKey.view())) {
+                    Ok(k) => {
+                        if (account.push(k).isErr()) { return Err(oom); }
+                    }
+                    Err(_) => { return Err(oom); }
+                }
+            }
+            UsersFile { account: account, users: Vector<UserEntry>.create() }
+        }
+    };
+    var kept = Vector<UserEntry>.create();
+    while (out.users.length > 0) {
+        let entry = out.users.remove(0);
+        var clash = false;
+        for (u in 0..iam.users.length) {
+            if (sameNameIgnoringCase(iam.users[u].name.view(), entry.name.view())) { clash = true; }
+        }
+        if (clash) {
+            match (copyBytes(entry.name.view())) {
+                Ok(n) => {
+                    if (skipped.push(n).isErr()) { return Err(oom); }
+                }
+                Err(_) => { return Err(oom); }
+            }
+        } else if (kept.push(entry).isErr()) {
+            return Err(oom);
+        }
+    }
+    for (u in 0..iam.users.length) {
+        let user = borrow iam.users[u];
+        var keys = Vector<Vector<u8>>.create();
+        for (k in 0..user.keys.length) {
+            if (!user.keys[k].active) { continue; }
+            match (copyBytes(user.keys[k].accessKey.view())) {
+                Ok(c) => {
+                    if (keys.push(c).isErr()) { return Err(oom); }
+                }
+                Err(_) => { return Err(oom); }
+            }
+        }
+        let policy = match (joinedPolicy(user.policies.view())) {
+            Ok(Some(p)) => p,
+            _ => { return Err(oom); }
+        };
+        let entry = UserEntry {
+            name: copyBytes(user.name.view()).ok() ?? { return Err(oom); },
+            id: copyBytes(user.id.view()).ok() ?? { return Err(oom); },
+            keys: keys,
+            policyText: policy,
+        };
+        if (kept.push(entry).isErr()) { return Err(oom); }
+    }
+    out.users = kept;
+    return Ok(Some(out));
+}
+
+/// The roles file's roles and the API's, whose names the file's give way to (ADR-0104 §5).
+fn withIamRoles(
+    fileRoles: Vector<StsRole>,
+    iam: borrow IamState,
+    skipped: borrow mut Vector<Vector<u8>>,
+) -> Result<Vector<StsRole>, AllocError> {
+    var out = Vector<StsRole>.create();
+    var rest = fileRoles;
+    while (rest.length > 0) {
+        let role = rest.remove(0);
+        var clash = false;
+        for (r in 0..iam.roles.length) {
+            if (iam.roles[r].name.view() == role.name.view()) { clash = true; }
+        }
+        if (clash) {
+            skipped.push(copyBytes(role.name.view())?)?;
+        } else {
+            out.push(role)?;
+        }
+    }
+    for (r in 0..iam.roles.length) {
+        let role = borrow iam.roles[r];
+        let text = joinedPolicy(role.policies.view())? ?? { continue; };
+        let policy = match (parseIdentityPolicy(text.view())) {
+            Ok(p) => p,
+            Err(S3Fail.OutOfMemory(e)) => { return Err(e); }
+            Err(_) => { continue; } // checked when it was put: a record that does not parse is left out
+        };
+        out.push(
+            StsRole { name: copyBytes(role.name.view())?, maxSeconds: role.maxSeconds, policy: policy, removed: false },
+        )?;
+    }
+    return Ok(out);
+}

@@ -400,6 +400,9 @@ async fn serveS3(
         null => {}
     }
     kind = latencyClass(borrow req);
+    // The store's hidden buckets (`_…`, the IAM API's records among them, ADR-0104 §3) are no client's: every request
+    // naming one is refused before anything else reads it, the stats endpoint (`_cosmostore`) excepted.
+    if (isHiddenBucketName(req.bucket.bytes())) { return Err(S3Fail.Code(S3Code.InvalidBucketName)); }
     // What the bucket's access log line needs (ADR-0072), while some bucket logs.
     let logging = app.loggingBuckets.load() > 0 && req.bucket.length > 0;
     if (logging) {
@@ -1140,11 +1143,25 @@ async fn listBuckets(app: borrow S3App, req: borrow S3Request, exchange: borrow 
 async fn storeBucketList(app: borrow S3App) -> Result<Vector<BucketEntry>, S3Fail> {
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return match (store.listBucketInfo()) { // memory only, as headObject (ADR-0023)
-        Ok(v) => Ok(v),
-        Err(e) => Err(storeFail(e, 0)),
+    var all = match (store.listBucketInfo()) { // memory only, as headObject (ADR-0023)
+        Ok(v) => v,
+        Err(e) => { return Err(storeFail(e, 0)); }
     };
+    // The store's hidden buckets are never listed (ADR-0104 §3).
+    var i: usize = 0;
+    while (i < all.length) {
+        if (isHiddenBucketName(all[i].name.view())) {
+            let _ = all.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    return Ok(all);
 }
+
+/// A bucket name of the store's own (`_…`), but not the stats endpoint's.
+fn isHiddenBucketName(name: Slice<u8>) -> bool =>
+    name.length > 0 && name[0] == '_' && name != STATS_BUCKET.bytes();
 
 async fn createBucket(
     app: borrow S3App,

@@ -4465,3 +4465,27 @@ Browser form uploads with a SigV4 POST policy.
   - DeleteConflict as on AWS;
   - API roles' trust policies enforced at AssumeRole.
 - **Next:** slice 1, the records and the sets.
+
+### 20 Nov 2026: M19 slice 1, the IAM records and the sets built with them (ADR-0104 §3 to §5)
+
+- **`src/s3/iam.cee`:** the API's users (keys, inline policies) and roles (trust, inline policies), all in one
+  record, `state`, of the hidden bucket `_cosmostore-iam`, so a write is one conditional write. It is JSON, version 1.
+- **The merges** (`withIamKeys`, `withIamUsers`, `withIamRoles`):
+  - the API's active keys go after the file's;
+  - its users after the file's, whose same names give way and are reported;
+  - without a users file, the credentials file's keys are the account's, never an API user's;
+  - its roles likewise;
+  - a user or role with no policy is allowed nothing by its own policy (the parser refuses an empty statement
+    list), but a bucket policy may still grant it.
+- **`serve`'s rebuild** reads the record each round and rebuilds the credential and role sets when a file or the
+  record's generation changed. It always keeps a role rotation, so the API's roles count without a roles file.
+- **The hidden bucket:**
+  - the store takes `_cosmostore-iam`;
+  - the S3 layer refuses every request naming a `_…` bucket other than the stats endpoint, before anything reads
+    it, and never lists one.
+- **Bugs caught by the slice's tests:**
+  - without a users file, the API's keys would have been taken for the account's;
+  - a user with no policy failed the whole rebuild.
+- **Tests:** `iamStatesRoundTrip`, `iamRecordsMergeWithTheFiles`, `iamUsersWithoutPoliciesAreAllowedNothing`,
+  `iamSnapshotsComeFromTheStore`. 419 unit tests and both smokes pass.
+- **Next:** slice 2, the users, keys and user policies calls.

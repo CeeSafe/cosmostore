@@ -73,8 +73,10 @@ struct Rotation {
     usersModified: i64;
     /// The modification time of a file that did not read: it is tried again each round, and reported once.
     failed: i64;
-    /// The roles file, reloaded beside them (ADR-0096 §1); none without `--roles-file`.
+    /// The roles file, reloaded beside them (ADR-0096 §1), and the API's roles (ADR-0104 §4).
     roles: RoleRotation?;
+    /// The IAM records' generation last merged into the credentials (ADR-0104 §4).
+    iamGeneration: u64;
     /// The STS, SSE-S3 and KMS key files given, reloaded beside them (ADR-0096 §3, §4).
     keyFiles: Vector<KeyRotation>;
     /// Where the re-wrap pass goes on from (ADR-0100 §3): the last key it looked at, or null for the first.
@@ -444,34 +446,85 @@ async fn reloadKeysIfChanged(r: borrow mut Rotation, store: borrow Arc<AsyncMute
 /// The roles file and its sets (ADR-0096 §1, §2), reloaded as the credentials file is.
 struct RoleRotation {
     sets: Arc<RoleSets>;
+    /// The roles file; empty for none (the API's roles are still merged in, ADR-0104 §4).
     path: String;
     modified: i64;
     failed: i64;
+    /// The IAM records' generation last merged in.
+    iamGeneration: u64;
+}
+
+/// The IAM API's records as last read, and the generation of the record they came from (0 for none).
+struct IamSnapshot {
+    state: IamState;
+    generation: u64;
+}
+
+/// The IAM records of a store, under its lock; null when the record does not read (the sets in use stay).
+async fn readIamSnapshot(store: borrow Arc<AsyncMutex<ObjectStore>>) -> IamSnapshot? {
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return null; }
+    };
+    let st = guard.data();
+    return await Async.blocking(() => iamSnapshotOf(st));
+}
+
+/// The IAM records of a store: none when its hidden bucket or record is not there.
+fn iamSnapshotOf(store: borrow ObjectStore) -> IamSnapshot? {
+    let info = match (store.headObject(IAM_BUCKET, IAM_STATE_KEY)) {
+        Ok(i) => i,
+        Err(StoreError.NoSuchBucket) => { return Some(IamSnapshot { state: IamState.empty(), generation: 0 }); }
+        Err(StoreError.NoSuchKey) => { return Some(IamSnapshot { state: IamState.empty(), generation: 0 }); }
+        Err(_) => { return null; }
+    };
+    let bytes = store.getObject(IAM_BUCKET, IAM_STATE_KEY).ok() ?? { return null; };
+    let state = decodeIamState(bytes.view()).ok() ?? { return null; };
+    return match (state) {
+        Some(s) => Some(IamSnapshot { state: s, generation: info.generation }),
+        null => null,
+    };
 }
 
 /// Reads the roles file again if its modification time changed: its roles become the current set, each in its place,
 /// one the file no longer has marked removed. A file that does not read changes nothing, and is reported once.
-fn checkRoles(r: borrow mut RoleRotation) -> RotationOutcome {
-    let modified = match (Fs.modifiedMillis(r.path.view())) {
+fn checkRoles(r: borrow mut RoleRotation, iam: borrow IamSnapshot?) -> RotationOutcome {
+    let modified = if (r.path.length == 0) 0 else match (Fs.modifiedMillis(r.path.view())) {
         Ok(m) => m,
         Err(_) => r.modified,
     };
-    if (modified == r.modified) { return RotationOutcome.Unchanged; }
-    let text = match (readSmallFile(r.path.view(), "roles file")) {
-        Ok(t) => t,
-        Err(message) => {
-            if (modified == r.failed) { return RotationOutcome.Unchanged; }
-            r.failed = modified;
-            return RotationOutcome.Failed(message);
-        }
+    let generation = match (iam) {
+        Some(s) => s.generation,
+        null => r.iamGeneration,
     };
-    let fresh = match (parseRolesFile(text.view())) {
-        Ok(f) => f,
-        Err(_) => {
-            if (modified == r.failed) { return RotationOutcome.Unchanged; }
-            r.failed = modified;
-            return RotationOutcome.Failed(textOf("the roles file has a line that is not a role"));
-        }
+    if (modified == r.modified && generation == r.iamGeneration) { return RotationOutcome.Unchanged; }
+    var fileRoles = Vector<StsRole>.create();
+    if (r.path.length > 0) {
+        let text = match (readSmallFile(r.path.view(), "roles file")) {
+            Ok(t) => t,
+            Err(message) => {
+                if (modified == r.failed) { return RotationOutcome.Unchanged; }
+                r.failed = modified;
+                return RotationOutcome.Failed(message);
+            }
+        };
+        fileRoles = match (parseRolesFile(text.view())) {
+            Ok(f) => f,
+            Err(_) => {
+                if (modified == r.failed) { return RotationOutcome.Unchanged; }
+                r.failed = modified;
+                return RotationOutcome.Failed(textOf("the roles file has a line that is not a role"));
+            }
+        };
+    }
+    // The API's roles merged in, its names over the file's (ADR-0104 §4, §5).
+    var skipped = Vector<Vector<u8>>.create();
+    let fresh = match (iam) {
+        Some(s) => match (withIamRoles(fileRoles, borrow s.state, mut skipped)) {
+            Ok(f) => f,
+            Err(_) => { return RotationOutcome.Failed(textOf("out of memory")); }
+        },
+        null => fileRoles,
     };
     // The file counts as read only once its roles are installed, so a failure below is tried again (the M15 exit
     // review).
@@ -493,6 +546,7 @@ fn checkRoles(r: borrow mut RoleRotation) -> RotationOutcome {
         return RotationOutcome.Failed(textOf("the roles were reloaded too many times; restart to reload"));
     }
     r.modified = modified;
+    r.iamGeneration = generation;
     return RotationOutcome.Reloaded(live, removed);
 }
 
@@ -505,7 +559,7 @@ enum RotationOutcome {
 
 /// Reads the credentials file again if its modification time changed, and makes its keys the current set. A file
 /// that does not read, or has no key, changes nothing: the keys in use stay.
-fn checkCredentials(r: borrow mut Rotation) -> RotationOutcome {
+fn checkCredentials(r: borrow mut Rotation, iam: borrow IamSnapshot?) -> RotationOutcome {
     let modified = match (Fs.modifiedMillis(r.path.view())) {
         Ok(m) => m,
         Err(_) => r.modified,
@@ -514,8 +568,14 @@ fn checkCredentials(r: borrow mut Rotation) -> RotationOutcome {
         Ok(m) => m,
         Err(_) => r.usersModified,
     };
-    if (modified == r.modified && usersModified == r.usersModified) { return RotationOutcome.Unchanged; }
-    let fresh = match (readCredentials(r.path.view())) {
+    let generation = match (iam) {
+        Some(s) => s.generation,
+        null => r.iamGeneration,
+    };
+    if (modified == r.modified && usersModified == r.usersModified && generation == r.iamGeneration) {
+        return RotationOutcome.Unchanged;
+    }
+    let fileKeys = match (readCredentials(r.path.view())) {
         Ok(f) => f,
         Err(message) => {
             // A file caught half written reads on a later round; one that stays unreadable is reported once.
@@ -524,33 +584,56 @@ fn checkCredentials(r: borrow mut Rotation) -> RotationOutcome {
             return RotationOutcome.Failed(message);
         }
     };
+    // The API's active keys after the file's (ADR-0104 §4).
+    let empty = IamState.empty();
+    let iamState = match (iam) {
+        Some(s) => borrow s.state,
+        null => borrow empty,
+    };
+    let fresh = match (withIamKeys(fileKeys, iamState)) {
+        Ok(f) => f,
+        Err(_) => { return RotationOutcome.Failed(textOf("out of memory")); }
+    };
     let old = r.sets.get().view();
     var next = match (nextCredentials(old, fresh.view())) {
         Ok(n) => n,
         Err(_) => { return RotationOutcome.Failed(textOf("out of memory")); }
     };
     // The users file, applied to the new set: one that does not read changes nothing, as a credentials file that
-    // does not read (ADR-0088 §1). A key it does not name is refused (the M11 exit review's A2).
+    // does not read (ADR-0088 §1). A key it does not name is refused (the M11 exit review's A2). The API's users join
+    // it, their names over the file's (ADR-0104 §5).
+    var fileUsers: UsersFile? = null;
     if (r.usersPath.length > 0) {
-        let users = match (readUsers(r.usersPath.view())) {
-            Ok(u) => u,
+        fileUsers = match (readUsers(r.usersPath.view())) {
+            Ok(u) => Some(u),
             Err(message) => {
                 if (usersModified == r.failed) { return RotationOutcome.Unchanged; }
                 r.failed = usersModified;
                 return RotationOutcome.Failed(message);
             }
         };
-        match (applyUsers(mut next, borrow users)) {
-            Ok() => {}
-            Err(message) => {
-                if (usersModified == r.failed) { return RotationOutcome.Unchanged; }
-                r.failed = usersModified;
-                return RotationOutcome.Failed(message);
+    }
+    var skipped = Vector<Vector<u8>>.create();
+    let users = match (withIamUsers(fileUsers, fresh.view(), iamState, mut skipped)) {
+        Ok(u) => u,
+        Err(message) => { return RotationOutcome.Failed(message); }
+    };
+    match (users) {
+        Some(u) => {
+            match (applyUsers(mut next, borrow u)) {
+                Ok() => {}
+                Err(message) => {
+                    if (usersModified == r.failed) { return RotationOutcome.Unchanged; }
+                    r.failed = usersModified;
+                    return RotationOutcome.Failed(message);
+                }
             }
         }
+        null => {}
     }
     r.modified = modified; // seen: a file that is the same keys, or a set that cannot be taken, is not read again
     r.usersModified = usersModified;
+    r.iamGeneration = generation;
     if (sameCredentials(old, next.view())) { return RotationOutcome.Unchanged; }
     var live: u64 = 0;
     var revoked: u64 = 0;
@@ -567,10 +650,10 @@ fn checkCredentials(r: borrow mut Rotation) -> RotationOutcome {
     return RotationOutcome.Reloaded(live, revoked);
 }
 
-async fn reloadCredentialsIfChanged(r: borrow mut Rotation) {
+async fn reloadCredentialsIfChanged(r: borrow mut Rotation, iam: borrow IamSnapshot?) {
     match (borrow mut r.roles) {
         Some(roles) => {
-            match (await Async.blocking(() => checkRoles(roles))) {
+            match (await Async.blocking(() => checkRoles(roles, iam))) {
                 RotationOutcome.Unchanged => {}
                 RotationOutcome.Reloaded(live, removed) => {
                     var line = String.create();
@@ -592,7 +675,7 @@ async fn reloadCredentialsIfChanged(r: borrow mut Rotation) {
         }
         null => {}
     }
-    let outcome = await Async.blocking(() => checkCredentials(r));
+    let outcome = await Async.blocking(() => checkCredentials(r, iam));
     match (outcome) {
         RotationOutcome.Unchanged => {}
         RotationOutcome.Reloaded(live, revoked) => {
@@ -876,7 +959,8 @@ async fn maintainForever(
             Err(e) => { return Err(NetErrors.fromAsync(e)); }
         }
         await upkeep(store);
-        await reloadCredentialsIfChanged(rotation);
+        let iam = await readIamSnapshot(store);
+        await reloadCredentialsIfChanged(rotation, iam.asBorrow());
         await reloadKeysIfChanged(rotation, store);
         await rewrapUnderFirst(rotation, store);
         await reloadTargetsIfChanged(rotation);
@@ -899,7 +983,8 @@ async fn maintainAndReload(
         }
         await upkeep(store);
         await reloadIfChanged(config, watch);
-        await reloadCredentialsIfChanged(rotation);
+        let iam = await readIamSnapshot(store);
+        await reloadCredentialsIfChanged(rotation, iam.asBorrow());
         await reloadKeysIfChanged(rotation, store);
         await rewrapUnderFirst(rotation, store);
         await reloadTargetsIfChanged(rotation);
@@ -1483,6 +1568,7 @@ fn serve() -> i32 {
             Err(_) => 0,
         },
         roles: null,
+        iamGeneration: 0,
         keyFiles: Vector<KeyRotation>.create(),
         rewrapAfter: null,
         notifyFile: null,
@@ -1663,15 +1749,15 @@ fn serve() -> i32 {
         Err(_) => { die("out of memory"); }
     };
     // The roles file, reloaded with the credentials (ADR-0096 §1).
-    if (rolesAt != 0) {
-        let rolesPath = Process.argument(rolesAt) ?? "";
-        rotation.roles = Some(RoleRotation {
-            sets: roleSets.clone(),
-            path: textOf(rolesPath),
-            modified: Fs.modifiedMillis(rolesPath).ok() ?? 0,
-            failed: 0,
-        });
-    }
+    // Always, so the API's roles are merged in without a roles file too (ADR-0104 §4); its path empty then.
+    let rolesPath = if (rolesAt != 0) Process.argument(rolesAt) ?? "" else "";
+    rotation.roles = Some(RoleRotation {
+        sets: roleSets.clone(),
+        path: textOf(rolesPath),
+        modified: if (rolesPath.length == 0) 0 else Fs.modifiedMillis(rolesPath).ok() ?? 0,
+        failed: 0,
+        iamGeneration: 0,
+    });
     // The writers decide a configuration's writes as its requester (ADR-0094 §3), with the credentials as reloaded.
     auditWriter.decider = RecordedDecider {
         credentials: Some(credentials.clone()),
