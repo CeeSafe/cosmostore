@@ -4433,3 +4433,13 @@ Browser form uploads with a SigV4 POST policy.
 - **No downgrade past it:** a store with a format-6 SetTags record (a restore) cannot be opened by an older binary.
 - **Recorded:** B1 to B5 of the exit review.
 - **Next:** M19, when the owner asks for one.
+
+### 20 Nov 2026: M19 proposed (ADR-0103)
+
+- **The owner:** "propose M19". ADR-0103 (proposed) gives three candidates, one to be M19:
+  - **A, recommended:** the IAM API, a subset. Users, access keys, user policies and roles, kept in the store and
+    live at once.
+  - **B:** the recorded Lows of M15 to M18.
+  - **C:** compaction that re-encodes.
+- **For A, the owner decides the store's users beside the files':** both, a name once (recommended), or the store
+  only, the files a seed.
