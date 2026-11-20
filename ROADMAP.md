@@ -4048,3 +4048,14 @@ Browser form uploads with a SigV4 POST policy.
 - **The review's recorded Lows:** `docs/m15-exit-review.md` B1 to B5.
 - **CI:** the closing fixes (d37b0a4) passed.
 - **Next:** M16, when the owner asks for one.
+
+### 20 Nov 2026: M16 proposed (ADR-0097)
+
+- **The owner:** "propose M16". ADR-0097 (proposed) gives three candidates, one to be M16:
+  - **A, recommended:** key rotation without re-sealing. Versions under a retired key are re-wrapped in their
+    metadata, the bytes untouched. Counts per key are kept as writes happen, so a node can take a key's removal once
+    every shard's leader reports none.
+  - **B:** archive storage classes with RestoreObject.
+  - **C:** compaction for S3 Tables.
+- **For A, the owner decides when re-wrapping starts:** on its own once a key is not first (recommended), or on a
+  command.
