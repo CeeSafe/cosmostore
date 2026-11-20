@@ -4213,3 +4213,14 @@ Browser form uploads with a SigV4 POST policy.
   - a cluster's leaders re-wrap, and a node takes a removal when every leader counts none;
   - key bytes wiped from atomic cells.
 - **Next:** slice 1, the counts.
+
+### 20 Nov 2026: M17 slice 1, envelopes counted by the index (ADR-0100 §1)
+
+- **`VersionIndex` counts versions by envelope prefix** (`v1.<mode>.<id>.`):
+  - in at `put` and `push`, out at a removal and at the version a `put` replaces;
+  - rebuilt at open through the same calls, so no format changes;
+  - a count it cannot keep (out of memory) marks the counts unknown, and the check then walks, as before.
+- **The removal check** (`countFieldPrefix`) reads them, and walks only the uploads in progress. A removal no longer
+  holds the store's lock for a walk of every version (M15's B1).
+- **Tests:** `sealedCountsFollowTheIndex` (an overwrite, one without an envelope, a version deleted, the journal
+  replayed, a checkpoint loaded). 401 unit tests and both smokes pass.

@@ -274,3 +274,43 @@ fn versionsSealedUnderAKeyAreCounted() -> Result<void, TestFailure> {
     Check.equalU64(0, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k9.".bytes())!)?;
     return Ok();
 }
+
+/// The index's counts of versions by envelope (ADR-0100 §1) follow every change: an overwrite in an unversioned bucket,
+/// a version deleted, and a store reopened from its journal or from a checkpoint.
+@test
+fn sealedCountsFollowTheIndex() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("sealed-counts");
+    {
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        s.createBucket("plain")!;
+        s.createBucket("kept")!;
+        setVersioning(mut s, "kept", VERSIONING_ENABLED);
+        for (bucket in ["plain", "plain", "kept", "kept"]) {
+            var meta = Vector<u8>.create();
+            metadataAdd(mut meta, SSE_FIELD.bytes(), "v1.s3.k2.00.00".bytes())!;
+            var w = s.newWriter()!;
+            w.write("sealed".bytes())!;
+            let obj = w.finish()!;
+            let _ = s.putFinishedWith(bucket, "same", "", meta.view(), "".bytes(), borrow obj, PutCondition.None)!;
+        }
+        // The unversioned bucket's overwrite replaced its version: one there, two in the versioned one.
+        Check.equalU64(3, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k2.".bytes())!)?;
+        // An overwrite with no envelope counts the one it replaced out.
+        putText(mut s, "plain", "same", "not sealed");
+        Check.equalU64(2, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k2.".bytes())!)?;
+        let first = s.listVersions("kept", "", "", "".bytes(), false, null, 10)!.versions[1].versionId;
+        s.deleteVersion("kept", "same", first)!;
+        Check.equalU64(1, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k2.".bytes())!)?;
+    }
+    {
+        // From the journal.
+        var s = ObjectStore.open(dir.view(), uploadConfig())!;
+        Check.equalU64(1, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k2.".bytes())!)?;
+        s.checkpoint()!;
+    }
+    // From the checkpoint.
+    var s = ObjectStore.open(dir.view(), uploadConfig())!;
+    Check.equalU64(1, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k2.".bytes())!)?;
+    Check.equalU64(0, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k1.".bytes())!)?;
+    return Ok();
+}

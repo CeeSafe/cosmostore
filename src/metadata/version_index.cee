@@ -11,6 +11,28 @@
 /// No slot: the end of a key's chain.
 const NO_VERSION_SLOT: u32 = 0xFFFFFFFF;
 
+/// The metadata field that holds a sealed version's envelope (ADR-0046 §3), as `src/store/sealed.cee` names it.
+const ENVELOPE_FIELD: StringView = "x-amz-server-side-encryption";
+
+/// How many versions carry envelopes of one prefix, `v1.<mode>.<key id>.` (ADR-0100 §1).
+struct SealedCount {
+    prefix: Vector<u8>;
+    count: u64;
+}
+
+/// A version's envelope's prefix, `v1.<mode>.<key id>.`, if it is sealed.
+fn envelopePrefixOf(v: borrow ObjectVersion) -> Slice<u8>? {
+    let field = metadataFind(v.metadata.view(), ENVELOPE_FIELD.bytes()) ?? { return null; };
+    var dots = 0;
+    for (i in 0..field.length) {
+        if (field[i] == '.') {
+            dots += 1;
+            if (dots == 3) { return Some(field[0..i + 1]); }
+        }
+    }
+    return null;
+}
+
 /// Versions by key, in key order. A cursor is a position in that order (`first`, `seek`, `seekAfter`, `next`), read
 /// with `keyAt` and `valueAt`. Any change to the index invalidates it.
 struct VersionIndex {
@@ -34,6 +56,10 @@ struct VersionIndex {
     private before: OrderedMap<IndexKey, Vector<ObjectVersion>>;
     /// A version could not be kept (out of memory): the snapshot is not whole, and its reader must give it up.
     private broken: bool;
+    /// The versions under each envelope prefix (ADR-0100 §1), kept as versions come and go.
+    private sealed: Vector<SealedCount>;
+    /// A count could not be kept (out of memory): the counts are not known, and a removal's check refuses.
+    private sealedBroken: bool;
 
     fn create() -> VersionIndex => VersionIndex {
         order: OrderedMap<IndexKey, u32>.create(),
@@ -45,7 +71,90 @@ struct VersionIndex {
         snapshotDone: null,
         before: OrderedMap<IndexKey, Vector<ObjectVersion>>.create(),
         broken: false,
+        sealed: Vector<SealedCount>.create(),
+        sealedBroken: false,
     };
+
+    /// How many versions carry envelopes of `prefix` (`v1.<mode>.<key id>.`); null when the counts are not known.
+    fn sealedUnder(borrow this, prefix: Slice<u8>) -> u64? {
+        if (this.sealedBroken) { return null; }
+        for (i in 0..this.sealed.length) {
+            if (this.sealed[i].prefix.view() == prefix) { return Some(this.sealed[i].count); }
+        }
+        return Some(0);
+    }
+
+    /// Counts a version in (`add`) or out.
+    private fn countSealed(borrow mut this, v: borrow ObjectVersion, add: bool) {
+        let prefix = envelopePrefixOf(v) ?? { return; };
+        for (i in 0..this.sealed.length) {
+            if (this.sealed[i].prefix.view() == prefix) {
+                if (add) {
+                    this.sealed[i].count += 1;
+                } else if (this.sealed[i].count > 0) {
+                    this.sealed[i].count -= 1;
+                } else {
+                    this.sealedBroken = true; // a version counted out that was never in: not to be trusted
+                }
+                return;
+            }
+        }
+        if (!add) {
+            this.sealedBroken = true;
+            return;
+        }
+        let copied = match (copyBytes(prefix)) {
+            Ok(p) => p,
+            Err(_) => {
+                this.sealedBroken = true;
+                return;
+            }
+        };
+        if (this.sealed.push(SealedCount { prefix: copied, count: 1 }).isErr()) { this.sealedBroken = true; }
+    }
+
+    /// A version's envelope changed in place (the re-wrap, ADR-0100 §2): `before` counted out, the version as it is
+    /// now counted in. Every other change to a version's envelope goes through `put`, `push` or a removal.
+    fn envelopeChanged(borrow mut this, before: borrow ObjectVersion, key: borrow IndexKey, versionId: [u8; 16]) {
+        this.countSealed(before, false);
+        let slot = this.slotOf(key, versionId);
+        if (slot == NO_VERSION_SLOT) {
+            this.sealedBroken = true;
+            return;
+        }
+        // The version is read out of the vector to count it, as `countSealed` borrows the index mutably.
+        let now = match (envelopePrefixOf(borrow this.versions[slot as usize])) {
+            Some(p) => match (copyBytes(p)) {
+                Ok(c) => Some(c),
+                Err(_) => {
+                    this.sealedBroken = true;
+                    return;
+                }
+            },
+            null => null,
+        };
+        match (now) {
+            Some(p) => { this.countPrefix(p.view()); }
+            null => {}
+        }
+    }
+
+    private fn countPrefix(borrow mut this, prefix: Slice<u8>) {
+        for (i in 0..this.sealed.length) {
+            if (this.sealed[i].prefix.view() == prefix) {
+                this.sealed[i].count += 1;
+                return;
+            }
+        }
+        let copied = match (copyBytes(prefix)) {
+            Ok(p) => p,
+            Err(_) => {
+                this.sealedBroken = true;
+                return;
+            }
+        };
+        if (this.sealed.push(SealedCount { prefix: copied, count: 1 }).isErr()) { this.sealedBroken = true; }
+    }
 
     /// The keys.
     fn length(borrow this) -> usize => this.order.length();
@@ -144,8 +253,17 @@ struct VersionIndex {
     /// Null if the key was not there. A failure leaves the index as it was.
     fn put(borrow mut this, key: IndexKey, version: ObjectVersion) -> Result<ObjectVersion?, AllocError> {
         this.keep(borrow key);
-        match (this.order.get(borrow key)) {
-            Some(s) => { return Ok(replace(mut this.versions[s as usize], version)); }
+        let existing: u32? = match (this.order.get(borrow key)) {
+            Some(s) => Some(s),
+            null => null,
+        };
+        match (existing) {
+            Some(s) => {
+                this.countSealed(borrow version, true);
+                let old = replace(mut this.versions[s as usize], version);
+                this.countSealed(borrow old, false);
+                return Ok(Some(old));
+            }
             null => {}
         }
         // A slot first, so the B-tree's put is the last step that can fail.
@@ -158,6 +276,7 @@ struct VersionIndex {
                 return Err(e);
             }
         }
+        this.countSealed(borrow version, true);
         this.versions[slot as usize] = version;
         this.count += 1;
         return Ok(null);
@@ -185,6 +304,7 @@ struct VersionIndex {
                 return Err(e);
             }
         }
+        this.countSealed(borrow version, true);
         this.versions[slot as usize] = version;
         this.count += 1;
         return Ok();
@@ -234,6 +354,7 @@ struct VersionIndex {
         // Without room to remember it, the slot stays unused: a few bytes, never a wrong answer.
         let _ = this.free.push(slot);
         this.count -= 1;
+        this.countSealed(borrow old, false);
         return old;
     }
 
