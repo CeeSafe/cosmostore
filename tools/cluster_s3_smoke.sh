@@ -84,7 +84,7 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --users-file users --sts-key-file sts.keys --roles-file "${ROLES_FILE:-roles}" --sse-key-file sse.keys --kms-key-file kms.keys --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --tables-day-seconds 24 --lifecycle-seconds 2 --zone-id local-az1 >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --users-file users --sts-key-file sts.keys --roles-file "${ROLES_FILE:-roles}" --sse-key-file sse.keys --kms-key-file kms.keys --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --tables-day-seconds 24 --lifecycle-seconds 2 --zone-id local-az1 --restore-hour-seconds 1 >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -508,6 +508,13 @@ check "a storage class through node 2, seen through node 3" "$(on 3 s3api head-o
 check "and listed through node 1" "$(on 1 s3api list-objects-v2 --bucket tail-c --query 'Contents[0].StorageClass' --output text 2>&1)" STANDARD_IA
 on 3 s3api put-object --bucket tail-c --key g --body one.txt --storage-class GLACIER > /dev/null 2>&1
 check "an archive class taken through node 3, its read refused through node 1" "$(code 1 s3api get-object --bucket tail-c --key g g.out)" InvalidObjectState
+# A restore on a cluster (ADR-0102 §7): asked through node 2, its state through the shard's log, read through node 1
+# once ready (an hour is a second: Standard's 4 hours take 4 s).
+on 2 s3api restore-object --bucket tail-c --key g --restore-request '{"Days":1}' > /dev/null 2>&1
+check "restoring, seen through node 3" "$(on 3 s3api head-object --bucket tail-c --key g --query Restore --output text 2>&1)" 'ongoing-request="true"'
+check "a second restore through node 1" "$(code 1 s3api restore-object --bucket tail-c --key g --restore-request '{"Days":1}')" RestoreAlreadyInProgress
+pause 5
+check "restored: read through node 1" "$(on 1 s3 cp s3://tail-c/g - 2>&1)" "$(cat one.txt)"
 on 1 s3api put-bucket-lifecycle-configuration --bucket tail-c --lifecycle-configuration '{"Rules":[{"ID":"tiers","Status":"Enabled","Filter":{},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"}]}]}' > /dev/null 2>&1
 check "lifecycle transitions through node 1, read through node 2" "$(on 2 s3api get-bucket-lifecycle-configuration --bucket tail-c --query 'Rules[0].Transitions[0].StorageClass' --output text 2>&1)" STANDARD_IA
 tu1=$(on 3 s3api create-multipart-upload --bucket tail-c --key logs/a --query UploadId --output text 2>&1)

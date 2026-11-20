@@ -30,7 +30,7 @@ cat > "$work/roles" <<'ROLES'
 reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::sdk-m7","arn:aws:s3:::sdk-m7/*"]}]}
 ROLES
 
-"$bin" serve "$work/store" "$port" "$work/credentials" localhost --users-file "$work/users" --sse-key-file "$work/sse.keys" --sts-key-file "$work/sts.keys" --roles-file "$work/roles" --access-log-seconds 2 --inventory-day-seconds 3 --website-domain web.localhost --zone-id local-az1 2> "$work/server.log" &
+"$bin" serve "$work/store" "$port" "$work/credentials" localhost --users-file "$work/users" --sse-key-file "$work/sse.keys" --sts-key-file "$work/sts.keys" --roles-file "$work/roles" --access-log-seconds 2 --inventory-day-seconds 3 --website-domain web.localhost --zone-id local-az1 --restore-hour-seconds 1 2> "$work/server.log" &
 server=$!
 sleep 1
 

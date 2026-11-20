@@ -415,6 +415,15 @@ foreach (var sessions in new[] { false })
     await tail.PutObjectAsync(new PutObjectRequest { BucketName = "sdk-net-tail", Key = "g", ContentBody = "x", StorageClass = S3StorageClass.Glacier });
     Check("an archive class taken", (await tail.GetObjectMetadataAsync("sdk-net-tail", "g")).StorageClass?.Value, "GLACIER");
     Check("its read refused, not restored", await CodeOf(() => tail.GetObjectAsync("sdk-net-tail", "g")), "InvalidObjectState");
+    // RestoreObject (an hour is a second here: Standard's 4 hours take 4 s).
+    await tail.RestoreObjectAsync(new RestoreObjectRequest { BucketName = "sdk-net-tail", Key = "g", Days = 1, Tier = GlacierJobTier.Standard });
+    Check("restoring", (await tail.GetObjectMetadataAsync("sdk-net-tail", "g")).RestoreInProgress.ToString(), "True");
+    await Task.Delay(5000);
+    using (var restored = await tail.GetObjectAsync("sdk-net-tail", "g"))
+    using (var restoredReader = new StreamReader(restored.ResponseStream))
+    {
+        Check("restored, read", await restoredReader.ReadToEndAsync(), "x");
+    }
     await tail.DeleteObjectAsync("sdk-net-tail", "g");
     await tail.DeleteObjectAsync("sdk-net-tail", "ia");
     await tail.DeleteBucketAsync("sdk-net-tail");

@@ -4395,3 +4395,13 @@ Browser form uploads with a SigV4 POST policy.
     and took a shard without counts for 0. It now reads every node's, and waits for every shard.
 - **Checks:** 414 unit tests, both smokes (179 on the cluster) and the SDK matrix pass.
 - **Next:** slice 3, a cluster's restores and the SDK matrix.
+
+### 20 Nov 2026: M18 slice 3, restores on a cluster and through the SDKs (ADR-0102 §7)
+
+- **A node takes `--restore-hour-seconds`,** as `serve` does.
+- **The cluster smoke:** a GLACIER version restored through node 2, seen restoring through node 3, a second restore
+  refused through node 1, and read through node 1 once ready (182 checks).
+- **The SDK matrix:** boto3, Go, Java, JS and .NET each restore an archived object, see it restoring, and read it
+  once ready. Their server runs with `--restore-hour-seconds 1`.
+- **Checks:** 414 unit tests, both smokes and the SDK matrix pass.
+- **Next:** slice 4, the exit review.

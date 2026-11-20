@@ -731,6 +731,11 @@ check("a storage class recorded", client().head_object(Bucket="sdk-py-tail", Key
 client().put_object(Bucket="sdk-py-tail", Key="g", Body=b"x", StorageClass="GLACIER")
 check("an archive class taken", client().head_object(Bucket="sdk-py-tail", Key="g").get("StorageClass"), "GLACIER")
 check("its read refused, not restored", code_of(lambda: client().get_object(Bucket="sdk-py-tail", Key="g")), "InvalidObjectState")
+# RestoreObject (an hour is a second here: Standard's 4 hours take 4 s).
+client().restore_object(Bucket="sdk-py-tail", Key="g", RestoreRequest={"Days": 1, "GlacierJobParameters": {"Tier": "Standard"}})
+check("restoring", client().head_object(Bucket="sdk-py-tail", Key="g").get("Restore"), 'ongoing-request="true"')
+time.sleep(5)
+check("restored, read", client().get_object(Bucket="sdk-py-tail", Key="g")["Body"].read(), b"x")
 client().delete_object(Bucket="sdk-py-tail", Key="g")
 client().delete_object(Bucket="sdk-py-tail", Key="ia")
 client().delete_bucket(Bucket="sdk-py-tail")

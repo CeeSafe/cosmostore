@@ -5,7 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import http from "node:http";
 import { gunzipSync } from "node:zlib";
 import {
-  S3Client, CreateBucketCommand, ListBucketsCommand, PutObjectCommand, GetObjectCommand, HeadObjectCommand, CopyObjectCommand,
+  S3Client, CreateBucketCommand, ListBucketsCommand, PutObjectCommand, GetObjectCommand, RestoreObjectCommand, HeadObjectCommand, CopyObjectCommand,
   DeleteObjectsCommand, DeleteBucketCommand, ListObjectsV2Command, paginateListObjectsV2, HeadBucketCommand,
   PutBucketLoggingCommand, GetBucketLoggingCommand, PutBucketWebsiteCommand, GetBucketWebsiteCommand,
   DeleteBucketWebsiteCommand, PutBucketPolicyCommand, DeleteBucketPolicyCommand, PutBucketInventoryConfigurationCommand,
@@ -350,6 +350,11 @@ for (const sessions of [true, false]) {
   await s3t.send(new PutObjectCommand({ Bucket: "sdk-js-tail", Key: "g", Body: "x", StorageClass: "GLACIER" }));
   check("an archive class taken", (await s3t.send(new HeadObjectCommand({ Bucket: "sdk-js-tail", Key: "g" }))).StorageClass, "GLACIER");
   check("its read refused, not restored", await codeOf(s3t.send(new GetObjectCommand({ Bucket: "sdk-js-tail", Key: "g" }))), "InvalidObjectState");
+  // RestoreObject (an hour is a second here: Standard's 4 hours take 4 s).
+  await s3t.send(new RestoreObjectCommand({ Bucket: "sdk-js-tail", Key: "g", RestoreRequest: { Days: 1, GlacierJobParameters: { Tier: "Standard" } } }));
+  check("restoring", (await s3t.send(new HeadObjectCommand({ Bucket: "sdk-js-tail", Key: "g" }))).Restore, 'ongoing-request="true"');
+  await new Promise((r) => setTimeout(r, 5000));
+  check("restored, read", await (await s3t.send(new GetObjectCommand({ Bucket: "sdk-js-tail", Key: "g" }))).Body.transformToString(), "x");
   await s3t.send(new DeleteObjectCommand({ Bucket: "sdk-js-tail", Key: "g" }));
   await s3t.send(new DeleteObjectCommand({ Bucket: "sdk-js-tail", Key: "ia" }));
   await s3t.send(new DeleteBucketCommand({ Bucket: "sdk-js-tail" }));

@@ -4,6 +4,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -24,6 +25,17 @@ func longTail(ctx context.Context, cfg aws.Config) {
 	check("an archive class taken", codeOf(err), "no error")
 	_, err = c.GetObject(ctx, &s3.GetObjectInput{Bucket: b, Key: aws.String("g")})
 	check("its read refused, not restored", codeOf(err), "InvalidObjectState")
+	// RestoreObject (an hour is a second here: Standard's 4 hours take 4 s).
+	must(c.RestoreObject(ctx, &s3.RestoreObjectInput{Bucket: b, Key: aws.String("g"), RestoreRequest: &types.RestoreRequest{
+		Days: aws.Int32(1), GlacierJobParameters: &types.GlacierJobParameters{Tier: types.TierStandard}}}))
+	head = must(c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: b, Key: aws.String("g")}))
+	check("restoring", aws.ToString(head.Restore), `ongoing-request="true"`)
+	time.Sleep(5 * time.Second)
+	got, err2 := c.GetObject(ctx, &s3.GetObjectInput{Bucket: b, Key: aws.String("g")})
+	check("restored, read", codeOf(err2), "no error")
+	if got != nil {
+		got.Body.Close()
+	}
 	must(c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: b, Key: aws.String("g")}))
 	must(c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: b, Key: aws.String("ia")}))
 	must(c.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: b}))
