@@ -1,6 +1,11 @@
 # ADR-0098: Compaction for S3 Tables (M16)
 
 **Status:** proposed, 20 Nov 2026. M16 is item C of ADR-0097 (the owner: "C: Tables compaction").
+- **Decided by the owner the same day:**
+  - copy row groups;
+  - skip partitions with delete files ("Copy, skip deletes").
+- **How it was decided:** the owner first chose "Apply while rewriting" for deletes. That needs re-encoding, so the
+  conflict was asked again, and the owner chose to skip.
 
 ## Context
 

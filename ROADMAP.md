@@ -4082,3 +4082,7 @@ Browser form uploads with a SigV4 POST policy.
     4. a cluster's leaders;
     5. the exit review.
 - **CeeSafe:** G40 (no compression codecs).
+- **The owner's choices:** copy row groups, and skip partitions with delete files.
+  - **How:** "Apply while rewriting" was asked again, since applying deletes needs re-encoding; the owner chose
+    "Copy, skip deletes".
+- **Next:** slice 1, Thrift and Parquet's footer.
