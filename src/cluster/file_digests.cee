@@ -1,0 +1,132 @@
+// The files a node reads and reloads, and their digests (ADR-0096 §6): `cluster-status` asks every node for them and
+// shows a file that differs. A digest is HMAC-SHA256 under the cluster's secret, cut to 16 bytes: it tells two
+// files apart and gives nothing of a file to one who does not hold the secret.
+
+/// A file a node was given: its option's name and its path.
+struct WatchedFile {
+    name: Vector<u8>;
+    path: String;
+}
+
+/// The status lines of a node's files, `# file <name> <digest>`, read now; `unreadable` for one that does not read.
+fn fileDigestLines(secret: Slice<u8>, files: Slice<WatchedFile>) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    for (i in 0..files.length) {
+        out.extend("# file ".bytes())?;
+        out.extend(files[i].name.view())?;
+        out.push(0x20)?;
+        var text = Vector<u8>.create();
+        match (readSmallFileInto(files[i].path.view(), mut text)) {
+            Ok() => {
+                var mac = HmacSha256.create(secret);
+                mac.update("cosmostore file digest\n".bytes());
+                mac.update(text.view());
+                let d = mac.finish();
+                appendHexBytes(mut out, d[0..16])?;
+            }
+            Err(_) => { out.extend("unreadable".bytes())?; }
+        }
+        for (j in 0..text.length) { text[j] = 0; }
+        out.push(0x0A)?;
+    }
+    return Ok(out);
+}
+
+/// One node's digests, as its status gave them.
+struct NodeDigests {
+    node: u32;
+    /// Whether the node answered.
+    answered: bool;
+    /// `<name> <digest>` lines.
+    lines: Vector<Vector<u8>>;
+}
+
+/// The `# file` lines of a status answer, without the `# file ` head.
+fn digestLinesOf(status: Slice<u8>) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    let all = StringView.fromUtf8(status) ?? "";
+    for (line in all.split("\n")) {
+        if (line.startsWith("# file ")) { out.push(copyBytes(line.bytes()[7..])?)?; }
+    }
+    return Ok(out);
+}
+
+/// The line a node gave for `name`, if it gave one; its digest is after the name and a space.
+fn digestLineOf(lines: Slice<Vector<u8>>, name: Slice<u8>) -> usize? {
+    for (i in 0..lines.length) {
+        let l = lines[i].view();
+        if (l.length > name.length && l[..name.length] == name && l[name.length] == 0x20) { return Some(i); }
+    }
+    return null;
+}
+
+/// Whether two nodes gave the same digest for `name` (both none counts as the same).
+fn sameDigest(a: Slice<Vector<u8>>, b: Slice<Vector<u8>>, name: Slice<u8>) -> bool {
+    return match (digestLineOf(a, name)) {
+        Some(i) => match (digestLineOf(b, name)) {
+            Some(j) => a[i].view() == b[j].view(),
+            null => false,
+        },
+        null => digestLineOf(b, name).isNull(),
+    };
+}
+
+/// What `cluster-status` adds (ADR-0096 §6): `# files agree` when every node that answered gave the same files and
+/// digests; else a `# file-differs <name>` line per file with each node's digest (`-` for none), and the nodes that
+/// did not answer.
+fn compareDigests(nodes: Slice<NodeDigests>) -> Result<Vector<u8>, AllocError> {
+    var names = Vector<Vector<u8>>.create();
+    for (n in 0..nodes.length) {
+        for (i in 0..nodes[n].lines.length) {
+            let l = nodes[n].lines[i].view();
+            var end = 0usize;
+            while (end < l.length && l[end] != 0x20) { end += 1; }
+            var known = false;
+            for (k in 0..names.length) {
+                if (names[k].view() == l[..end]) { known = true; }
+            }
+            if (!known) { names.push(copyBytes(l[..end])?)?; }
+        }
+    }
+    var out = Vector<u8>.create();
+    var differs = false;
+    for (k in 0..names.length) {
+        var first: usize? = null;
+        var same = true;
+        for (n in 0..nodes.length) {
+            if (!nodes[n].answered) { continue; }
+            match (first) {
+                Some(f) => {
+                    if (!sameDigest(nodes[f].lines.view(), nodes[n].lines.view(), names[k].view())) { same = false; }
+                }
+                null => { first = Some(n); }
+            }
+        }
+        if (same) { continue; }
+        differs = true;
+        out.extend("# file-differs ".bytes())?;
+        out.extend(names[k].view())?;
+        for (n in 0..nodes.length) {
+            if (!nodes[n].answered) { continue; }
+            out.extend(" node".bytes())?;
+            appendDecimal(mut out, nodes[n].node as u64)?;
+            out.push('=')?;
+            match (digestLineOf(nodes[n].lines.view(), names[k].view())) {
+                Some(i) => { out.extend(nodes[n].lines[i].view()[names[k].length + 1..])?; }
+                null => { out.push('-')?; }
+            }
+        }
+        out.push(0x0A)?;
+    }
+    var silent = false;
+    for (n in 0..nodes.length) {
+        if (nodes[n].answered) { continue; }
+        if (!silent) { out.extend("# no-answer".bytes())?; }
+        silent = true;
+        out.extend(" node".bytes())?;
+        appendDecimal(mut out, nodes[n].node as u64)?;
+    }
+    if (silent) { out.push(0x0A)?; }
+    if (!differs) { out.extend("# files agree\n".bytes())?; }
+    return Ok(out);
+}

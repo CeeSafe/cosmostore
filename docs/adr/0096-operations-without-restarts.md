@@ -43,8 +43,16 @@ remove a master key stored objects still need is refused (the owner's choice).
      is replaced whole (`Reloaded<T>`), and a target removed is simply not found.
 6. **On a cluster:**
    - **Reloads:** each node reloads its files as `serve` does (ADR-0092 §1's task, widened).
-   - **Digests:** each node gives its peers, in the handshake, a digest of each file's contents, a salted hash
-     that holds no secret. `cluster-status` shows, per node, the files whose digest differs from the others'.
+   - **Digests:** each node gives a digest of each file's contents, a salted hash that holds no secret.
+     `cluster-status` shows, per node, the files whose digest differs from the others'.
+   - **Amended in slice 4:** the digests are in each node's status answer (`# file <option> <digest>`), and
+     `cluster-status` asks every node for its own, rather than the peer handshake carrying them.
+     - **Why:** only the operator reads them, so they need not travel between nodes, and the peer protocol is
+       unchanged.
+     - **The digest:** HMAC-SHA256 under the cluster's secret, cut to 16 bytes, of the file as it is on disk now
+       (so a reload the node refused shows as the file, not as what the node uses).
+     - **What `cluster-status` adds:** `# files agree`, or a `# file-differs <option>` line with each answering
+       node's digest (`-` for a file not given), and `# no-answer` for the nodes that did not answer.
 
 ## Slices
 

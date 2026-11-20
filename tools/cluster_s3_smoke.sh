@@ -84,7 +84,7 @@ reader 3600 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3
 ROLES
 start() {
     mkdir -p "d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --users-file users --sts-key-file sts.keys --roles-file roles --sse-key-file sse.keys --kms-key-file kms.keys --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --tables-day-seconds 24 --lifecycle-seconds 2 --zone-id local-az1 >> "log$1" 2>&1 &
+    "$BIN" node "$WORK/d$1" --init --cluster-file cluster.conf --node "$1" --listen $((BASE + 10 + $1)) --credentials credentials --users-file users --sts-key-file sts.keys --roles-file "${ROLES_FILE:-roles}" --sse-key-file sse.keys --kms-key-file kms.keys --website-domain web.localhost --domain localhost --notify-targets targets --replication-targets reptargets --access-log-seconds 2 --inventory-day-seconds 4 --tables-day-seconds 24 --lifecycle-seconds 2 --zone-id local-az1 >> "log$1" 2>&1 &
     PIDS[$1]=$!
 }
 # The AWS CLI against node n's S3 port.
@@ -156,12 +156,18 @@ on "${live[0]}" s3 cp s3://alpha/huge huge.got > /dev/null 2>&1
 check "the multipart object read through node ${live[0]}, by ranges" "$(md5of huge.got)" "$(md5of huge.bin)"
 extents() { find "d$1" -name 'ext-*.ce' | wc -l | tr -d ' '; }
 check "the extents are on the two live nodes" "$([ "$(extents "${live[0]}")" -ge 6 ] && [ "$(extents "${live[0]}")" = "$(extents "${live[1]}")" ] && echo yes)" "yes"
-start "$down"
+# The nodes' files compared (ADR-0096 §6): node $down comes back with a roles file of its own, the same roles and a
+# comment more, so its digest differs and cluster-status says so; the others agree.
+check "cluster-status: the files agree" "$("$BIN" cluster-status --cluster-file cluster.conf --node "${live[0]}" 2>/dev/null | grep -c '^# files agree')" 1
+{ cat roles; echo "# node $down's own copy"; } > roles.own
+ROLES_FILE=roles.own start "$down"
 for i in $(seq 1 75); do
     [ "$(extents "$down")" = "$(extents "${live[0]}")" ] && break
     pause 0.2
 done
 check "node $down back: it fetched the extents it missed" "$(extents "$down")" "$(extents "${live[0]}")"
+check "cluster-status: node $down's roles file differs" "$("$BIN" cluster-status --cluster-file cluster.conf --node "${live[0]}" 2>/dev/null | grep '^# file-differs' | cut -d' ' -f3)" roles-file
+check "cluster-status: its digest is not the others'" "$("$BIN" cluster-status --cluster-file cluster.conf --node "${live[0]}" 2>/dev/null | grep '^# file-differs' | tr ' ' '\n' | grep -c "^node")" 3
 
 # The leader of alpha's shard goes down; the others go on.
 # Find alpha's shard by asking every node's status for the shard that has applied the most entries.

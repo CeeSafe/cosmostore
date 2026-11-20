@@ -40,6 +40,8 @@ struct PeerLink {
 
 struct NodeShared {
     file: ClusterFile;
+    /// The files the node was given, whose digests its status shows (ADR-0096 §6).
+    files: Vector<WatchedFile>;
     secret: Vector<u8>;
     id: u32;
     slots: Vector<ShardSlot>;
@@ -292,8 +294,17 @@ fn openNode(
         Ok(n) => n,
         Err(_) => { return Err(textOf("out of memory")); }
     };
+    var files = Vector<WatchedFile>.create();
+    for (i in 0..sts.watched.length) {
+        let copied = match (copyBytes(sts.watched[i].name.view())) {
+            Ok(name) => files.push(WatchedFile { name: name, path: textOf(sts.watched[i].path.view()) }).isOk(),
+            Err(_) => false,
+        };
+        if (!copied) { return Err(textOf("out of memory")); }
+    }
     let shared = NodeShared {
         file: file,
+        files: files,
         secret: secret,
         id: id,
         slots: slots,
@@ -754,6 +765,16 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
         appendDecimal(mut out, shared.received.load()).isOk() && out.push(0x20).isOk() &&
         appendDecimal(mut out, shared.refused.load()).isOk() && out.push(0x0A).isOk();
     if (!peer) { return Err(NodeFault.OutOfMemory); }
+    // The digests of the files the node was given (ADR-0096 §6), read now.
+    let secret = shared.secret.view();
+    let files = shared.files.view();
+    let digests = await Async.blocking(() => fileDigestLines(secret, files));
+    match (digests) {
+        Ok(d) => {
+            if (out.extend(d.view()).isErr()) { return Err(NodeFault.OutOfMemory); }
+        }
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    }
     return Ok(out);
 }
 
@@ -1257,6 +1278,7 @@ fn nodeCommand() -> i32 {
         kmsKeys: Vector<MasterKey>.create(),
         stsSets: null,
         notifyList: null,
+        watched: Vector<WatchedFile>.create(),
         replicationList: null,
         sseSets: null,
         kmsSets: null,
@@ -1530,6 +1552,15 @@ fn nodeCommand() -> i32 {
         }
         null => {}
     }
+    // The files whose digests the node's status shows (ADR-0096 §6), by their options' names.
+    watchFile(mut sts.watched, "credentials", args.credentials.asBorrow());
+    watchFile(mut sts.watched, "users-file", args.users.asBorrow());
+    watchFile(mut sts.watched, "roles-file", args.roles.asBorrow());
+    watchFile(mut sts.watched, "sts-key-file", args.stsKeys.asBorrow());
+    watchFile(mut sts.watched, "sse-key-file", args.sseKeys.asBorrow());
+    watchFile(mut sts.watched, "kms-key-file", args.kmsKeys.asBorrow());
+    watchFile(mut sts.watched, "notify-targets", args.notifyTargets.asBorrow());
+    watchFile(mut sts.watched, "replication-targets", args.replicationTargets.asBorrow());
     let parts = match (openNode(
         dir,
         loaded.file,
@@ -1603,6 +1634,19 @@ fn nodeCommand() -> i32 {
     match (Async.run(runNode(borrow arc, server, address, parts.internals, front, frontAddress, rotation))) {
         Ok(_) => { return 1; }
         Err(_) => { return 1; }
+    }
+}
+
+/// A file the node was given, by its option's name, for its digest; none when the option is not given.
+fn watchFile(out: borrow mut Vector<WatchedFile>, name: StringView, path: borrow String?) {
+    match (path) {
+        Some(p) => {
+            match (copyBytes(name.bytes())) {
+                Ok(n) => { let _ = out.push(WatchedFile { name: n, path: textOf(p.view()) }); }
+                Err(_) => {}
+            }
+        }
+        null => {}
     }
 }
 
@@ -1858,7 +1902,35 @@ fn clusterStatusCommand() -> i32 {
         return 1;
     }
     Console.write(StringView.fromUtf8(answer.view()) ?? "");
+    // Every node's files, compared (ADR-0096 §6).
+    let compared = match (Async.run(compareNodeFiles(borrow loaded))) {
+        Ok(c) => c,
+        Err(_) => { return 1; }
+    };
+    Console.write(StringView.fromUtf8(compared.view()) ?? "");
     return 0;
+}
+
+/// Asks every node of the cluster file for its status, and compares the digests of their files (ADR-0096 §6).
+async fn compareNodeFiles(loaded: borrow LoadedCluster) -> Result<Vector<u8>, AllocError> {
+    var nodes = Vector<NodeDigests>.create();
+    for (i in 0..loaded.file.nodes.length) {
+        let n = borrow loaded.file.nodes[i];
+        var url = textOf("http://");
+        appendPeerAddress(mut url, n.peer)?;
+        url.append("/cluster/status")?;
+        var answer = Vector<u8>.create();
+        let status = match (await askStatus(loaded, url.view(), mut answer)) {
+            Ok(s) => s,
+            Err(_) => 0u16,
+        };
+        nodes.push(NodeDigests {
+            node: n.id,
+            answered: status == 200,
+            lines: if (status == 200) digestLinesOf(answer.view())? else Vector<Vector<u8>>.create(),
+        })?;
+    }
+    return compareDigests(nodes.view());
 }
 
 /// Before a node joins on an empty directory (ADR-0066 §2): a majority of its peers answer, and none lists it among a

@@ -546,3 +546,36 @@ fn clusterRosterAndStandby() -> Result<void, TestFailure> {
     )?;
     return Ok();
 }
+
+/// The nodes' files compared (ADR-0096 §6): the same digests agree; one that differs, or a file a node lacks, is
+/// shown with every answering node's digest; a node that did not answer is named, and not counted as differing.
+@test
+fn nodeFileDigestsCompared() -> Result<void, TestFailure> {
+    var files = Vector<WatchedFile>.create();
+    let dir = scratchDirectory("digests");
+    var path = textOf(dir.view());
+    path.append("/roles")!;
+    let f = DurableFile.createNew(path.view())!;
+    f.writeAt("reader 3600 {}\n".bytes(), 0)!;
+    files.push(WatchedFile { name: copyBytes("roles-file".bytes())!, path: textOf(path.view()) })!;
+    files.push(WatchedFile { name: copyBytes("users-file".bytes())!, path: textOf("/no/such/file") })!;
+    let one = fileDigestLines("secret".bytes(), files.view())!;
+    let other = fileDigestLines("another secret".bytes(), files.view())!;
+    let text = StringView.fromUtf8(one.view()) ?? "";
+    Check.isTrue(text.startsWith("# file roles-file "), "a digest line")?;
+    Check.isTrue(text.contains("# file users-file unreadable\n"), "a file that does not read")?;
+    Check.isFalse(one.view() == other.view(), "the digest is keyed by the cluster's secret")?;
+    var nodes = Vector<NodeDigests>.create();
+    nodes.push(NodeDigests { node: 1, answered: true, lines: digestLinesOf(one.view())! })!;
+    nodes.push(NodeDigests { node: 2, answered: true, lines: digestLinesOf(one.view())! })!;
+    nodes.push(NodeDigests { node: 3, answered: false, lines: Vector<Vector<u8>>.create() })!;
+    Check.equalBytes("# no-answer node3\n# files agree\n".bytes(), compareDigests(nodes.view())!.view())?;
+    nodes[1].lines = digestLinesOf("# file roles-file 00ff\n".bytes())!;
+    let differs = compareDigests(nodes.view())!;
+    let shown = StringView.fromUtf8(differs.view()) ?? "";
+    Check.isTrue(shown.startsWith("# file-differs roles-file node1="), "the file that differs")?;
+    Check.isTrue(shown.contains(" node2=00ff\n"), "each node's digest")?;
+    Check.isTrue(shown.contains("# file-differs users-file node1=unreadable node2=-\n"), "a file a node lacks")?;
+    Check.isFalse(shown.contains("# files agree"), "not agreeing")?;
+    return Ok();
+}

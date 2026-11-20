@@ -603,6 +603,34 @@ field-position error sends one looking for a syntax mistake.
 - **The error:** N0107 at a field, and at a parameter, should say the word is reserved, as N0100 does.
 - **The reserved list:** consider releasing words the language does not use (`class`).
 
+### G39: `borrow x` of an optional does not pass as `borrow T?`, and the error prints the same type twice (P2, diagnostics/language)
+
+**Found:** CosmoStore M15 slices 2 and 4, 20 Nov 2026, three times. Still in 0.79.0.
+
+**What happens.** A parameter `p: borrow String?` takes a borrow of an optional, but the call `f(borrow given)`, with
+`given: String?`, is refused:
+
+```
+error[N0205]: expected 'borrow String?', found 'borrow (String?)'
+```
+
+- **The fix that works:** `f(given.asBorrow())`. The parameter's type parses as `(borrow String)?`, an optional
+  borrow, and `asBorrow` makes one.
+- **Why it costs time:** the two types print almost the same. Nothing says that `borrow String?` is an optional of a
+  borrow, or suggests `asBorrow()`.
+
+**Repro.**
+
+```
+fn lengthOf(s: borrow String?) -> usize => match (s) { Some(t) => t.length, null => 0 };
+fn main() { let given: String? = null; let _ = lengthOf(borrow given); }
+```
+
+**Suggested.**
+- **The diagnostic:** print the parameter's type with parentheses, `(borrow String)?`, and offer `given.asBorrow()`
+  as a fix (`ceesafec fix` could apply it).
+- **Or the language:** accept `borrow x` of an `x: T?` where `(borrow T)?` is expected, as the conversion is total.
+
 ## Not gaps (checked)
 
 Things that worked well and are worth keeping:

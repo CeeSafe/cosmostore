@@ -3998,3 +3998,19 @@ Browser form uploads with a SigV4 POST policy.
     after it is removed;
   - 392 unit tests, the cluster smoke (167) and the SDK matrix pass.
 - **Next:** slice 4, the cluster's digests and `cluster-status`.
+
+### 20 Nov 2026: M15 slice 4, the nodes' files compared (ADR-0096 §6)
+
+- **In each node's status:** a `# file <option> <digest>` line per file it was given. The digest is HMAC-SHA256
+  under the cluster's secret, cut to 16 bytes, of the file on disk (`src/cluster/file_digests.cee`).
+- **`cluster-status` asks every node:**
+  - it adds `# files agree`, or `# file-differs <option>` with each node's digest (`-` for a file not given);
+  - it names the nodes that did not answer with `# no-answer`.
+- **ADR-0096 §6 amended:** the digests are in the status answer, not the peer handshake. Only the operator reads
+  them, and the peer protocol is unchanged.
+- **Tests:**
+  - `nodeFileDigestsCompared`;
+  - the cluster smoke restarts a node with a roles file of its own, and `cluster-status` names it;
+  - 393 unit tests, the S3 smoke, the cluster smoke (170) and the SDK matrix pass.
+- **CeeSafe:** G39 (`borrow x` of an optional against `borrow T?`).
+- **Next:** slice 5, the exit review.
