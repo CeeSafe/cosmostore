@@ -716,7 +716,9 @@ aws s3api delete-bucket --bucket cors > /dev/null 2>&1 && pass "delete-bucket af
 
 # Event notifications (ADR-0048): the rules, events at a webhook, and none lost while it is down or over a kill.
 events() { wc -l < hook.out | tr -d ' '; }
-wait_events() { n=0; while [ "$(events)" -lt "$1" ] && [ "$n" -lt 150 ]; do sleep 0.1; n=$((n + 1)); done; events; }
+# Up to 35 s: a delivery backs off 1, 2, 4, 8, 16 s while the webhook is down (DELIVERY_RETRY_MS), so the one that
+# finds it back can come up to 16 s after it is; on a slow runner the wait must cover that.
+wait_events() { n=0; while [ "$(events)" -lt "$1" ] && [ "$n" -lt 350 ]; do sleep 0.1; n=$((n + 1)); done; events; }
 event() { tail -1 hook.out | python3 -c 'import json,sys; r=json.load(sys.stdin)["Records"][0]; o=r["s3"]["object"]; print(r["eventName"], r["s3"]["bucket"]["name"], o["key"], o.get("size"), r["s3"]["configurationId"])'; }
 stat() { aws s3api get-object --bucket _cosmostore --key stats stats.json > /dev/null 2>&1; python3 -c 'import json,sys; print(json.load(open("stats.json"))[sys.argv[1]])' "$1"; }
 rules() { aws s3api put-bucket-notification-configuration --bucket notify --notification-configuration "$1"; }
