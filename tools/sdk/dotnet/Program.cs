@@ -411,7 +411,11 @@ foreach (var sessions in new[] { false })
     await tail.PutObjectAsync(new PutObjectRequest { BucketName = "sdk-net-tail", Key = "ia", ContentBody = "x", StorageClass = S3StorageClass.StandardInfrequentAccess });
     var tailHead = await tail.GetObjectMetadataAsync("sdk-net-tail", "ia");
     Check("a storage class recorded", tailHead.StorageClass?.Value, "STANDARD_IA");
-    Check("an archive class refused", await CodeOf(() => tail.PutObjectAsync(new PutObjectRequest { BucketName = "sdk-net-tail", Key = "g", ContentBody = "x", StorageClass = S3StorageClass.Glacier })), "InvalidStorageClass");
+    // An archive class (ADR-0102): taken; its read InvalidObjectState until restored.
+    await tail.PutObjectAsync(new PutObjectRequest { BucketName = "sdk-net-tail", Key = "g", ContentBody = "x", StorageClass = S3StorageClass.Glacier });
+    Check("an archive class taken", (await tail.GetObjectMetadataAsync("sdk-net-tail", "g")).StorageClass?.Value, "GLACIER");
+    Check("its read refused, not restored", await CodeOf(() => tail.GetObjectAsync("sdk-net-tail", "g")), "InvalidObjectState");
+    await tail.DeleteObjectAsync("sdk-net-tail", "g");
     await tail.DeleteObjectAsync("sdk-net-tail", "ia");
     await tail.DeleteBucketAsync("sdk-net-tail");
 }

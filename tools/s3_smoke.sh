@@ -300,7 +300,7 @@ aws s3api put-bucket-lifecycle-configuration --bucket smoke --lifecycle-configur
   {"ID":"logs","Filter":{"Prefix":"logs/"},"Status":"Enabled","Expiration":{"Days":30}},
   {"ID":"uploads","Filter":{"Prefix":""},"Status":"Enabled","AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}' > /dev/null 2>&1
 check "lifecycle rules" "$(aws s3api get-bucket-lifecycle-configuration --bucket smoke --query 'Rules[].[ID,Expiration.Days,AbortIncompleteMultipartUpload.DaysAfterInitiation]' --output text | tr '\t\n' ' ;')" "logs 30 None;uploads None 7;"
-check "a transition to an archive class refused (ADR-0090 §2)" "$(code s3api put-bucket-lifecycle-configuration --bucket smoke --lifecycle-configuration '{"Rules":[{"ID":"t","Filter":{"Prefix":""},"Status":"Enabled","Transitions":[{"Days":1,"StorageClass":"GLACIER"}]}]}')" InvalidStorageClass
+check "a transition to a class not kept here refused (ADR-0090 §2)" "$(code s3api put-bucket-lifecycle-configuration --bucket smoke --lifecycle-configuration '{"Rules":[{"ID":"t","Filter":{"Prefix":""},"Status":"Enabled","Transitions":[{"Days":1,"StorageClass":"SHELF"}]}]}')" InvalidStorageClass
 aws s3api put-bucket-lifecycle-configuration --bucket smoke --lifecycle-configuration '{"Rules":[
   {"ID":"old","Filter":{"Prefix":"docs/"},"Status":"Enabled","NoncurrentVersionExpiration":{"NoncurrentDays":30,"NewerNoncurrentVersions":3}},
   {"ID":"markers","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"ExpiredObjectDeleteMarker":true}}]}' > /dev/null 2>&1
@@ -1487,8 +1487,14 @@ check "and listed" "$(aws s3api list-objects-v2 --bucket classes --query 'Conten
 check "and in its versions" "$(aws s3api list-object-versions --bucket classes --query 'Versions[0].StorageClass' --output text 2>&1)" STANDARD_IA
 aws s3api put-object --bucket classes --key std --body dir.txt --storage-class STANDARD > /dev/null 2>&1
 check "STANDARD is not named on the object" "$(aws s3api head-object --bucket classes --key std --query StorageClass --output text 2>&1)" None
-check "an archive class refused" "$(code s3api put-object --bucket classes --key g --body dir.txt --storage-class GLACIER)" InvalidStorageClass
-check "and an unknown one" "$(code s3api put-object --bucket classes --key g --body dir.txt --storage-class SHELF)" InvalidStorageClass
+# The archive classes (ADR-0102): taken; their reads, and copies from them, InvalidObjectState until restored.
+check "an archive class taken" "$(aws s3api put-object --bucket classes --key g --body dir.txt --storage-class GLACIER --query ETag --output text 2>&1 | tr -d '"' | wc -c | tr -d ' ')" 33
+check "and named on the object" "$(aws s3api head-object --bucket classes --key g --query StorageClass --output text 2>&1)" GLACIER
+check "its read refused, not restored" "$(code s3api get-object --bucket classes --key g "$work/g.out")" InvalidObjectState
+check "a copy from it refused" "$(code s3api copy-object --bucket classes --key g2 --copy-source classes/g)" InvalidObjectState
+aws s3api put-object --bucket classes --key deep --body dir.txt --storage-class DEEP_ARCHIVE > /dev/null 2>&1
+check "DEEP_ARCHIVE too" "$(code s3api get-object --bucket classes --key deep "$work/g.out")" InvalidObjectState
+check "and an unknown class refused" "$(code s3api put-object --bucket classes --key g --body dir.txt --storage-class SHELF)" InvalidStorageClass
 check "a bucket that is not there, before the class (M12 review)" "$(code s3api put-object --bucket no-such-classes --key g --body dir.txt --storage-class GLACIER)" NoSuchBucket
 aws s3api copy-object --bucket classes --key ia --copy-source classes/ia --storage-class ONEZONE_IA > /dev/null 2>&1
 check "a copy onto itself changes only its class" "$(aws s3api head-object --bucket classes --key ia --query StorageClass --output text 2>&1)" ONEZONE_IA
@@ -1498,11 +1504,11 @@ check "a copy takes the request's class, not the source's" "$(aws s3api head-obj
 up=$(aws s3api create-multipart-upload --bucket classes --key mp --storage-class GLACIER_IR --query UploadId --output text 2>&1)
 check "an upload's class listed" "$(aws s3api list-multipart-uploads --bucket classes --query 'Uploads[0].StorageClass' --output text 2>&1)" GLACIER_IR
 aws s3api abort-multipart-upload --bucket classes --key mp --upload-id "$up" > /dev/null 2>&1
-for k in ia std copied; do aws s3api delete-object --bucket classes --key "$k" > /dev/null 2>&1; done
-# Lifecycle transitions (ADR-0090 §2): taken to the classes kept here, refused to the archive ones.
+for k in ia std copied g deep; do aws s3api delete-object --bucket classes --key "$k" > /dev/null 2>&1; done
+# Lifecycle transitions (ADR-0090 §2): taken to the classes kept here, the archive ones too (ADR-0102).
 aws s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-configuration '{"Rules":[{"ID":"tiers","Status":"Enabled","Filter":{"Prefix":"logs/"},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"},{"Days":90,"StorageClass":"GLACIER_IR"}],"NoncurrentVersionTransitions":[{"NoncurrentDays":30,"StorageClass":"ONEZONE_IA","NewerNoncurrentVersions":2}]}]}' > /dev/null 2>&1 && pass "lifecycle transitions taken" || fail "lifecycle transitions taken"
 check "and returned" "$(aws s3api get-bucket-lifecycle-configuration --bucket classes --query 'Rules[0].[Transitions[1].StorageClass,NoncurrentVersionTransitions[0].NewerNoncurrentVersions]' --output text 2>&1)" "GLACIER_IR	2"
-check "a transition to an archive class refused" "$(code s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-configuration '{"Rules":[{"ID":"g","Status":"Enabled","Filter":{},"Transitions":[{"Days":30,"StorageClass":"GLACIER"}]}]}')" InvalidStorageClass
+aws s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-configuration '{"Rules":[{"ID":"g","Status":"Enabled","Filter":{"Prefix":"archive/"},"Transitions":[{"Days":30,"StorageClass":"GLACIER"},{"Days":180,"StorageClass":"DEEP_ARCHIVE"}]}]}' > /dev/null 2>&1 && pass "transitions to the archive classes taken" || fail "transitions to the archive classes taken"
 check "and to infrequent access before 30 days" "$(code s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-configuration '{"Rules":[{"ID":"i","Status":"Enabled","Filter":{},"Transitions":[{"Days":7,"StorageClass":"STANDARD_IA"}]}]}')" InvalidArgument
 check "the bucket's transition minimum answered" "$(aws s3api get-bucket-lifecycle-configuration --bucket classes --query TransitionDefaultMinimumObjectSize --output text 2>&1)" varies_by_storage_class
 check "a transition minimum S3 has not refused" "$(code s3api put-bucket-lifecycle-configuration --bucket classes --transition-default-minimum-object-size bogus --lifecycle-configuration '{"Rules":[{"ID":"tiers","Status":"Enabled","Filter":{},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"}]}]}')" InvalidArgument

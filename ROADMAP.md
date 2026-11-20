@@ -4353,3 +4353,18 @@ Browser form uploads with a SigV4 POST policy.
   - RestoreObject answers 202, 409 or 200;
   - `--restore-hour-seconds` scales the times.
 - **Next:** slice 1, the classes.
+
+### 20 Nov 2026: M18 slice 1, the archive classes (ADR-0102 §1 to §3)
+
+- **GLACIER and DEEP_ARCHIVE are stored classes,** after GLACIER_IR in the waterfall. They are taken on writes,
+  copies, uploads, POST forms, replication's class and lifecycle transitions.
+- **`readableNow`** (`src/s3/restore.cee`): an archive class reads only from its restore's ready time to its expiry,
+  kept in `x-cosmo-restore` (written from slice 2).
+  - **What is refused, 403 InvalidObjectState:** GetObject, CopyObject from the version, and UploadPartCopy from
+    it.
+  - **What is not:** HEAD and listings.
+- **New codes:** InvalidObjectState (403), and RestoreAlreadyInProgress (409) for slice 2.
+- **The checks that expected refusal** now check the class taken and its read refused (the S3 and cluster smokes,
+  the five SDKs). Unit tests that checked refusal use an unknown class.
+- **Tests:** `archivedVersionsReadOnlyWhileRestored`. 409 unit tests, both smokes (179) and the SDK matrix pass.
+- **Next:** slice 2, RestoreObject.

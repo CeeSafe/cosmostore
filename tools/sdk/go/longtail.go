@@ -20,7 +20,11 @@ func longTail(ctx context.Context, cfg aws.Config) {
 	check("a storage class recorded", string(head.StorageClass), "STANDARD_IA")
 	_, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: b, Key: aws.String("g"), Body: bytes.NewReader([]byte("x")),
 		StorageClass: types.StorageClassGlacier})
-	check("an archive class refused", codeOf(err), "InvalidStorageClass")
+	// An archive class (ADR-0102): taken; its read InvalidObjectState until restored.
+	check("an archive class taken", codeOf(err), "no error")
+	_, err = c.GetObject(ctx, &s3.GetObjectInput{Bucket: b, Key: aws.String("g")})
+	check("its read refused, not restored", codeOf(err), "InvalidObjectState")
+	must(c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: b, Key: aws.String("g")}))
 	must(c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: b, Key: aws.String("ia")}))
 	must(c.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: b}))
 }

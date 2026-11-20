@@ -1,0 +1,36 @@
+// Archive storage classes (ADR-0102): GLACIER and DEEP_ARCHIVE versions keep their bytes where they are, and read only
+// while restored. A restore's state is two times in the version's metadata, when it is ready and when it expires;
+// each request decides by them, so nothing runs in the background to finish a restore or end one.
+
+/// The metadata field a restore's state is kept in (ADR-0102 §4): `<ready ms> <expiry ms>`.
+const RESTORE_FIELD: StringView = "x-cosmo-restore";
+
+/// Whether a class is an archive one, whose reads need a restore.
+fn isArchiveClass(value: Slice<u8>) -> bool => value == "GLACIER".bytes() || value == "DEEP_ARCHIVE".bytes();
+
+/// A restore's state, as kept.
+struct RestoreState {
+    readyMs: i64;
+    expiryMs: i64;
+}
+
+/// The state a version's metadata keeps, if it has one.
+fn restoreStateOf(metadata: Slice<u8>) -> RestoreState? {
+    let value = metadataFind(metadata, RESTORE_FIELD.bytes()) ?? { return null; };
+    let text = StringView.fromUtf8(value) ?? { return null; };
+    let space = text.indexOf(" ") ?? { return null; };
+    let ready = text[0..space].parseInt<i64>() ?? { return null; };
+    let expiry = text[space + 1..].parseInt<i64>() ?? { return null; };
+    return Some(RestoreState { readyMs: ready, expiryMs: expiry });
+}
+
+/// Whether a version's bytes may be read at `nowMs` (ADR-0102 §3, §4): any class but an archive one; an archive one
+/// only from its restore's ready time to its expiry.
+fn readableNow(metadata: Slice<u8>, nowMs: i64) -> bool {
+    let stored = metadataFind(metadata, STORAGE_CLASS_FIELD.bytes()) ?? { return true; };
+    if (!isArchiveClass(stored)) { return true; }
+    return match (restoreStateOf(metadata)) {
+        Some(s) => s.readyMs <= nowMs && nowMs < s.expiryMs,
+        null => false,
+    };
+}

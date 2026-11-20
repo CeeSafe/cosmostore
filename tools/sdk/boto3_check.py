@@ -727,8 +727,11 @@ client().delete_bucket(Bucket="sdk-py-users")
 client().create_bucket(Bucket="sdk-py-tail")
 client().put_object(Bucket="sdk-py-tail", Key="ia", Body=b"x", StorageClass="STANDARD_IA")
 check("a storage class recorded", client().head_object(Bucket="sdk-py-tail", Key="ia").get("StorageClass"), "STANDARD_IA")
-check("an archive class refused", code_of(lambda: client().put_object(Bucket="sdk-py-tail", Key="g", Body=b"x", StorageClass="GLACIER")),
-      "InvalidStorageClass")
+# An archive class (ADR-0102): taken; its read InvalidObjectState until restored.
+client().put_object(Bucket="sdk-py-tail", Key="g", Body=b"x", StorageClass="GLACIER")
+check("an archive class taken", client().head_object(Bucket="sdk-py-tail", Key="g").get("StorageClass"), "GLACIER")
+check("its read refused, not restored", code_of(lambda: client().get_object(Bucket="sdk-py-tail", Key="g")), "InvalidObjectState")
+client().delete_object(Bucket="sdk-py-tail", Key="g")
 client().delete_object(Bucket="sdk-py-tail", Key="ia")
 client().delete_bucket(Bucket="sdk-py-tail")
 sys.exit(1 if failed else 0)

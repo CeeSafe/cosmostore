@@ -506,7 +506,8 @@ on 1 s3api create-bucket --bucket tail-c > /dev/null 2>&1
 on 2 s3api put-object --bucket tail-c --key ia --body one.txt --storage-class STANDARD_IA > /dev/null 2>&1
 check "a storage class through node 2, seen through node 3" "$(on 3 s3api head-object --bucket tail-c --key ia --query StorageClass --output text 2>&1)" STANDARD_IA
 check "and listed through node 1" "$(on 1 s3api list-objects-v2 --bucket tail-c --query 'Contents[0].StorageClass' --output text 2>&1)" STANDARD_IA
-check "an archive class refused through node 3" "$(code 3 s3api put-object --bucket tail-c --key g --body one.txt --storage-class GLACIER)" InvalidStorageClass
+on 3 s3api put-object --bucket tail-c --key g --body one.txt --storage-class GLACIER > /dev/null 2>&1
+check "an archive class taken through node 3, its read refused through node 1" "$(code 1 s3api get-object --bucket tail-c --key g g.out)" InvalidObjectState
 on 1 s3api put-bucket-lifecycle-configuration --bucket tail-c --lifecycle-configuration '{"Rules":[{"ID":"tiers","Status":"Enabled","Filter":{},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"}]}]}' > /dev/null 2>&1
 check "lifecycle transitions through node 1, read through node 2" "$(on 2 s3api get-bucket-lifecycle-configuration --bucket tail-c --query 'Rules[0].Transitions[0].StorageClass' --output text 2>&1)" STANDARD_IA
 tu1=$(on 3 s3api create-multipart-upload --bucket tail-c --key logs/a --query UploadId --output text 2>&1)

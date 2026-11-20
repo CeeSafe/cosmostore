@@ -346,7 +346,11 @@ for (const sessions of [true, false]) {
   await s3t.send(new CreateBucketCommand({ Bucket: "sdk-js-tail" }));
   await s3t.send(new PutObjectCommand({ Bucket: "sdk-js-tail", Key: "ia", Body: "x", StorageClass: "STANDARD_IA" }));
   check("a storage class recorded", (await s3t.send(new HeadObjectCommand({ Bucket: "sdk-js-tail", Key: "ia" }))).StorageClass, "STANDARD_IA");
-  check("an archive class refused", await codeOf(s3t.send(new PutObjectCommand({ Bucket: "sdk-js-tail", Key: "g", Body: "x", StorageClass: "GLACIER" }))), "InvalidStorageClass");
+  // An archive class (ADR-0102): taken; its read InvalidObjectState until restored.
+  await s3t.send(new PutObjectCommand({ Bucket: "sdk-js-tail", Key: "g", Body: "x", StorageClass: "GLACIER" }));
+  check("an archive class taken", (await s3t.send(new HeadObjectCommand({ Bucket: "sdk-js-tail", Key: "g" }))).StorageClass, "GLACIER");
+  check("its read refused, not restored", await codeOf(s3t.send(new GetObjectCommand({ Bucket: "sdk-js-tail", Key: "g" }))), "InvalidObjectState");
+  await s3t.send(new DeleteObjectCommand({ Bucket: "sdk-js-tail", Key: "g" }));
   await s3t.send(new DeleteObjectCommand({ Bucket: "sdk-js-tail", Key: "ia" }));
   await s3t.send(new DeleteBucketCommand({ Bucket: "sdk-js-tail" }));
 }
