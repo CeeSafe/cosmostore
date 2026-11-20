@@ -4224,3 +4224,19 @@ Browser form uploads with a SigV4 POST policy.
   holds the store's lock for a walk of every version (M15's B1).
 - **Tests:** `sealedCountsFollowTheIndex` (an overwrite, one without an envelope, a version deleted, the journal
   replayed, a checkpoint loaded). 401 unit tests and both smokes pass.
+
+### 20 Nov 2026: M17 slice 2, the re-wrap record (ADR-0100 §2)
+
+- **SetTags format 5** (`SET_ENVELOPE_FORMAT`) sets a version's SSE-S3 envelope when its generation still matches.
+  Its bytes, generation and ETag stay. A KMS or SSE-C value is refused at decode.
+- **Its replay** moves the version's count in the index from the old key's prefix to the new one's.
+- **The store's calls:**
+  - `rewrapStep` pages through the index for SSE-S3 versions under another key than the one kept;
+  - `stageRewrap` stages a record only if the version's envelope is still the one read.
+- **Tests:**
+  - `rewrapsMoveEnvelopesNotBytes`: bytes, generation and MD5 as they were; a stale envelope left; KMS refused;
+    counts after the journal and after a checkpoint;
+  - the fault sweep `rewrapFaults{Once,Sticky,Torn,Crash}` (ADR-0004): every recovered version is the bytes put,
+    under the old envelope or the new one, and the counts match.
+- **Checks:** 406 unit tests and both smokes pass.
+- **No downgrade past it:** an older binary cannot open a store with a format-5 record.

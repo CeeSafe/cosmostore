@@ -796,14 +796,44 @@ fn applyRecord(
             let versionId = m.versionId;
             // The record's later formats set the version's ACL (ADR-0045) or lock (ADR-0047).
             let field = setTagsField(m.format);
+            // A re-wrap (ADR-0100 §2) moves the version's count from its old envelope's key to the new one's.
+            var movedFrom: Vector<u8>? = null;
             match (state.index.findMut(borrow key, versionId)) {
                 Some(v) => {
                     if (v.lsn == generation) {
+                        if (m.format == SET_ENVELOPE_FORMAT) {
+                            match (envelopePrefixOf(v)) {
+                                Some(p) => {
+                                    movedFrom = match (copyBytes(p)) {
+                                        Ok(c) => Some(c),
+                                        Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
+                                    };
+                                }
+                                null => {}
+                            }
+                        }
                         v.metadata = match (metadataReplace(v.metadata.view(), field.bytes(), tags.view())) {
                             Ok(b) => b,
                             Err(_) => { return Err(StoreError.BadMeta(segment, offset)); }
                         };
                     }
+                }
+                null => {}
+            }
+            match (movedFrom) {
+                Some(from) => {
+                    var dots = 0;
+                    var end = tags.length;
+                    for (i in 0..tags.length) {
+                        if (tags[i] == '.') {
+                            dots += 1;
+                            if (dots == 3) {
+                                end = i + 1;
+                                break;
+                            }
+                        }
+                    }
+                    state.index.envelopeMoved(from.view(), tags.view()[0..end]);
                 }
                 null => {}
             }
@@ -1433,6 +1463,20 @@ const ABANDONED_CAPACITY: usize = 4096;
 
 /// What a scrub step found damaged (ADR-0063): an extent (`extent`, its `id`), or an inline version's record (where it
 /// is: `segment`, `offset`, `length`), and the version it belongs to.
+/// A version to re-wrap (ADR-0100 §3): where it is, and its envelope as read.
+struct RewrapItem {
+    bucket: Vector<u8>;
+    key: Vector<u8>;
+    versionId: [u8; 16];
+    envelope: Vector<u8>;
+}
+
+/// A step of the re-wrap pass: the versions found, and where the next step starts (null: the index's end).
+struct RewrapPage {
+    items: Vector<RewrapItem>;
+    next: IndexKey?;
+}
+
 struct ScrubDamage {
     extent: bool;
     bucket: Vector<u8>;
@@ -6203,6 +6247,77 @@ struct ObjectStore {
             Err(_) => { return Ok(Vector<u8>.create()); }
         };
         return Ok(copyBytes(replicaClassFor(rules.view(), ruleIds, destination))?);
+    }
+
+    /// Up to `max` keys after `after` (from the first when null): their versions sealed by SSE-S3 under a master key
+    /// other than the one `keep` names (`v1.s3.<id>.`), to re-wrap under it (ADR-0100 §3).
+    fn rewrapStep(
+        borrow this,
+        keep: Slice<u8>,
+        after: borrow (IndexKey?),
+        max: usize,
+    ) -> Result<RewrapPage, StoreError> {
+        var page = RewrapPage { items: Vector<RewrapItem>.create(), next: null };
+        var cursor = match (after.asBorrow()) {
+            Some(k) => this.state.index.seekAfter(k),
+            null => this.state.index.first(),
+        };
+        var seen = 0usize;
+        while (seen < max) {
+            let i = match (cursor) {
+                Some(c) => c,
+                null => { break; }
+            };
+            cursor = this.state.index.next(i);
+            seen += 1;
+            let k = this.state.index.keyAt(i);
+            if (seen == max && cursor.isSome()) { page.next = copyIndexKey(k)?; }
+            var slot = this.state.index.slotAt(i);
+            while (slot != NO_VERSION_SLOT) {
+                let v = this.state.index.versionAt(slot);
+                match (metadataFind(v.metadata.view(), SSE_FIELD.bytes())) {
+                    Some(e) => {
+                        if (startsWithBytes(e, "v1.s3.".bytes()) && !startsWithBytes(e, keep)) {
+                            page.items.push(RewrapItem {
+                                bucket: copyBytes(this.state.bucketName(k.bucket))?,
+                                key: copyBytes(k.key.view())?,
+                                versionId: v.versionId,
+                                envelope: copyBytes(e)?,
+                            })?;
+                        }
+                    }
+                    null => {}
+                }
+                slot = this.state.index.olderOf(slot);
+            }
+        }
+        return Ok(page);
+    }
+
+    /// A re-wrap's record staged (ADR-0100 §2): the version's envelope set to `envelope`, if it is still `from` (the
+    /// envelope it was read with, so a version changed since is left). False when it was not staged. The pass commits
+    /// a batch together.
+    fn stageRewrap(
+        borrow mut this,
+        bucket: StringView,
+        key: StringView,
+        id: [u8; 16],
+        from: Slice<u8>,
+        envelope: Slice<u8>,
+    ) -> Result<bool, StoreError> {
+        if (!isRewrapValue(envelope)) { return Err(StoreError.InvalidKey); }
+        if (!this.state.hasBucket(bucket.bytes())?) { return Ok(false); }
+        let k = this.state.keyFor(bucket.bytes(), key.bytes())?;
+        let current = match (this.state.index.find(borrow k, id)) {
+            Some(v) => match (metadataFind(v.metadata.view(), SSE_FIELD.bytes())) {
+                Some(e) => e == from,
+                null => false,
+            },
+            null => false,
+        };
+        if (!current) { return Ok(false); }
+        this.stageFieldOf(bucket, key, Some(id), envelope, SET_ENVELOPE_FORMAT)?;
+        return Ok(true);
     }
 
     /// How many versions, and uploads in progress, have a metadata field `field` whose value starts with `prefix`: the

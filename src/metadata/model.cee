@@ -337,6 +337,20 @@ const SET_ACL_FORMAT: u8 = 2;
 const SET_LOCK_FORMAT: u8 = 3;
 /// A SetTags record that sets a version's storage class (ADR-0090 §2): a lifecycle transition.
 const SET_CLASS_FORMAT: u8 = 4;
+/// A SetTags record that sets a version's SSE-S3 envelope (ADR-0100 §2): its data key re-wrapped under another
+/// master key, its bytes untouched.
+const SET_ENVELOPE_FORMAT: u8 = 5;
+
+/// Whether a value is one a re-wrap may set: an SSE-S3 envelope (`v1.s3.<id>.<nonce>.<wrapped>`), never KMS's or
+/// SSE-C's.
+fn isRewrapValue(value: Slice<u8>) -> bool {
+    if (value.length < 7 || value[0..6] != "v1.s3.".bytes()) { return false; }
+    var dots = 0;
+    for (i in 0..value.length) {
+        if (value[i] == '.') { dots += 1; }
+    }
+    return dots >= 4;
+}
 
 /// The storage classes an object may record (ADR-0090 §1), in S3's waterfall order: a transition only moves an
 /// object later in it. STANDARD is not recorded (an empty value).
@@ -365,7 +379,7 @@ fn storageClassRank(value: Slice<u8>) -> u32 {
 /// The metadata field a SetTags record of `format` sets.
 fn setTagsField(format: u8) -> StringView =>
     if (format == SET_ACL_FORMAT) ACL_FIELD else if (format == SET_LOCK_FORMAT) LOCK_FIELD else if (format ==
-        SET_CLASS_FORMAT) STORAGE_CLASS_FIELD else TAGS_FIELD;
+        SET_CLASS_FORMAT) STORAGE_CLASS_FIELD else if (format == SET_ENVELOPE_FORMAT) ENVELOPE_FIELD else TAGS_FIELD;
 
 /// SetTags meta v2, v3 and v4: as v1 with format 2, 3 or 4, and the last field is the version's ACL, its object lock,
 /// or its storage class, as it is stored (empty: the private ACL; no lock; STANDARD) in place of its tags.
@@ -402,7 +416,8 @@ fn decodeSetTagsMeta(bytes: Slice<u8>) -> Result<SetTagsMeta, MetaFault> {
     var at: usize = 0;
     need(bytes, at, 1)?;
     let format = bytes[at];
-    if (format == SET_ACL_FORMAT || format == SET_LOCK_FORMAT || format == SET_CLASS_FORMAT) {
+    if (format == SET_ACL_FORMAT || format == SET_LOCK_FORMAT || format == SET_CLASS_FORMAT ||
+        format == SET_ENVELOPE_FORMAT) {
         at += 1;
     } else {
         checkVersion(bytes, mut at)?;
@@ -416,6 +431,7 @@ fn decodeSetTagsMeta(bytes: Slice<u8>) -> Result<SetTagsMeta, MetaFault> {
     if (format == SET_ACL_FORMAT && !isAclValue(tags.view())) { return Err(MetaFault.TooLong); }
     if (format == SET_LOCK_FORMAT && decodeLock(tags.view()).isNull()) { return Err(MetaFault.TooLong); }
     if (format == SET_CLASS_FORMAT && !isStoredClassValue(tags.view())) { return Err(MetaFault.TooLong); }
+    if (format == SET_ENVELOPE_FORMAT && !isRewrapValue(tags.view())) { return Err(MetaFault.TooLong); }
     return Ok(SetTagsMeta {
         bucket: bucket,
         key: key,

@@ -1,0 +1,193 @@
+// The re-wrap record (ADR-0100 §2): SetTags format 5 sets a version's SSE-S3 envelope, its bytes and generation
+// untouched, and the index's counts move with it; its fault sweep (ADR-0004).
+
+const REWRAP_OLD: StringView = "v1.s3.k2.000000000000000000000000.0000";
+const REWRAP_NEW: StringView = "v1.s3.k3.111111111111111111111111.1111";
+
+fn rewrapKey(k: usize) -> StringView => match (k) {
+    0 => "inline",
+    1 => "extent",
+    _ => "bigger",
+};
+
+/// The keys' sizes: inline, one extent, two extents (faultStoreConfig: inline to 16 KiB, extents of 64 KiB).
+fn rewrapSize(k: usize) -> usize => match (k) {
+    0 => 1000,
+    1 => 40000,
+    _ => 100000,
+};
+
+fn putSealedSeed(s: borrow mut ObjectStore, k: usize) -> Result<void, StoreError> {
+    var meta = Vector<u8>.create();
+    metadataAdd(mut meta, SSE_FIELD.bytes(), REWRAP_OLD.bytes())?;
+    let obj = s.writeAll(patterned(rewrapSize(k), truncate<u64>(k) + 1).view())?;
+    let _ = s.putFinishedWith("bkt", rewrapKey(k), "", meta.view(), "".bytes(), borrow obj, PutCondition.None)?;
+    return Ok();
+}
+
+/// The envelope a key's current version carries, if it has one.
+fn envelopeOf(s: borrow ObjectStore, k: usize) -> Vector<u8>? {
+    let info = s.headObject("bkt", rewrapKey(k)).ok() ?? { return null; };
+    return match (metadataFind(info.metadata.view(), SSE_FIELD.bytes())) {
+        Some(e) => copyBytes(e).ok(),
+        null => null,
+    };
+}
+
+/// A version moved, its bytes and generation as they were; the counts moved with it; a stale `from` is left; a KMS
+/// envelope is not one to set; and all of it after the journal is replayed and after a checkpoint.
+@test
+fn rewrapsMoveEnvelopesNotBytes() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("rewrap");
+    {
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        s.createBucket("bkt")!;
+        for (k in 0..3) { putSealedSeed(mut s, k)!; }
+        // A KMS version too: never one to re-wrap.
+        var kms = Vector<u8>.create();
+        metadataAdd(mut kms, SSE_FIELD.bytes(), "v1.kms.k2.00.00".bytes())!;
+        let obj = s.writeAll("kms".bytes())!;
+        let _ = s.putFinishedWith("bkt", "kms", "", kms.view(), "".bytes(), borrow obj, PutCondition.None)!;
+        let before = s.headObject("bkt", "extent")!;
+        let none: IndexKey? = null;
+        let page = s.rewrapStep("v1.s3.k3.".bytes(), borrow none, 100)!;
+        Check.equalU64(3, page.items.length as u64)?;
+        for (i in 0..page.items.length) {
+            let it = borrow page.items[i];
+            Check.isTrue(
+                s.stageRewrap(
+                    catalogText(it.bucket.view()),
+                    catalogText(it.key.view()),
+                    it.versionId,
+                    it.envelope.view(),
+                    REWRAP_NEW.bytes(),
+                )!,
+                "staged",
+            )?;
+        }
+        let _ = s.commitStaged()!;
+        // A stale `from`, and a KMS value, are not set.
+        let id = s.headObject("bkt", "inline")!.versionId;
+        Check.isFalse(s.stageRewrap("bkt", "inline", id, REWRAP_OLD.bytes(), REWRAP_NEW.bytes())!, "a stale from")?;
+        Check.isTrue(s.stageRewrap("bkt", "inline", id, REWRAP_NEW.bytes(), "v1.kms.k3.00.00".bytes()).isErr(), "KMS")?;
+        let after = s.headObject("bkt", "extent")!;
+        Check.equalU64(before.generation, after.generation)?;
+        Check.equalBytes(before.md5[..], after.md5[..])?;
+        Check.equalBytes(patterned(rewrapSize(1), 2).view(), s.getObject("bkt", "extent")!.view())?;
+    }
+    for (round in 0..2) {
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        for (k in 0..3) { Check.equalBytes(REWRAP_NEW.bytes(), envelopeOf(borrow s, k)!.view())?; }
+        Check.equalU64(0, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k2.".bytes())!)?;
+        Check.equalU64(3, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k3.".bytes())!)?;
+        Check.equalU64(1, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.kms.k2.".bytes())!)?;
+        if (round == 0) { s.checkpoint()!; }
+    }
+    return Ok();
+}
+
+/// The workload: three sealed versions put, then all three re-wrapped in one batch. Each step's outcome is not
+/// modelled: the check takes any version's envelope as old or new, and its bytes as the ones put.
+fn rewrapWorkload(dir: StringView) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    if (s.createBucket("bkt").isErr()) { return; }
+    for (k in 0..3) {
+        if (putSealedSeed(mut s, k).isErr()) { return; }
+    }
+    let none: IndexKey? = null;
+    let page = match (s.rewrapStep("v1.s3.k3.".bytes(), borrow none, 100)) {
+        Ok(p) => p,
+        Err(_) => { return; }
+    };
+    for (i in 0..page.items.length) {
+        let it = borrow page.items[i];
+        if (s.stageRewrap(
+            catalogText(it.bucket.view()),
+            catalogText(it.key.view()),
+            it.versionId,
+            it.envelope.view(),
+            REWRAP_NEW.bytes(),
+        ).isErr()) {
+            return;
+        }
+    }
+    let _ = s.commitStaged();
+}
+
+/// A store recovered from a faulted run: each key it has holds the bytes put, under the old envelope or the new one,
+/// and the counts are what the envelopes say.
+fn checkRewrapped(s: borrow mut ObjectStore) -> Result<void, TestFailure> {
+    if (!s.bucketExists("bkt")!) { return Ok(); }
+    var olds: u64 = 0;
+    var news: u64 = 0;
+    for (k in 0..3) {
+        match (s.getObject("bkt", rewrapKey(k))) {
+            Ok(bytes) => {
+                Check.equalBytes(patterned(rewrapSize(k), truncate<u64>(k) + 1).view(), bytes.view())?;
+                let e = envelopeOf(s, k) ?? { return Check.fail("a sealed version without its envelope"); };
+                if (e.view() == REWRAP_OLD.bytes()) {
+                    olds += 1;
+                } else if (e.view() == REWRAP_NEW.bytes()) {
+                    news += 1;
+                } else {
+                    return Check.fail("an envelope neither old nor new");
+                }
+            }
+            Err(StoreError.NoSuchKey) => {}
+            Err(_) => { return Check.fail("a version that does not read"); }
+        }
+    }
+    Check.equalU64(olds, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k2.".bytes())!)?;
+    Check.equalU64(news, s.countFieldPrefix(SSE_FIELD.bytes(), "v1.s3.k3.".bytes())!)?;
+    return Ok();
+}
+
+fn sweepRewrap(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    Faults.countOperations();
+    rewrapWorkload(dir.view());
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 20, "the workload performs I/O")?;
+    {
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        for (k in 0..3) { Check.equalBytes(REWRAP_NEW.bytes(), envelopeOf(borrow s, k)!.view())?; }
+    }
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        armMode(borrow mode, n);
+        rewrapWorkload(dir.view());
+        Faults.disarm();
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        {
+            var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+            checkRewrapped(mut s)?;
+            let _ = s.checkpoint()!;
+        }
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        checkRewrapped(mut s)?;
+    }
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn rewrapFaultsOnce() -> Result<void, TestFailure> => sweepRewrap("rewrap-once", SweepMode.Once);
+
+@test
+fn rewrapFaultsSticky() -> Result<void, TestFailure> => sweepRewrap("rewrap-sticky", SweepMode.Sticky);
+
+@test
+fn rewrapFaultsTorn() -> Result<void, TestFailure> => sweepRewrap("rewrap-torn", SweepMode.StickyTorn);
+
+@test
+fn rewrapFaultsCrash() -> Result<void, TestFailure> => sweepRewrap("rewrap-crash", SweepMode.Crash);
