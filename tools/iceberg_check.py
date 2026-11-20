@@ -51,6 +51,10 @@ check("list_namespaces", catalog.list_namespaces(), [("sales",)])
 check("its owner kept", catalog.load_namespace_properties("sales"), {"owner": "ana"})
 schema = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("item", pa.string())])
 table = catalog.create_table("sales.orders", schema=schema)
+# Compaction (ADR-0098) is on by default; off here, so the snapshots counted below are this check's own (a cluster's
+# day is seconds, and its pass may run between them).
+tables.put_table_maintenance_configuration(tableBucketARN=arn, namespace="sales", name="orders", type="icebergCompaction",
+                                           value={"status": "disabled"})
 check("create_table: its location is its warehouse", table.location().startswith("s3://"), True)
 try:
     catalog.create_table("sales.orders", schema=schema)

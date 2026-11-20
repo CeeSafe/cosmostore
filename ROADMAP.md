@@ -4147,3 +4147,17 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** 397 unit tests, the S3 smoke (PyIceberg 23, maintenance 14, compaction 22), the cluster smoke (172)
   and the SDK matrix pass.
 - **Next:** slice 4, a cluster's shard leaders.
+
+### 20 Nov 2026: M16 slice 4, compaction on a cluster (ADR-0098 §4)
+
+- **Each shard's leader** asks its tables for compaction between snapshot management and unreferenced removal, as
+  `serve` runs them. The run is then a shard's write, through the node's front.
+- **A bug found:** a dropped table left compaction's job status behind (compaction writes one now). On a cluster,
+  that record made DeleteTableBucket a ConflictException. Every job's status now goes with its table
+  (`droppedTablesLeaveNoJobStatus`).
+- **The PyIceberg check** turns compaction off for its table. On a cluster's day of seconds, a compaction between its
+  appends changed the snapshots it counts.
+- **Tests:**
+  - the cluster smoke runs `compaction_check.py` through node 3 (22 checks), 175 in all;
+  - the S3 smoke (PyIceberg 23, maintenance 14, compaction 22) and 398 unit tests pass.
+- **Next:** slice 5, the exit review.

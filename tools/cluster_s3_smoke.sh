@@ -457,6 +457,12 @@ if [ -n "${ICEBERG_PYTHON:-}" ]; then
     else
         fail "table maintenance through node 2"; cat maintenance.out
     fi
+    # Compaction (ADR-0098 §4): asked for by each table's shard leader, as the other jobs are.
+    if "$ICEBERG_PYTHON" "$OLDPWD/tools/compaction_check.py" "http://127.0.0.1:$((BASE + 13))" 24 > compaction.out 2>&1; then
+        pass "compaction through node 3: $(grep -c '^ok' compaction.out) checks"
+    else
+        fail "compaction through node 3"; cat compaction.out
+    fi
 fi
 for t in tables-a tables-b; do on 3 s3tables delete-table-bucket --table-bucket-arn "arn:aws:s3tables:us-east-1:000000000000:bucket/$t" > /dev/null 2>&1; done
 check "deleted through node 3" "$(on 1 s3tables list-table-buckets --query 'length(tableBuckets)' 2>&1)" 0
