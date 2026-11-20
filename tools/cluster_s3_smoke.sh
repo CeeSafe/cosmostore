@@ -648,6 +648,13 @@ on 1 iam delete-user-policy --user-name ops --policy-name lists > /dev/null 2>&1
 check "the user deleted through node 3" "$(code 3 iam delete-user --user-name ops)" ""
 for i in $(seq 1 30); do [ "$(ops 2 s3api list-buckets 2>&1 | grep -c InvalidAccessKeyId)" = 1 ] && break; pause 0.5; done
 check "its key refused through node 2 after" "$(ops 2 s3api list-buckets 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9]*\)).*/\1/p')" InvalidAccessKeyId
+# The records' peer endpoint, which a node without a replica of their shard asks (ADR-0104 §4): every node here holds
+# one, so it is asked directly. Signed as nodes sign their asks, it answers `<generation>` and the record; unsigned,
+# or under another secret, it refuses (the M19 exit review: nodes' own asks were refused).
+check "/cluster/iam answers a node's signed ask" "$(python3 -I "$OLDPWD/tools/peer_get.py" cluster.conf cluster.key $((BASE + 2)) /cluster/iam | sed 's/^200 [0-9][0-9]*$/200 generation/')" "200 generation"
+check "and refuses an unsigned one" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((BASE + 2))/cluster/iam")" 403
+head -c 32 /dev/urandom | base64 > other.key
+check "and one under another secret" "$(python3 -I "$OLDPWD/tools/peer_get.py" cluster.conf other.key $((BASE + 2)) /cluster/iam | cut -d' ' -f1)" 403
 
 echo "cluster s3 smoke: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]

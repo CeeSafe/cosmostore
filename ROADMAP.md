@@ -4547,3 +4547,37 @@ Browser form uploads with a SigV4 POST policy.
   key works through every node and no further than its policy; the user is deleted through node 3 and its key
   refused after (190). The S3 smoke, the SDK matrix and 421 unit tests pass.
 - **Next:** slice 5, the exit review.
+
+### 21 Nov 2026: M19 slice 5 begun, the exit review's fixes (ADR-0104)
+
+A review by a reader who had not written the code found one High, two Mediums and several Lows, most reproduced.
+All are fixed here except the ones `docs/m19-exit-review.md` records.
+
+- **High: a copy read the hidden bucket.**
+  - `copy-object --copy-source _cosmostore-iam/state` (or `upload-part-copy`) by any user with `s3:*` wrote the
+    record, every API user's secret in it, to a bucket of theirs.
+  - The guard looked only at the request's own bucket.
+  - **Fixed:** a hidden bucket is never a copy's source, a log's target, an inventory's or replica's destination, or
+    an access point's bucket.
+- **Medium: trust policies' Condition, NotPrincipal, NotAction and wildcard actions were ignored,** which widened who
+  may assume a role.
+  - **Fixed:** `CreateRole` refuses them (MalformedPolicyDocument), and `trustAllows` fails closed on them.
+- **Medium: a node's ask of a peer's `/cluster/iam` was refused,** as its operator signature was not taken there.
+  - **Fixed:** the signature is taken there.
+  - A node also never takes records older than ones it has seen.
+- **Lows:**
+  - authorization was on the name as given, not the record's; it now uses the record's, and lists are decided
+    on `*`;
+  - PolicyName is checked;
+  - a presigned IAM request on a cluster went to shard 0, and now goes to the records' shard;
+  - the files' entries skipped for an API name are now logged, as ADR-0104 §5 says.
+- **Found by the new boto3 checks:** until the next round, a deleted API user's set entry was listed as a users
+  file's user.
+  - **Fixed:** a credential now records whether it is the API's.
+- **Tests:**
+  - the S3 smoke's regression checks for each fix;
+  - the cluster smoke asks `/cluster/iam` signed, unsigned and under another secret (193), through a new
+    `tools/peer_get.py`;
+  - boto3's IAM checks (users, keys, policies, roles, AssumeRole, deletes);
+  - 421 unit tests.
+- **Next:** the Go, Java, JS and .NET IAM checks, and the exit review.

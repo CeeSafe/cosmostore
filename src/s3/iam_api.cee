@@ -144,6 +144,16 @@ fn roleAtIam(state: borrow IamState, name: Slice<u8>) -> usize? {
     return null;
 }
 
+fn policyNameOk(name: Slice<u8>) -> bool {
+    if (name.length < 1 || name.length > 128) { return false; }
+    for (c in name) {
+        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '+' || c == '=' ||
+            c == ',' || c == '.' || c == '@' || c == '_' || c == '-';
+        if (!ok) { return false; }
+    }
+    return true;
+}
+
 fn userAt(state: borrow IamState, name: Slice<u8>) -> usize? {
     for (i in 0..state.users.length) {
         if (sameNameIgnoringCase(state.users[i].name.view(), name)) { return Some(i); }
@@ -296,7 +306,7 @@ fn applyIamCall(
             }
             // A trust policy is a policy document with statements (checked at AssumeRole, ADR-0104 §7).
             let doc = parseJson(trust.view())? ?? { return Ok(IamOutcome.MalformedPolicyDocument); };
-            if (jsonMember(borrow doc, "Statement").isNull()) { return Ok(IamOutcome.MalformedPolicyDocument); }
+            if (!trustSupported(borrow doc)) { return Ok(IamOutcome.MalformedPolicyDocument); }
             var id = copyBytes("AROA".bytes())?;
             if (!randomText(mut id, 17, IAM_ID_CHARS)?) { return Err(StoreError.DataCorrupt); }
             madeRole = Some(IamRole {
@@ -370,7 +380,7 @@ fn fileUsersOf(credentials: Slice<Credential>, state: borrow IamState) -> Result
     var out = Vector<Vector<u8>>.create();
     for (i in 0..credentials.length) {
         let c = borrow credentials[i];
-        if (c.revoked || c.user.length == 0 || userAt(state, c.user.view()).isSome()) { continue; }
+        if (c.revoked || c.fromIam || c.user.length == 0 || userAt(state, c.user.view()).isSome()) { continue; }
         var known = false;
         for (k in 0..out.length) {
             if (out[k].view() == c.userKey.view()) { known = true; }
@@ -455,6 +465,17 @@ async fn serveIam(
     if (!taken) {
         return await iamError(exchange, 400, "InvalidAction", "This IAM action is not implemented here.", requestId);
     }
+    // A policy's name, when the call takes one: 1 to 128 of IAM's characters (the M19 exit review).
+    let policyName = formText(body.view(), "PolicyName")?;
+    if (action.view().endsWith("Policy".bytes()) && !policyNameOk(policyName.view())) {
+        return await iamError(
+            exchange,
+            400,
+            "ValidationError",
+            "PolicyName is 1 to 128 of A-Z a-z 0-9 + = , . @ _ -.",
+            requestId,
+        );
+    }
     // A user's call is its identity policy's to allow, `iam:<Action>` on the user it is about.
     let credentials = app.credentials.get().view();
     let who = requesterOf(Some(caller), null);
@@ -475,7 +496,28 @@ async fn serveIam(
         var iamAction = copyBytes("iam:".bytes())?;
         iamAction.extend(action.view())?;
         var resource = copyBytes(if (roleCall) "iam:role/".bytes() else "iam:user/".bytes())?;
-        resource.extend(aboutName)?;
+        // A list is about every user or role; anything else about the record's own name, as names match ignoring
+        // case (the M19 exit review: a policy on `user/BOB` allowed acting on `bob`, and ListUsers on oneself listed
+        // everyone).
+        let listing = action.view() == "ListUsers".bytes() || action.view() == "ListRoles".bytes();
+        if (listing) {
+            resource.extend("*".bytes())?;
+        } else {
+            let snapshot = await readIamSnapshot(borrow app.store) ?? {
+                return await iamError(exchange, 500, "ServiceFailure", "The IAM records do not read.", requestId);
+            };
+            let found = if (roleCall) match (roleAtIam(borrow snapshot.state, aboutName)) {
+                Some(i) => Some(copyBytes(snapshot.state.roles[i].name.view())?),
+                null => null,
+            } else match (userAt(borrow snapshot.state, aboutName)) {
+                Some(i) => Some(copyBytes(snapshot.state.users[i].name.view())?),
+                null => null,
+            };
+            match (found) {
+                Some(n) => { resource.extend(n.view())?; }
+                null => { resource.extend(aboutName)?; }
+            }
+        }
         if (!sessionAllows(app, req, borrow who, StringView.fromUtf8(iamAction.view()) ?? "", resource.view())?) {
             return await iamError(
                 exchange,

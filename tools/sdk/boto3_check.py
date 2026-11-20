@@ -739,4 +739,59 @@ check("restored, read", client().get_object(Bucket="sdk-py-tail", Key="g")["Body
 client().delete_object(Bucket="sdk-py-tail", Key="g")
 client().delete_object(Bucket="sdk-py-tail", Key="ia")
 client().delete_bucket(Bucket="sdk-py-tail")
+
+# The IAM API (ADR-0104): a user, its key and policy made through boto3; the key signs within an upkeep round (10 s
+# here); a role made with a trust policy and assumed; everything deleted, and the key refused after.
+iam = boto3.client("iam", endpoint_url=endpoint, region_name="us-east-1")
+check("iam create_user", iam.create_user(UserName="py-dev")["User"]["UserName"], "py-dev")
+check("iam a name twice", code_of(lambda: iam.create_user(UserName="py-dev")), "EntityAlreadyExists")
+made = iam.create_access_key(UserName="py-dev")["AccessKey"]
+check("iam create_access_key", (made["AccessKeyId"][:4], len(made["SecretAccessKey"]) >= 40), ("AKIA", True))
+check("iam its secret listed nowhere", "SecretAccessKey" in iam.list_access_keys(UserName="py-dev")["AccessKeyMetadata"][0], False)
+iam.put_user_policy(UserName="py-dev", PolicyName="reads", PolicyDocument=json.dumps({"Version": "2012-10-17",
+    "Statement": {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::%s/*" % M7}}))
+check("iam get_user_policy", iam.get_user_policy(UserName="py-dev", PolicyName="reads")["PolicyDocument"]["Statement"]["Action"],
+      "s3:GetObject")
+dev = boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=made["AccessKeyId"], aws_secret_access_key=made["SecretAccessKey"],
+                   config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}, signature_version="s3v4"))
+
+
+def dev_reads():
+    try:
+        return dev.get_object(Bucket=M7, Key="logged.txt")["Body"].read()
+    except ClientError:
+        return None
+
+
+check("iam its key reads within a round", until(dev_reads, 25), b"logged")
+check("iam and no more", code_of(lambda: dev.put_object(Bucket=M7, Key="no", Body=b"no")), "AccessDenied")
+trust = {"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                                                "Action": "sts:AssumeRole"}}
+check("iam create_role", iam.create_role(RoleName="py-role", AssumeRolePolicyDocument=json.dumps(trust))["Role"]["Arn"],
+      "arn:aws:iam::000000000000:role/py-role")
+check("iam its trust read back", iam.get_role(RoleName="py-role")["Role"]["AssumeRolePolicyDocument"]["Statement"]["Principal"]["AWS"],
+      "arn:aws:iam::000000000000:root")
+iam.put_role_policy(RoleName="py-role", PolicyName="reads", PolicyDocument=json.dumps({"Version": "2012-10-17",
+    "Statement": {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::%s/*" % M7}}))
+
+
+def assumed():
+    try:
+        return sts.assume_role(RoleArn="arn:aws:iam::000000000000:role/py-role", RoleSessionName="py")["Credentials"]
+    except ClientError:
+        return None
+
+
+creds = until(assumed, 25)
+check("iam the role assumed", (creds or {}).get("AccessKeyId", "")[:4], "ASIA")
+if creds:
+    check("iam its session reads", as_creds(creds).get_object(Bucket=M7, Key="logged.txt")["Body"].read(), b"logged")
+check("iam a user with keys not deleted", code_of(lambda: iam.delete_user(UserName="py-dev")), "DeleteConflict")
+iam.delete_access_key(UserName="py-dev", AccessKeyId=made["AccessKeyId"])
+iam.delete_user_policy(UserName="py-dev", PolicyName="reads")
+iam.delete_user(UserName="py-dev")
+iam.delete_role_policy(RoleName="py-role", PolicyName="reads")
+iam.delete_role(RoleName="py-role")
+check("iam the user gone", code_of(lambda: iam.get_user(UserName="py-dev")), "NoSuchEntity")
+check("iam its key refused within a round", until(lambda: code_of(lambda: dev.get_object(Bucket=M7, Key="logged.txt")) == "InvalidAccessKeyId", 25), True)
 sys.exit(1 if failed else 0)

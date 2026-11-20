@@ -851,18 +851,22 @@ check "a key made" "$(echo "$devid" | cut -c1-4)" AKIA
 aws iam put-user-policy --user-name dev --policy-name list-smoke --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::smoke"}}' > /dev/null 2>&1 && pass "iam put-user-policy" || fail "iam put-user-policy"
 check "its policy read back" "$(aws iam get-user-policy --user-name dev --policy-name list-smoke --query 'PolicyDocument.Statement.Action' --output text 2>&1)" s3:ListBucket
 check "a policy not taken" "$(code iam put-user-policy --user-name dev --policy-name bad --policy-document '{"Statement":"nope"}')" MalformedPolicyDocument
+check "nor a policy name IAM does not take" "$(code iam put-user-policy --user-name dev --policy-name 'a/b' --policy-document '{"Statement":{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}}')" ValidationError
+# ListUsers allowed on itself only: a list is about every user, so still refused (the M19 exit review).
+aws iam put-user-policy --user-name dev --policy-name self-only --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"iam:ListUsers","Resource":"arn:aws:iam::000000000000:user/dev"}}' > /dev/null 2>&1
 check "listed" "$(aws iam list-users --query 'Users[?UserName==`dev`].UserName' --output text 2>&1)" dev
 sleep 3
 dev() { ( export AWS_ACCESS_KEY_ID="$devid" AWS_SECRET_ACCESS_KEY="$devsecret"; "$@" ); }
 check "its key lists what its policy allows" "$(dev aws s3api list-objects-v2 --bucket smoke --max-keys 1 --query KeyCount --output text 2>&1)" 1
 check "and no more" "$(dev code s3api put-object --bucket smoke --key iam.txt --body sse.txt)" AccessDenied
-check "nor calls IAM itself" "$(dev code iam list-users)" AccessDenied
+check "nor lists the users with a policy on itself" "$(dev code iam list-users)" AccessDenied
 aws iam update-access-key --user-name dev --access-key-id "$devid" --status Inactive > /dev/null 2>&1
 sleep 3
 check "an inactive key refused" "$(dev code s3api list-objects-v2 --bucket smoke)" InvalidAccessKeyId
 check "a user with keys is not deleted" "$(code iam delete-user --user-name dev)" DeleteConflict
 aws iam delete-access-key --user-name dev --access-key-id "$devid" > /dev/null 2>&1
 aws iam delete-user-policy --user-name dev --policy-name list-smoke > /dev/null 2>&1
+aws iam delete-user-policy --user-name dev --policy-name self-only > /dev/null 2>&1
 aws iam delete-user --user-name dev > /dev/null 2>&1 && pass "iam delete-user" || fail "iam delete-user"
 check "gone" "$(code iam get-user --user-name dev)" NoSuchEntity
 # IAM roles (ADR-0104 §1, §7): one made with a trust policy naming the account, given a policy, assumed through STS
@@ -872,6 +876,9 @@ check "iam create-role" "$(aws iam create-role --role-name deployer --assume-rol
 check "a roles file's name not made again" "$(code iam create-role --role-name reader --assume-role-policy-document "$trustroot")" EntityAlreadyExists
 aws iam put-role-policy --role-name deployer --policy-name list --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::smoke"}}' > /dev/null 2>&1 && pass "iam put-role-policy" || fail "iam put-role-policy"
 check "its trust read back" "$(aws iam get-role --role-name deployer --query 'Role.AssumeRolePolicyDocument.Statement.Principal.AWS' --output text 2>&1)" "arn:aws:iam::000000000000:root"
+# A trust policy with what it cannot decide (a Condition, NotPrincipal, a wildcard action) is refused, not widened.
+check "a trust policy with a Condition refused" "$(code iam create-role --role-name cond --assume-role-policy-document '{"Statement":{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole","Condition":{"StringEquals":{"aws:PrincipalArn":"arn:aws:iam::000000000000:user/nobody"}}}}')" MalformedPolicyDocument
+check "and one with a wildcard Deny" "$(code iam create-role --role-name wild --assume-role-policy-document '{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole"},{"Effect":"Deny","Principal":{"AWS":"*"},"Action":"sts:Assume*"}]}')" MalformedPolicyDocument
 aws iam create-role --role-name locked --assume-role-policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/nobody"},"Action":"sts:AssumeRole"}}' > /dev/null 2>&1
 sleep 3
 rolecreds=$(aws sts assume-role --role-arn arn:aws:iam::000000000000:role/deployer --role-session-name smoke --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)
@@ -888,6 +895,13 @@ check "the roles gone" "$(aws iam list-roles --query 'length(Roles)' --output te
 # The records' hidden bucket is no client's (ADR-0104 §3).
 check "the IAM bucket refused to S3" "$(code s3api list-objects-v2 --bucket _cosmostore-iam)" InvalidBucketName
 check "and never listed" "$(aws s3api list-buckets --query 'Buckets[?starts_with(Name, `_`)].Name' --output text 2>&1)" ""
+# Nor a copy's source (the M19 exit review: a copy read the record, every secret in it), nor any destination.
+check "nor a copy's source" "$(code s3api copy-object --bucket smoke --key leak --copy-source _cosmostore-iam/state)" InvalidBucketName
+check "nor a part copy's" "$(upid=$(aws s3api create-multipart-upload --bucket smoke --key leak --query UploadId --output text); code s3api upload-part-copy --bucket smoke --key leak --upload-id "$upid" --part-number 1 --copy-source /_cosmostore-iam/state; aws s3api abort-multipart-upload --bucket smoke --key leak --upload-id "$upid" > /dev/null 2>&1)" InvalidBucketName
+check "nothing copied" "$(code s3api head-object --bucket smoke --key leak)" 404
+check "nor a log's target" "$(code s3api put-bucket-logging --bucket smoke --bucket-logging-status '{"LoggingEnabled":{"TargetBucket":"_cosmostore-iam","TargetPrefix":"x/"}}')" InvalidTargetBucketForLogging
+check "nor an inventory's destination" "$(code s3api put-bucket-inventory-configuration --bucket smoke --id leak --inventory-configuration '{"Id":"leak","IsEnabled":true,"Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::_cosmostore-iam","Format":"CSV"}},"Schedule":{"Frequency":"Daily"},"IncludedObjectVersions":"Current"}')" InvalidArgument
+check "nor an access point's bucket" "$(AWS_ENDPOINT_URL="http://localhost:$port" aws s3control create-access-point --account-id 000000000000 --name leak-ap --bucket _cosmostore-iam 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9]*\)).*/\1/p' | head -1)" InvalidBucketName
 
 # Credential rotation (ADR-0050): the credentials file is read again when it changes, within an upkeep round (2 s).
 second() { ( export AWS_ACCESS_KEY_ID=AKIASMOKETEST0000002; export AWS_SECRET_ACCESS_KEY="$1"; shift; "$@" ); }

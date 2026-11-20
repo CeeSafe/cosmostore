@@ -904,7 +904,7 @@ impl Handler<NodeApp> for PeerHandler {
                 borrow shared.file,
                 shared.secret.view(),
                 shared.id,
-                isStatus || isActive,
+                isStatus || isActive || isIam, // the operator's signature is what nodes' asks carry
                 method,
                 path,
                 borrow headers,
@@ -1056,13 +1056,27 @@ const CREDENTIALS_EVERY_MS: u64 = 2000;
 async fn credentialsForever(rotation: Rotation, shared: borrow NodeShared) -> Result<void, NodeFault> {
     var r = rotation;
     var cycle: u64 = 0;
+    var iamSeen: u64 = 0;
     while (true) {
         if (!(await frontPause(CREDENTIALS_EVERY_MS))) { return Err(NodeFault.Net); }
         // Every fifth cycle (10 s): whether every node holds this node's first SSE-S3 key, for its leaders' re-wraps.
         cycle += 1;
         if (cycle % 5 == 0) { shared.rewrapTag.store(await rewrapGate(shared)); }
         // The IAM API's records, from the node's replica of their shard or a peer's (ADR-0104 §4).
-        let iam = await nodeIamSnapshot(shared);
+        // Never older than one already taken (the M19 exit review): a lagging replica would bring a deleted key back.
+        var iam = await nodeIamSnapshot(shared);
+        let newest = match (borrow iam) {
+            Some(s) => s.generation >= iamSeen,
+            null => false,
+        };
+        if (newest) {
+            iamSeen = match (borrow iam) {
+                Some(s) => s.generation,
+                null => iamSeen,
+            };
+        } else {
+            iam = null;
+        }
         await reloadCredentialsIfChanged(mut r, iam.asBorrow());
         await reloadNodeKeysIfChanged(mut r, shared);
         await reloadTargetsIfChanged(mut r);
