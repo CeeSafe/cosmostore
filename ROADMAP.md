@@ -4321,3 +4321,13 @@ Browser form uploads with a SigV4 POST policy.
 - **No downgrade past it:** a store with a format-5 SetTags record (a re-wrap) cannot be opened by an older binary.
 - **Recorded:** B1 to B5 of the exit review.
 - **Next:** M18, when the owner asks for one.
+
+### 20 Nov 2026: M18 proposed (ADR-0101)
+
+- **The owner:** "propose M18". ADR-0101 (proposed) gives three candidates, one to be M18:
+  - **A, recommended:** archive storage classes. GLACIER and DEEP_ARCHIVE on writes and transitions, RestoreObject
+    with tiers, InvalidObjectState until restored, `x-amz-restore`.
+  - **B:** a subset of the IAM API.
+  - **C:** compaction that re-encodes.
+- **For A, the owner decides the default restore times:** AWS's scaled by `--restore-scale` (recommended), or
+  immediate.
