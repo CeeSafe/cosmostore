@@ -444,12 +444,15 @@ fn tickOf(
     r: borrow mut ShardReplica,
     store: borrow mut ObjectStore,
     maintain: bool,
+    sseKeys: Slice<MasterKey>,
 ) -> Result<Vector<RaftMessage>, StoreError> {
     r.tick()?;
     var out = Vector<RaftMessage>.create();
     r.drain(store, mut out)?;
     if (maintain) {
         r.maintain(store)?;
+        // The leader's re-wrap round (ADR-0100 §4), with the node's SSE-S3 keys as they are now.
+        let _ = r.rewrap(store, sseKeys)?;
         r.drain(store, mut out)?;
     }
     return Ok(out);
@@ -561,7 +564,8 @@ async fn tickForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
             };
             let st = storeGuard.data();
             let t2 = Clock.unixMillis();
-            let ticked = await Async.blocking(() => tickOf(r, st, maintain));
+            let keys = shared.replication.sseKeys.get().view();
+            let ticked = await Async.blocking(() => tickOf(r, st, maintain, keys));
             let t3 = Clock.unixMillis();
             if (t3 - t0 > SLOW_TICK_MS) { await noteSlowTick(slot.shard, t1 - t0, t2 - t1, t3 - t2); }
             match (ticked) {
@@ -750,6 +754,38 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
             appendIdList(mut out, r.core.members.voters.view()).isOk() && out.push(0x20).isOk() &&
             appendIdList(mut out, r.core.members.learners.view()).isOk() && out.push(0x0A).isOk();
         if (!line) { return Err(NodeFault.OutOfMemory); }
+        // What still needs each master key, from the shards this node leads (ADR-0100 §4).
+        if (slot.failed.load() == 0 && r.core.role == RAFT_LEADER) {
+            let report = match (await Async.blocking(() => st.sealedReport())) {
+                Ok(rep) => rep,
+                Err(_) => null,
+            };
+            let reported = match (report) {
+                Some(text) => {
+                    var fine = true;
+                    let all = StringView.fromUtf8(text.view()) ?? "";
+                    for (piece in all.split("\n")) {
+                        if (piece.length == 0) { continue; }
+                        fine = fine && out.extend("# sealed ".bytes()).isOk() && appendDecimal(
+                            mut out,
+                            slot.shard as u64,
+                        ).isOk() &&
+                            out.push(0x20).isOk() && out.extend(piece.bytes()).isOk() && out.push(0x0A).isOk();
+                    }
+                    fine && out.extend("# sealed-led ".bytes()).isOk() && appendDecimal(
+                        mut out,
+                        slot.shard as u64,
+                    ).isOk() &&
+                        out.push(0x0A).isOk()
+                }
+                null => out.extend("# sealed-unknown ".bytes()).isOk() && appendDecimal(
+                    mut out,
+                    slot.shard as u64,
+                ).isOk() &&
+                    out.push(0x0A).isOk(),
+            };
+            if (!reported) { return Err(NodeFault.OutOfMemory); }
+        }
     }
     // The node's scrub (ADR-0063 §4).
     let scrub = out.extend("# scrub ".bytes()).isOk() && appendDecimal(mut out, shared.scrubChecked.load()).isOk() &&
@@ -987,6 +1023,66 @@ async fn credentialsForever(rotation: Rotation, shared: borrow NodeShared) -> Re
     return Ok();
 }
 
+/// What still needs the keys `ids` (envelopes of `mode`) across the cluster (ADR-0100 §4): every node's status asked,
+/// each shard's count taken from its leader's answer. Null when a shard has no leader that answered with counts.
+async fn clusterSealedUnder(shared: borrow NodeShared, mode: StringView, ids: Slice<Vector<u8>>) -> u64? {
+    var led = Vector<u32>.create();
+    var unknown = false;
+    var total: u64 = 0;
+    for (i in 0..shared.file.nodes.length) {
+        var url = textOf("http://");
+        if (appendPeerAddress(mut url, shared.file.nodes[i].peer).isErr() || url.append("/cluster/status").isErr()) {
+            return null;
+        }
+        var answer = Vector<u8>.create();
+        let status = match (await askStatusWith(borrow shared.file, shared.secret.view(), url.view(), mut answer)) {
+            Ok(s) => s,
+            Err(_) => 0u16,
+        };
+        if (status != 200) { continue; }
+        let text = StringView.fromUtf8(answer.view()) ?? "";
+        for (line in text.split("\n")) {
+            if (line.startsWith("# sealed-unknown ")) { unknown = true; }
+            if (line.startsWith("# sealed-led ")) {
+                match (line.bytes()[13..].parseInt<u32>()) {
+                    Some(shard) => {
+                        if (led.push(shard).isErr()) { return null; }
+                    }
+                    null => {}
+                }
+            }
+            if (!line.startsWith("# sealed ")) { continue; }
+            // `# sealed <shard> <prefix> <n>` or `# sealed <shard> kms-default <id> <n>`.
+            var words = Vector<StringView>.create();
+            for (w in line.split(" ")) {
+                if (words.push(w).isErr()) { return null; }
+            }
+            if (words.length < 5) { continue; }
+            let n = words[words.length - 1].parseInt<u64>() ?? { continue; };
+            for (d in 0..ids.length) {
+                var prefix = textOf("v1.");
+                if (prefix.append(mode).isErr() || prefix.append(".").isErr() ||
+                    prefix.append(StringView.fromUtf8(ids[d].view()) ?? "").isErr() || prefix.append(".").isErr()) {
+                    return null;
+                }
+                let matches = words[3] == prefix.view() ||
+                    (mode == "kms" && words[3] == "kms-default" && words.length >= 6 &&
+                        words[4].bytes() == ids[d].view());
+                if (matches) { total += n; }
+            }
+        }
+    }
+    if (unknown) { return null; }
+    for (shard in 0..shared.file.shards) {
+        var found = false;
+        for (j in 0..led.length) {
+            if (led[j] == shard) { found = true; }
+        }
+        if (!found) { return null; }
+    }
+    return Some(total);
+}
+
 /// The node's key files reloaded (ADR-0096 §3, §6). A master key may be added, but a reload that removes or changes
 /// one is refused (the M15 exit review): the node cannot count what the cluster still seals under it, since shards it
 /// holds no replica of, entries not yet applied, and other nodes reloading on their own time all escape its count. A
@@ -1004,15 +1100,27 @@ async fn reloadNodeKeysIfChanged(r: borrow mut Rotation, shared: borrow NodeShar
                 let _ = await AsyncConsole.writeError("\n");
             }
             KeyChange.Fresh(fresh, dropped, modified) => {
-                if (keyFileMode(k.kind).length > 0 && dropped.length > 0) {
-                    await refuseKeys(
-                        k,
-                        modified,
-                        "a node does not remove or change a master key while it runs; re-seal what it sealed, then restart the nodes with the file",
-                        0,
-                        borrow dropped,
-                    );
-                    continue;
+                let mode = keyFileMode(k.kind);
+                if (mode.length > 0 && dropped.length > 0) {
+                    // Every shard's leader is asked what still needs the keys dropped (ADR-0100 §4, the owner's
+                    // choice); the removal is taken only when every shard answers none.
+                    match (await clusterSealedUnder(shared, mode, dropped.view())) {
+                        Some(0) => {}
+                        Some(n) => {
+                            await refuseKeys(k, modified, "", n, borrow dropped);
+                            continue;
+                        }
+                        null => {
+                            await refuseKeys(
+                                k,
+                                modified,
+                                "not every shard's leader answered with its counts; tried again when the file next changes",
+                                0,
+                                borrow dropped,
+                            );
+                            continue;
+                        }
+                    }
                 }
                 let installed = await Async.blocking(() => installKeys(k, borrow fresh));
                 if (installed) {
@@ -1977,6 +2085,14 @@ async fn askStatus(
     loaded: borrow LoadedCluster,
     url: StringView,
     answer: borrow mut Vector<u8>,
+) -> Result<u16, NodeFault> => await askStatusWith(borrow loaded.file, loaded.secret.view(), url, answer);
+
+/// `askStatus` with a cluster file and secret: a node asks its peers so, as the operator does (ADR-0100 §4).
+async fn askStatusWith(
+    file: borrow ClusterFile,
+    secret: Slice<u8>,
+    url: StringView,
+    answer: borrow mut Vector<u8>,
 ) -> Result<u16, NodeFault> {
     var options = ClientOptions.defaults();
     options.totalMs = 10000;
@@ -1991,8 +2107,8 @@ async fn askStatus(
     };
     if (!signRequest(
         mut request,
-        borrow loaded.file,
-        loaded.secret.view(),
+        file,
+        secret,
         0,
         "GET",
         "/cluster/status",

@@ -4259,3 +4259,21 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** `rewrapRoundsKeepTheDataKey` (the data key opened under the new key is the one sealed). 407 unit tests,
   both smokes and the SDK matrix pass.
 - **Next:** slice 4, a cluster.
+
+### 20 Nov 2026: M17 slice 4, key rotation on a cluster (ADR-0100 §4)
+
+- **Each shard's leader re-wraps** a round per upkeep, with the node's SSE-S3 keys, as a write. The records are
+  entries every replica applies (`ShardReplica.rewrap`).
+- **A leader's status** lists, for each shard it leads, what still needs each key:
+  - `# sealed <shard> <prefix> <n>`, and `kms-default` for buckets whose default names a KMS key;
+  - `# sealed-led <shard>`, or `# sealed-unknown <shard>` when its counts are not known.
+- **A node takes a master key's removal** once every shard has a leader that answered with counts, all zero. Otherwise
+  it is refused, with the count or why, and tried again when the file next changes. A node no longer refuses every
+  removal (M15's fail-closed rule, now replaced).
+- **The cluster smoke rotates a key:**
+  - `sse2` put first, and `cluster-status` counts none under `sse1`;
+  - `sse1`'s removal taken by every running node, and the object read through each;
+  - `sse2`, in use, refused.
+  - 178 checks in all.
+- **Checks:** the S3 smoke, the SDK matrix and 407 unit tests pass.
+- **Next:** slice 5, key bytes wiped.

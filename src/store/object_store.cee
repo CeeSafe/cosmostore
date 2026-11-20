@@ -6363,6 +6363,57 @@ struct ObjectStore {
         return Some(versions + this.uploadsWithPrefix(SSE_FIELD.bytes(), prefix));
     }
 
+    /// What still needs each master key (ADR-0100 §4), for a cluster's count: `<prefix> <n>` lines, a prefix per key
+    /// that has versions or uploads (`v1.<mode>.<id>.`), and `kms-default <id> <n>` for buckets whose default names a
+    /// KMS key. Null when the counts are not known.
+    fn sealedReport(borrow this) -> Result<Vector<u8>?, StoreError> {
+        let counts = this.state.index.sealedCounts() ?? { return Ok(null); };
+        var prefixes = Vector<Vector<u8>>.create();
+        for (i in 0..counts.length) { prefixes.push(copyBytes(counts[i].prefix.view())?)?; }
+        // The uploads' prefixes too, which the index does not count.
+        for (u in 0..this.state.uploads.length()) {
+            match (metadataFind(this.state.uploads.valueAt(u).metadata.view(), SSE_FIELD.bytes())) {
+                Some(e) => {
+                    var dots = 0;
+                    var end = e.length;
+                    for (i in 0..e.length) {
+                        if (e[i] == '.') {
+                            dots += 1;
+                            if (dots == 3) {
+                                end = i + 1;
+                                break;
+                            }
+                        }
+                    }
+                    var known = false;
+                    for (p in 0..prefixes.length) {
+                        if (prefixes[p].view() == e[0..end]) { known = true; }
+                    }
+                    if (!known) { prefixes.push(copyBytes(e[0..end])?)?; }
+                }
+                null => {}
+            }
+        }
+        var out = Vector<u8>.create();
+        for (p in 0..prefixes.length) {
+            let n = this.sealedCount(prefixes[p].view()) ?? { return Ok(null); };
+            out.extend(prefixes[p].view())?;
+            out.push(' ')?;
+            appendDecimal(mut out, n)?;
+            out.push(0x0A)?;
+        }
+        let buckets = this.listBuckets()?;
+        for (b in 0..buckets.length) {
+            let config = this.bucketConfig(StringView.fromUtf8(buckets[b].view()) ?? "", BUCKET_CONFIG_ENCRYPTION)?;
+            if (startsWithBytes(config.view(), "aws:kms ".bytes())) {
+                out.extend("kms-default ".bytes())?;
+                out.extend(config.view()[8..])?;
+                out.extend(" 1\n".bytes())?;
+            }
+        }
+        return Ok(Some(out));
+    }
+
     /// How many uploads in progress have the field `field` starting with `prefix`.
     private fn uploadsWithPrefix(borrow this, field: Slice<u8>, prefix: Slice<u8>) -> u64 {
         var n: u64 = 0;

@@ -45,6 +45,8 @@ struct ShardReplica {
     snapshotsInstalled: u64;
     /// Reads a quorum has confirmed: serve each once the store has applied its index.
     reads: Vector<RaftReadState>;
+    /// Where the leader's re-wrap pass goes on from (ADR-0100 §4).
+    rewrapAfter: IndexKey?;
 
     /// Opens the replica in `dir`: the store (its journal a Raft log), the hard state, and a core holding the terms
     /// of the entries recovery found unapplied.
@@ -101,6 +103,7 @@ struct ShardReplica {
             storeConfig: storeConfig,
             snapshotsInstalled: 0,
             reads: Vector<RaftReadState>.create(),
+            rewrapAfter: null,
         };
         return Ok(OpenedReplica { replica: replica, store: store });
     }
@@ -144,6 +147,29 @@ struct ShardReplica {
         let _ = store.sweepRaftOrphans(Clock.unixMillis())?;
         let _ = store.sweepDecoded(Clock.unixMillis())?;
         return Ok();
+    }
+
+    /// A round of the re-wrap pass (ADR-0100 §4), on the leader only and as a write, so its records are entries every
+    /// replica applies: versions under an SSE-S3 key other than `keys`' first re-wrapped under it.
+    fn rewrap(borrow mut this, store: borrow mut ObjectStore, keys: Slice<MasterKey>) -> Result<u64, StoreError> {
+        if (!this.core.isLeader() || keys.length == 0) { return Ok(0); }
+        let before = match (this.beginWrite(store)) {
+            Ok(b) => b,
+            Err(_) => { return Ok(0); } // a write in flight: the next round
+        };
+        let round = rewrapRound(store, keys, borrow this.rewrapAfter);
+        let _ = this.finishWrite(store, before)?;
+        return match (round) {
+            Ok(r) => {
+                this.rewrapAfter = r.next;
+                Ok(r.moved)
+            }
+            Err(StoreError.NotLeader) => Ok(0),
+            Err(e) => {
+                this.rewrapAfter = null;
+                Err(e)
+            }
+        };
     }
 
     /// Installs a leader's snapshot as the store's next generation (snapshot.cee).

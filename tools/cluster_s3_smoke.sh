@@ -585,15 +585,33 @@ for i in $(seq 1 100); do keys | grep -q "e4$" && break; pause 0.2; done
 check "its leader (node $eventsLeader) killed: the next leader delivers" "$(keys | tr ' ' '\n' | tail -1)" e4
 check "and nothing delivered before is lost" "$(keys | tr ' ' '\n' | sort -u | tr '\n' ' ')" "e1 e2 e3 e4 "
 
-# A node's key file reloaded (ADR-0096 §3; the M15 exit review): a master key added is taken by every node that
-# runs; one removed is refused, since a node cannot count what the cluster still seals under it.
+# Key rotation on a cluster (ADR-0100 §4): a key put first; each shard's leader re-wraps what the old one sealed,
+# through its log; a node takes the old key's removal once every shard's leader counts none under it, and refuses the
+# key in use.
+on "$survivor" s3api create-bucket --bucket rotate > /dev/null 2>&1
+printf 'rotated on a cluster' > rotate.txt
+check "an SSE-S3 object before the rotation" "$(on "$survivor" s3api put-object --bucket rotate --key a --body rotate.txt --server-side-encryption AES256 --query ServerSideEncryption --output text 2>&1)" AES256
 cp sse.keys sse.keys.kept
-printf 'sse2 %s\n' "$(head -c 32 /dev/urandom | base64)" >> sse.keys
+{ printf 'sse2 %s\n' "$(head -c 32 /dev/urandom | base64)"; cat sse.keys.kept; } > sse.keys
 pause 4
-check "an SSE key added: the running nodes take it" "$(for n in 1 2 3; do [ -n "${PIDS[$n]}" ] && grep -c "SSE key file reloaded: 2 keys" "log$n"; done | sort -u)" 1
-cp sse.keys.kept sse.keys
+running() { for n in 1 2 3; do [ -n "${PIDS[$n]}" ] && grep -c "$1" "log$n"; done | sort -u; }
+check "a key put first: the running nodes take it" "$(running "SSE key file reloaded: 2 keys")" 1
+underOld() { "$BIN" cluster-status --cluster-file cluster.conf --node "$survivor" 2>/dev/null | awk '$2 == "sealed" && $4 == "v1.s3.sse1." { n += $5 } END { print n + 0 }'; }
+for i in $(seq 1 60); do [ "$(underOld)" = 0 ] && break; pause 0.5; done
+check "the leaders re-wrapped what the old key sealed" "$(underOld)" 0
+check "the object reads after" "$(on "$survivor" s3 cp s3://rotate/a - 2>&1)" "rotated on a cluster"
+grep '^sse2 ' sse.keys > sse.keys.next && mv sse.keys.next sse.keys
 pause 4
-check "an SSE key removed: the running nodes refuse it" "$(for n in 1 2 3; do [ -n "${PIDS[$n]}" ] && grep -c "SSE key file reload refused: a node does not remove or change a master key" "log$n"; done | sort -u)" 1
+check "the old key removed: the running nodes take it" "$(running "SSE key file reloaded: 1 keys")" 1
+for n in 1 2 3; do
+    [ -n "${PIDS[$n]}" ] || continue
+    check "the object reads through node $n, the old key gone" "$(on "$n" s3 cp s3://rotate/a - 2>&1)" "rotated on a cluster"
+done
+cp sse.keys sse.keys.sse2
+printf 'sse3 %s\n' "$(head -c 32 /dev/urandom | base64)" > sse.keys
+pause 4
+check "the key in use removed: the running nodes refuse it" "$(running "SSE key file reload refused: [0-9]* versions, uploads or bucket encryption configurations still need the key it removes or changes (sse2)")" 1
+cp sse.keys.sse2 sse.keys
 
 echo "cluster s3 smoke: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]
