@@ -128,6 +128,9 @@ struct NodeS3Setup {
     /// The three key files' sets, shared by every shard's S3 server and the delivery task, and reloaded (ADR-0096 §1,
     /// §3); made once the files are read.
     stsSets: Arc<KeySets>?;
+    /// The target files' lists, shared by every shard's S3 server and the delivery task, reloaded (ADR-0096 §5).
+    notifyList: Arc<Reloaded<NotifyTarget>>?;
+    replicationList: Arc<Reloaded<ReplicationTarget>>?;
     sseSets: Arc<KeySets>?;
     kmsSets: Arc<KeySets>?;
     rolesText: Vector<u8>;
@@ -195,10 +198,7 @@ fn clusterS3App(
         policyBuckets: AtomicU64.create(1),
         denyBuckets: AtomicU64.create(1),
         secure: false,
-        notifyTargets: match (parseTargets(sts.notifyTargetsText.view())?) {
-            Some(t) => t,
-            null => Vector<NotifyTarget>.create(), // checked when the node started
-        },
+        notifyTargets: notifyListOf(sts)?,
         sseKeys: sharedOr(sts.sseSets.asBorrow(), sts.sseKeys.view())?,
         stsKeys: sharedOr(sts.stsSets.asBorrow(), sts.keys.view())?,
         roles: roles,
@@ -213,7 +213,7 @@ fn clusterS3App(
         accessPointBuckets: AtomicU64.create(1),
         // "Some", for good, as policies are.
         replicationBuckets: AtomicU64.create(1),
-        replicationTargetIds: replicationTargetIdsOf(sts.replicationTargetsText.view())?,
+        replicationTargets: replicationListOf(sts)?,
         rates: RateLimiter.create(0, 0)?,
         cluster: true,
     });
@@ -225,16 +225,25 @@ fn sharedOr(sets: borrow Arc<KeySets>?, keys: Slice<MasterKey>) -> Result<Arc<Ke
     null => sharedKeys(copyKeys(keys)?),
 };
 
-/// The ids of a replication targets file's endpoints (checked when the node started).
-fn replicationTargetIdsOf(text: Slice<u8>) -> Result<Vector<Vector<u8>>, AllocError> {
-    var ids = Vector<Vector<u8>>.create();
-    match (parseReplicationTargets(text)?) {
-        Some(targets) => {
-            for (i in 0..targets.length) { ids.push(copyBytes(targets[i].id.view())?)?; }
-        }
+/// The node's notification targets, or a list of its own from the file's text when the node made none (checked when
+/// the node started).
+fn notifyListOf(sts: borrow NodeS3Setup) -> Result<Arc<Reloaded<NotifyTarget>>, AllocError> {
+    match (borrow sts.notifyList) {
+        Some(l) => { return Ok(l.clone()); }
         null => {}
     }
-    return Ok(ids);
+    return sharedList(parseTargets(sts.notifyTargetsText.view())? ?? Vector<NotifyTarget>.create());
+}
+
+/// The node's replication targets, as `notifyListOf`.
+fn replicationListOf(sts: borrow NodeS3Setup) -> Result<Arc<Reloaded<ReplicationTarget>>, AllocError> {
+    match (borrow sts.replicationList) {
+        Some(l) => { return Ok(l.clone()); }
+        null => {}
+    }
+    return sharedList(
+        parseReplicationTargets(sts.replicationTargetsText.view())? ?? Vector<ReplicationTarget>.create(),
+    );
 }
 
 async fn frontPause(ms: u64) -> bool {

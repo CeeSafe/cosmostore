@@ -792,6 +792,20 @@ check "the use after it" "$(quota GET quota) $(quotaxml)" "200 0</MaxBytes><MaxO
 aws s3 rm --recursive s3://quota/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket quota > /dev/null 2>&1 && pass "delete-bucket after a quota" || fail "delete-bucket after a quota"
 
+# The notification targets file reloaded (ADR-0096 §5): a target added is taken in a configuration, without a
+# restart, and one removed is not.
+cp "$work/targets" "$work/targets.kept"
+printf 'later http://127.0.0.1:%s/later\n' "$hookport" >> "$work/targets"
+sleep 4
+grep -q "notification targets file reloaded: 2 targets" "$work/server.log" && pass "a notification target added, without a restart" || fail "a notification target added, without a restart"
+aws s3api create-bucket --bucket reload-notify > /dev/null 2>&1
+aws s3api put-bucket-notification-configuration --bucket reload-notify --notification-configuration '{"QueueConfigurations":[{"QueueArn":"arn:cosmostore:sqs::later:webhook","Events":["s3:ObjectCreated:*"]}]}' > /dev/null 2>&1 && pass "a configuration naming the target added" || fail "a configuration naming the target added"
+cp "$work/targets.kept" "$work/targets"
+sleep 4
+check "a configuration naming a target removed" "$(code s3api put-bucket-notification-configuration --bucket reload-notify --notification-configuration '{"QueueConfigurations":[{"QueueArn":"arn:cosmostore:sqs::later:webhook","Events":["s3:ObjectCreated:*"]}]}')" InvalidArgument
+aws s3api put-bucket-notification-configuration --bucket reload-notify --notification-configuration '{}' > /dev/null 2>&1
+aws s3api delete-bucket --bucket reload-notify > /dev/null 2>&1
+
 # Key files reloaded (ADR-0096 §3): a key added first seals what is new, the old ones still open what they sealed; a
 # reload that removes a key stored versions still need is refused, and says how many.
 cp "$work/sse.keys" "$work/sse.keys.kept"

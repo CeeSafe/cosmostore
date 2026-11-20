@@ -3982,3 +3982,19 @@ Browser form uploads with a SigV4 POST policy.
   - the S3 smoke adds a key, reads old and new objects, and is refused the removal of the key in use;
   - 392 unit tests, the cluster smoke (167) and the SDK matrix pass.
 - **Next:** slice 3, the target files.
+
+### 20 Nov 2026: M15 slice 3, the target files reloaded (ADR-0096 §5)
+
+- **`Reloaded<T>`** (`src/s3/reloaded.cee`): a list replaced whole when its file changes. Every reader finds a target
+  by its id, so targets keep no places; ADR-0096 §5 is amended to say so.
+- **What shares the lists:**
+  - the notification and replication targets are each one list, for the S3 server and the delivery task, and on a
+    node every shard's server;
+  - S3App's separate list of replication target ids is gone: it reads the targets.
+- **The reload:** `Rotation.notifyFile`/`replicationFile`, on `serve`'s upkeep and the node's 2 s task. The
+  replication file's text, which holds secrets, is wiped once parsed.
+- **Tests:**
+  - the S3 smoke adds a notification target under a running server: a configuration naming it is taken, and refused
+    after it is removed;
+  - 392 unit tests, the cluster smoke (167) and the SDK matrix pass.
+- **Next:** slice 4, the cluster's digests and `cluster-status`.

@@ -63,7 +63,7 @@ struct NodeShared {
     /// `--domain` (ADR-0078 §5): a request to `<bucket>.<domain>` is that bucket's, virtual-hosted.
     domain: Vector<u8>;
     /// `--notify-targets` (ADR-0078 §4): the webhooks this node's leaders deliver to.
-    notifyTargets: Vector<NotifyTarget>;
+    notifyTargets: Arc<Reloaded<NotifyTarget>>;
     /// `--replication-targets` (ADR-0078 §4): the other endpoints replicas go to, with SSE's keys to open a sealed
     /// source (ADR-0092 §2).
     replication: ReplicaContext;
@@ -315,14 +315,14 @@ fn openNode(
             Ok(d) => d,
             Err(_) => { return Err(textOf("out of memory")); }
         },
-        notifyTargets: match (parseTargets(sts.notifyTargetsText.view())) {
-            Ok(Some(t)) => t,
-            _ => { return Err(textOf("the notification targets file needs lines of `<id> <http or https url>`")); }
+        notifyTargets: match (notifyListOf(sts)) {
+            Ok(t) => t,
+            Err(_) => { return Err(textOf("out of memory")); }
         },
         replication: ReplicaContext {
-            targets: match (parseReplicationTargets(sts.replicationTargetsText.view())) {
-                Ok(Some(t)) => t,
-                _ => { return Err(textOf("the replication targets file cannot be read again")); }
+            targets: match (replicationListOf(sts)) {
+                Ok(t) => t,
+                Err(_) => { return Err(textOf("out of memory")); }
             },
             sseKeys: match (sharedOr(sts.sseSets.asBorrow(), sts.sseKeys.view())) {
                 Ok(k) => k,
@@ -961,6 +961,7 @@ async fn credentialsForever(rotation: Rotation, shared: borrow NodeShared) -> Re
         if (!(await frontPause(CREDENTIALS_EVERY_MS))) { return Err(NodeFault.Net); }
         await reloadCredentialsIfChanged(mut r);
         await reloadNodeKeysIfChanged(mut r, shared);
+        await reloadTargetsIfChanged(mut r);
     }
     return Ok();
 }
@@ -1188,6 +1189,8 @@ fn nodeCommand() -> i32 {
                         usersModified: if (usersPath.length == 0) 0 else Fs.modifiedMillis(usersPath).ok() ?? 0,
                         roles: null,
                         keyFiles: Vector<KeyRotation>.create(),
+                        notifyFile: null,
+                        replicationFile: null,
                     });
                 }
                 null => {}
@@ -1253,6 +1256,8 @@ fn nodeCommand() -> i32 {
         sseKeys: Vector<MasterKey>.create(),
         kmsKeys: Vector<MasterKey>.create(),
         stsSets: null,
+        notifyList: null,
+        replicationList: null,
         sseSets: null,
         kmsSets: null,
         rolesText: Vector<u8>.create(),
@@ -1290,7 +1295,10 @@ fn nodeCommand() -> i32 {
                 }
             };
             match (parseReplicationTargets(sts.replicationTargetsText.view())) {
-                Ok(Some(_)) => {}
+                Ok(Some(t)) => {
+                    sts.replicationList = sharedList(t).ok();
+                    if (sts.replicationList.isNull()) { return 1; }
+                }
                 _ => {
                     Console.writeErrorLine(
                         "cosmostore: the replication targets file needs lines of `<id> <http or https url> <access key> <secret key> [region]`, each id once",
@@ -1311,7 +1319,10 @@ fn nodeCommand() -> i32 {
                 }
             };
             match (parseTargets(sts.notifyTargetsText.view())) {
-                Ok(Some(_)) => {}
+                Ok(Some(t)) => {
+                    sts.notifyList = sharedList(t).ok();
+                    if (sts.notifyList.isNull()) { return 1; }
+                }
                 _ => {
                     Console.writeErrorLine(
                         "cosmostore: the notification targets file needs lines of `<id> <http or https url>`, each id once",
@@ -1434,6 +1445,44 @@ fn nodeCommand() -> i32 {
         null => {}
     }
     sts.stsSets = Some(made);
+    // The target files, reloaded with the credentials (ADR-0096 §5).
+    match (borrow mut rotation) {
+        Some(r) => {
+            match (borrow args.notifyTargets) {
+                Some(path) => {
+                    match (borrow sts.notifyList) {
+                        Some(list) => {
+                            r.notifyFile = Some(TargetRotation<NotifyTarget> {
+                                list: list.clone(),
+                                path: textOf(path.view()),
+                                modified: Fs.modifiedMillis(path.view()).ok() ?? 0,
+                                failed: 0,
+                            });
+                        }
+                        null => {}
+                    }
+                }
+                null => {}
+            }
+            match (borrow args.replicationTargets) {
+                Some(path) => {
+                    match (borrow sts.replicationList) {
+                        Some(list) => {
+                            r.replicationFile = Some(TargetRotation<ReplicationTarget> {
+                                list: list.clone(),
+                                path: textOf(path.view()),
+                                modified: Fs.modifiedMillis(path.view()).ok() ?? 0,
+                                failed: 0,
+                            });
+                        }
+                        null => {}
+                    }
+                }
+                null => {}
+            }
+        }
+        null => {}
+    }
     sts.sseSets = Some(sseMade);
     sts.kmsSets = Some(kmsMade);
     match (borrow args.roles) {

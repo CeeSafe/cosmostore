@@ -1,0 +1,43 @@
+// A list read from a file and replaced when the file changes (ADR-0096 §1): the target files' (§5). Read without a
+// lock, each list written once, `current` naming it, as the credential sets are (ADR-0050). Targets are found by their
+// id, so a list need not keep a removed one's place.
+
+/// The most lists a server takes in its life: the first, and a reload for each of the others.
+const MAX_RELOADED: usize = 4096;
+
+struct Reloaded<T: Send + Share> {
+    lists: Vector<OnceLock<Vector<T>>>;
+    current: AtomicU64;
+    none: Vector<T>;
+
+    fn create(first: Vector<T>) -> Result<Reloaded<T>, AllocError> {
+        var lists = Vector<OnceLock<Vector<T>>>.create();
+        lists.reserve(MAX_RELOADED)?;
+        for (i in 0..MAX_RELOADED) { lists.push(OnceLock<Vector<T>>.create())?; }
+        let _ = lists[0].set(first);
+        return Ok(Reloaded<T> { lists: lists, current: AtomicU64.create(0), none: Vector<T>.create() });
+    }
+
+    /// The current list.
+    fn view(borrow this) -> Slice<T> {
+        let at = this.current.load() as usize;
+        return match (this.lists[at].get()) {
+            Some(list) => list.view(),
+            null => this.none.view(),
+        };
+    }
+
+    /// Makes `next` the current list; false when every cell is used. One task calls this, the upkeep, on a worker
+    /// thread (a cell is a lock).
+    fn replace(borrow this, next: Vector<T>) -> bool {
+        let at = this.current.load() as usize + 1;
+        if (at >= this.lists.length) { return false; }
+        if (this.lists[at].set(next).isErr()) { return false; }
+        this.current.store(at as u64);
+        return true;
+    }
+}
+
+/// A list shared.
+fn sharedList<T: Send + Share>(first: Vector<T>) -> Result<Arc<Reloaded<T>>, AllocError> =>
+    Arc<Reloaded<T>>.create(Reloaded<T>.create(first)?);

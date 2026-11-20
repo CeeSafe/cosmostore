@@ -39,6 +39,8 @@ remove a master key stored objects still need is refused (the owner's choice).
    new tokens are sealed with.
 5. **Targets:** a notification or replication target removed makes its pending events' deliveries fail as an
    unknown target's do today. One changed is used from the next delivery.
+   - **No places (amended in slice 3):** every reader finds a target by its id, never by a place, so a target list
+     is replaced whole (`Reloaded<T>`), and a target removed is simply not found.
 6. **On a cluster:**
    - **Reloads:** each node reloads its files as `serve` does (ADR-0092 §1's task, widened).
    - **Digests:** each node gives its peers, in the handshake, a digest of each file's contents, a salted hash
