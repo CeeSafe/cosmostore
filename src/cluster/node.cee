@@ -42,6 +42,9 @@ struct NodeShared {
     file: ClusterFile;
     /// The files the node was given, whose digests its status shows (ADR-0096 §6).
     files: Vector<WatchedFile>;
+    /// The tag of the SSE-S3 key every node was last seen to hold as this node's first (`rewrapGate`), 0 for none: a
+    /// leader re-wraps only under it (ADR-0100 §4, the M17 exit review).
+    rewrapTag: AtomicU64;
     secret: Vector<u8>;
     id: u32;
     slots: Vector<ShardSlot>;
@@ -305,6 +308,7 @@ fn openNode(
     let shared = NodeShared {
         file: file,
         files: files,
+        rewrapTag: AtomicU64.create(0),
         secret: secret,
         id: id,
         slots: slots,
@@ -564,7 +568,14 @@ async fn tickForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
             };
             let st = storeGuard.data();
             let t2 = Clock.unixMillis();
-            let keys = shared.replication.sseKeys.get().view();
+            // A leader re-wraps only under a first key every node was seen to hold (the M17 exit review).
+            let held = shared.replication.sseKeys.get().view();
+            let gate = shared.rewrapTag.load();
+            let keys: Slice<MasterKey> = if (held.length > 0 && gate != 0 && keyTag(
+                shared.secret.view(),
+                borrow held[0],
+            ) == gate) held
+                else held[0..0];
             let ticked = await Async.blocking(() => tickOf(r, st, maintain, keys));
             let t3 = Clock.unixMillis();
             if (t3 - t0 > SLOW_TICK_MS) { await noteSlowTick(slot.shard, t1 - t0, t2 - t1, t3 - t2); }
@@ -756,7 +767,10 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
         if (!line) { return Err(NodeFault.OutOfMemory); }
         // What still needs each master key, from the shards this node leads (ADR-0100 §4).
         if (slot.failed.load() == 0 && r.core.role == RAFT_LEADER) {
-            let report = match (await Async.blocking(() => st.sealedReport())) {
+            // Only a leader caught up, with an entry of its own term committed and applied to `commit`, counts (the
+            // M17 exit review): one just elected may hold committed entries it has not applied.
+            let caughtUp = r.core.termAt(r.core.commit) == Some(r.core.term) && st.appliedIndex() >= r.core.commit;
+            let report = if (!caughtUp) null else match (await Async.blocking(() => st.sealedReport())) {
                 Ok(rep) => rep,
                 Err(_) => null,
             };
@@ -775,7 +789,7 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
                     fine && out.extend("# sealed-led ".bytes()).isOk() && appendDecimal(
                         mut out,
                         slot.shard as u64,
-                    ).isOk() &&
+                    ).isOk() && out.push(0x20).isOk() && appendDecimal(mut out, r.core.term).isOk() &&
                         out.push(0x0A).isOk()
                 }
                 null => out.extend("# sealed-unknown ".bytes()).isOk() && appendDecimal(
@@ -801,6 +815,19 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
         appendDecimal(mut out, shared.received.load()).isOk() && out.push(0x20).isOk() &&
         appendDecimal(mut out, shared.refused.load()).isOk() && out.push(0x0A).isOk();
     if (!peer) { return Err(NodeFault.OutOfMemory); }
+    // The master keys the node holds now, by id and a tag of their bytes (ADR-0100 §4, the M17 exit review): a leader
+    // re-wraps only under a key every node holds, and a removal waits for every node to stop putting the key first.
+    for (mode in ["s3", "kms"]) {
+        let keys =
+            if (mode == "s3") shared.replication.sseKeys.get().view() else shared.replication.kmsKeys.get().view();
+        var line = out.extend("# keys ".bytes()).isOk() && out.extend(mode.bytes()).isOk() && out.push(0x20).isOk();
+        for (i in 0..keys.length) {
+            if (i > 0) { line = line && out.push(',').isOk(); }
+            line = line && out.extend(keys[i].id.view()).isOk() && out.push(':').isOk() &&
+                appendDecimal(mut out, keyTag(shared.secret.view(), borrow keys[i])).isOk();
+        }
+        if (!(line && out.push(0x0A).isOk())) { return Err(NodeFault.OutOfMemory); }
+    }
     // The digests of the files the node was given (ADR-0096 §6), read now.
     let secret = shared.secret.view();
     let files = shared.files.view();
@@ -1014,8 +1041,12 @@ const CREDENTIALS_EVERY_MS: u64 = 2000;
 /// user removed is refused at the node's next request, without a restart (ADR-0092 §1).
 async fn credentialsForever(rotation: Rotation, shared: borrow NodeShared) -> Result<void, NodeFault> {
     var r = rotation;
+    var cycle: u64 = 0;
     while (true) {
         if (!(await frontPause(CREDENTIALS_EVERY_MS))) { return Err(NodeFault.Net); }
+        // Every fifth cycle (10 s): whether every node holds this node's first SSE-S3 key, for its leaders' re-wraps.
+        cycle += 1;
+        if (cycle % 5 == 0) { shared.rewrapTag.store(await rewrapGate(shared)); }
         await reloadCredentialsIfChanged(mut r);
         await reloadNodeKeysIfChanged(mut r, shared);
         await reloadTargetsIfChanged(mut r);
@@ -1023,12 +1054,24 @@ async fn credentialsForever(rotation: Rotation, shared: borrow NodeShared) -> Re
     return Ok();
 }
 
-/// What still needs the keys `ids` (envelopes of `mode`) across the cluster (ADR-0100 §4): every node's status asked,
-/// each shard's count taken from its leader's answer. Null when a shard has no leader that answered with counts.
-async fn clusterSealedUnder(shared: borrow NodeShared, mode: StringView, ids: Slice<Vector<u8>>) -> u64? {
-    var led = Vector<u32>.create();
-    var unknown = false;
-    var total: u64 = 0;
+/// A key's tag: the first 8 bytes of HMAC-SHA256 under the cluster's secret of its id and bytes, so nodes can tell
+/// they hold the same key without showing it (never 0).
+fn keyTag(secret: Slice<u8>, key: borrow MasterKey) -> u64 {
+    var mac = HmacSha256.create(secret);
+    mac.update("cosmostore key tag\n".bytes());
+    mac.update(key.id.view());
+    mac.update(":".bytes());
+    let m = key.material();
+    mac.update(m.b[..]);
+    let d = mac.finish();
+    let tag = d[..].readLE<u64>(0);
+    return if (tag == 0) 1 else tag;
+}
+
+/// Every node's status, or null when one does not answer (the M17 exit review: a node not heard from may lead a shard
+/// whose counts are not known, or hold a key first).
+async fn everyStatus(shared: borrow NodeShared) -> Vector<Vector<u8>>? {
+    var all = Vector<Vector<u8>>.create();
     for (i in 0..shared.file.nodes.length) {
         var url = textOf("http://");
         if (appendPeerAddress(mut url, shared.file.nodes[i].peer).isErr() || url.append("/cluster/status").isErr()) {
@@ -1039,25 +1082,70 @@ async fn clusterSealedUnder(shared: borrow NodeShared, mode: StringView, ids: Sl
             Ok(s) => s,
             Err(_) => 0u16,
         };
-        if (status != 200) { continue; }
-        let text = StringView.fromUtf8(answer.view()) ?? "";
+        if (status != 200 || all.push(answer).isErr()) { return null; }
+    }
+    return Some(all);
+}
+
+/// What still needs the keys `ids` (envelopes of `mode`) across the cluster (ADR-0100 §4, as the M17 exit review
+/// amended it). Null, not known, unless every node answers; every shard has a leader of the shard's highest term seen
+/// that reported its counts caught up; and, for SSE-S3, no node has one of `ids` first.
+async fn clusterSealedUnder(shared: borrow NodeShared, mode: StringView, ids: Slice<Vector<u8>>) -> u64? {
+    let statuses = await everyStatus(shared) ?? { return null; };
+    var shards = Vector<u32>.create();
+    var highest = Vector<u64>.create();
+    var ledShard = Vector<u32>.create();
+    var ledTerm = Vector<u64>.create();
+    var total: u64 = 0;
+    for (s in 0..statuses.length) {
+        let text = StringView.fromUtf8(statuses[s].view()) ?? "";
         for (line in text.split("\n")) {
-            if (line.startsWith("# sealed-unknown ")) { unknown = true; }
-            if (line.startsWith("# sealed-led ")) {
-                match (line.bytes()[13..].parseInt<u32>()) {
-                    Some(shard) => {
-                        if (led.push(shard).isErr()) { return null; }
-                    }
-                    null => {}
-                }
-            }
-            if (!line.startsWith("# sealed ")) { continue; }
-            // `# sealed <shard> <prefix> <n>` or `# sealed <shard> kms-default <id> <n>`.
+            if (line.length == 0) { continue; }
             var words = Vector<StringView>.create();
             for (w in line.split(" ")) {
                 if (words.push(w).isErr()) { return null; }
             }
-            if (words.length < 5) { continue; }
+            if (line.startsWith("# sealed-unknown ")) { return null; }
+            // A replica's line, `shard role term …`: the highest term each shard has.
+            if (!line.startsWith("#") && !line.startsWith("shard")) {
+                if (words.length < 3) { continue; }
+                let shard = words[0].parseInt<u32>() ?? { continue; };
+                let term = words[2].parseInt<u64>() ?? { continue; };
+                var found = false;
+                for (k in 0..shards.length) {
+                    if (shards[k] == shard) {
+                        found = true;
+                        if (term > highest[k]) { highest[k] = term; }
+                    }
+                }
+                if (!found && (shards.push(shard).isErr() || highest.push(term).isErr())) { return null; }
+                continue;
+            }
+            if (line.startsWith("# sealed-led ") && words.length >= 4) {
+                let shard = words[2].parseInt<u32>() ?? { continue; };
+                let term = words[3].parseInt<u64>() ?? { continue; };
+                if (ledShard.push(shard).isErr() || ledTerm.push(term).isErr()) { return null; }
+                continue;
+            }
+            // A node that has a dropped SSE-S3 key first still seals new versions under it.
+            if (mode == "s3" && line.startsWith("# keys s3 ") && words.length >= 4) {
+                var first = words[3];
+                match (first.indexOf(",")) {
+                    Some(c) => { first = first[0..c]; }
+                    null => {}
+                }
+                var id = first;
+                match (first.indexOf(":")) {
+                    Some(c) => { id = first[0..c]; }
+                    null => {}
+                }
+                for (d in 0..ids.length) {
+                    if (id.bytes() == ids[d].view()) { return null; }
+                }
+                continue;
+            }
+            if (!line.startsWith("# sealed ") || words.length < 5) { continue; }
+            // `# sealed <shard> <prefix> <n>` or `# sealed <shard> kms-default <id> <n>`.
             let n = words[words.length - 1].parseInt<u64>() ?? { continue; };
             for (d in 0..ids.length) {
                 var prefix = textOf("v1.");
@@ -1072,15 +1160,44 @@ async fn clusterSealedUnder(shared: borrow NodeShared, mode: StringView, ids: Sl
             }
         }
     }
-    if (unknown) { return null; }
     for (shard in 0..shared.file.shards) {
-        var found = false;
-        for (j in 0..led.length) {
-            if (led[j] == shard) { found = true; }
+        var top: u64 = 0;
+        for (k in 0..shards.length) {
+            if (shards[k] == shard) { top = highest[k]; }
         }
-        if (!found) { return null; }
+        var current = false;
+        for (j in 0..ledShard.length) {
+            if (ledShard[j] == shard && ledTerm[j] == top) { current = true; }
+        }
+        if (!current) { return null; }
     }
     return Some(total);
+}
+
+/// Whether every node holds this node's first SSE-S3 key (ADR-0100 §4, the M17 exit review): its tag when so, the
+/// tag a leader re-wraps under; 0 when not, or when a node did not answer.
+async fn rewrapGate(shared: borrow NodeShared) -> u64 {
+    let keys = shared.replication.sseKeys.get().view();
+    if (keys.length == 0) { return 0; }
+    let tag = keyTag(shared.secret.view(), borrow keys[0]);
+    var want = Vector<u8>.create();
+    if (want.extend(keys[0].id.view()).isErr() || want.push(':').isErr() || appendDecimal(mut want, tag).isErr()) {
+        return 0;
+    }
+    let statuses = await everyStatus(shared) ?? { return 0; };
+    for (s in 0..statuses.length) {
+        let text = StringView.fromUtf8(statuses[s].view()) ?? "";
+        var holds = false;
+        for (line in text.split("\n")) {
+            if (!line.startsWith("# keys s3 ")) { continue; }
+            let list = StringView.fromUtf8(line.bytes()[10..]) ?? "";
+            for (entry in list.split(",")) {
+                if (entry.bytes() == want.view()) { holds = true; }
+            }
+        }
+        if (!holds) { return 0; }
+    }
+    return tag;
 }
 
 /// The node's key files reloaded (ADR-0096 §3, §6). A master key may be added, but a reload that removes or changes
@@ -1114,7 +1231,7 @@ async fn reloadNodeKeysIfChanged(r: borrow mut Rotation, shared: borrow NodeShar
                             await refuseKeys(
                                 k,
                                 modified,
-                                "not every shard's leader answered with its counts; tried again when the file next changes",
+                                "a node did not answer, a shard's leader was not caught up, or a node has the key first; tried again when the file next changes",
                                 0,
                                 borrow dropped,
                             );

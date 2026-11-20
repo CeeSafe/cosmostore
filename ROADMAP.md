@@ -4289,3 +4289,21 @@ Browser form uploads with a SigV4 POST policy.
   This fixes M15's B2.
 - **Tests:** `removedKeysAreWiped`. 408 unit tests, both smokes (178 on the cluster) and the SDK matrix pass.
 - **Next:** slice 6, the exit review.
+
+### 20 Nov 2026: M17's exit review (docs/m17-exit-review.md)
+
+- **Fixed (a cluster's removal and re-wrap):**
+  - leaders report counts only when caught up, with their term;
+  - a shard's count is taken only from a leader of its highest term;
+  - every node must answer;
+  - each node's status shows the keys it holds, by id and tag;
+  - a leader re-wraps only under a first key every node holds (a gate checked every 10 s);
+  - an SSE-S3 key's removal is refused while any node has it first.
+- **Fixed (smaller):** out of memory in a re-wrap's replay marks the counts unknown; the key file's decode buffer is
+  reserved.
+- **ADR-0100 §4 amended,** with the rule for operators: add the new key everywhere, put it first everywhere, wait for
+  0, remove the old one.
+- **Recorded:** B1 to B5 of the review.
+- **Tests:** the cluster smoke restarts the killed node and rotates through all three (179). The S3 smoke, the SDK
+  matrix and 408 unit tests pass.
+- **For the owner:** accept ADR-0100 as amended, and close M17.

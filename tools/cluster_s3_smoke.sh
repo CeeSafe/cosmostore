@@ -588,6 +588,10 @@ check "and nothing delivered before is lost" "$(keys | tr ' ' '\n' | sort -u | t
 # Key rotation on a cluster (ADR-0100 §4): a key put first; each shard's leader re-wraps what the old one sealed,
 # through its log; a node takes the old key's removal once every shard's leader counts none under it, and refuses the
 # key in use.
+# Every node answers for a removal to be taken (the M17 exit review): the one killed above comes back first.
+start "$eventsLeader"
+for i in $(seq 1 60); do "$BIN" cluster-status --cluster-file cluster.conf --node "$eventsLeader" > /dev/null 2>&1 && break; pause 0.5; done
+pause 12 # a cycle of every node's re-wrap gate (10 s)
 on "$survivor" s3api create-bucket --bucket rotate > /dev/null 2>&1
 printf 'rotated on a cluster' > rotate.txt
 check "an SSE-S3 object before the rotation" "$(on "$survivor" s3api put-object --bucket rotate --key a --body rotate.txt --server-side-encryption AES256 --query ServerSideEncryption --output text 2>&1)" AES256
@@ -610,7 +614,8 @@ done
 cp sse.keys sse.keys.sse2
 printf 'sse3 %s\n' "$(head -c 32 /dev/urandom | base64)" > sse.keys
 pause 4
-check "the key in use removed: the running nodes refuse it" "$(running "SSE key file reload refused: [0-9]* versions, uploads or bucket encryption configurations still need the key it removes or changes (sse2)")" 1
+# Refused: every node has sse2 first (and, were it not, versions are sealed under it).
+check "the key in use removed: the running nodes refuse it" "$(running "SSE key file reload refused: .*node has the key first\|SSE key file reload refused: [0-9]* versions.*(sse2)")" 1
 cp sse.keys.sse2 sse.keys
 
 echo "cluster s3 smoke: $passed passed, $failed failed"

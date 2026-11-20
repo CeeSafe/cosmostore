@@ -61,6 +61,17 @@ leaders (the owner's choice, ADR-0099).
      cannot, as nothing seals new ones under it. A KMS request that names the key explicitly can, as ADR-0096 §3
      said for `serve`. It fails its commit on the node that took the removal (`sealKeyHeld`). Operators should
      remove a KMS key from bucket defaults first.
+   - **Amended by the exit review (docs/m17-exit-review.md, A1 and A2):**
+     - **Which counts are trusted:**
+       - a leader reports counts only when caught up (an entry of its own term committed, and applied to
+         `commit`);
+       - a shard's report counts only from a leader of the highest term any node shows for it;
+       - every node must answer.
+     - **What each node shows:** the keys it holds, by id and a tag (HMAC under the cluster's secret).
+     - **When a leader re-wraps:** only under a first key every node was last seen to hold.
+     - **When a removal is refused:** while any node has the SSE-S3 key first.
+     - **The rule for operators:** add the new key on every node; put it first on every node; wait until the old
+       key's count is 0; remove it.
 5. **Key bytes wiped (M15's B2).**
    - **The problem:** a set's keys are read without a lock (ADR-0050), so a removed key's bytes cannot be zeroed in
      place.
