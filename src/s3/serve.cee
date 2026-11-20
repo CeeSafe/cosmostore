@@ -77,6 +77,8 @@ struct Rotation {
     roles: RoleRotation?;
     /// The STS, SSE-S3 and KMS key files given, reloaded beside them (ADR-0096 §3, §4).
     keyFiles: Vector<KeyRotation>;
+    /// Where the re-wrap pass goes on from (ADR-0100 §3): the last key it looked at, or null for the first.
+    rewrapAfter: IndexKey?;
     /// The notification and replication target files given (ADR-0096 §5).
     notifyFile: TargetRotation<NotifyTarget>?;
     replicationFile: TargetRotation<ReplicationTarget>?;
@@ -362,6 +364,46 @@ async fn reportKeys(k: borrow mut KeyRotation, modified: i64, count: usize) {
 fn installKeys(k: borrow KeyRotation, fresh: borrow Vector<MasterKey>) -> bool {
     let copied = copyKeys(fresh.view()).ok() ?? { return false; };
     return k.sets.get().replace(copied);
+}
+
+/// A round of the re-wrap pass (ADR-0100 §3): versions under an SSE-S3 key that is not its file's first re-wrapped
+/// under the first, under the store's lock. Nothing without `--sse-key-file`.
+async fn rewrapUnderFirst(r: borrow mut Rotation, store: borrow Arc<AsyncMutex<ObjectStore>>) {
+    var sets: Arc<KeySets>? = null;
+    for (i in 0..r.keyFiles.length) {
+        if (r.keyFiles[i].kind == KEY_FILE_SSE) { sets = Some(r.keyFiles[i].sets.clone()); }
+    }
+    let keySets = match (sets) {
+        Some(s) => s,
+        null => { return; }
+    };
+    let keys = keySets.get().view();
+    var round: Result<RewrapRound, StoreError> = Err(StoreError.DataCorrupt);
+    {
+        // The store's lock for the round only, not for what is said of it.
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return; }
+        };
+        let st = guard.data();
+        let after = borrow r.rewrapAfter;
+        round = await Async.blocking(() => rewrapRound(st, keys, after));
+    }
+    match (round) {
+        Ok(done) => {
+            r.rewrapAfter = done.next;
+            if (done.moved > 0) {
+                var line = String.create();
+                let _ = line.append("cosmostore: re-wrapped ");
+                let _ = line.appendNumber(done.moved);
+                let _ = line.append(" versions under SSE key ");
+                let _ = line.append(StringView.fromUtf8(keys[0].id.view()) ?? "?");
+                let _ = line.append("\n");
+                let _ = await AsyncConsole.writeError(line.view());
+            }
+        }
+        Err(_) => { r.rewrapAfter = null; }
+    }
 }
 
 /// `serve`'s key files reloaded, a removed key checked against its one store.
@@ -833,6 +875,7 @@ async fn maintainForever(
         await upkeep(store);
         await reloadCredentialsIfChanged(rotation);
         await reloadKeysIfChanged(rotation, store);
+        await rewrapUnderFirst(rotation, store);
         await reloadTargetsIfChanged(rotation);
     }
     return Err(NetError.Closed);
@@ -855,6 +898,7 @@ async fn maintainAndReload(
         await reloadIfChanged(config, watch);
         await reloadCredentialsIfChanged(rotation);
         await reloadKeysIfChanged(rotation, store);
+        await rewrapUnderFirst(rotation, store);
         await reloadTargetsIfChanged(rotation);
     }
     return Err(NetError.Closed);
@@ -1427,6 +1471,7 @@ fn serve() -> i32 {
         },
         roles: null,
         keyFiles: Vector<KeyRotation>.create(),
+        rewrapAfter: null,
         notifyFile: null,
         replicationFile: null,
     };

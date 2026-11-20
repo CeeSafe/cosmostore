@@ -87,6 +87,39 @@ async fn statsOf(app: borrow S3App) -> Result<StoreStats, S3Fail> {
     return Ok(await Async.blocking(() => readStats(store)));
 }
 
+/// `"sealedByKey": {"s3": {<id>: n, …}, "kms": {…}}` (ADR-0100 §3): for each master key of the current sets, how
+/// many versions and uploads it seals; `null` for a count not known. A key whose count is 0 can be removed.
+async fn sealedByKey(app: borrow S3App) -> Result<Vector<u8>, S3Fail> {
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    var out = Vector<u8>.create();
+    out.extend("\"sealedByKey\": {".bytes())?;
+    for (mode in ["s3", "kms"]) {
+        if (mode == "kms") { out.extend(", ".bytes())?; }
+        out.push('"')?;
+        out.extend(mode.bytes())?;
+        out.extend("\": {".bytes())?;
+        let keys = if (mode == "s3") app.sseKeys.get().view() else app.kmsKeys.get().view();
+        for (i in 0..keys.length) {
+            if (i > 0) { out.extend(", ".bytes())?; }
+            writeJsonText(mut out, keys[i].id.view())?;
+            out.extend(": ".bytes())?;
+            var prefix = copyBytes("v1.".bytes())?;
+            prefix.extend(mode.bytes())?;
+            prefix.push('.')?;
+            prefix.extend(keys[i].id.view())?;
+            prefix.push('.')?;
+            match (store.sealedCount(prefix.view())) {
+                Some(n) => { appendDecimal(mut out, n)?; }
+                null => { out.extend("null".bytes())?; }
+            }
+        }
+        out.push('}')?;
+    }
+    out.extend("},\n  ".bytes())?;
+    return Ok(out);
+}
+
 async fn serveStats(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
     if (!isMethod(req.method, Method.Get)) { return Err(S3Fail.Code(S3Code.NoSuchKey)); }
     if (req.key.view() == "buckets") { return await serveBuckets(app, exchange); } // the admin API (ADR-0054)
@@ -99,6 +132,7 @@ async fn serveStats(app: borrow S3App, req: borrow S3Request, exchange: borrow m
     jsonField(mut body, "uploads", s.uploads, false)?;
     jsonField(mut body, "usedBytes", s.usedBytes, false)?;
     jsonField(mut body, "journalBytes", s.journalBytes, false)?;
+    body.extend((await sealedByKey(app)?).view())?;
     match (borrow app.audit) {
         Some(audit) => { jsonField(mut body, "auditLinesDropped", audit.dropped.load(), false)?; }
         null => {}

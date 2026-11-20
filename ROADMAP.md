@@ -4240,3 +4240,22 @@ Browser form uploads with a SigV4 POST policy.
     under the old envelope or the new one, and the counts match.
 - **Checks:** 406 unit tests and both smokes pass.
 - **No downgrade past it:** an older binary cannot open a store with a format-5 record.
+
+### 20 Nov 2026: M17 slice 3, the re-wrap pass on `serve` (ADR-0100 §3)
+
+- **`rewrapRound`** (`src/s3/sse.cee`): each upkeep round, the versions of up to 1,000 keys sealed by SSE-S3 under a
+  key that is not the file's first.
+  - **Each version:** its data key is unwrapped with its key, wrapped under the first with a new nonce, and zeroed.
+  - **The commit:** the records are staged and committed as one batch, under the store's lock; the bytes are not
+    read.
+  - **A version of a key the set no longer has** is left, and counted.
+- **The stats' `sealedByKey`:** `{"s3": {<id>: n}, "kms": {…}}` for every current key, from the index's counts. A
+  key at 0 can be removed.
+- **The S3 smoke rotates a key:**
+  - `k3` put first, and the old keys' counts reach 0;
+  - re-wrapped versions, inline and in extents, read with their ETags;
+  - the old keys' removal taken without a restart;
+  - the key in use, removed or given new bytes, refused.
+- **Tests:** `rewrapRoundsKeepTheDataKey` (the data key opened under the new key is the one sealed). 407 unit tests,
+  both smokes and the SDK matrix pass.
+- **Next:** slice 4, a cluster.

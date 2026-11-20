@@ -953,3 +953,43 @@ fn keyRemovalsAreCheckedWhole() -> Result<void, TestFailure> {
     Check.isTrue(sealKeyHeld(none.view(), none.view(), "".bytes()), "nothing sealed")?;
     return Ok();
 }
+
+/// A round of the re-wrap pass (ADR-0100 §3): a version sealed under `k2` is wrapped again under the first key,
+/// `k3`; the data key `k3` opens is the one `k2` sealed, so the bytes open as before; a version of a key the set no
+/// longer has is left, and counted.
+@test
+fn rewrapRoundsKeepTheDataKey() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("rewrap-round");
+    var s = ObjectStore.open(dir.view(), spaceConfig(0, 0))!;
+    s.createBucket("bkt")!;
+    var old = Vector<MasterKey>.create();
+    old.push(sseKeyOf("k2", 2))!;
+    let sealed = newManagedSeal(old.view())!;
+    var meta = Vector<u8>.create();
+    metadataAdd(mut meta, SSE_FIELD.bytes(), sealed.field.view())!;
+    let obj = s.writeAll("bytes".bytes())!;
+    let _ = s.putFinishedWith("bkt", "k", "", meta.view(), "".bytes(), borrow obj, PutCondition.None)!;
+    // A version of a key no set has.
+    var lost = Vector<MasterKey>.create();
+    lost.push(sseKeyOf("k9", 9))!;
+    let orphan = newManagedSeal(lost.view())!;
+    var orphanMeta = Vector<u8>.create();
+    metadataAdd(mut orphanMeta, SSE_FIELD.bytes(), orphan.field.view())!;
+    let obj2 = s.writeAll("other".bytes())!;
+    let _ = s.putFinishedWith("bkt", "lost", "", orphanMeta.view(), "".bytes(), borrow obj2, PutCondition.None)!;
+    var keys = Vector<MasterKey>.create();
+    keys.push(sseKeyOf("k3", 3))!;
+    keys.push(sseKeyOf("k2", 2))!;
+    let none: IndexKey? = null;
+    let round = rewrapRound(mut s, keys.view(), borrow none)!;
+    Check.equalU64(1, round.moved)?;
+    Check.equalU64(1, round.unopened)?;
+    let field = copyBytes(metadataFind(s.headObject("bkt", "k")!.metadata.view(), SSE_FIELD.bytes())!)!;
+    Check.isTrue(startsWithBytes(field.view(), "v1.s3.k3.".bytes()), "under the first key")?;
+    let e = decodeEnvelope(field.view())!!;
+    let opened = unwrapDataKey(borrow keys[0].key, borrow e)!;
+    Check.equalBytes(sealed.dataKey[..], opened[..])?;
+    // A second round has nothing to move.
+    Check.equalU64(0, rewrapRound(mut s, keys.view(), borrow none)!.moved)?;
+    return Ok();
+}

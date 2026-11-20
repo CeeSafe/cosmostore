@@ -1427,3 +1427,86 @@ async fn sendOpened(
     giveBodyBuffer(app, buf);
     return Ok();
 }
+
+// ---- Key rotation (ADR-0100 §3) ----
+
+/// How many keys one round of the re-wrap pass looks at.
+const REWRAP_KEYS_PER_ROUND: usize = 1000;
+
+/// What a round of the re-wrap pass did, and where the next one starts.
+struct RewrapRound {
+    next: IndexKey?;
+    moved: u64;
+    /// Versions whose key the set no longer has: left, and counted, as nothing can open them here.
+    unopened: u64;
+}
+
+/// One round, under the store's lock on a worker thread: the versions of up to REWRAP_KEYS_PER_ROUND keys after
+/// `after` sealed by SSE-S3 under a key other than the set's first, each one's data key unwrapped and wrapped again
+/// under the first, all staged and committed as one batch. The bytes are not read.
+fn rewrapRound(
+    s: borrow mut ObjectStore,
+    keys: Slice<MasterKey>,
+    after: borrow (IndexKey?),
+) -> Result<RewrapRound, StoreError> {
+    var round = RewrapRound { next: null, moved: 0, unopened: 0 };
+    if (keys.length == 0) { return Ok(round); }
+    let first = borrow keys[0];
+    var keep = copyBytes("v1.s3.".bytes())?;
+    keep.extend(first.id.view())?;
+    keep.push('.')?;
+    let page = s.rewrapStep(keep.view(), after, REWRAP_KEYS_PER_ROUND)?;
+    round.next = page.next;
+    for (i in 0..page.items.length) {
+        let item = borrow page.items[i];
+        let e = match (decodeEnvelope(item.envelope.view())?) {
+            Some(e) => e,
+            null => {
+                round.unopened += 1;
+                continue;
+            }
+        };
+        var master: usize? = null;
+        for (k in 0..keys.length) {
+            if (keys[k].id.view() == e.keyId.view()) { master = Some(k); }
+        }
+        let from = match (master) {
+            Some(k) => k,
+            null => {
+                round.unopened += 1;
+                continue;
+            }
+        };
+        var dataKey = match (unwrapDataKey(borrow keys[from].key, borrow e)) {
+            Some(d) => d,
+            null => {
+                round.unopened += 1;
+                continue;
+            }
+        };
+        var nonce = [0u8; 12];
+        if (Random.fill(mut nonce[..]).isErr()) {
+            for (b in 0..32) { dataKey[b] = 0; }
+            return Ok(round);
+        }
+        var next = SseEnvelope {
+            customer: false,
+            kms: false,
+            keyId: copyBytes(first.id.view())?,
+            nonce: nonce,
+            wrapped: [0u8; 48],
+            context: Vector<u8>.create(),
+        };
+        let aad = envelopeAad(borrow next)?;
+        let wrapped = wrapDataKeyWith(borrow first.key, aad.view(), borrow dataKey, nonce);
+        for (b in 0..32) { dataKey[b] = 0; }
+        next.wrapped = wrapped ?? { continue; };
+        var field = Vector<u8>.create();
+        encodeEnvelope(borrow next, mut field)?;
+        let bucket = StringView.fromUtf8(item.bucket.view()) ?? "";
+        let key = StringView.fromUtf8(item.key.view()) ?? "";
+        if (s.stageRewrap(bucket, key, item.versionId, item.envelope.view(), field.view())?) { round.moved += 1; }
+    }
+    if (round.moved > 0) { let _ = s.commitStaged()?; }
+    return Ok(round);
+}

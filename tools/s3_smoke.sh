@@ -808,27 +808,38 @@ check "a configuration naming a target removed" "$(code s3api put-bucket-notific
 aws s3api put-bucket-notification-configuration --bucket reload-notify --notification-configuration '{}' > /dev/null 2>&1
 aws s3api delete-bucket --bucket reload-notify > /dev/null 2>&1
 
-# Key files reloaded (ADR-0096 §3): a key added first seals what is new, the old ones still open what they sealed; a
-# reload that removes a key stored versions still need is refused, and says how many.
+# Key rotation without a restart or a re-seal (ADR-0096 §3, ADR-0100): a key put first seals what is new, and the
+# re-wrap pass moves what the old keys sealed under it, a batch per upkeep round (2 s), the bytes untouched. Once the
+# stats count none under the old key, its removal is taken; the key in use cannot be removed, nor given new bytes.
+sealed() { aws s3api get-object --bucket _cosmostore --key stats "$work/stats.json" > /dev/null 2>&1; python3 -c 'import json,sys; v=json.load(open(sys.argv[1]))["sealedByKey"]["s3"].get(sys.argv[2]); print(v)' "$work/stats.json" "$1"; }
+check "the versions under k2 before" "$([ "$(sealed k2)" -gt 0 ] && echo some)" some
 cp "$work/sse.keys" "$work/sse.keys.kept"
 { printf 'k3 %s\n' "$(head -c 32 /dev/urandom | base64)"; cat "$work/sse.keys.kept"; } > "$work/sse.keys"
 sleep 4
 grep -q "SSE key file reloaded: 3 keys" "$work/server.log" && pass "an SSE key added, without a restart" || fail "an SSE key added, without a restart"
 check "an SSE-S3 put after the key added" "$(aws s3api put-object --bucket smoke --key sse/after-k3.txt --body sse.txt --server-side-encryption AES256 --query ServerSideEncryption --output text)" AES256
 check "its read" "$(aws s3api get-object --bucket smoke --key sse/after-k3.txt "$work/k3.out" > /dev/null 2>&1 && cmp -s sse.txt "$work/k3.out" && echo same)" same
-check "a version the old key sealed still reads" "$(aws s3api get-object --bucket smoke --key sse/small.txt "$work/k2.out" > /dev/null 2>&1 && cmp -s sse.txt "$work/k2.out" && echo same)" same
-grep -v '^k2 ' "$work/sse.keys" > "$work/sse.keys.next" && mv "$work/sse.keys.next" "$work/sse.keys"
+for i in $(seq 1 30); do [ "$(sealed k2)" = 0 ] && [ "$(sealed k1)" = 0 ] && break; sleep 1; done
+check "the old keys' versions re-wrapped under k3" "$(sealed k2) $(sealed k1)" "0 0"
+grep -q "re-wrapped [0-9]* versions under SSE key k3" "$work/server.log" && pass "the re-wrap logged" || fail "the re-wrap logged"
+etag_after=$(aws s3api head-object --bucket smoke --key sse/big.bin --query ETag --output text)
+check "a re-wrapped version reads, its bytes untouched" "$(aws s3api get-object --bucket smoke --key sse/small.txt "$work/k2.out" > /dev/null 2>&1 && cmp -s sse.txt "$work/k2.out" && echo same)" same
+check "a re-wrapped version in extents reads" "$(aws s3api get-object --bucket smoke --key sse/big.bin "$work/big.out" > /dev/null 2>&1 && cmp -s sse.bin "$work/big.out" && echo same)" same
+# The old keys removed: taken, as nothing needs them now.
+grep '^k3 ' "$work/sse.keys" > "$work/sse.keys.next" && mv "$work/sse.keys.next" "$work/sse.keys"
 sleep 4
-grep -q "SSE key file reload refused: [0-9]* versions, uploads or bucket encryption configurations still need the key it removes or changes (k2)" "$work/server.log" && pass "removing a key in use refused" || fail "removing a key in use refused"
-check "the key kept opens its versions" "$(aws s3api get-object --bucket smoke --key sse/small.txt "$work/k2.out" > /dev/null 2>&1 && cmp -s sse.txt "$work/k2.out" && echo same)" same
-# New bytes under k2's id: as a removal of k2, refused.
-cp "$work/sse.keys" "$work/sse.keys.removed"
-{ grep '^k3 ' "$work/sse.keys.removed"; printf 'k2 %s\n' "$(head -c 32 /dev/urandom | base64)"; grep '^k1 ' "$work/sse.keys.kept"; } > "$work/sse.keys"
-sleep 4
-check "new bytes under a key in use refused" "$(grep -c "SSE key file reload refused: [0-9]* versions, uploads or bucket encryption configurations still need the key it removes or changes (k2)" "$work/server.log")" 2
-# Put k2 back, for the checks after.
+grep -q "SSE key file reloaded: 1 keys" "$work/server.log" && pass "the old keys removed, without a restart" || fail "the old keys removed, without a restart"
+check "and every version still reads" "$(aws s3api get-object --bucket smoke --key sse/big.bin "$work/big.out" > /dev/null 2>&1 && cmp -s sse.bin "$work/big.out" && echo same)" same
+check "its ETag as it was" "$(aws s3api head-object --bucket smoke --key sse/big.bin --query ETag --output text)" "$etag_after"
+# The key in use: its removal refused, and new bytes under its id refused.
 cp "$work/sse.keys" "$work/sse.keys.k3"
-{ grep '^k3 ' "$work/sse.keys.k3"; cat "$work/sse.keys.kept"; } > "$work/sse.keys"
+printf 'k4 %s\n' "$(head -c 32 /dev/urandom | base64)" > "$work/sse.keys"
+sleep 4
+grep -q "SSE key file reload refused: [0-9]* versions, uploads or bucket encryption configurations still need the key it removes or changes (k3)" "$work/server.log" && pass "removing the key in use refused" || fail "removing the key in use refused"
+printf 'k3 %s\n' "$(head -c 32 /dev/urandom | base64)" > "$work/sse.keys"
+sleep 4
+check "new bytes under the key in use refused" "$(grep -c "SSE key file reload refused: [0-9]* versions, uploads or bucket encryption configurations still need the key it removes or changes (k3)" "$work/server.log")" 2
+cp "$work/sse.keys.k3" "$work/sse.keys"
 sleep 4
 
 # Credential rotation (ADR-0050): the credentials file is read again when it changes, within an upkeep round (2 s).
