@@ -3893,3 +3893,14 @@ Browser form uploads with a SigV4 POST policy.
   - **Smaller:** client conditions at delivery, two fail-open defaults, the ADR's field name, and a refused replica
     whose body is cut.
 - **Next:** the fixes.
+
+### 20 Nov 2026: M14's exit review findings fixed
+
+- **A1:** inventory decided file by file.
+- **A2:** a replica's upload decided at its creation, and a refused completion aborted.
+- **A3:** each outbox event keeps its targets' requesters from when it was made. The checkpoints' event encoding
+  gains an optional section, so a binary before M14 cannot read one that has it.
+- **B1:** client conditions hold for no delivery write. **B3:** unnamed requesters fail closed. **B6:** a refused
+  replica with its body cut is FAILED.
+- **ADR-0094:** B2, B4 and B5 are in its amendments.
+- **Tests:** 390 unit tests, the S3 smoke, the cluster smoke (167) and the SDK matrix pass.

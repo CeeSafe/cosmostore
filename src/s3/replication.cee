@@ -415,11 +415,10 @@ async fn replicateEvent(
         let s = guard.data();
         // Decided as the rule's requester, with the policies of now (ADR-0094 §3): refused, the source reads FAILED,
         // as a destination's refusal does.
-        let ruleIds = e.ruleIds.view();
         let action = if (e.kind == EVENT_MARKER) "s3:ReplicateDelete" else "s3:ReplicateObject";
         let keyBytes = e.key.view();
         let allowed = await Async.blocking(
-            () => replicaAllowed(s, decider, src, ruleIds, destination, action, dst, keyBytes),
+            () => replicaAllowed(s, decider, e, destination, action, dst, keyBytes),
         );
         if (!allowed) {
             let noted = await Async.blocking(() => s.noteReplicationFailure(src, keyBytes, id));
@@ -485,22 +484,23 @@ async fn replicateEvent(
     return Ok(await replicationOutcome(put, e));
 }
 
-/// Whether a replica is allowed as its rule's requester (ADR-0094 §3), under the store's lock.
+/// Whether a replica is allowed as the requester its event recorded (ADR-0094 §3, the M14 exit review's A3), under
+/// the store's lock.
 fn replicaAllowed(
     s: borrow ObjectStore,
     decider: borrow RecordedDecider,
-    source: StringView,
-    ruleIds: Slice<Vector<u8>>,
+    e: borrow OutboxEvent,
     destination: Slice<u8>,
     action: StringView,
     dst: StringView,
     key: Slice<u8>,
 ) -> bool {
-    let requester = match (s.replicaRequesterOf(source, ruleIds, destination)) {
-        Ok(r) => r,
+    let target = match (replicationTarget(destination)) {
+        Ok(t) => t,
         Err(_) => { return false; }
     };
-    return match (decidedIn(decider, s, requester.view(), action, dst, key)) {
+    let requester = eventRequester(e, target.view());
+    return match (decidedIn(decider, s, requester, action, dst, key)) {
         Ok(a) => a,
         Err(_) => false,
     };

@@ -90,10 +90,24 @@ struct OutboxEvent {
     /// The rules that take it, each its id and its target, in the rules' order.
     ruleIds: Vector<Vector<u8>>;
     targets: Vector<Vector<u8>>;
+    /// Each target's requester, as its replication rule recorded it when the event was made (ADR-0094 §1, the M14
+    /// exit review's A3): a write is decided as the requester of the configuration that made it, whatever the
+    /// configuration became since. Empty for none (a webhook's, the account's); shorter than `targets` for an event
+    /// made before M14.
+    requesters: Vector<Vector<u8>>;
+}
+
+/// The requester of an event's target `target`, or empty for none.
+fn eventRequester<region a>(e: borrow(a) OutboxEvent, target: Slice<u8>) -> Slice<a, u8> {
+    for (i in 0..e.targets.length) {
+        if (e.targets[i].view() == target && i < e.requesters.length) { return e.requesters[i].view(); }
+    }
+    return "".bytes();
 }
 
 /// An event as a checkpoint keeps it: u64 lsn, u8 kind, u16+bytes bucket, u16+bytes key, 16 version id, u64 size,
-/// 16 md5, u32 parts, i64 mtime ms, u16 rule count, then per rule u16+bytes id and u16+bytes target.
+/// 16 md5, u32 parts, i64 mtime ms, u16 rule count, then per rule u16+bytes id and u16+bytes target. When a target has
+/// a requester (ADR-0094), then u16 rule count again and per rule u16+bytes requester.
 fn encodeEvent(e: borrow OutboxEvent, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
     out.pushLE(e.lsn)?;
     out.pushLE(e.kind)?;
@@ -108,6 +122,16 @@ fn encodeEvent(e: borrow OutboxEvent, out: borrow mut Vector<u8>) -> Result<void
     for (i in 0..e.targets.length) {
         pushText16(out, e.ruleIds[i].view())?;
         pushText16(out, e.targets[i].view())?;
+    }
+    var any = false;
+    for (i in 0..e.requesters.length) {
+        if (e.requesters[i].length > 0) { any = true; }
+    }
+    if (any) {
+        out.pushLE(truncate<u16>(e.targets.length))?;
+        for (i in 0..e.targets.length) {
+            pushText16(out, if (i < e.requesters.length) e.requesters[i].view() else "".bytes())?;
+        }
     }
     return Ok();
 }
@@ -140,11 +164,18 @@ fn decodeEvent(bytes: Slice<u8>) -> Result<OutboxEvent, MetaFault> {
         mtimeMillis: truncate<i64>(mtime),
         ruleIds: Vector<Vector<u8>>.create(),
         targets: Vector<Vector<u8>>.create(),
+        requesters: Vector<Vector<u8>>.create(),
     };
     if (count == 0 || count > MAX_NOTIFICATION_RULES) { return Err(MetaFault.TooLong); }
     for (i in 0..count) {
         e.ruleIds.push(readText16(bytes, mut at)?)?;
         e.targets.push(readText16(bytes, mut at)?)?;
+    }
+    if (at < bytes.length) {
+        need(bytes, at, 2)?;
+        if (bytes.readLE<u16>(at) as usize != count) { return Err(MetaFault.TooLong); }
+        at += 2;
+        for (i in 0..count) { e.requesters.push(readText16(bytes, mut at)?)?; }
     }
     if (at != bytes.length) { return Err(MetaFault.TooLong); }
     return Ok(e);
@@ -163,11 +194,13 @@ fn cloneEvent(e: borrow OutboxEvent) -> Result<OutboxEvent, AllocError> {
         mtimeMillis: e.mtimeMillis,
         ruleIds: Vector<Vector<u8>>.create(),
         targets: Vector<Vector<u8>>.create(),
+        requesters: Vector<Vector<u8>>.create(),
     };
     for (i in 0..e.targets.length) {
         copy.ruleIds.push(copyBytes(e.ruleIds[i].view())?)?;
         copy.targets.push(copyBytes(e.targets[i].view())?)?;
     }
+    for (i in 0..e.requesters.length) { copy.requesters.push(copyBytes(e.requesters[i].view())?)?; }
     return Ok(copy);
 }
 

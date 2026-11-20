@@ -432,16 +432,14 @@ async fn sendRemote(
     if (remotePath(bucket, key.bytes(), mut path).isErr()) { return RemoteOutcome.Again; }
     // Through the cluster's own front, the rule's requester goes with each write, for the destination's shard to
     // decide it as (ADR-0094 §4); another endpoint decides by its own keys.
+    // The requester the event recorded (the M14 exit review's A3), not the configuration's now.
     var requester = Vector<u8>.create();
     if (fidelity) {
-        var guard = match (await store.get().lock()) {
-            Ok(g) => g,
+        let named = match (replicationTarget(bucket)) {
+            Ok(n) => n,
             Err(_) => { return RemoteOutcome.Again; }
         };
-        requester = match (guard.data().replicaRequesterOf(src, e.ruleIds.view(), bucket)) {
-            Ok(r) => r,
-            Err(_) => { return RemoteOutcome.Again; }
-        };
+        if (requester.extend(eventRequester(e, named.view())).isErr()) { return RemoteOutcome.Again; }
     }
     // A delete marker: a DELETE, which makes one there; with fidelity, one with the source marker's id.
     if (e.kind == EVENT_MARKER) {
@@ -584,7 +582,7 @@ async fn sendRemote(
         if (!fidelityHeaders(borrow v, mut headers)) { return RemoteOutcome.Again; }
         body.left = v.size;
         return match (await remoteCall(client, t, Method.Put, path.view(), "".bytes(), headers.view(), mut body)) {
-            Ok(a) => if (body.broken) RemoteOutcome.Again else outcomeFor(t, borrow a),
+            Ok(a) => if (body.broken && a.status < 400) RemoteOutcome.Again else outcomeFor(t, borrow a),
             Err(_) => RemoteOutcome.Again,
         };
     }
@@ -592,7 +590,7 @@ async fn sendRemote(
     if (v.parts == 0 || extras.partSizes.length != v.parts as usize) {
         body.left = v.size;
         return match (await remoteCall(client, t, Method.Put, path.view(), "".bytes(), headers.view(), mut body)) {
-            Ok(a) => if (body.broken) RemoteOutcome.Again else outcomeFor(t, borrow a),
+            Ok(a) => if (body.broken && a.status < 400) RemoteOutcome.Again else outcomeFor(t, borrow a),
             Err(_) => RemoteOutcome.Again,
         };
     }
@@ -651,7 +649,7 @@ async fn sendRemote(
                 break;
             }
         };
-        let o = if (body.broken) RemoteOutcome.Again else outcomeFor(t, borrow sent);
+        let o = if (body.broken && sent.status < 400) RemoteOutcome.Again else outcomeFor(t, borrow sent);
         match (o) {
             RemoteOutcome.Done => {}
             other => {
@@ -719,5 +717,15 @@ async fn sendRemote(
         "<Error>".bytes(),
         0,
     ).isSome()) { return RemoteOutcome.Again; }
-    return outcomeFor(t, borrow done);
+    let outcome = outcomeFor(t, borrow done);
+    match (outcome) {
+        RemoteOutcome.Refused => {
+            // A completion refused (by the destination's shard, as the rule's requester): its upload is abandoned
+            // there, so its parts are not left in a bucket it may not write (the M14 exit review's A2).
+            var none3 = NoBody {};
+            let _ = await remoteCall(client, t, Method.Delete, path.view(), query.view(), noHeaders.view(), mut none3);
+        }
+        _ => {}
+    }
+    return outcome;
 }

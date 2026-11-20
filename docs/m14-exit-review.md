@@ -65,3 +65,18 @@ Checked and right:
 it may not be. B1, B3, B5 and B6 are cheap and fixed with them. B2 and B4 go into ADR-0094.
 
 Closing M14 and accepting ADR-0094 are the owner's decisions.
+
+## The fixes (20 Nov 2026)
+
+| Finding | Fix | Shown by |
+|---|---|---|
+| A1 | an inventory report is decided file by file, before each is written; a refusal stops it before its manifest | S3 smoke: a Deny on the report's dated keys; no manifest is written after it (a check that the count does not grow, as the first report may come before the Deny) |
+| A2 | a replica's upload is decided at CreateMultipartUpload, before any part; a refused completion is aborted | (by reading) |
+| A3 | each event keeps its targets' requesters, recorded when it is made (checkpoints carry them); a write is decided as that, whatever the configuration became | `eventsKeepTheirTargetsRequesters` |
+| B1 | at delivery, a test of a client's fact holds for no write, whatever its operator; only `aws:SecureTransport` is the server's | `writesDecidedAsTheirRequester`: a Null Deny on encryption and a Null Allow on an address, neither applies |
+| B3 | a requester that cannot be named records `user ` or `role `, refused; an empty user key matches no account key | `writesDecidedAsTheirRequester` |
+| B6 | a 4xx answer is the answer, even with the body cut | (by reading) |
+| B2, B4, B5 | in ADR-0094's amendments | |
+
+**Checked after the fixes:** 390 unit tests, the S3 smoke, the cluster smoke (167) and the SDK matrix pass.
+**Not done:** a cluster check of a refused multipart replica (A2), which the cluster smoke does not make.

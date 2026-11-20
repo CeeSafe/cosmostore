@@ -1316,7 +1316,7 @@ USERS
 cat > "$work/users.roles" <<'ROLES'
 tablereader 3600 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":"*"}}
 ROLES
-"$bin" serve "$work/users-store" "$usersport" "$work/users.credentials" localhost --users-file "$work/users.file" --maintain-seconds 2 --access-log-seconds 2 --sts-key-file "$work/sts.keys" --roles-file "$work/users.roles" 2>> "$work/users.log" &
+"$bin" serve "$work/users-store" "$usersport" "$work/users.credentials" localhost --users-file "$work/users.file" --maintain-seconds 2 --access-log-seconds 2 --inventory-day-seconds 3 --sts-key-file "$work/sts.keys" --roles-file "$work/users.roles" 2>> "$work/users.log" &
 usersrv=$!
 sleep 1
 ua() { AWS_ENDPOINT_URL="http://127.0.0.1:$usersport" aws "$@"; }
@@ -1355,6 +1355,16 @@ uw s3api put-object --bucket wsrc --key one.txt --body dir.txt > /dev/null 2>&1
 wstatus() { ua s3api head-object --bucket wsrc --key "$1" --query ReplicationStatus --output text 2>/dev/null; }
 for i in $(seq 1 40); do [ "$(wstatus one.txt)" = COMPLETED ] && break; sleep 0.25; done
 check "replicated while its policy allows it" "$(wstatus one.txt)" COMPLETED
+# An inventory report is decided file by file (the M14 exit review's A1): a Deny on its dated keys keeps its manifest
+# out, though its policy allows the rest.
+uw s3api put-bucket-inventory-configuration --bucket wsrc --id i1 --inventory-configuration '{"Id":"i1","IsEnabled":true,"Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::wdst","Format":"CSV","Prefix":"inv"}},"Schedule":{"Frequency":"Daily"},"IncludedObjectVersions":"Current"}' > /dev/null 2>&1 && pass "a user's inventory put" || fail "a user's inventory put"
+ua s3api put-bucket-policy --bucket wdst --policy '{"Version":"2012-10-17","Statement":{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::000000000000:user/writer"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::wdst/inv/wsrc/i1/2*"}}' > /dev/null 2>&1
+# A first report may be written before the Deny is in: none after it, over several of the test's days.
+manifests() { ua s3api list-objects-v2 --bucket wdst --prefix inv/ --query 'length(Contents[?ends_with(Key, `manifest.json`)] || `[]`)' --output text 2>&1; }
+before=$(manifests)
+sleep 10
+check "no manifest past a Deny on its keys" "$(manifests)" "$before"
+ua s3api delete-bucket-policy --bucket wdst > /dev/null 2>&1
 sed -i.bak 's#"arn:aws:s3:::wsrc","arn:aws:s3:::wsrc/\*","arn:aws:s3:::wdst","arn:aws:s3:::wdst/\*"#"arn:aws:s3:::wsrc","arn:aws:s3:::wsrc/*"#' "$work/users.file"
 sleep 4
 uw s3api put-object --bucket wsrc --key two.txt --body dir.txt > /dev/null 2>&1

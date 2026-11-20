@@ -1180,6 +1180,9 @@ struct PolicyFacts {
     sseAlgorithm: Vector<u8>?;
     sseKmsKeyId: Vector<u8>?;
     sseCustomerAlgorithm: Vector<u8>?;
+    /// A write the server makes for a configuration (ADR-0094 §2): it has no client, so a condition on a client's
+    /// facts holds for it in no way, and its statement neither allows nor denies (the M14 exit review's B1).
+    noClient: bool;
 }
 
 fn ownedOf(v: Slice<u8>?) -> Result<Vector<u8>?, AllocError> => match (v) {
@@ -1205,6 +1208,7 @@ fn policyFacts(
         sseAlgorithm: ownedOf(headerOf(req, "x-amz-server-side-encryption"))?,
         sseKmsKeyId: ownedOf(headerOf(req, "x-amz-server-side-encryption-aws-kms-key-id"))?,
         sseCustomerAlgorithm: ownedOf(headerOf(req, "x-amz-server-side-encryption-customer-algorithm"))?,
+        noClient: false,
     };
     if (listing) {
         facts.prefix = copyBytes(paramOf(req, "prefix") ?? "".bytes())?;
@@ -1261,6 +1265,14 @@ fn factPresent(facts: borrow PolicyFacts, key: PolicyKey) -> bool => match (key)
 /// One condition test (ADR-0043 §3): any value matches; a key the request does not have fails it unless it is
 /// negated; `Null` asks whether the key is absent.
 fn testHolds(t: borrow PolicyTest, facts: borrow PolicyFacts) -> bool {
+    // No client: a test of a client's fact does not hold, whatever its operator (`Not…` and `Null` included), so its
+    // statement does not apply. Only whether the server is reached over TLS is the server's own.
+    if (facts.noClient) {
+        match (t.key) {
+            PolicyKey.SecureTransport => {}
+            _ => { return false; }
+        }
+    }
     let present = factPresent(facts, t.key);
     match (t.op) {
         PolicyOp.Null => {
@@ -1853,22 +1865,20 @@ async fn authorize(
 /// account's keys, whose configurations are the account's.
 fn requesterText(app: borrow S3App, who: borrow Requester) -> Result<Vector<u8>, AllocError> {
     var out = Vector<u8>.create();
+    // A role or a user that cannot be named records a requester no write is allowed as (`role `, `user `): it fails
+    // closed, rather than as the account's (the M14 exit review's B3).
     match (who.role) {
         Some(r) => {
-            if (r < app.roles.length) {
-                out.extend("role ".bytes())?;
-                out.extend(app.roles[r].name.view())?;
-            }
+            out.extend("role ".bytes())?;
+            if (r < app.roles.length) { out.extend(app.roles[r].name.view())?; }
             return Ok(out);
         }
         null => {}
     }
     match (userOfRequester(app.credentials.get().view(), who)) {
         Some(u) => {
-            if (u.userKey.length > 0) {
-                out.extend("user ".bytes())?;
-                out.extend(u.userKey.view())?;
-            }
+            out.extend("user ".bytes())?;
+            out.extend(u.userKey.view())?;
         }
         null => {}
     }
@@ -1913,18 +1923,22 @@ fn decideRecorded(
     var role: usize? = null;
     if (startsWithBytes(requester, userHead)) {
         let userKey = requester[userHead.length..];
+        // An account's key has an empty user key: an empty one names no user.
+        if (userKey.length == 0) { return Ok(false); }
         for (i in 0..credentials.length) {
             if (!credentials[i].revoked && credentials[i].userKey.view() == userKey) { user = Some(i); }
         }
     } else if (startsWithBytes(requester, roleHead)) {
         let name = requester[roleHead.length..];
+        if (name.length == 0) { return Ok(false); }
         for (r in 0..roles.length) {
             if (roles[r].name.view() == name) { role = Some(r); }
         }
     }
     if (user.isNull() && role.isNull()) { return Ok(false); }
     let req = deliveryRequest();
-    let facts = policyFacts(borrow req, false, secure, null)?;
+    var facts = policyFacts(borrow req, false, secure, null)?;
+    facts.noClient = true;
     let call = identityCallOf(action, bucket, key)?;
     let identityAction = StringView.fromUtf8(call.action.view()) ?? action;
     var identityAllows = false;

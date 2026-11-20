@@ -42,9 +42,36 @@ configuration is decided as its parent (the owner's choice).
    - **Later writes:** each is decided again. One a user's policy allows once more goes through.
 4. **On a cluster,** the destination's shard decides.
    - **How it learns the requester:** the delivering node sends it with the write, in a field the front passes only
-     with the node's stamp (`x-cosmo-acting-as`, as ADR-0078 §4's replica fields).
+     with the node's stamp (`x-cosmo-replica-requester`, one of ADR-0078 §4's replica fields).
    - **What decides:** the shard's S3 server decides that write as the requester, with its own node's credentials
      and policies. A field without the stamp is dropped by the front, as the cluster's other fields are.
+
+## Amended after M14's exit review
+
+- **Whose requester a write is decided as (A3):**
+  - **Recorded with the event:** a replica's requester is the one its rule recorded when the event was made, kept
+    with the event in the outbox and its checkpoints. A rule deleted or re-pointed while events wait changes nothing
+    of them; before, they were written as the account's.
+  - **A configuration that does not decode** makes no event.
+- **A refusal fails closed (B3):** a role or user that cannot be named records `role ` or `user `, which no write is
+  allowed as.
+- **Inventory (A1):** a report is decided file by file, before each is written. A refusal stops it before its
+  manifest.
+- **A replica's upload on a cluster (A2):**
+  - it is decided at CreateMultipartUpload, before any part is stored;
+  - a refused completion is aborted at the destination.
+- **No client (B1):** a condition on a client's fact holds for no write, whatever its operator (`Not…` and `Null`
+  included), so its statement neither allows nor denies. Only `aws:SecureTransport` is the server's own.
+- **AccessDenied is for good (B2):** a node's own front answering AccessDenied is FAILED, the account's replication
+  included. A user not yet in the destination leader's users file also reads FAILED during a rollout, where an
+  unknown key is tried again.
+- **Coarse, and recorded (B4):**
+  - a user is decided with one of its keys as the principal, so a bucket Deny naming one specific key of a user with
+    several may not apply;
+  - the roles file is read at start, as `serve` reads it, so a role removed takes effect at the next start;
+  - a role session's configuration is decided by the role's policy without its session policy (§1, the owner's
+    choice).
+- **A refused replica's body (B6):** a 4xx answer is the answer, even if the destination cut the body short.
 
 ## Durability (slice 2)
 

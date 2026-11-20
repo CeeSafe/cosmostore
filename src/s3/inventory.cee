@@ -563,12 +563,14 @@ fn putInventoryFile(
 }
 
 /// Writes one configuration's report now: its data files, then its manifest and the manifest's checksum (ADR-0074 §3).
-/// Whether it was written.
+/// Whether it was written. Each file is decided first as the configuration's requester (ADR-0094 §3, the M14 exit
+/// review's A1): one refused stops the report before its manifest.
 fn writeReport(
     store: borrow mut ObjectStore,
     source: Slice<u8>,
     c: borrow InventoryConfig,
     now: i64,
+    decider: borrow RecordedDecider,
 ) -> Result<bool, StoreError> {
     let bucket = StringView.fromUtf8(source) ?? "";
     let destination = StringView.fromUtf8(c.destination.view()) ?? "";
@@ -579,10 +581,23 @@ fn writeReport(
             Some(f) => f,
             null => { break; }
         };
+        if (!(decidedIn(
+            decider,
+            store,
+            c.requester.view(),
+            "s3:PutObject",
+            destination,
+            f.key.view(),
+        )?)) { return Ok(false); }
         putInventoryFile(store, destination, borrow f)?;
         scan.written(borrow f)?;
     }
     let tail = scan.manifest(source, c, now)?;
+    for (i in 0..tail.length) {
+        if (!(decidedIn(decider, store, c.requester.view(), "s3:PutObject", destination, tail[i].key.view())?)) {
+            return Ok(false);
+        }
+    }
     for (i in 0..tail.length) { putInventoryFile(store, destination, borrow tail[i])?; }
     return Ok(true);
 }
@@ -672,7 +687,7 @@ async fn inventoryForever(
                         continue;
                     }
                 }
-                let written = await Async.blocking(() => writeReport(st, source, c, now));
+                let written = await Async.blocking(() => writeReport(st, source, c, now, decider));
                 match (written) {
                     Ok(true) => { runs[at].lastMs = now; }
                     _ => {

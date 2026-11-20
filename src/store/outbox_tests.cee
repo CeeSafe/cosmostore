@@ -78,6 +78,7 @@ fn notificationRulesAndEvents() -> Result<void, TestFailure> {
         mtimeMillis: 1767225600000,
         ruleIds: Vector<Vector<u8>>.create(),
         targets: Vector<Vector<u8>>.create(),
+        requesters: Vector<Vector<u8>>.create(),
     };
     e.ruleIds.push(copyBytes("images".bytes())!)!;
     e.targets.push(copyBytes("hook".bytes())!)!;
@@ -203,6 +204,7 @@ fn outboxDropsTheOldestPastItsLimit() -> Result<void, TestFailure> {
             mtimeMillis: 0,
             ruleIds: Vector<Vector<u8>>.create(),
             targets: Vector<Vector<u8>>.create(),
+            requesters: Vector<Vector<u8>>.create(),
         };
         box.add(e)!;
     }
@@ -303,3 +305,42 @@ fn outboxFaultsTorn() -> Result<void, TestFailure> => sweepOutbox("outbox-fault-
 
 @test
 fn outboxFaultsCrash() -> Result<void, TestFailure> => sweepOutbox("outbox-fault-crash", SweepMode.Crash);
+
+/// Each target's requester (ADR-0094, the M14 exit review's A3) goes with the event through a checkpoint's encoding,
+/// written only when a target has one; an event without them encodes as before, and reads back with none.
+@test
+fn eventsKeepTheirTargetsRequesters() -> Result<void, TestFailure> {
+    var e = OutboxEvent {
+        lsn: 7,
+        kind: EVENT_PUT,
+        bucket: copyBytes("src".bytes())!,
+        key: copyBytes("k".bytes())!,
+        versionId: [1u8; 16],
+        size: 3,
+        md5: [2u8; 16],
+        parts: 0,
+        mtimeMillis: 1000,
+        ruleIds: Vector<Vector<u8>>.create(),
+        targets: Vector<Vector<u8>>.create(),
+        requesters: Vector<Vector<u8>>.create(),
+    };
+    e.ruleIds.push(copyBytes("hook".bytes())!)!;
+    e.targets.push(copyBytes("t1".bytes())!)!;
+    e.requesters.push(Vector<u8>.create())!;
+    var plain = Vector<u8>.create();
+    encodeEvent(borrow e, mut plain)!;
+    e.ruleIds.push(copyBytes("w".bytes())!)!;
+    let target = replicationTarget("dst".bytes())!;
+    e.targets.push(copyBytes(target.view())!)!;
+    e.requesters.push(copyBytes("user writer W1".bytes())!)!;
+    var blob = Vector<u8>.create();
+    encodeEvent(borrow e, mut blob)!;
+    let back = decodeEvent(blob.view())!;
+    Check.equalBytes("user writer W1".bytes(), eventRequester(borrow back, target.view()))?;
+    Check.equalU64(0, eventRequester(borrow back, "t1".bytes()).length as u64)?;
+    // Without a requester: no section, and none read back.
+    let old = decodeEvent(plain.view())!;
+    Check.equalU64(0, old.requesters.length as u64)?;
+    Check.equalU64(0, eventRequester(borrow old, "t1".bytes()).length as u64)?;
+    return Ok();
+}
