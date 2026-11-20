@@ -1,6 +1,7 @@
 # ADR-0094: Configurations decided at delivery (M14)
 
-**Status:** proposed, 20 Nov 2026. M14 is item A of ADR-0093 (the owner: "A: decided at delivery"); a session's
+**Status:** accepted, 20 Nov 2026 (the owner: "Accept and close"), as amended after M14's exit review. Proposed
+the same day. M14 is item A of ADR-0093 (the owner: "A: decided at delivery"); a session's
 configuration is decided as its parent (the owner's choice).
 
 ## Context
@@ -15,7 +16,7 @@ configuration is decided as its parent (the owner's choice).
 - **What is then never checked again:** the writes themselves. A user removed, or a policy narrowed, does not stop
   them.
 
-## Decision (proposed)
+## Decision
 
 1. **The requester is recorded** with each of the three configurations when a user or a session puts it.
    - **What is recorded:** `user <name> <id>` for a user, or a GetSessionToken session's user (ADR-0088), and

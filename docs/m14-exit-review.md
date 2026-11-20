@@ -80,3 +80,9 @@ Closing M14 and accepting ADR-0094 are the owner's decisions.
 
 **Checked after the fixes:** 390 unit tests, the S3 smoke, the cluster smoke (167) and the SDK matrix pass.
 **Not done:** a cluster check of a refused multipart replica (A2), which the cluster smoke does not make.
+
+## Closed (20 Nov 2026)
+
+The owner accepted ADR-0094, as amended, and closed M14 ("Accept and close"). **Still recorded:**
+- a cluster test of a refused multipart replica (A2's fix was made by reading);
+- B4's coarse lookups.

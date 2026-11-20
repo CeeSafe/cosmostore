@@ -314,8 +314,10 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 
 ### M14: Configurations decided at delivery
 
-The owner chose ADR-0093's item A (20 Nov 2026), a session's configuration decided as its parent. ADR-0094
-(proposed) designs it:
+**Closed 20 Nov 2026** (the owner: "Accept and close"; `docs/m14-exit-review.md`).
+
+The owner chose ADR-0093's item A (20 Nov 2026), a session's configuration decided as its parent. ADR-0094 (accepted
+20 Nov 2026) designs it:
 - **The requester recorded:** each replication, inventory and logging configuration records the user or role that
   put it.
 - **Decided at each write:** each replica, report and log object is authorized as that requester, with the policies
@@ -3904,3 +3906,14 @@ Browser form uploads with a SigV4 POST policy.
   replica with its body cut is FAILED.
 - **ADR-0094:** B2, B4 and B5 are in its amendments.
 - **Tests:** 390 unit tests, the S3 smoke, the cluster smoke (167) and the SDK matrix pass.
+
+### 20 Nov 2026: M14 closed, ADR-0094 accepted
+
+- **The owner:** "Accept and close".
+- **At closing (`c7e77d8`):** 390 unit tests, the S3 smoke, the cluster smoke (167) and the SDK matrix pass.
+- **What M14 gives:** a user's or role's replication, inventory and logging writes are decided as that requester at
+  each write, on `serve` and through a cluster's destination shard. Removing a user or narrowing a policy now stops
+  them at the next write.
+- **No downgrade past M14** once it has written them: replication rules v3, inventory and logging v2, and outbox
+  events with requesters in checkpoints.
+- **Next:** M15, when the owner asks for one.
