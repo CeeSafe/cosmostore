@@ -314,8 +314,10 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 
 ### M17: Key rotation without re-sealing
 
+**Closed 20 Nov 2026** (the owner: "Accept and close"; `docs/m17-exit-review.md`).
+
 The owner chose ADR-0099's item A (20 Nov 2026), a cluster's removal taken by asking the shards' leaders. ADR-0100
-(proposed) designs it:
+(accepted 20 Nov 2026, as amended) designs it:
 - **Re-wrap:** versions under an SSE-S3 key that is not first are re-wrapped under the first, a batch per round. A
   metadata-only record moves the envelope; the bytes, version ids and ETags stay.
 - **Counts:** each key's versions are counted as the index changes, so a removal needs no walk. A cluster takes a
@@ -4307,3 +4309,15 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** the cluster smoke restarts the killed node and rotates through all three (179). The S3 smoke, the SDK
   matrix and 408 unit tests pass.
 - **For the owner:** accept ADR-0100 as amended, and close M17.
+
+### 20 Nov 2026: M17 closed, ADR-0100 accepted
+
+- **The owner:** "Accept and close".
+- **What M17 gives:** an SSE-S3 key is rotated, on `serve` and on a cluster, by editing the key file:
+  - the versions the old key sealed are re-wrapped under the new one, a batch per round, their bytes untouched;
+  - the stats and `cluster-status` count what each key still seals;
+  - the old key's removal is taken at 0;
+  - a removed key's bytes are wiped.
+- **No downgrade past it:** a store with a format-5 SetTags record (a re-wrap) cannot be opened by an older binary.
+- **Recorded:** B1 to B5 of the exit review.
+- **Next:** M18, when the owner asks for one.

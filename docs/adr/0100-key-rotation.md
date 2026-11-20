@@ -1,6 +1,7 @@
 # ADR-0100: Key rotation without re-sealing (M17)
 
-**Status:** proposed, 20 Nov 2026. M17 is item A of ADR-0099 (the owner: "A: key rotation"). Re-wrapping starts on
+**Status:** accepted, 20 Nov 2026, as amended by the exit review (§4; the owner: "Accept and close";
+`docs/m17-exit-review.md`). Proposed the same day. M17 is item A of ADR-0099 (the owner: "A: key rotation"). Re-wrapping starts on
 its own once a key is not first (the owner's choice, ADR-0097). A cluster takes a removal by asking the shards'
 leaders (the owner's choice, ADR-0099).
 

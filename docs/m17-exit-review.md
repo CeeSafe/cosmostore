@@ -78,6 +78,8 @@ a re-seal, on `serve` and on a cluster.
 
 ## Decisions for the owner
 
+**Taken, 20 Nov 2026** (the owner: "Accept and close"): ADR-0100 accepted as amended, and M17 closed.
+
 - **Accept ADR-0100,** with §4 amended:
   - caught-up leaders of the highest term;
   - every node answering;
