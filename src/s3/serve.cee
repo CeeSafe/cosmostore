@@ -240,9 +240,11 @@ fn keyFileChange(k: borrow mut KeyRotation) -> KeyChange {
     var dropped = Vector<Vector<u8>>.create();
     let current = k.sets.get().view();
     for (i in 0..current.length) {
+        // A key is kept only with the same bytes: new bytes under its id would open nothing it sealed, so they count
+        // as its removal (the M15 exit review).
         var kept = false;
         for (j in 0..fresh.length) {
-            if (fresh[j].id.view() == current[i].id.view()) { kept = true; }
+            if (fresh[j].id.view() == current[i].id.view() && fresh[j].key[..] == current[i].key[..]) { kept = true; }
         }
         if (!kept) {
             match (copyBytes(current[i].id.view())) {
@@ -256,59 +258,96 @@ fn keyFileChange(k: borrow mut KeyRotation) -> KeyChange {
     return KeyChange.Fresh(fresh, dropped, modified);
 }
 
-/// How many of a store's versions and uploads are sealed under one of `ids` with envelopes of `mode`.
-async fn sealedIn(store: borrow Arc<AsyncMutex<ObjectStore>>, mode: StringView, ids: Slice<Vector<u8>>) -> u64 {
-    var guard = match (await store.get().lock()) {
-        Ok(g) => g,
-        Err(_) => { return 0; }
-    };
-    let s = guard.data();
+/// How much of a store still needs one of `ids` (envelopes of `mode`): its versions and uploads sealed under it, and,
+/// for KMS, its buckets whose default encryption names it. Under the store's lock, on a worker thread.
+fn sealedUnder(s: borrow mut ObjectStore, mode: StringView, ids: Slice<Vector<u8>>) -> Result<u64, StoreError> {
     var n: u64 = 0;
     for (i in 0..ids.length) {
         var prefix = Vector<u8>.create();
-        let built = prefix.extend(
-            "v1.".bytes(),
-        ).isOk() && prefix.extend(mode.bytes()).isOk() && prefix.push('.').isOk() &&
-            prefix.extend(ids[i].view()).isOk() && prefix.push('.').isOk();
-        if (!built) { return 1; } // out of memory: not known to be unused, so kept
-        let p = prefix.view();
-        let counted = await Async.blocking(() => s.countFieldPrefix(SSE_FIELD.bytes(), p));
-        n += counted.ok() ?? 1;
+        prefix.extend("v1.".bytes())?;
+        prefix.extend(mode.bytes())?;
+        prefix.push('.')?;
+        prefix.extend(ids[i].view())?;
+        prefix.push('.')?;
+        n += s.countFieldPrefix(SSE_FIELD.bytes(), prefix.view())?;
+        if (mode == "kms") {
+            var named = Vector<u8>.create();
+            named.extend("aws:kms ".bytes())?; // as the store keeps it (`isEncryptionValue`)
+            named.extend(ids[i].view())?;
+            let buckets = s.listBuckets()?;
+            for (b in 0..buckets.length) {
+                let name = StringView.fromUtf8(buckets[b].view()) ?? "";
+                if (s.bucketConfig(name, BUCKET_CONFIG_ENCRYPTION)?.view() == named.view()) { n += 1; }
+            }
+        }
     }
-    return n;
+    return Ok(n);
 }
 
-/// The new keys made the current set, unless a key they drop still seals `inUse` versions (ADR-0096 §3, the owner's
-/// choice): then the reload is refused, said once with the key and the count, and the keys in use stay.
-async fn applyKeyFile(
+/// What a removal's check found.
+enum KeyInstall {
+    Installed,
+    /// Still needed by this many versions, uploads and bucket configurations: the keys in use stay.
+    InUse(u64),
+    /// The store could not be counted, or every set cell is used: the keys in use stay.
+    Failed,
+}
+
+/// The new keys counted against the store and installed under one hold of its lock (the M15 exit review): a write
+/// commits under the same lock and checks its key is in the current set (`sealKeyHeld`), so none sealed under a
+/// removed key commits after the count.
+async fn countAndInstall(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    k: borrow KeyRotation,
+    fresh: borrow Vector<MasterKey>,
+    dropped: Slice<Vector<u8>>,
+) -> KeyInstall {
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return KeyInstall.Failed; } // not known to be unused: kept
+    };
+    let s = guard.data();
+    let mode = keyFileMode(k.kind);
+    if (mode.length > 0 && dropped.length > 0) {
+        match (await Async.blocking(() => sealedUnder(s, mode, dropped))) {
+            Ok(0) => {}
+            Ok(n) => { return KeyInstall.InUse(n); }
+            Err(_) => { return KeyInstall.Failed; }
+        }
+    }
+    if (!(await Async.blocking(() => installKeys(k, fresh)))) { return KeyInstall.Failed; }
+    return KeyInstall.Installed;
+}
+
+/// A key file's reload refused, said once.
+async fn refuseKeys(
     k: borrow mut KeyRotation,
-    fresh: Vector<MasterKey>,
-    dropped: borrow Vector<Vector<u8>>,
     modified: i64,
+    why: StringView,
     inUse: u64,
+    dropped: borrow Vector<Vector<u8>>,
 ) {
+    k.failed = modified;
+    var line = String.create();
+    let _ = line.append("cosmostore: ");
+    let _ = line.append(keyFileWhat(k.kind));
+    let _ = line.append(" reload refused: ");
     if (inUse > 0) {
-        k.failed = modified;
-        var line = String.create();
-        let _ = line.append("cosmostore: ");
-        let _ = line.append(keyFileWhat(k.kind));
-        let _ = line.append(" reload refused: ");
         let _ = line.appendNumber(inUse);
-        let _ = line.append(" versions are still sealed under the key it removes (");
-        let _ = line.append(StringView.fromUtf8(dropped[0].view()) ?? "?");
-        let _ = line.append("); re-seal them (CopyObject onto itself) first\n");
-        let _ = await AsyncConsole.writeError(line.view());
-        return;
-    }
-    let count = fresh.length;
-    let installed = await Async.blocking(() => installKeys(k, borrow fresh));
-    if (!installed) {
-        k.failed = modified;
-        let _ = await AsyncConsole.writeError(
-            "cosmostore: a key file was reloaded too many times; restart to reload\n",
+        let _ = line.append(
+            " versions, uploads or bucket encryption configurations still need the key it removes or changes (",
         );
-        return;
+        let _ = line.append(StringView.fromUtf8(dropped[0].view()) ?? "?");
+        let _ = line.append("); re-seal them (CopyObject onto itself) first");
+    } else {
+        let _ = line.append(why);
     }
+    let _ = line.append("\n");
+    let _ = await AsyncConsole.writeError(line.view());
+}
+
+/// A key file's reload taken, said.
+async fn reportKeys(k: borrow mut KeyRotation, modified: i64, count: usize) {
     k.modified = modified;
     var line = String.create();
     let _ = line.append("cosmostore: ");
@@ -339,13 +378,19 @@ async fn reloadKeysIfChanged(r: borrow mut Rotation, store: borrow Arc<AsyncMute
                 let _ = await AsyncConsole.writeError("\n");
             }
             KeyChange.Fresh(fresh, dropped, modified) => {
-                let mode = keyFileMode(k.kind);
-                let inUse = if (mode.length > 0 && dropped.length > 0) await sealedIn(
-                    store,
-                    mode,
-                    dropped.view(),
-                ) else 0;
-                await applyKeyFile(k, fresh, borrow dropped, modified, inUse);
+                match (await countAndInstall(store, k, borrow fresh, dropped.view())) {
+                    KeyInstall.Installed => { await reportKeys(k, modified, fresh.length); }
+                    KeyInstall.InUse(n) => { await refuseKeys(k, modified, "", n, borrow dropped); }
+                    KeyInstall.Failed => {
+                        await refuseKeys(
+                            k,
+                            modified,
+                            "the store could not be counted, or the keys were reloaded too many times",
+                            0,
+                            borrow dropped,
+                        );
+                    }
+                }
             }
         }
     }
@@ -383,7 +428,8 @@ fn checkRoles(r: borrow mut RoleRotation) -> RotationOutcome {
             return RotationOutcome.Failed(textOf("the roles file has a line that is not a role"));
         }
     };
-    r.modified = modified;
+    // The file counts as read only once its roles are installed, so a failure below is tried again (the M15 exit
+    // review).
     let next = match (nextRoles(r.sets.get().view(), fresh.view())) {
         Ok(n) => n,
         Err(_) => { return RotationOutcome.Failed(textOf("out of memory")); }
@@ -398,8 +444,10 @@ fn checkRoles(r: borrow mut RoleRotation) -> RotationOutcome {
         }
     }
     if (!r.sets.get().replace(next)) {
+        r.failed = modified; // every cell used: said once, not tried again until the file changes
         return RotationOutcome.Failed(textOf("the roles were reloaded too many times; restart to reload"));
     }
+    r.modified = modified;
     return RotationOutcome.Reloaded(live, removed);
 }
 

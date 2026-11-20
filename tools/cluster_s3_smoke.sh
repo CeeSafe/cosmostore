@@ -167,7 +167,9 @@ for i in $(seq 1 75); do
 done
 check "node $down back: it fetched the extents it missed" "$(extents "$down")" "$(extents "${live[0]}")"
 check "cluster-status: node $down's roles file differs" "$("$BIN" cluster-status --cluster-file cluster.conf --node "${live[0]}" 2>/dev/null | grep '^# file-differs' | cut -d' ' -f3)" roles-file
-check "cluster-status: its digest is not the others'" "$("$BIN" cluster-status --cluster-file cluster.conf --node "${live[0]}" 2>/dev/null | grep '^# file-differs' | tr ' ' '\n' | grep -c "^node")" 3
+differs=$("$BIN" cluster-status --cluster-file cluster.conf --node "${live[0]}" 2>/dev/null | grep '^# file-differs')
+digestOf() { echo "$differs" | tr ' ' '\n' | sed -n "s/^node$1=//p"; }
+check "cluster-status: node $down's digest is not the others', and theirs agree" "$([ -n "$(digestOf "$down")" ] && [ "$(digestOf "$down")" != "$(digestOf "${live[0]}")" ] && [ "$(digestOf "${live[0]}")" = "$(digestOf "${live[1]}")" ] && echo yes)" yes
 
 # The leader of alpha's shard goes down; the others go on.
 # Find alpha's shard by asking every node's status for the shard that has applied the most entries.
@@ -576,6 +578,16 @@ for i in $(seq 1 25); do on "$survivor" s3api put-object --bucket events --key e
 for i in $(seq 1 100); do keys | grep -q "e4$" && break; pause 0.2; done
 check "its leader (node $eventsLeader) killed: the next leader delivers" "$(keys | tr ' ' '\n' | tail -1)" e4
 check "and nothing delivered before is lost" "$(keys | tr ' ' '\n' | sort -u | tr '\n' ' ')" "e1 e2 e3 e4 "
+
+# A node's key file reloaded (ADR-0096 §3; the M15 exit review): a master key added is taken by every node that
+# runs; one removed is refused, since a node cannot count what the cluster still seals under it.
+cp sse.keys sse.keys.kept
+printf 'sse2 %s\n' "$(head -c 32 /dev/urandom | base64)" >> sse.keys
+pause 4
+check "an SSE key added: the running nodes take it" "$(for n in 1 2 3; do [ -n "${PIDS[$n]}" ] && grep -c "SSE key file reloaded: 2 keys" "log$n"; done | sort -u)" 1
+cp sse.keys.kept sse.keys
+pause 4
+check "an SSE key removed: the running nodes refuse it" "$(for n in 1 2 3; do [ -n "${PIDS[$n]}" ] && grep -c "SSE key file reload refused: a node does not remove or change a master key" "log$n"; done | sort -u)" 1
 
 echo "cluster s3 smoke: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]

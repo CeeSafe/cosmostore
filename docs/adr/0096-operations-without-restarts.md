@@ -35,6 +35,15 @@ remove a master key stored objects still need is refused (the owner's choice).
      (the owner's choice). It is reported with the key's id and how many versions need it, and the keys in use stay.
    - **How to retire a key:** re-seal those versions first (CopyObject onto itself, ADR-0046 §3), then remove it.
    - **The count:** from the index's metadata in memory, so a reload reads no object.
+   - **Amended by the exit review (docs/m15-exit-review.md, A1 and A2):**
+     - **New bytes under a key's id** count as that key's removal.
+     - **On `serve`:**
+       - the count and the install happen under one hold of the store's lock;
+       - the count takes in staged writes, and buckets whose default encryption names the KMS key;
+       - each sealed write checks, just before it commits, that its key is still in the set.
+     - **On a cluster:** a node refuses any reload that removes or changes a master key. It cannot count what other
+       shards, unapplied entries and other nodes still seal. A key is retired by re-sealing, then restarting the
+       nodes with the new file. Adding a key is taken.
 4. **STS keys:** a key removed takes the tokens it sealed with it, as a revocation does. Adding one makes it the key
    new tokens are sealed with.
 5. **Targets:** a notification or replication target removed makes its pending events' deliveries fail as an

@@ -819,8 +819,13 @@ check "its read" "$(aws s3api get-object --bucket smoke --key sse/after-k3.txt "
 check "a version the old key sealed still reads" "$(aws s3api get-object --bucket smoke --key sse/small.txt "$work/k2.out" > /dev/null 2>&1 && cmp -s sse.txt "$work/k2.out" && echo same)" same
 grep -v '^k2 ' "$work/sse.keys" > "$work/sse.keys.next" && mv "$work/sse.keys.next" "$work/sse.keys"
 sleep 4
-grep -q "SSE key file reload refused: [0-9]* versions are still sealed under the key it removes (k2)" "$work/server.log" && pass "removing a key in use refused" || fail "removing a key in use refused"
+grep -q "SSE key file reload refused: [0-9]* versions, uploads or bucket encryption configurations still need the key it removes or changes (k2)" "$work/server.log" && pass "removing a key in use refused" || fail "removing a key in use refused"
 check "the key kept opens its versions" "$(aws s3api get-object --bucket smoke --key sse/small.txt "$work/k2.out" > /dev/null 2>&1 && cmp -s sse.txt "$work/k2.out" && echo same)" same
+# New bytes under k2's id: as a removal of k2, refused.
+cp "$work/sse.keys" "$work/sse.keys.removed"
+{ grep '^k3 ' "$work/sse.keys.removed"; printf 'k2 %s\n' "$(head -c 32 /dev/urandom | base64)"; grep '^k1 ' "$work/sse.keys.kept"; } > "$work/sse.keys"
+sleep 4
+check "new bytes under a key in use refused" "$(grep -c "SSE key file reload refused: [0-9]* versions, uploads or bucket encryption configurations still need the key it removes or changes (k2)" "$work/server.log")" 2
 # Put k2 back, for the checks after.
 cp "$work/sse.keys" "$work/sse.keys.k3"
 { grep '^k3 ' "$work/sse.keys.k3"; cat "$work/sse.keys.kept"; } > "$work/sse.keys"
@@ -1440,6 +1445,7 @@ sleep 4
 check "a role removed refuses its session, without a restart" "$(ucode urole s3api list-objects-v2 --bucket team)" InvalidToken
 grep -q "roles reloaded" "$work/users.log" && pass "the roles reload logged" || fail "the roles reload logged"
 cp "$work/users.roles.kept" "$work/users.roles"
+sleep 4 # the roles back before the checks after (the M15 exit review)
 check "nor probe a table bucket's warehouse" "$(ucode ui s3api head-bucket --bucket "$lb")" 403
 # The M11 exit review's A2: a user's line removed, its key is refused, not the account's.
 sed -i.bak '/^intern:/d' "$work/users.file"

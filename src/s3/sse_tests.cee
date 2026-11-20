@@ -880,3 +880,76 @@ fn kmsEncryptionContextIsSealed() -> Result<void, TestFailure> {
     Check.equalU64(4, dots as u64)?;
     return Ok();
 }
+
+/// A key file's reload (ADR-0096 §3, the M15 exit review): new bytes under a key's id count as its removal; what
+/// still needs a key is counted with the writes staged and the buckets whose KMS default names it; and a write sealed
+/// under a key no longer in the set does not pass the commit check.
+@test
+fn keyRemovalsAreCheckedWhole() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("key-removals");
+    let zero = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    let other = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=";
+    var firstPath = textOf(dir.view());
+    firstPath.append("/first.keys")!;
+    var first = textOf("k2 ");
+    first.append(zero)!;
+    first.append("\nk1 ")!;
+    first.append(zero)!;
+    first.append("\n")!;
+    DurableFile.createNew(firstPath.view())!.writeAt(first.bytes(), 0)!;
+    var secondPath = textOf(dir.view());
+    secondPath.append("/second.keys")!;
+    var second = textOf("k2 ");
+    second.append(other)!;
+    second.append("\nk1 ")!;
+    second.append(zero)!;
+    second.append("\n")!;
+    DurableFile.createNew(secondPath.view())!.writeAt(second.bytes(), 0)!;
+    var k = KeyRotation {
+        sets: sharedKeys(readSseKeys(firstPath.view())!)!,
+        path: textOf(secondPath.view()),
+        kind: KEY_FILE_SSE,
+        modified: 0,
+        failed: 0,
+    };
+    match (keyFileChange(mut k)) {
+        KeyChange.Fresh(fresh, dropped, _) => {
+            Check.equalU64(2, fresh.length as u64)?;
+            Check.equalU64(1, dropped.length as u64)?;
+            Check.equalBytes("k2".bytes(), dropped[0].view())?;
+        }
+        _ => { return Check.fail("the file's change"); }
+    }
+    // What needs a key: a version, a staged inline write, and (KMS) a bucket's default encryption.
+    var s = ObjectStore.open(dir.view(), spaceConfig(0, 0))!;
+    s.createBucket("bkt")!;
+    s.setBucketConfig("bkt", BUCKET_CONFIG_ENCRYPTION, "aws:kms proj".bytes())!;
+    var meta = Vector<u8>.create();
+    metadataAdd(mut meta, SSE_FIELD.bytes(), "v1.s3.k2.00.00".bytes())!;
+    var w = s.newWriter()!;
+    w.write("sealed".bytes())!;
+    let obj = w.finish()!;
+    let _ = s.putInlineDeferred("bkt", "staged", "", meta.view(), "".bytes(), borrow obj)!;
+    var ids = Vector<Vector<u8>>.create();
+    ids.push(copyBytes("k2".bytes())!)!;
+    Check.equalU64(1, sealedUnder(mut s, "s3", ids.view())!)?;
+    ids[0] = copyBytes("k1".bytes())!;
+    Check.equalU64(0, sealedUnder(mut s, "s3", ids.view())!)?;
+    ids[0] = copyBytes("proj".bytes())!;
+    Check.equalU64(1, sealedUnder(mut s, "kms", ids.view())!)?;
+    // The commit check.
+    let sse = readSseKeys(secondPath.view())!;
+    let none = Vector<MasterKey>.create();
+    Check.isTrue(sealKeyHeld(sse.view(), none.view(), meta.view()), "a key in the set")?;
+    var gone = Vector<u8>.create();
+    metadataAdd(mut gone, SSE_FIELD.bytes(), "v1.s3.k9.00.00".bytes())!;
+    Check.isFalse(sealKeyHeld(sse.view(), none.view(), gone.view()), "a key removed")?;
+    var kms = Vector<u8>.create();
+    metadataAdd(mut kms, SSE_FIELD.bytes(), "v1.kms.k2.00.00".bytes())!;
+    Check.isFalse(sealKeyHeld(sse.view(), none.view(), kms.view()), "KMS's envelope looks in KMS's keys")?;
+    var customer = Vector<u8>.create();
+    metadataAdd(mut customer, SSE_FIELD.bytes(), "v1.c.-.00.00".bytes())!;
+    Check.isTrue(sealKeyHeld(none.view(), none.view(), customer.view()), "SSE-C needs no master key")?;
+    Check.isTrue(sealKeyHeld(none.view(), none.view(), "".bytes()), "nothing sealed")?;
+    return Ok();
+}

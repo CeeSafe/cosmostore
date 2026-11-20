@@ -4014,3 +4014,22 @@ Browser form uploads with a SigV4 POST policy.
   - 393 unit tests, the S3 smoke, the cluster smoke (170) and the SDK matrix pass.
 - **CeeSafe:** G39 (`borrow x` of an optional against `borrow T?`).
 - **Next:** slice 5, the exit review.
+
+### 20 Nov 2026: M15's exit review (docs/m15-exit-review.md)
+
+- **Fixed:**
+  - new bytes under a key's id count as its removal;
+  - on `serve`, the count and the install are under one hold of the store's lock;
+  - the count takes in staged writes, and buckets whose KMS default names the key;
+  - each sealed write checks its key at commit (`sealKeyHeld`);
+  - a node refuses any master key's removal or change;
+  - a lock failure refuses the removal; a failed roles reload is retried;
+  - the smokes check what they claim.
+- **Recorded:**
+  - the count holds the lock for a full walk;
+  - old secrets stay in memory;
+  - a local replica of a deleted source is not checked;
+  - the digests are of the files on disk;
+  - no smoke removes a target with deliveries waiting.
+- **Tests:** 394 unit tests, the S3 smoke, the cluster smoke (172) and the SDK matrix pass.
+- **For the owner:** accept ADR-0096 as amended (§3, §5, §6), and close M15.

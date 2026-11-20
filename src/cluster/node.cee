@@ -987,21 +987,10 @@ async fn credentialsForever(rotation: Rotation, shared: borrow NodeShared) -> Re
     return Ok();
 }
 
-/// A master key's removal refused on a node that holds only some of the shards: it cannot know the others need none.
-async fn refuseUncounted(k: borrow mut KeyRotation, modified: i64, held: usize, shards: u32) {
-    k.failed = modified;
-    var line = String.create();
-    let _ = line.append("cosmostore: ");
-    let _ = line.append(keyFileWhat(k.kind));
-    let _ = line.append(" reload refused: it removes a key, and this node holds ");
-    let _ = line.appendNumber(held as u64);
-    let _ = line.append(" of the ");
-    let _ = line.appendNumber(shards as u64);
-    let _ = line.append(" shards, so it cannot count the versions sealed under it\n");
-    let _ = await AsyncConsole.writeError(line.view());
-}
-
-/// The node's key files reloaded (ADR-0096 §3, §6): a removed key is checked against every shard store the node holds.
+/// The node's key files reloaded (ADR-0096 §3, §6). A master key may be added, but a reload that removes or changes
+/// one is refused (the M15 exit review): the node cannot count what the cluster still seals under it, since shards it
+/// holds no replica of, entries not yet applied, and other nodes reloading on their own time all escape its count. A
+/// key is retired by restarting the nodes with the new file, after re-sealing what it sealed. STS keys are taken.
 async fn reloadNodeKeysIfChanged(r: borrow mut Rotation, shared: borrow NodeShared) {
     for (i in 0..r.keyFiles.length) {
         let k = borrow mut r.keyFiles[i];
@@ -1015,20 +1004,28 @@ async fn reloadNodeKeysIfChanged(r: borrow mut Rotation, shared: borrow NodeShar
                 let _ = await AsyncConsole.writeError("\n");
             }
             KeyChange.Fresh(fresh, dropped, modified) => {
-                let mode = keyFileMode(k.kind);
-                var inUse: u64 = 0;
-                if (mode.length > 0 && dropped.length > 0) {
-                    // A shard this node holds no replica of cannot be counted here, so a removal is refused unless
-                    // the node holds every shard (fail closed).
-                    if (shared.slots.length < shared.file.shards as usize) {
-                        await refuseUncounted(k, modified, shared.slots.length, shared.file.shards);
-                        continue;
-                    }
-                    for (s in 0..shared.slots.length) {
-                        inUse += await sealedIn(borrow shared.slots[s].store, mode, dropped.view());
-                    }
+                if (keyFileMode(k.kind).length > 0 && dropped.length > 0) {
+                    await refuseKeys(
+                        k,
+                        modified,
+                        "a node does not remove or change a master key while it runs; re-seal what it sealed, then restart the nodes with the file",
+                        0,
+                        borrow dropped,
+                    );
+                    continue;
                 }
-                await applyKeyFile(k, fresh, borrow dropped, modified, inUse);
+                let installed = await Async.blocking(() => installKeys(k, borrow fresh));
+                if (installed) {
+                    await reportKeys(k, modified, fresh.length);
+                } else {
+                    await refuseKeys(
+                        k,
+                        modified,
+                        "the keys were reloaded too many times; restart to reload",
+                        0,
+                        borrow dropped,
+                    );
+                }
             }
         }
     }
