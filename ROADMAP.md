@@ -314,7 +314,10 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 
 ### M18: Archive storage classes
 
-The owner chose ADR-0101's item A (20 Nov 2026), with AWS's restore times scaled. ADR-0102 (proposed) designs it:
+**Closed 20 Nov 2026** (the owner: "Accept and close"; `docs/m18-exit-review.md`).
+
+The owner chose ADR-0101's item A (20 Nov 2026), with AWS's restore times scaled. ADR-0102 (accepted 20 Nov 2026, as
+amended) designs it:
 - **The classes:** GLACIER and DEEP_ARCHIVE are taken on writes and transitions. An archived version's reads are
   InvalidObjectState until it is restored.
 - **RestoreObject:** it records when a restore is ready and when it expires (a metadata-only record), and each request
@@ -4418,3 +4421,15 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** `restoresBelongToTheirClass`; the S3 smoke's copy of a restored version. 415 unit tests, both smokes
   (182) and the SDK matrix pass.
 - **For the owner:** accept ADR-0102 as amended, and close M18.
+
+### 20 Nov 2026: M18 closed, ADR-0102 accepted
+
+- **The owner:** "Accept and close".
+- **What M18 gives:** GLACIER and DEEP_ARCHIVE, on `serve` and a cluster.
+  - **Writes:** taken on writes and lifecycle transitions.
+  - **Reads:** InvalidObjectState until restored.
+  - **RestoreObject:** with AWS's tier times, scaled by `--restore-hour-seconds`; `x-amz-restore` on HEAD and GET.
+  - **After its days:** archived again, with no background job: each request decides from the times kept.
+- **No downgrade past it:** a store with a format-6 SetTags record (a restore) cannot be opened by an older binary.
+- **Recorded:** B1 to B5 of the exit review.
+- **Next:** M19, when the owner asks for one.

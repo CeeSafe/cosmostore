@@ -1,6 +1,7 @@
 # ADR-0102: Archive storage classes (M18)
 
-**Status:** proposed, 20 Nov 2026. M18 is item A of ADR-0101 (the owner: "A: archive classes"). Restore times are
+**Status:** accepted, 20 Nov 2026, as amended by the exit review (§4; the owner: "Accept and close";
+`docs/m18-exit-review.md`). Proposed the same day. M18 is item A of ADR-0101 (the owner: "A: archive classes"). Restore times are
 AWS's, scaled (the owner's choice).
 
 ## Context

@@ -63,5 +63,7 @@ archived again after its days, on `serve` and a cluster, through the SDKs.
 
 ## Decisions for the owner
 
+**Taken, 20 Nov 2026** (the owner: "Accept and close"): ADR-0102 accepted as amended, and M18 closed.
+
 - **Accept ADR-0102,** with §4 amended: a restore's state names its class, and copies and replicas never carry it.
 - **Close M18.**
