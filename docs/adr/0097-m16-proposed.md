@@ -1,6 +1,8 @@
 # ADR-0097: M16, what comes after operations without restarts (proposed)
 
-**Status:** proposed, 20 Nov 2026. The owner: "propose M16". M15 (operations without restarts, ADR-0096) closed the
+**Status:** decided, 20 Nov 2026: the owner chose C ("C: Tables compaction"), against the recommendation; ADR-0098
+designs it. For A, when it comes, the owner chose re-wrapping on its own once a key is not first. Proposed the same
+day. The owner: "propose M16". M15 (operations without restarts, ADR-0096) closed the
 same day.
 
 ## Context

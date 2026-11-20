@@ -312,6 +312,15 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 **Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
 (ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
+### M16: Compaction for S3 Tables
+
+The owner chose ADR-0097's item C (20 Nov 2026). ADR-0098 (proposed) designs it:
+- **Binpack by copying row groups:** a table's small data files are joined into files near `targetFileSizeMB`. Their
+  row groups are copied byte for byte, under a new Parquet footer, and committed as a `replace` snapshot.
+- **What stays:** partitions with delete files are left as they are, and `sort` and `z-order` are not done.
+- **Done when** the maintenance pass compacts a PyIceberg table's small files on `serve` and on a cluster, and
+  PyIceberg reads the same rows after.
+
 ### M15: Operations without restarts
 
 **Closed 20 Nov 2026** (the owner: "Accept and close"; `docs/m15-exit-review.md`).
@@ -4059,3 +4068,17 @@ Browser form uploads with a SigV4 POST policy.
   - **C:** compaction for S3 Tables.
 - **For A, the owner decides when re-wrapping starts:** on its own once a key is not first (recommended), or on a
   command.
+
+### 20 Nov 2026: M16 is compaction for S3 Tables (ADR-0098, proposed)
+
+- **The owner:** "C: Tables compaction", against the recommendation (A, key rotation). For A, when it comes:
+  re-wrapping starts on its own.
+- **ADR-0098 (proposed):** binpack by copying row groups under a new footer, so no page is decoded.
+  - **Partitions with delete files** are skipped.
+  - **Slices:**
+    1. Thrift and Parquet's footer;
+    2. an Avro writer;
+    3. the plan and the commit;
+    4. a cluster's leaders;
+    5. the exit review.
+- **CeeSafe:** G40 (no compression codecs).

@@ -631,6 +631,24 @@ fn main() { let given: String? = null; let _ = lengthOf(borrow given); }
   as a fix (`ceesafec fix` could apply it).
 - **Or the language:** accept `borrow x` of an `x: T?` where `(borrow T)?` is expected, as the conversion is total.
 
+### G40: no compression codecs in the libraries: zstd, snappy, deflate (P2, library)
+
+**Found:** CosmoStore M16's design (ADR-0098), 20 Nov 2026. None in `lib/core`, `lib/kernel` or `lib/std` of 0.79.1.
+
+**What happens.** Parquet and Avro files, as Iceberg's writers make them, compress with zstd (the default of
+PyIceberg and Spark), snappy, or deflate/gzip.
+- **What a CeeSafe program must do:** write its own decoders. CosmoStore already carries an inflate
+  (`src/s3/inflate.cee`) for Avro's deflate blocks.
+- **What it cost here:** compaction for S3 Tables was designed around never decompressing a page (ADR-0098 §1).
+  Re-encoding Parquet would need zstd and snappy written from scratch.
+- **Why C is no way out:** a C library is not an option either (no C in CosmoStore).
+
+**Suggested.** `lib/std` codecs, decoder first:
+- `Zstd.decompress` and `Snappy.decompress`;
+- `Deflate.inflate` and `Gzip`;
+- then their compressors, at least a fast level;
+- all streaming, with a bound on the output (against decompression bombs).
+
 ## Not gaps (checked)
 
 Things that worked well and are worth keeping:
