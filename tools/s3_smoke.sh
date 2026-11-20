@@ -842,6 +842,33 @@ check "new bytes under the key in use refused" "$(grep -c "SSE key file reload r
 cp "$work/sse.keys.k3" "$work/sse.keys"
 sleep 4
 
+# The IAM API (ADR-0104): a user made, given a key and a policy; its key live within an upkeep round (2 s).
+check "iam create-user" "$(aws iam create-user --user-name dev --query User.UserName --output text 2>&1)" dev
+check "a name twice" "$(code iam create-user --user-name dev)" EntityAlreadyExists
+devkey=$(aws iam create-access-key --user-name dev --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>&1)
+devid=$(echo "$devkey" | cut -f1); devsecret=$(echo "$devkey" | cut -f2)
+check "a key made" "$(echo "$devid" | cut -c1-4)" AKIA
+aws iam put-user-policy --user-name dev --policy-name list-smoke --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::smoke"}}' > /dev/null 2>&1 && pass "iam put-user-policy" || fail "iam put-user-policy"
+check "its policy read back" "$(aws iam get-user-policy --user-name dev --policy-name list-smoke --query 'PolicyDocument.Statement.Action' --output text 2>&1)" s3:ListBucket
+check "a policy not taken" "$(code iam put-user-policy --user-name dev --policy-name bad --policy-document '{"Statement":"nope"}')" MalformedPolicyDocument
+check "listed" "$(aws iam list-users --query 'Users[?UserName==`dev`].UserName' --output text 2>&1)" dev
+sleep 3
+dev() { ( export AWS_ACCESS_KEY_ID="$devid" AWS_SECRET_ACCESS_KEY="$devsecret"; "$@" ); }
+check "its key lists what its policy allows" "$(dev aws s3api list-objects-v2 --bucket smoke --max-keys 1 --query KeyCount --output text 2>&1)" 1
+check "and no more" "$(dev code s3api put-object --bucket smoke --key iam.txt --body sse.txt)" AccessDenied
+check "nor calls IAM itself" "$(dev code iam list-users)" AccessDenied
+aws iam update-access-key --user-name dev --access-key-id "$devid" --status Inactive > /dev/null 2>&1
+sleep 3
+check "an inactive key refused" "$(dev code s3api list-objects-v2 --bucket smoke)" InvalidAccessKeyId
+check "a user with keys is not deleted" "$(code iam delete-user --user-name dev)" DeleteConflict
+aws iam delete-access-key --user-name dev --access-key-id "$devid" > /dev/null 2>&1
+aws iam delete-user-policy --user-name dev --policy-name list-smoke > /dev/null 2>&1
+aws iam delete-user --user-name dev > /dev/null 2>&1 && pass "iam delete-user" || fail "iam delete-user"
+check "gone" "$(code iam get-user --user-name dev)" NoSuchEntity
+# The records' hidden bucket is no client's (ADR-0104 §3).
+check "the IAM bucket refused to S3" "$(code s3api list-objects-v2 --bucket _cosmostore-iam)" InvalidBucketName
+check "and never listed" "$(aws s3api list-buckets --query 'Buckets[?starts_with(Name, `_`)].Name' --output text 2>&1)" ""
+
 # Credential rotation (ADR-0050): the credentials file is read again when it changes, within an upkeep round (2 s).
 second() { ( export AWS_ACCESS_KEY_ID=AKIASMOKETEST0000002; export AWS_SECRET_ACCESS_KEY="$1"; shift; "$@" ); }
 check "a key the file does not have" "$(second second/secret/one code s3api list-buckets)" InvalidAccessKeyId
@@ -859,7 +886,8 @@ echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > credentials
 sleep 4
 check "a key taken out of the file" "$(second second/secret/two code s3api list-buckets)" InvalidAccessKeyId
 check "the first key through it all" "$(aws s3api list-buckets --query 'length(Buckets)')" 1
-check "the reloads in the log" "$(grep -c 'credentials reloaded' server.log) $(grep -c 'credentials reload failed' server.log)" "3 1"
+# At least the three of this section's file changes: the IAM API's above add their own, as many as rounds took them.
+check "the reloads in the log" "$([ "$(grep -c 'credentials reloaded' server.log)" -ge 3 ] && echo some) $(grep -c 'credentials reload failed' server.log)" "some 1"
 
 # Rate limits (ADR-0053): a second server with a limit, so this one's requests are not held back. The limits are
 # low and the bounds wide: however slowly the requests go, some are let through and many are slowed.

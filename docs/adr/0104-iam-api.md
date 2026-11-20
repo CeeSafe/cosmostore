@@ -41,11 +41,13 @@ files and from the API live side by side, each name once (the owner's choice).
 4. **Live at once:**
    - **How a set is built:** the credential and role sets are built from the files and the records together. An API
      user's key goes after the files' keys and keeps its place, as a file's does.
-   - **When:**
-     - **`serve`:** rebuilds them after each IAM write, before it answers, and the request after it sees the change.
-       Replacing a set is serialized by a lock, now that the upkeep and the IAM calls both replace one.
-     - **A node:** reads the records' generation every 2 s (its reload task, ADR-0092) and rebuilds when it changed.
-       A change is live on every node within that.
+   - **When (amended in slice 2):** within an upkeep round, as a file's change is.
+     - **`serve`:** its upkeep (`--maintain-seconds`, 10 s by default) reads the records' generation and rebuilds
+       when it changed.
+     - **A node:** its reload task does the same every 2 s (ADR-0092).
+     - **Why not before the call answers:** the rebuild's state is the upkeep's, so sharing it with request handlers
+       would take a rework of the upkeep's loops. AWS's IAM is itself eventually consistent: its documentation has
+       changes take seconds to be seen everywhere.
 5. **A name once** (the owner's choice):
    - **The files stay the operator's.** The API cannot read their secrets, nor change or delete a file's user, key
      or role. It answers `NoSuchEntity` for those writes, and it lists them as their names only.

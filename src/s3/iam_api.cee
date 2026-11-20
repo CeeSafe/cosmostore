@@ -1,0 +1,685 @@
+// The IAM API, a subset (ADR-0104): users, their access keys and inline policies, through a `POST /` signed for `iam`
+// (Query protocol, XML answers). Its records are one record of the hidden bucket `_cosmostore-iam` (`iam.cee`),
+// changed under the store's lock by a conditional write; the credential sets take them at the next round (§4).
+import web_core;
+import web_http;
+import web_server;
+
+const IAM_XMLNS: StringView = "https://iam.amazonaws.com/doc/2010-05-08/";
+const IAM_ACCOUNT_ARN: StringView = "arn:aws:iam::000000000000:";
+
+/// An IAM error answered.
+async fn iamError(
+    exchange: borrow mut Exchange,
+    status: u16,
+    code: StringView,
+    message: StringView,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    var body = Vector<u8>.create();
+    body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ErrorResponse xmlns=\"".bytes())?;
+    body.extend(IAM_XMLNS.bytes())?;
+    body.extend("\"><Error><Type>Sender</Type><Code>".bytes())?;
+    body.extend(code.bytes())?;
+    body.extend("</Code><Message>".bytes())?;
+    appendXmlEscaped(mut body, message.bytes())?;
+    body.extend("</Message></Error><RequestId>".bytes())?;
+    body.extend(requestId)?;
+    body.extend("</RequestId></ErrorResponse>".bytes())?;
+    exchange.header("content-type", "text/xml".bytes())?;
+    await exchange.send(statusOf(status), body.view())?;
+    return Ok();
+}
+
+/// A call's answer: `<Action>Response`, its result (empty for none), and the request id.
+async fn iamAnswer(
+    exchange: borrow mut Exchange,
+    action: Slice<u8>,
+    result: Slice<u8>,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    var out = Vector<u8>.create();
+    out.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<".bytes())?;
+    out.extend(action)?;
+    out.extend("Response xmlns=\"".bytes())?;
+    out.extend(IAM_XMLNS.bytes())?;
+    out.extend("\">".bytes())?;
+    if (result.length > 0) {
+        out.push('<')?;
+        out.extend(action)?;
+        out.extend("Result>".bytes())?;
+        out.extend(result)?;
+        out.extend("</".bytes())?;
+        out.extend(action)?;
+        out.extend("Result>".bytes())?;
+    }
+    out.extend("<ResponseMetadata><RequestId>".bytes())?;
+    out.extend(requestId)?;
+    out.extend("</RequestId></ResponseMetadata></".bytes())?;
+    out.extend(action)?;
+    out.extend("Response>".bytes())?;
+    exchange.header("content-type", "text/xml".bytes())?;
+    await exchange.send(Status.ok(), out.view())?;
+    for (i in 0..out.length) { out[i] = 0; } // a new key's secret may be in it
+    return Ok();
+}
+
+/// `<User>…</User>`.
+fn appendUser(out: borrow mut Vector<u8>, name: Slice<u8>, id: Slice<u8>, createdMs: i64) -> Result<void, AllocError> {
+    out.extend("<Path>/</Path>".bytes())?;
+    xmlTextElement(out, "UserName", name)?;
+    xmlTextElement(out, "UserId", id)?;
+    out.extend("<Arn>".bytes())?;
+    out.extend(IAM_ACCOUNT_ARN.bytes())?;
+    out.extend("user/".bytes())?;
+    appendXmlEscaped(out, name)?;
+    out.extend("</Arn><CreateDate>".bytes())?;
+    appendIso8601(out, createdMs)?;
+    out.extend("</CreateDate>".bytes())?;
+    return Ok();
+}
+
+/// `n` characters of `alphabet`, at random.
+fn randomText(out: borrow mut Vector<u8>, n: usize, alphabet: StringView) -> Result<bool, AllocError> {
+    var raw = Vector<u8>.create();
+    raw.resize(n, 0)?;
+    if (Random.fill(raw.viewMut()).isErr()) { return Ok(false); }
+    let chars = alphabet.bytes();
+    for (i in 0..n) { out.push(chars[(raw[i] as usize) % chars.length])?; }
+    for (i in 0..raw.length) { raw[i] = 0; }
+    return Ok(true);
+}
+
+const IAM_ID_CHARS: StringView = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+const IAM_SECRET_CHARS: StringView = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// ---- A change, under the store's lock ----
+
+/// A change the IAM API asks.
+enum IamCall {
+    CreateUser(Vector<u8>),
+    DeleteUser(Vector<u8>),
+    CreateAccessKey(Vector<u8>),
+    /// A user's key, made active or not.
+    UpdateAccessKey(Vector<u8>, Vector<u8>, bool),
+    DeleteAccessKey(Vector<u8>, Vector<u8>),
+    /// A user's policy, by name, and its document.
+    PutUserPolicy(Vector<u8>, Vector<u8>, Vector<u8>),
+    DeleteUserPolicy(Vector<u8>, Vector<u8>),
+}
+
+/// What a change came to.
+enum IamOutcome {
+    /// Done: the user it was about, as it is now (for CreateUser and CreateAccessKey's answers), and the key made.
+    Done(IamUser?, IamKey?),
+    NoSuchEntity,
+    EntityAlreadyExists,
+    LimitExceeded,
+    DeleteConflict,
+    MalformedPolicyDocument,
+    /// The record changed between its read and its write: tried again by the caller.
+    Conflict,
+}
+
+/// Whether `names` holds `name`, case aside (IAM's names are unique so).
+fn namedIn(names: Slice<Vector<u8>>, name: Slice<u8>) -> bool {
+    for (i in 0..names.length) {
+        if (sameNameIgnoringCase(names[i].view(), name)) { return true; }
+    }
+    return false;
+}
+
+fn userAt(state: borrow IamState, name: Slice<u8>) -> usize? {
+    for (i in 0..state.users.length) {
+        if (sameNameIgnoringCase(state.users[i].name.view(), name)) { return Some(i); }
+    }
+    return null;
+}
+
+fn copyUser(u: borrow IamUser) -> Result<IamUser, AllocError> {
+    var keys = Vector<IamKey>.create();
+    for (k in 0..u.keys.length) {
+        keys.push(IamKey {
+            accessKey: copyBytes(u.keys[k].accessKey.view())?,
+            secret: copyBytes(u.keys[k].secret.view())?,
+            active: u.keys[k].active,
+            createdMs: u.keys[k].createdMs,
+        })?;
+    }
+    var policies = Vector<IamPolicy>.create();
+    for (p in 0..u.policies.length) {
+        policies.push(
+            IamPolicy { name: copyBytes(u.policies[p].name.view())?, text: copyBytes(u.policies[p].text.view())? },
+        )?;
+    }
+    return Ok(
+        IamUser {
+            name: copyBytes(u.name.view())?,
+            id: copyBytes(u.id.view())?,
+            createdMs: u.createdMs,
+            keys: keys,
+            policies: policies,
+        },
+    );
+}
+
+/// Applies a change to the store's record: read, changed, written back on the generation it was read at (a new record
+/// only if there is none). `fileNames` are the users the files hold, which the API neither makes again nor changes.
+fn applyIamCall(
+    store: borrow mut ObjectStore,
+    call: borrow IamCall,
+    fileNames: Slice<Vector<u8>>,
+    nowMs: i64,
+) -> Result<IamOutcome, StoreError> {
+    let snapshot = iamSnapshotOf(store) ?? { return Err(StoreError.DataCorrupt); };
+    var state = snapshot.state;
+    var made: IamKey? = null;
+    var about: usize? = null;
+    match (call) {
+        IamCall.CreateUser(name) => {
+            if (userAt(borrow state, name.view()).isSome() || namedIn(fileNames, name.view())) {
+                return Ok(IamOutcome.EntityAlreadyExists);
+            }
+            var id = copyBytes("AIDA".bytes())?;
+            if (!randomText(mut id, 17, IAM_ID_CHARS)?) { return Err(StoreError.DataCorrupt); }
+            state.users.push(IamUser {
+                name: copyBytes(name.view())?,
+                id: id,
+                createdMs: nowMs,
+                keys: Vector<IamKey>.create(),
+                policies: Vector<IamPolicy>.create(),
+            })?;
+            about = Some(state.users.length - 1);
+        }
+        IamCall.DeleteUser(name) => {
+            let u = userAt(borrow state, name.view()) ?? { return Ok(IamOutcome.NoSuchEntity); };
+            if (state.users[u].keys.length > 0 || state.users[u].policies.length > 0) {
+                return Ok(IamOutcome.DeleteConflict);
+            }
+            let _ = state.users.remove(u);
+        }
+        IamCall.CreateAccessKey(name) => {
+            let u = userAt(borrow state, name.view()) ?? { return Ok(IamOutcome.NoSuchEntity); };
+            if (state.users[u].keys.length >= IAM_MAX_KEYS) { return Ok(IamOutcome.LimitExceeded); }
+            var key = copyBytes("AKIA".bytes())?;
+            if (!randomText(mut key, 16, IAM_ID_CHARS)?) { return Err(StoreError.DataCorrupt); }
+            var secret = Vector<u8>.create();
+            if (!randomText(mut secret, 40, IAM_SECRET_CHARS)?) { return Err(StoreError.DataCorrupt); }
+            let fresh = IamKey { accessKey: key, secret: secret, active: true, createdMs: nowMs };
+            made = Some(IamKey {
+                accessKey: copyBytes(fresh.accessKey.view())?,
+                secret: copyBytes(fresh.secret.view())?,
+                active: true,
+                createdMs: nowMs,
+            });
+            state.users[u].keys.push(fresh)?;
+            about = Some(u);
+        }
+        IamCall.UpdateAccessKey(name, key, active) => {
+            let u = userAt(borrow state, name.view()) ?? { return Ok(IamOutcome.NoSuchEntity); };
+            var found = false;
+            for (k in 0..state.users[u].keys.length) {
+                if (state.users[u].keys[k].accessKey.view() == key.view()) {
+                    state.users[u].keys[k].active = *active;
+                    found = true;
+                }
+            }
+            if (!found) { return Ok(IamOutcome.NoSuchEntity); }
+        }
+        IamCall.DeleteAccessKey(name, key) => {
+            let u = userAt(borrow state, name.view()) ?? { return Ok(IamOutcome.NoSuchEntity); };
+            var at: usize? = null;
+            for (k in 0..state.users[u].keys.length) {
+                if (state.users[u].keys[k].accessKey.view() == key.view()) { at = Some(k); }
+            }
+            let _ = state.users[u].keys.remove(at ?? { return Ok(IamOutcome.NoSuchEntity); });
+        }
+        IamCall.PutUserPolicy(name, policy, text) => {
+            let u = userAt(borrow state, name.view()) ?? { return Ok(IamOutcome.NoSuchEntity); };
+            match (parseIdentityPolicy(text.view())) {
+                Ok(_) => {}
+                Err(S3Fail.OutOfMemory(e)) => { return Err(StoreError.OutOfMemory(e)); }
+                Err(_) => { return Ok(IamOutcome.MalformedPolicyDocument); }
+            }
+            var replaced = false;
+            for (p in 0..state.users[u].policies.length) {
+                if (state.users[u].policies[p].name.view() == policy.view()) {
+                    state.users[u].policies[p].text = copyBytes(text.view())?;
+                    replaced = true;
+                }
+            }
+            if (!replaced) {
+                state.users[u].policies.push(
+                    IamPolicy { name: copyBytes(policy.view())?, text: copyBytes(text.view())? },
+                )?;
+            }
+            // The user's policies joined must still be a policy (statements past its size, say).
+            match (joinedPolicy(state.users[u].policies.view())?) {
+                Some(j) => {
+                    match (parseIdentityPolicy(j.view())) {
+                        Ok(_) => {}
+                        Err(S3Fail.OutOfMemory(e)) => { return Err(StoreError.OutOfMemory(e)); }
+                        Err(_) => { return Ok(IamOutcome.LimitExceeded); }
+                    }
+                }
+                null => { return Ok(IamOutcome.MalformedPolicyDocument); }
+            }
+        }
+        IamCall.DeleteUserPolicy(name, policy) => {
+            let u = userAt(borrow state, name.view()) ?? { return Ok(IamOutcome.NoSuchEntity); };
+            var at: usize? = null;
+            for (p in 0..state.users[u].policies.length) {
+                if (state.users[u].policies[p].name.view() == policy.view()) { at = Some(p); }
+            }
+            let _ = state.users[u].policies.remove(at ?? { return Ok(IamOutcome.NoSuchEntity); });
+        }
+    }
+    let bytes = encodeIamState(borrow state)?;
+    if (!store.bucketExists(IAM_BUCKET)?) { store.createBucket(IAM_BUCKET)?; }
+    let condition = if (snapshot.generation == 0) PutCondition.IfAbsent else PutCondition.IfGeneration(
+        snapshot.generation,
+    );
+    match (store.putObject(IAM_BUCKET, IAM_STATE_KEY, "application/json", bytes.view(), condition)) {
+        Ok(_) => {}
+        Err(StoreError.PreconditionFailed) => { return Ok(IamOutcome.Conflict); }
+        Err(e) => { return Err(e); }
+    }
+    let user = match (about) {
+        Some(u) => Some(copyUser(borrow state.users[u])?),
+        null => null,
+    };
+    return Ok(IamOutcome.Done(user, made));
+}
+
+// ---- The calls ----
+
+/// The users the files hold, from the credential set as it is now: their names and ids, not the API's.
+fn fileUsersOf(credentials: Slice<Credential>, state: borrow IamState) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    for (i in 0..credentials.length) {
+        let c = borrow credentials[i];
+        if (c.revoked || c.user.length == 0 || userAt(state, c.user.view()).isSome()) { continue; }
+        var known = false;
+        for (k in 0..out.length) {
+            if (out[k].view() == c.userKey.view()) { known = true; }
+        }
+        if (!known) { out.push(copyBytes(c.userKey.view())?)?; } // `<name> <id>`
+    }
+    return Ok(out);
+}
+
+/// The name part of a `<name> <id>`.
+fn nameOfUserKey(userKey: Slice<u8>) -> Slice<u8> {
+    for (i in 0..userKey.length) {
+        if (userKey[i] == ' ') { return userKey[0..i]; }
+    }
+    return userKey;
+}
+
+fn idOfUserKey(userKey: Slice<u8>) -> Slice<u8> {
+    for (i in 0..userKey.length) {
+        if (userKey[i] == ' ') { return userKey[i + 1..]; }
+    }
+    return "".bytes();
+}
+
+/// A form value; empty when absent.
+fn formText(body: Slice<u8>, name: StringView) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    let _ = formValue(body, name, mut out)?;
+    return Ok(out);
+}
+
+/// `POST /` signed for `iam` (ADR-0104 §1, §2): authenticated, then decided (the account, or a user its identity
+/// policy lets; never a session), then the call.
+async fn serveIam(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    let unsigned = Authenticated { payload: PayloadMode.Unsigned, signer: null, key: null, session: null };
+    let body = await readSmallBody(unsigned, exchange, 131072)?;
+    var hash = Vector<u8>.create();
+    appendHexBytes(mut hash, Sha256.of(body.view())[..])?;
+    if (req.isAnonymous()) {
+        return await iamError(
+            exchange,
+            403,
+            "MissingAuthenticationToken",
+            "Request is missing a signature.",
+            requestId,
+        );
+    }
+    let now = Clock.unixMillis() / 1000;
+    let auth = match (req.authenticate(
+        app.credentials.get().view(),
+        app.stsKeys.get().view(),
+        now,
+        "iam",
+        Some(hash.view()),
+    )) {
+        Ok(a) => a,
+        Err(code) => { return await iamError(exchange, 403, stsCodeOf(code), s3Message(code), requestId); }
+    };
+    if (auth.session.isSome()) {
+        return await iamError(exchange, 403, "AccessDenied", "Temporary credentials cannot call IAM.", requestId);
+    }
+    let caller = match (auth.key) {
+        Some(k) => k,
+        null => { return await iamError(exchange, 403, "AccessDenied", "Access denied.", requestId); }
+    };
+    let action = formText(body.view(), "Action")?;
+    let target = formText(body.view(), "UserName")?;
+    let known = [
+        "CreateUser",
+        "GetUser",
+        "ListUsers",
+        "DeleteUser",
+        "CreateAccessKey",
+        "ListAccessKeys",
+        "UpdateAccessKey",
+        "DeleteAccessKey",
+        "PutUserPolicy",
+        "GetUserPolicy",
+        "ListUserPolicies",
+        "DeleteUserPolicy",
+    ];
+    var taken = false;
+    for (k in known) {
+        if (action.view() == k.bytes()) { taken = true; }
+    }
+    if (!taken) {
+        return await iamError(exchange, 400, "InvalidAction", "This IAM action is not implemented here.", requestId);
+    }
+    // A user's call is its identity policy's to allow, `iam:<Action>` on the user it is about.
+    let credentials = app.credentials.get().view();
+    let who = requesterOf(Some(caller), null);
+    let callerUser = match (userOfRequester(credentials, borrow who)) {
+        Some(c) => Some(copyBytes(c.user.view())?),
+        null => null,
+    };
+    let aboutName = if (target.length > 0) target.view() else match (borrow callerUser) {
+        Some(n) => n.view(),
+        null => "*".bytes(),
+    };
+    if (callerUser.isSome()) {
+        var iamAction = copyBytes("iam:".bytes())?;
+        iamAction.extend(action.view())?;
+        var resource = copyBytes("iam:user/".bytes())?;
+        resource.extend(aboutName)?;
+        if (!sessionAllows(app, req, borrow who, StringView.fromUtf8(iamAction.view()) ?? "", resource.view())?) {
+            return await iamError(
+                exchange,
+                403,
+                "AccessDenied",
+                "Not authorized to perform this IAM action.",
+                requestId,
+            );
+        }
+    }
+    let name = copyBytes(aboutName)?;
+    let a = action.view();
+    // The reads.
+    if (a == "GetUser".bytes() ||
+        a == "ListUsers".bytes() || a == "ListAccessKeys".bytes() || a == "GetUserPolicy".bytes() ||
+        a == "ListUserPolicies".bytes()) {
+        let snapshot = await readIamSnapshot(borrow app.store) ?? {
+            return await iamError(exchange, 500, "ServiceFailure", "The IAM records do not read.", requestId);
+        };
+        let files = fileUsersOf(credentials, borrow snapshot.state)?;
+        return await iamRead(
+            exchange,
+            a,
+            name.view(),
+            body.view(),
+            borrow snapshot.state,
+            files.view(),
+            callerUser.isNull() && target.length == 0,
+            requestId,
+        );
+    }
+    // The changes.
+    let call = if (a == "CreateUser".bytes()) IamCall.CreateUser(name)
+        else if (a == "DeleteUser".bytes()) IamCall.DeleteUser(name)
+        else if (a == "CreateAccessKey".bytes()) IamCall.CreateAccessKey(name)
+        else if (a == "UpdateAccessKey".bytes()) {
+            let status = formText(body.view(), "Status")?;
+            if (status.view() != "Active".bytes() && status.view() != "Inactive".bytes()) {
+                return await iamError(exchange, 400, "ValidationError", "Status is Active or Inactive.", requestId);
+            }
+            IamCall.UpdateAccessKey(name, formText(body.view(), "AccessKeyId")?, status.view() == "Active".bytes())
+        } else if (a == "DeleteAccessKey".bytes()) IamCall.DeleteAccessKey(name, formText(body.view(), "AccessKeyId")?)
+            else if (a == "PutUserPolicy".bytes()) IamCall.PutUserPolicy(
+                name,
+                formText(body.view(), "PolicyName")?,
+                formText(body.view(), "PolicyDocument")?,
+            )
+            else IamCall.DeleteUserPolicy(name, formText(body.view(), "PolicyName")?);
+    // Names are checked as the users file's are.
+    if (!userNameOk(aboutName) || aboutName == "*".bytes()) {
+        return await iamError(
+            exchange,
+            400,
+            "ValidationError",
+            "UserName is 1 to 64 of A-Z a-z 0-9 + = , . @ _ -.",
+            requestId,
+        );
+    }
+    var outcome = IamOutcome.Conflict;
+    for (attempt in 0..3) {
+        let snapshotFiles = match (await readIamSnapshot(borrow app.store)) {
+            Some(s) => fileUsersOf(credentials, borrow s.state)?,
+            null => Vector<Vector<u8>>.create(),
+        };
+        var names = Vector<Vector<u8>>.create();
+        for (i in 0..snapshotFiles.length) { names.push(copyBytes(nameOfUserKey(snapshotFiles[i].view()))?)?; }
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let nowMs = Clock.unixMillis();
+        let c = borrow call;
+        let n = names.view();
+        outcome = match (await Async.blocking(() => applyIamCall(store, c, n, nowMs))) {
+            Ok(o) => o,
+            Err(e) => { return Err(storeFail(e, 0)); }
+        };
+        match (outcome) {
+            IamOutcome.Conflict => {}
+            _ => { break; }
+        }
+    }
+    return match (outcome) {
+        IamOutcome.Done(user, key) => await iamDone(exchange, a, user, key, requestId),
+        IamOutcome.NoSuchEntity => await iamError(
+            exchange,
+            404,
+            "NoSuchEntity",
+            "The user, key or policy named is not the API's.",
+            requestId,
+        ),
+        IamOutcome.EntityAlreadyExists => await iamError(
+            exchange,
+            409,
+            "EntityAlreadyExists",
+            "A user with this name already exists.",
+            requestId,
+        ),
+        IamOutcome.LimitExceeded => await iamError(
+            exchange,
+            409,
+            "LimitExceeded",
+            "Cannot exceed the quota for this user.",
+            requestId,
+        ),
+        IamOutcome.DeleteConflict => await iamError(
+            exchange,
+            409,
+            "DeleteConflict",
+            "Delete the user's access keys and policies first.",
+            requestId,
+        ),
+        IamOutcome.MalformedPolicyDocument => await iamError(
+            exchange,
+            400,
+            "MalformedPolicyDocument",
+            "The policy document is not one taken here.",
+            requestId,
+        ),
+        IamOutcome.Conflict => await iamError(
+            exchange,
+            409,
+            "ConcurrentModification",
+            "The IAM records changed meanwhile; try again.",
+            requestId,
+        ),
+    };
+}
+
+/// A change's answer.
+async fn iamDone(
+    exchange: borrow mut Exchange,
+    action: Slice<u8>,
+    user: IamUser?,
+    key: IamKey?,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    var result = Vector<u8>.create();
+    match (user) {
+        Some(u) => {
+            match (key) {
+                Some(k) => {
+                    result.extend("<AccessKey>".bytes())?;
+                    xmlTextElement(mut result, "UserName", u.name.view())?;
+                    xmlTextElement(mut result, "AccessKeyId", k.accessKey.view())?;
+                    result.extend("<Status>Active</Status>".bytes())?;
+                    xmlTextElement(mut result, "SecretAccessKey", k.secret.view())?;
+                    result.extend("<CreateDate>".bytes())?;
+                    appendIso8601(mut result, k.createdMs)?;
+                    result.extend("</CreateDate></AccessKey>".bytes())?;
+                }
+                null => {
+                    result.extend("<User>".bytes())?;
+                    appendUser(mut result, u.name.view(), u.id.view(), u.createdMs)?;
+                    result.extend("</User>".bytes())?;
+                }
+            }
+        }
+        null => {}
+    }
+    await iamAnswer(exchange, action, result.view(), requestId)?;
+    for (i in 0..result.length) { result[i] = 0; }
+    return Ok();
+}
+
+/// The reads: GetUser, ListUsers, ListAccessKeys, GetUserPolicy, ListUserPolicies. The files' users are listed and
+/// got by their names and ids; their keys and policies are the operator's, not the API's (ADR-0104 §5).
+async fn iamRead(
+    exchange: borrow mut Exchange,
+    action: Slice<u8>,
+    name: Slice<u8>,
+    body: Slice<u8>,
+    state: borrow IamState,
+    files: Slice<Vector<u8>>,
+    root: bool,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    var result = Vector<u8>.create();
+    if (action == "ListUsers".bytes()) {
+        result.extend("<IsTruncated>false</IsTruncated><Users>".bytes())?;
+        for (i in 0..files.length) {
+            result.extend("<member>".bytes())?;
+            appendUser(mut result, nameOfUserKey(files[i].view()), idOfUserKey(files[i].view()), 0)?;
+            result.extend("</member>".bytes())?;
+        }
+        for (i in 0..state.users.length) {
+            result.extend("<member>".bytes())?;
+            appendUser(mut result, state.users[i].name.view(), state.users[i].id.view(), state.users[i].createdMs)?;
+            result.extend("</member>".bytes())?;
+        }
+        result.extend("</Users>".bytes())?;
+        return await iamAnswer(exchange, action, result.view(), requestId);
+    }
+    if (action == "GetUser".bytes() && root) {
+        // The account's keys, no user named: the account's root user, as AWS answers.
+        result.extend(
+            "<User><UserId>000000000000</UserId><Arn>arn:aws:iam::000000000000:root</Arn><CreateDate>".bytes(),
+        )?;
+        appendIso8601(mut result, 0)?;
+        result.extend("</CreateDate></User>".bytes())?;
+        return await iamAnswer(exchange, action, result.view(), requestId);
+    }
+    let u = match (userAt(state, name)) {
+        Some(u) => u,
+        null => {
+            // A file's user: got by name, with no keys or policies the API shows.
+            for (i in 0..files.length) {
+                if (!sameNameIgnoringCase(nameOfUserKey(files[i].view()), name)) { continue; }
+                if (action == "GetUser".bytes()) {
+                    result.extend("<User>".bytes())?;
+                    appendUser(mut result, nameOfUserKey(files[i].view()), idOfUserKey(files[i].view()), 0)?;
+                    result.extend("</User>".bytes())?;
+                    return await iamAnswer(exchange, action, result.view(), requestId);
+                }
+                if (action == "ListAccessKeys".bytes()) {
+                    result.extend("<AccessKeyMetadata></AccessKeyMetadata><IsTruncated>false</IsTruncated>".bytes())?;
+                    return await iamAnswer(exchange, action, result.view(), requestId);
+                }
+                if (action == "ListUserPolicies".bytes()) {
+                    result.extend("<PolicyNames></PolicyNames><IsTruncated>false</IsTruncated>".bytes())?;
+                    return await iamAnswer(exchange, action, result.view(), requestId);
+                }
+            }
+            return await iamError(
+                exchange,
+                404,
+                "NoSuchEntity",
+                "The user with the name given cannot be found.",
+                requestId,
+            );
+        }
+    };
+    let user = borrow state.users[u];
+    if (action == "GetUser".bytes()) {
+        result.extend("<User>".bytes())?;
+        appendUser(mut result, user.name.view(), user.id.view(), user.createdMs)?;
+        result.extend("</User>".bytes())?;
+    } else if (action == "ListAccessKeys".bytes()) {
+        result.extend("<AccessKeyMetadata>".bytes())?;
+        for (k in 0..user.keys.length) {
+            result.extend("<member>".bytes())?;
+            xmlTextElement(mut result, "UserName", user.name.view())?;
+            xmlTextElement(mut result, "AccessKeyId", user.keys[k].accessKey.view())?;
+            result.extend(
+                if (user.keys[k].active) "<Status>Active</Status>".bytes() else "<Status>Inactive</Status>".bytes(),
+            )?;
+            result.extend("<CreateDate>".bytes())?;
+            appendIso8601(mut result, user.keys[k].createdMs)?;
+            result.extend("</CreateDate></member>".bytes())?;
+        }
+        result.extend("</AccessKeyMetadata><IsTruncated>false</IsTruncated>".bytes())?;
+    } else if (action == "ListUserPolicies".bytes()) {
+        result.extend("<PolicyNames>".bytes())?;
+        for (p in 0..user.policies.length) {
+            result.extend("<member>".bytes())?;
+            appendXmlEscaped(mut result, user.policies[p].name.view())?;
+            result.extend("</member>".bytes())?;
+        }
+        result.extend("</PolicyNames><IsTruncated>false</IsTruncated>".bytes())?;
+    } else {
+        // GetUserPolicy: the document URL-encoded, as IAM answers it.
+        let policyName = formText(body, "PolicyName")?;
+        var found: usize? = null;
+        for (p in 0..user.policies.length) {
+            if (user.policies[p].name.view() == policyName.view()) { found = Some(p); }
+        }
+        let p = found ?? {
+            return await iamError(exchange, 404, "NoSuchEntity", "The user has no policy with this name.", requestId);
+        };
+        xmlTextElement(mut result, "UserName", user.name.view())?;
+        xmlTextElement(mut result, "PolicyName", user.policies[p].name.view())?;
+        var encoded = Vector<u8>.create();
+        appendUriEncoded(mut encoded, user.policies[p].text.view(), false)?;
+        xmlTextElement(mut result, "PolicyDocument", encoded.view())?;
+    }
+    return await iamAnswer(exchange, action, result.view(), requestId);
+}

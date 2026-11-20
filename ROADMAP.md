@@ -4489,3 +4489,26 @@ Browser form uploads with a SigV4 POST policy.
 - **Tests:** `iamStatesRoundTrip`, `iamRecordsMergeWithTheFiles`, `iamUsersWithoutPoliciesAreAllowedNothing`,
   `iamSnapshotsComeFromTheStore`. 419 unit tests and both smokes pass.
 - **Next:** slice 2, the users, keys and user policies calls.
+
+### 20 Nov 2026: M19 slice 2, the users, keys and user policies calls (ADR-0104 §1, §2, §5, §6)
+
+- **`src/s3/iam_api.cee`:** a `POST /` signed for `iam` is IAM's (anything else stays STS's).
+  - **The calls:**
+    - `CreateUser`, `GetUser`, `ListUsers`, `DeleteUser`;
+    - `CreateAccessKey` (its secret answered once; two keys a user), `ListAccessKeys`, `UpdateAccessKey`,
+      `DeleteAccessKey`;
+    - `PutUserPolicy` (checked as the users file's), `GetUserPolicy` (the document URL-encoded, as IAM answers
+      it), `ListUserPolicies`, `DeleteUserPolicy`.
+  - **IAM's errors:** EntityAlreadyExists, NoSuchEntity, LimitExceeded, DeleteConflict, MalformedPolicyDocument.
+- **Who:** the account's keys, or a user whose identity policy allows `iam:<Action>` on `arn:aws:iam::…:user/<name>`.
+  Never a session. Identity policies now take `iam:` actions and user ARNs.
+- **A change:** one conditional write of the record under the store's lock, tried again if another landed first.
+- **The files' users** are listed and got by name, and never changed. Their names cannot be made again.
+- **ADR-0104 §4 amended:** a change is live within an upkeep round (10 s by default on `serve`, 2 s on a node), as
+  a file's is, not before the call answers. AWS's IAM is itself eventually consistent.
+- **Tests:**
+  - `iamCallsChangeTheRecord`;
+  - the S3 smoke's IAM section: a user made, keyed and given a policy with the AWS CLI; its key lists what the
+    policy allows and no more; inactive, it is refused; the deletions; the hidden bucket refused and unlisted.
+  - 420 unit tests, both smokes (182 on the cluster) and the SDK matrix pass.
+- **Next:** slice 3, the roles calls and trust policies.

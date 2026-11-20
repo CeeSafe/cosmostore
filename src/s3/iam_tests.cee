@@ -153,3 +153,98 @@ fn iamSnapshotsComeFromTheStore() -> Result<void, TestFailure> {
     Check.equalU64(2, read.state.users.length as u64)?;
     return Ok();
 }
+
+fn outcomeName(o: borrow IamOutcome) -> StringView => match (o) {
+    IamOutcome.Done(_, _) => "Done",
+    IamOutcome.NoSuchEntity => "NoSuchEntity",
+    IamOutcome.EntityAlreadyExists => "EntityAlreadyExists",
+    IamOutcome.LimitExceeded => "LimitExceeded",
+    IamOutcome.DeleteConflict => "DeleteConflict",
+    IamOutcome.MalformedPolicyDocument => "MalformedPolicyDocument",
+    IamOutcome.Conflict => "Conflict",
+};
+
+fn iamCall(s: borrow mut ObjectStore, c: IamCall, files: Slice<Vector<u8>>) -> Vector<u8> {
+    return match (applyIamCall(s, borrow c, files, 1000)) {
+        Ok(o) => copyBytes(outcomeName(borrow o).bytes())!,
+        Err(_) => copyBytes("Err".bytes())!,
+    };
+}
+
+fn iamName(text: StringView) -> Vector<u8> => copyBytes(text.bytes())!;
+
+/// The calls' changes, and their refusals as IAM's: a name twice, a file's name, two keys at most, a user with keys or
+/// policies kept, a policy that does not parse; a key made inactive leaves the set.
+@test
+fn iamCallsChangeTheRecord() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("iam-calls");
+    var s = ObjectStore.open(dir.view(), spaceConfig(0, 0))!;
+    var files = Vector<Vector<u8>>.create();
+    files.push(iamName("filer"))!;
+    Check.equalBytes("Done".bytes(), iamCall(mut s, IamCall.CreateUser(iamName("dev")), files.view()).view())?;
+    Check.equalBytes(
+        "EntityAlreadyExists".bytes(),
+        iamCall(mut s, IamCall.CreateUser(iamName("DEV")), files.view()).view(),
+    )?;
+    Check.equalBytes(
+        "EntityAlreadyExists".bytes(),
+        iamCall(mut s, IamCall.CreateUser(iamName("filer")), files.view()).view(),
+    )?;
+    for (i in 0..2) {
+        Check.equalBytes("Done".bytes(), iamCall(mut s, IamCall.CreateAccessKey(iamName("dev")), files.view()).view())?;
+    }
+    Check.equalBytes(
+        "LimitExceeded".bytes(),
+        iamCall(mut s, IamCall.CreateAccessKey(iamName("dev")), files.view()).view(),
+    )?;
+    Check.equalBytes(
+        "NoSuchEntity".bytes(),
+        iamCall(mut s, IamCall.CreateAccessKey(iamName("nobody")), files.view()).view(),
+    )?;
+    Check.equalBytes(
+        "MalformedPolicyDocument".bytes(),
+        iamCall(
+            mut s,
+            IamCall.PutUserPolicy(iamName("dev"), iamName("p"), iamName("{\"Statement\":\"no\"}")),
+            files.view(),
+        ).view(),
+    )?;
+    Check.equalBytes(
+        "Done".bytes(),
+        iamCall(
+            mut s,
+            IamCall.PutUserPolicy(iamName("dev"), iamName("p"), copyBytes(READER_POLICY.bytes())!),
+            files.view(),
+        ).view(),
+    )?;
+    Check.equalBytes(
+        "DeleteConflict".bytes(),
+        iamCall(mut s, IamCall.DeleteUser(iamName("dev")), files.view()).view(),
+    )?;
+    // A key made inactive is not in the set built from the record.
+    let snapshot = iamSnapshotOf(borrow s)!;
+    let key = copyBytes(snapshot.state.users[0].keys[0].accessKey.view())!;
+    Check.equalBytes(
+        "Done".bytes(),
+        iamCall(mut s, IamCall.UpdateAccessKey(iamName("dev"), copyBytes(key.view())!, false), files.view()).view(),
+    )?;
+    let after = iamSnapshotOf(borrow s)!;
+    let keys = withIamKeys(Vector<Credential>.create(), borrow after.state)!;
+    Check.equalU64(1, keys.length as u64)?;
+    Check.isFalse(keys[0].accessKey.view() == key.view(), "the inactive key left out")?;
+    // Emptied, the user goes.
+    for (k in 0..after.state.users[0].keys.length) {
+        let id = copyBytes(after.state.users[0].keys[k].accessKey.view())!;
+        Check.equalBytes(
+            "Done".bytes(),
+            iamCall(mut s, IamCall.DeleteAccessKey(iamName("dev"), id), files.view()).view(),
+        )?;
+    }
+    Check.equalBytes(
+        "Done".bytes(),
+        iamCall(mut s, IamCall.DeleteUserPolicy(iamName("dev"), iamName("p")), files.view()).view(),
+    )?;
+    Check.equalBytes("Done".bytes(), iamCall(mut s, IamCall.DeleteUser(iamName("dev")), files.view()).view())?;
+    Check.equalU64(0, iamSnapshotOf(borrow s)!.state.users.length as u64)?;
+    return Ok();
+}
