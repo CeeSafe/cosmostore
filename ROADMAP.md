@@ -4405,3 +4405,16 @@ Browser form uploads with a SigV4 POST policy.
   once ready. Their server runs with `--restore-hour-seconds 1`.
 - **Checks:** 414 unit tests, both smokes and the SDK matrix pass.
 - **Next:** slice 4, the exit review.
+
+### 20 Nov 2026: M18's exit review (docs/m18-exit-review.md)
+
+- **Fixed:**
+  - copies and replicas never carry a restore's state (a copy of a restored version, archived, read without one);
+  - a restore's state names its class and counts only while the version has it;
+  - a website's error document in an archive class is checked as any read is.
+- **ADR-0102 §4 amended.**
+- **Recorded:** B1 to B5 of the review.
+- **CI:** `fa9f79e` (slice 2, with M17's cluster fix) passed, so M17's cluster removal holds in CI too.
+- **Tests:** `restoresBelongToTheirClass`; the S3 smoke's copy of a restored version. 415 unit tests, both smokes
+  (182) and the SDK matrix pass.
+- **For the owner:** accept ADR-0102 as amended, and close M18.

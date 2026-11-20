@@ -1506,6 +1506,10 @@ sleep 5
 check "restored: its expiry shown" "$(aws s3api head-object --bucket classes --key g --query Restore --output text 2>&1 | sed 's/expiry-date=".*"/expiry-date=…/')" 'ongoing-request="false", expiry-date=…'
 check "and it reads" "$(aws s3api get-object --bucket classes --key g "$work/g.out" > /dev/null 2>&1 && cmp -s dir.txt "$work/g.out" && echo same)" same
 check "a restore of a restored version extends it" "$(restore g '{"Days":2}' | grep -c .)" 0
+# A copy of a restored version is not restored (the M18 exit review): archived, it is restored on its own.
+aws s3api copy-object --bucket classes --key g-copy --copy-source classes/g --storage-class GLACIER > /dev/null 2>&1
+check "a copy of a restored version, archived, is not restored" "$(code s3api get-object --bucket classes --key g-copy "$work/g.out")" InvalidObjectState
+check "nor says it is" "$(aws s3api head-object --bucket classes --key g-copy --query Restore --output text 2>&1)" None
 check "Expedited is not for DEEP_ARCHIVE" "$(code s3api restore-object --bucket classes --key deep --restore-request '{"Days":1,"GlacierJobParameters":{"Tier":"Expedited"}}')" InvalidArgument
 aws s3api put-object --bucket classes --key warm --body dir.txt > /dev/null 2>&1
 check "a version not archived is not restored" "$(code s3api restore-object --bucket classes --key warm --restore-request '{"Days":1}')" InvalidObjectState
@@ -1519,7 +1523,7 @@ check "a copy takes the request's class, not the source's" "$(aws s3api head-obj
 up=$(aws s3api create-multipart-upload --bucket classes --key mp --storage-class GLACIER_IR --query UploadId --output text 2>&1)
 check "an upload's class listed" "$(aws s3api list-multipart-uploads --bucket classes --query 'Uploads[0].StorageClass' --output text 2>&1)" GLACIER_IR
 aws s3api abort-multipart-upload --bucket classes --key mp --upload-id "$up" > /dev/null 2>&1
-for k in ia std copied g deep warm; do aws s3api delete-object --bucket classes --key "$k" > /dev/null 2>&1; done
+for k in ia std copied g deep warm g-copy; do aws s3api delete-object --bucket classes --key "$k" > /dev/null 2>&1; done
 # Lifecycle transitions (ADR-0090 §2): taken to the classes kept here, the archive ones too (ADR-0102).
 aws s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-configuration '{"Rules":[{"ID":"tiers","Status":"Enabled","Filter":{"Prefix":"logs/"},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"},{"Days":90,"StorageClass":"GLACIER_IR"}],"NoncurrentVersionTransitions":[{"NoncurrentDays":30,"StorageClass":"ONEZONE_IA","NewerNoncurrentVersions":2}]}]}' > /dev/null 2>&1 && pass "lifecycle transitions taken" || fail "lifecycle transitions taken"
 check "and returned" "$(aws s3api get-bucket-lifecycle-configuration --bucket classes --query 'Rules[0].[Transitions[1].StorageClass,NoncurrentVersionTransitions[0].NewerNoncurrentVersions]' --output text 2>&1)" "GLACIER_IR	2"

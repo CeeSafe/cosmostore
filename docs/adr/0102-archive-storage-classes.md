@@ -47,6 +47,10 @@ AWS's, scaled (the owner's choice).
      - **Restored:** from the ready time to the expiry. HeadObject says `ongoing-request="false"` and the expiry
        date; reads are taken.
      - **Archived again:** after the expiry, as if never restored. A new RestoreObject may start another.
+   - **Amended by the exit review (docs/m18-exit-review.md, A1 and A2):**
+     - **The state names its class** (`<ready> <expiry> <class>`), and counts only while the version has that class:
+       a version moved to another archive class is archived again.
+     - **Copies and replicas never carry the state.**
 5. **RestoreObject.**
    - **The request:** `RestoreRequest` with `Days` (1 to 30,000), and `GlacierJobParameters.Tier` (Standard by
      default).
