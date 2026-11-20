@@ -19,6 +19,8 @@ struct CompactionInput {
     path: Vector<u8>;
     key: Vector<u8>;
     size: u64;
+    /// Its version's generation when planned: any overwrite since changes it (the M16 exit review).
+    generation: u64;
     footer: ParquetFooter;
     /// Its manifest (an index into the plan's manifests) and its entry there.
     manifest: usize;
@@ -236,10 +238,11 @@ fn planCompaction(
             }
             if (inDeleted) { continue; }
             let key = refKey(path);
-            let footer = match (readFooterOf(store, hidden.view(), key, truncate<u64>(size))?) {
+            let read = match (readFooterOf(store, hidden.view(), key, truncate<u64>(size))?) {
                 Some(f) => f,
                 null => { continue; }
             };
+            let footer = read.footer;
             var group = copyBytes(partitionKey.view())?;
             group.push(0)?;
             group.extend(footer.shape.view())?;
@@ -251,6 +254,7 @@ fn planCompaction(
                 path: copyBytes(path)?,
                 key: copyBytes(key)?,
                 size: truncate<u64>(size),
+                generation: read.generation,
                 footer: footer,
                 manifest: i,
                 entry: e,
@@ -309,6 +313,12 @@ fn readWarehouseAvro(store: borrow ObjectStore, hidden: Slice<u8>, path: Slice<u
     };
 }
 
+/// A data file's footer, and the generation of the version it was read from.
+struct FooterRead {
+    footer: ParquetFooter;
+    generation: u64;
+}
+
 /// A data file's footer, read from the store; null when it is not one to join: missing, sealed, of another size than
 /// its manifest says, or not a footer `parquet.cee` takes.
 fn readFooterOf(
@@ -316,7 +326,7 @@ fn readFooterOf(
     hidden: Slice<u8>,
     key: Slice<u8>,
     size: u64,
-) -> Result<ParquetFooter?, TablesError> {
+) -> Result<FooterRead?, TablesError> {
     let bucket = catalogText(hidden);
     let name = catalogText(key);
     let info = match (store.headObject(bucket, name)) {
@@ -336,7 +346,10 @@ fn readFooterOf(
         Some(f) => f,
         null => { return Ok(null); }
     };
-    return Ok(parseParquetFooter(footer.view(), size)?);
+    return Ok(match (parseParquetFooter(footer.view(), size)?) {
+        Some(f) => Some(FooterRead { footer: f, generation: info.generation }),
+        null => null,
+    });
 }
 
 /// Bytes `[from, to)` of an object; null when it cannot be read.
@@ -430,7 +443,11 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
     for (i in 0..bin.inputs.length) {
         match (store.headObject(bucket, catalogText(bin.inputs[i].key.view()))) {
             Ok(info) => {
-                if (info.size != bin.inputs[i].size) { return Ok(null); }
+                // The same version as planned, still not sealed: its footer and ranges are the plan's.
+                if (info.size != bin.inputs[i].size || info.generation != bin.inputs[i].generation ||
+                    metadataFind(info.metadata.view(), SSE_FIELD.bytes()).isSome()) {
+                    return Ok(null);
+                }
             }
             Err(_) => { return Ok(null); }
         }
@@ -628,7 +645,10 @@ fn mergedMetrics(
                 found = true;
                 let v = jsonMember(borrow items[j], "value") ?? { continue; };
                 if (bound == 0) {
-                    sum += jsonI64(v) ?? 0;
+                    match (addChecked(sum, jsonI64(v) ?? 0)) {
+                        Some(n) => { sum = n; }
+                        null => { everyInput = false; } // a count past i64: left out
+                    }
                 } else {
                     let b = match (v) {
                         Json.Text(t) => t.view(),
@@ -729,13 +749,19 @@ fn commitCompaction(
 ) -> Result<bool, TablesError> {
     var written = Vector<Vector<u8>>.create();
     for (i in 0..outputs.length) { written.push(copyBytes(outputs[i].key.view())?)?; }
-    let done = commitWritten(store, plan, outputs, bins, nowMs, mut written)?;
+    // Everything the run wrote is deleted unless the swap made it the table's, an error's path included (the M16
+    // exit review).
+    let outcome = commitWritten(store, plan, outputs, bins, nowMs, mut written);
+    let done = match (outcome) {
+        Ok(d) => d,
+        Err(_) => false,
+    };
     if (!done) {
         for (i in 0..written.length) {
             let _ = store.deleteObject(catalogText(plan.hidden.view()), catalogText(written[i].view()));
         }
     }
-    return Ok(done);
+    return outcome;
 }
 
 fn commitWritten(
@@ -776,87 +802,105 @@ fn commitWritten(
             inputsCount += 1;
         }
     }
-    // The manifest of the joined files: its first input's manifest's schema and metadata, an entry per file.
+    // A manifest of the joined files per partition spec (the M16 exit review): each written by a manifest of that
+    // spec's schema and metadata, an entry per file of the spec.
     var newList = Vector<Json>.create();
-    let template = plan.bins[bins[0]].inputs[0].manifest;
-    var entries = Vector<Json>.create();
-    var leastSequence: i64 = sequence;
+    var specs = Vector<i64>.create();
     for (o in 0..outputs.length) {
-        let bin = borrow plan.bins[bins[o]];
-        let first = borrow bin.inputs[0];
-        var entry = cloneJson(borrow plan.manifests[first.manifest].records[first.entry])?;
-        var file = cloneJson(dataFileOf(plan, first) ?? { return Ok(false); })?;
-        jsonSet(mut file, "file_path", Json.Text(copyBytes(outputs[o].path.view())?))?;
-        jsonSet(mut file, "file_size_in_bytes", jsonInteger(truncate<i64>(outputs[o].length))?)?;
-        jsonSet(mut file, "record_count", jsonInteger(bin.join.rows)?)?;
-        for (name in ["column_sizes", "value_counts", "null_value_counts", "nan_value_counts"]) {
-            if (jsonMember(borrow file, name).isSome()) {
-                jsonSet(mut file, name, mergedMetrics(plan, bin, name, 0)?)?;
+        let spec = recordInt(borrow plan.list.records[plan.bins[bins[o]].inputs[0].manifest], "partition_spec_id", 0);
+        if (!holdsId(specs.view(), spec)) { specs.push(spec)?; }
+    }
+    for (sp in 0..specs.length) {
+        var template: usize = 0;
+        var entries = Vector<Json>.create();
+        var leastSequence: i64 = sequence;
+        var specRows: i64 = 0;
+        var specFiles: i64 = 0;
+        for (o in 0..outputs.length) {
+            let bin = borrow plan.bins[bins[o]];
+            if (recordInt(
+                borrow plan.list.records[bin.inputs[0].manifest],
+                "partition_spec_id",
+                0,
+            ) != specs[sp]) { continue; }
+            if (specFiles == 0) { template = bin.inputs[0].manifest; }
+            specFiles += 1;
+            specRows = addChecked(specRows, bin.join.rows) ?? { return Ok(false); };
+            let first = borrow bin.inputs[0];
+            var entry = cloneJson(borrow plan.manifests[first.manifest].records[first.entry])?;
+            var file = cloneJson(dataFileOf(plan, first) ?? { return Ok(false); })?;
+            jsonSet(mut file, "file_path", Json.Text(copyBytes(outputs[o].path.view())?))?;
+            jsonSet(mut file, "file_size_in_bytes", jsonInteger(truncate<i64>(outputs[o].length))?)?;
+            jsonSet(mut file, "record_count", jsonInteger(bin.join.rows)?)?;
+            for (name in ["column_sizes", "value_counts", "null_value_counts", "nan_value_counts"]) {
+                if (jsonMember(borrow file, name).isSome()) {
+                    jsonSet(mut file, name, mergedMetrics(plan, bin, name, 0)?)?;
+                }
             }
+            if (jsonMember(borrow file, "lower_bounds").isSome()) {
+                jsonSet(mut file, "lower_bounds", mergedMetrics(plan, bin, "lower_bounds", -1)?)?;
+            }
+            if (jsonMember(borrow file, "upper_bounds").isSome()) {
+                jsonSet(mut file, "upper_bounds", mergedMetrics(plan, bin, "upper_bounds", 1)?)?;
+            }
+            for (name in ["split_offsets", "key_metadata", "sort_order_id", "equality_ids", "distinct_counts"]) {
+                if (jsonMember(borrow file, name).isSome()) { jsonSet(mut file, name, Json.Null)?; }
+            }
+            jsonSet(mut entry, "data_file", file)?;
+            jsonSet(mut entry, "status", jsonInteger(1)?)?;
+            jsonSet(mut entry, "snapshot_id", jsonInteger(snapshot)?)?;
+            if (v2) {
+                // The largest of its inputs' data sequence numbers (ADR-0098 §3).
+                var most: i64 = 0;
+                for (i in 0..bin.inputs.length) {
+                    if (bin.inputs[i].sequence > most) { most = bin.inputs[i].sequence; }
+                }
+                if (most < leastSequence) { leastSequence = most; }
+                jsonSet(mut entry, "sequence_number", jsonInteger(most)?)?;
+                jsonSet(mut entry, "file_sequence_number", Json.Null)?;
+            }
+            entries.push(entry)?;
         }
-        if (jsonMember(borrow file, "lower_bounds").isSome()) {
-            jsonSet(mut file, "lower_bounds", mergedMetrics(plan, bin, "lower_bounds", -1)?)?;
-        }
-        if (jsonMember(borrow file, "upper_bounds").isSome()) {
-            jsonSet(mut file, "upper_bounds", mergedMetrics(plan, bin, "upper_bounds", 1)?)?;
-        }
-        for (name in ["split_offsets", "key_metadata", "sort_order_id", "equality_ids"]) {
-            if (jsonMember(borrow file, name).isSome()) { jsonSet(mut file, name, Json.Null)?; }
-        }
-        jsonSet(mut entry, "data_file", file)?;
-        jsonSet(mut entry, "status", jsonInteger(1)?)?;
-        jsonSet(mut entry, "snapshot_id", jsonInteger(snapshot)?)?;
+        let addedManifest = match (writeAvro(plan.manifests[template].metadata.view(), entries.view())?) {
+            Some(b) => b,
+            null => { return Ok(false); }
+        };
+        var addedKey = copyBytes(dir.view())?;
+        if (!newUuid(mut addedKey)?) { return Ok(false); }
+        addedKey.extend("-m-compaction.avro".bytes())?;
+        let addedPath = putWarehouseFile(
+            store,
+            plan,
+            scheme.view(),
+            addedKey.view(),
+            addedManifest.view(),
+            written,
+        )? ?? { return Ok(false); };
+        var addedRecord = cloneJson(borrow plan.list.records[template])?;
+        jsonSet(mut addedRecord, "manifest_path", Json.Text(addedPath))?;
+        jsonSet(mut addedRecord, "manifest_length", jsonInteger(truncate<i64>(addedManifest.length))?)?;
+        jsonSet(mut addedRecord, "added_snapshot_id", jsonInteger(snapshot)?)?;
+        jsonSet(mut addedRecord, "partitions", Json.Null)?;
+        setCount(mut addedRecord, ["added_files_count", "added_data_files_count"][..], specFiles)?;
+        setCount(
+            mut addedRecord,
+            [
+                "existing_files_count",
+                "existing_data_files_count",
+                "deleted_files_count",
+                "deleted_data_files_count",
+                "existing_rows_count",
+                "deleted_rows_count",
+            ][..],
+            0,
+        )?;
+        setCount(mut addedRecord, ["added_rows_count"][..], specRows)?;
         if (v2) {
-            // The largest of its inputs' data sequence numbers (ADR-0098 §3).
-            var most: i64 = 0;
-            for (i in 0..bin.inputs.length) {
-                if (bin.inputs[i].sequence > most) { most = bin.inputs[i].sequence; }
-            }
-            if (most < leastSequence) { leastSequence = most; }
-            jsonSet(mut entry, "sequence_number", jsonInteger(most)?)?;
-            jsonSet(mut entry, "file_sequence_number", Json.Null)?;
+            jsonSet(mut addedRecord, "sequence_number", jsonInteger(sequence)?)?;
+            jsonSet(mut addedRecord, "min_sequence_number", jsonInteger(leastSequence)?)?;
         }
-        entries.push(entry)?;
+        newList.push(addedRecord)?;
     }
-    let addedManifest = match (writeAvro(plan.manifests[template].metadata.view(), entries.view())?) {
-        Some(b) => b,
-        null => { return Ok(false); }
-    };
-    var addedKey = copyBytes(dir.view())?;
-    if (!newUuid(mut addedKey)?) { return Ok(false); }
-    addedKey.extend("-m-compaction.avro".bytes())?;
-    let addedPath = putWarehouseFile(
-        store,
-        plan,
-        scheme.view(),
-        addedKey.view(),
-        addedManifest.view(),
-        written,
-    )? ?? { return Ok(false); };
-    var addedRecord = cloneJson(borrow plan.list.records[template])?;
-    jsonSet(mut addedRecord, "manifest_path", Json.Text(addedPath))?;
-    jsonSet(mut addedRecord, "manifest_length", jsonInteger(truncate<i64>(addedManifest.length))?)?;
-    jsonSet(mut addedRecord, "added_snapshot_id", jsonInteger(snapshot)?)?;
-    jsonSet(mut addedRecord, "partitions", Json.Null)?;
-    setCount(mut addedRecord, ["added_files_count", "added_data_files_count"][..], truncate<i64>(outputs.length))?;
-    setCount(
-        mut addedRecord,
-        [
-            "existing_files_count",
-            "existing_data_files_count",
-            "deleted_files_count",
-            "deleted_data_files_count",
-            "existing_rows_count",
-            "deleted_rows_count",
-        ][..],
-        0,
-    )?;
-    setCount(mut addedRecord, ["added_rows_count"][..], addedRows)?;
-    if (v2) {
-        jsonSet(mut addedRecord, "sequence_number", jsonInteger(sequence)?)?;
-        jsonSet(mut addedRecord, "min_sequence_number", jsonInteger(leastSequence)?)?;
-    }
-    newList.push(addedRecord)?;
     // The manifests that held inputs, rewritten; the others as they are.
     for (i in 0..plan.manifests.length) {
         if (gone[i].length == 0) {
@@ -897,11 +941,11 @@ fn commitWritten(
                 jsonSet(mut entry, "status", jsonInteger(2)?)?;
                 jsonSet(mut entry, "snapshot_id", jsonInteger(snapshot)?)?;
                 deletedFiles += 1;
-                deletedRows += rows;
+                deletedRows = addChecked(deletedRows, rows) ?? { return Ok(false); };
             } else {
                 jsonSet(mut entry, "status", jsonInteger(0)?)?;
                 existing += 1;
-                existingRows += rows;
+                existingRows = addChecked(existingRows, rows) ?? { return Ok(false); };
             }
             kept.push(entry)?;
         }
@@ -981,12 +1025,23 @@ fn commitWritten(
             null => {}
         }
     }
+    // A previous total that would overflow (a writer's text, not trusted) is left out (the M16 exit review).
     match (summaryValue(previous, "total-data-files")) {
-        Some(v) => { summaryCount(mut summary, "total-data-files", v - inputsCount + truncate<i64>(outputs.length))?; }
+        Some(v) => {
+            match (addChecked(v, truncate<i64>(outputs.length) - inputsCount)) {
+                Some(t) => { summaryCount(mut summary, "total-data-files", t)?; }
+                null => {}
+            }
+        }
         null => {}
     }
     match (summaryValue(previous, "total-files-size")) {
-        Some(v) => { summaryCount(mut summary, "total-files-size", v - removedBytes + addedBytes)?; }
+        Some(v) => {
+            match (addChecked(v, addedBytes - removedBytes)) {
+                Some(t) => { summaryCount(mut summary, "total-files-size", t)?; }
+                null => {}
+            }
+        }
         null => {}
     }
     var snap = jsonObject();
@@ -1051,7 +1106,7 @@ fn summaryCount(summary: borrow mut Json, name: StringView, value: i64) -> Resul
     var digits = Vector<u8>.create();
     if (value < 0) {
         digits.push('-')?;
-        appendDecimal(mut digits, truncate<u64>(-value))?;
+        appendDecimal(mut digits, truncate<u64>(-(value + 1)) + 1)?; // i64's least too
     } else {
         appendDecimal(mut digits, truncate<u64>(value))?;
     }
@@ -1200,9 +1255,7 @@ fn finishCompaction(
         }
         Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
         Err(_) => {
-            for (i in 0..outputs.length) {
-                let _ = store.deleteObject(catalogText(hidden.view()), catalogText(outputs[i].key.view()));
-            }
+            // What it wrote is deleted already (`commitCompaction`).
             return writeJobStatus(
                 store,
                 hidden.view(),

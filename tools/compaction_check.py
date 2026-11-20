@@ -103,15 +103,23 @@ check("an append after", catalog.load_table("ns.flat").scan().to_arrow().num_row
 pschema = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("part", pa.string(), nullable=False)])
 ptable = catalog.create_table("ns.parts", schema=pschema)
 compaction("parts", "disabled")
-with ptable.update_spec() as u:
+# Two files under the first spec (unpartitioned), then the spec changes and eight more under it: each spec's files
+# are compacted under their own spec (the M16 exit review).
+for i in range(2):
+    catalog.load_table("ns.parts").append(pa.table({"id": [100 + i], "part": ["a"]}, schema=pschema))
+with catalog.load_table("ns.parts").update_spec() as u:
     u.add_identity("part")
 for i in range(4):
     catalog.load_table("ns.parts").append(pa.table({"id": [2 * i, 2 * i + 1], "part": ["a", "b"]}, schema=pschema))
-check("eight files before", len(data_files("parts")), 8)
+check("ten files before, under two specs", len(data_files("parts")), 10)
 compaction("parts", "enabled")
-wait_for("compacted to a file a partition", lambda: len(data_files("parts")) == 2, 4 * day)
+wait_for("compacted to a file a spec's partition", lambda: len(data_files("parts")) == 3, 4 * day)
 rows = catalog.load_table("ns.parts").scan(row_filter="part == 'a'").to_arrow().sort_by("id")
-check("partition a's rows", rows.column("id").to_pylist(), [0, 2, 4, 6])
+check("partition a's rows, both specs'", rows.column("id").to_pylist(), [0, 2, 4, 6, 100, 101])
+specs = sorted(f.file.spec_id for f in catalog.load_table("ns.parts").scan().plan_files())
+check("each file under its own spec", specs, [0, 1, 1])
+rows = catalog.load_table("ns.parts").scan(row_filter="part == 'b'").to_arrow().sort_by("id")
+check("partition b's rows", rows.column("id").to_pylist(), [1, 3, 5, 7])
 
 # The sort strategy is not done: Failed, and the files stay.
 catalog.create_table("ns.sorted", schema=schema)

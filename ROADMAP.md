@@ -314,7 +314,9 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 
 ### M16: Compaction for S3 Tables
 
-The owner chose ADR-0097's item C (20 Nov 2026). ADR-0098 (proposed) designs it:
+**Closed 20 Nov 2026** (the owner: "yes, close M16"; `docs/m16-exit-review.md`).
+
+The owner chose ADR-0097's item C (20 Nov 2026). ADR-0098 (accepted 20 Nov 2026, as amended) designs it:
 - **Binpack by copying row groups:** a table's small data files are joined into files near `targetFileSizeMB`. Their
   row groups are copied byte for byte, under a new Parquet footer, and committed as a `replace` snapshot.
 - **What stays:** partitions with delete files are left as they are, and `sort` and `z-order` are not done.
@@ -4161,3 +4163,21 @@ Browser form uploads with a SigV4 POST policy.
   - the cluster smoke runs `compaction_check.py` through node 3 (22 checks), 175 in all;
   - the S3 smoke (PyIceberg 23, maintenance 14, compaction 22) and 398 unit tests pass.
 - **Next:** slice 5, the exit review.
+
+### 20 Nov 2026: M16's exit review, M16 closed, ADR-0098 accepted
+
+- **The review (`docs/m16-exit-review.md`), fixed:**
+  - footers that crashed the server: lists nested without bound, and numbers that overflowed;
+  - one added manifest per partition spec, where all joined files were filed under the first spec;
+  - inputs checked again by generation and SSE before their copy;
+  - every file of a failed commit deleted;
+  - `distinct_counts` left out;
+  - named Avro union branches resolved.
+- **Recorded:** B1 to B6 of the review.
+- **The owner:** "I accept the amended ADR-0098", then "yes, close M16".
+- **What M16 gives:** S3 Tables' `icebergCompaction`, on by default as on AWS, on `serve` and a cluster. Small
+  Parquet files are joined by copying their row groups, with no codec in CeeSafe needed, and committed as a
+  `replace` snapshot that PyIceberg reads.
+- **At closing:** 400 unit tests, the S3 smoke and the cluster smoke (175; PyIceberg 23, maintenance 14 and
+  compaction 24 on each) and the SDK matrix pass.
+- **Next:** M17, when the owner asks for one.

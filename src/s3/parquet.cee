@@ -8,6 +8,14 @@
 // reader reads every page of a row group it does not skip by its statistics).
 
 const PARQUET_MAGIC: StringView = "PAR1";
+
+/// `a + b`, or null when it overflows: a footer's numbers are a writer's, not trusted (the M16 exit review).
+fn addChecked(a: i64, b: i64) -> i64? {
+    let most: i64 = 9223372036854775807;
+    let least: i64 = -9223372036854775807 - 1;
+    if ((b > 0 && a > most - b) || (b < 0 && a < least - b)) { return null; }
+    return Some(a + b);
+}
 /// The most a footer may be: pyarrow's are a few KB per row group; this bounds what one file costs to plan.
 const MAX_PARQUET_FOOTER: u64 = 16777216;
 
@@ -135,7 +143,9 @@ fn parseParquetFooter(footer: Slice<u8>, fileLength: u64) -> Result<ParquetFoote
             ThriftValue.Struct(f) => f,
             _ => { return Ok(null); }
         };
-        counted += thriftInt(group, PQ_GROUP_NUM_ROWS) ?? { return Ok(null); };
+        let groupRows = thriftInt(group, PQ_GROUP_NUM_ROWS) ?? { return Ok(null); };
+        if (groupRows < 0) { return Ok(null); }
+        counted = addChecked(counted, groupRows) ?? { return Ok(null); };
         let columns = structItems(group, PQ_GROUP_COLUMNS) ?? { return Ok(null); };
         for (c in 0..columns.length) {
             let chunk = match (borrow columns[c]) {
@@ -190,7 +200,7 @@ fn joinParquet(inputs: Slice<ParquetFooter>) -> Result<ParquetJoin?, AllocError>
     var rows: i64 = 0;
     for (i in 0..inputs.length) {
         let source = borrow inputs[i];
-        rows += source.rows;
+        rows = addChecked(rows, source.rows) ?? { return Ok(null); };
         let items = structItems(borrow source.meta, PQ_FILE_ROW_GROUPS) ?? { return Ok(null); };
         for (g in 0..items.length) {
             var group = cloneThrift(borrow items[g])?;
@@ -274,7 +284,10 @@ fn moveChunk(chunk: borrow mut Vector<ThriftField>, delta: i64) -> Result<bool, 
                 for (id in [PQ_META_DATA_PAGE, PQ_META_DICTIONARY_PAGE, PQ_META_INDEX_PAGE]) {
                     match (thriftInt(meta, id)) {
                         Some(o) => {
-                            if (o >= 4) { setThriftInt(meta, id, THRIFT_I64, o + delta)?; }
+                            if (o >= 4) {
+                                let moved = addChecked(o, delta) ?? { return Ok(false); };
+                                setThriftInt(meta, id, THRIFT_I64, moved)?;
+                            }
                         }
                         null => {}
                     }

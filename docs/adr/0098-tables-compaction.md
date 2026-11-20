@@ -1,6 +1,7 @@
 # ADR-0098: Compaction for S3 Tables (M16)
 
-**Status:** proposed, 20 Nov 2026. M16 is item C of ADR-0097 (the owner: "C: Tables compaction").
+**Status:** accepted, 20 Nov 2026, as amended by the exit review (§3: one added manifest per partition spec; the
+owner: "I accept the amended ADR-0098"). Proposed the same day. M16 is item C of ADR-0097 (the owner: "C: Tables compaction").
 - **Decided by the owner the same day:**
   - copy row groups;
   - skip partitions with delete files ("Copy, skip deletes").
@@ -55,6 +56,8 @@
      - **Counts:** record, value and null counts are summed from the inputs' manifest entries.
      - **Bounds:** lower and upper bounds are the least and greatest of the inputs', for the types whose
        serialized order is known; for others they are left out.
+   - **Amended by the exit review (docs/m16-exit-review.md, A2):** one added manifest per partition spec, each
+     written by a manifest of that spec's schema and metadata.
    - **The swap:** through `swapMetadata`, against the metadata the run started from. If a client committed
      meanwhile, the run is abandoned, and its written files are deleted at once.
    - **Data sequence numbers:** a compacted file takes the largest of its inputs'. Skipped partitions with deletes

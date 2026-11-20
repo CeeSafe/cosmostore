@@ -89,3 +89,83 @@ fn parquetFilesJoin() -> Result<void, TestFailure> {
     Check.isTrue(joinParquet(footers.view())!.isNull(), "a schema that differs")?;
     return Ok();
 }
+
+/// Hostile footers are refused, not crashed on (the M16 exit review): lists nested past the depth limit, row counts
+/// whose sum overflows, a page offset that overflows when moved.
+@test
+fn hostileParquetFootersAreRefused() -> Result<void, TestFailure> {
+    // A field holding a list of lists of lists… two million deep.
+    var deep = Vector<u8>.create();
+    deep.push(0x19)!;
+    for (i in 0..2000000) { deep.push(0x19)!; }
+    Check.isTrue(readThriftStruct(deep.view(), 0)!.isNull(), "lists nested too deep")?;
+    // Two row groups of i64's most rows each.
+    let a = fixtureBytes(PARQUET_FIXTURE_A[..]);
+    var footer = fixtureFooter(a.view());
+    for (f in 0..footer.meta.length) {
+        if (footer.meta[f].id != PQ_FILE_ROW_GROUPS) { continue; }
+        match (borrow mut footer.meta[f].value) {
+            ThriftValue.List(_, _, groups) => {
+                for (g in 0..groups.length) {
+                    match (borrow mut groups[g]) {
+                        ThriftValue.Struct(fields) => {
+                            setThriftInt(fields, PQ_GROUP_NUM_ROWS, THRIFT_I64, 9223372036854775807)!;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    var bytes = Vector<u8>.create();
+    writeThriftStruct(mut bytes, footer.meta.view())!;
+    Check.isTrue(parseParquetFooter(bytes.view(), 100000)!.isNull(), "row counts that overflow")?;
+    // A dictionary page offset past the data page's, near i64's most: moved, it would overflow.
+    var huge = fixtureFooter(a.view());
+    for (f in 0..huge.meta.length) {
+        if (huge.meta[f].id != PQ_FILE_ROW_GROUPS) { continue; }
+        match (borrow mut huge.meta[f].value) {
+            ThriftValue.List(_, _, groups) => {
+                match (borrow mut groups[0]) {
+                    ThriftValue.Struct(fields) => {
+                        for (c in 0..fields.length) {
+                            if (fields[c].id != PQ_GROUP_COLUMNS) { continue; }
+                            match (borrow mut fields[c].value) {
+                                ThriftValue.List(_, _, chunks) => {
+                                    match (borrow mut chunks[0]) {
+                                        ThriftValue.Struct(chunk) => {
+                                            for (m in 0..chunk.length) {
+                                                if (chunk[m].id != PQ_CHUNK_META) { continue; }
+                                                match (borrow mut chunk[m].value) {
+                                                    ThriftValue.Struct(meta) => {
+                                                        setThriftInt(
+                                                            meta,
+                                                            PQ_META_DICTIONARY_PAGE,
+                                                            THRIFT_I64,
+                                                            9223372036854775800,
+                                                        )!;
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    var inputs = Vector<ParquetFooter>.create();
+    inputs.push(fixtureFooter(fixtureBytes(PARQUET_FIXTURE_B[..]).view()))!;
+    inputs.push(huge)!;
+    Check.isTrue(joinParquet(inputs.view())!.isNull(), "an offset that overflows when moved")?;
+    return Ok();
+}
