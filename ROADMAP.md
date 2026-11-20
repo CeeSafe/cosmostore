@@ -4086,3 +4086,20 @@ Browser form uploads with a SigV4 POST policy.
   - **How:** "Apply while rewriting" was asked again, since applying deletes needs re-encoding; the owner chose
     "Copy, skip deletes".
 - **Next:** slice 1, Thrift and Parquet's footer.
+
+### 20 Nov 2026: M16 slice 1, Parquet's footer (ADR-0098 §1)
+
+- **`src/s3/thrift.cee`:** Thrift's compact protocol, read into a tree that keeps every field and written back as
+  read.
+- **`src/s3/parquet.cee`:**
+  - reads a footer, refusing encrypted footers, chunks in another file, ranges outside the file, and row counts
+    that do not add up;
+  - two files join only with the same schema, writer and column orders;
+  - a join's plan: the chunks copied in order, their offsets moved, page indexes and bloom filters dropped.
+- **Tests,** on files pyarrow 26.0.1 wrote (`parquet_fixtures.cee`):
+  - every footer is written back to its bytes;
+  - two zstd files with Iceberg field ids join into one pyarrow reads as the same rows, schema and statistics;
+  - a snappy file with a struct and a list joins with itself;
+  - another schema does not join.
+- **A bug caught:** a test caught an underflow on a file shorter than its footer, now refused.
+- **Checks:** 397 unit tests and the S3 smoke pass.

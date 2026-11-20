@@ -1,0 +1,91 @@
+// Parquet's footer (ADR-0098 slice 1): Thrift's compact protocol read and written back unchanged, and files joined by
+// copying their column chunks under a new footer.
+
+/// A fixture's footer.
+fn fixtureFooter(bytes: Slice<u8>) -> ParquetFooter {
+    let n = parquetFooterLength(bytes[bytes.length - 8..], bytes.length as u64)!;
+    let start = bytes.length - 8 - n as usize;
+    return parseParquetFooter(bytes[start..bytes.length - 8], bytes.length as u64)!!;
+}
+
+/// Every fixture's footer is read, and written back to the same bytes.
+@test
+fn parquetFootersRoundTrip() -> Result<void, TestFailure> {
+    for (rows in [PARQUET_FIXTURE_A[..], PARQUET_FIXTURE_B[..], PARQUET_FIXTURE_C[..]]) {
+        let bytes = fixtureBytes(rows);
+        let n = parquetFooterLength(bytes.view()[bytes.length - 8..], bytes.length as u64) ?? {
+            return Check.fail("a footer length");
+        };
+        let start = bytes.length - 8 - n as usize;
+        let footer = bytes.view()[start..bytes.length - 8];
+        let read = readThriftStruct(footer, 0)!!;
+        Check.equalU64(footer.length as u64, read.end as u64)?;
+        var again = Vector<u8>.create();
+        writeThriftStruct(mut again, read.fields.view())!;
+        Check.equalBytes(footer, again.view())?;
+        Check.isTrue(parseParquetFooter(footer, bytes.length as u64)!.isSome(), "a footer this can join")?;
+    }
+    // Broken ones are refused, not trusted.
+    let a = fixtureBytes(PARQUET_FIXTURE_A[..]);
+    Check.isTrue(parquetFooterLength("abcdPAR2".bytes(), 100).isNull(), "not the magic")?;
+    Check.isTrue(parquetFooterLength(a.view()[a.length - 8..], 20).isNull(), "a footer longer than the file")?;
+    let n = parquetFooterLength(a.view()[a.length - 8..], a.length as u64)!;
+    let start = a.length - 8 - n as usize;
+    Check.isTrue(parseParquetFooter(a.view()[start + 1..a.length - 8], a.length as u64)!.isNull(), "cut")?;
+    Check.isTrue(parseParquetFooter(a.view()[start..a.length - 8], 200)!.isNull(), "chunks past the file")?;
+    return Ok();
+}
+
+/// Two files of one schema join: their chunks copied in order, the footer's rows and offsets theirs; a file of another
+/// schema does not join.
+@test
+fn parquetFilesJoin() -> Result<void, TestFailure> {
+    let a = fixtureBytes(PARQUET_FIXTURE_A[..]);
+    let b = fixtureBytes(PARQUET_FIXTURE_B[..]);
+    let c = fixtureBytes(PARQUET_FIXTURE_C[..]);
+    var footers = Vector<ParquetFooter>.create();
+    footers.push(fixtureFooter(a.view()))!;
+    footers.push(fixtureFooter(b.view()))!;
+    let plan = joinParquet(footers.view())!!;
+    Check.equalU64(5, truncate<u64>(plan.rows))?;
+    // The joined file, built as the plan says.
+    var out = Vector<u8>.create();
+    out.extend(PARQUET_MAGIC.bytes())!;
+    for (i in 0..plan.copies.length) {
+        let copy = borrow plan.copies[i];
+        let source = if (copy.input == 0) a.view() else b.view();
+        out.extend(source[copy.start as usize..(copy.start + copy.length) as usize])!;
+    }
+    out.extend(plan.tail.view())!;
+    Check.equalU64(plan.length, out.length as u64)?;
+    let joined = fixtureFooter(out.view());
+    Check.equalU64(5, truncate<u64>(joined.rows))?;
+    Check.isTrue(parquetJoinable(borrow joined, borrow footers[0]), "the same shape")?;
+    let groups = structItems(borrow joined.meta, PQ_FILE_ROW_GROUPS)!;
+    Check.equalU64(3, groups.length as u64)?;
+    // For pyarrow to read (ADR-0098 slice 1's check): the joined file in the scratch directory.
+    let dir = scratchDirectory("parquet-join");
+    var path = textOf(dir.view());
+    path.append("/joined.parquet")!;
+    DurableFile.createNew(path.view())!.writeAt(out.view(), 0)!;
+    // Nested columns (a struct, a list) and snappy join as well: `c` twice.
+    var nested = Vector<ParquetFooter>.create();
+    nested.push(fixtureFooter(c.view()))!;
+    nested.push(fixtureFooter(c.view()))!;
+    let twice = joinParquet(nested.view())!!;
+    var both = Vector<u8>.create();
+    both.extend(PARQUET_MAGIC.bytes())!;
+    for (i in 0..twice.copies.length) {
+        let copy = borrow twice.copies[i];
+        both.extend(c.view()[copy.start as usize..(copy.start + copy.length) as usize])!;
+    }
+    both.extend(twice.tail.view())!;
+    Check.equalU64(4, truncate<u64>(fixtureFooter(both.view()).rows))?;
+    var nestedPath = textOf(dir.view());
+    nestedPath.append("/nested.parquet")!;
+    DurableFile.createNew(nestedPath.view())!.writeAt(both.view(), 0)!;
+    // Another schema does not join.
+    footers.push(fixtureFooter(c.view()))!;
+    Check.isTrue(joinParquet(footers.view())!.isNull(), "a schema that differs")?;
+    return Ok();
+}

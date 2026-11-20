@@ -1,0 +1,324 @@
+// Thrift's compact protocol (ADR-0098 §1), as Parquet's footer uses it: read into a tree that keeps every field, and
+// written back from it. Fields the footer's changes do not touch are written as they were read, whatever they are.
+//
+// A field's header is a byte: its id's delta from the previous field's (1 to 15, else 0 and the id as a zigzag
+// varint) in the high nibble, its type in the low one, and a 0 byte ends a struct. Integers are zigzag varints, a
+// double eight bytes little-endian, a binary a varint length and its bytes. A list's or set's header is its size (in
+// the high nibble below 15, else 15 and a varint) and its elements' type; a map's is a varint size, then, if not
+// empty, a byte of the keys' and values' types.
+
+const THRIFT_BOOL_TRUE: u8 = 1;
+const THRIFT_BOOL_FALSE: u8 = 2;
+const THRIFT_I8: u8 = 3;
+const THRIFT_I16: u8 = 4;
+const THRIFT_I32: u8 = 5;
+const THRIFT_I64: u8 = 6;
+const THRIFT_DOUBLE: u8 = 7;
+const THRIFT_BINARY: u8 = 8;
+const THRIFT_LIST: u8 = 9;
+const THRIFT_SET: u8 = 10;
+const THRIFT_MAP: u8 = 11;
+const THRIFT_STRUCT: u8 = 12;
+
+/// How deep structs and collections may nest: a footer's are a few levels; more is a broken or hostile file.
+const THRIFT_MAX_DEPTH: u32 = 64;
+
+/// A value. Integers keep their wire type (`kind`: I8, I16, I32 or I64), so they are written back as read.
+enum ThriftValue {
+    Bool(bool),
+    Int(u8, i64),
+    Double([u8; 8]),
+    Binary(Vector<u8>),
+    Struct(Vector<ThriftField>),
+    /// A list or set: its wire type (LIST or SET), its elements' type, and the elements.
+    List(u8, u8, Vector<ThriftValue>),
+    /// A map: the keys' and values' types, and the keys and values in turn.
+    Map(u8, u8, Vector<ThriftValue>),
+}
+
+struct ThriftField {
+    id: i16;
+    value: ThriftValue;
+}
+
+/// Reading: the bytes and where in them.
+struct ThriftInput<region a> {
+    data: Slice<a, u8>;
+    at: usize;
+
+    fn byte(borrow mut this) -> u8? {
+        if (this.at >= this.data.length) { return null; }
+        let b = this.data[this.at];
+        this.at += 1;
+        return Some(b);
+    }
+
+    fn varint(borrow mut this) -> u64? {
+        var v: u64 = 0;
+        var shift: u32 = 0;
+        while (true) {
+            let b = this.byte()?;
+            if (shift > 63 || (shift == 63 && (b & 0x7E) != 0)) { return null; }
+            v = v | (((b & 0x7F) as u64) << shift);
+            if ((b & 0x80) == 0) { return Some(v); }
+            shift += 7;
+        }
+        return null;
+    }
+
+    fn zigzag(borrow mut this) -> i64? {
+        let v = this.varint()?;
+        let half = truncate<i64>(v >> 1);
+        return Some(if ((v & 1) == 0) half else -half - 1);
+    }
+
+    fn take(borrow mut this, n: u64) -> Slice<a, u8>? {
+        if (n > (this.data.length - this.at) as u64) { return null; }
+        let start = this.at;
+        this.at += n as usize;
+        return Some(this.data[start..this.at]);
+    }
+}
+
+/// A struct read from `data` at `at`, and where it ended; null when the bytes are not one.
+fn readThriftStruct(data: Slice<u8>, at: usize) -> Result<(ThriftStructRead)?, AllocError> {
+    var input = ThriftInput { data: data, at: at };
+    return match (readStructBody(mut input, 0)?) {
+        Some(fields) => Ok(Some(ThriftStructRead { fields: fields, end: input.at })),
+        null => Ok(null),
+    };
+}
+
+/// A struct read, and the offset after it.
+struct ThriftStructRead {
+    fields: Vector<ThriftField>;
+    end: usize;
+}
+
+fn readStructBody(input: borrow mut ThriftInput, depth: u32) -> Result<Vector<ThriftField>?, AllocError> {
+    if (depth > THRIFT_MAX_DEPTH) { return Ok(null); }
+    var fields = Vector<ThriftField>.create();
+    var last: i64 = 0;
+    while (true) {
+        let header = input.byte() ?? { return Ok(null); };
+        if (header == 0) { break; }
+        let kind = header & 0x0F;
+        let delta = (header >> 4) as i64;
+        let id = if (delta != 0) last + delta else input.zigzag() ?? { return Ok(null); };
+        if (id < -32768 || id > 32767) { return Ok(null); }
+        last = id;
+        let value = if (kind == THRIFT_BOOL_TRUE) Some(ThriftValue.Bool(true))
+            else if (kind == THRIFT_BOOL_FALSE) Some(ThriftValue.Bool(false))
+            else readValue(input, kind, depth)?;
+        match (value) {
+            Some(v) => { fields.push(ThriftField { id: truncate<i16>(id), value: v })?; }
+            null => { return Ok(null); }
+        }
+    }
+    return Ok(Some(fields));
+}
+
+/// A value of wire type `kind` (a bool here is a collection's element: a byte, 1 for true).
+fn readValue(input: borrow mut ThriftInput, kind: u8, depth: u32) -> Result<ThriftValue?, AllocError> {
+    if (kind == THRIFT_BOOL_TRUE || kind == THRIFT_BOOL_FALSE) {
+        return Ok(match (input.byte()) {
+            Some(b) => Some(ThriftValue.Bool(b == 1)),
+            null => null,
+        });
+    }
+    if (kind == THRIFT_I8) {
+        return Ok(match (input.byte()) {
+            Some(b) => Some(ThriftValue.Int(THRIFT_I8, if (b >= 128) (b as i64) - 256 else b as i64)),
+            null => null,
+        });
+    }
+    if (kind == THRIFT_I16 || kind == THRIFT_I32 || kind == THRIFT_I64) {
+        return Ok(match (input.zigzag()) {
+            Some(v) => Some(ThriftValue.Int(kind, v)),
+            null => null,
+        });
+    }
+    if (kind == THRIFT_DOUBLE) {
+        let bytes = input.take(8) ?? { return Ok(null); };
+        var d = [0u8; 8];
+        for (i in 0..8) { d[i] = bytes[i]; }
+        return Ok(Some(ThriftValue.Double(d)));
+    }
+    if (kind == THRIFT_BINARY) {
+        let n = input.varint() ?? { return Ok(null); };
+        let bytes = input.take(n) ?? { return Ok(null); };
+        return Ok(Some(ThriftValue.Binary(copyBytes(bytes)?)));
+    }
+    if (kind == THRIFT_STRUCT) {
+        return Ok(match (readStructBody(input, depth + 1)?) {
+            Some(f) => Some(ThriftValue.Struct(f)),
+            null => null,
+        });
+    }
+    if (kind == THRIFT_LIST || kind == THRIFT_SET) {
+        let header = input.byte() ?? { return Ok(null); };
+        let element = header & 0x0F;
+        var size = (header >> 4) as u64;
+        if (size == 15) { size = input.varint() ?? { return Ok(null); }; }
+        // Each element takes a byte at least, so a size past the bytes left is a broken file, not an allocation.
+        if (size > (input.data.length - input.at) as u64) { return Ok(null); }
+        var items = Vector<ThriftValue>.create();
+        for (i in 0..size) {
+            match (readValue(input, element, depth + 1)?) {
+                Some(v) => { items.push(v)?; }
+                null => { return Ok(null); }
+            }
+        }
+        return Ok(Some(ThriftValue.List(kind, element, items)));
+    }
+    if (kind == THRIFT_MAP) {
+        let size = input.varint() ?? { return Ok(null); };
+        if (size > (input.data.length - input.at) as u64) { return Ok(null); }
+        var items = Vector<ThriftValue>.create();
+        if (size == 0) { return Ok(Some(ThriftValue.Map(0, 0, items))); }
+        let types = input.byte() ?? { return Ok(null); };
+        let keys = types >> 4;
+        let values = types & 0x0F;
+        for (i in 0..size) {
+            match (readValue(input, keys, depth + 1)?) {
+                Some(v) => { items.push(v)?; }
+                null => { return Ok(null); }
+            }
+            match (readValue(input, values, depth + 1)?) {
+                Some(v) => { items.push(v)?; }
+                null => { return Ok(null); }
+            }
+        }
+        return Ok(Some(ThriftValue.Map(keys, values, items)));
+    }
+    return Ok(null);
+}
+
+// ---- Writing ----
+
+fn writeVarint(out: borrow mut Vector<u8>, value: u64) -> Result<void, AllocError> {
+    var v = value;
+    while (v >= 0x80) {
+        out.push(truncate<u8>(v & 0x7F) | 0x80)?;
+        v = v >> 7;
+    }
+    out.push(truncate<u8>(v))?;
+    return Ok();
+}
+
+fn writeZigzag(out: borrow mut Vector<u8>, value: i64) -> Result<void, AllocError> {
+    let z = if (value < 0) truncate<u64>(-(value + 1)) * 2 + 1 else truncate<u64>(value) * 2;
+    return writeVarint(out, z);
+}
+
+/// A struct's fields and its stop byte.
+fn writeThriftStruct(out: borrow mut Vector<u8>, fields: Slice<ThriftField>) -> Result<void, AllocError> {
+    var last: i64 = 0;
+    for (i in 0..fields.length) {
+        let f = borrow fields[i];
+        let kind = wireType(borrow f.value);
+        let id = f.id as i64;
+        if (id > last && id - last <= 15) {
+            out.push((truncate<u8>(id - last) << 4) | kind)?;
+        } else {
+            out.push(kind)?;
+            writeZigzag(out, id)?;
+        }
+        last = id;
+        match (borrow f.value) {
+            ThriftValue.Bool(_) => {} // in the header
+            _ => { writeValue(out, borrow f.value)?; }
+        }
+    }
+    out.push(0)?;
+    return Ok();
+}
+
+/// A value's type in a field's header (a bool's value is its type there).
+fn wireType(v: borrow ThriftValue) -> u8 => match (v) {
+    ThriftValue.Bool(b) => if (*b) THRIFT_BOOL_TRUE else THRIFT_BOOL_FALSE,
+    ThriftValue.Int(kind, _) => *kind,
+    ThriftValue.Double(_) => THRIFT_DOUBLE,
+    ThriftValue.Binary(_) => THRIFT_BINARY,
+    ThriftValue.Struct(_) => THRIFT_STRUCT,
+    ThriftValue.List(kind, _, _) => *kind,
+    ThriftValue.Map(_, _, _) => THRIFT_MAP,
+};
+
+/// A value's body (a bool as a collection's element, a byte).
+fn writeValue(out: borrow mut Vector<u8>, v: borrow ThriftValue) -> Result<void, AllocError> {
+    match (v) {
+        ThriftValue.Bool(b) => { out.push(if (*b) 1 else 2)?; }
+        ThriftValue.Int(kind, n) => {
+            if (*kind == THRIFT_I8) { out.push(truncate<u8>(*n))?; } else { writeZigzag(out, *n)?; }
+        }
+        ThriftValue.Double(d) => { out.extend(d[..])?; }
+        ThriftValue.Binary(b) => {
+            writeVarint(out, b.length as u64)?;
+            out.extend(b.view())?;
+        }
+        ThriftValue.Struct(fields) => { writeThriftStruct(out, fields.view())?; }
+        ThriftValue.List(_, element, items) => {
+            if (items.length < 15) {
+                out.push(truncate<u8>(items.length << 4) | *element)?;
+            } else {
+                out.push(0xF0 | *element)?;
+                writeVarint(out, items.length as u64)?;
+            }
+            for (i in 0..items.length) { writeValue(out, borrow items[i])?; }
+        }
+        ThriftValue.Map(keys, values, items) => {
+            writeVarint(out, (items.length / 2) as u64)?;
+            if (items.length > 0) { out.push((*keys << 4) | *values)?; }
+            for (i in 0..items.length) { writeValue(out, borrow items[i])?; }
+        }
+    }
+    return Ok();
+}
+
+// ---- Fields ----
+
+/// The field of id `id`, if the struct has it.
+fn thriftField<region a>(fields: borrow(a) Vector<ThriftField>, id: i16) -> borrow(a) ThriftValue? {
+    for (i in 0..fields.length) {
+        if (fields[i].id == id) { return Some(borrow fields[i].value); }
+    }
+    return null;
+}
+
+/// An integer field's value.
+fn thriftInt(fields: borrow Vector<ThriftField>, id: i16) -> i64? => match (thriftField(fields, id)) {
+    Some(v) => match (v) {
+        ThriftValue.Int(_, n) => Some(*n),
+        _ => null,
+    },
+    null => null,
+};
+
+/// Sets an integer field (of wire type `kind`), adding it in id order if the struct does not have it.
+fn setThriftInt(fields: borrow mut Vector<ThriftField>, id: i16, kind: u8, value: i64) -> Result<void, AllocError> {
+    for (i in 0..fields.length) {
+        if (fields[i].id == id) {
+            fields[i].value = ThriftValue.Int(kind, value);
+            return Ok();
+        }
+    }
+    var at = fields.length;
+    for (i in 0..fields.length) {
+        if (fields[i].id > id && at == fields.length) { at = i; }
+    }
+    fields.insert(at, ThriftField { id: id, value: ThriftValue.Int(kind, value) })?;
+    return Ok();
+}
+
+/// Removes a field, if the struct has it.
+fn removeThriftField(fields: borrow mut Vector<ThriftField>, id: i16) {
+    var i: usize = 0;
+    while (i < fields.length) {
+        if (fields[i].id == id) {
+            let _ = fields.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}

@@ -1,0 +1,314 @@
+// Parquet's footer, for compaction by copying row groups (ADR-0098 §1): read, check that files can be joined, and the
+// plan of a joined file. A file is `PAR1`, its column chunks, the footer (a Thrift compact `FileMetaData`), the
+// footer's length (4 bytes, little-endian) and `PAR1`. A joined file is `PAR1`, every input's column chunks copied
+// byte for byte in order, and a footer whose row groups are the inputs', each chunk's offsets moved to where it now
+// is. No page is read: the chunks' codecs, encodings and types are carried as written.
+//
+// What is not carried: a chunk's page indexes and bloom filter, which live outside it (their offsets are dropped, so a
+// reader reads every page of a row group it does not skip by its statistics).
+
+const PARQUET_MAGIC: StringView = "PAR1";
+/// The most a footer may be: pyarrow's are a few KB per row group; this bounds what one file costs to plan.
+const MAX_PARQUET_FOOTER: u64 = 16777216;
+
+// FileMetaData's fields.
+const PQ_FILE_SCHEMA: i16 = 2;
+const PQ_FILE_NUM_ROWS: i16 = 3;
+const PQ_FILE_ROW_GROUPS: i16 = 4;
+const PQ_FILE_CREATED_BY: i16 = 6;
+const PQ_FILE_COLUMN_ORDERS: i16 = 7;
+const PQ_FILE_ENCRYPTION: i16 = 8;
+const PQ_FILE_SIGNING_KEY: i16 = 9;
+// RowGroup's.
+const PQ_GROUP_COLUMNS: i16 = 1;
+const PQ_GROUP_NUM_ROWS: i16 = 3;
+const PQ_GROUP_FILE_OFFSET: i16 = 5;
+const PQ_GROUP_ORDINAL: i16 = 7;
+// ColumnChunk's.
+const PQ_CHUNK_FILE_PATH: i16 = 1;
+const PQ_CHUNK_FILE_OFFSET: i16 = 2;
+const PQ_CHUNK_META: i16 = 3;
+const PQ_CHUNK_OFFSET_INDEX_OFFSET: i16 = 4;
+const PQ_CHUNK_OFFSET_INDEX_LENGTH: i16 = 5;
+const PQ_CHUNK_COLUMN_INDEX_OFFSET: i16 = 6;
+const PQ_CHUNK_COLUMN_INDEX_LENGTH: i16 = 7;
+const PQ_CHUNK_CRYPTO: i16 = 8;
+const PQ_CHUNK_ENCRYPTED_META: i16 = 9;
+// ColumnMetaData's.
+const PQ_META_COMPRESSED: i16 = 7;
+const PQ_META_DATA_PAGE: i16 = 9;
+const PQ_META_INDEX_PAGE: i16 = 10;
+const PQ_META_DICTIONARY_PAGE: i16 = 11;
+const PQ_META_BLOOM_OFFSET: i16 = 14;
+const PQ_META_BLOOM_LENGTH: i16 = 15;
+
+/// A file's footer, read and checked.
+struct ParquetFooter {
+    meta: Vector<ThriftField>;
+    rows: i64;
+    /// Its schema, writer and column orders, encoded: two files join only when these are the same.
+    shape: Vector<u8>;
+    /// Where its footer starts: its chunks are before it.
+    dataEnd: u64;
+}
+
+/// The footer's length, from a file's last 8 bytes; null when they do not end a Parquet file.
+fn parquetFooterLength(tail: Slice<u8>, fileLength: u64) -> u64? {
+    if (tail.length != 8 || tail[4..] != PARQUET_MAGIC.bytes()) { return null; }
+    let n = (tail[0] as u64) | ((tail[1] as u64) << 8) | ((tail[2] as u64) << 16) | ((tail[3] as u64) << 24);
+    if (n == 0 || n > MAX_PARQUET_FOOTER || n + 12 > fileLength) { return null; }
+    return Some(n);
+}
+
+/// A column chunk's bytes in its file: from its first page to the end of its last.
+struct ChunkRange {
+    start: u64;
+    length: u64;
+}
+
+/// A chunk's range, by its metadata; null when the chunk is not one this can move (in another file, or encrypted)
+/// or its range is outside the file's chunks (`dataEnd`: where the footer starts).
+fn chunkRange(chunk: borrow Vector<ThriftField>, dataEnd: u64) -> ChunkRange? {
+    if (thriftField(chunk, PQ_CHUNK_FILE_PATH).isSome() || thriftField(chunk, PQ_CHUNK_CRYPTO).isSome() ||
+        thriftField(chunk, PQ_CHUNK_ENCRYPTED_META).isSome()) {
+        return null;
+    }
+    let meta = match (thriftField(chunk, PQ_CHUNK_META)) {
+        Some(v) => match (v) {
+            ThriftValue.Struct(f) => f,
+            _ => { return null; },
+        },
+        null => { return null; }
+    };
+    var start = thriftInt(meta, PQ_META_DATA_PAGE) ?? { return null; };
+    // A dictionary or index page comes before the data pages; an offset below the magic is a writer's "none".
+    for (id in [PQ_META_DICTIONARY_PAGE, PQ_META_INDEX_PAGE]) {
+        match (thriftInt(meta, id)) {
+            Some(o) => {
+                if (o >= 4 && o < start) { start = o; }
+            }
+            null => {}
+        }
+    }
+    let length = thriftInt(meta, PQ_META_COMPRESSED) ?? { return null; };
+    if (start < 4 || length <= 0) { return null; }
+    let s = truncate<u64>(start);
+    let l = truncate<u64>(length);
+    if (l > dataEnd || s > dataEnd - l) { return null; }
+    return Some(ChunkRange { start: s, length: l });
+}
+
+/// The structs of a list field (a footer's row groups, a row group's columns); null when the field is not a list of
+/// structs.
+fn structItems<region a>(fields: borrow(a) Vector<ThriftField>, id: i16) -> borrow(a) Vector<ThriftValue>? {
+    return match (thriftField(fields, id)) {
+        Some(v) => match (v) {
+            ThriftValue.List(_, element, items) => if (*element == THRIFT_STRUCT) Some(items) else null,
+            _ => null,
+        },
+        null => null,
+    };
+}
+
+/// A footer read from its bytes, for a file of `fileLength` bytes; null when it is not one this can join: not
+/// Thrift, encrypted, a chunk in another file or outside this one, or row counts that do not add up.
+fn parseParquetFooter(footer: Slice<u8>, fileLength: u64) -> Result<ParquetFooter?, AllocError> {
+    let read = match (readThriftStruct(footer, 0)?) {
+        Some(r) => r,
+        null => { return Ok(null); }
+    };
+    if (read.end != footer.length) { return Ok(null); }
+    let meta = read.fields;
+    if (thriftField(
+        borrow meta,
+        PQ_FILE_ENCRYPTION,
+    ).isSome() || thriftField(borrow meta, PQ_FILE_SIGNING_KEY).isSome()) {
+        return Ok(null);
+    }
+    let rows = thriftInt(borrow meta, PQ_FILE_NUM_ROWS) ?? { return Ok(null); };
+    if (fileLength < footer.length as u64 + 12) { return Ok(null); }
+    let dataEnd = fileLength - 8 - footer.length as u64;
+    var counted: i64 = 0;
+    let groups = structItems(borrow meta, PQ_FILE_ROW_GROUPS) ?? { return Ok(null); };
+    for (g in 0..groups.length) {
+        let group = match (borrow groups[g]) {
+            ThriftValue.Struct(f) => f,
+            _ => { return Ok(null); }
+        };
+        counted += thriftInt(group, PQ_GROUP_NUM_ROWS) ?? { return Ok(null); };
+        let columns = structItems(group, PQ_GROUP_COLUMNS) ?? { return Ok(null); };
+        for (c in 0..columns.length) {
+            let chunk = match (borrow columns[c]) {
+                ThriftValue.Struct(f) => f,
+                _ => { return Ok(null); }
+            };
+            if (chunkRange(chunk, dataEnd).isNull()) { return Ok(null); }
+        }
+    }
+    if (counted != rows) { return Ok(null); }
+    var shape = Vector<u8>.create();
+    for (id in [PQ_FILE_SCHEMA, PQ_FILE_CREATED_BY, PQ_FILE_COLUMN_ORDERS]) {
+        shape.push(truncate<u8>(id))?;
+        match (thriftField(borrow meta, id)) {
+            Some(v) => { writeValue(mut shape, v)?; }
+            null => { shape.push(0xFF)?; }
+        }
+    }
+    return Ok(Some(ParquetFooter { meta: meta, rows: rows, shape: shape, dataEnd: dataEnd }));
+}
+
+/// Whether two files can be joined: the same schema (columns, field ids, types), the same writer (whose quirks a
+/// reader may work around by its name) and the same column orders.
+fn parquetJoinable(a: borrow ParquetFooter, b: borrow ParquetFooter) -> bool => a.shape.view() == b.shape.view();
+
+/// One range of an input to copy into the joined file, in order.
+struct ParquetCopy {
+    input: usize;
+    start: u64;
+    length: u64;
+}
+
+/// A joined file's plan: `PAR1`, the copies in order, then `tail` (the footer, its length and `PAR1`).
+struct ParquetJoin {
+    copies: Vector<ParquetCopy>;
+    tail: Vector<u8>;
+    rows: i64;
+    /// The file's length.
+    length: u64;
+}
+
+/// The plan of the file that joins `inputs`, in order; null when they cannot be joined (none, or shapes that differ,
+/// or more row groups than a footer can number).
+fn joinParquet(inputs: Slice<ParquetFooter>) -> Result<ParquetJoin?, AllocError> {
+    if (inputs.length == 0) { return Ok(null); }
+    for (i in 1..inputs.length) {
+        if (!parquetJoinable(borrow inputs[0], borrow inputs[i])) { return Ok(null); }
+    }
+    var copies = Vector<ParquetCopy>.create();
+    var groups = Vector<ThriftValue>.create();
+    var at: u64 = 4;
+    var rows: i64 = 0;
+    for (i in 0..inputs.length) {
+        let source = borrow inputs[i];
+        rows += source.rows;
+        let items = structItems(borrow source.meta, PQ_FILE_ROW_GROUPS) ?? { return Ok(null); };
+        for (g in 0..items.length) {
+            var group = cloneThrift(borrow items[g])?;
+            match (borrow mut group) {
+                ThriftValue.Struct(fields) => {
+                    if (groups.length > 32767) { return Ok(null); }
+                    let first = at;
+                    if (!(moveChunks(mut fields, mut copies, i, mut at, source.dataEnd)?)) { return Ok(null); }
+                    setThriftInt(fields, PQ_GROUP_FILE_OFFSET, THRIFT_I64, truncate<i64>(first))?;
+                    setThriftInt(fields, PQ_GROUP_ORDINAL, THRIFT_I16, truncate<i64>(groups.length))?;
+                }
+                _ => { return Ok(null); }
+            }
+            groups.push(group)?;
+        }
+    }
+    var meta = cloneFields(borrow inputs[0].meta)?;
+    setThriftInt(mut meta, PQ_FILE_NUM_ROWS, THRIFT_I64, rows)?;
+    for (f in 0..meta.length) {
+        if (meta[f].id == PQ_FILE_ROW_GROUPS) {
+            meta[f].value = ThriftValue.List(THRIFT_LIST, THRIFT_STRUCT, groups);
+            break;
+        }
+    }
+    var tail = Vector<u8>.create();
+    writeThriftStruct(mut tail, meta.view())?;
+    let footerBytes = tail.length as u64;
+    if (footerBytes > MAX_PARQUET_FOOTER) { return Ok(null); }
+    for (s in [0u64, 8, 16, 24]) { tail.push(truncate<u8>(footerBytes >> s))?; }
+    tail.extend(PARQUET_MAGIC.bytes())?;
+    return Ok(Some(ParquetJoin { copies: copies, tail: tail, rows: rows, length: at + tail.length as u64 }));
+}
+
+/// A row group's column chunks moved to `at` on, in order: each a copy of its input's range, its offsets moved by as
+/// much, its page indexes and bloom filter dropped. False when a chunk is not one this can move.
+fn moveChunks(
+    group: borrow mut Vector<ThriftField>,
+    copies: borrow mut Vector<ParquetCopy>,
+    input: usize,
+    at: borrow mut u64,
+    dataEnd: u64,
+) -> Result<bool, AllocError> {
+    for (f in 0..group.length) {
+        if (group[f].id != PQ_GROUP_COLUMNS) { continue; }
+        match (borrow mut group[f].value) {
+            ThriftValue.List(_, _, columns) => {
+                for (c in 0..columns.length) {
+                    match (borrow mut columns[c]) {
+                        ThriftValue.Struct(chunk) => {
+                            let range = chunkRange(chunk, dataEnd) ?? { return Ok(false); };
+                            let delta = truncate<i64>(*at) - truncate<i64>(range.start);
+                            if (!(moveChunk(chunk, delta)?)) { return Ok(false); }
+                            setThriftInt(chunk, PQ_CHUNK_FILE_OFFSET, THRIFT_I64, truncate<i64>(*at))?;
+                            for (id in [
+                                PQ_CHUNK_OFFSET_INDEX_OFFSET,
+                                PQ_CHUNK_OFFSET_INDEX_LENGTH,
+                                PQ_CHUNK_COLUMN_INDEX_OFFSET,
+                                PQ_CHUNK_COLUMN_INDEX_LENGTH,
+                            ]) {
+                                removeThriftField(chunk, id);
+                            }
+                            copies.push(ParquetCopy { input: input, start: range.start, length: range.length })?;
+                            *at = *at + range.length;
+                        }
+                        _ => { return Ok(false); }
+                    }
+                }
+            }
+            _ => { return Ok(false); }
+        }
+    }
+    return Ok(true);
+}
+
+/// A chunk's page offsets moved by `delta`, and its bloom filter's dropped.
+fn moveChunk(chunk: borrow mut Vector<ThriftField>, delta: i64) -> Result<bool, AllocError> {
+    for (f in 0..chunk.length) {
+        if (chunk[f].id != PQ_CHUNK_META) { continue; }
+        match (borrow mut chunk[f].value) {
+            ThriftValue.Struct(meta) => {
+                for (id in [PQ_META_DATA_PAGE, PQ_META_DICTIONARY_PAGE, PQ_META_INDEX_PAGE]) {
+                    match (thriftInt(meta, id)) {
+                        Some(o) => {
+                            if (o >= 4) { setThriftInt(meta, id, THRIFT_I64, o + delta)?; }
+                        }
+                        null => {}
+                    }
+                }
+                removeThriftField(meta, PQ_META_BLOOM_OFFSET);
+                removeThriftField(meta, PQ_META_BLOOM_LENGTH);
+                return Ok(true);
+            }
+            _ => { return Ok(false); }
+        }
+    }
+    return Ok(false);
+}
+
+fn cloneFields(fields: borrow Vector<ThriftField>) -> Result<Vector<ThriftField>, AllocError> {
+    var out = Vector<ThriftField>.create();
+    for (i in 0..fields.length) {
+        out.push(ThriftField { id: fields[i].id, value: cloneThrift(borrow fields[i].value)? })?;
+    }
+    return Ok(out);
+}
+
+fn cloneThrift(v: borrow ThriftValue) -> Result<ThriftValue, AllocError> => match (v) {
+    ThriftValue.Bool(b) => Ok(ThriftValue.Bool(*b)),
+    ThriftValue.Int(kind, n) => Ok(ThriftValue.Int(*kind, *n)),
+    ThriftValue.Double(d) => Ok(ThriftValue.Double(*d)),
+    ThriftValue.Binary(b) => Ok(ThriftValue.Binary(copyBytes(b.view())?)),
+    ThriftValue.Struct(f) => Ok(ThriftValue.Struct(cloneFields(f)?)),
+    ThriftValue.List(kind, element, items) => Ok(ThriftValue.List(*kind, *element, cloneValues(items)?)),
+    ThriftValue.Map(keys, values, items) => Ok(ThriftValue.Map(*keys, *values, cloneValues(items)?)),
+};
+
+fn cloneValues(items: borrow Vector<ThriftValue>) -> Result<Vector<ThriftValue>, AllocError> {
+    var out = Vector<ThriftValue>.create();
+    for (i in 0..items.length) { out.push(cloneThrift(borrow items[i])?)?; }
+    return Ok(out);
+}
