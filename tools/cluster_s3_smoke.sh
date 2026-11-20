@@ -47,11 +47,12 @@ export AWS_MAX_ATTEMPTS=6 AWS_RETRY_MODE=standard
 echo "$AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY" > credentials
 # Users (ADR-0088 §5): the same users file on every node.
 printf '%s\n' "AKIACLUSTERREADER001 reader/secret/0123456789abcdefgh" "AKIACLUSTERANALYST01 analyst/secret/0123456789abcdefg" \
-    "AKIACLUSTERTEMPKEY01 temp/secret/0123456789abcdefghij" >> credentials
+    "AKIACLUSTERTEMPKEY01 temp/secret/0123456789abcdefghij" "AKIACLUSTERWRITER001 writer/secret/0123456789abcdefgh" >> credentials
 # The account's key, named: a key the users file does not name is refused.
 echo "account $AWS_ACCESS_KEY_ID,AKIACLUSTERTEMPKEY01" > users
 cat >> users <<'USERS'
 reader:AIDACREADER01 AKIACLUSTERREADER001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::team-c","arn:aws:s3:::team-c/*"]}}
+writer:AIDACWRITER01 AKIACLUSTERWRITER001 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":["arn:aws:s3:::wsrc-c","arn:aws:s3:::wsrc-c/*","arn:aws:s3:::wdst-c","arn:aws:s3:::wdst-c/*"]}}
 analyst:AIDACANALYST1 AKIACLUSTERANALYST01 {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":["arn:aws:s3tables:*:*:bucket/lake-c","arn:aws:s3tables:*:*:bucket/lake-c/table/*"]}}
 USERS
 head -c 32 /dev/urandom | base64 > cluster.key
@@ -505,6 +506,21 @@ check "a SHA-1 checksum through node 3, returned through node 1" "$(on 1 s3api h
 on 1 s3api delete-bucket-lifecycle --bucket tail-c > /dev/null 2>&1
 for k in ia sha1; do on 2 s3api delete-object --bucket tail-c --key "$k" > /dev/null 2>&1; done
 on 3 s3api delete-bucket --bucket tail-c > /dev/null 2>&1
+# Configurations decided at delivery on a cluster (ADR-0094 §4): the writer's replication and logs go while its policy
+# allows them; narrowed in every node's users file, the destination's shard refuses the next ones.
+writer() { AWS_ACCESS_KEY_ID=AKIACLUSTERWRITER001 AWS_SECRET_ACCESS_KEY=writer/secret/0123456789abcdefgh on "$@"; }
+for b in wsrc-c wdst-c; do on 1 s3api create-bucket --bucket $b > /dev/null 2>&1; on 2 s3api put-bucket-versioning --bucket $b --versioning-configuration Status=Enabled > /dev/null 2>&1; done
+writer 3 s3api put-bucket-replication --bucket wsrc-c --replication-configuration '{"Role":"arn:aws:iam::000000000000:role/r","Rules":[{"ID":"w","Status":"Enabled","Priority":1,"Filter":{},"DeleteMarkerReplication":{"Status":"Disabled"},"Destination":{"Bucket":"arn:aws:s3:::wdst-c"}}]}' > /dev/null 2>&1 && pass "a user's replication through node 3 (wdst-c on shard $(shardOf wdst-c), wsrc-c on $(shardOf wsrc-c))" || fail "a user's replication through node 3"
+writer 1 s3api put-object --bucket wsrc-c --key one.txt --body one.txt > /dev/null 2>&1
+wstat() { on "$1" s3api head-object --bucket wsrc-c --key "$2" --query ReplicationStatus --output text 2>/dev/null; }
+for i in $(seq 1 60); do [ "$(wstat 2 one.txt)" = COMPLETED ] && break; pause 0.25; done
+check "replicated while its policy allows it" "$(wstat 2 one.txt)" COMPLETED
+sed -i.bak 's#"arn:aws:s3:::wsrc-c","arn:aws:s3:::wsrc-c/\*","arn:aws:s3:::wdst-c","arn:aws:s3:::wdst-c/\*"#"arn:aws:s3:::wsrc-c","arn:aws:s3:::wsrc-c/*"#' users
+sleep 5
+writer 2 s3api put-object --bucket wsrc-c --key two.txt --body one.txt > /dev/null 2>&1
+for i in $(seq 1 80); do [ "$(wstat 3 two.txt)" = FAILED ] && break; pause 0.25; done
+check "narrowed, the next replica is refused by the destination's shard (FAILED)" "$(wstat 1 two.txt)" FAILED
+check "and nothing of it there" "$(code 2 s3api head-object --bucket wdst-c --key two.txt)" 404
 # SSE on a cluster (ADR-0092 §2): SSE-S3 and SSE-KMS with an encryption context, put through one node, read through
 # the others; a bucket's default encryption.
 on 1 s3api create-bucket --bucket sse-c > /dev/null 2>&1

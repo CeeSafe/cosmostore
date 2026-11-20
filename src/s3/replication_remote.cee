@@ -291,9 +291,14 @@ enum RemoteOutcome {
 
 /// `outcomeOf`, but a 401 or 403 of the cluster's own front is tried again (the M13 exit review's A3): its node may
 /// not have this node's key yet, during a rotation, and a refusal would be for good.
-fn outcomeFor(t: borrow ReplicationTarget, status: u16) -> RemoteOutcome {
-    if (t.id.view() == "self".bytes() && (status == 401 || status == 403)) { return RemoteOutcome.Again; }
-    return outcomeOf(status);
+fn outcomeFor(t: borrow ReplicationTarget, a: borrow RemoteAnswer) -> RemoteOutcome {
+    // AccessDenied is a decision (a policy's, or the requester's, ADR-0094 §4): FAILED. A key or signature the node
+    // does not know yet is tried again.
+    let denied = findBytes(a.body.view(), "<Code>AccessDenied</Code>".bytes(), 0).isSome();
+    if (t.id.view() == "self".bytes() && (a.status == 401 || a.status == 403) && !denied) {
+        return RemoteOutcome.Again;
+    }
+    return outcomeOf(a.status);
 }
 
 fn outcomeOf(status: u16) -> RemoteOutcome {
@@ -425,10 +430,26 @@ async fn sendRemote(
 ) -> RemoteOutcome {
     var path = Vector<u8>.create();
     if (remotePath(bucket, key.bytes(), mut path).isErr()) { return RemoteOutcome.Again; }
+    // Through the cluster's own front, the rule's requester goes with each write, for the destination's shard to
+    // decide it as (ADR-0094 §4); another endpoint decides by its own keys.
+    var requester = Vector<u8>.create();
+    if (fidelity) {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return RemoteOutcome.Again; }
+        };
+        requester = match (guard.data().replicaRequesterOf(src, e.ruleIds.view(), bucket)) {
+            Ok(r) => r,
+            Err(_) => { return RemoteOutcome.Again; }
+        };
+    }
     // A delete marker: a DELETE, which makes one there; with fidelity, one with the source marker's id.
     if (e.kind == EVENT_MARKER) {
         var none = NoBody {};
         var extra = Vector<HeaderPair>.create();
+        if (requester.length > 0 && !pushPair(mut extra, REPLICA_REQUESTER_FIELD.bytes(), requester.view())) {
+            return RemoteOutcome.Again;
+        }
         if (fidelity) {
             var id = Vector<u8>.create();
             let added = appendVersionId(mut id, e.versionId).isOk() && pushPair(
@@ -439,7 +460,7 @@ async fn sendRemote(
             if (!added) { return RemoteOutcome.Again; }
         }
         return match (await remoteCall(client, t, Method.Delete, path.view(), "".bytes(), extra.view(), mut none)) {
-            Ok(a) => outcomeFor(t, a.status),
+            Ok(a) => outcomeFor(t, borrow a),
             Err(_) => RemoteOutcome.Again,
         };
     }
@@ -553,6 +574,9 @@ async fn sendRemote(
     };
     var headers = Vector<HeaderPair>.create();
     if (replicaHeaders(borrow v, sealed, mut headers).isErr()) { return RemoteOutcome.Again; }
+    if (requester.length > 0 && !pushPair(mut headers, REPLICA_REQUESTER_FIELD.bytes(), requester.view())) {
+        return RemoteOutcome.Again;
+    }
     // With fidelity (a CosmoStore that takes them, ADR-0078 §4): a single PUT's replica is one PUT with the source's
     // id, MD5 and extras; a multipart one is an upload with its parts, completed as the source's id (below).
     let multipart = v.parts > 0 && extras.partSizes.length == v.parts as usize;
@@ -560,7 +584,7 @@ async fn sendRemote(
         if (!fidelityHeaders(borrow v, mut headers)) { return RemoteOutcome.Again; }
         body.left = v.size;
         return match (await remoteCall(client, t, Method.Put, path.view(), "".bytes(), headers.view(), mut body)) {
-            Ok(a) => if (body.broken) RemoteOutcome.Again else outcomeFor(t, a.status),
+            Ok(a) => if (body.broken) RemoteOutcome.Again else outcomeFor(t, borrow a),
             Err(_) => RemoteOutcome.Again,
         };
     }
@@ -568,7 +592,7 @@ async fn sendRemote(
     if (v.parts == 0 || extras.partSizes.length != v.parts as usize) {
         body.left = v.size;
         return match (await remoteCall(client, t, Method.Put, path.view(), "".bytes(), headers.view(), mut body)) {
-            Ok(a) => if (body.broken) RemoteOutcome.Again else outcomeFor(t, a.status),
+            Ok(a) => if (body.broken) RemoteOutcome.Again else outcomeFor(t, borrow a),
             Err(_) => RemoteOutcome.Again,
         };
     }
@@ -585,7 +609,7 @@ async fn sendRemote(
         Ok(a) => a,
         Err(_) => { return RemoteOutcome.Again; }
     };
-    match (outcomeFor(t, created.status)) {
+    match (outcomeFor(t, borrow created)) {
         RemoteOutcome.Done => {}
         other => { return other; }
     }
@@ -627,7 +651,7 @@ async fn sendRemote(
                 break;
             }
         };
-        let o = if (body.broken) RemoteOutcome.Again else outcomeFor(t, sent.status);
+        let o = if (body.broken) RemoteOutcome.Again else outcomeFor(t, borrow sent);
         match (o) {
             RemoteOutcome.Done => {}
             other => {
@@ -662,6 +686,9 @@ async fn sendRemote(
         Err(_) => { return RemoteOutcome.Again; }
     };
     var completeHeaders = Vector<HeaderPair>.create();
+    if (requester.length > 0 && !pushPair(mut completeHeaders, REPLICA_REQUESTER_FIELD.bytes(), requester.view())) {
+        return RemoteOutcome.Again;
+    }
     if (fidelity) {
         var vid = Vector<u8>.create();
         if (appendVersionId(mut vid, v.versionId).isErr() || !pushPair(
@@ -692,5 +719,5 @@ async fn sendRemote(
         "<Error>".bytes(),
         0,
     ).isSome()) { return RemoteOutcome.Again; }
-    return outcomeFor(t, done.status);
+    return outcomeFor(t, borrow done);
 }

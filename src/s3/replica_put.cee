@@ -233,6 +233,33 @@ fn forwardedPeer(request: borrow Request) -> SocketAddress? {
     return null;
 }
 
+/// The requester a configuration records (ADR-0094 §1), sent with each of its writes by a cluster's delivery task: its
+/// replicas, log objects and inventory reports. The front passes it only with the node's stamp (it is an
+/// `x-cosmo-replica-` field), and it is taken only signed by a long-term key.
+const REPLICA_REQUESTER_FIELD: StringView = "x-cosmo-replica-requester";
+
+/// A cluster's write for a configuration decided as its requester (ADR-0094 §4), by the destination's shard, with its
+/// own node's credentials, roles and policies: refused, AccessDenied, which the delivery reads as a refusal (FAILED,
+/// or dropped). A write without the field is a client's, or the account's configuration's: decided as before.
+async fn checkActingAs(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: borrow Authenticated,
+    action: StringView,
+) -> Result<void, S3Fail> {
+    let requester = match (headerOf(req, REPLICA_REQUESTER_FIELD)) {
+        Some(r) => r,
+        null => { return Ok(); }
+    };
+    if (!app.cluster || auth.key.isNull() || auth.session.isSome() || !headerSigned(req, REPLICA_REQUESTER_FIELD)) {
+        return Err(S3Fail.Code(S3Code.AccessDenied));
+    }
+    if (!(await allowedAsRecorded(app, requester, action, req.bucket.view(), req.key.view().bytes())?)) {
+        return Err(S3Fail.Code(S3Code.AccessDenied));
+    }
+    return Ok();
+}
+
 /// An access log object a cluster's node delivers (ADR-0078 §4): signed by a long-term key, it is not logged itself,
 /// or a bucket that logs into itself would never stop.
 const LOG_DELIVERY_FIELD: StringView = "x-cosmo-log-delivery";

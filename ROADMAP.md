@@ -3867,3 +3867,19 @@ Browser form uploads with a SigV4 POST policy.
     refused.
 - **All pass:** 389 unit tests, the S3 smoke, the cluster smoke (163) and the SDK matrix.
 - **Next:** slice 3, on a cluster.
+
+### 20 Nov 2026: M14 slice 3, decided at delivery on a cluster (ADR-0094 §4)
+
+- **What is sent:** a node's delivery task sends a configuration's requester with each write, in
+  `x-cosmo-replica-requester`, which the front passes only with the node's stamp. That covers replicas (single PUT,
+  multipart completion, delete marker), log objects and inventory reports.
+- **What decides:** the destination's shard decides each such write as the requester (`checkActingAs`), with its
+  own node's credentials, roles and policies.
+- **Answers:** a node's own front answering AccessDenied is now FAILED. Only an unknown key or a bad signature is
+  tried again (M13's A3), so a narrowed policy is not retried for ever.
+- **Tests:** the cluster smoke's writer user (source and destination on different shards) replicates while
+  allowed. Narrowed in the users file, its next replica reads FAILED and nothing of it reaches the destination. 167
+  checks pass.
+- **All pass:** the S3 smoke and the SDK matrix. Of 389 unit tests, `snapshotsFaultsCrash` timed out once under a
+  load average of 60 to 73 (other runs on this machine), and passed twice alone.
+- **Next:** M14's exit review.
