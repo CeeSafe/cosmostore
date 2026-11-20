@@ -314,11 +314,14 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 
 ### M15: Operations without restarts
 
+**Closed 20 Nov 2026** (the owner: "Accept and close"; `docs/m15-exit-review.md`).
+
 The owner chose ADR-0095's item A (20 Nov 2026), a reload that would remove a needed master key refused. ADR-0096
-(proposed) designs it:
-- **Reloads:** the roles, STS, SSE-S3 and KMS key, and target files reload when they change, each role, key and
-  target keeping its place.
-- **Master keys:** one added seals new objects at once; one stored versions still need cannot be removed.
+(accepted 20 Nov 2026, as amended) designs it:
+- **Reloads:** the roles, STS, SSE-S3 and KMS key, and target files reload when they change. Roles and keys keep
+  their places; targets are found by id.
+- **Master keys:** one added seals new objects at once; one stored versions still need cannot be removed. A node
+  refuses any master key's removal or change: re-seal, then restart the nodes with the new file.
 - **Done when** a role removed, a master key added and a target changed take effect without a restart, on `serve`
   and on every node, and `cluster-status` shows a node whose files differ.
 
@@ -4033,3 +4036,15 @@ Browser form uploads with a SigV4 POST policy.
   - no smoke removes a target with deliveries waiting.
 - **Tests:** 394 unit tests, the S3 smoke, the cluster smoke (172) and the SDK matrix pass.
 - **For the owner:** accept ADR-0096 as amended (§3, §5, §6), and close M15.
+
+### 20 Nov 2026: M15 closed, ADR-0096 accepted
+
+- **The owner:** "Accept and close".
+- **ADR-0096:** accepted as amended:
+  - §3: new bytes under a key's id are its removal; the count and install are under the store's lock; sealed writes
+    check their key at commit; a node refuses a master key's removal or change;
+  - §5: targets keep no places;
+  - §6: the digests are in the status answer.
+- **The review's recorded Lows:** `docs/m15-exit-review.md` B1 to B5.
+- **CI:** the closing fixes (d37b0a4) passed.
+- **Next:** M16, when the owner asks for one.

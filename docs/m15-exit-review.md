@@ -74,8 +74,8 @@ is not removed. On a cluster, `cluster-status` shows a node whose files differ.
 
 ## Decisions for the owner
 
-- **Accept ADR-0096** with its amendments:
-  - §5: targets keep no places;
-  - §6: the digests are in the status answer;
-  - §3: a node refuses a master key's removal or change (A2).
-- **Close M15.**
+- **Taken, 20 Nov 2026** (the owner: "Accept and close"): ADR-0096 accepted with its amendments, and M15 closed.
+  - **The amendments:**
+    - §5: targets keep no places;
+    - §6: the digests are in the status answer;
+    - §3: a node refuses a master key's removal or change (A2).

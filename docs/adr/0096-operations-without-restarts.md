@@ -1,6 +1,7 @@
 # ADR-0096: Operations without restarts (M15)
 
-**Status:** proposed, 20 Nov 2026. M15 is item A of ADR-0095 (the owner: "A: no restarts"). A reload that would
+**Status:** accepted, 20 Nov 2026, as amended (§3, §5, §6) (the owner: "Accept and close";
+`docs/m15-exit-review.md`). Proposed the same day. M15 is item A of ADR-0095 (the owner: "A: no restarts"). A reload that would
 remove a master key stored objects still need is refused (the owner's choice).
 
 ## Context
