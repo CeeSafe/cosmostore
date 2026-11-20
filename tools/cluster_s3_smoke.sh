@@ -601,12 +601,16 @@ cp sse.keys sse.keys.kept
 pause 4
 running() { for n in 1 2 3; do [ -n "${PIDS[$n]}" ] && grep -c "$1" "log$n"; done | sort -u; }
 check "a key put first: the running nodes take it" "$(running "SSE key file reloaded: 2 keys")" 1
-underOld() { "$BIN" cluster-status --cluster-file cluster.conf --node "$survivor" 2>/dev/null | awk '$2 == "sealed" && $4 == "v1.s3.sse1." { n += $5 } END { print n + 0 }'; }
+# What every shard's leader counts under sse1, from every node's status (each lists the shards it leads), or "unknown"
+# until every shard has a leader that reported (one not caught up reports none, which must not read as 0).
+underOld() { for n in 1 2 3; do "$BIN" cluster-status --cluster-file cluster.conf --node "$n" 2>/dev/null; done | awk -v shards=8 '$2 == "sealed-led" { led[$3] = 1 } $2 == "sealed" && $4 == "v1.s3.sse1." { n += $5 } END { c = 0; for (s in led) c++; if (c < shards) print "unknown"; else print n + 0 }'; }
 for i in $(seq 1 60); do [ "$(underOld)" = 0 ] && break; pause 0.5; done
 check "the leaders re-wrapped what the old key sealed" "$(underOld)" 0
 check "the object reads after" "$(on "$survivor" s3 cp s3://rotate/a - 2>&1)" "rotated on a cluster"
 grep '^sse2 ' sse.keys > sse.keys.next && mv sse.keys.next sse.keys
-pause 4
+# A removal whose counts are not known yet waits, and is tried again each cycle (a slow runner's leaders after the
+# restart): up to a minute.
+for i in $(seq 1 60); do [ "$(running "SSE key file reloaded: 1 keys")" = 1 ] && break; pause 1; done
 check "the old key removed: the running nodes take it" "$(running "SSE key file reloaded: 1 keys")" 1
 for n in 1 2 3; do
     [ -n "${PIDS[$n]}" ] || continue
@@ -615,8 +619,8 @@ done
 cp sse.keys sse.keys.sse2
 printf 'sse3 %s\n' "$(head -c 32 /dev/urandom | base64)" > sse.keys
 pause 4
-# Refused: every node has sse2 first (and, were it not, versions are sealed under it).
-check "the key in use removed: the running nodes refuse it" "$(running "SSE key file reload refused: .*node has the key first\|SSE key file reload refused: [0-9]* versions.*(sse2)")" 1
+# Not taken: every node has sse2 first, so it waits (and, were it not, versions are sealed under it: refused).
+check "the key in use removed: the running nodes do not take it" "$(running "SSE key file reload waits: .*node has the key first\|SSE key file reload waits: [0-9]* versions.*(sse2)")" 1
 cp sse.keys.sse2 sse.keys
 
 echo "cluster s3 smoke: $passed passed, $failed failed"

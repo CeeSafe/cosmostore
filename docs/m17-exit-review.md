@@ -87,3 +87,14 @@ a re-seal, on `serve` and on a cluster.
   - the re-wrap gate;
   - the rule for operators.
 - **Close M17.**
+
+## After closing
+
+- **CI on `daccea3` and `a07b99e` failed:** the cluster smoke's removal of the old key was not taken.
+- **Why:**
+  - the smoke's count read one node's status, which lists only that node's shards, and took a missing count for 0,
+    so it removed the key before the leaders had re-wrapped all of it;
+  - the node then refused the removal until the file changed.
+- **Fixed in M18's slice 2 commit:**
+  - a removal a node cannot take yet waits, and is tried again each cycle;
+  - the smoke reads every node's status.

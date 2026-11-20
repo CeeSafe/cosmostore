@@ -1224,17 +1224,38 @@ async fn reloadNodeKeysIfChanged(r: borrow mut Rotation, shared: borrow NodeShar
                     match (await clusterSealedUnder(shared, mode, dropped.view())) {
                         Some(0) => {}
                         Some(n) => {
-                            await refuseKeys(k, modified, "", n, borrow dropped);
+                            // Still needed: the removal waits, tried again each cycle, so it is taken once the
+                            // leaders' re-wraps have moved what the key sealed (ADR-0100 §4); said once.
+                            if (k.waiting != modified) {
+                                k.waiting = modified;
+                                var line = String.create();
+                                let _ = line.append("cosmostore: ");
+                                let _ = line.append(keyFileWhat(k.kind));
+                                let _ = line.append(" reload waits: ");
+                                let _ = line.appendNumber(n);
+                                let _ = line.append(
+                                    " versions, uploads or bucket encryption configurations still need the key it removes or changes (",
+                                );
+                                let _ = line.append(StringView.fromUtf8(dropped[0].view()) ?? "?");
+                                let _ = line.append("); tried again each cycle\n");
+                                let _ = await AsyncConsole.writeError(line.view());
+                            }
                             continue;
                         }
                         null => {
-                            await refuseKeys(
-                                k,
-                                modified,
-                                "a node did not answer, a shard's leader was not caught up, or a node has the key first; tried again when the file next changes",
-                                0,
-                                borrow dropped,
-                            );
+                            // Not known yet (a node slow to answer, a leader just elected, a node not yet reloaded):
+                            // tried again each cycle, said once (CI's slower runner found a refusal for good too
+                            // strict).
+                            if (k.waiting != modified) {
+                                k.waiting = modified;
+                                var line = String.create();
+                                let _ = line.append("cosmostore: ");
+                                let _ = line.append(keyFileWhat(k.kind));
+                                let _ = line.append(
+                                    " reload waits: a node did not answer, a shard's leader was not caught up, or a node has the key first; tried again each cycle\n",
+                                );
+                                let _ = await AsyncConsole.writeError(line.view());
+                            }
                             continue;
                         }
                     }
@@ -1520,6 +1541,7 @@ fn nodeCommand() -> i32 {
         inventoryDayMs: (args.inventoryDaySeconds ?? 86400) * 1000,
         lifecycleEveryMs: (args.lifecycleSeconds ?? 3600) * 1000,
         tablesDayMs: (args.tablesDaySeconds ?? 86400) * 1000,
+        restoreHourMs: 3600000, // a node's option: slice 3
         zoneId: Vector<u8>.create(),
     };
     {
@@ -1680,6 +1702,7 @@ fn nodeCommand() -> i32 {
                             kind: kind,
                             modified: Fs.modifiedMillis(path.view()).ok() ?? 0,
                             failed: 0,
+                            waiting: 0,
                         });
                         if (pushed.isErr()) { return 1; }
                     }

@@ -1,0 +1,123 @@
+// The restore record (ADR-0102 §4): SetTags format 6 sets a version's restore state, its bytes untouched; its
+// decode refuses what is not a state; and its fault sweep (ADR-0004).
+
+const RESTORE_VALUE: StringView = "1000 90000";
+
+fn putArchivedSeed(s: borrow mut ObjectStore) -> Result<void, StoreError> {
+    var meta = Vector<u8>.create();
+    metadataAdd(mut meta, STORAGE_CLASS_FIELD.bytes(), "GLACIER".bytes())?;
+    let obj = s.writeAll(patterned(40000, 7).view())?;
+    let _ = s.putFinishedWith("bkt", "archived", "", meta.view(), "".bytes(), borrow obj, PutCondition.None)?;
+    return Ok();
+}
+
+fn restoreValueOf(s: borrow ObjectStore) -> Vector<u8>? {
+    let info = s.headObject("bkt", "archived").ok() ?? { return null; };
+    return match (metadataFind(info.metadata.view(), RESTORE_FIELD.bytes())) {
+        Some(v) => copyBytes(v).ok(),
+        null => null,
+    };
+}
+
+/// A restore's state set, and read back after the journal and a checkpoint; a value that is not a state refused.
+@test
+fn restoreStatesAreKept() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("restore-state");
+    {
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        s.createBucket("bkt")!;
+        putArchivedSeed(mut s)!;
+        let before = s.headObject("bkt", "archived")!;
+        s.setFieldOf("bkt", "archived", null, RESTORE_VALUE.bytes(), SET_RESTORE_FORMAT)!;
+        let after = s.headObject("bkt", "archived")!;
+        Check.equalU64(before.generation, after.generation)?;
+        // A value that is not a state is refused before it is written: the journal never holds a record that does not
+        // decode (it would stop the store's next open).
+        Check.isTrue(
+            s.setFieldOf("bkt", "archived", null, "later sooner".bytes(), SET_RESTORE_FORMAT).isErr(),
+            "refused",
+        )?;
+    }
+    {
+        let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        Check.equalBytes(RESTORE_VALUE.bytes(), restoreValueOf(borrow s)!.view())?;
+    }
+    Check.isFalse(isRestoreValue("later sooner".bytes()), "not a state")?;
+    Check.isFalse(isRestoreValue("9 1".bytes()), "ready after its expiry")?;
+    Check.isTrue(isRestoreValue(RESTORE_VALUE.bytes()), "a state")?;
+    return Ok();
+}
+
+/// The workload: an archived version put, then its restore state set.
+fn restoreWorkload(dir: StringView) {
+    var s = match (ObjectStore.open(dir, faultStoreConfig())) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    if (s.createBucket("bkt").isErr() || putArchivedSeed(mut s).isErr()) { return; }
+    let _ = s.setFieldOf("bkt", "archived", null, RESTORE_VALUE.bytes(), SET_RESTORE_FORMAT);
+}
+
+/// A recovered store: the version, if there, holds its bytes, and no restore state or exactly the one set.
+fn checkRestored(s: borrow ObjectStore) -> Result<void, TestFailure> {
+    if (!s.bucketExists("bkt")!) { return Ok(); }
+    match (s.getObject("bkt", "archived")) {
+        Ok(bytes) => {
+            Check.equalBytes(patterned(40000, 7).view(), bytes.view())?;
+            match (restoreValueOf(s)) {
+                Some(v) => { Check.equalBytes(RESTORE_VALUE.bytes(), v.view())?; }
+                null => {}
+            }
+        }
+        Err(StoreError.NoSuchKey) => {}
+        Err(_) => { return Check.fail("a version that does not read"); }
+    }
+    return Ok();
+}
+
+fn sweepRestore(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let dir = scratchDirectory(name);
+    Faults.countOperations();
+    restoreWorkload(dir.view());
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 10, "the workload performs I/O")?;
+    {
+        let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        Check.equalBytes(RESTORE_VALUE.bytes(), restoreValueOf(borrow s)!.view())?;
+    }
+    for (n in 1..points + 1) {
+        removeTree(dir.view());
+        Fs.ensureDirectory(dir.view())!;
+        armMode(borrow mode, n);
+        restoreWorkload(dir.view());
+        Faults.disarm();
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir.view())!;
+        }
+        {
+            var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+            checkRestored(borrow s)?;
+            let _ = s.checkpoint()!;
+        }
+        let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        checkRestored(borrow s)?;
+    }
+    removeTree(dir.view());
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn restoreFaultsOnce() -> Result<void, TestFailure> => sweepRestore("restore-once", SweepMode.Once);
+
+@test
+fn restoreFaultsSticky() -> Result<void, TestFailure> => sweepRestore("restore-sticky", SweepMode.Sticky);
+
+@test
+fn restoreFaultsTorn() -> Result<void, TestFailure> => sweepRestore("restore-torn", SweepMode.StickyTorn);
+
+@test
+fn restoreFaultsCrash() -> Result<void, TestFailure> => sweepRestore("restore-crash", SweepMode.Crash);

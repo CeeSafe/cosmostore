@@ -341,6 +341,20 @@ const SET_CLASS_FORMAT: u8 = 4;
 /// master key, its bytes untouched.
 const SET_ENVELOPE_FORMAT: u8 = 5;
 
+/// A SetTags record that sets a version's restore state (ADR-0102 §4): `<ready ms> <expiry ms>`.
+const SET_RESTORE_FORMAT: u8 = 6;
+/// The metadata field a restore's state is kept in.
+const RESTORE_FIELD: StringView = "x-cosmo-restore";
+
+/// Whether a value is a restore's state: two decimal times, ready before expiry.
+fn isRestoreValue(value: Slice<u8>) -> bool {
+    let text = StringView.fromUtf8(value) ?? { return false; };
+    let space = text.indexOf(" ") ?? { return false; };
+    let ready = text[0..space].parseInt<i64>() ?? { return false; };
+    let expiry = text[space + 1..].parseInt<i64>() ?? { return false; };
+    return ready >= 0 && ready <= expiry;
+}
+
 /// Whether a value is one a re-wrap may set: an SSE-S3 envelope (`v1.s3.<id>.<nonce>.<wrapped>`), never KMS's or
 /// SSE-C's.
 fn isRewrapValue(value: Slice<u8>) -> bool {
@@ -376,10 +390,22 @@ fn storageClassRank(value: Slice<u8>) -> u32 {
     return 0;
 }
 
+/// Whether `value` is one a SetTags record of `format` may set: checked when the record is decoded, and before it is
+/// written, so the journal never holds one its replay would refuse (the M18 restore record's test found the gap).
+fn setFieldValueOk(format: u8, value: Slice<u8>) -> bool {
+    if (format == SET_ACL_FORMAT) { return isAclValue(value); }
+    if (format == SET_LOCK_FORMAT) { return decodeLock(value).isSome(); }
+    if (format == SET_CLASS_FORMAT) { return isStoredClassValue(value); }
+    if (format == SET_ENVELOPE_FORMAT) { return isRewrapValue(value); }
+    if (format == SET_RESTORE_FORMAT) { return isRestoreValue(value); }
+    return true;
+}
+
 /// The metadata field a SetTags record of `format` sets.
 fn setTagsField(format: u8) -> StringView =>
     if (format == SET_ACL_FORMAT) ACL_FIELD else if (format == SET_LOCK_FORMAT) LOCK_FIELD else if (format ==
-        SET_CLASS_FORMAT) STORAGE_CLASS_FIELD else if (format == SET_ENVELOPE_FORMAT) ENVELOPE_FIELD else TAGS_FIELD;
+        SET_CLASS_FORMAT) STORAGE_CLASS_FIELD else if (format == SET_ENVELOPE_FORMAT) ENVELOPE_FIELD else if (format ==
+        SET_RESTORE_FORMAT) RESTORE_FIELD else TAGS_FIELD;
 
 /// SetTags meta v2, v3 and v4: as v1 with format 2, 3 or 4, and the last field is the version's ACL, its object lock,
 /// or its storage class, as it is stored (empty: the private ACL; no lock; STANDARD) in place of its tags.
@@ -417,7 +443,7 @@ fn decodeSetTagsMeta(bytes: Slice<u8>) -> Result<SetTagsMeta, MetaFault> {
     need(bytes, at, 1)?;
     let format = bytes[at];
     if (format == SET_ACL_FORMAT || format == SET_LOCK_FORMAT || format == SET_CLASS_FORMAT ||
-        format == SET_ENVELOPE_FORMAT) {
+        format == SET_ENVELOPE_FORMAT || format == SET_RESTORE_FORMAT) {
         at += 1;
     } else {
         checkVersion(bytes, mut at)?;
@@ -428,10 +454,7 @@ fn decodeSetTagsMeta(bytes: Slice<u8>) -> Result<SetTagsMeta, MetaFault> {
     let generation = readU64(bytes, mut at)?;
     let tags = readText16(bytes, mut at)?;
     if (at != bytes.length) { return Err(MetaFault.TooLong); }
-    if (format == SET_ACL_FORMAT && !isAclValue(tags.view())) { return Err(MetaFault.TooLong); }
-    if (format == SET_LOCK_FORMAT && decodeLock(tags.view()).isNull()) { return Err(MetaFault.TooLong); }
-    if (format == SET_CLASS_FORMAT && !isStoredClassValue(tags.view())) { return Err(MetaFault.TooLong); }
-    if (format == SET_ENVELOPE_FORMAT && !isRewrapValue(tags.view())) { return Err(MetaFault.TooLong); }
+    if (!setFieldValueOk(format, tags.view())) { return Err(MetaFault.TooLong); }
     return Ok(SetTagsMeta {
         bucket: bucket,
         key: key,

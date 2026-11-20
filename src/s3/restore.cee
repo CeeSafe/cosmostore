@@ -1,9 +1,10 @@
+import web_core;
+import web_http;
+import web_server;
+
 // Archive storage classes (ADR-0102): GLACIER and DEEP_ARCHIVE versions keep their bytes where they are, and read only
 // while restored. A restore's state is two times in the version's metadata, when it is ready and when it expires;
 // each request decides by them, so nothing runs in the background to finish a restore or end one.
-
-/// The metadata field a restore's state is kept in (ADR-0102 §4): `<ready ms> <expiry ms>`.
-const RESTORE_FIELD: StringView = "x-cosmo-restore";
 
 /// Whether a class is an archive one, whose reads need a restore.
 fn isArchiveClass(value: Slice<u8>) -> bool => value == "GLACIER".bytes() || value == "DEEP_ARCHIVE".bytes();
@@ -33,4 +34,150 @@ fn readableNow(metadata: Slice<u8>, nowMs: i64) -> bool {
         Some(s) => s.readyMs <= nowMs && nowMs < s.expiryMs,
         null => false,
     };
+}
+
+// ---- RestoreObject (ADR-0102 §5, §6) ----
+
+/// A restore's tier, from `GlacierJobParameters.Tier` (Standard when absent).
+enum RestoreTier {
+    Expedited,
+    Standard,
+    Bulk,
+}
+
+/// The tier's time for a class, in hundredths of an hour (AWS's, ADR-0102 §6); null for Expedited on DEEP_ARCHIVE.
+fn tierCentiHours(stored: Slice<u8>, tier: RestoreTier) -> u64? {
+    let deep = stored == "DEEP_ARCHIVE".bytes();
+    return match (tier) {
+        RestoreTier.Expedited => if (deep) null else Some(5), // 3 minutes
+        RestoreTier.Standard => Some(if (deep) 1200 else 400),
+        RestoreTier.Bulk => Some(if (deep) 4800 else 800),
+    };
+}
+
+/// What RestoreObject did.
+enum RestoreOutcome {
+    /// A restore started: 202.
+    Started,
+    /// A restored version's expiry moved: 200.
+    Extended,
+    InProgress,
+    NotArchived,
+    ExpeditedRefused,
+}
+
+/// RestoreObject's decision and its record, under the store's lock: a version not archived, a restore running, one
+/// done (its expiry moved), or a new one (ready after the tier's time, for `days`).
+fn applyRestore(
+    s: borrow mut ObjectStore,
+    bucket: StringView,
+    key: StringView,
+    versionId: [u8; 16]?,
+    days: u64,
+    tier: RestoreTier,
+    nowMs: i64,
+    hourMs: u64,
+) -> Result<RestoreOutcome, StoreError> {
+    let info = s.headObjectOf(bucket, key, versionId)?;
+    let stored = metadataFind(info.metadata.view(), STORAGE_CLASS_FIELD.bytes()) ?? "".bytes();
+    if (!isArchiveClass(stored)) { return Ok(RestoreOutcome.NotArchived); }
+    let dayMs = truncate<i64>(hourMs * 24);
+    var ready = nowMs;
+    var expiry = nowMs;
+    var outcome = RestoreOutcome.Started;
+    match (restoreStateOf(info.metadata.view())) {
+        Some(state) => {
+            if (nowMs < state.readyMs) { return Ok(RestoreOutcome.InProgress); }
+            if (nowMs < state.expiryMs) {
+                ready = state.readyMs;
+                expiry = nowMs + truncate<i64>(days) * dayMs;
+                outcome = RestoreOutcome.Extended;
+            }
+        }
+        null => {}
+    }
+    match (outcome) {
+        RestoreOutcome.Started => {
+            let centi = tierCentiHours(stored, tier) ?? { return Ok(RestoreOutcome.ExpeditedRefused); };
+            ready = nowMs + truncate<i64>(centi * hourMs / 100);
+            expiry = ready + truncate<i64>(days) * dayMs;
+        }
+        _ => {}
+    }
+    var value = Vector<u8>.create();
+    appendDecimal(mut value, truncate<u64>(ready))?;
+    value.push(' ')?;
+    appendDecimal(mut value, truncate<u64>(expiry))?;
+    s.setFieldOf(bucket, key, Some(info.versionId), value.view(), SET_RESTORE_FORMAT)?;
+    return Ok(outcome);
+}
+
+/// `POST /<bucket>/<key>?restore[&versionId=]`: a `RestoreRequest` of `Days` and, optionally, a `Tier`.
+async fn restoreObject(
+    app: borrow S3App,
+    req: borrow S3Request,
+    auth: Authenticated,
+    exchange: borrow mut Exchange,
+) -> Result<void, S3Fail> {
+    let xml = await readSmallBody(auth, exchange, 65536)?;
+    verifySmallBody(req, xml.view(), false)?;
+    if (findBytes(xml.view(), "<RestoreRequest".bytes(), 0).isNull()) { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    // A SELECT restore, or one to an output location, is not done here.
+    if (elementText(xml.view(), "Type").isSome() || elementText(xml.view(), "OutputLocation").isSome()) {
+        return Err(S3Fail.Code(S3Code.NotImplemented));
+    }
+    let days = match (elementText(xml.view(), "Days")) {
+        Some(t) => parseDecimal(trimBlank(t)) ?? { return Err(S3Fail.Code(S3Code.MalformedXML)); },
+        null => { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+    };
+    if (days < 1 || days > 30000) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    let tier = match (elementText(xml.view(), "Tier")) {
+        Some(t) => {
+            let name = trimBlank(t);
+            if (name == "Expedited".bytes()) RestoreTier.Expedited
+                else if (name == "Standard".bytes()) RestoreTier.Standard
+                else if (name == "Bulk".bytes()) RestoreTier.Bulk
+                else { return Err(S3Fail.Code(S3Code.MalformedXML)); }
+        }
+        null => RestoreTier.Standard,
+    };
+    let versionId = requestVersion(req)?;
+    let bucket = req.bucket.view();
+    let key = req.key.view();
+    let hourMs = app.restoreHourMs;
+    let now = Clock.unixMillis();
+    var guard = await lockStore(app)?;
+    let store = guard.data();
+    let outcome = match (await Async.blocking(
+        () => applyRestore(store, bucket, key, versionId, days, tier, now, hourMs),
+    )) {
+        Ok(o) => o,
+        Err(e) => { return Err(storeFail(e, key.length)); }
+    };
+    match (outcome) {
+        RestoreOutcome.NotArchived => { return Err(S3Fail.Code(S3Code.InvalidObjectState)); }
+        RestoreOutcome.InProgress => { return Err(S3Fail.Code(S3Code.RestoreAlreadyInProgress)); }
+        RestoreOutcome.ExpeditedRefused => { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+        RestoreOutcome.Extended => { await exchange.send(Status.ok(), "".bytes())?; }
+        RestoreOutcome.Started => { await exchange.send(StatusCode.of(202) ?? Status.ok(), "".bytes())?; }
+    }
+    return Ok();
+}
+
+/// `x-amz-restore` for an archived version with a restore's state (ADR-0102 §4): running, or done until its expiry;
+/// nothing once it has expired.
+fn restoreHeader(metadata: Slice<u8>, nowMs: i64, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+    let stored = metadataFind(metadata, STORAGE_CLASS_FIELD.bytes()) ?? { return Ok(); };
+    if (!isArchiveClass(stored)) { return Ok(); }
+    let state = restoreStateOf(metadata) ?? { return Ok(); };
+    if (nowMs < state.readyMs) {
+        exchange.header("x-amz-restore", "ongoing-request=\"true\"".bytes())?;
+    } else if (nowMs < state.expiryMs) {
+        var value = Vector<u8>.create();
+        value.extend("ongoing-request=\"false\", expiry-date=\"".bytes())?;
+        appendHttpDate(mut value, state.expiryMs / 1000)?;
+        value.push('"')?;
+        exchange.header("x-amz-restore", value.view())?;
+    }
+    return Ok();
 }

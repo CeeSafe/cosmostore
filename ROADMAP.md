@@ -4368,3 +4368,30 @@ Browser form uploads with a SigV4 POST policy.
   the five SDKs). Unit tests that checked refusal use an unknown class.
 - **Tests:** `archivedVersionsReadOnlyWhileRestored`. 409 unit tests, both smokes (179) and the SDK matrix pass.
 - **Next:** slice 2, RestoreObject.
+
+### 20 Nov 2026: M18 slice 2, RestoreObject (ADR-0102 §4 to §6); and M17's cluster removal waits
+
+- **RestoreObject** (`POST ?restore`, `s3:RestoreObject`):
+  - **The request:** `Days` (1 to 30,000) and a tier. A SELECT restore, or an output location, is NotImplemented.
+  - **The answers:**
+    - 202 for a new restore, 409 RestoreAlreadyInProgress while one runs, 200 for a restored version (its expiry
+      moved);
+    - InvalidObjectState for a version not archived;
+    - InvalidArgument for Expedited on DEEP_ARCHIVE.
+  - **The tiers' times are AWS's:** GLACIER 3 minutes, 4 hours and 8 hours; DEEP_ARCHIVE 12 and 48 hours.
+    `--restore-hour-seconds` scales them, and a day of `Days`.
+- **The restore's state:** SetTags format 6 (`x-cosmo-restore`, ready and expiry times), decided at each request.
+  HEAD and GET give `x-amz-restore`.
+- **A bug found:** a SetTags value that a record's format refuses was written before it was checked, so the store's
+  next open failed on it. Each format's value is now checked before the record is written (`setFieldValueOk`, used
+  by decode too).
+- **Tests:**
+  - `restoreStatesAreKept` and the fault sweep `restoreFaults{Once,Sticky,Torn,Crash}`;
+  - the S3 smoke (with `--restore-hour-seconds 1`) restores a version, reads it, and checks every refusal.
+- **M17's cluster removal, after CI failed on `daccea3` and `a07b99e`:** a removal a node cannot take yet, its counts
+  not known or above 0, now waits and is tried again each cycle, said once, where it was refused until the file
+  changed. A removal made while the leaders still re-wrap is taken once they are done.
+  - **The smoke's own check was vacuous:** it read one node's status, which lists only the shards that node leads,
+    and took a shard without counts for 0. It now reads every node's, and waits for every shard.
+- **Checks:** 414 unit tests, both smokes (179 on the cluster) and the SDK matrix pass.
+- **Next:** slice 3, a cluster's restores and the SDK matrix.

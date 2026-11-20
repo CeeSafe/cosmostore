@@ -38,7 +38,7 @@ remoteport=$((port + 3))
 echo "AKIAFARSERVER0000001 far/secret/0123456789abcdefghij" > "$work/far.credentials"
 printf 'far http://127.0.0.1:%s AKIAFARSERVER0000001 far/secret/0123456789abcdefghij\n' "$remoteport" > "$work/replication.targets"
 start_server() {
-    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 --website-domain web.localhost --inventory-day-seconds 3 --sts-key-file "$work/sts.keys" --roles-file "$work/roles" --replication-targets "$work/replication.targets" --zone-id local-az1 2>> "$work/server.log" &
+    "$bin" serve "$work/store" "$port" "$work/credentials" localhost --notify-targets "$work/targets" --maintain-seconds 2 --audit-log "$work/audit.log" --sse-key-file "$work/sse.keys" --kms-key-file "$work/kms.keys" --access-log-seconds 2 --website-domain web.localhost --inventory-day-seconds 3 --sts-key-file "$work/sts.keys" --roles-file "$work/roles" --replication-targets "$work/replication.targets" --zone-id local-az1 --restore-hour-seconds 1 2>> "$work/server.log" &
     server=$!
     sleep 1
 }
@@ -1495,6 +1495,21 @@ check "a copy from it refused" "$(code s3api copy-object --bucket classes --key 
 aws s3api put-object --bucket classes --key deep --body dir.txt --storage-class DEEP_ARCHIVE > /dev/null 2>&1
 check "DEEP_ARCHIVE too" "$(code s3api get-object --bucket classes --key deep "$work/g.out")" InvalidObjectState
 check "and an unknown class refused" "$(code s3api put-object --bucket classes --key g --body dir.txt --storage-class SHELF)" InvalidStorageClass
+# RestoreObject (ADR-0102 §5): an hour is a second here (--restore-hour-seconds 1), so Standard's 4 hours take 4 s, and
+# a day 24 s.
+restore() { aws s3api restore-object --bucket classes --key "$1" --restore-request "$2" 2>&1; }
+check "a restore started" "$(restore g '{"Days":1,"GlacierJobParameters":{"Tier":"Standard"}}' | grep -c . )" 0
+check "restoring" "$(aws s3api head-object --bucket classes --key g --query Restore --output text 2>&1)" 'ongoing-request="true"'
+check "its read refused while restoring" "$(code s3api get-object --bucket classes --key g "$work/g.out")" InvalidObjectState
+check "a restore while one runs" "$(code s3api restore-object --bucket classes --key g --restore-request '{"Days":1}')" RestoreAlreadyInProgress
+sleep 5
+check "restored: its expiry shown" "$(aws s3api head-object --bucket classes --key g --query Restore --output text 2>&1 | sed 's/expiry-date=".*"/expiry-date=…/')" 'ongoing-request="false", expiry-date=…'
+check "and it reads" "$(aws s3api get-object --bucket classes --key g "$work/g.out" > /dev/null 2>&1 && cmp -s dir.txt "$work/g.out" && echo same)" same
+check "a restore of a restored version extends it" "$(restore g '{"Days":2}' | grep -c .)" 0
+check "Expedited is not for DEEP_ARCHIVE" "$(code s3api restore-object --bucket classes --key deep --restore-request '{"Days":1,"GlacierJobParameters":{"Tier":"Expedited"}}')" InvalidArgument
+aws s3api put-object --bucket classes --key warm --body dir.txt > /dev/null 2>&1
+check "a version not archived is not restored" "$(code s3api restore-object --bucket classes --key warm --restore-request '{"Days":1}')" InvalidObjectState
+check "a tier not known" "$(code s3api restore-object --bucket classes --key deep --restore-request '{"Days":1,"GlacierJobParameters":{"Tier":"Slow"}}')" MalformedXML
 check "a bucket that is not there, before the class (M12 review)" "$(code s3api put-object --bucket no-such-classes --key g --body dir.txt --storage-class GLACIER)" NoSuchBucket
 aws s3api copy-object --bucket classes --key ia --copy-source classes/ia --storage-class ONEZONE_IA > /dev/null 2>&1
 check "a copy onto itself changes only its class" "$(aws s3api head-object --bucket classes --key ia --query StorageClass --output text 2>&1)" ONEZONE_IA
@@ -1504,7 +1519,7 @@ check "a copy takes the request's class, not the source's" "$(aws s3api head-obj
 up=$(aws s3api create-multipart-upload --bucket classes --key mp --storage-class GLACIER_IR --query UploadId --output text 2>&1)
 check "an upload's class listed" "$(aws s3api list-multipart-uploads --bucket classes --query 'Uploads[0].StorageClass' --output text 2>&1)" GLACIER_IR
 aws s3api abort-multipart-upload --bucket classes --key mp --upload-id "$up" > /dev/null 2>&1
-for k in ia std copied g deep; do aws s3api delete-object --bucket classes --key "$k" > /dev/null 2>&1; done
+for k in ia std copied g deep warm; do aws s3api delete-object --bucket classes --key "$k" > /dev/null 2>&1; done
 # Lifecycle transitions (ADR-0090 §2): taken to the classes kept here, the archive ones too (ADR-0102).
 aws s3api put-bucket-lifecycle-configuration --bucket classes --lifecycle-configuration '{"Rules":[{"ID":"tiers","Status":"Enabled","Filter":{"Prefix":"logs/"},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"},{"Days":90,"StorageClass":"GLACIER_IR"}],"NoncurrentVersionTransitions":[{"NoncurrentDays":30,"StorageClass":"ONEZONE_IA","NewerNoncurrentVersions":2}]}]}' > /dev/null 2>&1 && pass "lifecycle transitions taken" || fail "lifecycle transitions taken"
 check "and returned" "$(aws s3api get-bucket-lifecycle-configuration --bucket classes --query 'Rules[0].[Transitions[1].StorageClass,NoncurrentVersionTransitions[0].NewerNoncurrentVersions]' --output text 2>&1)" "GLACIER_IR	2"
