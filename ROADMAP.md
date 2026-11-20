@@ -4181,3 +4181,13 @@ Browser form uploads with a SigV4 POST policy.
 - **At closing:** 400 unit tests, the S3 smoke and the cluster smoke (175; PyIceberg 23, maintenance 14 and
   compaction 24 on each) and the SDK matrix pass.
 - **Next:** M17, when the owner asks for one.
+
+### 20 Nov 2026: M17 proposed (ADR-0099)
+
+- **The owner:** "propose M17". ADR-0099 (proposed) gives three candidates, one to be M17:
+  - **A, recommended:** key rotation without re-sealing (re-wrap in metadata, counts kept as writes happen, a
+    cluster's removal taken once every shard's leader reports none);
+  - **B:** archive storage classes with RestoreObject;
+  - **C:** compaction that re-encodes (zstd and snappy in CeeSafe, merged row groups, deletes applied).
+- **For A, the owner decides how a cluster takes a removal:** asked of the leaders (recommended), or two-phase
+  through every shard's log.
