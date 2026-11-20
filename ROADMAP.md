@@ -4512,3 +4512,21 @@ Browser form uploads with a SigV4 POST policy.
     policy allows and no more; inactive, it is refused; the deletions; the hidden bucket refused and unlisted.
   - 420 unit tests, both smokes (182 on the cluster) and the SDK matrix pass.
 - **Next:** slice 3, the roles calls and trust policies.
+
+### 20 Nov 2026: M19 slice 3, the roles calls and trust policies (ADR-0104 §1, §7)
+
+- **The calls:** `CreateRole` (its trust policy; `MaxSessionDuration` 3,600 to 43,200), `GetRole`, `ListRoles`,
+  `DeleteRole` (DeleteConflict with a policy); `PutRolePolicy` (one a role), `GetRolePolicy`, `DeleteRolePolicy`.
+  A roles file's name is not made again.
+- **A user's role call** is decided on `arn:aws:iam::…:role/<name>`.
+- **Trust policies** (`trustAllows`): an API role's AssumeRole also needs its trust policy to let the caller. A
+  statement counts when it covers `sts:AssumeRole` and names `*`, the account (id or root), or the caller's user
+  ARN; a Deny that counts wins. A roles file's roles keep ADR-0088 §4's rule.
+- **`StsRole.trust`** carries it through the role sets (empty for a file's role).
+- **Tests:**
+  - `trustPoliciesDecideWhoAssumes`;
+  - the S3 smoke makes a role with the AWS CLI, assumes it through STS within a round, and checks its session
+    lists and does not write. A role trusting someone else is refused, a file role's name too, and the deletions
+    work.
+  - 421 unit tests, both smokes (182) and the SDK matrix pass.
+- **Next:** slice 4, a cluster.

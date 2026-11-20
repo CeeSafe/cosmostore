@@ -97,6 +97,7 @@ fn iamRecordsMergeWithTheFiles() -> Result<void, TestFailure> {
             maxSeconds: 900,
             policy: parseIdentityPolicy(READER_POLICY.bytes())!,
             removed: false,
+            trust: Vector<u8>.create(),
         },
     )!;
     fileRoles.push(
@@ -105,6 +106,7 @@ fn iamRecordsMergeWithTheFiles() -> Result<void, TestFailure> {
             maxSeconds: 900,
             policy: parseIdentityPolicy(READER_POLICY.bytes())!,
             removed: false,
+            trust: Vector<u8>.create(),
         },
     )!;
     var skipped3 = Vector<Vector<u8>>.create();
@@ -165,7 +167,8 @@ fn outcomeName(o: borrow IamOutcome) -> StringView => match (o) {
 };
 
 fn iamCall(s: borrow mut ObjectStore, c: IamCall, files: Slice<Vector<u8>>) -> Vector<u8> {
-    return match (applyIamCall(s, borrow c, files, 1000)) {
+    let roles = Vector<Vector<u8>>.create();
+    return match (applyIamCall(s, borrow c, files, roles.view(), 1000)) {
         Ok(o) => copyBytes(outcomeName(borrow o).bytes())!,
         Err(_) => copyBytes("Err".bytes())!,
     };
@@ -246,5 +249,31 @@ fn iamCallsChangeTheRecord() -> Result<void, TestFailure> {
     )?;
     Check.equalBytes("Done".bytes(), iamCall(mut s, IamCall.DeleteUser(iamName("dev")), files.view()).view())?;
     Check.equalU64(0, iamSnapshotOf(borrow s)!.state.users.length as u64)?;
+    return Ok();
+}
+
+/// A trust policy lets the account when it names the account (its id, its root, or `*`), and a user when it names the
+/// user's ARN or the account; a Deny that counts wins; a statement of another action does not count.
+@test
+fn trustPoliciesDecideWhoAssumes() -> Result<void, TestFailure> {
+    let root =
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:root\"},\"Action\":\"sts:AssumeRole\"}}";
+    let alice =
+        "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"arn:aws:iam::000000000000:user/alice\"]},\"Action\":\"sts:AssumeRole\"}]}";
+    let denied =
+        "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"sts:*\"},{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:user/bob\"},\"Action\":\"sts:AssumeRole\"}]}";
+    let other = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"*\"},\"Action\":\"sts:TagSession\"}}";
+    let none: Vector<u8>? = null;
+    let a: Vector<u8>? = Some(copyBytes("alice".bytes())!);
+    let b: Vector<u8>? = Some(copyBytes("bob".bytes())!);
+    Check.isTrue(trustAllows(root.bytes(), none.asBorrow())!, "the account, by its root")?;
+    Check.isTrue(trustAllows(root.bytes(), a.asBorrow())!, "a user, the account named")?;
+    Check.isTrue(trustAllows(alice.bytes(), a.asBorrow())!, "a user named")?;
+    Check.isFalse(trustAllows(alice.bytes(), b.asBorrow())!, "a user not named")?;
+    Check.isFalse(trustAllows(alice.bytes(), none.asBorrow())!, "the account, not named")?;
+    Check.isTrue(trustAllows(denied.bytes(), a.asBorrow())!, "anyone")?;
+    Check.isFalse(trustAllows(denied.bytes(), b.asBorrow())!, "but a Deny")?;
+    Check.isFalse(trustAllows(other.bytes(), none.asBorrow())!, "another action")?;
+    Check.isFalse(trustAllows("not json".bytes(), none.asBorrow())!, "a document that does not parse")?;
     return Ok();
 }

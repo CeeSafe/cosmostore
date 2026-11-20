@@ -35,6 +35,8 @@ struct StsRole {
     /// The roles file no longer has it (ADR-0096 §2): its sessions and its configurations' writes are refused. Its
     /// place stays, so a place taken from one set means the same role in the next.
     removed: bool;
+    /// An IAM API role's trust policy (ADR-0104 §7), which AssumeRole also checks; empty for a roles file's.
+    trust: Vector<u8>;
 }
 
 /// The most role sets a server takes in its life: the first, and a reload for each of the others.
@@ -91,6 +93,7 @@ fn nextRoles(old: Slice<StsRole>, fresh: Slice<StsRole>) -> Result<Vector<StsRol
                     maxSeconds: fresh[j].maxSeconds,
                     policy: clonePolicy(borrow fresh[j].policy)?,
                     removed: false,
+                    trust: copyBytes(fresh[j].trust.view())?,
                 })?;
             }
             null => {
@@ -99,6 +102,7 @@ fn nextRoles(old: Slice<StsRole>, fresh: Slice<StsRole>) -> Result<Vector<StsRol
                     maxSeconds: old[i].maxSeconds,
                     policy: clonePolicy(borrow old[i].policy)?,
                     removed: true,
+                    trust: copyBytes(old[i].trust.view())?,
                 })?;
             }
         }
@@ -114,6 +118,7 @@ fn nextRoles(old: Slice<StsRole>, fresh: Slice<StsRole>) -> Result<Vector<StsRol
             maxSeconds: fresh[j].maxSeconds,
             policy: clonePolicy(borrow fresh[j].policy)?,
             removed: false,
+            trust: copyBytes(fresh[j].trust.view())?,
         })?;
     }
     return Ok(out);
@@ -305,7 +310,9 @@ fn parseRolesFile(text: Slice<u8>) -> Result<Vector<StsRole>, RolesFault> {
             Ok(n) => n,
             Err(_) => { return Err(RolesFault.OutOfMemory); }
         };
-        if (out.push(StsRole { name: named, maxSeconds: seconds, policy: policy, removed: false }).isErr()) {
+        if (out.push(
+            StsRole { name: named, maxSeconds: seconds, policy: policy, removed: false, trust: Vector<u8>.create() },
+        ).isErr()) {
             return Err(RolesFault.OutOfMemory);
         }
     }
@@ -536,6 +543,24 @@ async fn serveSts(
                 );
             }
         };
+        // An IAM API role's trust policy lets the caller, too (ADR-0104 §7): the account, or the user by its ARN.
+        let rolesNow = app.roles.get().view();
+        let trust = rolesNow[role].trust.view();
+        if (trust.length > 0) {
+            let callerUser = match (userOfRequester(credentials, borrow assumer)) {
+                Some(c) => Some(copyBytes(c.user.view())?),
+                null => null,
+            };
+            if (!trustAllows(trust, callerUser.asBorrow())?) {
+                return await stsError(
+                    exchange,
+                    403,
+                    "AccessDenied",
+                    "The role's trust policy does not let the caller assume it.",
+                    requestId,
+                );
+            }
+        }
         session.role.extend(name)?;
         maxSeconds = app.roles.get().view()[role].maxSeconds;
         seconds = 3600;

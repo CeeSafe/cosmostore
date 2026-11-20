@@ -865,6 +865,26 @@ aws iam delete-access-key --user-name dev --access-key-id "$devid" > /dev/null 2
 aws iam delete-user-policy --user-name dev --policy-name list-smoke > /dev/null 2>&1
 aws iam delete-user --user-name dev > /dev/null 2>&1 && pass "iam delete-user" || fail "iam delete-user"
 check "gone" "$(code iam get-user --user-name dev)" NoSuchEntity
+# IAM roles (ADR-0104 §1, §7): one made with a trust policy naming the account, given a policy, assumed through STS
+# within a round; one whose trust names someone else, not assumed; a roles file's name not made again.
+trustroot='{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:root"},"Action":"sts:AssumeRole"}}'
+check "iam create-role" "$(aws iam create-role --role-name deployer --assume-role-policy-document "$trustroot" --query Role.RoleName --output text 2>&1)" deployer
+check "a roles file's name not made again" "$(code iam create-role --role-name reader --assume-role-policy-document "$trustroot")" EntityAlreadyExists
+aws iam put-role-policy --role-name deployer --policy-name list --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::smoke"}}' > /dev/null 2>&1 && pass "iam put-role-policy" || fail "iam put-role-policy"
+check "its trust read back" "$(aws iam get-role --role-name deployer --query 'Role.AssumeRolePolicyDocument.Statement.Principal.AWS' --output text 2>&1)" "arn:aws:iam::000000000000:root"
+aws iam create-role --role-name locked --assume-role-policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/nobody"},"Action":"sts:AssumeRole"}}' > /dev/null 2>&1
+sleep 3
+rolecreds=$(aws sts assume-role --role-arn arn:aws:iam::000000000000:role/deployer --role-session-name smoke --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)
+check "an IAM role assumed" "$(echo "$rolecreds" | cut -c1-4)" ASIA
+asrole() { ( export AWS_ACCESS_KEY_ID="$(echo "$rolecreds" | cut -f1)" AWS_SECRET_ACCESS_KEY="$(echo "$rolecreds" | cut -f2)" AWS_SESSION_TOKEN="$(echo "$rolecreds" | cut -f3)"; "$@" ); }
+check "its session lists what its policy allows" "$(asrole aws s3api list-objects-v2 --bucket smoke --max-keys 1 --query KeyCount --output text 2>&1)" 1
+check "and no more" "$(asrole code s3api put-object --bucket smoke --key role.txt --body sse.txt)" AccessDenied
+check "a role whose trust names someone else" "$(code sts assume-role --role-arn arn:aws:iam::000000000000:role/locked --role-session-name smoke)" AccessDenied
+check "a role with a policy is not deleted" "$(code iam delete-role --role-name deployer)" DeleteConflict
+aws iam delete-role-policy --role-name deployer --policy-name list > /dev/null 2>&1
+aws iam delete-role --role-name deployer > /dev/null 2>&1 && pass "iam delete-role" || fail "iam delete-role"
+aws iam delete-role --role-name locked > /dev/null 2>&1
+check "the roles gone" "$(aws iam list-roles --query 'length(Roles)' --output text 2>&1)" 0
 # The records' hidden bucket is no client's (ADR-0104 §3).
 check "the IAM bucket refused to S3" "$(code s3api list-objects-v2 --bucket _cosmostore-iam)" InvalidBucketName
 check "and never listed" "$(aws s3api list-buckets --query 'Buckets[?starts_with(Name, `_`)].Name' --output text 2>&1)" ""

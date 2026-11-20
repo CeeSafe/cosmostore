@@ -106,6 +106,11 @@ enum IamCall {
     /// A user's policy, by name, and its document.
     PutUserPolicy(Vector<u8>, Vector<u8>, Vector<u8>),
     DeleteUserPolicy(Vector<u8>, Vector<u8>),
+    /// A role, its trust policy, and its sessions' longest (MaxSessionDuration).
+    CreateRole(Vector<u8>, Vector<u8>, u64),
+    DeleteRole(Vector<u8>),
+    PutRolePolicy(Vector<u8>, Vector<u8>, Vector<u8>),
+    DeleteRolePolicy(Vector<u8>, Vector<u8>),
 }
 
 /// What a change came to.
@@ -127,6 +132,13 @@ fn namedIn(names: Slice<Vector<u8>>, name: Slice<u8>) -> bool {
         if (sameNameIgnoringCase(names[i].view(), name)) { return true; }
     }
     return false;
+}
+
+fn roleAtIam(state: borrow IamState, name: Slice<u8>) -> usize? {
+    for (i in 0..state.roles.length) {
+        if (sameNameIgnoringCase(state.roles[i].name.view(), name)) { return Some(i); }
+    }
+    return null;
 }
 
 fn userAt(state: borrow IamState, name: Slice<u8>) -> usize? {
@@ -169,6 +181,7 @@ fn applyIamCall(
     store: borrow mut ObjectStore,
     call: borrow IamCall,
     fileNames: Slice<Vector<u8>>,
+    fileRoles: Slice<Vector<u8>>,
     nowMs: i64,
 ) -> Result<IamOutcome, StoreError> {
     let snapshot = iamSnapshotOf(store) ?? { return Err(StoreError.DataCorrupt); };
@@ -273,6 +286,48 @@ fn applyIamCall(
             }
             let _ = state.users[u].policies.remove(at ?? { return Ok(IamOutcome.NoSuchEntity); });
         }
+        IamCall.CreateRole(name, trust, seconds) => {
+            if (roleAtIam(borrow state, name.view()).isSome() || namedIn(fileRoles, name.view())) {
+                return Ok(IamOutcome.EntityAlreadyExists);
+            }
+            // A trust policy is a policy document with statements (checked at AssumeRole, ADR-0104 §7).
+            let doc = parseJson(trust.view())? ?? { return Ok(IamOutcome.MalformedPolicyDocument); };
+            if (jsonMember(borrow doc, "Statement").isNull()) { return Ok(IamOutcome.MalformedPolicyDocument); }
+            var id = copyBytes("AROA".bytes())?;
+            if (!randomText(mut id, 17, IAM_ID_CHARS)?) { return Err(StoreError.DataCorrupt); }
+            state.roles.push(IamRole {
+                name: copyBytes(name.view())?,
+                id: id,
+                createdMs: nowMs,
+                trust: copyBytes(trust.view())?,
+                policies: Vector<IamPolicy>.create(),
+                maxSeconds: *seconds,
+            })?;
+        }
+        IamCall.DeleteRole(name) => {
+            let r = roleAtIam(borrow state, name.view()) ?? { return Ok(IamOutcome.NoSuchEntity); };
+            if (state.roles[r].policies.length > 0) { return Ok(IamOutcome.DeleteConflict); }
+            let _ = state.roles.remove(r);
+        }
+        IamCall.PutRolePolicy(name, policy, text) => {
+            let r = roleAtIam(borrow state, name.view()) ?? { return Ok(IamOutcome.NoSuchEntity); };
+            match (parseIdentityPolicy(text.view())) {
+                Ok(_) => {}
+                Err(S3Fail.OutOfMemory(e)) => { return Err(StoreError.OutOfMemory(e)); }
+                Err(_) => { return Ok(IamOutcome.MalformedPolicyDocument); }
+            }
+            // One inline policy a role (ADR-0104 §1): a new name replaces the one it had.
+            state.roles[r].policies.clear();
+            state.roles[r].policies.push(IamPolicy { name: copyBytes(policy.view())?, text: copyBytes(text.view())? })?;
+        }
+        IamCall.DeleteRolePolicy(name, policy) => {
+            let r = roleAtIam(borrow state, name.view()) ?? { return Ok(IamOutcome.NoSuchEntity); };
+            var at: usize? = null;
+            for (p in 0..state.roles[r].policies.length) {
+                if (state.roles[r].policies[p].name.view() == policy.view()) { at = Some(p); }
+            }
+            let _ = state.roles[r].policies.remove(at ?? { return Ok(IamOutcome.NoSuchEntity); });
+        }
     }
     let bytes = encodeIamState(borrow state)?;
     if (!store.bucketExists(IAM_BUCKET)?) { store.createBucket(IAM_BUCKET)?; }
@@ -372,18 +427,9 @@ async fn serveIam(
     let action = formText(body.view(), "Action")?;
     let target = formText(body.view(), "UserName")?;
     let known = [
-        "CreateUser",
-        "GetUser",
-        "ListUsers",
-        "DeleteUser",
-        "CreateAccessKey",
-        "ListAccessKeys",
-        "UpdateAccessKey",
-        "DeleteAccessKey",
-        "PutUserPolicy",
-        "GetUserPolicy",
-        "ListUserPolicies",
-        "DeleteUserPolicy",
+        "CreateUser", "GetUser", "ListUsers", "DeleteUser", "CreateAccessKey", "ListAccessKeys", "UpdateAccessKey",
+        "DeleteAccessKey", "PutUserPolicy", "GetUserPolicy", "ListUserPolicies", "DeleteUserPolicy", "CreateRole",
+        "GetRole", "ListRoles", "DeleteRole", "PutRolePolicy", "GetRolePolicy", "DeleteRolePolicy",
     ];
     var taken = false;
     for (k in known) {
@@ -399,14 +445,19 @@ async fn serveIam(
         Some(c) => Some(copyBytes(c.user.view())?),
         null => null,
     };
-    let aboutName = if (target.length > 0) target.view() else match (borrow callerUser) {
-        Some(n) => n.view(),
-        null => "*".bytes(),
-    };
+    // A role's call is about the role it names (`iam:role/<name>`), a user's about the user.
+    let roleCall = action.view() == "ListRoles".bytes() || action.view().endsWith("Role".bytes()) ||
+        action.view().endsWith("RolePolicy".bytes());
+    let roleName = formText(body.view(), "RoleName")?;
+    let aboutName = if (roleCall) (if (roleName.length > 0) roleName.view() else "*".bytes())
+        else if (target.length > 0) target.view() else match (borrow callerUser) {
+            Some(n) => n.view(),
+            null => "*".bytes(),
+        };
     if (callerUser.isSome()) {
         var iamAction = copyBytes("iam:".bytes())?;
         iamAction.extend(action.view())?;
-        var resource = copyBytes("iam:user/".bytes())?;
+        var resource = copyBytes(if (roleCall) "iam:role/".bytes() else "iam:user/".bytes())?;
         resource.extend(aboutName)?;
         if (!sessionAllows(app, req, borrow who, StringView.fromUtf8(iamAction.view()) ?? "", resource.view())?) {
             return await iamError(
@@ -420,6 +471,7 @@ async fn serveIam(
     }
     let name = copyBytes(aboutName)?;
     let a = action.view();
+    if (roleCall) { return await serveIamRole(app, exchange, a, name.view(), body.view(), requestId); }
     // The reads.
     if (a == "GetUser".bytes() ||
         a == "ListUsers".bytes() || a == "ListAccessKeys".bytes() || a == "GetUserPolicy".bytes() ||
@@ -479,7 +531,9 @@ async fn serveIam(
         let nowMs = Clock.unixMillis();
         let c = borrow call;
         let n = names.view();
-        outcome = match (await Async.blocking(() => applyIamCall(store, c, n, nowMs))) {
+        let none = Vector<Vector<u8>>.create();
+        let noRoles = none.view();
+        outcome = match (await Async.blocking(() => applyIamCall(store, c, n, noRoles, nowMs))) {
             Ok(o) => o,
             Err(e) => { return Err(storeFail(e, 0)); }
         };
@@ -682,4 +736,208 @@ async fn iamRead(
         xmlTextElement(mut result, "PolicyDocument", encoded.view())?;
     }
     return await iamAnswer(exchange, action, result.view(), requestId);
+}
+
+// ---- Roles (ADR-0104 §1, §7) ----
+
+/// The roles the roles file holds, from the role set as it is now: not the API's.
+fn fileRolesOf(roles: Slice<StsRole>, state: borrow IamState) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    for (i in 0..roles.length) {
+        if (roles[i].removed || roleAtIam(state, roles[i].name.view()).isSome()) { continue; }
+        out.push(copyBytes(roles[i].name.view())?)?;
+    }
+    return Ok(out);
+}
+
+/// `<Role>…</Role>`'s inside.
+fn appendRole(out: borrow mut Vector<u8>, r: borrow IamRole) -> Result<void, AllocError> {
+    out.extend("<Path>/</Path>".bytes())?;
+    xmlTextElement(out, "RoleName", r.name.view())?;
+    xmlTextElement(out, "RoleId", r.id.view())?;
+    out.extend("<Arn>".bytes())?;
+    out.extend(IAM_ACCOUNT_ARN.bytes())?;
+    out.extend("role/".bytes())?;
+    appendXmlEscaped(out, r.name.view())?;
+    out.extend("</Arn><CreateDate>".bytes())?;
+    appendIso8601(out, r.createdMs)?;
+    out.extend("</CreateDate>".bytes())?;
+    var encoded = Vector<u8>.create();
+    appendUriEncoded(mut encoded, r.trust.view(), false)?;
+    xmlTextElement(out, "AssumeRolePolicyDocument", encoded.view())?;
+    out.extend("<MaxSessionDuration>".bytes())?;
+    appendDecimal(out, r.maxSeconds)?;
+    out.extend("</MaxSessionDuration>".bytes())?;
+    return Ok();
+}
+
+/// A role's call, decided already: the reads (GetRole, ListRoles, GetRolePolicy) from the record, the changes through
+/// `applyIamCall`.
+async fn serveIamRole(
+    app: borrow S3App,
+    exchange: borrow mut Exchange,
+    a: Slice<u8>,
+    name: Slice<u8>,
+    body: Slice<u8>,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    let snapshot = await readIamSnapshot(borrow app.store) ?? {
+        return await iamError(exchange, 500, "ServiceFailure", "The IAM records do not read.", requestId);
+    };
+    var result = Vector<u8>.create();
+    if (a == "ListRoles".bytes()) {
+        result.extend("<IsTruncated>false</IsTruncated><Roles>".bytes())?;
+        for (i in 0..snapshot.state.roles.length) {
+            result.extend("<member>".bytes())?;
+            appendRole(mut result, borrow snapshot.state.roles[i])?;
+            result.extend("</member>".bytes())?;
+        }
+        result.extend("</Roles>".bytes())?;
+        return await iamAnswer(exchange, a, result.view(), requestId);
+    }
+    if (!roleNameOk(name) || name == "*".bytes()) {
+        return await iamError(exchange, 400, "ValidationError", "RoleName is 1 to 64 of \\w+=,.@-.", requestId);
+    }
+    if (a == "GetRole".bytes() || a == "GetRolePolicy".bytes()) {
+        let r = roleAtIam(borrow snapshot.state, name) ?? {
+            return await iamError(
+                exchange,
+                404,
+                "NoSuchEntity",
+                "The role with the name given cannot be found.",
+                requestId,
+            );
+        };
+        let role = borrow snapshot.state.roles[r];
+        if (a == "GetRole".bytes()) {
+            result.extend("<Role>".bytes())?;
+            appendRole(mut result, role)?;
+            result.extend("</Role>".bytes())?;
+        } else {
+            let policyName = formText(body, "PolicyName")?;
+            var found: usize? = null;
+            for (p in 0..role.policies.length) {
+                if (role.policies[p].name.view() == policyName.view()) { found = Some(p); }
+            }
+            let p = found ?? {
+                return await iamError(
+                    exchange,
+                    404,
+                    "NoSuchEntity",
+                    "The role has no policy with this name.",
+                    requestId,
+                );
+            };
+            xmlTextElement(mut result, "RoleName", role.name.view())?;
+            xmlTextElement(mut result, "PolicyName", role.policies[p].name.view())?;
+            var encoded = Vector<u8>.create();
+            appendUriEncoded(mut encoded, role.policies[p].text.view(), false)?;
+            xmlTextElement(mut result, "PolicyDocument", encoded.view())?;
+        }
+        return await iamAnswer(exchange, a, result.view(), requestId);
+    }
+    let owned = copyBytes(name)?;
+    let call = if (a == "CreateRole".bytes()) {
+        let trust = formText(body, "AssumeRolePolicyDocument")?;
+        let given = formText(body, "MaxSessionDuration")?;
+        var seconds: u64 = 3600;
+        if (given.length > 0) {
+            seconds = parseDecimal(given.view()) ?? 0;
+            if (seconds < 3600 || seconds > 43200) {
+                return await iamError(
+                    exchange,
+                    400,
+                    "ValidationError",
+                    "MaxSessionDuration is 3600 to 43200.",
+                    requestId,
+                );
+            }
+        }
+        IamCall.CreateRole(owned, trust, seconds)
+    } else if (a == "DeleteRole".bytes()) IamCall.DeleteRole(owned)
+        else if (a == "PutRolePolicy".bytes()) IamCall.PutRolePolicy(
+            owned,
+            formText(body, "PolicyName")?,
+            formText(body, "PolicyDocument")?,
+        )
+        else IamCall.DeleteRolePolicy(owned, formText(body, "PolicyName")?);
+    let fileRoles = fileRolesOf(app.roles.get().view(), borrow snapshot.state)?;
+    var outcome = IamOutcome.Conflict;
+    for (attempt in 0..3) {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let nowMs = Clock.unixMillis();
+        let c = borrow call;
+        let none = Vector<Vector<u8>>.create();
+        let users = none.view();
+        let roles = fileRoles.view();
+        outcome = match (await Async.blocking(() => applyIamCall(store, c, users, roles, nowMs))) {
+            Ok(o) => o,
+            Err(e) => { return Err(storeFail(e, 0)); }
+        };
+        match (outcome) {
+            IamOutcome.Conflict => {}
+            _ => { break; }
+        }
+    }
+    return match (outcome) {
+        IamOutcome.Done(_, _) => {
+            if (a == "CreateRole".bytes()) {
+                let after = await readIamSnapshot(borrow app.store) ?? {
+                    return await iamAnswer(exchange, a, "".bytes(), requestId);
+                };
+                match (roleAtIam(borrow after.state, name)) {
+                    Some(r) => {
+                        result.extend("<Role>".bytes())?;
+                        appendRole(mut result, borrow after.state.roles[r])?;
+                        result.extend("</Role>".bytes())?;
+                    }
+                    null => {}
+                }
+            }
+            await iamAnswer(exchange, a, result.view(), requestId)
+        },
+        IamOutcome.NoSuchEntity => await iamError(
+            exchange,
+            404,
+            "NoSuchEntity",
+            "The role or policy named is not the API's.",
+            requestId,
+        ),
+        IamOutcome.EntityAlreadyExists => await iamError(
+            exchange,
+            409,
+            "EntityAlreadyExists",
+            "A role with this name already exists.",
+            requestId,
+        ),
+        IamOutcome.LimitExceeded => await iamError(
+            exchange,
+            409,
+            "LimitExceeded",
+            "Cannot exceed the quota for this role.",
+            requestId,
+        ),
+        IamOutcome.DeleteConflict => await iamError(
+            exchange,
+            409,
+            "DeleteConflict",
+            "Delete the role's policy first.",
+            requestId,
+        ),
+        IamOutcome.MalformedPolicyDocument => await iamError(
+            exchange,
+            400,
+            "MalformedPolicyDocument",
+            "The policy document is not one taken here.",
+            requestId,
+        ),
+        IamOutcome.Conflict => await iamError(
+            exchange,
+            409,
+            "ConcurrentModification",
+            "The IAM records changed meanwhile; try again.",
+            requestId,
+        ),
+    };
 }

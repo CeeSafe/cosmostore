@@ -342,8 +342,83 @@ fn withIamRoles(
             Err(_) => { continue; } // checked when it was put: a record that does not parse is left out
         };
         out.push(
-            StsRole { name: copyBytes(role.name.view())?, maxSeconds: role.maxSeconds, policy: policy, removed: false },
+            StsRole {
+                name: copyBytes(role.name.view())?,
+                maxSeconds: role.maxSeconds,
+                policy: policy,
+                removed: false,
+                trust: copyBytes(role.trust.view())?,
+            },
         )?;
     }
     return Ok(out);
+}
+
+// ---- Trust policies (ADR-0104 §7) ----
+
+/// Whether a JSON value is, or is an array holding, a text one of `wanted` matches.
+fn jsonNames(v: borrow Json, wanted: Slice<Vector<u8>>) -> bool {
+    match (v) {
+        Json.Text(t) => {
+            for (w in 0..wanted.length) {
+                if (t.view() == wanted[w].view()) { return true; }
+            }
+            return false;
+        }
+        Json.Array(items) => {
+            for (i in 0..items.length) {
+                if (jsonNames(borrow items[i], wanted)) { return true; }
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+}
+
+/// Whether a role's trust policy lets the caller assume it: the account (its keys: `user` none), or the user named.
+/// A statement counts when its action covers `sts:AssumeRole` and its `AWS` principal names `*`, the account (its id or
+/// `root`), or the user's ARN; a Deny that counts wins.
+fn trustAllows(trust: Slice<u8>, user: borrow Vector<u8>?) -> Result<bool, AllocError> {
+    let doc = parseJson(trust)? ?? { return Ok(false); };
+    var principals = Vector<Vector<u8>>.create();
+    principals.push(copyBytes("*".bytes())?)?;
+    principals.push(copyBytes("000000000000".bytes())?)?;
+    principals.push(copyBytes("arn:aws:iam::000000000000:root".bytes())?)?;
+    match (user) {
+        Some(u) => {
+            var arn = copyBytes("arn:aws:iam::000000000000:user/".bytes())?;
+            arn.extend(u.view())?;
+            principals.push(arn)?;
+        }
+        null => {}
+    }
+    var actions = Vector<Vector<u8>>.create();
+    for (a in ["*", "sts:*", "sts:AssumeRole"]) { actions.push(copyBytes(a.bytes())?)?; }
+    let statement = jsonMember(borrow doc, "Statement") ?? { return Ok(false); };
+    var list = Vector<Json>.create();
+    match (statement) {
+        Json.Array(items) => {
+            for (i in 0..items.length) { list.push(cloneJson(borrow items[i])?)?; }
+        }
+        _ => { list.push(cloneJson(statement)?)?; }
+    }
+    var allowed = false;
+    for (i in 0..list.length) {
+        let s = borrow list[i];
+        let action = jsonMember(s, "Action") ?? { continue; };
+        if (!jsonNames(action, actions.view())) { continue; }
+        let principal = jsonMember(s, "Principal") ?? { continue; };
+        let names = match (principal) {
+            Json.Text(_) => jsonNames(principal, principals.view()), // "Principal": "*"
+            _ => match (jsonMember(principal, "AWS")) {
+                Some(aws) => jsonNames(aws, principals.view()),
+                null => false,
+            },
+        };
+        if (!names) { continue; }
+        let effect = jsonMemberText(s, "Effect") ?? "".bytes();
+        if (effect == "Deny".bytes()) { return Ok(false); }
+        if (effect == "Allow".bytes()) { allowed = true; }
+    }
+    return Ok(allowed);
 }
