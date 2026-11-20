@@ -1,6 +1,7 @@
 # ADR-0095: M15, what comes after configurations decided at delivery (proposed)
 
-**Status:** proposed, 20 Nov 2026. The owner: "propose M15". M14 (configurations decided at delivery, ADR-0094)
+**Status:** decided, 20 Nov 2026: the owner chose A ("A: no restarts"), a reload that would remove a needed
+master key refused; ADR-0096 designs it. Proposed the same day. The owner: "propose M15". M14 (configurations decided at delivery, ADR-0094)
 closed the same day.
 
 ## Context

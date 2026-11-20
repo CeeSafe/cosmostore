@@ -312,6 +312,16 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 **Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
 (ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
+### M15: Operations without restarts
+
+The owner chose ADR-0095's item A (20 Nov 2026), a reload that would remove a needed master key refused. ADR-0096
+(proposed) designs it:
+- **Reloads:** the roles, STS, SSE-S3 and KMS key, and target files reload when they change, each role, key and
+  target keeping its place.
+- **Master keys:** one added seals new objects at once; one stored versions still need cannot be removed.
+- **Done when** a role removed, a master key added and a target changed take effect without a restart, on `serve`
+  and on every node, and `cluster-status` shows a node whose files differ.
+
 ### M14: Configurations decided at delivery
 
 **Closed 20 Nov 2026** (the owner: "Accept and close"; `docs/m14-exit-review.md`).
@@ -3927,3 +3937,14 @@ Browser form uploads with a SigV4 POST policy.
   - **C, compaction for S3 Tables.**
 - **Why A:** a role removed, or a master key rotated, still takes a restart, of every node on a cluster.
 - **Next:** the owner's choice.
+
+### 20 Nov 2026: M15 is operations without restarts (ADR-0096, proposed)
+
+- **The owner:** "A: no restarts", and a needed master key's removal refused.
+- **ADR-0096's slices:**
+  1. a reloadable set with stable places, and the roles on it;
+  2. the key files;
+  3. the target files;
+  4. the cluster's digests;
+  5. the exit review.
+- **Next:** slice 1.
