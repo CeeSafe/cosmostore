@@ -1,6 +1,7 @@
 # ADR-0099: M17, what comes after compaction for S3 Tables (proposed)
 
-**Status:** proposed, 20 Nov 2026. The owner: "propose M17". M16 (compaction for S3 Tables, ADR-0098) closed the
+**Status:** decided, 20 Nov 2026: the owner chose A ("A: key rotation"), a cluster's removal taken by asking the
+leaders; ADR-0100 designs it. Proposed the same day. The owner: "propose M17". M16 (compaction for S3 Tables, ADR-0098) closed the
 same day.
 
 ## Context

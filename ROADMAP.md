@@ -312,6 +312,17 @@ The owner: "Next we need s3 tables iceberg" (19 Nov 2026). ADR-0083 (accepted 19
 **Closed 19 Nov 2026** (`docs/m9-exit-review.md`): S3 Tables and the Iceberg REST catalog on `serve` and on a cluster
 (ADR-0083), with the exit review's findings closed, and table bucket and table policies (ADR-0084).
 
+### M17: Key rotation without re-sealing
+
+The owner chose ADR-0099's item A (20 Nov 2026), a cluster's removal taken by asking the shards' leaders. ADR-0100
+(proposed) designs it:
+- **Re-wrap:** versions under an SSE-S3 key that is not first are re-wrapped under the first, a batch per round. A
+  metadata-only record moves the envelope; the bytes, version ids and ETags stay.
+- **Counts:** each key's versions are counted as the index changes, so a removal needs no walk. A cluster takes a
+  removal once every shard's leader counts none.
+- **Done when** a key is rotated and its old key removed without a restart or a re-seal, on `serve` and on a
+  cluster.
+
 ### M16: Compaction for S3 Tables
 
 **Closed 20 Nov 2026** (the owner: "yes, close M16"; `docs/m16-exit-review.md`).
@@ -4191,3 +4202,14 @@ Browser form uploads with a SigV4 POST policy.
   - **C:** compaction that re-encodes (zstd and snappy in CeeSafe, merged row groups, deletes applied).
 - **For A, the owner decides how a cluster takes a removal:** asked of the leaders (recommended), or two-phase
   through every shard's log.
+
+### 20 Nov 2026: M17 is key rotation without re-sealing (ADR-0100, proposed)
+
+- **The owner:** "A: key rotation", and "Ask the leaders" for a cluster's removal.
+- **ADR-0100 (proposed):**
+  - per-key counts kept in the version index;
+  - SetTags format 5 re-wraps an SSE-S3 envelope;
+  - an upkeep pass re-wraps under the first key;
+  - a cluster's leaders re-wrap, and a node takes a removal when every leader counts none;
+  - key bytes wiped from atomic cells.
+- **Next:** slice 1, the counts.
