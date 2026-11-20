@@ -3917,3 +3917,13 @@ Browser form uploads with a SigV4 POST policy.
 - **No downgrade past M14** once it has written them: replication rules v3, inventory and logging v2, and outbox
   events with requesters in checkpoints.
 - **Next:** M15, when the owner asks for one.
+
+### 20 Nov 2026: M15 proposed (ADR-0095)
+
+- **The owner:** "propose M15". ADR-0095 (proposed) gives three candidates, one to be M15:
+  - **A, operations without restarts** (recommended): the roles, STS, SSE and KMS key, and target files reloaded
+    as the credentials are, and a cluster's nodes' file digests compared.
+  - **B, archive storage classes:** GLACIER and DEEP_ARCHIVE, with RestoreObject modelled.
+  - **C, compaction for S3 Tables.**
+- **Why A:** a role removed, or a master key rotated, still takes a restart, of every node on a cluster.
+- **Next:** the owner's choice.
