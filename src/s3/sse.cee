@@ -589,6 +589,9 @@ struct KeyBytes {
 /// wiped when it is dropped.
 struct MasterKey {
     id: Vector<u8>;
+    /// Being removed (ADR-0106 §1.1): it opens what it sealed, but seals nothing new, so a cluster's count of what
+    /// it sealed reaches 0 and stays there. Only a node's KMS keys are retired.
+    retiring: bool;
     private c0: AtomicU64;
     private c1: AtomicU64;
     private c2: AtomicU64;
@@ -597,6 +600,7 @@ struct MasterKey {
     /// A key of `raw`'s 32 bytes.
     fn create(id: Vector<u8>, raw: Slice<u8>) -> MasterKey => MasterKey {
         id: id,
+        retiring: false,
         c0: AtomicU64.create(raw.readLE<u64>(0)),
         c1: AtomicU64.create(raw.readLE<u64>(8)),
         c2: AtomicU64.create(raw.readLE<u64>(16)),
@@ -704,9 +708,51 @@ fn sealKeyHeld(sse: Slice<MasterKey>, kms: Slice<MasterKey>, metadata: Slice<u8>
     let id = field[head..end];
     let keys = if (kmsEnvelope) kms else sse;
     for (i in 0..keys.length) {
-        if (keys[i].id.view() == id) { return true; }
+        // A retiring key's envelope does not commit: nothing new is sealed under it once it retires (ADR-0106 §1.1).
+        if (keys[i].id.view() == id) { return !keys[i].retiring; }
     }
     return false;
+}
+
+/// `keys`, with those whose ids are in `ids` marked retiring, and then `fresh`'s keys whose ids `keys` does not
+/// hold (ADR-0106 §1.1): the set a node takes before it counts what the cluster sealed under `ids`. Made at its full
+/// size, so no buffer is left behind as it grows (§1.3).
+fn retiringSet(
+    keys: Slice<MasterKey>,
+    ids: Slice<Vector<u8>>,
+    fresh: Slice<MasterKey>,
+) -> Result<Vector<MasterKey>, AllocError> {
+    var out = Vector<MasterKey>.create();
+    out.reserve(keys.length + fresh.length)?;
+    for (i in 0..keys.length) {
+        let m = keys[i].material();
+        var k = MasterKey.create(copyBytes(keys[i].id.view())?, m.b[..]);
+        k.retiring = keys[i].retiring;
+        for (d in 0..ids.length) {
+            if (ids[d].view() == keys[i].id.view()) { k.retiring = true; }
+        }
+        out.push(k)?;
+    }
+    for (j in 0..fresh.length) {
+        var held = false;
+        for (i in 0..keys.length) {
+            if (keys[i].id.view() == fresh[j].id.view()) { held = true; }
+        }
+        if (held) { continue; }
+        let m = fresh[j].material();
+        out.push(MasterKey.create(copyBytes(fresh[j].id.view())?, m.b[..]))?;
+    }
+    return Ok(out);
+}
+
+/// Whether every key of `ids` is marked retiring in `keys`, or is not there.
+fn allRetiring(keys: Slice<MasterKey>, ids: Slice<Vector<u8>>) -> bool {
+    for (d in 0..ids.length) {
+        for (i in 0..keys.length) {
+            if (keys[i].id.view() == ids[d].view() && !keys[i].retiring) { return false; }
+        }
+    }
+    return true;
 }
 
 /// A key set, shared: empty when its file is not given.
@@ -1139,11 +1185,14 @@ fn newKmsSeal(kmsKeys: Slice<MasterKey>, name: borrow KmsKeyName) -> Result<NewS
     if (kmsKeys.length == 0) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
     let context = name.context.view();
     if (name.length == 0) {
+        if (kmsKeys[0].retiring) { return Err(S3Fail.Code(S3Code.KmsInvalidState)); }
         let m = kmsKeys[0].material();
         return newSealWith(borrow m.b, false, true, kmsKeys[0].id.view(), context);
     }
     for (i in 0..kmsKeys.length) {
         if (kmsKeys[i].id.view() == name.view()) {
+            // A key being removed seals nothing new, as AWS's key pending deletion (ADR-0106 §1.1).
+            if (kmsKeys[i].retiring) { return Err(S3Fail.Code(S3Code.KmsInvalidState)); }
             let m = kmsKeys[i].material();
             return newSealWith(borrow m.b, false, true, kmsKeys[i].id.view(), context);
         }

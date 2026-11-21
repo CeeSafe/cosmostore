@@ -4604,3 +4604,24 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     B5, old sets, and lib/std's key schedule.
   - **Seven slices.**
 - **Next:** slice 1, the sealed writes.
+
+### 21 Nov 2026: M20 slice 1, sealed writes (ADR-0106 §1.1, §1.2)
+
+- **A KMS key's removal on a cluster retires it first** (M17 B4, the owner's choice: "Retire, then count").
+  - **What a node does:** it marks the key retiring in its set, which opens what the key sealed but seals nothing new.
+  - **What a request sees:** a write naming the key, or taking it as the default, answers
+    KMS.KMSInvalidStateException (400). Nothing sealed under it commits after.
+  - **The status line:** `# keys kms` names it `<id>:<tag>:retiring`.
+  - **The count:** it waits until every node has the key retiring or gone, so a 0 stays 0.
+  - **Putting the key back in the file** takes it out of retiring at the next reload.
+- **A local replica's commit checks its key** (M15 B3), as every sealed write does. If the key is retiring or
+  removed, the replica is refused and logged, and the source keeps what it holds.
+- **Key sets made at their full size** (part of §1.3): `copyKeys` and the retiring set reserve their length first.
+- **Tests:**
+  - a unit test of retiring;
+  - the cluster smoke retires `orders` with an object under it: refused on every node, the object read, the
+    removal waiting, then taken once the object is re-sealed (206);
+  - the S3 smoke, the SDK matrix, and 422 unit tests pass.
+- **Not raced:** a source deleted between a count and its replica's copy is checked by reading only. Forcing it
+  would need a fault hook.
+- **Next:** slice 2, key bytes.

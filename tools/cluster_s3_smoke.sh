@@ -629,6 +629,28 @@ pause 4
 # Not taken: every node has sse2 first, so it waits (and, were it not, versions are sealed under it: refused).
 check "the key in use removed: the running nodes do not take it" "$(running "SSE key file reload waits: .*node has the key first\|SSE key file reload waits: [0-9]* versions.*(sse2)")" 1
 cp sse.keys.sse2 sse.keys
+# A KMS key's removal retires it first (ADR-0106 §1.1): every node seals nothing new under it, while what it sealed
+# still reads; the removal is taken once nothing is under it, and then the key is not known.
+kmscode() { on "$@" 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9.]*\)).*/\1/p' | head -1; }
+on "$survivor" s3api create-bucket --bucket retire > /dev/null 2>&1
+check "an SSE-KMS object under orders" "$(on "$survivor" s3api put-object --bucket retire --key a --body rotate.txt --server-side-encryption aws:kms --ssekms-key-id orders --query SSEKMSKeyId --output text 2>&1)" orders
+cp kms.keys kms.keys.kept
+grep '^app-default ' kms.keys.kept > kms.keys
+for i in $(seq 1 30); do [ "$(running "KMS key file reload: orders retiring")" = 1 ] && break; pause 0.5; done
+check "orders removed from the file: the running nodes retire it" "$(running "KMS key file reload: orders retiring")" 1
+for n in 1 2 3; do
+    [ -n "${PIDS[$n]}" ] || continue
+    check "a new seal under it refused through node $n" "$(kmscode "$n" s3api put-object --bucket retire --key b --body rotate.txt --server-side-encryption aws:kms --ssekms-key-id orders)" KMS.KMSInvalidStateException
+    check "its status says it retires, node $n" "$("$BIN" cluster-status --cluster-file cluster.conf --node "$n" 2>/dev/null | grep '^# keys kms ' | grep -c 'orders:[0-9]*:retiring')" 1
+done
+check "what it sealed still reads" "$(on "$survivor" s3 cp s3://retire/a - 2>&1)" "rotated on a cluster"
+pause 6
+check "and the removal waits for it" "$(running "KMS key file reloaded: 1 keys")" 0
+on "$survivor" s3api copy-object --bucket retire --key a --copy-source retire/a --server-side-encryption aws:kms --ssekms-key-id app-default > /dev/null 2>&1
+for i in $(seq 1 60); do [ "$(running "KMS key file reloaded: 1 keys")" = 1 ] && break; pause 1; done
+check "re-sealed under another key: the running nodes take the removal" "$(running "KMS key file reloaded: 1 keys")" 1
+check "the object reads after" "$(on "$survivor" s3 cp s3://retire/a - 2>&1)" "rotated on a cluster"
+check "and orders is not known any more" "$(kmscode "$survivor" s3api put-object --bucket retire --key b --body rotate.txt --server-side-encryption aws:kms --ssekms-key-id orders)" InvalidArgument
 
 # The IAM API on a cluster (ADR-0104 §3, §4): a user made through node 1, its records in their shard; every node takes
 # them within its 2 s reload, from its own replica or a peer's.

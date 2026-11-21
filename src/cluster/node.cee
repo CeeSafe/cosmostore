@@ -829,6 +829,8 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
             if (i > 0) { line = line && out.push(',').isOk(); }
             line = line && out.extend(keys[i].id.view()).isOk() && out.push(':').isOk() &&
                 appendDecimal(mut out, keyTag(shared.secret.view(), borrow keys[i])).isOk();
+            // A KMS key being removed (ADR-0106 §1.1): a removal's count waits until every node has it so.
+            if (keys[i].retiring) { line = line && out.extend(":retiring".bytes()).isOk(); }
         }
         if (!(line && out.push(0x0A).isOk())) { return Err(NodeFault.OutOfMemory); }
     }
@@ -1234,6 +1236,23 @@ async fn clusterSealedUnder(shared: borrow NodeShared, mode: StringView, ids: Sl
                 }
                 continue;
             }
+            // A node that still seals under a dropped KMS key (it has not retired it, ADR-0106 §1.1): its count would
+            // not stay at 0.
+            if (mode == "kms" && line.startsWith("# keys kms ")) {
+                let list = StringView.fromUtf8(line.bytes()[11..]) ?? "";
+                for (entry in list.split(",")) {
+                    if (entry.length == 0) { continue; }
+                    var id = entry;
+                    match (entry.indexOf(":")) {
+                        Some(c) => { id = entry[0..c]; }
+                        null => {}
+                    }
+                    for (d in 0..ids.length) {
+                        if (id.bytes() == ids[d].view() && !entry.endsWith(":retiring")) { return null; }
+                    }
+                }
+                continue;
+            }
             if (!line.startsWith("# sealed ") || words.length < 5) { continue; }
             // `# sealed <shard> <prefix> <n>` or `# sealed <shard> kms-default <id> <n>`.
             let n = words[words.length - 1].parseInt<u64>() ?? { continue; };
@@ -1290,6 +1309,13 @@ async fn rewrapGate(shared: borrow NodeShared) -> u64 {
     return tag;
 }
 
+/// The keys `ids` marked retiring in the file's set, with `fresh`'s new keys (ADR-0106 §1.1), on a worker thread (the
+/// set's cell is a lock): 0 when taken, 1 out of memory, 2 when every cell is used.
+fn retireKeys(k: borrow KeyRotation, ids: Slice<Vector<u8>>, fresh: Slice<MasterKey>) -> u8 {
+    let retired = retiringSet(k.sets.get().view(), ids, fresh).ok() ?? { return 1; };
+    return if (k.sets.get().replace(retired)) 0 else 2;
+}
+
 /// The node's key files reloaded (ADR-0096 §3, §6). A master key may be added, but a reload that removes or changes
 /// one is refused (the M15 exit review): the node cannot count what the cluster still seals under it, since shards it
 /// holds no replica of, entries not yet applied, and other nodes reloading on their own time all escape its count. A
@@ -1308,6 +1334,34 @@ async fn reloadNodeKeysIfChanged(r: borrow mut Rotation, shared: borrow NodeShar
             }
             KeyChange.Fresh(fresh, dropped, modified) => {
                 let mode = keyFileMode(k.kind);
+                // A KMS key is retired first (ADR-0106 §1.1, the owner's choice): this node seals nothing new under
+                // it, and the count below waits until every node says the same.
+                if (mode == "kms" && dropped.length > 0 && !allRetiring(k.sets.get().view(), dropped.view())) {
+                    let ids = dropped.view();
+                    let adds = fresh.view();
+                    let taken = await Async.blocking(() => retireKeys(k, ids, adds));
+                    if (taken == 1) { continue; } // out of memory: tried again next cycle
+                    if (taken == 2) {
+                        await refuseKeys(
+                            k,
+                            modified,
+                            "the keys were reloaded too many times; restart to reload",
+                            0,
+                            borrow dropped,
+                        );
+                        continue;
+                    }
+                    var line = String.create();
+                    let _ = line.append("cosmostore: ");
+                    let _ = line.append(keyFileWhat(k.kind));
+                    let _ = line.append(" reload: ");
+                    let _ = line.append(StringView.fromUtf8(dropped[0].view()) ?? "?");
+                    let _ = line.append(
+                        " retiring, sealing nothing new; removed once the cluster holds nothing under it\n",
+                    );
+                    let _ = await AsyncConsole.writeError(line.view());
+                    continue;
+                }
                 if (mode.length > 0 && dropped.length > 0) {
                     // Every shard's leader is asked what still needs the keys dropped (ADR-0100 §4, the owner's
                     // choice); the removal is taken only when every shard answers none.

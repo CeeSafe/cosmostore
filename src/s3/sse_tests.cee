@@ -1020,3 +1020,50 @@ fn removedKeysAreWiped() -> Result<void, TestFailure> {
     Check.equalBytes(sseKeyOf("k2", 2).material().b[..], k2.b[..])?;
     return Ok();
 }
+
+/// A KMS key being removed (ADR-0106 §1.1): it opens what it sealed, but seals nothing new, by its name or as the
+/// default, and nothing sealed under it commits; the retiring set keeps it in its place and adds the file's new keys.
+@test
+fn retiringKeysSealNothingNew() -> Result<void, TestFailure> {
+    var keys = Vector<MasterKey>.create();
+    keys.push(sseKeyOf("orders", 1))!;
+    keys.push(sseKeyOf("billing", 40))!;
+    var fresh = Vector<MasterKey>.create();
+    fresh.push(sseKeyOf("billing", 40))!;
+    fresh.push(sseKeyOf("audit", 90))!;
+    var ids = Vector<Vector<u8>>.create();
+    ids.push(copyBytes("orders".bytes())!)!;
+    Check.isFalse(allRetiring(keys.view(), ids.view()), "not yet retiring")?;
+    let retired = retiringSet(keys.view(), ids.view(), fresh.view())!;
+    Check.equalU64(3, retired.length as u64)?;
+    Check.isTrue(retired[0].id.view() == "orders".bytes() && retired[0].retiring, "the key retiring, in its place")?;
+    Check.isFalse(retired[1].retiring, "the other kept as it was")?;
+    Check.isTrue(retired[2].id.view() == "audit".bytes() && !retired[2].retiring, "the file's new key added")?;
+    Check.isTrue(retired[0].sameAs(borrow keys[0]), "the same bytes: it still opens what it sealed")?;
+    Check.isTrue(allRetiring(retired.view(), ids.view()), "now retiring")?;
+    Check.isTrue(copyKeys(retired.view())![0].retiring, "a copy keeps the mark")?;
+    let none = Vector<MasterKey>.create();
+    let named = SseRequest.Kms(
+        kmsKeyNameOf("orders".bytes()) ?? KmsKeyName { length: 0, bytes: [0u8; 32], context: Vector<u8>.create() },
+    );
+    let refused = match (newSeal(none.view(), retired.view(), borrow named)) {
+        Err(S3Fail.Code(S3Code.KmsInvalidState)) => true,
+        _ => false,
+    };
+    Check.isTrue(refused, "a new seal under it refused, KMSInvalidState")?;
+    let byDefault = SseRequest.Kms(KmsKeyName { length: 0, bytes: [0u8; 32], context: Vector<u8>.create() });
+    let refusedDefault = match (newSeal(none.view(), retired.view(), borrow byDefault)) {
+        Err(S3Fail.Code(S3Code.KmsInvalidState)) => true,
+        _ => false,
+    };
+    Check.isTrue(refusedDefault, "nor as the first key")?;
+    let other = SseRequest.Kms(
+        kmsKeyNameOf("billing".bytes()) ?? KmsKeyName { length: 0, bytes: [0u8; 32], context: Vector<u8>.create() },
+    );
+    Check.isTrue(newSeal(none.view(), retired.view(), borrow other).isOk(), "another key still seals")?;
+    var meta = Vector<u8>.create();
+    metadataAdd(mut meta, SSE_FIELD.bytes(), "v1.kms.orders.00.00".bytes())!;
+    Check.isFalse(sealKeyHeld(none.view(), retired.view(), meta.view()), "nothing under it commits")?;
+    Check.isTrue(sealKeyHeld(none.view(), keys.view(), meta.view()), "as it did before it retired")?;
+    return Ok();
+}

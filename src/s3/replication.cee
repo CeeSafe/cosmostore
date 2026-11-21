@@ -408,6 +408,7 @@ async fn replicateEvent(
     e: borrow OutboxEvent,
     destination: Slice<u8>,
     decider: borrow RecordedDecider,
+    replication: borrow ReplicaContext,
 ) -> Result<bool, NetError> {
     let src = StringView.fromUtf8(e.bucket.view()) ?? "";
     let key = StringView.fromUtf8(e.key.view()) ?? "";
@@ -480,8 +481,22 @@ async fn replicateEvent(
         Err(err) => { return Err(NetErrors.fromAsync(err)); }
     };
     let t = guard.data();
-    let contentType = StringView.fromUtf8(r.info.contentType.view()) ?? "";
     let meta = r.metadata.view();
+    // The replica carries its source's envelope: checked at commit, as every sealed write is (ADR-0106 §1.2, the M15
+    // exit review's B3). A source deleted between a removal's count and this copy would otherwise leave a replica
+    // under a removed key, and one under a retiring key a replica its count no longer sees. Refused, as a
+    // destination's refusal is: the source keeps what it holds.
+    if (!sealKeyHeld(replication.sseKeys.get().view(), replication.kmsKeys.get().view(), meta)) {
+        let refused = borrow finished;
+        await Async.blocking(() => t.discardFinished(refused)); // its extents removed: on a worker thread
+        let _ = await AsyncConsole.writeError("cosmostore: a replica was refused, its key being removed: ");
+        let _ = await AsyncConsole.writeError(src);
+        let _ = await AsyncConsole.writeError("/");
+        let _ = await AsyncConsole.writeError(key);
+        let _ = await AsyncConsole.writeError("\n");
+        return Ok(true);
+    }
+    let contentType = StringView.fromUtf8(r.info.contentType.view()) ?? "";
     let extras = r.info.extras.view();
     let md5 = r.info.md5;
     let parts = r.info.parts;
