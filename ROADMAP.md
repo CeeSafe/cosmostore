@@ -4714,3 +4714,28 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     - 0196: codecs;
     - 0197: secret memory;
     - 0198: arrays of non-Copy types.
+
+### 21 Nov 2026: the toolchain moved to ceesafec 0.85.1 (CeeSafe ADRs 0194 to 0198)
+
+- **CeeSafe's side:** ADRs 0194 to 0198 were accepted (the owner: "Accept all as recommended"). 0.85.1 shipped their
+  patch, on the owner's word ("Push and tag v0.85.1"):
+  - one function per test in the harness (G36);
+  - `ceesafe_wipe` for lib/std's key holders (G43);
+  - `HmacSha256` wiping its key (G34).
+- **CosmoStore's side:**
+  - CI's `CEESAFE_VERSION` moves from v0.56.0 to v0.85.1, and `ceesafe.toml` requires 0.85.1;
+  - `ceesafec test` runs without `--cflag -fbracket-depth=1024`;
+  - CeeSafe.Web stays at ccda03a.
+- **Tests on 0.85.1** (the release's osx-arm64 build, checked against its SHA256SUMS):
+  - `check` is clean, and 427 unit tests pass with no flag;
+  - the S3 smoke, the cluster smoke (206) and the SDK matrix pass.
+- **The S3 smoke's restore checks** now use the Bulk tier (8 s here) and wait for the restore. Standard's 4 s had run
+  out before the in-progress checks on a loaded machine.
+- **Next:** CeeSafe 0.86.0, which brings:
+  - the structurer's fix;
+  - `Crc32`, `Sha1` and `OrderedMap`'s edge splits;
+  - `Secret.wipe` and `SecretHeap`;
+  - arrays of atomics.
+
+  CosmoStore then moves to it: its key wipes onto `Secret.wipe`, its master key onto `[AtomicU64; 4]`, and its own
+  CRC-32 and SHA-1 onto lib/std's.

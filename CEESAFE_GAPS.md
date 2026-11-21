@@ -42,15 +42,16 @@ boilerplate; **P2** ergonomics.
 | G31 | P2 | lib/std/checksums | `Crc32c` is software only (slicing-by-8, 1.5 GB/s on an M1): no way to use the CPU's CRC32C instructions (ARMv8 `crc32c`, x86 SSE4.2), 4.7 times faster in one chain. **Fixed in CeeSafe 0.30.0** (ADR 0089: the instruction where the CPU has it, asked at run time; `Crc32c.of` 1,652 to 8,147 MB/s on the M1). CosmoStore builds with 0.30.0 since 11 Nov 2026 |
 | G32 | P2 | std/process | No way to read or raise the open-file limit (`getrlimit`/`setrlimit` `RLIMIT_NOFILE`): a server cannot lift its soft limit (256 on macOS) to the hard one at start, as servers usually do **Fixed in CeeSafe 0.41.0** (ADR 0104: `ProcessLimits.openFiles`, `raiseOpenFiles`, `IoError.TooManyOpenFiles`); `serve` raises its limit at start since 13 Nov 2026 |
 | G33 | P1 | lib/std/crypto | No authenticated cipher (AES-256-GCM): S3 server-side encryption (ADR-0046) has nothing to seal an object's bytes with, and CosmoStore calls no C. Wanted on the CPU's AES and carry-less multiply instructions, with a constant-time fallback **Fixed in CeeSafe 0.45.0** (ADR 0135: `Aes256Gcm`, `ConstantTime.equal`); SSE-S3 on PutObject, GetObject and HeadObject since 14 Nov 2026 |
-| G34 | P3 | lib/std/checksums | `HmacSha256` keeps its key XOR 0x5C in `outerKey` (and the inner pad's state in `inner`) and has no `drop` that wipes them: an SSE-C key used for an ETag (ADR-0046 §6), or a data key deriving a part key, stays in freed memory |
+| G34 | P3 | lib/std/checksums | `HmacSha256` keeps its key XOR 0x5C in `outerKey` (and the inner pad's state in `inner`) and has no `drop` that wipes them: an SSE-C key used for an ETag (ADR-0046 §6), or a data key deriving a part key, stays in freed memory **Fixed in CeeSafe 0.85.1** (ADR 0194 §2.1: a wiping `drop` on ADR 0197's wipe, and `clone()`) |
 | G35 | P2 | lib/std | No deflate or gzip (RFC 1951, 1952), nor the IEEE CRC-32 gzip uses |
-| G36 | P1 | tooling/test | The generated test runner nests each test a level deeper in C: past about 256 tests, clang refuses it without `--cflag -fbracket-depth=1024` |
+| G36 | P1 | tooling/test | The generated test runner nests each test a level deeper in C: past about 256 tests, clang refuses it without `--cflag -fbracket-depth=1024` **Fixed for the harness in CeeSafe 0.85.1** (ADR 0195 §2.1.4: a function per test); CosmoStore's CI drops the flag. The structurer's fix, for user code, is 0.86.0's |
 | G37 | P3 | language | No nested pattern through a reference payload: bind first, then match |
 | G38 | P3 | diagnostics | `class` is reserved but means nothing, and a field named so gets an unclear error |
 | G39 | P2 | diagnostics/language | `borrow x` of an optional does not pass as `borrow T?`, and the error prints the same type twice (`.asBorrow()` does it) |
 | G40 | P2 | lib/std | No zstd, snappy or deflate codecs: compaction that re-encodes Parquet and Avro waits on them |
 | G41 | P3 | language | An array cannot hold atomics, or any type that is not Copy |
 | G42 | P3 | language/runtime | A value with a wiping `drop` leaves its bytes behind when moved, and a growing vector frees its old buffer unwiped |
+| G43 | P2 | runtime/C backend | The C compiler deletes a wiping `drop` (or any zeroing loop) of a value on the stack at `-O2`: a local `Aes256Gcm`'s schedule, and CosmoStore's own key wipes, may not be wiped at all **Fixed for lib/std in CeeSafe 0.85.1** (ADR 0197 §2.1: `ceesafe_wipe`); `Secret.wipe`, for CosmoStore's own wipes, is 0.86.0's |
 
 ## Status (2026-11-06)
 
@@ -101,7 +102,7 @@ the owner's word ("Before proceeding, we need to tackle your findings in CeeSafe
     - G36: still fails at 0.84.1, `bracket nesting level exceeded maximum of 256`.
     - G37, G38, G39.
   - **ADR 0196:** G35 and G40, the codecs.
-  - **ADR 0197:** G42, secret memory.
+  - **ADR 0197:** G42, secret memory, and G43, found while drafting it.
   - **ADR 0198:** G41, arrays of non-Copy types.
 
 ## Details
@@ -731,6 +732,31 @@ Every growth frees a block that still holds the keys pushed so far.
   data the program marks as secret.
 - **A wiping move:** a type attribute asking moves of the type to zero the place they leave.
 - **Either one** would let a key type wipe every copy, not only its last.
+
+### G43: a wipe of a stack value is optimised away (P2, runtime/C backend)
+
+**Found:** while drafting CeeSafe ADRs 0194 and 0197, 21 Nov 2026 (ceesafec 0.84.1, Apple clang 21, arm64, `-O2`,
+the default build).
+
+**What happens.**
+- **A struct with a wiping `drop`:** if its `drop` zeroes a `[u8; 32]` in a loop, the zeroing is gone from the
+  object code when the value is a local. The stores are dead to the C compiler, since nothing reads them before the
+  frame ends.
+- **lib/std's `Aes256Gcm`:** a local one keeps its 304-byte schedule after `seal`. So ADR 0135's "wipes it when it is
+  dropped" holds only for values on the heap.
+- **A dropped `Vector<Key>`:** it was still zeroed, but only because the free could not be seen through on that path.
+  With LTO it could be removed too.
+- **CosmoStore's own wipes:** `KeyBytes`' self-wipe and the loops that zero key text or decoded bytes are plain
+  stores, at the same risk.
+
+**Why it matters.** A wipe the compiler deletes only looks like one. CosmoStore's M17 and M20 records of what is
+wiped assume these stores happen.
+
+**Repro.** A `struct K { b: [u8; 32]; drop { for (i in 0..32) { this.b[i] = 0; } } }` used as a local, built with
+`ceesafec build`. The disassembly shows no store to `b` after its last use.
+
+**Suggested.** CeeSafe ADR 0197's `ceesafe_wipe(p, n)` (zeroing followed by a compiler barrier) and a built-in
+`Secret.wipe(mut place)`, used by lib/std's key holders and by CosmoStore's.
 
 ## Not gaps (checked)
 

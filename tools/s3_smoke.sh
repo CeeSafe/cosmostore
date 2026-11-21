@@ -1612,12 +1612,13 @@ check "and an unknown class refused" "$(code s3api put-object --bucket classes -
 # RestoreObject (ADR-0102 §5): an hour is a second here (--restore-hour-seconds 1), so Standard's 4 hours take 4 s, and
 # a day 24 s.
 restore() { aws s3api restore-object --bucket classes --key "$1" --restore-request "$2" 2>&1; }
-check "a restore started" "$(restore g '{"Days":1,"GlacierJobParameters":{"Tier":"Standard"}}' | grep -c . )" 0
+# Bulk: 8 hours, 8 s here, so the checks of a restore that runs hold on a loaded machine (Standard's 4 s did not).
+check "a restore started" "$(restore g '{"Days":1,"GlacierJobParameters":{"Tier":"Bulk"}}' | grep -c . )" 0
 check "restoring" "$(aws s3api head-object --bucket classes --key g --query Restore --output text 2>&1)" 'ongoing-request="true"'
 check "its read refused while restoring" "$(code s3api get-object --bucket classes --key g "$work/g.out")" InvalidObjectState
 check "a listing's RestoreStatus while restoring" "$(aws s3api list-objects-v2 --bucket classes --optional-object-attributes RestoreStatus --query "Contents[?Key=='g'].RestoreStatus.IsRestoreInProgress" --output text 2>&1)" True
 check "a restore while one runs" "$(code s3api restore-object --bucket classes --key g --restore-request '{"Days":1}')" RestoreAlreadyInProgress
-sleep 5
+for i in $(seq 1 60); do aws s3api head-object --bucket classes --key g --query Restore --output text 2>&1 | grep -q 'ongoing-request="false"' && break; sleep 0.5; done
 check "restored: its expiry shown" "$(aws s3api head-object --bucket classes --key g --query Restore --output text 2>&1 | sed 's/expiry-date=".*"/expiry-date=…/')" 'ongoing-request="false", expiry-date=…'
 check "and in a listing, with its expiry" "$(aws s3api list-objects-v2 --bucket classes --optional-object-attributes RestoreStatus --query "Contents[?Key=='g'].[RestoreStatus.IsRestoreInProgress, RestoreStatus.RestoreExpiryDate != null]" --output text 2>&1 | tr '\t' ' ')" "False True"
 check "a key never restored has none" "$(aws s3api list-objects-v2 --bucket classes --optional-object-attributes RestoreStatus --query "Contents[?Key=='deep'].RestoreStatus" --output text 2>&1)" ""
