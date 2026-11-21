@@ -4697,3 +4697,20 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   pass.
 - **Next:** the owner's decisions. They are ADR-0106 as amended, M17 B1 and M16 B1 to stay, M16 B5 as an item of its
   own, and closing M20.
+
+### 21 Nov 2026: M20 closed; CeeSafe's gaps next (CEESAFE_GAPS.md)
+
+- **M20 closed** (the owner: "Accept and close"), after CI passed on e0b12bc.
+  - ADR-0106 accepted as amended.
+  - **The three Lows proposed differently, decided as proposed** (the owner: "As proposed"): M17 B1 and M16 B1
+    stay; M16 B5 is an item of its own.
+- **Next, at the owner's word, CeeSafe's gaps before M21** ("Before proceeding, we need to tackle your findings in
+  CeeSafe"):
+  - **The audit** at CeeSafe main (v0.84.1): 29 fixed, 2 partly fixed, 11 open. It is recorded in
+    `CEESAFE_GAPS.md`.
+  - **Five CeeSafe ADRs are being proposed,** 0194 to 0198, in `~/dev/CeeSafe-wt-gaps`, for the owner's acceptance:
+    - 0194: library fixes;
+    - 0195: the test runner's nesting and diagnostics;
+    - 0196: codecs;
+    - 0197: secret memory;
+    - 0198: arrays of non-Copy types.

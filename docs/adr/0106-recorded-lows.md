@@ -1,8 +1,10 @@
 # ADR-0106: The recorded Lows of M15 to M19 (M20)
 
-**Status:** proposed, 21 Nov 2026, with the owner's choices made: the KMS race closed by retiring, then counting
-("Retire, then count"), and the Lows that stay accepted with their reasons ("Accept them"). M20 is item A of ADR-0105
-(the owner: "A: the recorded Lows", all of them, the security ones first).
+**Status:** accepted, 21 Nov 2026, as amended in slices 1 to 6 and by the exit review (§1.1, §1.3, §1.5, §2, §3 and
+the consequences; the owner: "Accept and close"; `docs/m20-exit-review.md`). Its other choices were made earlier:
+"Retire, then count", and the Lows that stay accepted with their reasons. The three Lows proposed differently were
+decided as proposed: M17 B1 and M16 B1 stay, and M16 B5 is an item of its own. Proposed 21 Nov 2026. M20 is item A
+of ADR-0105 (the owner: "A: the recorded Lows").
 
 ## Context
 

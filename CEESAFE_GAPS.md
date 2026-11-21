@@ -43,6 +43,14 @@ boilerplate; **P2** ergonomics.
 | G32 | P2 | std/process | No way to read or raise the open-file limit (`getrlimit`/`setrlimit` `RLIMIT_NOFILE`): a server cannot lift its soft limit (256 on macOS) to the hard one at start, as servers usually do **Fixed in CeeSafe 0.41.0** (ADR 0104: `ProcessLimits.openFiles`, `raiseOpenFiles`, `IoError.TooManyOpenFiles`); `serve` raises its limit at start since 13 Nov 2026 |
 | G33 | P1 | lib/std/crypto | No authenticated cipher (AES-256-GCM): S3 server-side encryption (ADR-0046) has nothing to seal an object's bytes with, and CosmoStore calls no C. Wanted on the CPU's AES and carry-less multiply instructions, with a constant-time fallback **Fixed in CeeSafe 0.45.0** (ADR 0135: `Aes256Gcm`, `ConstantTime.equal`); SSE-S3 on PutObject, GetObject and HeadObject since 14 Nov 2026 |
 | G34 | P3 | lib/std/checksums | `HmacSha256` keeps its key XOR 0x5C in `outerKey` (and the inner pad's state in `inner`) and has no `drop` that wipes them: an SSE-C key used for an ETag (ADR-0046 §6), or a data key deriving a part key, stays in freed memory |
+| G35 | P2 | lib/std | No deflate or gzip (RFC 1951, 1952), nor the IEEE CRC-32 gzip uses |
+| G36 | P1 | tooling/test | The generated test runner nests each test a level deeper in C: past about 256 tests, clang refuses it without `--cflag -fbracket-depth=1024` |
+| G37 | P3 | language | No nested pattern through a reference payload: bind first, then match |
+| G38 | P3 | diagnostics | `class` is reserved but means nothing, and a field named so gets an unclear error |
+| G39 | P2 | diagnostics/language | `borrow x` of an optional does not pass as `borrow T?`, and the error prints the same type twice (`.asBorrow()` does it) |
+| G40 | P2 | lib/std | No zstd, snappy or deflate codecs: compaction that re-encodes Parquet and Avro waits on them |
+| G41 | P3 | language | An array cannot hold atomics, or any type that is not Copy |
+| G42 | P3 | language/runtime | A value with a wiping `drop` leaves its bytes behind when moved, and a growing vector frees its old buffer unwiped |
 
 ## Status (2026-11-06)
 
@@ -68,6 +76,33 @@ Not used yet:
 The migration found that `File`'s positional methods needed `borrow mut this`, which CosmoStore's shared read paths
 can't give. CeeSafe 0.19.1 (ADR 0075 §8) relaxes them to `borrow this`, so CosmoStore needs ceesafec 0.19.1 or
 later; G23 covers the manifest's missing way to say so.
+
+## Status at CeeSafe main, v0.84.1 (2026-11-21)
+
+An audit of every gap against CeeSafe's `main`, by reading it and by compiling repros with ceesafec 0.84.1, found
+29 fixed, 2 partly fixed and 11 open. The open and partly fixed ones are proposed as CeeSafe ADRs 0194 to 0198, at
+the owner's word ("Before proceeding, we need to tackle your findings in CeeSafe"), in the worktree
+`~/dev/CeeSafe-wt-gaps`, branch `adr/0194-0198-cosmostore-gaps`.
+
+- **Fixed since this log was written:**
+  - **0.19 to 0.21:** G6 (async file I/O through `Async.blocking`), G10 to G14, G18 to G20, G22 (prefix `*`),
+    G24, G25.
+  - **Later releases:** G27 (0.44.1), G28 (0.36.0), G30 (0.55.1, for the case logged), G31 (0.30.0), G32 (0.41.0),
+    G33 (0.45.0).
+- **Partly fixed:**
+  - G7: no `map` or `mapErr` on `Result`.
+  - G21: static arrays of atomics are in, but `Mutex.constant` is not.
+- **Open, and the ADR each is proposed in:**
+  - **ADR 0194, small library fixes:**
+    - G34: `HmacSha256` has no wiping `drop`.
+    - G26: no CRC-32 (IEEE) or SHA-1.
+    - G29: `OrderedMap` nodes end half full after in-order inserts.
+  - **ADR 0195, the test runner and three diagnostics:**
+    - G36: still fails at 0.84.1, `bracket nesting level exceeded maximum of 256`.
+    - G37, G38, G39.
+  - **ADR 0196:** G35 and G40, the codecs.
+  - **ADR 0197:** G42, secret memory.
+  - **ADR 0198:** G41, arrays of non-Copy types.
 
 ## Details
 

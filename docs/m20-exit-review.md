@@ -97,6 +97,12 @@ fixed, or decided to stay with a reason. The security ones come first.
 
 ## Decisions for the owner
 
+**Taken, 21 Nov 2026** (the owner: "Accept and close"; the three Lows "As proposed"):
+- ADR-0106 is accepted as amended.
+- M17 B1 and M16 B1 stay.
+- M16 B5 is an item of its own, beside ADR-0105's B.
+- M20 is closed, once CI passed on e0b12bc.
+
 - **Accept ADR-0106,** with its amendments:
   - §1.1: keys before counts;
   - §1.3: G42, and lib/std's `Aes256Gcm` found to wipe;
