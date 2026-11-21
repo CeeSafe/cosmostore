@@ -4786,3 +4786,18 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - snappy and zstd, ADR 0196's phases 2 and 3;
   - G44;
   - G7 and G21.
+
+### 22 Nov 2026: M21 is IAM for tools, with Terraform as the bar (ADR-0107, ADR-0108)
+
+- **M21 proposed and chosen:** ADR-0107's item A (the owner: "A: IAM for tools"), with Terraform as the bar
+  ("Terraform").
+- **ADR-0108 designs it:**
+  - managed policies and their versions and attachments;
+  - groups;
+  - tags and paths;
+  - `UpdateRole` and `UpdateAssumeRolePolicy`;
+  - the reads Terraform's refresh makes;
+  - STS's `GetCallerIdentity`.
+- **The owner's choices:** AWS's four managed policies that matter here, and `tools/terraform_check.sh` run locally.
+- **Six slices.**
+- **Next:** slice 1, the record's version 2 and the joined identity policies.
