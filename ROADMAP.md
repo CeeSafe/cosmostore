@@ -4801,3 +4801,22 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **The owner's choices:** AWS's four managed policies that matter here, and `tools/terraform_check.sh` run locally.
 - **Six slices.**
 - **Next:** slice 1, the record's version 2 and the joined identity policies.
+
+### 22 Nov 2026: M21 slice 1, the IAM record's form 2 and the joined identity policies (ADR-0108 §1, §2, §4)
+
+- **The record's form 2** holds:
+  - groups (members, inline and attached policies);
+  - managed policies (versions, the default, the next number, path, description, tags);
+  - paths, tags and attached policies on users and roles, and a role's description.
+  - **Form 1 still reads,** with paths `/` and none of the rest; it is written back as form 2.
+- **A user's identity policy** joins its inline policies, its attached policies' default versions, and each of its
+  groups' inline and attached ones. **A role's** joins its inline and attached policies.
+- **AWS's four managed policies** are fixed documents: `AdministratorAccess`, `AmazonS3FullAccess`,
+  `AmazonS3ReadOnlyAccess` and `IAMReadOnlyAccess`.
+- **Deletes refused, as AWS refuses them:** DeleteUser while the user has attached policies or groups; DeleteRole
+  while the role has attached policies.
+- **Tests:**
+  - 4 new (429 in all);
+  - the S3 and cluster smokes (206);
+  - the SDK matrix.
+- **Next:** slice 2, managed policies, their versions and attachments.

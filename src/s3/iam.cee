@@ -1,5 +1,5 @@
-// The IAM API's records (ADR-0104): users with their access keys and inline policies, and roles with their trust and
-// inline policies, kept in one record of the hidden bucket `_cosmostore-iam`, and merged with the users and roles
+// The IAM API's records (ADR-0104, ADR-0108): users with their access keys and inline policies, roles with their trust
+// and inline policies, groups, and managed policies with their versions, kept in one record of the hidden bucket `_cosmostore-iam`, and merged with the users and roles
 // files into the credential and role sets (§4). The files stay the operator's: a name in both keeps the API's, and the
 // file's entry is skipped (§5).
 
@@ -22,12 +22,23 @@ struct IamPolicy {
     text: Vector<u8>;
 }
 
+/// A tag of a user, role or managed policy, as given.
+struct IamTag {
+    key: Vector<u8>;
+    value: Vector<u8>;
+}
+
 struct IamUser {
     name: Vector<u8>;
     id: Vector<u8>;
     createdMs: i64;
     keys: Vector<IamKey>;
     policies: Vector<IamPolicy>;
+    /// Its path (`/` unless given), shown in its ARN (ADR-0108 §3).
+    path: Vector<u8>;
+    tags: Vector<IamTag>;
+    /// The ARNs of the managed policies attached to it.
+    attached: Vector<Vector<u8>>;
 }
 
 struct IamRole {
@@ -38,15 +49,64 @@ struct IamRole {
     trust: Vector<u8>;
     policies: Vector<IamPolicy>;
     maxSeconds: u64;
+    path: Vector<u8>;
+    tags: Vector<IamTag>;
+    attached: Vector<Vector<u8>>;
+    description: Vector<u8>;
+}
+
+/// A version of a managed policy, `v<number>`: its document as given.
+struct IamPolicyVersion {
+    number: u32;
+    text: Vector<u8>;
+    createdMs: i64;
+}
+
+/// A managed policy (ADR-0108 §1): up to five versions, one of them the default, attached by its ARN,
+/// `arn:aws:iam::000000000000:policy<path><name>`.
+struct IamManagedPolicy {
+    name: Vector<u8>;
+    id: Vector<u8>;
+    path: Vector<u8>;
+    description: Vector<u8>;
+    createdMs: i64;
+    updatedMs: i64;
+    tags: Vector<IamTag>;
+    versions: Vector<IamPolicyVersion>;
+    defaultVersion: u32;
+    /// The number the next version takes: numbers are not used again, as on AWS.
+    nextVersion: u32;
+}
+
+/// A group: its members (user names), and inline and attached policies its members' identity policies join.
+struct IamGroup {
+    name: Vector<u8>;
+    id: Vector<u8>;
+    path: Vector<u8>;
+    createdMs: i64;
+    members: Vector<Vector<u8>>;
+    policies: Vector<IamPolicy>;
+    attached: Vector<Vector<u8>>;
 }
 
 /// Everything the API has made.
 struct IamState {
     users: Vector<IamUser>;
     roles: Vector<IamRole>;
+    groups: Vector<IamGroup>;
+    managed: Vector<IamManagedPolicy>;
 
-    fn empty() -> IamState => IamState { users: Vector<IamUser>.create(), roles: Vector<IamRole>.create() };
+    fn empty() -> IamState => IamState {
+        users: Vector<IamUser>.create(),
+        roles: Vector<IamRole>.create(),
+        groups: Vector<IamGroup>.create(),
+        managed: Vector<IamManagedPolicy>.create(),
+    };
 }
+
+/// The record's form: 2 since ADR-0108 (groups, managed policies, paths, tags). A record of form 1 is read too, with
+/// none of those.
+const IAM_RECORD_VERSION: i64 = 2;
 
 // ---- The record ----
 
@@ -57,6 +117,45 @@ fn policiesJson(policies: Slice<IamPolicy>) -> Result<Json, AllocError> {
         jsonSet(mut p, "name", Json.Text(copyBytes(policies[i].name.view())?))?;
         jsonSet(mut p, "text", Json.Text(copyBytes(policies[i].text.view())?))?;
         jsonPush(mut out, p)?;
+    }
+    return Ok(out);
+}
+
+fn tagsJson(tags: Slice<IamTag>) -> Result<Json, AllocError> {
+    var out = jsonArray();
+    for (i in 0..tags.length) {
+        var t = jsonObject();
+        jsonSet(mut t, "key", Json.Text(copyBytes(tags[i].key.view())?))?;
+        jsonSet(mut t, "value", Json.Text(copyBytes(tags[i].value.view())?))?;
+        jsonPush(mut out, t)?;
+    }
+    return Ok(out);
+}
+
+fn namesJson(names: Slice<Vector<u8>>) -> Result<Json, AllocError> {
+    var out = jsonArray();
+    for (i in 0..names.length) { jsonPush(mut out, Json.Text(copyBytes(names[i].view())?))?; }
+    return Ok(out);
+}
+
+fn copyNames(names: Slice<Vector<u8>>) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    for (i in 0..names.length) { out.push(copyBytes(names[i].view())?)?; }
+    return Ok(out);
+}
+
+fn copyTags(tags: Slice<IamTag>) -> Result<Vector<IamTag>, AllocError> {
+    var out = Vector<IamTag>.create();
+    for (i in 0..tags.length) {
+        out.push(IamTag { key: copyBytes(tags[i].key.view())?, value: copyBytes(tags[i].value.view())? })?;
+    }
+    return Ok(out);
+}
+
+fn copyPolicies(policies: Slice<IamPolicy>) -> Result<Vector<IamPolicy>, AllocError> {
+    var out = Vector<IamPolicy>.create();
+    for (i in 0..policies.length) {
+        out.push(IamPolicy { name: copyBytes(policies[i].name.view())?, text: copyBytes(policies[i].text.view())? })?;
     }
     return Ok(out);
 }
@@ -81,6 +180,9 @@ fn encodeIamState(s: borrow IamState) -> Result<Vector<u8>, AllocError> {
         jsonSet(mut user, "created", jsonInteger(u.createdMs)?)?;
         jsonSet(mut user, "keys", keys)?;
         jsonSet(mut user, "policies", policiesJson(u.policies.view())?)?;
+        jsonSet(mut user, "path", Json.Text(copyBytes(u.path.view())?))?;
+        jsonSet(mut user, "tags", tagsJson(u.tags.view())?)?;
+        jsonSet(mut user, "attached", namesJson(u.attached.view())?)?;
         jsonPush(mut users, user)?;
     }
     var roles = jsonArray();
@@ -93,12 +195,55 @@ fn encodeIamState(s: borrow IamState) -> Result<Vector<u8>, AllocError> {
         jsonSet(mut role, "trust", Json.Text(copyBytes(r.trust.view())?))?;
         jsonSet(mut role, "maxSeconds", jsonInteger(truncate<i64>(r.maxSeconds))?)?;
         jsonSet(mut role, "policies", policiesJson(r.policies.view())?)?;
+        jsonSet(mut role, "path", Json.Text(copyBytes(r.path.view())?))?;
+        jsonSet(mut role, "tags", tagsJson(r.tags.view())?)?;
+        jsonSet(mut role, "attached", namesJson(r.attached.view())?)?;
+        jsonSet(mut role, "description", Json.Text(copyBytes(r.description.view())?))?;
         jsonPush(mut roles, role)?;
     }
+    var groups = jsonArray();
+    for (i in 0..s.groups.length) {
+        let g = borrow s.groups[i];
+        var group = jsonObject();
+        jsonSet(mut group, "name", Json.Text(copyBytes(g.name.view())?))?;
+        jsonSet(mut group, "id", Json.Text(copyBytes(g.id.view())?))?;
+        jsonSet(mut group, "path", Json.Text(copyBytes(g.path.view())?))?;
+        jsonSet(mut group, "created", jsonInteger(g.createdMs)?)?;
+        jsonSet(mut group, "members", namesJson(g.members.view())?)?;
+        jsonSet(mut group, "policies", policiesJson(g.policies.view())?)?;
+        jsonSet(mut group, "attached", namesJson(g.attached.view())?)?;
+        jsonPush(mut groups, group)?;
+    }
+    var managed = jsonArray();
+    for (i in 0..s.managed.length) {
+        let m = borrow s.managed[i];
+        var versions = jsonArray();
+        for (v in 0..m.versions.length) {
+            var version = jsonObject();
+            jsonSet(mut version, "number", jsonInteger(m.versions[v].number as i64)?)?;
+            jsonSet(mut version, "text", Json.Text(copyBytes(m.versions[v].text.view())?))?;
+            jsonSet(mut version, "created", jsonInteger(m.versions[v].createdMs)?)?;
+            jsonPush(mut versions, version)?;
+        }
+        var policy = jsonObject();
+        jsonSet(mut policy, "name", Json.Text(copyBytes(m.name.view())?))?;
+        jsonSet(mut policy, "id", Json.Text(copyBytes(m.id.view())?))?;
+        jsonSet(mut policy, "path", Json.Text(copyBytes(m.path.view())?))?;
+        jsonSet(mut policy, "description", Json.Text(copyBytes(m.description.view())?))?;
+        jsonSet(mut policy, "created", jsonInteger(m.createdMs)?)?;
+        jsonSet(mut policy, "updated", jsonInteger(m.updatedMs)?)?;
+        jsonSet(mut policy, "tags", tagsJson(m.tags.view())?)?;
+        jsonSet(mut policy, "versions", versions)?;
+        jsonSet(mut policy, "default", jsonInteger(m.defaultVersion as i64)?)?;
+        jsonSet(mut policy, "next", jsonInteger(m.nextVersion as i64)?)?;
+        jsonPush(mut managed, policy)?;
+    }
     var root = jsonObject();
-    jsonSet(mut root, "version", jsonInteger(1)?)?;
+    jsonSet(mut root, "version", jsonInteger(IAM_RECORD_VERSION)?)?;
     jsonSet(mut root, "users", users)?;
     jsonSet(mut root, "roles", roles)?;
+    jsonSet(mut root, "groups", groups)?;
+    jsonSet(mut root, "managed", managed)?;
     var out = Vector<u8>.create();
     writeJson(mut out, borrow root)?;
     return Ok(out);
@@ -129,10 +274,49 @@ fn policiesOf(j: borrow Json) -> Result<Vector<IamPolicy>?, AllocError> {
     return Ok(Some(out));
 }
 
+/// A path, `/` when the record has none (form 1).
+fn pathMember(j: borrow Json) -> Result<Vector<u8>?, AllocError> {
+    if (jsonMember(j, "path").isNull()) { return Ok(Some(copyBytes("/".bytes())?)); }
+    return textMember(j, "path");
+}
+
+/// Texts of `key`, none when the record has none (form 1); null when one is not a text.
+fn namesMember(j: borrow Json, key: StringView) -> Result<Vector<Vector<u8>>?, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    if (jsonMember(j, key).isNull()) { return Ok(Some(out)); }
+    let items = memberItems(j, key) ?? { return Ok(null); };
+    for (i in 0..items.length) {
+        match (borrow items[i]) {
+            Json.Text(t) => { out.push(copyBytes(t.view())?)?; }
+            _ => { return Ok(null); }
+        }
+    }
+    return Ok(Some(out));
+}
+
+fn tagsMember(j: borrow Json) -> Result<Vector<IamTag>?, AllocError> {
+    var out = Vector<IamTag>.create();
+    if (jsonMember(j, "tags").isNull()) { return Ok(Some(out)); }
+    let items = memberItems(j, "tags") ?? { return Ok(null); };
+    for (i in 0..items.length) {
+        let key = textMember(borrow items[i], "key")? ?? { return Ok(null); };
+        let value = textMember(borrow items[i], "value")? ?? { return Ok(null); };
+        out.push(IamTag { key: key, value: value })?;
+    }
+    return Ok(Some(out));
+}
+
+/// A text member, empty when the record has none.
+fn textOrEmpty(j: borrow Json, key: StringView) -> Result<Vector<u8>?, AllocError> {
+    if (jsonMember(j, key).isNull()) { return Ok(Some(Vector<u8>.create())); }
+    return textMember(j, key);
+}
+
 /// The record read back; null when it is not one this reads.
 fn decodeIamState(bytes: Slice<u8>) -> Result<IamState?, AllocError> {
     let root = parseJson(bytes)? ?? { return Ok(null); };
-    if (jsonMemberI64(borrow root, "version") != Some(1i64)) { return Ok(null); }
+    let form = jsonMemberI64(borrow root, "version") ?? { return Ok(null); };
+    if (form < 1 || form > IAM_RECORD_VERSION) { return Ok(null); }
     var out = IamState.empty();
     let users = memberItems(borrow root, "users") ?? { return Ok(null); };
     for (i in 0..users.length) {
@@ -154,6 +338,9 @@ fn decodeIamState(bytes: Slice<u8>) -> Result<IamState?, AllocError> {
             createdMs: jsonMemberI64(u, "created") ?? 0,
             keys: keys,
             policies: policiesOf(u)? ?? { return Ok(null); },
+            path: pathMember(u)? ?? { return Ok(null); },
+            tags: tagsMember(u)? ?? { return Ok(null); },
+            attached: namesMember(u, "attached")? ?? { return Ok(null); },
         })?;
     }
     let roles = memberItems(borrow root, "roles") ?? { return Ok(null); };
@@ -166,7 +353,56 @@ fn decodeIamState(bytes: Slice<u8>) -> Result<IamState?, AllocError> {
             trust: textMember(r, "trust")? ?? { return Ok(null); },
             policies: policiesOf(r)? ?? { return Ok(null); },
             maxSeconds: truncate<u64>(jsonMemberI64(r, "maxSeconds") ?? 3600),
+            path: pathMember(r)? ?? { return Ok(null); },
+            tags: tagsMember(r)? ?? { return Ok(null); },
+            attached: namesMember(r, "attached")? ?? { return Ok(null); },
+            description: textOrEmpty(r, "description")? ?? { return Ok(null); },
         })?;
+    }
+    if (jsonMember(borrow root, "groups").isSome()) {
+        let groups = memberItems(borrow root, "groups") ?? { return Ok(null); };
+        for (i in 0..groups.length) {
+            let g = borrow groups[i];
+            out.groups.push(IamGroup {
+                name: textMember(g, "name")? ?? { return Ok(null); },
+                id: textMember(g, "id")? ?? { return Ok(null); },
+                path: pathMember(g)? ?? { return Ok(null); },
+                createdMs: jsonMemberI64(g, "created") ?? 0,
+                members: namesMember(g, "members")? ?? { return Ok(null); },
+                policies: policiesOf(g)? ?? { return Ok(null); },
+                attached: namesMember(g, "attached")? ?? { return Ok(null); },
+            })?;
+        }
+    }
+    if (jsonMember(borrow root, "managed").isSome()) {
+        let managed = memberItems(borrow root, "managed") ?? { return Ok(null); };
+        for (i in 0..managed.length) {
+            let m = borrow managed[i];
+            var versions = Vector<IamPolicyVersion>.create();
+            let items = memberItems(m, "versions") ?? { return Ok(null); };
+            for (v in 0..items.length) {
+                let number = jsonMemberI64(borrow items[v], "number") ?? { return Ok(null); };
+                versions.push(IamPolicyVersion {
+                    number: checkedTruncate<u32>(number) ?? { return Ok(null); },
+                    text: textMember(borrow items[v], "text")? ?? { return Ok(null); },
+                    createdMs: jsonMemberI64(borrow items[v], "created") ?? 0,
+                })?;
+            }
+            let defaultVersion = jsonMemberI64(m, "default") ?? { return Ok(null); };
+            let nextVersion = jsonMemberI64(m, "next") ?? { return Ok(null); };
+            out.managed.push(IamManagedPolicy {
+                name: textMember(m, "name")? ?? { return Ok(null); },
+                id: textMember(m, "id")? ?? { return Ok(null); },
+                path: pathMember(m)? ?? { return Ok(null); },
+                description: textOrEmpty(m, "description")? ?? { return Ok(null); },
+                createdMs: jsonMemberI64(m, "created") ?? 0,
+                updatedMs: jsonMemberI64(m, "updated") ?? 0,
+                tags: tagsMember(m)? ?? { return Ok(null); },
+                versions: versions,
+                defaultVersion: checkedTruncate<u32>(defaultVersion) ?? { return Ok(null); },
+                nextVersion: checkedTruncate<u32>(nextVersion) ?? { return Ok(null); },
+            })?;
+        }
     }
     return Ok(Some(out));
 }
@@ -179,12 +415,127 @@ fn decodeIamState(bytes: Slice<u8>) -> Result<IamState?, AllocError> {
 const IAM_NO_POLICY: StringView =
     "{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:CosmoStoreNoPolicy\",\"Resource\":\"*\"}}";
 
-/// A policy document joining the statements of `policies` (a user's or role's inline ones); IAM_NO_POLICY for none.
-fn joinedPolicy(policies: Slice<IamPolicy>) -> Result<Vector<u8>?, AllocError> {
-    if (policies.length == 0) { return Ok(Some(copyBytes(IAM_NO_POLICY.bytes())?)); }
+/// The account's managed policies' ARNs begin so; AWS's own, so (ADR-0108 §4).
+const IAM_POLICY_ARN: StringView = "arn:aws:iam::000000000000:policy";
+const AWS_POLICY_ARN: StringView = "arn:aws:iam::aws:policy/";
+
+/// AWS's managed policies that mean something to this store, each a fixed document (ADR-0108 §4, the owner's choice);
+/// null for any other.
+fn awsManagedPolicy(arn: Slice<u8>) -> StringView? {
+    let p = AWS_POLICY_ARN.bytes();
+    if (arn.length <= p.length || arn[0..p.length] != p) { return null; }
+    let name = arn[p.length..];
+    if (name == "AdministratorAccess".bytes()) {
+        return Some(
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}",
+        );
+    }
+    if (name == "AmazonS3FullAccess".bytes()) {
+        return Some(
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}]}",
+        );
+    }
+    if (name == "AmazonS3ReadOnlyAccess".bytes()) {
+        return Some(
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:Get*\",\"s3:List*\",\"s3:Describe*\"],\"Resource\":\"*\"}]}",
+        );
+    }
+    if (name == "IAMReadOnlyAccess".bytes()) {
+        return Some(
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"iam:Get*\",\"iam:List*\"],\"Resource\":\"*\"}]}",
+        );
+    }
+    return null;
+}
+
+/// Whether `arn` is the ARN of the account's managed policy `path` + `name`.
+fn managedArnIs(arn: Slice<u8>, path: Slice<u8>, name: Slice<u8>) -> bool {
+    let p = IAM_POLICY_ARN.bytes();
+    if (arn.length != p.length + path.length + name.length) { return false; }
+    return arn[0..p.length] == p &&
+        arn[p.length..p.length + path.length] == path && arn[p.length + path.length..] == name;
+}
+
+/// The account's managed policy with ARN `arn`.
+fn managedAt(iam: borrow IamState, arn: Slice<u8>) -> usize? {
+    for (i in 0..iam.managed.length) {
+        if (managedArnIs(arn, iam.managed[i].path.view(), iam.managed[i].name.view())) { return Some(i); }
+    }
+    return null;
+}
+
+/// Whether `arn` names a managed policy there is: the account's, or one of AWS's four.
+fn managedArnKnown(iam: borrow IamState, arn: Slice<u8>) -> bool =>
+    awsManagedPolicy(arn).isSome() || managedAt(iam, arn).isSome();
+
+/// The default versions' documents of the managed policies `arns` names. One there is not is left out: an attach
+/// checks it, and a policy attached is not deleted.
+fn pushAttachedTexts(
+    iam: borrow IamState,
+    arns: Slice<Vector<u8>>,
+    out: borrow mut Vector<Vector<u8>>,
+) -> Result<void, AllocError> {
+    for (a in 0..arns.length) {
+        match (awsManagedPolicy(arns[a].view())) {
+            Some(doc) => {
+                out.push(copyBytes(doc.bytes())?)?;
+                continue;
+            }
+            null => {}
+        }
+        let m = managedAt(iam, arns[a].view()) ?? { continue; };
+        let policy = borrow iam.managed[m];
+        for (v in 0..policy.versions.length) {
+            if (policy.versions[v].number == policy.defaultVersion) {
+                out.push(copyBytes(policy.versions[v].text.view())?)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+fn pushInlineTexts(policies: Slice<IamPolicy>, out: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
+    for (i in 0..policies.length) { out.push(copyBytes(policies[i].text.view())?)?; }
+    return Ok();
+}
+
+/// Whether group `g` has user `name` among its members.
+fn groupHolds(g: borrow IamGroup, name: Slice<u8>) -> bool {
+    for (i in 0..g.members.length) {
+        if (sameNameIgnoringCase(g.members[i].view(), name)) { return true; }
+    }
+    return false;
+}
+
+/// The documents user `u`'s identity policy joins (ADR-0108 §2): its inline policies, its attached policies' default
+/// versions, and each of its groups' inline and attached policies.
+fn userPolicyTexts(iam: borrow IamState, u: usize) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    let user = borrow iam.users[u];
+    pushInlineTexts(user.policies.view(), mut out)?;
+    pushAttachedTexts(iam, user.attached.view(), mut out)?;
+    for (g in 0..iam.groups.length) {
+        if (!groupHolds(borrow iam.groups[g], user.name.view())) { continue; }
+        pushInlineTexts(iam.groups[g].policies.view(), mut out)?;
+        pushAttachedTexts(iam, iam.groups[g].attached.view(), mut out)?;
+    }
+    return Ok(out);
+}
+
+/// The documents role `r`'s policy joins: its inline policies and its attached policies' default versions.
+fn rolePolicyTexts(iam: borrow IamState, r: usize) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    pushInlineTexts(iam.roles[r].policies.view(), mut out)?;
+    pushAttachedTexts(iam, iam.roles[r].attached.view(), mut out)?;
+    return Ok(out);
+}
+
+/// A policy document joining the statements of `texts` (policy documents); IAM_NO_POLICY for none.
+fn joinedPolicy(texts: Slice<Vector<u8>>) -> Result<Vector<u8>?, AllocError> {
+    if (texts.length == 0) { return Ok(Some(copyBytes(IAM_NO_POLICY.bytes())?)); }
     var statements = jsonArray();
-    for (i in 0..policies.length) {
-        let doc = parseJson(policies[i].text.view())? ?? { return Ok(null); };
+    for (i in 0..texts.length) {
+        let doc = parseJson(texts[i].view())? ?? { return Ok(null); };
         let member = jsonMember(borrow doc, "Statement") ?? { return Ok(null); };
         match (member) {
             Json.Array(items) => {
@@ -298,7 +649,8 @@ fn withIamUsers(
                 Err(_) => { return Err(oom); }
             }
         }
-        let policy = match (joinedPolicy(user.policies.view())) {
+        let texts = userPolicyTexts(iam, u).ok() ?? { return Err(oom); };
+        let policy = match (joinedPolicy(texts.view())) {
             Ok(Some(p)) => p,
             _ => { return Err(oom); }
         };
@@ -336,7 +688,8 @@ fn withIamRoles(
     }
     for (r in 0..iam.roles.length) {
         let role = borrow iam.roles[r];
-        let text = joinedPolicy(role.policies.view())? ?? { continue; };
+        let texts = rolePolicyTexts(iam, r)?;
+        let text = joinedPolicy(texts.view())? ?? { continue; };
         let policy = match (parseIdentityPolicy(text.view())) {
             Ok(p) => p,
             Err(S3Fail.OutOfMemory(e)) => { return Err(e); }

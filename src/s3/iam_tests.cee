@@ -29,6 +29,9 @@ fn iamUserOf(name: StringView, key: StringView, active: bool) -> IamUser {
         createdMs: 3,
         keys: keys,
         policies: policies,
+        path: copyBytes("/".bytes())!,
+        tags: Vector<IamTag>.create(),
+        attached: Vector<Vector<u8>>.create(),
     };
 }
 
@@ -45,6 +48,10 @@ fn sampleIam() -> IamState {
         trust: copyBytes("{\"Version\":\"2012-10-17\",\"Statement\":[]}".bytes())!,
         policies: policies,
         maxSeconds: 3600,
+        path: copyBytes("/".bytes())!,
+        tags: Vector<IamTag>.create(),
+        attached: Vector<Vector<u8>>.create(),
+        description: Vector<u8>.create(),
     })!;
     return s;
 }
@@ -58,7 +65,10 @@ fn iamStatesRoundTrip() -> Result<void, TestFailure> {
     Check.equalBytes(bytes.view(), encodeIamState(borrow back)!.view())?;
     Check.equalU64(2, back.users.length as u64)?;
     Check.isFalse(back.users[1].keys[0].active, "an inactive key stays so")?;
-    Check.isTrue(decodeIamState("{\"version\":2}".bytes())!.isNull(), "a version this does not read")?;
+    Check.isTrue(
+        decodeIamState("{\"version\":3,\"users\":[],\"roles\":[]}".bytes())!.isNull(),
+        "a version this does not read",
+    )?;
     return Ok();
 }
 
@@ -303,5 +313,142 @@ fn fileUsersWithoutKeysAreTheFiles() -> Result<void, TestFailure> {
     var names = Vector<Vector<u8>>.create();
     for (i in 0..files.length) { names.push(copyBytes(nameOfUserKey(files[i].view()))!)!; }
     Check.isTrue(namedIn(names.view(), "CAROL".bytes()), "its name, in any case, not the API's to make")?;
+    return Ok();
+}
+
+fn managedPolicyOf(name: StringView, path: StringView, first: StringView, second: StringView) -> IamManagedPolicy {
+    var versions = Vector<IamPolicyVersion>.create();
+    versions.push(IamPolicyVersion { number: 1, text: iamPolicy("v1", first).text, createdMs: 7 })!;
+    versions.push(IamPolicyVersion { number: 2, text: iamPolicy("v2", second).text, createdMs: 8 })!;
+    var tags = Vector<IamTag>.create();
+    tags.push(IamTag { key: copyBytes("team".bytes())!, value: copyBytes("data".bytes())! })!;
+    return IamManagedPolicy {
+        name: copyBytes(name.bytes())!,
+        id: copyBytes("ANPAEXAMPLE".bytes())!,
+        path: copyBytes(path.bytes())!,
+        description: copyBytes("for tests".bytes())!,
+        createdMs: 7,
+        updatedMs: 8,
+        tags: tags,
+        versions: versions,
+        defaultVersion: 2,
+        nextVersion: 3,
+    };
+}
+
+/// A state with a managed policy (its version 2 the default), a group holding alice with an inline policy and the
+/// managed one attached, and AWS's read-only S3 policy attached to the role.
+fn sampleIamWithGroups() -> IamState {
+    var s = sampleIam();
+    s.managed.push(managedPolicyOf("writers", "/team/", "s3:DeleteObject", "s3:PutObject"))!;
+    var members = Vector<Vector<u8>>.create();
+    members.push(copyBytes("Alice".bytes())!)!; // names are matched as IAM matches them, case aside
+    var policies = Vector<IamPolicy>.create();
+    policies.push(iamPolicy("tagging", "s3:PutObjectTagging"))!;
+    var attached = Vector<Vector<u8>>.create();
+    attached.push(copyBytes("arn:aws:iam::000000000000:policy/team/writers".bytes())!)!;
+    s.groups.push(IamGroup {
+        name: copyBytes("editors".bytes())!,
+        id: copyBytes("AGPAEDITORS".bytes())!,
+        path: copyBytes("/".bytes())!,
+        createdMs: 9,
+        members: members,
+        policies: policies,
+        attached: attached,
+    })!;
+    s.roles[0].attached.push(copyBytes("arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess".bytes())!)!;
+    s.users[0].tags.push(IamTag { key: copyBytes("cost".bytes())!, value: copyBytes("42".bytes())! })!;
+    s.users[0].path = copyBytes("/staff/".bytes())!;
+    return s;
+}
+
+/// Form 2 of the record (ADR-0108 §1) is read back as written: groups, managed policies with their versions, paths,
+/// tags and attachments.
+@test
+fn iamRecordsOfForm2RoundTrip() -> Result<void, TestFailure> {
+    let s = sampleIamWithGroups();
+    let bytes = encodeIamState(borrow s)!;
+    let back = decodeIamState(bytes.view())!!;
+    Check.equalBytes(bytes.view(), encodeIamState(borrow back)!.view())?;
+    Check.equalU64(1, back.groups.length as u64)?;
+    Check.equalBytes("Alice".bytes(), back.groups[0].members[0].view())?;
+    Check.equalU64(1, back.managed.length as u64)?;
+    Check.equalU64(2, back.managed[0].versions.length as u64)?;
+    Check.equalU64(2, back.managed[0].defaultVersion as u64)?;
+    Check.equalU64(3, back.managed[0].nextVersion as u64)?;
+    Check.equalBytes("/team/".bytes(), back.managed[0].path.view())?;
+    Check.equalBytes("data".bytes(), back.managed[0].tags[0].value.view())?;
+    Check.equalBytes("/staff/".bytes(), back.users[0].path.view())?;
+    Check.equalBytes("42".bytes(), back.users[0].tags[0].value.view())?;
+    Check.equalU64(1, back.roles[0].attached.length as u64)?;
+    return Ok();
+}
+
+/// A record of form 1, M19's, is read with none of form 2's: paths `/`, no tags, groups or managed policies.
+@test
+fn iamRecordsOfForm1StillRead() -> Result<void, TestFailure> {
+    let form1 = """
+        {"version":1,"users":[{"name":"alice","id":"AIDAALICE","created":3,"keys":[],"policies":[]}],
+        "roles":[{"name":"deployer","id":"AROAD","created":4,"trust":"{}","maxSeconds":900,"policies":[]}]}
+        """;
+    let back = decodeIamState(form1.bytes())!!;
+    Check.equalBytes("/".bytes(), back.users[0].path.view())?;
+    Check.equalU64(0, back.users[0].tags.length as u64)?;
+    Check.equalU64(0, back.users[0].attached.length as u64)?;
+    Check.equalBytes("/".bytes(), back.roles[0].path.view())?;
+    Check.equalU64(0, back.roles[0].description.length as u64)?;
+    Check.equalU64(0, back.groups.length as u64)?;
+    Check.equalU64(0, back.managed.length as u64)?;
+    // Written again, it is form 2.
+    let again = encodeIamState(borrow back)!;
+    Check.isTrue(findBytes(again.view(), "\"version\":2".bytes(), 0).isSome(), "written as form 2")?;
+    return Ok();
+}
+
+/// A user's identity policy joins its own, its groups' inline and attached ones, and an attached policy's default
+/// version only; a role's joins AWS's policy attached to it (ADR-0108 §2, §4).
+@test
+fn iamPoliciesJoinGroupsAndManagedOnes() -> Result<void, TestFailure> {
+    let iam = sampleIamWithGroups();
+    let alice = joinedPolicy(userPolicyTexts(borrow iam, 0)!.view())!!;
+    Check.isTrue(findBytes(alice.view(), "s3:GetObject".bytes(), 0).isSome(), "her own")?;
+    Check.isTrue(findBytes(alice.view(), "s3:PutObjectTagging".bytes(), 0).isSome(), "her group's inline one")?;
+    Check.isTrue(findBytes(alice.view(), "s3:PutObject\"".bytes(), 0).isSome(), "the default version attached")?;
+    Check.isTrue(findBytes(alice.view(), "s3:DeleteObject".bytes(), 0).isNull(), "not a version not the default")?;
+    Check.isTrue(parseIdentityPolicy(alice.view()).isOk(), "a policy")?;
+    let bob = joinedPolicy(userPolicyTexts(borrow iam, 1)!.view())!!;
+    Check.isTrue(findBytes(bob.view(), "s3:PutObjectTagging".bytes(), 0).isNull(), "not in the group")?;
+    let role = joinedPolicy(rolePolicyTexts(borrow iam, 0)!.view())!!;
+    Check.isTrue(findBytes(role.view(), "s3:List*".bytes(), 0).isSome(), "AWS's read-only policy")?;
+    Check.isTrue(parseIdentityPolicy(role.view()).isOk(), "a policy")?;
+    // The set's user is given the joined policy.
+    let fileKeys = parseCredentials("AKIAACCOUNT000000001 account/secret\n".bytes())!;
+    let keys = withIamKeys(fileKeys, borrow iam)!;
+    var skipped = Vector<Vector<u8>>.create();
+    let users = withIamUsers(null, keys.view(), borrow iam, mut skipped).ok()!!;
+    Check.isTrue(findBytes(users.users[0].policyText.view(), "s3:PutObjectTagging".bytes(), 0).isSome(), "joined")?;
+    return Ok();
+}
+
+/// AWS's four managed policies each parse as an identity policy; any other of AWS's is none.
+@test
+fn awsManagedPoliciesParse() -> Result<void, TestFailure> {
+    let names = ["AdministratorAccess", "AmazonS3FullAccess", "AmazonS3ReadOnlyAccess", "IAMReadOnlyAccess"];
+    for (n in names) {
+        var arn = textOf("arn:aws:iam::aws:policy/");
+        arn.append(n)!;
+        let doc = awsManagedPolicy(arn.bytes()) ?? { return Err(TestFailure.create("one of the four")); };
+        Check.isTrue(parseIdentityPolicy(doc.bytes()).isOk(), "it parses")?;
+    }
+    Check.isTrue(awsManagedPolicy("arn:aws:iam::aws:policy/AmazonEC2FullAccess".bytes()).isNull(), "not one")?;
+    Check.isTrue(awsManagedPolicy("arn:aws:iam::aws:policy/".bytes()).isNull(), "no name")?;
+    Check.isTrue(
+        managedArnIs("arn:aws:iam::000000000000:policy/team/writers".bytes(), "/team/".bytes(), "writers".bytes()),
+        "the account's",
+    )?;
+    Check.isFalse(
+        managedArnIs("arn:aws:iam::000000000000:policy/writers".bytes(), "/team/".bytes(), "writers".bytes()),
+        "its path counts",
+    )?;
     return Ok();
 }

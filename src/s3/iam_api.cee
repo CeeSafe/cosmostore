@@ -175,19 +175,16 @@ fn copyUser(u: borrow IamUser) -> Result<IamUser, AllocError> {
             createdMs: u.keys[k].createdMs,
         })?;
     }
-    var policies = Vector<IamPolicy>.create();
-    for (p in 0..u.policies.length) {
-        policies.push(
-            IamPolicy { name: copyBytes(u.policies[p].name.view())?, text: copyBytes(u.policies[p].text.view())? },
-        )?;
-    }
     return Ok(
         IamUser {
             name: copyBytes(u.name.view())?,
             id: copyBytes(u.id.view())?,
             createdMs: u.createdMs,
             keys: keys,
-            policies: policies,
+            policies: copyPolicies(u.policies.view())?,
+            path: copyBytes(u.path.view())?,
+            tags: copyTags(u.tags.view())?,
+            attached: copyNames(u.attached.view())?,
         },
     );
 }
@@ -219,13 +216,24 @@ fn applyIamCall(
                 createdMs: nowMs,
                 keys: Vector<IamKey>.create(),
                 policies: Vector<IamPolicy>.create(),
+                path: copyBytes("/".bytes())?,
+                tags: Vector<IamTag>.create(),
+                attached: Vector<Vector<u8>>.create(),
             })?;
             about = Some(state.users.length - 1);
         }
         IamCall.DeleteUser(name) => {
             let u = userAt(borrow state, name.view()) ?? { return Ok(IamOutcome.NoSuchEntity); };
-            if (state.users[u].keys.length > 0 || state.users[u].policies.length > 0) {
+            // As on AWS: its keys, inline and attached policies, and groups go first.
+            if (state.users[u].keys.length > 0 ||
+                state.users[u].policies.length > 0 || state.users[u].attached.length > 0) {
                 return Ok(IamOutcome.DeleteConflict);
+            }
+            for (g in 0..state.groups.length) {
+                if (groupHolds(
+                    borrow state.groups[g],
+                    state.users[u].name.view(),
+                )) { return Ok(IamOutcome.DeleteConflict); }
             }
             let _ = state.users.remove(u);
         }
@@ -285,7 +293,8 @@ fn applyIamCall(
                 )?;
             }
             // The user's policies joined must still be a policy (statements past its size, say).
-            match (joinedPolicy(state.users[u].policies.view())?) {
+            let texts = userPolicyTexts(borrow state, u)?;
+            match (joinedPolicy(texts.view())?) {
                 Some(j) => {
                     match (parseIdentityPolicy(j.view())) {
                         Ok(_) => {}
@@ -320,6 +329,10 @@ fn applyIamCall(
                 trust: copyBytes(trust.view())?,
                 policies: Vector<IamPolicy>.create(),
                 maxSeconds: *seconds,
+                path: copyBytes("/".bytes())?,
+                tags: Vector<IamTag>.create(),
+                attached: Vector<Vector<u8>>.create(),
+                description: Vector<u8>.create(),
             });
             state.roles.push(IamRole {
                 name: copyBytes(name.view())?,
@@ -328,11 +341,17 @@ fn applyIamCall(
                 trust: copyBytes(trust.view())?,
                 policies: Vector<IamPolicy>.create(),
                 maxSeconds: *seconds,
+                path: copyBytes("/".bytes())?,
+                tags: Vector<IamTag>.create(),
+                attached: Vector<Vector<u8>>.create(),
+                description: Vector<u8>.create(),
             })?;
         }
         IamCall.DeleteRole(name) => {
             let r = roleAtIam(borrow state, name.view()) ?? { return Ok(IamOutcome.NoSuchEntity); };
-            if (state.roles[r].policies.length > 0) { return Ok(IamOutcome.DeleteConflict); }
+            if (state.roles[r].policies.length > 0 || state.roles[r].attached.length > 0) {
+                return Ok(IamOutcome.DeleteConflict);
+            }
             let _ = state.roles.remove(r);
         }
         IamCall.PutRolePolicy(name, policy, text) => {
