@@ -670,6 +670,33 @@ error[N0259]: array and slice elements must be Copy types in v0; 'AtomicU64' is 
 **Suggested.** Arrays of non-Copy element types, built by a literal or `[T; N].fill(f)`, read by index through a
 reference. They need no Copy to be read in place.
 
+### G42: a value with a wiping `drop` leaves its bytes behind when moved, and a growing vector frees its old buffer unwiped (P3, language/runtime)
+
+**Found:** CosmoStore M20 slice 2, 21 Nov 2026 (ceesafec 0.54.0; the same at 0.59.0).
+
+**What happens.**
+- **A vector that grows** moves its elements with `ceesafe_realloc` (`runtime/core/ceesafe_rt_core.c`, line 168 at
+  v0.54.0). The old block goes back to the allocator as it was, so a `Vector<MasterKey>` or `Vector<u8>` that
+  held key bytes leaves a copy in freed memory.
+- **Drops don't help:** a `drop` that wipes runs once, at the value's last place. Earlier places, such as the old
+  buffer or a stack slot a value was returned from (`Aes256Gcm.create` returns its schedule by value), keep the
+  bytes.
+- **CosmoStore's workaround:** it reserves every vector of key bytes at its full size before writing one (the key
+  file's keys, a set's copies, decoded key text), so none grows. That covers the vectors it makes, but not the
+  library's or a moved value's stack slot.
+
+**Why it matters.** As with G34, the risk is memory read after the fact: a core dump, or a later bug. The keys
+are never written to disk.
+
+**Repro.** `var v = Vector<MasterKey>.create(); for (i in 0..64) { v.push(MasterKey.create(id(i), key(i)))!; }`
+Every growth frees a block that still holds the keys pushed so far.
+
+**Suggested.**
+- **A secret vector:** a `Vector` constructor (or allocator) whose growth and free zero the old block first, for
+  data the program marks as secret.
+- **A wiping move:** a type attribute asking moves of the type to zero the place they leave.
+- **Either one** would let a key type wipe every copy, not only its last.
+
 ## Not gaps (checked)
 
 Things that worked well and are worth keeping:

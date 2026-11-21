@@ -4625,3 +4625,16 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Not raced:** a source deleted between a count and its replica's copy is checked by reading only. Forcing it
   would need a fault hook.
 - **Next:** slice 2, key bytes.
+
+### 21 Nov 2026: M20 slice 2, key bytes (ADR-0106 §1.3)
+
+- **The key file's vector is reserved at its full size,** a key a line, so it never grows and frees a buffer of key
+  bytes. Slice 1 did the same for set copies and the retiring set.
+- **Found already done:**
+  - **A removed master key:** `KeySets.replace` zeroes every earlier set's copy (ADR-0100 §5).
+  - **lib/std's `Aes256Gcm`:** it wipes its schedule in its `drop` at v0.54.0. M17 B2's record of it was wrong.
+- **Logged as G42:** a growing vector frees its old block unwiped, and a moved value leaves its bytes in the place it
+  left. A wiping `drop` cannot reach those copies. `HmacSha256` still has no `drop` at v0.59.0 (G34, already logged).
+- **ADR-0106 §1.3 corrected.** The Lows that stay are now old sets and the copies a move leaves (G42).
+- **Tests:** both smokes (206 on the cluster) and 422 unit tests pass.
+- **Next:** slice 3, S3's order and the archive classes' rest.

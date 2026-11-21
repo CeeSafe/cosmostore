@@ -30,16 +30,21 @@
    - **The fix:** a replica's commit checks its envelope's key against the set, as the other sealed writes do
      (M15 A2).
 3. **Not every copy of a key's bytes is wiped (M17 B2), and old secrets stay in memory (M15 B2).**
-   - **Wiped, newly:**
-     - a key set's vector is made at its full size, so it never grows and leaves an old buffer behind;
-     - a removed master key's cells (its four `AtomicU64`s) are zeroed once its removal is taken, as nothing may
-       open with it any more.
+   - **Wiped, newly:** every vector of master keys is reserved at its full size before a key goes in, so none
+     grows and leaves an old buffer behind. That covers the key file's keys, a set's copies, and the retiring set.
+   - **Already wiped, found in slice 2:**
+     - **A removed master key:** `KeySets.replace` already zeroes every earlier set's copy of a key the new set
+       does not hold (ADR-0100 §5). A retiring key keeps its bytes until its removal is taken, then goes the same
+       way.
+     - **lib/std's `Aes256Gcm`:** it wipes its schedule in its `drop` (CeeSafe ADR 0135, checked at v0.54.0). M17
+       B2 recorded it as not wiped, which was wrong about the library.
    - **Staying, with a reason:**
      - **Old credential, role and target sets:** requests read them without a lock, from write-once cells. Wiping a
        set a request may still read would need a lock or a count of readers on every request. None is logged or
        sent.
-     - **lib/std's `Aes256Gcm` key schedule:** it is the library's. This is logged as a CeeSafe gap, with a repro,
-       for a wiping `drop`.
+     - **Copies a move leaves behind:** a value moved out of a stack slot, and a growing buffer in a library, keep
+       their bytes. That is the language's, logged as G42 in `CEESAFE_GAPS.md`. `HmacSha256` has no wiping `drop`,
+       still true at v0.59.0 and already logged as G34.
 4. **An archived GET checks its conditions and range before its class (M18 B2).**
    - **The fix:** the class is checked first, so an archived version not restored answers 403
      InvalidObjectState, whatever its Range or If-None-Match. That is S3's order.
@@ -98,7 +103,7 @@
 ## Slices
 
 1. **Sealed writes:** retire, then count (§1.1), and the replica's commit check (§1.2), with their fault sweeps.
-2. **Key bytes** (§1.3), and the CeeSafe gap logged.
+2. **Key bytes** (§1.3), and G42 logged.
 3. **S3's order and the archive's rest:** §1.4 and §4.
 4. **IAM:** role ids in sessions (§1.5), the files' names (§1.6), and §5.
 5. **Key rotation's rest** (§2).
@@ -112,7 +117,7 @@
     Writes naming it are refused during the removal.
   - **Check every sealed commit:** no new state, but every sealed write checks a cluster-wide list.
 - **The Lows that stay:** M16 B2, B3 and B4; M17 B5; M18 B1 and SELECT restores; M19 B3 and B5; and, in §1.3, old
-  sets and lib/std's key schedule.
+  sets, and the copies a move leaves behind (G42, found in slice 2 in place of lib/std's key schedule, which is wiped).
 
 ## Consequences
 
