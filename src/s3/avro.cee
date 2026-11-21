@@ -371,9 +371,10 @@ fn readAvro(bytes: Slice<u8>) -> Result<AvroFile, AvroError> {
         var inflated = Vector<u8>.create();
         let block: Slice<u8> = if (codec.view() == "deflate".bytes()) {
             let left = AVRO_MAX_FILE - decoded;
-            match (inflate(raw, if (left < AVRO_MAX_BLOCK) left else AVRO_MAX_BLOCK, mut inflated)) {
+            // Avro's `deflate` is raw RFC 1951: lib/std's since ceesafec 0.90.0 (CeeSafe ADR 0196).
+            match (inflateAvroBlock(raw, if (left < AVRO_MAX_BLOCK) left else AVRO_MAX_BLOCK, mut inflated)) {
                 Ok() => {}
-                Err(InflateError.OutOfMemory(e)) => { return Err(AvroError.OutOfMemory(e)); }
+                Err(DecodeError.OutOfMemory(e)) => { return Err(AvroError.OutOfMemory(e)); }
                 Err(_) => { return Err(AvroError.Malformed); }
             }
             inflated.view()
@@ -651,4 +652,27 @@ fn avroBuiltin(kind: Slice<u8>) -> bool {
         if (kind == b.bytes()) { return true; }
     }
     return false;
+}
+
+/// The bytes after a block's deflate stream that are taken: Python's Avro writer frames a block as
+/// `zlib.compress(data)[2:-1]`, so 3 of the Adler-32's 4 bytes follow the stream. Its files are PyIceberg's.
+const AVRO_DEFLATE_TAIL: usize = 4;
+
+/// A block's raw deflate stream, decoded by lib/std's `Inflater` up to `limit` bytes. Up to AVRO_DEFLATE_TAIL bytes
+/// after the stream's end are left, as Python's writer leaves them; lib/std's whole-buffer `Deflate.decompress`
+/// refuses any (ADR 0196 §2.5).
+fn inflateAvroBlock(raw: Slice<u8>, limit: usize, out: borrow mut Vector<u8>) -> Result<void, DecodeError> {
+    var inflater = Inflater.create(DeflateFormat.Raw, limit as u64)?;
+    var buf = Vector<u8>.create();
+    buf.resize(65536, 0)?;
+    var at: usize = 0;
+    while (true) {
+        let p = inflater.step(raw[at..], buf.viewMut())?;
+        out.extend(buf.view()[0..p.written])?;
+        at += p.read;
+        if (p.done) { break; }
+        if (p.read == 0 && p.written == 0) { return Err(DecodeError.Malformed); } // cut short
+    }
+    if (raw.length - at > AVRO_DEFLATE_TAIL) { return Err(DecodeError.Malformed); }
+    return Ok();
 }

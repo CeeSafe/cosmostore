@@ -43,15 +43,16 @@ boilerplate; **P2** ergonomics.
 | G32 | P2 | std/process | No way to read or raise the open-file limit (`getrlimit`/`setrlimit` `RLIMIT_NOFILE`): a server cannot lift its soft limit (256 on macOS) to the hard one at start, as servers usually do **Fixed in CeeSafe 0.41.0** (ADR 0104: `ProcessLimits.openFiles`, `raiseOpenFiles`, `IoError.TooManyOpenFiles`); `serve` raises its limit at start since 13 Nov 2026 |
 | G33 | P1 | lib/std/crypto | No authenticated cipher (AES-256-GCM): S3 server-side encryption (ADR-0046) has nothing to seal an object's bytes with, and CosmoStore calls no C. Wanted on the CPU's AES and carry-less multiply instructions, with a constant-time fallback **Fixed in CeeSafe 0.45.0** (ADR 0135: `Aes256Gcm`, `ConstantTime.equal`); SSE-S3 on PutObject, GetObject and HeadObject since 14 Nov 2026 |
 | G34 | P3 | lib/std/checksums | `HmacSha256` keeps its key XOR 0x5C in `outerKey` (and the inner pad's state in `inner`) and has no `drop` that wipes them: an SSE-C key used for an ETag (ADR-0046 §6), or a data key deriving a part key, stays in freed memory **Fixed in CeeSafe 0.85.1** (ADR 0194 §2.1: a wiping `drop` on ADR 0197's wipe, and `clone()`) |
-| G35 | P2 | lib/std | No deflate or gzip (RFC 1951, 1952), nor the IEEE CRC-32 gzip uses |
+| G35 | P2 | lib/std | No deflate or gzip (RFC 1951, 1952), nor the IEEE CRC-32 gzip uses **Fixed in CeeSafe 0.90.0** (ADR 0196 phase 1: `Deflate`, `Zlib`, `Gzip`, `Inflater`, `Deflater`); CosmoStore reads Avro and writes its inventory gzip with them, and its own inflater is gone |
 | G36 | P1 | tooling/test | The generated test runner nests each test a level deeper in C: past about 256 tests, clang refuses it without `--cflag -fbracket-depth=1024` **Fixed for the harness in CeeSafe 0.85.1** (ADR 0195 §2.1.4: a function per test); CosmoStore's CI drops the flag. The structurer's, for user code, is in 0.87.0 (ADR 0195 §2.1.1 to §2.1.3) |
 | G37 | P3 | language | No nested pattern through a reference payload: bind first, then match **Diagnostic fixed in CeeSafe 0.87.0** (ADR 0195 §2.2: no follow-on error, the two-step form named); the pattern itself stays |
 | G38 | P3 | diagnostics | `class` is reserved but means nothing, and a field named so gets an unclear error **Fixed in CeeSafe 0.87.0** (ADR 0195 §2.3: `class` is a name) |
 | G39 | P2 | diagnostics/language | `borrow x` of an optional does not pass as `borrow T?`, and the error prints the same type twice (`.asBorrow()` does it) **Fixed in CeeSafe 0.87.0** (ADR 0195 §2.4: a borrowed optional is lent at a `borrow T?` parameter) |
-| G40 | P2 | lib/std | No zstd, snappy or deflate codecs: compaction that re-encodes Parquet and Avro waits on them |
+| G40 | P2 | lib/std | No zstd, snappy or deflate codecs: compaction that re-encodes Parquet and Avro waits on them **Deflate fixed in CeeSafe 0.90.0** (ADR 0196 phase 1); snappy and zstd are its phases 2 and 3 |
 | G41 | P3 | language | An array cannot hold atomics, or any type that is not Copy **Fixed in CeeSafe 0.87.0** (ADR 0198 phase 1: arrays of types without drop glue, `arrayFrom`); the master key's cells are `[AtomicU64; 4]` |
 | G42 | P3 | language/runtime | A value with a wiping `drop` leaves its bytes behind when moved, and a growing vector frees its old buffer unwiped **Fixed in CeeSafe 0.87.0** (ADR 0197: `SecretHeap`, which wipes every block it frees or outgrows; `--scan-freed`) |
 | G43 | P2 | runtime/C backend | The C compiler deletes a wiping `drop` (or any zeroing loop) of a value on the stack at `-O2`: a local `Aes256Gcm`'s schedule, and CosmoStore's own key wipes, may not be wiped at all **Fixed for lib/std in CeeSafe 0.85.1** (ADR 0197 §2.1: `ceesafe_wipe`); `Secret.wipe` is in 0.87.0 (ADR 0197 §2.2), and CosmoStore's 34 zeroing loops use it |
+| G44 | P3 | lib/std/compress | `Deflate.decompress` refuses bytes after the stream's end, as ADR 0196 decides, with no whole-buffer form that says how much input it used: Python's Avro writer leaves 3 bytes of zlib's Adler-32 after each block, so CosmoStore steps an `Inflater` to read PyIceberg's files |
 
 ## Status (2026-11-06)
 
@@ -757,6 +758,25 @@ wiped assume these stores happen.
 
 **Suggested.** CeeSafe ADR 0197's `ceesafe_wipe(p, n)` (zeroing followed by a compiler barrier) and a built-in
 `Secret.wipe(mut place)`, used by lib/std's key holders and by CosmoStore's.
+
+### G44: no whole-buffer decode that says how much input it used (P3, lib/std)
+
+**Found:** CosmoStore's move to ceesafec 0.90.0, 21 Nov 2026. The PyIceberg checks and two Avro tests failed.
+
+**What happens.**
+- **The cause:** Python's Avro writer, whose files PyIceberg writes, frames a `deflate` block as
+  `zlib.compress(data)[2:-1]`. That drops zlib's 2-byte header but only one of the Adler-32's 4 bytes, so 3 bytes
+  follow the raw stream.
+- **lib/std's side:** `Deflate.decompress` refuses them as Malformed ("bytes after its end"), as ADR 0196 §2.5 says
+  a decoder of untrusted bytes should.
+- **CosmoStore's side:** its own inflater stopped at the stream's end. Since 0.90.0 it steps an `Inflater`, which
+  reports what it read, and takes up to 4 bytes after the end (`src/s3/avro.cee`, `inflateAvroBlock`).
+
+**Repro.** `Deflate.decompress(raw ++ [1, 2, 3], limit, mut out)` is `Err(Malformed)` for a valid raw stream `raw`.
+
+**Suggested.** A whole-buffer form that returns the input it read, such as
+`Deflate.decompressPrefix(input, limit, out) -> Result<usize, DecodeError>`, so a container format can decide what
+follows. Avro's own spec says a block's data is "deflate-compressed", and Java's writer leaves no tail.
 
 ## Not gaps (checked)
 

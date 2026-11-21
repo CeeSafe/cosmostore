@@ -4762,3 +4762,27 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Left in CEESAFE_GAPS:**
   - G35/G40, the codecs: ADR 0196 is accepted, a minor release a phase;
   - G7 and G21, of little value.
+
+### 21 Nov 2026: the toolchain moved to ceesafec 0.90.0; lib/std's codecs in place of CosmoStore's inflater (CeeSafe ADR 0196)
+
+- **CeeSafe 0.90.0** (released at the owner's word): ADR 0196's phase 1, with deflate, zlib and gzip in lib/std.
+  - It was checked on macOS and on the owner's Linux box. The fuzzer ran 44.8 million inputs, none failing.
+- **In CosmoStore:**
+  - **Avro's deflate blocks** go through lib/std's `Inflater`. Up to 4 bytes after a block's stream are taken, since
+    Python's Avro writer, PyIceberg's, leaves 3 of zlib's Adler-32 there. `Deflate.decompress` refuses them, as ADR
+    0196 decides. That gap is logged as G44.
+  - **The inventory reports** are compressed by lib/std's `Gzip` at level 6. They were stored blocks.
+  - **Removed:** `src/s3/inflate.cee` and its tests, whose refusal cases are in CeeSafe's own corpus.
+  - **The pins:** CI pins v0.90.0, and `ceesafe.toml` requires it.
+- **The first run on 0.90.0 failed:** PyIceberg's manifests didn't read (the tail above), and with them the table
+  maintenance and compaction checks.
+- **Tests after the fix:**
+  - 425 unit tests;
+  - the S3 smoke, with PyIceberg (23), table maintenance (14) and compaction (24), and the inventory's gzip read by
+    Python;
+  - the cluster smoke (206);
+  - the SDK matrix.
+- **Left in CEESAFE_GAPS:**
+  - snappy and zstd, ADR 0196's phases 2 and 3;
+  - G44;
+  - G7 and G21.
