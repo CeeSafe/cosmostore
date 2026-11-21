@@ -1,6 +1,7 @@
 # ADR-0104: The IAM API, a subset (M19)
 
-**Status:** proposed, 20 Nov 2026. M19 is item A of ADR-0103 (the owner: "A: IAM API"). Users and roles from the
+**Status:** accepted, 21 Nov 2026, as amended in slices 2 and 4 and by the exit review (§2, §3, §4, §7; the owner:
+"Accept and close"; `docs/m19-exit-review.md`). Proposed 20 Nov 2026. M19 is item A of ADR-0103 (the owner: "A: IAM API"). Users and roles from the
 files and from the API live side by side, each name once (the owner's choice).
 
 ## Context

@@ -4592,3 +4592,15 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   decided.
 - **The exit review:** `docs/m19-exit-review.md`. Every finding is fixed except five recorded Lows.
 - **Next:** the owner's decisions, accepting ADR-0104 as amended and closing M19.
+
+### 21 Nov 2026: M19 closed; M20 is the recorded Lows (ADR-0105, ADR-0106)
+
+- **M19 closed** (the owner: "Accept and close"): ADR-0104 accepted as amended. CI passed on its last commits.
+- **M20 proposed and chosen:** ADR-0105's item A, the 26 Lows of M15 to M19's exit reviews. Each is fixed or decided
+  to stay, the security ones first.
+- **ADR-0106 designs it:**
+  - **The KMS race:** retire, then count. A key being removed seals nothing new on any node before it is counted.
+  - **Lows that stay, accepted with their reasons:** M16 B2 to B4, M17 B5, M18 B1 and SELECT restores, M19 B3 and
+    B5, old sets, and lib/std's key schedule.
+  - **Seven slices.**
+- **Next:** slice 1, the sealed writes.

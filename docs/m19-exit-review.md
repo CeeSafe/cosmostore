@@ -88,6 +88,9 @@ round, through the AWS CLI and every SDK of the matrix.
 
 ## Decisions for the owner
 
+**Taken, 21 Nov 2026** (the owner: "Accept and close"): ADR-0104 accepted as amended, and M19 closed once CI passed on
+its last commits (a7de6aa, 4507f70).
+
 - **Accept ADR-0104,** with its amendments:
   - §2: authorization is on the record's name, and `*` for lists;
   - §3: the shard's leader makes the bucket, and the bucket is no client's in any role;
