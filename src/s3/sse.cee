@@ -115,7 +115,7 @@ struct SseSealer {
     fn createPart(dataKey: borrow [u8; 32], salt: [u8; 16], size: u64) -> Result<SseSealer?, AllocError> {
         var partKey = ssePartKey(dataKey, salt[..]);
         var made = SseSealer.create(borrow partKey, 0, size);
-        for (i in 0..32) { partKey[i] = 0; }
+        Secret.wipe(mut partKey[0..32]);
         match (made.asBorrowMut()) {
             Some(s) => {
                 s.header.extend(salt[..])?;
@@ -132,7 +132,7 @@ struct SseSealer {
     drop {
         match (this.etagKey.asBorrowMut()) {
             Some(k) => {
-                for (i in 0..32) { k[i] = 0; }
+                Secret.wipe(mut k[0..32]);
             }
             null => {}
         }
@@ -360,7 +360,7 @@ struct SseStream {
         var partKey = ssePartKey(borrow this.dataKey, salt);
         let size = this.sizes[this.part];
         this.opener = SseOpener.create(borrow partKey, 0, size, first);
-        for (i in 0..32) { partKey[i] = 0; }
+        Secret.wipe(mut partKey[0..32]);
         let skipped = first * (SSE_CHUNK + SSE_TAG);
         let stored = sseStoredLength(size);
         this.left = if (skipped < stored) stored - skipped else 0;
@@ -425,7 +425,7 @@ struct SseStream {
     }
 
     drop {
-        for (i in 0..32) { this.dataKey[i] = 0; }
+        Secret.wipe(mut this.dataKey[0..32]);
     }
 }
 
@@ -580,54 +580,49 @@ struct KeyBytes {
     b: [u8; 32];
 
     drop {
-        for (i in 0..32) { this.b[i] = 0; }
+        Secret.wipe(mut this.b[0..32]);
     }
 }
 
-/// A master key: its id, and its bytes in atomic cells, so a key removed can be wiped where a reader without a lock
-/// may still see it (ADR-0100 §5; arrays hold only Copy types, CEESAFE_GAPS G41, so four fields). Every copy is
-/// wiped when it is dropped.
+/// A master key: its id and its 32 bytes, in four atomic cells so that a key removed can be wiped while readers on an
+/// older set may still see it (ADR-0100 §5). An array of them since ceesafec 0.87.0 (ADR 0198, CEESAFE_GAPS G41). Every
+/// copy is wiped when it is dropped.
 struct MasterKey {
     id: Vector<u8>;
     /// Being removed (ADR-0106 §1.1): it opens what it sealed, but seals nothing new, so a cluster's count of what
     /// it sealed reaches 0 and stays there. Only a node's KMS keys are retired.
     retiring: bool;
-    private c0: AtomicU64;
-    private c1: AtomicU64;
-    private c2: AtomicU64;
-    private c3: AtomicU64;
+    private cells: [AtomicU64; 4];
 
     /// A key of `raw`'s 32 bytes.
     fn create(id: Vector<u8>, raw: Slice<u8>) -> MasterKey => MasterKey {
         id: id,
         retiring: false,
-        c0: AtomicU64.create(raw.readLE<u64>(0)),
-        c1: AtomicU64.create(raw.readLE<u64>(8)),
-        c2: AtomicU64.create(raw.readLE<u64>(16)),
-        c3: AtomicU64.create(raw.readLE<u64>(24)),
+        cells: arrayFrom((i) => AtomicU64.create(raw.readLE<u64>(i * 8))),
     };
 
     /// Its bytes, for one use.
     fn material(borrow this) -> KeyBytes {
         var out = KeyBytes { b: [0u8; 32] };
-        let words = [this.c0.load(), this.c1.load(), this.c2.load(), this.c3.load()];
         for (i in 0..4) {
-            for (j in 0..8) { out.b[i * 8 + j] = truncate<u8>(words[i] >> (j * 8) as u64); }
+            let word = this.cells[i].load();
+            for (j in 0..8) { out.b[i * 8 + j] = truncate<u8>(word >> (j * 8) as u64); }
         }
         return out;
     }
 
     /// The same id and bytes.
-    fn sameAs(borrow this, other: borrow MasterKey) -> bool =>
-        this.id.view() == other.id.view() && this.c0.load() == other.c0.load() && this.c1.load() == other.c1.load() &&
-            this.c2.load() == other.c2.load() && this.c3.load() == other.c3.load();
+    fn sameAs(borrow this, other: borrow MasterKey) -> bool {
+        if (this.id.view() != other.id.view()) { return false; }
+        for (i in 0..4) {
+            if (this.cells[i].load() != other.cells[i].load()) { return false; }
+        }
+        return true;
+    }
 
-    /// Its bytes zeroed.
+    /// Its bytes zeroed. Atomic stores, which the C compiler keeps.
     fn wipe(borrow this) {
-        this.c0.store(0);
-        this.c1.store(0);
-        this.c2.store(0);
-        this.c3.store(0);
+        for (i in 0..4) { this.cells[i].store(0); }
     }
 
     drop {
@@ -833,7 +828,7 @@ fn parseKeyFile(text: Slice<u8>) -> Result<Vector<MasterKey>, KeyFileFault> {
             },
             raw.view(),
         );
-        for (i in 0..raw.length) { raw[i] = 0; }
+        Secret.wipe(mut raw[..]);
         match (keys.push(key)) {
             Ok() => {}
             Err(e) => { return Err(keyFileOom(e)); }
@@ -1155,7 +1150,7 @@ struct NewSeal {
     kms: bool;
 
     drop {
-        for (i in 0..32) { this.dataKey[i] = 0; }
+        Secret.wipe(mut this.dataKey[0..32]);
     }
 }
 
@@ -1641,7 +1636,7 @@ fn rewrapRound(
         };
         var nonce = [0u8; 12];
         if (Random.fill(mut nonce[..]).isErr()) {
-            for (b in 0..32) { dataKey[b] = 0; }
+            Secret.wipe(mut dataKey[0..32]);
             return Ok(round);
         }
         var next = SseEnvelope {
@@ -1655,7 +1650,7 @@ fn rewrapRound(
         let aad = envelopeAad(borrow next)?;
         let firstBytes = first.material();
         let wrapped = wrapDataKeyWith(borrow firstBytes.b, aad.view(), borrow dataKey, nonce);
-        for (b in 0..32) { dataKey[b] = 0; }
+        Secret.wipe(mut dataKey[0..32]);
         next.wrapped = wrapped ?? { continue; };
         var field = Vector<u8>.create();
         encodeEnvelope(borrow next, mut field)?;

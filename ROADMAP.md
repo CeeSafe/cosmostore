@@ -4739,3 +4739,26 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 
   CosmoStore then moves to it: its key wipes onto `Secret.wipe`, its master key onto `[AtomicU64; 4]`, and its own
   CRC-32 and SHA-1 onto lib/std's.
+
+### 21 Nov 2026: the toolchain moved to ceesafec 0.88.0; CosmoStore on 0.87.0's fixes (CeeSafe ADRs 0194, 0197, 0198)
+
+- **CeeSafe 0.87.0** (released at the owner's word, built in four worktrees, checked on macOS and on the owner's
+  Linux box, x86-64):
+  - the rest of ADRs 0194, 0195 and 0197;
+  - ADR 0198's phase 1.
+- **0.88.0,** another session's, adds ADRs 0201 and 0202 on top of it. CI pins it.
+- **CosmoStore uses 0.87.0's fixes:**
+  - **G41:** the master key's cells are `[AtomicU64; 4]`, built by `arrayFrom`.
+  - **G43:** 34 loops that zeroed secrets are `Secret.wipe`, which the C compiler keeps. They zeroed data keys,
+    session secrets, key text, request headers and IAM records.
+  - **G26:** lib/std's `Crc32` and `Sha1` replace CosmoStore's own. The FIPS 180 and padding tests stay, in
+    `sha1_tests.cee`, against lib/std's.
+  - `ceesafe.toml` requires 0.87.0.
+- **Tests on 0.88.0:**
+  - `check` and `fmt --check` are clean;
+  - 427 unit tests pass;
+  - the S3 smoke passes, with its CRC-32 checks;
+  - the cluster smoke (206) and the SDK matrix pass.
+- **Left in CEESAFE_GAPS:**
+  - G35/G40, the codecs: ADR 0196 is accepted, a minor release a phase;
+  - G7 and G21, of little value.
