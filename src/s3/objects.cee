@@ -1068,13 +1068,23 @@ fn checkConditions(
 }
 
 /// Under the lock, with no I/O: the object's metadata, its conditions and its range. `openGet` adds the reader.
-fn planGet(store: borrow ObjectStore, req: borrow S3Request, versionId: [u8; 16]?) -> Result<GetPlan, S3Fail> {
+fn planGet(
+    store: borrow ObjectStore,
+    req: borrow S3Request,
+    versionId: [u8; 16]?,
+    refuseArchived: bool,
+) -> Result<GetPlan, S3Fail> {
     let bucket = req.bucket.view();
     let key = req.key.view();
     let info = match (store.headObjectOf(bucket, key, versionId)) {
         Ok(i) => i,
         Err(e) => { return Err(storeFail(e, key.length)); }
     };
+    // An archived version not restored is refused before its conditions and range, as S3 does (ADR-0106 §1.4, the
+    // M18 exit review's B2): no 304 or 416 tells of it, and no record of it is read.
+    if (refuseArchived && !readableNow(info.metadata.view(), Clock.unixMillis())) {
+        return Err(S3Fail.Code(S3Code.InvalidObjectState));
+    }
     match (checkGetConditions(req, borrow info)) {
         Ok() => {}
         Err(S3Code.NotModified) => {
@@ -1167,7 +1177,7 @@ async fn openGet(
     {
         var guard = await lockStore(app)?;
         let store = guard.data();
-        var p = match (planGet(store, req, versionId)) {
+        var p = match (planGet(store, req, versionId, withBody)) {
             Ok(p) => p,
             Err(f) => {
                 // A delete marker in the way names itself in the error's response (ADR-0041).

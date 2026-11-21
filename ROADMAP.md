@@ -4638,3 +4638,39 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **ADR-0106 §1.3 corrected.** The Lows that stay are now old sets and the copies a move leaves (G42).
 - **Tests:** both smokes (206 on the cluster) and 422 unit tests pass.
 - **Next:** slice 3, S3's order and the archive classes' rest.
+
+### 21 Nov 2026: M20 slices 3 to 6 (ADR-0106 §1.4 to §1.6, §2 to §5)
+
+- **Slice 3, S3's order and the archive classes' rest:**
+  - an archived GET not restored is refused (403 InvalidObjectState) before its conditions and range: no 304,
+    412 or 416 (M18 B2);
+  - a restore's expiry is rounded up to the next midnight UTC (M18 B3);
+  - ListObjectsV2 gives `RestoreStatus` when asked (M18 B4).
+  - **Restore events:** `s3:ObjectRestore:Post`, `:Completed` and `:Delete`, each once.
+    - **How:** the index watches versions with a restore state. The upkeep, or a shard's leader as a write, marks
+      the state ` c` and ` d` as its times come. The event comes from the state before and after, so replay raises
+      the same.
+    - **Tested:** a store test, the restore record's fault sweep with the marks, and the S3 smoke at a webhook.
+- **Slice 4, IAM's rest:**
+  - **Sessions name their role's id** (M19 B1): a session of a role deleted and made again is refused
+    (InvalidToken). Tokens from before still open.
+  - **Found by its smoke:** CreateRole right after DeleteRole answered EntityAlreadyExists. The deleted API role,
+    still in the live set until the next round, was taken for a roles file's role. API roles have ids now, file
+    roles none.
+  - **The users file's names** are read from the file, keyed or not (M19 B2).
+  - **M19 B4:** ListRoles and GetRole show the roles file's roles; ListAccessKeys with the account's key lists its
+    keys; ServiceFailure is a Receiver error; another account's IAM ARN matches nothing, and AssumeRole refuses its
+    roles.
+- **Slice 5, key rotation's rest:**
+  - the SSE and KMS key files' status digests are of the keys a node holds (M15 B4);
+  - sealed counts not known are made again in the next upkeep (M17 B3);
+  - a waiting removal asks at 2 s, doubling to a minute (M18 B5);
+  - M15 B1 is recorded as fixed by M17.
+- **Slice 6, compaction's rest:** footers are read off the store's lock (M16 B6). The plan pins each candidate's last
+  256 KB, then reads them off the lock.
+- **Proposed differently, the owner's to decide at the exit review** (ADR-0106 amended):
+  - M17 B1 and M16 B1 to stay;
+  - M16 B5 as a design of its own, since a cluster's maintenance run holds its shard's write gate throughout.
+- **Tests:** the S3 smoke (with its compaction checks), the cluster smoke (206), the SDK matrix, and 427 unit tests
+  pass.
+- **Next:** slice 7, the target smoke and the exit review.

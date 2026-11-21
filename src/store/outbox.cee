@@ -11,7 +11,11 @@ const EVENT_PUT: u8 = 1;
 const EVENT_COMPLETE: u8 = 2;
 const EVENT_DELETE: u8 = 4;
 const EVENT_MARKER: u8 = 8;
-const EVENT_ALL: u8 = 15;
+/// A restore asked, done, and its copy expired (ADR-0106 §4): s3:ObjectRestore:Post, :Completed and :Delete.
+const EVENT_RESTORE_POST: u8 = 16;
+const EVENT_RESTORE_DONE: u8 = 32;
+const EVENT_RESTORE_DELETE: u8 = 64;
+const EVENT_ALL: u8 = 127;
 const MAX_NOTIFICATION_RULES: usize = 100;
 const MAX_NOTIFICATION_BYTES: usize = 65536;
 /// The most events the outbox holds: past it the oldest is dropped, and counted (ADR-0048 §4).
@@ -315,4 +319,29 @@ fn writeOutboxCursor(dir: StringView, lsn: u64) -> Result<void, StoreError> {
     sio(Fs.rename(tmp.view(), path.view()))?;
     sio(Fs.syncDirectory(dir))?;
     return Ok();
+}
+
+/// The event a restore state's change raises (ADR-0106 §4), from the state before (`old`, none for a version never
+/// restored) and the one set: a new ready time is a restore asked (:Post); the upkeep's marks, its copy ready
+/// (:Completed) and expired (:Delete). 0 for none (an extension, or a state set again).
+fn restoreEventOf(old: Slice<u8>?, set: Slice<u8>) -> u8 {
+    let next = restorePartsOf(set) ?? { return 0; };
+    let before = match (old) {
+        Some(o) => restorePartsOf(o),
+        null => null,
+    };
+    return match (before) {
+        Some(b) => {
+            if (b.readyMs != next.readyMs) {
+                EVENT_RESTORE_POST
+            } else if (next.sent == RESTORE_SENT_DONE && b.sent != RESTORE_SENT_DONE) {
+                EVENT_RESTORE_DONE
+            } else if (next.sent == RESTORE_SENT_EXPIRED && b.sent != RESTORE_SENT_EXPIRED) {
+                EVENT_RESTORE_DELETE
+            } else {
+                0u8
+            }
+        },
+        null => EVENT_RESTORE_POST,
+    };
 }

@@ -48,15 +48,22 @@ fn restoreStatesAreKept() -> Result<void, TestFailure> {
     return Ok();
 }
 
-/// The workload: an archived version put, then its restore state set.
+/// The workload: an archived version put, then its restore state set, then the upkeep's marks for its copy ready and
+/// expired (ADR-0106 §4).
 fn restoreWorkload(dir: StringView) {
     var s = match (ObjectStore.open(dir, faultStoreConfig())) {
         Ok(s) => s,
         Err(_) => { return; }
     };
     if (s.createBucket("bkt").isErr() || putArchivedSeed(mut s).isErr()) { return; }
-    let _ = s.setFieldOf("bkt", "archived", null, RESTORE_VALUE.bytes(), SET_RESTORE_FORMAT);
+    if (s.setFieldOf("bkt", "archived", null, RESTORE_VALUE.bytes(), SET_RESTORE_FORMAT).isErr()) { return; }
+    if (s.restoreRound(1000).isErr()) { return; }
+    let _ = s.restoreRound(90000);
 }
+
+/// The states a recovered store may hold: as set, or with either of the upkeep's marks.
+fn isSweptRestore(v: Slice<u8>) -> bool =>
+    v == RESTORE_VALUE.bytes() || v == "1000 90000 GLACIER c".bytes() || v == "1000 90000 GLACIER d".bytes();
 
 /// A recovered store: the version, if there, holds its bytes, and no restore state or exactly the one set.
 fn checkRestored(s: borrow ObjectStore) -> Result<void, TestFailure> {
@@ -65,7 +72,7 @@ fn checkRestored(s: borrow ObjectStore) -> Result<void, TestFailure> {
         Ok(bytes) => {
             Check.equalBytes(patterned(40000, 7).view(), bytes.view())?;
             match (restoreValueOf(s)) {
-                Some(v) => { Check.equalBytes(RESTORE_VALUE.bytes(), v.view())?; }
+                Some(v) => { Check.isTrue(isSweptRestore(v.view()), "a state set, or marked")?; }
                 null => {}
             }
         }
@@ -85,7 +92,7 @@ fn sweepRestore(name: StringView, mode: SweepMode) -> Result<void, TestFailure> 
     Check.isTrue(points > 10, "the workload performs I/O")?;
     {
         let s = ObjectStore.open(dir.view(), faultStoreConfig())!;
-        Check.equalBytes(RESTORE_VALUE.bytes(), restoreValueOf(borrow s)!.view())?;
+        Check.equalBytes("1000 90000 GLACIER d".bytes(), restoreValueOf(borrow s)!.view())?;
     }
     for (n in 1..points + 1) {
         removeTree(dir.view());
@@ -121,3 +128,62 @@ fn restoreFaultsTorn() -> Result<void, TestFailure> => sweepRestore("restore-tor
 
 @test
 fn restoreFaultsCrash() -> Result<void, TestFailure> => sweepRestore("restore-crash", SweepMode.Crash);
+
+/// The kinds of the waiting events, as their numbers, in order.
+fn restoreKinds(s: borrow ObjectStore) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    let events = s.pendingEvents(1000)!;
+    for (i in 0..events.length) {
+        if (i > 0) { out.push(' ')!; }
+        appendDecimal(mut out, events[i].kind as u64)!;
+    }
+    return out;
+}
+
+/// A restore's events (ADR-0106 §4): asked (:Post, 16), its copy ready (:Completed, 32) and expired (:Delete, 64),
+/// each once, the upkeep marking the state as their times come; the watch found again after a reopen, and dropped
+/// once it is done with.
+@test
+fn restoresRaiseTheirEvents() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("restore-events");
+    {
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        s.createBucket("bkt")!;
+        var rules = Vector<NotificationRule>.create();
+        rules.push(notifyRule("r", "hook", EVENT_RESTORE_POST | EVENT_RESTORE_DONE | EVENT_RESTORE_DELETE, "", ""))!;
+        setNotification(mut s, "bkt", borrow rules);
+        putArchivedSeed(mut s)!;
+        s.setFieldOf("bkt", "archived", null, "1000 90000 GLACIER".bytes(), SET_RESTORE_FORMAT)!;
+        Check.equalBytes("16".bytes(), restoreKinds(borrow s).view())?;
+        Check.isFalse(s.restoreDue(999), "not ready yet")?;
+        Check.equalU64(0, s.restoreRound(999)!)?;
+        Check.isTrue(s.restoreDue(1000), "ready")?;
+        Check.equalU64(1, s.restoreRound(1000)!)?;
+        Check.equalBytes("1000 90000 GLACIER c".bytes(), restoreValueOf(borrow s)!.view())?;
+        Check.equalBytes("16 32".bytes(), restoreKinds(borrow s).view())?;
+        Check.equalU64(0, s.restoreRound(5000)!)?; // said once
+        // A state set again with the same times raises nothing.
+        s.setFieldOf("bkt", "archived", null, "1000 90000 GLACIER c".bytes(), SET_RESTORE_FORMAT)!;
+        Check.equalBytes("16 32".bytes(), restoreKinds(borrow s).view())?;
+    }
+    {
+        // Reopened: the version is watched again, from its state as kept.
+        var s = ObjectStore.open(dir.view(), faultStoreConfig())!;
+        Check.equalU64(1, s.restoreRound(90000)!)?;
+        Check.equalBytes("1000 90000 GLACIER d".bytes(), restoreValueOf(borrow s)!.view())?;
+        let kinds = restoreKinds(borrow s);
+        Check.isTrue(kinds.view().endsWith("64".bytes()), "its :Delete raised")?;
+        Check.isTrue(s.restoreDue(100000), "an entry to drop")?;
+        Check.equalU64(0, s.restoreRound(100000)!)?;
+        Check.isFalse(s.restoreDue(100000), "dropped")?;
+        // A new restore after it expired is asked again.
+        s.setFieldOf("bkt", "archived", null, "200000 300000 GLACIER".bytes(), SET_RESTORE_FORMAT)!;
+        Check.isTrue(restoreKinds(borrow s).view().endsWith("16".bytes()), "a new :Post")?;
+        Check.isTrue(s.restoreDue(200000), "watched again")?;
+    }
+    Check.isTrue(isRestoreValue("1 2 GLACIER c".bytes()), "a mark")?;
+    Check.isFalse(isRestoreValue("1 2 c".bytes()), "a mark needs its class")?;
+    Check.isFalse(isRestoreValue("1 2 GLACIER x".bytes()), "a mark that is not one")?;
+    removeTree(dir.view());
+    return Ok();
+}

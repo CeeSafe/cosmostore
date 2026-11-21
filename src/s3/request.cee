@@ -34,13 +34,38 @@ struct CredentialSets {
     sets: Vector<OnceLock<Vector<Credential>>>;
     current: AtomicU64;
     none: Vector<Credential>;
+    /// The users file's users, as `<name> <id>`, keyed or not (ADR-0106 §1.6): the names the IAM API neither makes
+    /// again nor changes, which the sets alone show only for users with a live key.
+    fileUsers: Reloaded<Vector<u8>>;
 
     fn create(first: Vector<Credential>) -> Result<CredentialSets, AllocError> {
         var sets = Vector<OnceLock<Vector<Credential>>>.create();
         sets.reserve(MAX_CREDENTIAL_SETS)?;
         for (i in 0..MAX_CREDENTIAL_SETS) { sets.push(OnceLock<Vector<Credential>>.create())?; }
         let _ = sets[0].set(first);
-        return Ok(CredentialSets { sets: sets, current: AtomicU64.create(0), none: Vector<Credential>.create() });
+        return Ok(CredentialSets {
+            sets: sets,
+            current: AtomicU64.create(0),
+            none: Vector<Credential>.create(),
+            fileUsers: Reloaded<Vector<u8>>.create(Vector<Vector<u8>>.create())?,
+        });
+    }
+
+    /// The users file's users, as `<name> <id>`.
+    fn fileUserKeys(borrow this) -> Slice<Vector<u8>> => this.fileUsers.view();
+
+    /// The users file's users, as it was read now; false when every cell is used. On a worker thread (a cell is a
+    /// lock).
+    fn noteFileUsers(borrow this, users: borrow UsersFile) -> bool {
+        var keys = Vector<Vector<u8>>.create();
+        for (i in 0..users.users.length) {
+            var k = Vector<u8>.create();
+            if (k.extend(users.users[i].name.view()).isErr() || k.push(' ').isErr() ||
+                k.extend(users.users[i].id.view()).isErr() || keys.push(k).isErr()) {
+                return false;
+            }
+        }
+        return this.fileUsers.replace(keys);
     }
 
     /// The current set.
@@ -558,6 +583,7 @@ struct S3Request {
                         name: Vector<u8>.create(),
                         policy: Vector<u8>.create(),
                         expiresMs: e.expiresMs,
+                        roleId: Vector<u8>.create(),
                     }),
                     Ok(null) => { return Err(S3Code.InvalidToken); }
                     Err(_) => { return Err(S3Code.InternalError); }

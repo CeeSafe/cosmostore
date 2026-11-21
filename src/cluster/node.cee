@@ -837,7 +837,21 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
     // The digests of the files the node was given (ADR-0096 §6), read now.
     let secret = shared.secret.view();
     let files = shared.files.view();
-    let digests = await Async.blocking(() => fileDigestLines(secret, files));
+    // The key files' digests are of the keys the node holds (ADR-0106 §2): a reload it refused shows as a difference.
+    var inUse = Vector<InUseDigest>.create();
+    for (kind in ["sse-key-file", "kms-key-file"]) {
+        let keys =
+            if (kind == "sse-key-file") shared.replication.sseKeys.get().view()
+                else shared.replication.kmsKeys.get().view();
+        match (keysDigest(secret, kind, keys)) {
+            Ok(d) => {
+                if (inUse.push(d).isErr()) { return Err(NodeFault.OutOfMemory); }
+            }
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        }
+    }
+    let used = inUse.view();
+    let digests = await Async.blocking(() => fileDigestLines(secret, files, used));
     match (digests) {
         Ok(d) => {
             if (out.extend(d.view()).isErr()) { return Err(NodeFault.OutOfMemory); }
@@ -1309,6 +1323,9 @@ async fn rewrapGate(shared: borrow NodeShared) -> u64 {
     return tag;
 }
 
+/// The wait before a waiting removal asks the cluster again: 2 s first, then doubling, to a minute (ADR-0106 §2).
+fn nextAskWait(lastMs: i64) -> i64 => if (lastMs <= 0) 2000 else if (lastMs >= 30000) 60000 else lastMs * 2;
+
 /// The keys `ids` marked retiring in the file's set, with `fresh`'s new keys (ADR-0106 §1.1), on a worker thread (the
 /// set's cell is a lock): 0 when taken, 1 out of memory, 2 when every cell is used.
 fn retireKeys(k: borrow KeyRotation, ids: Slice<Vector<u8>>, fresh: Slice<MasterKey>) -> u8 {
@@ -1334,6 +1351,15 @@ async fn reloadNodeKeysIfChanged(r: borrow mut Rotation, shared: borrow NodeShar
             }
             KeyChange.Fresh(fresh, dropped, modified) => {
                 let mode = keyFileMode(k.kind);
+                // A removal that waits asks the cluster less often as it goes on (ADR-0106 §2): 2 s, doubling to a
+                // minute; a file changed since starts it over.
+                let now = Clock.unixMillis();
+                if (modified != k.waiting) {
+                    k.askAtMs = 0;
+                    k.askEveryMs = 0;
+                } else if (now < k.askAtMs) {
+                    continue;
+                }
                 // A KMS key is retired first (ADR-0106 §1.1, the owner's choice): this node seals nothing new under
                 // it, and the count below waits until every node says the same.
                 if (mode == "kms" && dropped.length > 0 && !allRetiring(k.sets.get().view(), dropped.view())) {
@@ -1370,6 +1396,8 @@ async fn reloadNodeKeysIfChanged(r: borrow mut Rotation, shared: borrow NodeShar
                         Some(n) => {
                             // Still needed: the removal waits, tried again each cycle, so it is taken once the
                             // leaders' re-wraps have moved what the key sealed (ADR-0100 §4); said once.
+                            k.askEveryMs = nextAskWait(k.askEveryMs);
+                            k.askAtMs = now + k.askEveryMs;
                             if (k.waiting != modified) {
                                 k.waiting = modified;
                                 var line = String.create();
@@ -1390,6 +1418,8 @@ async fn reloadNodeKeysIfChanged(r: borrow mut Rotation, shared: borrow NodeShar
                             // Not known yet (a node slow to answer, a leader just elected, a node not yet reloaded):
                             // tried again each cycle, said once (CI's slower runner found a refusal for good too
                             // strict).
+                            k.askEveryMs = nextAskWait(k.askEveryMs);
+                            k.askAtMs = now + k.askEveryMs;
                             if (k.waiting != modified) {
                                 k.waiting = modified;
                                 var line = String.create();
@@ -1586,6 +1616,12 @@ fn nodeCommand() -> i32 {
                 },
                 Err(_) => { return 1; }
             };
+            match (borrow credentials) {
+                Some(sets) => {
+                    if (usersPath.length > 0) { noteFileUsersAt(sets.get(), usersPath); }
+                }
+                null => {}
+            }
             match (borrow credentials) {
                 Some(sets) => {
                     rotation = Some(Rotation {
@@ -1848,6 +1884,8 @@ fn nodeCommand() -> i32 {
                             modified: Fs.modifiedMillis(path.view()).ok() ?? 0,
                             failed: 0,
                             waiting: 0,
+                            askAtMs: 0,
+                            askEveryMs: 0,
                         });
                         if (pushed.isErr()) { return 1; }
                     }

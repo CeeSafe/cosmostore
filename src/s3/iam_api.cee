@@ -19,7 +19,11 @@ async fn iamError(
     var body = Vector<u8>.create();
     body.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ErrorResponse xmlns=\"".bytes())?;
     body.extend(IAM_XMLNS.bytes())?;
-    body.extend("\"><Error><Type>Sender</Type><Code>".bytes())?;
+    // The caller's fault, or the server's (ADR-0106 §5): IAM's ServiceFailure is a Receiver error.
+    body.extend(
+        if (status >= 500) "\"><Error><Type>Receiver</Type><Code>".bytes()
+            else "\"><Error><Type>Sender</Type><Code>".bytes(),
+    )?;
     body.extend(code.bytes())?;
     body.extend("</Code><Message>".bytes())?;
     appendXmlEscaped(mut body, message.bytes())?;
@@ -376,7 +380,11 @@ fn applyIamCall(
 // ---- The calls ----
 
 /// The users the files hold, from the credential set as it is now: their names and ids, not the API's.
-fn fileUsersOf(credentials: Slice<Credential>, state: borrow IamState) -> Result<Vector<Vector<u8>>, AllocError> {
+fn fileUsersOf(
+    credentials: Slice<Credential>,
+    fileKeys: Slice<Vector<u8>>,
+    state: borrow IamState,
+) -> Result<Vector<Vector<u8>>, AllocError> {
     var out = Vector<Vector<u8>>.create();
     for (i in 0..credentials.length) {
         let c = borrow credentials[i];
@@ -386,6 +394,16 @@ fn fileUsersOf(credentials: Slice<Credential>, state: borrow IamState) -> Result
             if (out[k].view() == c.userKey.view()) { known = true; }
         }
         if (!known) { out.push(copyBytes(c.userKey.view())?)?; } // `<name> <id>`
+    }
+    // The users file's users with no live key too (ADR-0106 §1.6, the M19 exit review's B2): their names are the
+    // file's all the same.
+    for (i in 0..fileKeys.length) {
+        if (userAt(state, nameOfUserKey(fileKeys[i].view())).isSome()) { continue; }
+        var known = false;
+        for (k in 0..out.length) {
+            if (sameNameIgnoringCase(nameOfUserKey(out[k].view()), nameOfUserKey(fileKeys[i].view()))) { known = true; }
+        }
+        if (!known) { out.push(copyBytes(fileKeys[i].view())?)?; }
     }
     return Ok(out);
 }
@@ -538,7 +556,12 @@ async fn serveIam(
         let snapshot = await readIamSnapshot(borrow app.store) ?? {
             return await iamError(exchange, 500, "ServiceFailure", "The IAM records do not read.", requestId);
         };
-        let files = fileUsersOf(credentials, borrow snapshot.state)?;
+        let files = fileUsersOf(credentials, app.credentials.get().fileUserKeys(), borrow snapshot.state)?;
+        var accountKeys = Vector<Vector<u8>>.create();
+        for (i in 0..credentials.length) {
+            let c = borrow credentials[i];
+            if (!c.revoked && !c.fromIam && c.user.length == 0) { accountKeys.push(copyBytes(c.accessKey.view())?)?; }
+        }
         return await iamRead(
             exchange,
             a,
@@ -547,6 +570,7 @@ async fn serveIam(
             borrow snapshot.state,
             files.view(),
             callerUser.isNull() && target.length == 0,
+            accountKeys.view(),
             requestId,
         );
     }
@@ -580,7 +604,7 @@ async fn serveIam(
     var outcome = IamOutcome.Conflict;
     for (attempt in 0..3) {
         let snapshotFiles = match (await readIamSnapshot(borrow app.store)) {
-            Some(s) => fileUsersOf(credentials, borrow s.state)?,
+            Some(s) => fileUsersOf(credentials, app.credentials.get().fileUserKeys(), borrow s.state)?,
             null => Vector<Vector<u8>>.create(),
         };
         var names = Vector<Vector<u8>>.create();
@@ -701,9 +725,23 @@ async fn iamRead(
     state: borrow IamState,
     files: Slice<Vector<u8>>,
     root: bool,
+    accountKeys: Slice<Vector<u8>>,
     requestId: Slice<u8>,
 ) -> Result<void, S3Fail> {
     var result = Vector<u8>.create();
+    if (action == "ListAccessKeys".bytes() && root) {
+        // The account's keys, no user named: the root's keys, as AWS lists them (ADR-0106 §5), their ids only.
+        result.extend("<AccessKeyMetadata>".bytes())?;
+        for (i in 0..accountKeys.length) {
+            result.extend("<member>".bytes())?;
+            xmlTextElement(mut result, "AccessKeyId", accountKeys[i].view())?;
+            result.extend("<Status>Active</Status><CreateDate>".bytes())?;
+            appendIso8601(mut result, 0)?;
+            result.extend("</CreateDate></member>".bytes())?;
+        }
+        result.extend("</AccessKeyMetadata><IsTruncated>false</IsTruncated>".bytes())?;
+        return await iamAnswer(exchange, action, result.view(), requestId);
+    }
     if (action == "ListUsers".bytes()) {
         result.extend("<IsTruncated>false</IsTruncated><Users>".bytes())?;
         for (i in 0..files.length) {
@@ -810,7 +848,9 @@ async fn iamRead(
 fn fileRolesOf(roles: Slice<StsRole>, state: borrow IamState) -> Result<Vector<Vector<u8>>, AllocError> {
     var out = Vector<Vector<u8>>.create();
     for (i in 0..roles.length) {
-        if (roles[i].removed || roleAtIam(state, roles[i].name.view()).isSome()) { continue; }
+        // An API role has an id, a file's none (ADR-0106 §1.5): one just deleted, still in the set until the next round,
+        // is not taken for a file's.
+        if (roles[i].removed || roles[i].id.length > 0 || roleAtIam(state, roles[i].name.view()).isSome()) { continue; }
         out.push(copyBytes(roles[i].name.view())?)?;
     }
     return Ok(out);
@@ -837,6 +877,22 @@ fn appendRole(out: borrow mut Vector<u8>, r: borrow IamRole) -> Result<void, All
     return Ok();
 }
 
+/// `<Role>…</Role>`'s inside for a roles file's role: no id or trust policy to show, as the file has neither.
+fn appendFileRole(out: borrow mut Vector<u8>, name: Slice<u8>, maxSeconds: u64) -> Result<void, AllocError> {
+    out.extend("<Path>/</Path>".bytes())?;
+    xmlTextElement(out, "RoleName", name)?;
+    out.extend("<RoleId></RoleId><Arn>".bytes())?;
+    out.extend(IAM_ACCOUNT_ARN.bytes())?;
+    out.extend("role/".bytes())?;
+    appendXmlEscaped(out, name)?;
+    out.extend("</Arn><CreateDate>".bytes())?;
+    appendIso8601(out, 0)?;
+    out.extend("</CreateDate><MaxSessionDuration>".bytes())?;
+    appendDecimal(out, maxSeconds)?;
+    out.extend("</MaxSessionDuration>".bytes())?;
+    return Ok();
+}
+
 /// A role's call, decided already: the reads (GetRole, ListRoles, GetRolePolicy) from the record, the changes through
 /// `applyIamCall`.
 async fn serveIamRole(
@@ -853,6 +909,19 @@ async fn serveIamRole(
     var result = Vector<u8>.create();
     if (a == "ListRoles".bytes()) {
         result.extend("<IsTruncated>false</IsTruncated><Roles>".bytes())?;
+        // The roles file's too (ADR-0106 §5), as ListUsers lists the users file's users.
+        let roles = app.roles.get().view();
+        for (i in 0..roles.length) {
+            if (roles[i].removed || roles[i].id.length > 0 || roleAtIam(
+                borrow snapshot.state,
+                roles[i].name.view(),
+            ).isSome()) {
+                continue;
+            }
+            result.extend("<member>".bytes())?;
+            appendFileRole(mut result, roles[i].name.view(), roles[i].maxSeconds)?;
+            result.extend("</member>".bytes())?;
+        }
         for (i in 0..snapshot.state.roles.length) {
             result.extend("<member>".bytes())?;
             appendRole(mut result, borrow snapshot.state.roles[i])?;
@@ -863,6 +932,17 @@ async fn serveIamRole(
     }
     if (!roleNameOk(name) || name == "*".bytes()) {
         return await iamError(exchange, 400, "ValidationError", "RoleName is 1 to 64 of \\w+=,.@-.", requestId);
+    }
+    if (a == "GetRole".bytes() && roleAtIam(borrow snapshot.state, name).isNull()) {
+        // A roles file's role: its name and session length; its policy is the operator's (ADR-0106 §5).
+        let roles = app.roles.get().view();
+        for (i in 0..roles.length) {
+            if (roles[i].removed || roles[i].id.length > 0 || roles[i].name.view() != name) { continue; }
+            result.extend("<Role>".bytes())?;
+            appendFileRole(mut result, roles[i].name.view(), roles[i].maxSeconds)?;
+            result.extend("</Role>".bytes())?;
+            return await iamAnswer(exchange, a, result.view(), requestId);
+        }
     }
     if (a == "GetRole".bytes() || a == "GetRolePolicy".bytes()) {
         let r = roleAtIam(borrow snapshot.state, name) ?? {

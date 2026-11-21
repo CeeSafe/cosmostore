@@ -60,6 +60,12 @@ struct VersionIndex {
     private sealed: Vector<SealedCount>;
     /// A count could not be kept (out of memory): the counts are not known, and a removal's check refuses.
     private sealedBroken: bool;
+    /// Versions that have had a restore state (ADR-0106 §4), for the upkeep that raises s3:ObjectRestore:Completed
+    /// and :Delete when their times come. Kept as versions come and their states are set; an entry whose version is
+    /// gone, or whose state is done with, is dropped by the upkeep.
+    private restoring: Vector<RestoreWatch>;
+    /// An entry could not be kept (out of memory): the upkeep walks the index once to find them again.
+    private restoringBroken: bool;
 
     fn create() -> VersionIndex => VersionIndex {
         order: OrderedMap<IndexKey, u32>.create(),
@@ -73,6 +79,8 @@ struct VersionIndex {
         broken: false,
         sealed: Vector<SealedCount>.create(),
         sealedBroken: false,
+        restoring: Vector<RestoreWatch>.create(),
+        restoringBroken: false,
     };
 
     /// The counts are not known any more (a change that could not be counted, out of memory): a removal's check then
@@ -90,6 +98,54 @@ struct VersionIndex {
             if (this.sealed[i].prefix.view() == prefix) { return Some(this.sealed[i].count); }
         }
         return Some(0);
+    }
+
+    /// Watches `version` of `key` if it has a restore state (ADR-0106 §4), once.
+    fn watchRestore(borrow mut this, key: borrow IndexKey, version: borrow ObjectVersion) {
+        if (metadataFind(version.metadata.view(), RESTORE_FIELD.bytes()).isNull()) { return; }
+        this.addWatch(key, version.versionId);
+    }
+
+    /// Watches version `versionId` of `key`, as it is in the index, if it has a restore state.
+    fn watchRestoreOf(borrow mut this, key: borrow IndexKey, versionId: [u8; 16]) {
+        let has = match (this.find(key, versionId)) {
+            Some(v) => metadataFind(v.metadata.view(), RESTORE_FIELD.bytes()).isSome(),
+            null => false,
+        };
+        if (has) { this.addWatch(key, versionId); }
+    }
+
+    private fn addWatch(borrow mut this, key: borrow IndexKey, versionId: [u8; 16]) {
+        for (i in 0..this.restoring.length) {
+            let w = borrow this.restoring[i];
+            if (w.versionId == versionId && w.key.bucket == key.bucket && w.key.key.view() == key.key.view()) {
+                return;
+            }
+        }
+        let copied = match (copyBytes(key.key.view())) {
+            Ok(k) => k,
+            Err(_) => {
+                this.restoringBroken = true;
+                return;
+            }
+        };
+        let watch = RestoreWatch { key: IndexKey { bucket: key.bucket, key: copied }, versionId: versionId };
+        if (this.restoring.push(watch).isErr()) { this.restoringBroken = true; }
+    }
+
+    /// The versions watched for their restores.
+    fn restoreWatches(borrow this) -> Slice<RestoreWatch> => this.restoring.view();
+
+    /// Stops watching entry `i`.
+    fn unwatchRestore(borrow mut this, i: usize) {
+        if (i < this.restoring.length) { let _ = this.restoring.swapRemove(i); }
+    }
+
+    /// Whether watches were lost (out of memory), and the flag cleared: the caller walks the index to find them.
+    fn takeRestoreLoss(borrow mut this) -> bool {
+        let lost = this.restoringBroken;
+        this.restoringBroken = false;
+        return lost;
     }
 
     /// Counts a version in (`add`) or out.
@@ -119,6 +175,68 @@ struct VersionIndex {
             }
         };
         if (this.sealed.push(SealedCount { prefix: copied, count: 1 }).isErr()) { this.sealedBroken = true; }
+    }
+
+    /// The counts made again from every version, once they are not known (ADR-0106 §2, the M17 exit review's B3):
+    /// true when they are known again. Counted aside and then taken, so a count that runs out of memory leaves them
+    /// not known, for a later round.
+    fn recountSealed(borrow mut this) -> bool {
+        if (!this.sealedBroken) { return true; }
+        var counts = Vector<SealedCount>.create();
+        var cursor = this.order.first();
+        while (true) {
+            let at = cursor ?? { break; };
+            var slot: u32 = this.order.valueAt(at);
+            while (slot != NO_VERSION_SLOT) {
+                match (envelopePrefixOf(borrow this.versions[slot as usize])) {
+                    Some(prefix) => {
+                        var found = false;
+                        for (i in 0..counts.length) {
+                            if (counts[i].prefix.view() == prefix) {
+                                counts[i].count += 1;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            let copied = copyBytes(prefix).ok() ?? { return false; };
+                            if (counts.push(SealedCount { prefix: copied, count: 1 }).isErr()) { return false; }
+                        }
+                    }
+                    null => {}
+                }
+                slot = this.olderOf(slot);
+            }
+            cursor = this.order.next(at);
+        }
+        this.sealed = counts;
+        this.sealedBroken = false;
+        return true;
+    }
+
+    /// Every version of every key, as `(key, version id)`, for a watch list made again (`restoreRound`).
+    fn everyVersionWith(
+        borrow this,
+        field: Slice<u8>,
+        keys: borrow mut Vector<IndexKey>,
+        ids: borrow mut Vector<[u8; 16]>,
+    ) -> Result<void, AllocError> {
+        var cursor = this.order.first();
+        while (true) {
+            let at = cursor ?? { break; };
+            var slot: u32 = this.order.valueAt(at);
+            while (slot != NO_VERSION_SLOT) {
+                let v = borrow this.versions[slot as usize];
+                if (metadataFind(v.metadata.view(), field).isSome()) {
+                    let k = this.order.keyAt(at);
+                    keys.push(IndexKey { bucket: k.bucket, key: copyBytes(k.key.view())? })?;
+                    ids.push(v.versionId)?;
+                }
+                slot = this.olderOf(slot);
+            }
+            cursor = this.order.next(at);
+        }
+        return Ok();
     }
 
     /// A version's envelope changed in place (the re-wrap, ADR-0100 §2): counted out of its old envelope's prefix and
@@ -257,6 +375,7 @@ struct VersionIndex {
         match (existing) {
             Some(s) => {
                 this.countSealed(borrow version, true);
+                this.watchRestore(borrow key, borrow version);
                 let old = replace(mut this.versions[s as usize], version);
                 this.countSealed(borrow old, false);
                 return Ok(Some(old));
@@ -264,6 +383,7 @@ struct VersionIndex {
             null => {}
         }
         // A slot first, so the B-tree's put is the last step that can fail.
+        this.watchRestore(borrow key, borrow version); // an entry for a put that fails is dropped by the upkeep
         var reused = false;
         let slot = this.takeSlot(mut reused)?;
         match (this.order.put(key, slot)) {
@@ -283,6 +403,7 @@ struct VersionIndex {
     /// index as it was.
     fn push(borrow mut this, key: IndexKey, version: ObjectVersion) -> Result<void, AllocError> {
         this.keep(borrow key);
+        this.watchRestore(borrow key, borrow version);
         let head = this.headSlot(borrow key);
         var reused = false;
         let slot = this.takeSlot(mut reused)?;
@@ -696,4 +817,10 @@ fn versionIndexChains() -> Result<void, TestFailure> {
     Check.equalU64(2, index.length() as u64)?;
     Check.equalU64(2, index.versionCount() as u64)?;
     return Ok();
+}
+
+/// A version watched for its restore (ADR-0106 §4).
+struct RestoreWatch {
+    key: IndexKey;
+    versionId: [u8; 16];
 }

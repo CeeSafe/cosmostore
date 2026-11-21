@@ -348,18 +348,56 @@ const RESTORE_FIELD: StringView = "x-cosmo-restore";
 
 /// Whether a value is a restore's state: two decimal times, ready before expiry, then the class it is for (the M18 exit
 /// review; a state without one, as first written, is taken too).
-fn isRestoreValue(value: Slice<u8>) -> bool {
-    let text = StringView.fromUtf8(value) ?? { return false; };
-    let space = text.indexOf(" ") ?? { return false; };
-    let ready = text[0..space].parseInt<i64>() ?? { return false; };
+fn isRestoreValue(value: Slice<u8>) -> bool => restorePartsOf(value).isSome();
+
+/// A restore state's parts, as kept: `<ready> <expiry>[ <class>[ <sent>]]`. `sent` is what the upkeep has said of
+/// it (ADR-0106 §4): RESTORE_SENT_NONE, RESTORE_SENT_DONE once its s3:ObjectRestore:Completed event was raised,
+/// RESTORE_SENT_EXPIRED once its :Delete was. `classAt` and `classEnd` are where its class is (equal: none).
+struct RestoreParts {
+    readyMs: i64;
+    expiryMs: i64;
+    classAt: usize;
+    classEnd: usize;
+    sent: u8;
+}
+
+const RESTORE_SENT_NONE: u8 = 0;
+const RESTORE_SENT_DONE: u8 = 1;
+const RESTORE_SENT_EXPIRED: u8 = 2;
+
+fn restorePartsOf(value: Slice<u8>) -> RestoreParts? {
+    let text = StringView.fromUtf8(value) ?? { return null; };
+    let space = text.indexOf(" ") ?? { return null; };
+    let ready = text[0..space].parseInt<i64>() ?? { return null; };
     let rest = text[space + 1..];
     let expiryEnd = rest.indexOf(" ") ?? rest.length;
-    let expiry = rest[0..expiryEnd].parseInt<i64>() ?? { return false; };
-    if (expiryEnd < rest.length) {
-        let made = rest[expiryEnd + 1..].bytes();
-        if (made != "GLACIER".bytes() && made != "DEEP_ARCHIVE".bytes()) { return false; }
+    let expiry = rest[0..expiryEnd].parseInt<i64>() ?? { return null; };
+    if (ready < 0 || ready > expiry) { return null; }
+    var parts = RestoreParts {
+        readyMs: ready,
+        expiryMs: expiry,
+        classAt: value.length,
+        classEnd: value.length,
+        sent: 0,
+    };
+    if (expiryEnd == rest.length) { return parts; }
+    let start = space + 1 + expiryEnd + 1;
+    var end = start;
+    while (end < value.length && value[end] != ' ') { end += 1; }
+    let made = value[start..end];
+    if (made != "GLACIER".bytes() && made != "DEEP_ARCHIVE".bytes()) { return null; }
+    parts.classAt = start;
+    parts.classEnd = end;
+    if (end == value.length) { return parts; }
+    let mark = value[end + 1..];
+    if (mark == "c".bytes()) {
+        parts.sent = RESTORE_SENT_DONE;
+    } else if (mark == "d".bytes()) {
+        parts.sent = RESTORE_SENT_EXPIRED;
+    } else {
+        return null;
     }
-    return ready >= 0 && ready <= expiry;
+    return parts;
 }
 
 /// Whether a value is one a re-wrap may set: an SSE-S3 envelope (`v1.s3.<id>.<nonce>.<wrapped>`), never KMS's or

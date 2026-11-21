@@ -25,6 +25,9 @@ struct StsSession {
     name: Vector<u8>;
     policy: Vector<u8>;
     expiresMs: i64;
+    /// Its role's id when it was assumed (ADR-0106 §1.5): an IAM API role's, empty for a roles file's, for
+    /// GetSessionToken's, and in a token from before the field.
+    roleId: Vector<u8>;
 }
 
 /// A role of `--roles-file`: `<name> <max session seconds> <policy JSON on one line>`.
@@ -37,6 +40,9 @@ struct StsRole {
     removed: bool;
     /// An IAM API role's trust policy (ADR-0104 §7), which AssumeRole also checks; empty for a roles file's.
     trust: Vector<u8>;
+    /// An IAM API role's id (`AROA…`), which its sessions name (ADR-0106 §1.5): a role deleted and made again under
+    /// its name has a new one, so the old role's sessions are refused. Empty for a roles file's.
+    id: Vector<u8>;
 }
 
 /// The most role sets a server takes in its life: the first, and a reload for each of the others.
@@ -94,6 +100,7 @@ fn nextRoles(old: Slice<StsRole>, fresh: Slice<StsRole>) -> Result<Vector<StsRol
                     policy: clonePolicy(borrow fresh[j].policy)?,
                     removed: false,
                     trust: copyBytes(fresh[j].trust.view())?,
+                    id: copyBytes(fresh[j].id.view())?,
                 })?;
             }
             null => {
@@ -103,6 +110,7 @@ fn nextRoles(old: Slice<StsRole>, fresh: Slice<StsRole>) -> Result<Vector<StsRol
                     policy: clonePolicy(borrow old[i].policy)?,
                     removed: true,
                     trust: copyBytes(old[i].trust.view())?,
+                    id: copyBytes(old[i].id.view())?,
                 })?;
             }
         }
@@ -119,6 +127,7 @@ fn nextRoles(old: Slice<StsRole>, fresh: Slice<StsRole>) -> Result<Vector<StsRol
             policy: clonePolicy(borrow fresh[j].policy)?,
             removed: false,
             trust: copyBytes(fresh[j].trust.view())?,
+            id: copyBytes(fresh[j].id.view())?,
         })?;
     }
     return Ok(out);
@@ -215,6 +224,7 @@ fn sealStsToken(keys: Slice<MasterKey>, s: borrow StsSession, out: borrow mut Ve
     pushText16(mut plain, s.role.view())?;
     pushText16(mut plain, s.name.view())?;
     pushText16(mut plain, s.policy.view())?;
+    pushText16(mut plain, s.roleId.view())?; // after the fields a token had before it, so those still open
     return sealToken(keys, STS_TOKEN_VERSION, STS_AAD, mut plain, out);
 }
 
@@ -229,6 +239,14 @@ fn openStsToken(keys: Slice<MasterKey>, token: Slice<u8>) -> Result<StsSession?,
     let expiresMs = p.readLE<i64>(0);
     var pos: usize = 8;
     let fields = stsFields(p, mut pos);
+    // The role's id, in tokens made since it was added (ADR-0106 §1.5).
+    var roleId = Vector<u8>.create();
+    if (fields.isOk() && pos < p.length) {
+        roleId = match (readText16(p, mut pos)) {
+            Ok(r) => r,
+            Err(_) => { return Ok(null); }
+        };
+    }
     if (pos != p.length) { return Ok(null); }
     return Ok(match (fields) {
         Ok(f) => Some(StsSession {
@@ -239,6 +257,7 @@ fn openStsToken(keys: Slice<MasterKey>, token: Slice<u8>) -> Result<StsSession?,
             name: f.name,
             policy: f.policy,
             expiresMs: expiresMs,
+            roleId: roleId,
         }),
         Err(_) => null,
     });
@@ -252,6 +271,7 @@ fn stsFields(p: Slice<u8>, at: borrow mut usize) -> Result<StsSession, MetaFault
     name: readText16(p, at)?,
     policy: readText16(p, at)?,
     expiresMs: 0,
+    roleId: Vector<u8>.create(),
 });
 
 // ---- Roles ----
@@ -311,7 +331,14 @@ fn parseRolesFile(text: Slice<u8>) -> Result<Vector<StsRole>, RolesFault> {
             Err(_) => { return Err(RolesFault.OutOfMemory); }
         };
         if (out.push(
-            StsRole { name: named, maxSeconds: seconds, policy: policy, removed: false, trust: Vector<u8>.create() },
+            StsRole {
+                name: named,
+                maxSeconds: seconds,
+                policy: policy,
+                removed: false,
+                trust: Vector<u8>.create(),
+                id: Vector<u8>.create(),
+            },
         ).isErr()) {
             return Err(RolesFault.OutOfMemory);
         }
@@ -342,6 +369,17 @@ fn sessionRequester(
         Some(r) => Some(r),
         null => { return Err(S3Fail.Code(S3Code.InvalidToken)); }
     };
+    // The role it assumed, not one made since under its name (ADR-0106 §1.5, the M19 exit review's B1).
+    match (who.role) {
+        Some(r) => {
+            let roles = app.roles.get().view();
+            let now = roles[r].id.view();
+            if (session.roleId.length > 0 && session.roleId.view() != now) {
+                return Err(S3Fail.Code(S3Code.InvalidToken));
+            }
+        }
+        null => {}
+    }
     if (session.policy.length > 0) {
         who.sessionPolicy = match (parseIdentityPolicy(session.policy.view())) {
             Ok(p) => Some(p),
@@ -505,6 +543,7 @@ async fn serveSts(
         name: Vector<u8>.create(),
         policy: Vector<u8>.create(),
         expiresMs: 0,
+        roleId: Vector<u8>.create(),
     };
     var text = Vector<u8>.create();
     var maxSeconds: u64 = 129600;
@@ -515,6 +554,16 @@ async fn serveSts(
         let marker = findBytes(arn, ":role/".bytes(), 0);
         if (!startsWithBytes(arn, "arn:aws:iam::".bytes()) || marker.isNull()) {
             return await stsError(exchange, 400, "ValidationError", "RoleArn is not a role's ARN.", requestId);
+        }
+        // Another account's role is none of this one's (ADR-0106 §5).
+        if (arn[13..(marker ?? 13)] != "000000000000".bytes()) {
+            return await stsError(
+                exchange,
+                403,
+                "AccessDenied",
+                "No such role, or not authorized to assume it.",
+                requestId,
+            );
         }
         // A role with a path (`role/path/name`) is named by its last part.
         var name = arn[(marker ?? 0) + 6..];
@@ -562,6 +611,7 @@ async fn serveSts(
             }
         }
         session.role.extend(name)?;
+        session.roleId.extend(rolesNow[role].id.view())?;
         maxSeconds = app.roles.get().view()[role].maxSeconds;
         seconds = 3600;
         if (!formValue(body.view(), "RoleSessionName", mut session.name)? || session.name.length < 2 ||

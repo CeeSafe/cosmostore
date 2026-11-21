@@ -559,8 +559,8 @@ fn nodeFileDigestsCompared() -> Result<void, TestFailure> {
     f.writeAt("reader 3600 {}\n".bytes(), 0)!;
     files.push(WatchedFile { name: copyBytes("roles-file".bytes())!, path: textOf(path.view()) })!;
     files.push(WatchedFile { name: copyBytes("users-file".bytes())!, path: textOf("/no/such/file") })!;
-    let one = fileDigestLines("secret".bytes(), files.view())!;
-    let other = fileDigestLines("another secret".bytes(), files.view())!;
+    let one = fileDigestLines("secret".bytes(), files.view(), Vector<InUseDigest>.create().view())!;
+    let other = fileDigestLines("another secret".bytes(), files.view(), Vector<InUseDigest>.create().view())!;
     let text = StringView.fromUtf8(one.view()) ?? "";
     Check.isTrue(text.startsWith("# file roles-file "), "a digest line")?;
     Check.isTrue(text.contains("# file users-file unreadable\n"), "a file that does not read")?;
@@ -577,5 +577,54 @@ fn nodeFileDigestsCompared() -> Result<void, TestFailure> {
     Check.isTrue(shown.contains(" node2=00ff\n"), "each node's digest")?;
     Check.isTrue(shown.contains("# file-differs users-file node1=unreadable node2=-\n"), "a file a node lacks")?;
     Check.isFalse(shown.contains("# files agree"), "not agreeing")?;
+    return Ok();
+}
+
+/// A key file's digest is of the keys held (ADR-0106 §2): the same keys the same, a retiring mark or other bytes not;
+/// and a waiting removal's asks back off to a minute.
+@test
+fn keyDigestsAreOfTheKeysHeld() -> Result<void, TestFailure> {
+    var a = Vector<MasterKey>.create();
+    a.push(MasterKey.create(copyBytes("k1".bytes())!, [3u8; 32][..]))!;
+    var b = Vector<MasterKey>.create();
+    b.push(MasterKey.create(copyBytes("k1".bytes())!, [3u8; 32][..]))!;
+    Check.equalBytes(
+        keysDigest("s".bytes(), "kms-key-file", a.view())!.digest.view(),
+        keysDigest("s".bytes(), "kms-key-file", b.view())!.digest.view(),
+    )?;
+    b[0].retiring = true;
+    Check.isFalse(
+        keysDigest(
+            "s".bytes(),
+            "kms-key-file",
+            a.view(),
+        )!.digest.view() == keysDigest("s".bytes(), "kms-key-file", b.view())!.digest.view(),
+        "a retiring key differs",
+    )?;
+    var c = Vector<MasterKey>.create();
+    c.push(MasterKey.create(copyBytes("k1".bytes())!, [4u8; 32][..]))!;
+    Check.isFalse(
+        keysDigest(
+            "s".bytes(),
+            "kms-key-file",
+            a.view(),
+        )!.digest.view() == keysDigest("s".bytes(), "kms-key-file", c.view())!.digest.view(),
+        "other bytes differ",
+    )?;
+    // The file's digest line takes the keys' digest.
+    var files = Vector<WatchedFile>.create();
+    files.push(WatchedFile { name: copyBytes("kms-key-file".bytes())!, path: textOf("/no/such/file") })!;
+    var used = Vector<InUseDigest>.create();
+    used.push(keysDigest("s".bytes(), "kms-key-file", a.view())!)!;
+    let lines = fileDigestLines("s".bytes(), files.view(), used.view())!;
+    Check.isFalse(lines.view().contains("unreadable".bytes()), "the keys held, not the file read")?;
+    var waits = Vector<u8>.create();
+    var w: i64 = 0;
+    for (i in 0..8) {
+        w = nextAskWait(w);
+        if (i > 0) { waits.push(' ')!; }
+        appendDecimal(mut waits, truncate<u64>(w / 1000))!;
+    }
+    Check.equalBytes("2 4 8 16 32 60 60 60".bytes(), waits.view())?;
     return Ok();
 }

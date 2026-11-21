@@ -755,6 +755,21 @@ aws s3api put-object --bucket notify --key logs/after.txt --body pub.txt > /dev/
 check "no rules, no events" "$(sleep 1; events)" 3
 aws s3 rm --recursive s3://notify/ > /dev/null 2>&1
 aws s3api delete-bucket --bucket notify > /dev/null 2>&1 && pass "delete-bucket after notifications" || fail "delete-bucket after notifications"
+# A restore's events (ADR-0106 §4): asked, its copy ready (4 s, an hour being a second here), and its copy expired
+# (a day of 24 s, rounded up to the next: up to 48 s), each once, raised by the upkeep (2 s) as their times come.
+aws s3api create-bucket --bucket notify-r > /dev/null 2>&1
+aws s3api put-bucket-notification-configuration --bucket notify-r --notification-configuration '{"QueueConfigurations":[{"Id":"restores","QueueArn":"arn:cosmostore:sqs::hook:webhook","Events":["s3:ObjectRestore:*"]}]}' > /dev/null 2>&1
+check "restore events in the rules" "$(aws s3api get-bucket-notification-configuration --bucket notify-r --query 'QueueConfigurations[0].Events[0]' --output text 2>&1)" "s3:ObjectRestore:*"
+aws s3api put-object --bucket notify-r --key cold --body pub.txt --storage-class GLACIER > /dev/null 2>&1
+check "no event for the write" "$(sleep 1; events)" 3
+aws s3api restore-object --bucket notify-r --key cold --restore-request '{"Days":1,"GlacierJobParameters":{"Tier":"Standard"}}' > /dev/null 2>&1
+check "a restore asked: :Post" "$(wait_events 4) $(event)" "4 ObjectRestore:Post notify-r cold 12 restores"
+check "its copy ready: :Completed" "$(wait_events 5) $(event)" "5 ObjectRestore:Completed notify-r cold 12 restores"
+n=0; while [ "$(events)" -lt 6 ] && [ "$n" -lt 600 ]; do sleep 0.1; n=$((n + 1)); done
+check "its copy expired: :Delete" "$(events) $(event)" "6 ObjectRestore:Delete notify-r cold 12 restores"
+check "each once" "$(sleep 3; events)" 6
+aws s3 rm --recursive s3://notify-r/ > /dev/null 2>&1
+aws s3api delete-bucket --bucket notify-r > /dev/null 2>&1
 
 # Bucket quotas (ADR-0052): `?quota` is not an S3 call, so it is sent presigned, with curl.
 quota() { curl -s -o quota.out -w '%{http_code}' -X "$1" ${3:+--data-binary "$3"} "$(python3 -I "$here/s3_raw.py" presign "$AWS_ENDPOINT_URL" "$1" "$2" "" 60 quota)"; }
@@ -890,8 +905,20 @@ check "a role whose trust names someone else" "$(code sts assume-role --role-arn
 check "a role with a policy is not deleted" "$(code iam delete-role --role-name deployer)" DeleteConflict
 aws iam delete-role-policy --role-name deployer --policy-name list > /dev/null 2>&1
 aws iam delete-role --role-name deployer > /dev/null 2>&1 && pass "iam delete-role" || fail "iam delete-role"
+# Made again under its name: the old role's session is refused, a new one's is taken (ADR-0106 §1.5).
+aws iam create-role --role-name deployer --assume-role-policy-document "$trustroot" > /dev/null 2>&1
+aws iam put-role-policy --role-name deployer --policy-name list --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::smoke"}}' > /dev/null 2>&1
+sleep 3
+check "a session of the role deleted, refused once it is made again" "$(asrole code s3api list-objects-v2 --bucket smoke --max-keys 1)" InvalidToken
+rolecreds=$(aws sts assume-role --role-arn arn:aws:iam::000000000000:role/deployer --role-session-name again --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)
+check "while the new role's session lists" "$(asrole aws s3api list-objects-v2 --bucket smoke --max-keys 1 --query KeyCount --output text 2>&1)" 1
+aws iam delete-role-policy --role-name deployer --policy-name list > /dev/null 2>&1
+aws iam delete-role --role-name deployer > /dev/null 2>&1
 aws iam delete-role --role-name locked > /dev/null 2>&1
-check "the roles gone" "$(aws iam list-roles --query 'length(Roles)' --output text 2>&1)" 0
+check "the API's roles gone, the file's listed" "$(aws iam list-roles --query 'Roles[].RoleName' --output text 2>&1)" reader
+check "a roles file's role got" "$(aws iam get-role --role-name reader --query 'Role.[Arn,MaxSessionDuration]' --output text 2>&1 | tr '\t' ' ')" "arn:aws:iam::000000000000:role/reader 3600"
+check "the account's keys listed" "$(aws iam list-access-keys --query "AccessKeyMetadata[?AccessKeyId=='$AWS_ACCESS_KEY_ID'].Status" --output text 2>&1)" Active
+check "another account's role is none" "$(code sts assume-role --role-arn arn:aws:iam::123456789012:role/reader --role-session-name smoke)" AccessDenied
 # The records' hidden bucket is no client's (ADR-0104 §3).
 check "the IAM bucket refused to S3" "$(code s3api list-objects-v2 --bucket _cosmostore-iam)" InvalidBucketName
 check "and never listed" "$(aws s3api list-buckets --query 'Buckets[?starts_with(Name, `_`)].Name' --output text 2>&1)" ""
@@ -1556,6 +1583,12 @@ check "its read refused, not restored" "$(code s3api get-object --bucket classes
 check "a copy from it refused" "$(code s3api copy-object --bucket classes --key g2 --copy-source classes/g)" InvalidObjectState
 aws s3api put-object --bucket classes --key deep --body dir.txt --storage-class DEEP_ARCHIVE > /dev/null 2>&1
 check "DEEP_ARCHIVE too" "$(code s3api get-object --bucket classes --key deep "$work/g.out")" InvalidObjectState
+# Refused before its conditions and range, as S3 does (ADR-0106 §1.4): no 304, 412 or 416 tells of it.
+getag=$(aws s3api head-object --bucket classes --key g --query ETag --output text 2>&1)
+check "a matching If-None-Match refused, not 304" "$(code s3api get-object --bucket classes --key g --if-none-match "$getag" "$work/g.out")" InvalidObjectState
+check "a failing If-Match refused, not 412" "$(code s3api get-object --bucket classes --key g --if-match '"0"' "$work/g.out")" InvalidObjectState
+check "a range past its end refused, not 416" "$(code s3api get-object --bucket classes --key g --range bytes=999999-1000000 "$work/g.out")" InvalidObjectState
+check "while HEAD still takes its conditions" "$(code s3api head-object --bucket classes --key g --if-none-match "$getag")" 304
 check "and an unknown class refused" "$(code s3api put-object --bucket classes --key g --body dir.txt --storage-class SHELF)" InvalidStorageClass
 # RestoreObject (ADR-0102 §5): an hour is a second here (--restore-hour-seconds 1), so Standard's 4 hours take 4 s, and
 # a day 24 s.
@@ -1563,9 +1596,12 @@ restore() { aws s3api restore-object --bucket classes --key "$1" --restore-reque
 check "a restore started" "$(restore g '{"Days":1,"GlacierJobParameters":{"Tier":"Standard"}}' | grep -c . )" 0
 check "restoring" "$(aws s3api head-object --bucket classes --key g --query Restore --output text 2>&1)" 'ongoing-request="true"'
 check "its read refused while restoring" "$(code s3api get-object --bucket classes --key g "$work/g.out")" InvalidObjectState
+check "a listing's RestoreStatus while restoring" "$(aws s3api list-objects-v2 --bucket classes --optional-object-attributes RestoreStatus --query "Contents[?Key=='g'].RestoreStatus.IsRestoreInProgress" --output text 2>&1)" True
 check "a restore while one runs" "$(code s3api restore-object --bucket classes --key g --restore-request '{"Days":1}')" RestoreAlreadyInProgress
 sleep 5
 check "restored: its expiry shown" "$(aws s3api head-object --bucket classes --key g --query Restore --output text 2>&1 | sed 's/expiry-date=".*"/expiry-date=…/')" 'ongoing-request="false", expiry-date=…'
+check "and in a listing, with its expiry" "$(aws s3api list-objects-v2 --bucket classes --optional-object-attributes RestoreStatus --query "Contents[?Key=='g'].[RestoreStatus.IsRestoreInProgress, RestoreStatus.RestoreExpiryDate != null]" --output text 2>&1 | tr '\t' ' ')" "False True"
+check "a key never restored has none" "$(aws s3api list-objects-v2 --bucket classes --optional-object-attributes RestoreStatus --query "Contents[?Key=='deep'].RestoreStatus" --output text 2>&1)" ""
 check "and it reads" "$(aws s3api get-object --bucket classes --key g "$work/g.out" > /dev/null 2>&1 && cmp -s dir.txt "$work/g.out" && echo same)" same
 check "a restore of a restored version extends it" "$(restore g '{"Days":2}' | grep -c .)" 0
 # A copy of a restored version is not restored (the M18 exit review): archived, it is restored on its own.

@@ -212,6 +212,10 @@ struct KeyRotation {
     /// The file's modification time whose removal waits on counts not yet known (a cluster's, ADR-0100 §4): tried
     /// again each cycle, said once.
     waiting: i64;
+    /// When a waiting removal asks the cluster again, and the wait after that (ADR-0106 §2, the M18 exit review's
+    /// B5): 2 s, doubling to a minute, from the start again when the file changes.
+    askAtMs: i64;
+    askEveryMs: i64;
 }
 
 const KEY_FILE_STS: u8 = 0;
@@ -628,6 +632,13 @@ fn checkCredentials(r: borrow mut Rotation, iam: borrow IamSnapshot?) -> Rotatio
             }
         };
     }
+    // The file's users, keyed or not, for the IAM API's names (ADR-0106 §1.6), when the file changed.
+    if (usersModified != r.usersModified) {
+        match (borrow fileUsers) {
+            Some(u) => { let _ = r.sets.get().noteFileUsers(u); }
+            null => {}
+        }
+    }
     var skipped = Vector<Vector<u8>>.create();
     let users = match (withIamUsers(fileUsers, fresh.view(), iamState, mut skipped)) {
         Ok(u) => u,
@@ -752,6 +763,15 @@ fn readCredentialsWithUsers(path: StringView, usersPath: StringView) -> Result<V
         applyUsers(mut creds, borrow users)?;
     }
     return Ok(creds);
+}
+
+/// The users file's users noted in `sets` (ADR-0106 §1.6), at start; nothing for a file that does not read, which the
+/// start has already refused.
+fn noteFileUsersAt(sets: borrow CredentialSets, usersPath: StringView) {
+    match (readUsers(usersPath)) {
+        Ok(u) => { let _ = sets.noteFileUsers(borrow u); }
+        Err(_) => {}
+    }
 }
 
 fn readCredentials(path: StringView) -> Result<Vector<Credential>, String> {
@@ -1570,6 +1590,7 @@ fn serve() -> i32 {
         },
         Err(_) => { die("out of memory"); }
     };
+    if (usersAt != 0) { noteFileUsersAt(credentials.get(), usersPath); }
     var rotation = Rotation {
         sets: credentials.clone(),
         path: textOf(credentialsPath),
@@ -1732,6 +1753,8 @@ fn serve() -> i32 {
             modified: Fs.modifiedMillis(path).ok() ?? 0,
             failed: 0,
             waiting: 0,
+            askAtMs: 0,
+            askEveryMs: 0,
         });
         if (added.isErr()) { die("out of memory"); }
     }

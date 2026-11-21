@@ -19,18 +19,14 @@ struct RestoreState {
 /// another class (a restored GLACIER version moved to DEEP_ARCHIVE by lifecycle) is none (the M18 exit review).
 fn restoreStateOf(metadata: Slice<u8>) -> RestoreState? {
     let value = metadataFind(metadata, RESTORE_FIELD.bytes()) ?? { return null; };
-    let text = StringView.fromUtf8(value) ?? { return null; };
-    let space = text.indexOf(" ") ?? { return null; };
-    let ready = text[0..space].parseInt<i64>() ?? { return null; };
-    let rest = text[space + 1..];
-    let expiryEnd = rest.indexOf(" ") ?? rest.length;
-    let expiry = rest[0..expiryEnd].parseInt<i64>() ?? { return null; };
-    if (expiryEnd < rest.length) {
-        let made = rest[expiryEnd + 1..];
-        let stored = metadataFind(metadata, STORAGE_CLASS_FIELD.bytes()) ?? "".bytes();
-        if (made.bytes() != stored) { return null; }
-    }
-    return Some(RestoreState { readyMs: ready, expiryMs: expiry });
+    return restoreStateIn(value, metadataFind(metadata, STORAGE_CLASS_FIELD.bytes()) ?? "".bytes());
+}
+
+/// The state a restore field's `value` keeps for a version of class `stored`, as `restoreStateOf`.
+fn restoreStateIn(value: Slice<u8>, stored: Slice<u8>) -> RestoreState? {
+    let parts = restorePartsOf(value) ?? { return null; };
+    if (parts.classAt < parts.classEnd && value[parts.classAt..parts.classEnd] != stored) { return null; }
+    return Some(RestoreState { readyMs: parts.readyMs, expiryMs: parts.expiryMs });
 }
 
 /// Whether a version's bytes may be read at `nowMs` (ADR-0102 §3, §4): any class but an archive one; an archive one
@@ -75,6 +71,14 @@ enum RestoreOutcome {
 }
 
 /// RestoreObject's decision and its record, under the store's lock: a version not archived, a restore running, one
+/// `ms` rounded up to the next day's start (midnight UTC at a real hour; a scaled day under `--restore-hour-seconds`),
+/// as S3 rounds a restore's expiry (ADR-0106 §4, the M18 exit review's B3). A time already at a day's start stays.
+fn untilDayEnd(ms: i64, dayMs: i64) -> i64 {
+    if (dayMs <= 0 || ms <= 0) { return ms; }
+    let over = ms % dayMs;
+    return if (over == 0) ms else ms + (dayMs - over);
+}
+
 /// done (its expiry moved), or a new one (ready after the tier's time, for `days`).
 fn applyRestore(
     s: borrow mut ObjectStore,
@@ -98,7 +102,7 @@ fn applyRestore(
             if (nowMs < state.readyMs) { return Ok(RestoreOutcome.InProgress); }
             if (nowMs < state.expiryMs) {
                 ready = state.readyMs;
-                expiry = nowMs + truncate<i64>(days) * dayMs;
+                expiry = untilDayEnd(nowMs + truncate<i64>(days) * dayMs, dayMs);
                 outcome = RestoreOutcome.Extended;
             }
         }
@@ -108,7 +112,7 @@ fn applyRestore(
         RestoreOutcome.Started => {
             let centi = tierCentiHours(stored, tier) ?? { return Ok(RestoreOutcome.ExpeditedRefused); };
             ready = nowMs + truncate<i64>(centi * hourMs / 100);
-            expiry = ready + truncate<i64>(days) * dayMs;
+            expiry = untilDayEnd(ready + truncate<i64>(days) * dayMs, dayMs);
         }
         _ => {}
     }
@@ -118,6 +122,19 @@ fn applyRestore(
     appendDecimal(mut value, truncate<u64>(expiry))?;
     value.push(' ')?;
     value.extend(stored)?; // the class it is for
+    // An extended restore keeps what was said of it, so its :Completed event is not raised again (ADR-0106 §4).
+    match (outcome) {
+        RestoreOutcome.Extended => {
+            let was = metadataFind(info.metadata.view(), RESTORE_FIELD.bytes()) ?? "".bytes();
+            match (restorePartsOf(was)) {
+                Some(p) => {
+                    if (p.sent == RESTORE_SENT_DONE) { value.extend(" c".bytes())?; }
+                }
+                null => {}
+            }
+        }
+        _ => {}
+    }
     s.setFieldOf(bucket, key, Some(info.versionId), value.view(), SET_RESTORE_FORMAT)?;
     return Ok(outcome);
 }
@@ -188,6 +205,27 @@ fn restoreHeader(metadata: Slice<u8>, nowMs: i64, exchange: borrow mut Exchange)
         appendHttpDate(mut value, state.expiryMs / 1000)?;
         value.push('"')?;
         exchange.header("x-amz-restore", value.view())?;
+    }
+    return Ok();
+}
+
+/// ListObjectsV2's `<RestoreStatus>` for a key of class `stored` whose restore field is `value`, when it is restoring
+/// or restored (ADR-0106 §4, the M18 exit review's B4): nothing for a key never restored or whose restore has expired,
+/// as S3 answers.
+fn appendRestoreStatus(
+    out: borrow mut Vector<u8>,
+    stored: Slice<u8>,
+    value: Slice<u8>,
+    nowMs: i64,
+) -> Result<void, AllocError> {
+    if (!isArchiveClass(stored) || value.length == 0) { return Ok(); }
+    let state = restoreStateIn(value, stored) ?? { return Ok(); };
+    if (nowMs < state.readyMs) {
+        out.extend("<RestoreStatus><IsRestoreInProgress>true</IsRestoreInProgress></RestoreStatus>".bytes())?;
+    } else if (nowMs < state.expiryMs) {
+        out.extend("<RestoreStatus><IsRestoreInProgress>false</IsRestoreInProgress><RestoreExpiryDate>".bytes())?;
+        appendIso8601(out, state.expiryMs)?;
+        out.extend("</RestoreExpiryDate></RestoreStatus>".bytes())?;
     }
     return Ok();
 }

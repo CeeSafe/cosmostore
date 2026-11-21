@@ -113,11 +113,35 @@ fn jsonTextOf(j: borrow Json) -> Result<Vector<u8>, AllocError> {
 
 /// The plan of a table's compaction, under the store; null when there is nothing to do (disabled, no snapshot, no
 /// bin of two files) or the table cannot be read (its job's status then says why).
+/// A candidate whose footer is still to be read, off the store's lock (ADR-0106 §3, the M16 exit review's B6): its
+/// tail pinned under it, read after.
+struct PendingInput {
+    path: Vector<u8>;
+    key: Vector<u8>;
+    size: u64;
+    generation: u64;
+    manifest: usize;
+    entry: usize;
+    sequence: i64;
+    partitionKey: Vector<u8>;
+    tail: PreparedReader;
+}
+
+/// What a footer is read from: a file's last bytes, up to this many. A longer footer's file is not joined this run.
+const COMPACTION_FOOTER_TAIL: u64 = 262144;
+
+/// A plan made under the store's lock, its candidates' footers not yet read.
+struct CompactionDraft {
+    plan: CompactionPlan;
+    pending: Vector<PendingInput>;
+    target: u64;
+}
+
 fn planCompaction(
     store: borrow mut ObjectStore,
     t: borrow MaintainedTable,
     nowMs: i64,
-) -> Result<CompactionPlan?, TablesError> {
+) -> Result<CompactionDraft?, TablesError> {
     let hidden = tableWarehouseBucket(t.bucket.view())?;
     let rec = match (tableRecord(store, t.bucket.view(), t.ns.view(), t.name.view())) {
         Ok(r) => r,
@@ -196,8 +220,8 @@ fn planCompaction(
             if (!holdsId(deleteSpecs.view(), spec)) { deleteSpecs.push(spec)?; }
         }
     }
-    // The candidates, by group, in path order.
-    var inputs = Vector<CompactionInput>.create();
+    // The candidates, by group, in path order: their footers read after, off the lock.
+    var pending = Vector<PendingInput>.create();
     let small = target * COMPACTION_SMALL_PERCENT / 100;
     for (i in 0..list.records.length) {
         let manifestRecord = borrow list.records[i];
@@ -211,7 +235,7 @@ fn planCompaction(
         if (otherSpec) { continue; }
         let manifestSequence = recordInt(manifestRecord, "sequence_number", 0);
         for (e in 0..manifests[i].records.length) {
-            if (inputs.length >= COMPACTION_MAX_CANDIDATES) { break; }
+            if (pending.length >= COMPACTION_MAX_CANDIDATES) { break; }
             let entry = borrow manifests[i].records[e];
             if (recordInt(entry, "status", 0) == 2) { continue; }
             let file = jsonMember(entry, "data_file") ?? { continue; };
@@ -238,37 +262,41 @@ fn planCompaction(
             }
             if (inDeleted) { continue; }
             let key = refKey(path);
-            let read = match (readFooterOf(store, hidden.view(), key, truncate<u64>(size))?) {
-                Some(f) => f,
-                null => { continue; }
+            // Its tail pinned, to be read off the lock (ADR-0106 §3): the version as it is now, its generation with it.
+            let bucket = catalogText(hidden.view());
+            let name = catalogText(key);
+            let info = match (store.headObject(bucket, name)) {
+                Ok(h) => h,
+                Err(_) => { continue; }
             };
-            let footer = read.footer;
-            var group = copyBytes(partitionKey.view())?;
-            group.push(0)?;
-            group.extend(footer.shape.view())?;
+            let fileSize = truncate<u64>(size);
+            if (info.size != fileSize || fileSize < 12 ||
+                metadataFind(info.metadata.view(), SSE_FIELD.bytes()).isSome()) {
+                continue;
+            }
+            let from = if (fileSize > COMPACTION_FOOTER_TAIL) fileSize - COMPACTION_FOOTER_TAIL else 0;
+            let tail = match (store.prepareReaderOf(bucket, name, null, from, fileSize)) {
+                Ok(r) => r,
+                Err(_) => { continue; }
+            };
             let sequence = match (jsonMember(entry, "sequence_number")) {
                 Some(v) => jsonI64(v) ?? manifestSequence,
                 null => manifestSequence,
             };
-            inputs.push(CompactionInput {
+            pending.push(PendingInput {
                 path: copyBytes(path)?,
                 key: copyBytes(key)?,
-                size: truncate<u64>(size),
-                generation: read.generation,
-                footer: footer,
+                size: fileSize,
+                generation: info.generation,
                 manifest: i,
                 entry: e,
                 sequence: sequence,
-                group: group,
+                partitionKey: partitionKey,
+                tail: tail,
             })?;
         }
     }
-    let bins = binsOf(inputs, target)?;
-    if (bins.length == 0) {
-        writeJobStatus(store, hidden.view(), id.view(), COMPACTION, "Successful", "", nowMs)?;
-        return Ok(null);
-    }
-    return Ok(Some(CompactionPlan {
+    let plan = CompactionPlan {
         bucket: copyBytes(t.bucket.view())?,
         hidden: hidden,
         id: id,
@@ -281,8 +309,66 @@ fn planCompaction(
         snapshot: snapshot,
         list: list,
         manifests: manifests,
-        bins: bins,
-    }));
+        bins: Vector<CompactionBin>.create(),
+    };
+    return Ok(Some(CompactionDraft { plan: plan, pending: pending, target: target }));
+}
+
+/// A draft's footers read and its plan's bins made, off the store's lock (ADR-0106 §3): no bins when there is nothing
+/// to join. The readers' pins keep the bytes each candidate had when planned.
+fn finishPlan(d: borrow mut CompactionDraft) -> Result<void, TablesError> {
+    var inputs = Vector<CompactionInput>.create();
+    for (i in 0..d.pending.length) {
+        let c = borrow mut d.pending[i];
+        let tail = match (readPrepared(mut c.tail)?) {
+            Some(t) => t,
+            null => { continue; }
+        };
+        if (tail.length < 12) { continue; }
+        let n = parquetFooterLength(tail.view()[tail.length - 8..], c.size) ?? { continue; };
+        if (n + 8 > tail.length as u64) { continue; } // a footer past the tail read: not this run
+        let at = tail.length - 8 - truncate<usize>(n);
+        let footer = match (parseParquetFooter(tail.view()[at..tail.length - 8], c.size)?) {
+            Some(f) => f,
+            null => { continue; }
+        };
+        var group = copyBytes(c.partitionKey.view())?;
+        group.push(0)?;
+        group.extend(footer.shape.view())?;
+        inputs.push(CompactionInput {
+            path: copyBytes(c.path.view())?,
+            key: copyBytes(c.key.view())?,
+            size: c.size,
+            generation: c.generation,
+            footer: footer,
+            manifest: c.manifest,
+            entry: c.entry,
+            sequence: c.sequence,
+            group: group,
+        })?;
+    }
+    d.plan.bins = binsOf(inputs, d.target)?;
+    return Ok();
+}
+
+/// A pinned reader's bytes, whole; null when they cannot be read.
+fn readPrepared(prepared: borrow mut PreparedReader) -> Result<Vector<u8>?, AllocError> {
+    var reader = match (prepared.open()) {
+        Ok(r) => r,
+        Err(_) => { return Ok(null); }
+    };
+    var out = Vector<u8>.create();
+    var buf = Vector<u8>.create();
+    buf.resize(65536, 0)?;
+    while (true) {
+        let n = match (reader.read(buf.viewMut())) {
+            Ok(n) => n,
+            Err(_) => { return Ok(null); }
+        };
+        if (n == 0) { break; }
+        out.extend(buf.view()[0..n])?;
+    }
+    return Ok(Some(out));
 }
 
 /// The manifest list of snapshot `id`, if the metadata has the snapshot and it names one.
@@ -311,77 +397,6 @@ fn readWarehouseAvro(store: borrow ObjectStore, hidden: Slice<u8>, path: Slice<u
         Err(AvroError.OutOfMemory(e)) => Err(TablesError.OutOfMemory(e)),
         Err(_) => Ok(null),
     };
-}
-
-/// A data file's footer, and the generation of the version it was read from.
-struct FooterRead {
-    footer: ParquetFooter;
-    generation: u64;
-}
-
-/// A data file's footer, read from the store; null when it is not one to join: missing, sealed, of another size than
-/// its manifest says, or not a footer `parquet.cee` takes.
-fn readFooterOf(
-    store: borrow mut ObjectStore,
-    hidden: Slice<u8>,
-    key: Slice<u8>,
-    size: u64,
-) -> Result<FooterRead?, TablesError> {
-    let bucket = catalogText(hidden);
-    let name = catalogText(key);
-    let info = match (store.headObject(bucket, name)) {
-        Ok(i) => i,
-        Err(_) => { return Ok(null); }
-    };
-    if (info.size != size || size < 12 || metadataFind(
-        info.metadata.view(),
-        SSE_FIELD.bytes(),
-    ).isSome()) { return Ok(null); }
-    let tail = match (readRange(store, bucket, name, size - 8, size)?) {
-        Some(t) => t,
-        null => { return Ok(null); }
-    };
-    let n = parquetFooterLength(tail.view(), size) ?? { return Ok(null); };
-    let footer = match (readRange(store, bucket, name, size - 8 - n, size - 8)?) {
-        Some(f) => f,
-        null => { return Ok(null); }
-    };
-    return Ok(match (parseParquetFooter(footer.view(), size)?) {
-        Some(f) => Some(FooterRead { footer: f, generation: info.generation }),
-        null => null,
-    });
-}
-
-/// Bytes `[from, to)` of an object; null when it cannot be read.
-fn readRange(
-    store: borrow mut ObjectStore,
-    bucket: StringView,
-    key: StringView,
-    from: u64,
-    to: u64,
-) -> Result<Vector<u8>?, AllocError> {
-    var prepared = match (store.prepareReaderOf(bucket, key, null, from, to)) {
-        Ok(p) => p,
-        Err(_) => { return Ok(null); }
-    };
-    var reader = match (prepared.open()) {
-        Ok(r) => r,
-        Err(_) => { return Ok(null); }
-    };
-    let want = truncate<usize>(to - from);
-    var out = Vector<u8>.create();
-    var buf = Vector<u8>.create();
-    buf.resize(65536, 0)?;
-    while (out.length < want) {
-        let n = match (reader.read(buf.viewMut())) {
-            Ok(n) => n,
-            Err(_) => { return Ok(null); }
-        };
-        if (n == 0) { return Ok(null); }
-        let take = if (n > want - out.length) want - out.length else n;
-        out.extend(buf.view()[0..take])?;
-    }
-    return Ok(Some(out));
 }
 
 /// The bins of `inputs` (ADR-0098 §2): by group, in path order, each up to `target` bytes; a bin of one file is left.
@@ -1152,10 +1167,27 @@ async fn compactTable(
     t: borrow MaintainedTable,
     nowMs: i64,
 ) -> Result<void, NetError> {
-    var plan = match (await lockedPlan(store, t, nowMs)?) {
-        Some(p) => p,
+    var draft = match (await lockedPlan(store, t, nowMs)?) {
+        Some(d) => d,
         null => { return Ok(); }
     };
+    match (await Async.blocking(() => finishPlan(mut draft))) {
+        Ok() => {}
+        Err(_) => { return Ok(); } // out of memory: the next run
+    }
+    var plan = draft.plan;
+    if (plan.bins.length == 0) {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let p = borrow plan;
+        let _ = await Async.blocking(
+            () => writeJobStatus(st, p.hidden.view(), p.id.view(), COMPACTION, "Successful", "", nowMs),
+        );
+        return Ok();
+    }
     var outputs = Vector<CompactionOutput>.create();
     var joined = Vector<usize>.create();
     for (b in 0..plan.bins.length) {
@@ -1209,12 +1241,12 @@ async fn lockedPrepare(
     };
 }
 
-/// The plan, under the store.
+/// The plan's draft, under the store.
 async fn lockedPlan(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     t: borrow MaintainedTable,
     nowMs: i64,
-) -> Result<CompactionPlan?, NetError> {
+) -> Result<CompactionDraft?, NetError> {
     var guard = match (await store.get().lock()) {
         Ok(g) => g,
         Err(_) => { return Err(NetError.Closed); }

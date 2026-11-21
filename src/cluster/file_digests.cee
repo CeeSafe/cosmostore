@@ -8,13 +8,55 @@ struct WatchedFile {
     path: String;
 }
 
+/// A file whose digest is of what the node uses, not of the file's text (ADR-0106 §2, the M15 exit review's B4): an
+/// SSE or KMS key file, whose reload a node may refuse, so two nodes given the same file can hold different keys.
+struct InUseDigest {
+    name: Vector<u8>;
+    /// The digest's hex.
+    digest: Vector<u8>;
+}
+
+/// The digest of the keys a set holds, in order: their ids, bytes and retiring marks, as `fileDigestLines`' are made.
+fn keysDigest(secret: Slice<u8>, name: StringView, keys: Slice<MasterKey>) -> Result<InUseDigest, AllocError> {
+    var mac = HmacSha256.create(secret);
+    mac.update("cosmostore keys digest\n".bytes());
+    for (i in 0..keys.length) {
+        mac.update(keys[i].id.view());
+        mac.update(if (keys[i].retiring) " r ".bytes() else " - ".bytes());
+        let m = keys[i].material();
+        mac.update(m.b[..]);
+        mac.update("\n".bytes());
+    }
+    let d = mac.finish();
+    var hex = Vector<u8>.create();
+    appendHexBytes(mut hex, d[0..16])?;
+    return Ok(InUseDigest { name: copyBytes(name.bytes())?, digest: hex });
+}
+
 /// The status lines of a node's files, `# file <name> <digest>`, read now; `unreadable` for one that does not read.
-fn fileDigestLines(secret: Slice<u8>, files: Slice<WatchedFile>) -> Result<Vector<u8>, AllocError> {
+/// A file in `inUse` is given that digest instead, of what the node holds.
+fn fileDigestLines(
+    secret: Slice<u8>,
+    files: Slice<WatchedFile>,
+    inUse: Slice<InUseDigest>,
+) -> Result<Vector<u8>, AllocError> {
     var out = Vector<u8>.create();
     for (i in 0..files.length) {
         out.extend("# file ".bytes())?;
         out.extend(files[i].name.view())?;
         out.push(0x20)?;
+        var used: usize? = null;
+        for (u in 0..inUse.length) {
+            if (inUse[u].name.view() == files[i].name.view()) { used = Some(u); }
+        }
+        match (used) {
+            Some(u) => {
+                out.extend(inUse[u].digest.view())?;
+                out.push(0x0A)?;
+                continue;
+            }
+            null => {}
+        }
         var text = Vector<u8>.create();
         match (readSmallFileInto(files[i].path.view(), mut text)) {
             Ok() => {

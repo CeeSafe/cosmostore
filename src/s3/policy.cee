@@ -821,11 +821,13 @@ fn identityResourcePattern(text: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
         head.extend(service.bytes())?;
         head.push(':')?;
         if (!startsWithBytes(text, head.view())) { continue; }
-        // The region and the account: any, as CosmoStore has one of each.
+        // The region and the account: any region, as CosmoStore has one; for IAM, the account's or none (ADR-0106 §5).
         var at = head.length;
+        var accountAt = at;
         for (field in 0..2) {
             let colon = pieceEnd(text, at, ':');
             if (colon == text.length) { return Err(malformedPolicy()); }
+            if (field == 1) { accountAt = at; }
             at = colon + 1;
         }
         let rest = text[at..];
@@ -833,6 +835,13 @@ fn identityResourcePattern(text: Slice<u8>) -> Result<Vector<u8>, S3Fail> {
         let kind = if (service == "iam" && startsWithBytes(rest, "user/".bytes())) "user/".bytes() else if (service ==
             "iam") "role/".bytes() else "bucket/".bytes();
         if (!startsWithBytes(rest, kind) || rest.length == kind.length) { return Err(malformedPolicy()); }
+        let account = text[accountAt..at - 1];
+        if (service == "iam" && account.length > 0 && account != "*".bytes() && account != "000000000000".bytes()) {
+            // Another account's user or role: a resource no request is (`iam:foreign/…` is never a call's).
+            out.extend("iam:foreign/".bytes())?;
+            out.extend(rest)?;
+            return Ok(out);
+        }
         out.extend(service.bytes())?;
         out.push(':')?;
         out.extend(if (service == "iam") rest else rest[kind.length..])?;
@@ -2015,6 +2024,7 @@ fn copyRoles(roles: Slice<StsRole>) -> Result<Vector<StsRole>, AllocError> {
                 policy: clonePolicy(borrow r.policy)?,
                 removed: r.removed,
                 trust: copyBytes(r.trust.view())?,
+                id: copyBytes(r.id.view())?,
             },
         )?;
     }

@@ -78,6 +78,13 @@ fn eventMaskOf(name: Slice<u8>) -> Result<u8, S3Fail> {
     if (name == "s3:ObjectRemoved:*".bytes()) { return Ok(EVENT_DELETE | EVENT_MARKER); }
     if (name == "s3:ObjectRemoved:Delete".bytes()) { return Ok(EVENT_DELETE); }
     if (name == "s3:ObjectRemoved:DeleteMarkerCreated".bytes()) { return Ok(EVENT_MARKER); }
+    // Restores (ADR-0106 §4): asked, done, and the restored copy expired.
+    if (name == "s3:ObjectRestore:*".bytes()) {
+        return Ok(EVENT_RESTORE_POST | EVENT_RESTORE_DONE | EVENT_RESTORE_DELETE);
+    }
+    if (name == "s3:ObjectRestore:Post".bytes()) { return Ok(EVENT_RESTORE_POST); }
+    if (name == "s3:ObjectRestore:Completed".bytes()) { return Ok(EVENT_RESTORE_DONE); }
+    if (name == "s3:ObjectRestore:Delete".bytes()) { return Ok(EVENT_RESTORE_DELETE); }
     if (startsWithBytes(name, "s3:".bytes())) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
     return Err(S3Fail.Code(S3Code.InvalidArgument));
 }
@@ -86,6 +93,9 @@ fn eventName(kind: u8) -> StringView =>
     if (kind == EVENT_PUT) "ObjectCreated:Put"
         else if (kind == EVENT_COMPLETE) "ObjectCreated:CompleteMultipartUpload"
         else if (kind == EVENT_DELETE) "ObjectRemoved:Delete"
+        else if (kind == EVENT_RESTORE_POST) "ObjectRestore:Post"
+        else if (kind == EVENT_RESTORE_DONE) "ObjectRestore:Completed"
+        else if (kind == EVENT_RESTORE_DELETE) "ObjectRestore:Delete"
         else "ObjectRemoved:DeleteMarkerCreated";
 
 /// The text between `<name>` and `</name>` from `at` on, and where it ends; null when there is no more.
@@ -204,6 +214,20 @@ fn notificationXml(rules: Slice<NotificationRule>, out: borrow mut Vector<u8>) -
         } else if ((r.events & EVENT_MARKER) != 0) {
             xmlElement(out, "Event", "s3:ObjectRemoved:DeleteMarkerCreated".bytes(), false)?;
         }
+        let restores = EVENT_RESTORE_POST | EVENT_RESTORE_DONE | EVENT_RESTORE_DELETE;
+        if ((r.events & restores) == restores) {
+            xmlElement(out, "Event", "s3:ObjectRestore:*".bytes(), false)?;
+        } else {
+            if ((r.events & EVENT_RESTORE_POST) != 0) {
+                xmlElement(out, "Event", "s3:ObjectRestore:Post".bytes(), false)?;
+            }
+            if ((r.events & EVENT_RESTORE_DONE) != 0) {
+                xmlElement(out, "Event", "s3:ObjectRestore:Completed".bytes(), false)?;
+            }
+            if ((r.events & EVENT_RESTORE_DELETE) != 0) {
+                xmlElement(out, "Event", "s3:ObjectRestore:Delete".bytes(), false)?;
+            }
+        }
         if (r.prefix.length > 0 || r.suffix.length > 0) {
             out.extend("<Filter><S3Key>".bytes())?;
             if (r.prefix.length > 0) {
@@ -298,7 +322,8 @@ fn eventJson(e: borrow OutboxEvent, rule: usize, out: borrow mut Vector<u8>) -> 
     out.extend("\"},\"object\":{\"key\":\"".bytes())?;
     appendUriEncoded(out, e.key.view(), true)?;
     out.push('"')?;
-    if (e.kind == EVENT_PUT || e.kind == EVENT_COMPLETE) {
+    // A restore's event names the object as a write's does (ADR-0106 §4).
+    if (e.kind == EVENT_PUT || e.kind == EVENT_COMPLETE || e.kind >= EVENT_RESTORE_POST) {
         out.extend(",\"size\":".bytes())?;
         appendDecimal(out, e.size)?;
         out.extend(",\"eTag\":\"".bytes())?;

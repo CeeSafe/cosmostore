@@ -49,9 +49,11 @@
    - **The fix:** the class is checked first, so an archived version not restored answers 403
      InvalidObjectState, whatever its Range or If-None-Match. That is S3's order.
 5. **A role deleted and made again under its name revives the old role's sessions (M19 B1).**
-   - **The fix:** a session names its role's id (`AROA…`, and the file roles get one as the users file's users have
-     theirs). A session whose role's id is not the role's now is refused, as users' grants are matched by name and id
-     (M11).
+   - **The fix:** a session names its role's id (`AROA…`). A session whose role's id is not the role's now is
+     refused (InvalidToken), as users' grants are matched by name and id (M11).
+   - **The roles file's roles (amended in slice 4):** they have no id, as the file has none to give. A file role
+     removed refuses its sessions while it is out of the file (ADR-0096 §2). Putting it back is the operator's act,
+     as before.
    - **Sessions from before the change** do not name an id. They stay valid until they expire, at most 12 hours.
 6. **CreateUser can take the name of a users file's user with no key (M19 B2).**
    - **The fix:** the files' names come from the users file itself, keyed or not, not from the live set.
@@ -62,7 +64,7 @@
 |---|---|
 | M15 B1: a removal holds the lock for a full count | **Fixed in M17:** the count is the index's, kept as versions are written (ADR-0100 §1). Recorded as fixed. |
 | M15 B4: the status digests are of the files, not the keys in use | **Fixed:** the digest is of the keys a node uses, so `# files agree` means the keys agree. |
-| M17 B1: new bytes under the first key can never be taken | **Fixed:** the re-wrap compares a version's key by its tag (id and bytes), not its id, so new bytes under the first key re-wrap versions sealed under the old bytes. |
+| M17 B1: new bytes under the first key can never be taken | **Proposed to stay (amended in slice 5, the owner's to decide at the exit review):** an envelope names its key's id, not its bytes. Once new bytes take the id, nothing opens what the old bytes sealed, so no re-wrap can move it. A fix would change the envelope's format. **The way out works:** put a new id first; the old key's versions re-wrap under it, and its removal is then taken. The refusal's message says so. |
 | M17 B3: counts unknown (out of memory) refuse every removal until a restart | **Fixed:** the node walks to count again in its next upkeep, off the lock and in steps, and its counts are known again. |
 | M17 B5: a node's re-wrap gate is up to 10 s old | **Stays:** the operator's rule never removes the first key, and such a removal is refused anyway. |
 | M18 B5: a waiting removal is asked of every node every 2 s | **Fixed:** the asks back off, doubling to 60 s, and reset when the file changes. |
@@ -71,12 +73,12 @@
 
 | Low | Decided |
 |---|---|
-| M16 B1: a run that loses the lock leaves the files it put | **Fixed:** they are deleted as a failed commit's are. |
+| M16 B1: a run that loses the lock leaves the files it put | **Proposed to stay (amended in slice 6, the owner's to decide at the exit review):** the lock is lost only when the store closes, as the server stops, and nothing can delete then. Unreferenced file removal reclaims them after its age, as M16 recorded. A failed put or commit already deletes what it wrote. |
 | M16 B2: the joined footer keeps the first input's key-value metadata | **Stays:** the inputs share schema, writer and column orders, so it describes them all. |
 | M16 B3: page indexes and bloom filters are dropped | **Stays:** ADR-0098 §1's choice. Row-group statistics still skip. |
 | M16 B4: only files of the same writer join | **Stays:** by design. A reader may work around a writer's quirks by its name. |
-| M16 B5: on a cluster, compaction runs inside a request under the front's timeout | **Fixed:** the leader runs it as its own job and the request answers at once, as `serve`'s upkeep does. |
-| M16 B6: footers are read under the store's lock | **Fixed:** read off the lock, with the generation checked again before the commit (as the copy already is). |
+| M16 B5: on a cluster, compaction runs inside a request under the front's timeout | **Proposed as a design of its own (amended in slice 6, the owner's to decide at the exit review):** the request is one leader write. `leadWrite` holds the shard's write gate from the forward to the commit, so a long run also holds up that shard's other writes, not only the timeout. The fix splits a run into gated writes (each bin's put, then the commit), with the copy between them outside the gate, each with its own extent push and proposal. That is more than this table's fixes, so it is proposed as ADR-0105's next item, beside B. Not seen at test sizes. |
+| M16 B6: footers are read under the store's lock | **Fixed (slice 6):** the plan pins each candidate's tail (its last 256 KB) under the lock. The footers are read and parsed off it, and the bins made there. The generation is checked again before each copy, as it already was. A longer footer's file is not joined that run. |
 
 ### 4. Archive classes' rest
 
@@ -123,5 +125,13 @@
 
 - **The store:** sessions carry a role id, so an older binary refuses sessions issued by a newer one. That costs
   nothing a restart would not, since sessions do not outlive their keys' sets.
+- **Restore events (§4, decided in slice 3):**
+  - **How they work:** a restore's state takes an optional mark after its class, ` c` once its :Completed event is
+    raised and ` d` once its :Delete is. The upkeep writes the marks as their times come, on `serve` and as a write
+    on each shard's leader.
+  - **Which event:** it comes from the state before and after, as the record applies, so replay raises the same
+    ones.
+  - **Older binaries:** an older binary refuses a restore record with a mark, so it cannot open a store holding one.
+    A notification rule naming restore events reads as no rules to an older binary.
 - **The cluster:** a new `retiring` mark in the key sets and their status lines, so nodes on an older binary do not
   report it. A removal waits until every node does, as M17's removals wait for every node's count.

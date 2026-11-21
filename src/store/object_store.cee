@@ -436,6 +436,9 @@ struct ListPage {
     parts: Vector<u32>;
     /// Each key's storage class, empty for STANDARD (ADR-0090 §1).
     classes: Vector<Vector<u8>>;
+    /// Each key's restore state as kept (`x-cosmo-restore`, ADR-0102 §5), empty for none: ListObjectsV2's
+    /// `RestoreStatus` (ADR-0106 §4).
+    restores: Vector<Vector<u8>>;
     commonPrefixes: Vector<Vector<u8>>;
     truncated: bool;
     /// The last key or prefix returned, for the next page's `startAfter`.
@@ -799,9 +802,26 @@ fn applyRecord(
             // A re-wrap (ADR-0100 §2) moves the version's count from its old envelope's key to the new one's.
             var movedFrom: Vector<u8>? = null;
             var unknownAfter = false;
+            // A restore's state (ADR-0106 §4): the event it raises, from the state before and after, so replay raises
+            // the same; and the version watched for the events its times raise.
+            var restoreEvent: u8 = 0;
+            var eventSize: u64 = 0;
+            var eventMd5 = [0u8; 16];
+            var eventParts: u32 = 0;
+            var eventMtime: i64 = 0;
             match (state.index.findMut(borrow key, versionId)) {
                 Some(v) => {
                     if (v.lsn == generation) {
+                        if (m.format == SET_RESTORE_FORMAT) {
+                            restoreEvent = restoreEventOf(
+                                metadataFind(v.metadata.view(), RESTORE_FIELD.bytes()),
+                                tags.view(),
+                            );
+                            eventSize = v.size;
+                            eventMd5 = v.md5;
+                            eventParts = v.parts;
+                            eventMtime = v.mtimeMillis;
+                        }
                         if (m.format == SET_ENVELOPE_FORMAT) {
                             match (envelopePrefixOf(v)) {
                                 Some(p) => {
@@ -839,6 +859,22 @@ fn applyRecord(
                 null => {}
             }
             if (unknownAfter) { state.index.markSealedUnknown(); }
+            if (m.format == SET_RESTORE_FORMAT) {
+                state.index.watchRestoreOf(borrow key, versionId);
+            }
+            if (restoreEvent != 0) {
+                state.noteEvent(
+                    restoreEvent,
+                    m.bucket.view(),
+                    m.key.view(),
+                    versionId,
+                    eventSize,
+                    eventMd5,
+                    eventParts,
+                    eventMtime,
+                    lsn,
+                )?;
+            }
         }
         RecordType.UploadCreate => {
             state.addSegmentBytes(segment, totalLen as u64, 0)?;
@@ -5498,6 +5534,7 @@ struct ObjectStore {
             mtimes: Vector<i64>.create(),
             parts: Vector<u32>.create(),
             classes: Vector<Vector<u8>>.create(),
+            restores: Vector<Vector<u8>>.create(),
             commonPrefixes: Vector<Vector<u8>>.create(),
             truncated: false,
             nextMarker: Vector<u8>.create(),
@@ -5556,6 +5593,9 @@ struct ObjectStore {
                     page.mtimes.push(v.mtimeMillis)?;
                     page.parts.push(v.parts)?;
                     page.classes.push(storageClassIn(v.metadata.view())?)?;
+                    page.restores.push(
+                        copyBytes(metadataFind(v.metadata.view(), RESTORE_FIELD.bytes()) ?? "".bytes())?,
+                    )?;
                     page.nextMarker.clear();
                     page.nextMarker.extend(key)?;
                     page.nextMarkerIsPrefix = false;
@@ -6112,6 +6152,10 @@ struct ObjectStore {
             lifecycle = this.applyLifecycle(now)?;
             this.lifecycleRan = now;
         }
+        // Restores' times (ADR-0106 §4): on `serve` here; a shard's leader runs them itself, as a write.
+        if (!this.raft) { let _ = this.restoreRound(now)?; }
+        // Sealed counts not known (out of memory, ADR-0106 §2): made again, so a key removal is decided again.
+        let _ = this.recountSealed();
         let total = this.upkeepHeld(started);
         let ended = Clock.monotonicNanos();
         return Ok(MaintenanceReport {
@@ -6434,6 +6478,108 @@ struct ObjectStore {
             }
         }
         return n;
+    }
+
+    /// The sealed counts made again if they are not known (ADR-0106 §2): true when they are known. From memory, under
+    /// the store's lock, as a removal's count is.
+    fn recountSealed(borrow mut this) -> bool => this.state.index.recountSealed();
+
+    /// Whether a watched restore has a change due at `nowMillis` (ADR-0106 §4): its copy ready, or expired, and not
+    /// yet said; or an entry to drop. A shard's leader asks before it opens a write for `restoreRound`.
+    fn restoreDue(borrow this, nowMillis: i64) -> bool {
+        let watches = this.state.index.restoreWatches();
+        for (i in 0..watches.length) {
+            let w = borrow watches[i];
+            let v = this.state.index.find(borrow w.key, w.versionId) ?? { return true; };
+            let value = metadataFind(v.metadata.view(), RESTORE_FIELD.bytes()) ?? { return true; };
+            let parts = restorePartsOf(value) ?? { return true; };
+            if (parts.sent == RESTORE_SENT_EXPIRED) { return true; }
+            if (parts.sent == RESTORE_SENT_NONE && nowMillis >= parts.readyMs) { return true; }
+            if (parts.sent == RESTORE_SENT_DONE && nowMillis >= parts.expiryMs) { return true; }
+        }
+        return false;
+    }
+
+    /// The watched restores whose times have come, marked (ADR-0106 §4): a copy ready gets ` c`, which raises
+    /// s3:ObjectRestore:Completed as it applies; one expired after that gets ` d`, which raises :Delete. One step a
+    /// version a round. Entries whose version is gone, whose state is done with, or whose class has moved are
+    /// dropped. The number of marks written.
+    fn restoreRound(borrow mut this, nowMillis: i64) -> Result<u64, StoreError> {
+        // Watches lost to out of memory: found again from the index's versions.
+        if (this.state.index.takeRestoreLoss()) {
+            var keys = Vector<IndexKey>.create();
+            var ids = Vector<[u8; 16]>.create();
+            this.state.index.everyVersionWith(RESTORE_FIELD.bytes(), mut keys, mut ids)?;
+            for (i in 0..keys.length) { this.state.index.watchRestoreOf(borrow keys[i], ids[i]); }
+        }
+        var buckets = Vector<Vector<u8>>.create();
+        var names = Vector<Vector<u8>>.create();
+        var versions = Vector<[u8; 16]>.create();
+        var values = Vector<Vector<u8>>.create();
+        var at = this.state.index.restoreWatches().length;
+        while (at > 0) {
+            at -= 1;
+            var gone = false;
+            var next = Vector<u8>.create();
+            {
+                let watches = this.state.index.restoreWatches();
+                let w = borrow watches[at];
+                let bucket = this.state.bucketName(w.key.bucket);
+                match (this.state.index.find(borrow w.key, w.versionId)) {
+                    Some(v) => {
+                        let stored = metadataFind(v.metadata.view(), STORAGE_CLASS_FIELD.bytes()) ?? "".bytes();
+                        let value = metadataFind(v.metadata.view(), RESTORE_FIELD.bytes()) ?? "".bytes();
+                        match (restorePartsOf(value)) {
+                            Some(p) => {
+                                let made = if (p.classAt < p.classEnd) value[p.classAt..p.classEnd] else stored;
+                                let archived = stored == "GLACIER".bytes() || stored == "DEEP_ARCHIVE".bytes();
+                                if (bucket.length == 0 || !archived || made != stored ||
+                                    p.sent == RESTORE_SENT_EXPIRED) {
+                                    gone = true;
+                                } else {
+                                    let mark: Slice<u8>? =
+                                        if (p.sent == RESTORE_SENT_NONE && nowMillis >= p.readyMs) Some(
+                                            " c".bytes(),
+                                        )
+                                            else if (p.sent == RESTORE_SENT_DONE && nowMillis >= p.expiryMs) Some(
+                                                " d".bytes(),
+                                            )
+                                            else null;
+                                    match (mark) {
+                                        Some(m) => {
+                                            appendDecimal(mut next, truncate<u64>(p.readyMs))?;
+                                            next.push(' ')?;
+                                            appendDecimal(mut next, truncate<u64>(p.expiryMs))?;
+                                            next.push(' ')?;
+                                            next.extend(stored)?;
+                                            next.extend(m)?;
+                                            buckets.push(copyBytes(bucket)?)?;
+                                            names.push(copyBytes(w.key.key.view())?)?;
+                                            versions.push(w.versionId)?;
+                                        }
+                                        null => {}
+                                    }
+                                }
+                            }
+                            null => { gone = true; }
+                        }
+                    }
+                    null => { gone = true; }
+                }
+            }
+            if (gone) {
+                this.state.index.unwatchRestore(at);
+            } else if (next.length > 0) {
+                values.push(next)?;
+            }
+        }
+        for (i in 0..values.length) {
+            let b = StringView.fromUtf8(buckets[i].view()) ?? "";
+            let k = StringView.fromUtf8(names[i].view()) ?? "";
+            this.stageFieldOf(b, k, Some(versions[i]), values[i].view(), SET_RESTORE_FORMAT)?;
+        }
+        if (values.length > 0) { this.commitStaged()?; }
+        return Ok(values.length as u64);
     }
 
     /// Whether the lifecycle rules are due at `nowMillis`, by the store's interval (a shard's leader runs them itself,
