@@ -153,6 +153,7 @@ func main() {
 	tables(ctx, cfg)
 	users(ctx, cfg)
 	longTail(ctx, cfg)
+	iamChecks(ctx, cfg)
 	if failed {
 		os.Exit(1)
 	}

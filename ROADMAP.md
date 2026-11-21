@@ -4581,3 +4581,14 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - boto3's IAM checks (users, keys, policies, roles, AssumeRole, deletes);
   - 421 unit tests.
 - **Next:** the Go, Java, JS and .NET IAM checks, and the exit review.
+
+### 21 Nov 2026: M19 slice 5, the SDK checks and the exit review (ADR-0104)
+
+- **The SDK matrix's IAM checks:** Go, Java, JS and .NET now run what boto3 does. Each makes a user, key, policy and
+  role, uses the key and the role, deletes them all, and sees the key refused (14 checks each, all passing).
+  - **New dependencies:** `@aws-sdk/client-iam`, Go's `service/iam`, Java's `iam` and `AWSSDK.IdentityManagement`.
+- **ADR-0104 amended:** §2, the record's name and `*` for lists; §3, the leader makes the bucket, and the bucket is no
+  client's in any role; §4, nodes read their replica or a peer's, never older; §7, trust policies hold only what is
+  decided.
+- **The exit review:** `docs/m19-exit-review.md`. Every finding is fixed except five recorded Lows.
+- **Next:** the owner's decisions, accepting ADR-0104 as amended and closing M19.

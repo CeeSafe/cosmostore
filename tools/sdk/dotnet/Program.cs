@@ -503,4 +503,54 @@ foreach (var sessions in new[] { false })
     await t.DeleteTableBucketAsync(new Amazon.S3Tables.Model.DeleteTableBucketRequest { TableBucketARN = arn });
     Check("DeleteTableBucket", (await t.ListTableBucketsAsync(new Amazon.S3Tables.Model.ListTableBucketsRequest())).TableBuckets?.Count ?? 0, 0);
 }
+// The IAM API (ADR-0104): a user, its key and policy; the key signs within an upkeep round (10 s here); a role made
+// with a trust policy and assumed; everything deleted, and the key refused after.
+{
+    var im = new Amazon.IdentityManagement.AmazonIdentityManagementServiceClient(new Amazon.IdentityManagement.AmazonIdentityManagementServiceConfig
+    {
+        ServiceURL = endpoint, AuthenticationRegion = "us-east-1", MaxErrorRetry = 0,
+    });
+    Check("iam CreateUser", (await im.CreateUserAsync(new Amazon.IdentityManagement.Model.CreateUserRequest { UserName = "dotnet-dev" })).User.UserName, "dotnet-dev");
+    Check("iam a name twice", await CodeOf(() => im.CreateUserAsync(new Amazon.IdentityManagement.Model.CreateUserRequest { UserName = "dotnet-dev" })), "EntityAlreadyExists");
+    var iamKey = (await im.CreateAccessKeyAsync(new Amazon.IdentityManagement.Model.CreateAccessKeyRequest { UserName = "dotnet-dev" })).AccessKey;
+    Check("iam CreateAccessKey", iamKey.AccessKeyId[..4] + " " + (iamKey.SecretAccessKey.Length >= 40), "AKIA True");
+    Check("iam ListAccessKeys", (await im.ListAccessKeysAsync(new Amazon.IdentityManagement.Model.ListAccessKeysRequest { UserName = "dotnet-dev" })).AccessKeyMetadata[0].AccessKeyId, iamKey.AccessKeyId);
+    var iamReads = "{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::" + m7 + "/*\"}}";
+    await im.PutUserPolicyAsync(new Amazon.IdentityManagement.Model.PutUserPolicyRequest { UserName = "dotnet-dev", PolicyName = "reads", PolicyDocument = iamReads });
+    var iamDoc = Uri.UnescapeDataString((await im.GetUserPolicyAsync(new Amazon.IdentityManagement.Model.GetUserPolicyRequest { UserName = "dotnet-dev", PolicyName = "reads" })).PolicyDocument);
+    Check("iam GetUserPolicy", iamDoc.Contains("\"Action\":\"s3:GetObject\""), true);
+    var iamDev = new AmazonS3Client(new Amazon.Runtime.BasicAWSCredentials(iamKey.AccessKeyId, iamKey.SecretAccessKey),
+        new AmazonS3Config { ServiceURL = endpoint, ForcePathStyle = true, AuthenticationRegion = "us-east-1", MaxErrorRetry = 0 });
+    Check("iam its key reads within a round", await Until(async () => await Read(iamDev, m7, "logged.txt") == "logged", 25), true);
+    Check("iam and no more", await CodeOf(() => iamDev.PutObjectAsync(new PutObjectRequest { BucketName = m7, Key = "no", ContentBody = "no" })), "AccessDenied");
+    var iamTrust = "{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:root\"},\"Action\":\"sts:AssumeRole\"}}";
+    Check("iam CreateRole", (await im.CreateRoleAsync(new Amazon.IdentityManagement.Model.CreateRoleRequest { RoleName = "dotnet-role", AssumeRolePolicyDocument = iamTrust })).Role.Arn,
+        "arn:aws:iam::000000000000:role/dotnet-role");
+    var iamTrustRead = Uri.UnescapeDataString((await im.GetRoleAsync(new Amazon.IdentityManagement.Model.GetRoleRequest { RoleName = "dotnet-role" })).Role.AssumeRolePolicyDocument);
+    Check("iam its trust read back", iamTrustRead.Contains("\"AWS\":\"arn:aws:iam::000000000000:root\""), true);
+    await im.PutRolePolicyAsync(new Amazon.IdentityManagement.Model.PutRolePolicyRequest { RoleName = "dotnet-role", PolicyName = "reads", PolicyDocument = iamReads });
+    Amazon.SecurityToken.Model.Credentials? iamAssumed = null;
+    await Until(async () =>
+    {
+        try
+        {
+            iamAssumed = (await sts.AssumeRoleAsync(new Amazon.SecurityToken.Model.AssumeRoleRequest
+            {
+                RoleArn = "arn:aws:iam::000000000000:role/dotnet-role", RoleSessionName = "dotnet",
+            })).Credentials;
+            return true;
+        }
+        catch (Amazon.Runtime.AmazonServiceException) { return false; }
+    }, 25);
+    Check("iam the role assumed", iamAssumed?.AccessKeyId?.StartsWith("ASIA") ?? false, true);
+    if (iamAssumed != null) { Check("iam its session reads", await Read(As(iamAssumed), m7, "logged.txt"), "logged"); }
+    Check("iam a user with keys not deleted", await CodeOf(() => im.DeleteUserAsync(new Amazon.IdentityManagement.Model.DeleteUserRequest { UserName = "dotnet-dev" })), "DeleteConflict");
+    await im.DeleteAccessKeyAsync(new Amazon.IdentityManagement.Model.DeleteAccessKeyRequest { UserName = "dotnet-dev", AccessKeyId = iamKey.AccessKeyId });
+    await im.DeleteUserPolicyAsync(new Amazon.IdentityManagement.Model.DeleteUserPolicyRequest { UserName = "dotnet-dev", PolicyName = "reads" });
+    await im.DeleteUserAsync(new Amazon.IdentityManagement.Model.DeleteUserRequest { UserName = "dotnet-dev" });
+    await im.DeleteRolePolicyAsync(new Amazon.IdentityManagement.Model.DeleteRolePolicyRequest { RoleName = "dotnet-role", PolicyName = "reads" });
+    await im.DeleteRoleAsync(new Amazon.IdentityManagement.Model.DeleteRoleRequest { RoleName = "dotnet-role" });
+    Check("iam the user gone", await CodeOf(() => im.GetUserAsync(new Amazon.IdentityManagement.Model.GetUserRequest { UserName = "dotnet-dev" })), "NoSuchEntity");
+    Check("iam its key refused within a round", await Until(async () => await Read(iamDev, m7, "logged.txt") == "InvalidAccessKeyId", 25), true);
+}
 return failed ? 1 : 0;

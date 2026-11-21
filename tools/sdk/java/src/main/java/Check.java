@@ -146,6 +146,7 @@ public class Check {
         Tables.run(endpoint);
         Users.run(endpoint);
         LongTail.run(endpoint);
+        Iam.run(endpoint);
         System.exit(failed ? 1 : 0);
     }
 }

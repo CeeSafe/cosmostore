@@ -19,6 +19,11 @@ import {
 } from "@aws-sdk/client-s3-control";
 import { STSClient, GetSessionTokenCommand, AssumeRoleCommand } from "@aws-sdk/client-sts";
 import {
+  IAMClient, CreateUserCommand, GetUserCommand, DeleteUserCommand, CreateAccessKeyCommand, ListAccessKeysCommand,
+  DeleteAccessKeyCommand, PutUserPolicyCommand, GetUserPolicyCommand, DeleteUserPolicyCommand, CreateRoleCommand,
+  GetRoleCommand, DeleteRoleCommand, PutRolePolicyCommand, DeleteRolePolicyCommand,
+} from "@aws-sdk/client-iam";
+import {
   S3TablesClient, CreateTableBucketCommand, ListTableBucketsCommand, CreateNamespaceCommand, CreateTableCommand,
   GetTableCommand, UpdateTableMetadataLocationCommand, RenameTableCommand, ListTablesCommand, DeleteTableCommand,
   DeleteNamespaceCommand, DeleteTableBucketCommand, PutTableBucketMaintenanceConfigurationCommand,
@@ -358,5 +363,44 @@ for (const sessions of [true, false]) {
   await s3t.send(new DeleteObjectCommand({ Bucket: "sdk-js-tail", Key: "g" }));
   await s3t.send(new DeleteObjectCommand({ Bucket: "sdk-js-tail", Key: "ia" }));
   await s3t.send(new DeleteBucketCommand({ Bucket: "sdk-js-tail" }));
+}
+
+// The IAM API (ADR-0104): a user, its key and policy; the key signs within an upkeep round (10 s here); a role made
+// with a trust policy and assumed; everything deleted, and the key refused after.
+{
+  const iam = new IAMClient({ endpoint, region: "us-east-1", maxAttempts: 1 });
+  check("iam CreateUser", (await iam.send(new CreateUserCommand({ UserName: "js-dev" }))).User.UserName, "js-dev");
+  check("iam a name twice", await codeOf(iam.send(new CreateUserCommand({ UserName: "js-dev" }))), "EntityAlreadyExistsException");
+  const made = (await iam.send(new CreateAccessKeyCommand({ UserName: "js-dev" }))).AccessKey;
+  check("iam CreateAccessKey", [made.AccessKeyId.slice(0, 4), made.SecretAccessKey.length >= 40], ["AKIA", true]);
+  check("iam ListAccessKeys", (await iam.send(new ListAccessKeysCommand({ UserName: "js-dev" }))).AccessKeyMetadata.map((k) => k.AccessKeyId), [made.AccessKeyId]);
+  const reads = JSON.stringify({ Version: "2012-10-17", Statement: { Effect: "Allow", Action: "s3:GetObject", Resource: `arn:aws:s3:::${M7}/*` } });
+  await iam.send(new PutUserPolicyCommand({ UserName: "js-dev", PolicyName: "reads", PolicyDocument: reads }));
+  const doc = (await iam.send(new GetUserPolicyCommand({ UserName: "js-dev", PolicyName: "reads" }))).PolicyDocument;
+  check("iam GetUserPolicy", JSON.parse(decodeURIComponent(doc)).Statement.Action, "s3:GetObject");
+  const dev = new S3Client({ endpoint, forcePathStyle: true, region: "us-east-1", maxAttempts: 1,
+    credentials: { accessKeyId: made.AccessKeyId, secretAccessKey: made.SecretAccessKey } });
+  check("iam its key reads within a round", await until(async () => (await read(dev, M7, "logged.txt")) === "logged", 25), true);
+  check("iam and no more", await codeOf(dev.send(new PutObjectCommand({ Bucket: M7, Key: "no", Body: "no" }))), "AccessDenied");
+  const trust = JSON.stringify({ Version: "2012-10-17", Statement: { Effect: "Allow", Principal: { AWS: `arn:aws:iam::${ACCOUNT}:root` }, Action: "sts:AssumeRole" } });
+  check("iam CreateRole", (await iam.send(new CreateRoleCommand({ RoleName: "js-role", AssumeRolePolicyDocument: trust }))).Role.Arn,
+    `arn:aws:iam::${ACCOUNT}:role/js-role`);
+  const role = (await iam.send(new GetRoleCommand({ RoleName: "js-role" }))).Role;
+  check("iam its trust read back", JSON.parse(decodeURIComponent(role.AssumeRolePolicyDocument)).Statement.Principal.AWS, `arn:aws:iam::${ACCOUNT}:root`);
+  await iam.send(new PutRolePolicyCommand({ RoleName: "js-role", PolicyName: "reads", PolicyDocument: reads }));
+  const creds = await until(async () => {
+    try { return (await sts.send(new AssumeRoleCommand({ RoleArn: `arn:aws:iam::${ACCOUNT}:role/js-role`, RoleSessionName: "js" }))).Credentials; }
+    catch (e) { return null; }
+  }, 25);
+  check("iam the role assumed", (creds?.AccessKeyId ?? "").slice(0, 4), "ASIA");
+  if (creds) check("iam its session reads", await read(as(creds), M7, "logged.txt"), "logged");
+  check("iam a user with keys not deleted", await codeOf(iam.send(new DeleteUserCommand({ UserName: "js-dev" }))), "DeleteConflictException");
+  await iam.send(new DeleteAccessKeyCommand({ UserName: "js-dev", AccessKeyId: made.AccessKeyId }));
+  await iam.send(new DeleteUserPolicyCommand({ UserName: "js-dev", PolicyName: "reads" }));
+  await iam.send(new DeleteUserCommand({ UserName: "js-dev" }));
+  await iam.send(new DeleteRolePolicyCommand({ RoleName: "js-role", PolicyName: "reads" }));
+  await iam.send(new DeleteRoleCommand({ RoleName: "js-role" }));
+  check("iam the user gone", await codeOf(iam.send(new GetUserCommand({ UserName: "js-dev" }))), "NoSuchEntityException");
+  check("iam its key refused within a round", await until(async () => (await read(dev, M7, "logged.txt")) === "InvalidAccessKeyId", 25), true);
 }
 process.exit(failed ? 1 : 0);

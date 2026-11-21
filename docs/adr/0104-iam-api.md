@@ -31,6 +31,8 @@ files and from the API live side by side, each name once (the owner's choice).
 2. **Who may call:**
    - the account's keys;
    - a user whose identity policy allows the call's `iam:<Action>` on its resource (the user's or role's ARN);
+     - **The resource (amended at the exit review):** the record's own name, as names match ignoring case. A list
+       call's resource is `*`.
    - never a session (STS's): IAM answers it `AccessDenied`, as AWS does without MFA.
 3. **Where kept:**
    - **The records:** users, keys, user policies and roles made by the API are records in a hidden bucket,
@@ -38,6 +40,12 @@ files and from the API live side by side, each name once (the owner's choice).
      callers cannot both make a name.
    - **Secrets:** kept as the credentials file keeps them: in the clear, in the store, as durable as any object.
    - **On a cluster:** the bucket lives on a shard, written through its log like any other.
+     - **Who makes it (amended in slice 4):** that shard's leader, at its upkeep, as a write. A leader's writes
+       apply when they commit, so a bucket made in the first call would not be seen by that call's own write. Until
+       it exists, a call answers 503 `ServiceUnavailable`, which SDKs retry.
+     - **Where calls go:** a `POST /` signed for `iam` goes to that shard, in its header or its query.
+   - **No client's (amended at the exit review):** the bucket is refused as a request's bucket, and also as a copy's
+     or part copy's source, a log's target, an inventory's or a replica's destination, and an access point's bucket.
 4. **Live at once:**
    - **How a set is built:** the credential and role sets are built from the files and the records together. An API
      user's key goes after the files' keys and keeps its place, as a file's does.
@@ -45,6 +53,10 @@ files and from the API live side by side, each name once (the owner's choice).
      - **`serve`:** its upkeep (`--maintain-seconds`, 10 s by default) reads the records' generation and rebuilds
        when it changed.
      - **A node:** its reload task does the same every 2 s (ADR-0092).
+       - **Where it reads (amended in slice 4):** from its own replica of the records' shard, or else from a peer's
+         `/cluster/iam`, signed as nodes' asks of each other are, since the records hold secrets.
+       - **Never older:** a node never takes records older than ones it has already taken, so a lagging replica
+         cannot bring a deleted key back.
      - **Why not before the call answers:** the rebuild's state is the upkeep's, so sharing it with request handlers
        would take a rework of the upkeep's loops. AWS's IAM is itself eventually consistent: its documentation has
        changes take seconds to be seen everywhere.
@@ -61,6 +73,12 @@ files and from the API live side by side, each name once (the owner's choice).
    - **What is enforced:** for a role made by the API, `AssumeRole` also needs its trust policy to allow the caller,
      as an `AWS` principal (the account, or the user's ARN).
    - **The roles file's roles:** they keep ADR-0088 §4's rule (the caller's identity policy alone).
+   - **What a trust policy may hold (amended at the exit review):** statements that are each an Allow or a Deny, with
+     a Principal and an Action. Wildcard actions are only `*` and `sts:*`.
+     - **Refused at `CreateRole`** (MalformedPolicyDocument): Condition, NotPrincipal, NotAction, NotResource, and
+       other wildcards.
+     - **Why:** ignoring them would let the role be assumed by more callers than the policy names.
+     - **One already stored with them** allows nobody.
 
 ## Slices
 
@@ -68,7 +86,7 @@ files and from the API live side by side, each name once (the owner's choice).
 2. The users, keys and user policies calls.
 3. The roles calls, and trust policies at `AssumeRole`.
 4. A cluster: the records through a shard, and every node's sets.
-5. The CLI and SDK checks (`aws iam`, boto3, Go, Java, JS, .NET), and the exit review.
+5. The CLI and SDK checks (`aws iam`, boto3, Go, Java, JS, .NET), and the exit review (`docs/m19-exit-review.md`).
 
 ## Consequences
 
