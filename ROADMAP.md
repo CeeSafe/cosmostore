@@ -4844,3 +4844,32 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - the cluster smoke (206);
   - the SDK matrix.
 - **Next:** slice 3, groups.
+
+### 22 Nov 2026: M21 slice 3, groups (ADR-0108 §3)
+
+- **The calls** (`src/s3/iam_groups.cee`):
+  - `CreateGroup` (with a path), `GetGroup` (with its users), `ListGroups` (`PathPrefix`), `DeleteGroup`;
+  - `AddUserToGroup`, `RemoveUserFromGroup`, `ListGroupsForUser`;
+  - `PutGroupPolicy`, `GetGroupPolicy`, `ListGroupPolicies`, `DeleteGroupPolicy`;
+  - `Attach`/`Detach`/`ListAttached` `GroupPolicies`.
+- **Members are the API's users.** A file's user is in no group (§5).
+- **A member's identity policy** joins its groups' inline policies and their attached policies' default versions.
+- **Refused as AWS refuses:**
+  - a group's name twice;
+  - an eleventh group for a user;
+  - deleting a group with members, inline or attached policies;
+  - deleting a user in a group.
+- **Decided on its resource:** each call's `iam:<Action>` on the group (`iam:group/<path><name>`), or on the user for
+  `ListGroupsForUser`.
+- **CreateGroup's answer** carries the group made, as CreateRole's does: on a cluster the record is not read back
+  until it commits.
+- **Tests:**
+  - 2 new unit tests (435 in all);
+  - 23 AWS CLI checks in the S3 smoke, among them a member listing by its group's inline policy, writing by an attached
+    `AmazonS3FullAccess`, and writing no more once it is detached;
+  - the cluster smoke (206);
+  - the SDK matrix.
+  - **The first run failed** on the smoke's check of CreateGroup's answer, which cut the group's id 3 characters too
+    long; the check now compares the ARN and the id's `AGPA` alone.
+- **Next:** slice 4: tags, paths, `UpdateRole`, `UpdateAssumeRolePolicy`, the refresh's reads, and
+  `GetCallerIdentity`.

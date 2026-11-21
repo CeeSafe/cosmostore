@@ -46,7 +46,7 @@ fn isManagedAction(a: Slice<u8>) -> bool {
         "CreatePolicy", "GetPolicy", "ListPolicies", "DeletePolicy", "CreatePolicyVersion", "GetPolicyVersion",
         "ListPolicyVersions", "DeletePolicyVersion", "SetDefaultPolicyVersion", "ListEntitiesForPolicy",
         "AttachUserPolicy", "DetachUserPolicy", "ListAttachedUserPolicies", "AttachRolePolicy", "DetachRolePolicy",
-        "ListAttachedRolePolicies",
+        "ListAttachedRolePolicies", "AttachGroupPolicy", "DetachGroupPolicy", "ListAttachedGroupPolicies",
     ]) {
         if (a == k.bytes()) { return true; }
     }
@@ -523,6 +523,9 @@ async fn serveIamManaged(
         a == "ListAttachedUserPolicies".bytes();
     let onRole = a == "AttachRolePolicy".bytes() || a == "DetachRolePolicy".bytes() ||
         a == "ListAttachedRolePolicies".bytes();
+    let onGroup = a == "AttachGroupPolicy".bytes() || a == "DetachGroupPolicy".bytes() ||
+        a == "ListAttachedGroupPolicies".bytes();
+    let groupName = formText(body, "GroupName")?;
     let path = if (a == "CreatePolicy".bytes()) {
         let given = formText(body, "Path")?;
         if (given.length == 0) copyBytes("/".bytes())? else given
@@ -541,7 +544,8 @@ async fn serveIamManaged(
         );
     }
     let needsArn = !(a == "CreatePolicy".bytes() || a == "ListPolicies".bytes() ||
-        a == "ListAttachedUserPolicies".bytes() || a == "ListAttachedRolePolicies".bytes());
+        a == "ListAttachedUserPolicies".bytes() || a == "ListAttachedRolePolicies".bytes() ||
+        a == "ListAttachedGroupPolicies".bytes());
     if (needsArn && !startsWithBytes(arn.view(), "arn:aws:iam::".bytes())) {
         return await iamError(exchange, 400, "ValidationError", "PolicyArn is an IAM policy's ARN.", requestId);
     }
@@ -558,6 +562,18 @@ async fn serveIamManaged(
         match (roleAtIam(state, roleName.view())) {
             Some(r) => { resource.extend(state.roles[r].name.view())?; }
             null => { resource.extend(roleName.view())?; }
+        }
+    } else if (onGroup) {
+        resource.extend("iam:group".bytes())?;
+        match (groupAt(state, groupName.view())) {
+            Some(g) => {
+                resource.extend(state.groups[g].path.view())?;
+                resource.extend(state.groups[g].name.view())?;
+            }
+            null => {
+                resource.push('/')?;
+                resource.extend(groupName.view())?;
+            }
         }
     } else if (a == "CreatePolicy".bytes()) {
         resource.extend("iam:policy".bytes())?;
@@ -617,9 +633,13 @@ async fn serveIamManaged(
         result.extend("</Policies>".bytes())?;
         return await iamAnswer(exchange, a, result.view(), requestId);
     }
-    if (a == "ListAttachedUserPolicies".bytes() || a == "ListAttachedRolePolicies".bytes()) {
+    if (a == "ListAttachedUserPolicies".bytes() || a == "ListAttachedRolePolicies".bytes() ||
+        a == "ListAttachedGroupPolicies".bytes()) {
         let attached = if (onUser) match (userAt(state, userName.view())) {
             Some(u) => Some(borrow state.users[u].attached),
+            null => null,
+        } else if (onGroup) match (groupAt(state, groupName.view())) {
+            Some(g) => Some(borrow state.groups[g].attached),
             null => null,
         } else match (roleAtIam(state, roleName.view())) {
             Some(r) => Some(borrow state.roles[r].attached),
@@ -811,11 +831,13 @@ async fn serveIamManaged(
         else if (a == "AttachUserPolicy".bytes()) ManagedCall.Attach(AttachTo.User, userName, arn)
         else if (a == "DetachUserPolicy".bytes()) ManagedCall.Detach(AttachTo.User, userName, arn)
         else if (a == "AttachRolePolicy".bytes()) ManagedCall.Attach(AttachTo.Role, roleName, arn)
-        else ManagedCall.Detach(AttachTo.Role, roleName, arn);
+        else if (a == "DetachRolePolicy".bytes()) ManagedCall.Detach(AttachTo.Role, roleName, arn)
+        else if (a == "AttachGroupPolicy".bytes()) ManagedCall.Attach(AttachTo.Group, groupName, arn)
+        else ManagedCall.Detach(AttachTo.Group, groupName, arn);
     let call = IamCall.Managed(managed);
     let outcome = await applyIamRetrying(app, borrow call)?;
     return match (borrow outcome) {
-        IamOutcome.Done(_, _, _, policy) => {
+        IamOutcome.Done(_, _, _, policy, _) => {
             match (policy) {
                 Some(p) => {
                     if (a == "CreatePolicy".bytes()) {

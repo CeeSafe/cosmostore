@@ -958,6 +958,40 @@ aws iam delete-user --user-name mp > /dev/null 2>&1 && pass "then deleted" || fa
 aws iam delete-policy-version --policy-arn $parn --version-id v1 > /dev/null 2>&1 && pass "iam delete-policy-version" || fail "iam delete-policy-version"
 aws iam delete-policy --policy-arn $parn > /dev/null 2>&1 && pass "iam delete-policy" || fail "iam delete-policy"
 check "gone" "$(code iam get-policy --policy-arn $parn)" NoSuchEntity
+# Groups (ADR-0108 §3): a member may do what its groups' inline and attached policies allow.
+group=$(aws iam create-group --group-name smoke-editors --path /team/ --query 'Group.[Arn,GroupId]' --output text 2>&1)
+check "iam create-group" "$(echo "$group" | cut -f1) $(echo "$group" | cut -f2 | cut -c1-4)" "arn:aws:iam::000000000000:group/team/smoke-editors AGPA"
+check "a group's name twice" "$(code iam create-group --group-name smoke-editors)" EntityAlreadyExists
+aws iam create-user --user-name gm > /dev/null 2>&1
+gmkey=$(aws iam create-access-key --user-name gm --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>&1)
+gmid=$(echo "$gmkey" | cut -f1); gmsecret=$(echo "$gmkey" | cut -f2)
+gm() { ( export AWS_ACCESS_KEY_ID="$gmid" AWS_SECRET_ACCESS_KEY="$gmsecret"; "$@" ); }
+aws iam add-user-to-group --group-name smoke-editors --user-name gm > /dev/null 2>&1 && pass "iam add-user-to-group" || fail "iam add-user-to-group"
+check "a user not the API's is in no group" "$(code iam add-user-to-group --group-name smoke-editors --user-name nobody)" NoSuchEntity
+check "its members got" "$(aws iam get-group --group-name smoke-editors --query 'Users[].UserName' --output text 2>&1)" gm
+check "the user's groups listed" "$(aws iam list-groups-for-user --user-name gm --query 'Groups[].GroupName' --output text 2>&1)" smoke-editors
+check "listed by path" "$(aws iam list-groups --path-prefix /team/ --query 'Groups[].GroupName' --output text 2>&1)" smoke-editors
+aws iam put-group-policy --group-name smoke-editors --policy-name list --policy-document "$pol1" > /dev/null 2>&1 && pass "iam put-group-policy" || fail "iam put-group-policy"
+check "its policy read back" "$(aws iam get-group-policy --group-name smoke-editors --policy-name list --query 'PolicyDocument.Statement.Action' --output text 2>&1)" s3:ListBucket
+check "its policies listed" "$(aws iam list-group-policies --group-name smoke-editors --query PolicyNames --output text 2>&1)" list
+aws iam attach-group-policy --group-name smoke-editors --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess > /dev/null 2>&1 && pass "iam attach-group-policy" || fail "iam attach-group-policy"
+check "its attached policies listed" "$(aws iam list-attached-group-policies --group-name smoke-editors --query 'AttachedPolicies[].PolicyName' --output text 2>&1)" AmazonS3FullAccess
+sleep 3
+check "a member lists by its group's inline policy" "$(gm aws s3api list-objects-v2 --bucket smoke --max-keys 1 --query KeyCount --output text 2>&1)" 1
+check "and writes by its attached one" "$(gm aws s3api put-object --bucket smoke --key gm.txt --body sse.txt > /dev/null 2>&1 && echo yes)" yes
+gm aws s3api delete-object --bucket smoke --key gm.txt > /dev/null 2>&1
+aws iam detach-group-policy --group-name smoke-editors --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess > /dev/null 2>&1 && pass "iam detach-group-policy" || fail "iam detach-group-policy"
+sleep 3
+check "detached, it writes no more" "$(gm code s3api put-object --bucket smoke --key gm.txt --body sse.txt)" AccessDenied
+check "a group with members not deleted" "$(code iam delete-group --group-name smoke-editors)" DeleteConflict
+aws iam delete-access-key --user-name gm --access-key-id "$gmid" > /dev/null 2>&1
+check "nor a user in a group" "$(code iam delete-user --user-name gm)" DeleteConflict
+aws iam remove-user-from-group --group-name smoke-editors --user-name gm > /dev/null 2>&1 && pass "iam remove-user-from-group" || fail "iam remove-user-from-group"
+aws iam delete-user --user-name gm > /dev/null 2>&1
+check "nor a group with a policy" "$(code iam delete-group --group-name smoke-editors)" DeleteConflict
+aws iam delete-group-policy --group-name smoke-editors --policy-name list > /dev/null 2>&1 && pass "iam delete-group-policy" || fail "iam delete-group-policy"
+aws iam delete-group --group-name smoke-editors > /dev/null 2>&1 && pass "iam delete-group" || fail "iam delete-group"
+check "the group gone" "$(code iam get-group --group-name smoke-editors)" NoSuchEntity
 check "a roles file's role got" "$(aws iam get-role --role-name reader --query 'Role.[Arn,MaxSessionDuration]' --output text 2>&1 | tr '\t' ' ')" "arn:aws:iam::000000000000:role/reader 3600"
 check "the account's keys listed" "$(aws iam list-access-keys --query "AccessKeyMetadata[?AccessKeyId=='$AWS_ACCESS_KEY_ID'].Status" --output text 2>&1)" Active
 check "another account's role is none" "$(code sts assume-role --role-arn arn:aws:iam::123456789012:role/reader --role-session-name smoke)" AccessDenied

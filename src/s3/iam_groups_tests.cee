@@ -1,0 +1,100 @@
+// The IAM API's groups (ADR-0108 §3): made, given members and policies, and deleted as AWS allows, on a state.
+
+fn groupOutcome(state: borrow mut IamState, call: GroupCall) -> String {
+    let a = applyGroupCall(state, borrow call, 10)!;
+    return match (a) {
+        GroupApplied.Refused(o) => textOf(outcomeName(borrow o)),
+        GroupApplied.Changed(_) => textOf("Changed"),
+    };
+}
+
+/// A group made with a path, given members and an inline policy their identity policies join, then emptied and
+/// deleted; a name twice, a user not the API's, and a deletion while it holds anything are refused.
+@test
+fn groupsAsAws() -> Result<void, TestFailure> {
+    var s = sampleIam();
+    Check.equalText("Changed", groupOutcome(mut s, GroupCall.Create(iamName("editors"), iamName("/team/"))).view())?;
+    Check.equalBytes("AGPA".bytes(), s.groups[0].id.view()[0..4])?;
+    Check.equalText(
+        "EntityAlreadyExists",
+        groupOutcome(mut s, GroupCall.Create(iamName("EDITORS"), iamName("/"))).view(),
+    )?;
+    Check.equalText("Changed", groupOutcome(mut s, GroupCall.AddUser(iamName("editors"), iamName("ALICE"))).view())?;
+    Check.equalBytes("alice".bytes(), s.groups[0].members[0].view())?; // the user's own name
+    Check.equalText("Changed", groupOutcome(mut s, GroupCall.AddUser(iamName("editors"), iamName("alice"))).view())?;
+    Check.equalU64(1, s.groups[0].members.length as u64)?; // once
+    Check.equalText(
+        "NoSuchEntity",
+        groupOutcome(mut s, GroupCall.AddUser(iamName("editors"), iamName("carol"))).view(),
+    )?;
+    Check.equalText(
+        "NoSuchEntity",
+        groupOutcome(mut s, GroupCall.AddUser(iamName("nobody"), iamName("alice"))).view(),
+    )?;
+    Check.equalText(
+        "MalformedPolicyDocument",
+        groupOutcome(
+            mut s,
+            GroupCall.PutPolicy(iamName("editors"), iamName("p"), iamName("{\"Statement\":\"no\"}")),
+        ).view(),
+    )?;
+    let doc = iamPolicy("tagging", "s3:PutObjectTagging").text;
+    Check.equalText(
+        "Changed",
+        groupOutcome(mut s, GroupCall.PutPolicy(iamName("editors"), iamName("tagging"), doc)).view(),
+    )?;
+    let joined = joinedPolicy(userPolicyTexts(borrow s, 0)!.view())!!;
+    Check.isTrue(findBytes(joined.view(), "s3:PutObjectTagging".bytes(), 0).isSome(), "a member's policy joins it")?;
+    let bobs = joinedPolicy(userPolicyTexts(borrow s, 1)!.view())!!;
+    Check.isTrue(findBytes(bobs.view(), "s3:PutObjectTagging".bytes(), 0).isNull(), "not a non-member's")?;
+    // Its members and policies first.
+    Check.equalText("DeleteConflict", groupOutcome(mut s, GroupCall.Delete(iamName("editors"))).view())?;
+    Check.equalText("Changed", groupOutcome(mut s, GroupCall.RemoveUser(iamName("editors"), iamName("Alice"))).view())?;
+    Check.equalText(
+        "NoSuchEntity",
+        groupOutcome(mut s, GroupCall.RemoveUser(iamName("editors"), iamName("alice"))).view(),
+    )?;
+    Check.equalText("DeleteConflict", groupOutcome(mut s, GroupCall.Delete(iamName("editors"))).view())?;
+    Check.equalText(
+        "Changed",
+        groupOutcome(mut s, GroupCall.DeletePolicy(iamName("editors"), iamName("tagging"))).view(),
+    )?;
+    Check.equalText(
+        "NoSuchEntity",
+        groupOutcome(mut s, GroupCall.DeletePolicy(iamName("editors"), iamName("tagging"))).view(),
+    )?;
+    Check.equalText("Changed", groupOutcome(mut s, GroupCall.Delete(iamName("editors"))).view())?;
+    Check.equalU64(0, s.groups.length as u64)?;
+    return Ok();
+}
+
+/// A user is in ten groups at most; a group with a policy attached is not deleted; a user in a group is not deleted.
+@test
+fn groupLimitsAndAttachments() -> Result<void, TestFailure> {
+    var s = sampleIam();
+    for (i in 0..11) {
+        var name = textOf("g");
+        var n = Vector<u8>.create();
+        appendDecimal(mut n, truncate<u64>(i))!;
+        name.append(StringView.fromUtf8(n.view()) ?? "")!;
+        Check.equalText(
+            "Changed",
+            groupOutcome(mut s, GroupCall.Create(copyBytes(name.bytes())!, iamName("/"))).view(),
+        )?;
+        let expected = if (i < 10) "Changed" else "LimitExceeded";
+        Check.equalText(
+            expected,
+            groupOutcome(mut s, GroupCall.AddUser(copyBytes(name.bytes())!, iamName("bob"))).view(),
+        )?;
+    }
+    let admin = iamName("arn:aws:iam::aws:policy/AdministratorAccess");
+    let attach = ManagedCall.Attach(AttachTo.Group, iamName("g0"), admin);
+    let attached = applyManagedCall(mut s, borrow attach, 10)!;
+    Check.equalText("Changed", refusedAs(borrow attached).view())?;
+    Check.equalU64(1, attachmentCount(borrow s, "arn:aws:iam::aws:policy/AdministratorAccess".bytes()))?;
+    let joined = joinedPolicy(userPolicyTexts(borrow s, 1)!.view())!!;
+    Check.isTrue(findBytes(joined.view(), "\"Action\":\"*\"".bytes(), 0).isSome(), "a group's attached policy")?;
+    Check.equalText("Changed", groupOutcome(mut s, GroupCall.RemoveUser(iamName("g0"), iamName("bob"))).view())?;
+    Check.equalText("DeleteConflict", groupOutcome(mut s, GroupCall.Delete(iamName("g0"))).view())?;
+    return Ok();
+}

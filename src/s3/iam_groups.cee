@@ -1,0 +1,405 @@
+// The IAM API's groups (ADR-0108 §3): their members, the API's users, and their inline and attached policies, which
+// the members' identity policies join (`iam.cee`). The files' users are in no group (§5).
+import web_core;
+import web_http;
+import web_server;
+
+/// Ten groups a user, as on AWS.
+const IAM_MAX_GROUPS_A_USER: usize = 10;
+
+/// A change to the groups.
+enum GroupCall {
+    /// A group's name and path.
+    Create(Vector<u8>, Vector<u8>),
+    Delete(Vector<u8>),
+    /// A group's name and a user's.
+    AddUser(Vector<u8>, Vector<u8>),
+    RemoveUser(Vector<u8>, Vector<u8>),
+    /// A group's name, the policy's name, and its document.
+    PutPolicy(Vector<u8>, Vector<u8>, Vector<u8>),
+    DeletePolicy(Vector<u8>, Vector<u8>),
+}
+
+/// The actions this file answers.
+fn isGroupAction(a: Slice<u8>) -> bool {
+    for (k in [
+        "CreateGroup", "GetGroup", "ListGroups", "DeleteGroup", "AddUserToGroup", "RemoveUserFromGroup",
+        "ListGroupsForUser", "PutGroupPolicy", "GetGroupPolicy", "ListGroupPolicies", "DeleteGroupPolicy",
+    ]) {
+        if (a == k.bytes()) { return true; }
+    }
+    return false;
+}
+
+/// How many groups have user `name` among their members.
+fn groupsOfUser(state: borrow IamState, name: Slice<u8>) -> usize {
+    var n: usize = 0;
+    for (g in 0..state.groups.length) {
+        if (groupHolds(borrow state.groups[g], name)) { n += 1; }
+    }
+    return n;
+}
+
+/// What a group's change came to: refused with an outcome, or made (with the group made, for CreateGroup's answer: on a
+/// cluster the record is not read back until it commits).
+enum GroupApplied {
+    Refused(IamOutcome),
+    Changed(IamGroup?),
+}
+
+/// A group's change, applied to `state` (the record, read under the store's lock: `applyIamCall` writes it back).
+fn applyGroupCall(state: borrow mut IamState, call: borrow GroupCall, nowMs: i64) -> Result<GroupApplied, StoreError> {
+    match (call) {
+        GroupCall.Create(name, path) => {
+            if (groupAt(state, name.view()).isSome()) {
+                return Ok(GroupApplied.Refused(IamOutcome.EntityAlreadyExists));
+            }
+            var id = copyBytes("AGPA".bytes())?;
+            if (!randomText(mut id, 17, IAM_ID_CHARS)?) { return Err(StoreError.DataCorrupt); }
+            state.groups.push(IamGroup {
+                name: copyBytes(name.view())?,
+                id: id,
+                path: copyBytes(path.view())?,
+                createdMs: nowMs,
+                members: Vector<Vector<u8>>.create(),
+                policies: Vector<IamPolicy>.create(),
+                attached: Vector<Vector<u8>>.create(),
+            })?;
+            let made = borrow state.groups[state.groups.length - 1];
+            return Ok(GroupApplied.Changed(Some(IamGroup {
+                name: copyBytes(made.name.view())?,
+                id: copyBytes(made.id.view())?,
+                path: copyBytes(made.path.view())?,
+                createdMs: made.createdMs,
+                members: Vector<Vector<u8>>.create(),
+                policies: Vector<IamPolicy>.create(),
+                attached: Vector<Vector<u8>>.create(),
+            })));
+        }
+        GroupCall.Delete(name) => {
+            let g = groupAt(state, name.view()) ?? { return Ok(GroupApplied.Refused(IamOutcome.NoSuchEntity)); };
+            // As on AWS: its members removed and its policies deleted and detached first.
+            let group = borrow state.groups[g];
+            if (group.members.length > 0 || group.policies.length > 0 || group.attached.length > 0) {
+                return Ok(GroupApplied.Refused(IamOutcome.DeleteConflict));
+            }
+            let _ = state.groups.remove(g);
+        }
+        GroupCall.AddUser(name, user) => {
+            let g = groupAt(state, name.view()) ?? { return Ok(GroupApplied.Refused(IamOutcome.NoSuchEntity)); };
+            let u = userAt(state, user.view()) ?? { return Ok(GroupApplied.Refused(IamOutcome.NoSuchEntity)); };
+            let member = copyBytes(state.users[u].name.view())?;
+            // A member already: done, as on AWS.
+            if (groupHolds(borrow state.groups[g], member.view())) { return Ok(GroupApplied.Changed(null)); }
+            if (groupsOfUser(state, member.view()) >= IAM_MAX_GROUPS_A_USER) {
+                return Ok(GroupApplied.Refused(IamOutcome.LimitExceeded));
+            }
+            state.groups[g].members.push(member)?;
+        }
+        GroupCall.RemoveUser(name, user) => {
+            let g = groupAt(state, name.view()) ?? { return Ok(GroupApplied.Refused(IamOutcome.NoSuchEntity)); };
+            var at: usize? = null;
+            for (i in 0..state.groups[g].members.length) {
+                if (sameNameIgnoringCase(state.groups[g].members[i].view(), user.view())) { at = Some(i); }
+            }
+            let _ = state.groups[g].members.remove(at ?? { return Ok(GroupApplied.Refused(IamOutcome.NoSuchEntity)); });
+        }
+        GroupCall.PutPolicy(name, policy, text) => {
+            let g = groupAt(state, name.view()) ?? { return Ok(GroupApplied.Refused(IamOutcome.NoSuchEntity)); };
+            match (parseIdentityPolicy(text.view())) {
+                Ok(_) => {}
+                Err(S3Fail.OutOfMemory(e)) => { return Err(StoreError.OutOfMemory(e)); }
+                Err(_) => { return Ok(GroupApplied.Refused(IamOutcome.MalformedPolicyDocument)); }
+            }
+            var replaced = false;
+            for (p in 0..state.groups[g].policies.length) {
+                if (state.groups[g].policies[p].name.view() == policy.view()) {
+                    state.groups[g].policies[p].text = copyBytes(text.view())?;
+                    replaced = true;
+                }
+            }
+            if (!replaced) {
+                state.groups[g].policies.push(
+                    IamPolicy { name: copyBytes(policy.view())?, text: copyBytes(text.view())? },
+                )?;
+            }
+        }
+        GroupCall.DeletePolicy(name, policy) => {
+            let g = groupAt(state, name.view()) ?? { return Ok(GroupApplied.Refused(IamOutcome.NoSuchEntity)); };
+            var at: usize? = null;
+            for (p in 0..state.groups[g].policies.length) {
+                if (state.groups[g].policies[p].name.view() == policy.view()) { at = Some(p); }
+            }
+            let _ = state.groups[g].policies.remove(
+                at ?? { return Ok(GroupApplied.Refused(IamOutcome.NoSuchEntity)); },
+            );
+        }
+    }
+    return Ok(GroupApplied.Changed(null));
+}
+
+// ---- The answers ----
+
+/// `<Group>…</Group>`'s inside.
+fn appendGroup(out: borrow mut Vector<u8>, g: borrow IamGroup) -> Result<void, AllocError> {
+    xmlTextElement(out, "Path", g.path.view())?;
+    xmlTextElement(out, "GroupName", g.name.view())?;
+    xmlTextElement(out, "GroupId", g.id.view())?;
+    out.extend("<Arn>".bytes())?;
+    out.extend(IAM_ACCOUNT_ARN.bytes())?;
+    out.extend("group".bytes())?;
+    appendXmlEscaped(out, g.path.view())?;
+    appendXmlEscaped(out, g.name.view())?;
+    out.extend("</Arn><CreateDate>".bytes())?;
+    appendIso8601(out, g.createdMs)?;
+    out.extend("</CreateDate>".bytes())?;
+    return Ok();
+}
+
+/// A group call's error for an outcome.
+async fn groupRefused(
+    exchange: borrow mut Exchange,
+    outcome: borrow IamOutcome,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    return match (outcome) {
+        IamOutcome.NotReady => await iamError(
+            exchange,
+            503,
+            "ServiceUnavailable",
+            "The IAM records are not ready yet; try again.",
+            requestId,
+        ),
+        IamOutcome.NoSuchEntity => await iamError(
+            exchange,
+            404,
+            "NoSuchEntity",
+            "The group, user or policy named is not the API's.",
+            requestId,
+        ),
+        IamOutcome.EntityAlreadyExists => await iamError(
+            exchange,
+            409,
+            "EntityAlreadyExists",
+            "A group with this name already exists.",
+            requestId,
+        ),
+        IamOutcome.LimitExceeded => await iamError(
+            exchange,
+            409,
+            "LimitExceeded",
+            "Cannot exceed the quota: a user is in 10 groups at most.",
+            requestId,
+        ),
+        IamOutcome.DeleteConflict => await iamError(
+            exchange,
+            409,
+            "DeleteConflict",
+            "Remove the group's users, and delete and detach its policies, first.",
+            requestId,
+        ),
+        IamOutcome.MalformedPolicyDocument => await iamError(
+            exchange,
+            400,
+            "MalformedPolicyDocument",
+            "The policy document is not one taken here.",
+            requestId,
+        ),
+        _ => await iamError(
+            exchange,
+            409,
+            "ConcurrentModification",
+            "The IAM records changed meanwhile; try again.",
+            requestId,
+        ),
+    };
+}
+
+/// A group's call (ADR-0108 §3): decided (`iam:<Action>` on the group, or on the user for ListGroupsForUser), then read
+/// from the record or changed through `applyIamCall`.
+async fn serveIamGroup(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+    a: Slice<u8>,
+    body: Slice<u8>,
+    who: borrow Requester,
+    decided: bool,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    let snapshot = await readIamSnapshot(borrow app.store) ?? {
+        return await iamError(exchange, 500, "ServiceFailure", "The IAM records do not read.", requestId);
+    };
+    let state = borrow snapshot.state;
+    let groupName = formText(body, "GroupName")?;
+    let userName = formText(body, "UserName")?;
+    let listing = a == "ListGroups".bytes();
+    let forUser = a == "ListGroupsForUser".bytes();
+    if (!listing && !forUser && !policyNameOk(groupName.view())) {
+        return await iamError(
+            exchange,
+            400,
+            "ValidationError",
+            "GroupName is 1 to 128 of A-Z a-z 0-9 + = , . @ _ -.",
+            requestId,
+        );
+    }
+    let path = if (a == "CreateGroup".bytes()) {
+        let given = formText(body, "Path")?;
+        if (given.length == 0) copyBytes("/".bytes())? else given
+    } else copyBytes("/".bytes())?;
+    if (!iamPathOk(path.view())) {
+        return await iamError(exchange, 400, "ValidationError", "Path is / or /…/, 1 to 512 characters.", requestId);
+    }
+    // The resource it is decided on: the group's ARN as a resource, with its path.
+    var resource = Vector<u8>.create();
+    if (listing) {
+        resource.extend("iam:group/*".bytes())?;
+    } else if (forUser) {
+        resource.extend("iam:user/".bytes())?;
+        match (userAt(state, userName.view())) {
+            Some(u) => { resource.extend(state.users[u].name.view())?; }
+            null => { resource.extend(userName.view())?; }
+        }
+    } else {
+        resource.extend("iam:group".bytes())?;
+        match (groupAt(state, groupName.view())) {
+            Some(g) => {
+                resource.extend(state.groups[g].path.view())?;
+                resource.extend(state.groups[g].name.view())?;
+            }
+            null => {
+                resource.extend(path.view())?;
+                resource.extend(groupName.view())?;
+            }
+        }
+    }
+    if (decided) {
+        var iamAction = copyBytes("iam:".bytes())?;
+        iamAction.extend(a)?;
+        if (!sessionAllows(app, req, who, StringView.fromUtf8(iamAction.view()) ?? "", resource.view())?) {
+            return await iamError(
+                exchange,
+                403,
+                "AccessDenied",
+                "Not authorized to perform this IAM action.",
+                requestId,
+            );
+        }
+    }
+    var result = Vector<u8>.create();
+    // The reads.
+    if (listing || forUser) {
+        let prefix = formText(body, "PathPrefix")?;
+        if (forUser && userAt(state, userName.view()).isNull()) {
+            // A file's user is in no group; any other is none.
+            let files = fileUsersOf(app.credentials.get().view(), app.credentials.get().fileUserKeys(), state)?;
+            var known = false;
+            for (i in 0..files.length) {
+                if (sameNameIgnoringCase(nameOfUserKey(files[i].view()), userName.view())) { known = true; }
+            }
+            if (!known) {
+                return await iamError(
+                    exchange,
+                    404,
+                    "NoSuchEntity",
+                    "The user with the name given cannot be found.",
+                    requestId,
+                );
+            }
+        }
+        result.extend("<Groups>".bytes())?;
+        for (g in 0..state.groups.length) {
+            let group = borrow state.groups[g];
+            if (forUser && !groupHolds(group, userName.view())) { continue; }
+            if (prefix.length > 0 && !startsWithBytes(group.path.view(), prefix.view())) { continue; }
+            result.extend("<member>".bytes())?;
+            appendGroup(mut result, group)?;
+            result.extend("</member>".bytes())?;
+        }
+        result.extend("</Groups><IsTruncated>false</IsTruncated>".bytes())?;
+        return await iamAnswer(exchange, a, result.view(), requestId);
+    }
+    if (a == "GetGroup".bytes() || a == "GetGroupPolicy".bytes() || a == "ListGroupPolicies".bytes()) {
+        let g = groupAt(state, groupName.view()) ?? {
+            return await iamError(
+                exchange,
+                404,
+                "NoSuchEntity",
+                "The group with the name given cannot be found.",
+                requestId,
+            );
+        };
+        let group = borrow state.groups[g];
+        if (a == "GetGroup".bytes()) {
+            result.extend("<Group>".bytes())?;
+            appendGroup(mut result, group)?;
+            result.extend("</Group><Users>".bytes())?;
+            for (m in 0..group.members.length) {
+                let u = userAt(state, group.members[m].view()) ?? { continue; };
+                let user = borrow state.users[u];
+                result.extend("<member>".bytes())?;
+                appendUser(mut result, user.name.view(), user.id.view(), user.createdMs)?;
+                result.extend("</member>".bytes())?;
+            }
+            result.extend("</Users><IsTruncated>false</IsTruncated>".bytes())?;
+        } else if (a == "ListGroupPolicies".bytes()) {
+            result.extend("<PolicyNames>".bytes())?;
+            for (p in 0..group.policies.length) {
+                result.extend("<member>".bytes())?;
+                appendXmlEscaped(mut result, group.policies[p].name.view())?;
+                result.extend("</member>".bytes())?;
+            }
+            result.extend("</PolicyNames><IsTruncated>false</IsTruncated>".bytes())?;
+        } else {
+            // GetGroupPolicy: the document URL-encoded, as IAM answers it.
+            let policyName = formText(body, "PolicyName")?;
+            var found: usize? = null;
+            for (p in 0..group.policies.length) {
+                if (group.policies[p].name.view() == policyName.view()) { found = Some(p); }
+            }
+            let p = found ?? {
+                return await iamError(
+                    exchange,
+                    404,
+                    "NoSuchEntity",
+                    "The group has no policy with this name.",
+                    requestId,
+                );
+            };
+            xmlTextElement(mut result, "GroupName", group.name.view())?;
+            xmlTextElement(mut result, "PolicyName", group.policies[p].name.view())?;
+            var encoded = Vector<u8>.create();
+            appendUriEncoded(mut encoded, group.policies[p].text.view(), false)?;
+            xmlTextElement(mut result, "PolicyDocument", encoded.view())?;
+        }
+        return await iamAnswer(exchange, a, result.view(), requestId);
+    }
+    // The changes.
+    let change = if (a == "CreateGroup".bytes()) GroupCall.Create(copyBytes(groupName.view())?, path)
+        else if (a == "DeleteGroup".bytes()) GroupCall.Delete(copyBytes(groupName.view())?)
+        else if (a == "AddUserToGroup".bytes()) GroupCall.AddUser(copyBytes(groupName.view())?, userName)
+        else if (a == "RemoveUserFromGroup".bytes()) GroupCall.RemoveUser(copyBytes(groupName.view())?, userName)
+        else if (a == "PutGroupPolicy".bytes()) GroupCall.PutPolicy(
+            copyBytes(groupName.view())?,
+            formText(body, "PolicyName")?,
+            formText(body, "PolicyDocument")?,
+        )
+        else GroupCall.DeletePolicy(copyBytes(groupName.view())?, formText(body, "PolicyName")?);
+    let call = IamCall.Group(change);
+    let outcome = await applyIamRetrying(app, borrow call)?;
+    return match (borrow outcome) {
+        IamOutcome.Done(_, _, _, _, group) => {
+            match (group) {
+                Some(g) => {
+                    result.extend("<Group>".bytes())?;
+                    appendGroup(mut result, g)?;
+                    result.extend("</Group>".bytes())?;
+                }
+                null => {}
+            }
+            await iamAnswer(exchange, a, result.view(), requestId)
+        },
+        _ => await groupRefused(exchange, borrow outcome, requestId),
+    };
+}

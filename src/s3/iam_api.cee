@@ -117,14 +117,16 @@ enum IamCall {
     DeleteRolePolicy(Vector<u8>, Vector<u8>),
     /// A managed policy's change or an attachment's (`iam_managed.cee`, ADR-0108 §3).
     Managed(ManagedCall),
+    /// A group's change (`iam_groups.cee`).
+    Group(GroupCall),
 }
 
 /// What a change came to.
 enum IamOutcome {
     /// Done: the user it was about, as it is now (for CreateUser and CreateAccessKey's answers), the key made, and the
     /// role made (CreateRole's answer: on a cluster the record is not read back until it commits), and the managed
-    /// policy made or changed (CreatePolicy's and CreatePolicyVersion's).
-    Done(IamUser?, IamKey?, IamRole?, IamManagedPolicy?),
+    /// policy made or changed (CreatePolicy's and CreatePolicyVersion's), and the group made (CreateGroup's).
+    Done(IamUser?, IamKey?, IamRole?, IamManagedPolicy?, IamGroup?),
     /// The records' bucket is not made yet (a cluster's shard leader makes it, ADR-0104 §3): try again.
     NotReady,
     NoSuchEntity,
@@ -206,6 +208,7 @@ fn applyIamCall(
     var made: IamKey? = null;
     var madeRole: IamRole? = null;
     var madePolicy: IamManagedPolicy? = null;
+    var madeGroup: IamGroup? = null;
     var about: usize? = null;
     match (call) {
         IamCall.CreateUser(name) => {
@@ -383,6 +386,12 @@ fn applyIamCall(
                 ManagedApplied.Changed(p) => { madePolicy = p; }
             }
         }
+        IamCall.Group(g) => {
+            match (applyGroupCall(mut state, g, nowMs)?) {
+                GroupApplied.Refused(o) => { return Ok(o); }
+                GroupApplied.Changed(groupMade) => { madeGroup = groupMade; }
+            }
+        }
     }
     let bytes = encodeIamState(borrow state)?;
     // On `serve` the bucket is made here; on a cluster its shard's leader makes it (ADR-0104 §3), as a bucket made in
@@ -403,7 +412,7 @@ fn applyIamCall(
         Some(u) => Some(copyUser(borrow state.users[u])?),
         null => null,
     };
-    return Ok(IamOutcome.Done(user, made, madeRole, madePolicy));
+    return Ok(IamOutcome.Done(user, made, madeRole, madePolicy, madeGroup));
 }
 
 // ---- The calls ----
@@ -505,7 +514,7 @@ async fn serveIam(
         "DeleteAccessKey", "PutUserPolicy", "GetUserPolicy", "ListUserPolicies", "DeleteUserPolicy", "CreateRole",
         "GetRole", "ListRoles", "DeleteRole", "PutRolePolicy", "GetRolePolicy", "DeleteRolePolicy",
     ];
-    var taken = isManagedAction(action.view());
+    var taken = isManagedAction(action.view()) || isGroupAction(action.view());
     for (k in known) {
         if (action.view() == k.bytes()) { taken = true; }
     }
@@ -535,6 +544,18 @@ async fn serveIam(
     // A managed policy's call or an attachment's is decided on the policy, or what it is attached to.
     if (isManagedAction(action.view())) {
         return await serveIamManaged(
+            app,
+            req,
+            exchange,
+            action.view(),
+            body.view(),
+            borrow who,
+            callerUser.isSome(),
+            requestId,
+        );
+    }
+    if (isGroupAction(action.view())) {
+        return await serveIamGroup(
             app,
             req,
             exchange,
@@ -670,7 +691,7 @@ async fn serveIam(
         }
     }
     return match (outcome) {
-        IamOutcome.Done(user, key, _, _) => await iamDone(exchange, a, user, key, requestId),
+        IamOutcome.Done(user, key, _, _, _) => await iamDone(exchange, a, user, key, requestId),
         IamOutcome.NotReady => await iamError(
             exchange,
             503,
@@ -1071,7 +1092,7 @@ async fn serveIamRole(
         }
     }
     return match (outcome) {
-        IamOutcome.Done(_, _, role, _) => {
+        IamOutcome.Done(_, _, role, _, _) => {
             match (role) {
                 Some(r) => {
                     result.extend("<Role>".bytes())?;
