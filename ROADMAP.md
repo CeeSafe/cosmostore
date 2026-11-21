@@ -4820,3 +4820,27 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - the S3 and cluster smokes (206);
   - the SDK matrix.
 - **Next:** slice 2, managed policies, their versions and attachments.
+
+### 22 Nov 2026: M21 slice 2, managed policies, their versions and attachments (ADR-0108 §3)
+
+- **The calls** (`src/s3/iam_managed.cee`):
+  - `CreatePolicy` (path, description, tags), `GetPolicy`, `ListPolicies` (`Scope`, `OnlyAttached`, `PathPrefix`),
+    `DeletePolicy`;
+  - `CreatePolicyVersion`, `GetPolicyVersion`, `ListPolicyVersions`, `DeletePolicyVersion`, `SetDefaultPolicyVersion`;
+  - `ListEntitiesForPolicy`;
+  - `Attach`/`Detach`/`ListAttached` of `UserPolicies` and `RolePolicies`. Groups' are slice 3's.
+- **Refused as AWS refuses:**
+  - a sixth version;
+  - an eleventh attached policy;
+  - a document over 6,144 characters;
+  - deleting the default version;
+  - deleting a policy that is attached or has other versions.
+- **AWS's four** are got, versioned (`v1`), listed (`Scope=AWS`) and attached.
+- **Decided on its resource:** each call's `iam:<Action>` on the policy (`iam:policy/<path><name>`), or on the user or
+  role it is attached to. An identity policy may now name `…:policy/…` and `…:group/…` ARNs.
+- **Tests:**
+  - 4 new unit tests (433 in all);
+  - 28 AWS CLI checks in the S3 smoke (a user allowed what the default version allows, and no more);
+  - the cluster smoke (206);
+  - the SDK matrix.
+- **Next:** slice 3, groups.

@@ -1,0 +1,846 @@
+// The IAM API's managed policies and their attachments (ADR-0108 §3): policies with up to five versions, attached to
+// users, roles and groups by their ARNs, whose default versions the identity policies join (`iam.cee`).
+import web_core;
+import web_http;
+import web_server;
+
+/// A managed policy's document is 6,144 characters at most, its description 1,000, as on AWS.
+const IAM_MANAGED_MAX_TEXT: usize = 6144;
+const IAM_MANAGED_MAX_DESCRIPTION: usize = 1000;
+/// Five versions a policy, ten managed policies attached to a user, role or group, 50 tags (ADR-0108 §1).
+const IAM_MANAGED_MAX_VERSIONS: usize = 5;
+const IAM_MAX_ATTACHED: usize = 10;
+const IAM_MAX_TAGS: usize = 50;
+
+/// What a managed policy is attached to.
+enum AttachTo {
+    User,
+    Role,
+    Group,
+}
+
+/// A change to the managed policies or their attachments.
+enum ManagedCall {
+    /// A policy's name, path, description, document and tags.
+    CreatePolicy(Vector<u8>, Vector<u8>, Vector<u8>, Vector<u8>, Vector<IamTag>),
+    DeletePolicy(Vector<u8>),
+    /// A policy's ARN, the new version's document, and whether it is made the default.
+    CreatePolicyVersion(Vector<u8>, Vector<u8>, bool),
+    DeletePolicyVersion(Vector<u8>, u32),
+    SetDefaultPolicyVersion(Vector<u8>, u32),
+    /// What it is attached to, its name, and the policy's ARN.
+    Attach(AttachTo, Vector<u8>, Vector<u8>),
+    Detach(AttachTo, Vector<u8>, Vector<u8>),
+}
+
+/// A managed change applied to the state: refused with an outcome, or made (with the policy, for the answers that show
+/// it).
+enum ManagedApplied {
+    Refused(IamOutcome),
+    Changed(IamManagedPolicy?),
+}
+
+/// The actions this file answers.
+fn isManagedAction(a: Slice<u8>) -> bool {
+    for (k in [
+        "CreatePolicy", "GetPolicy", "ListPolicies", "DeletePolicy", "CreatePolicyVersion", "GetPolicyVersion",
+        "ListPolicyVersions", "DeletePolicyVersion", "SetDefaultPolicyVersion", "ListEntitiesForPolicy",
+        "AttachUserPolicy", "DetachUserPolicy", "ListAttachedUserPolicies", "AttachRolePolicy", "DetachRolePolicy",
+        "ListAttachedRolePolicies",
+    ]) {
+        if (a == k.bytes()) { return true; }
+    }
+    return false;
+}
+
+fn groupAt(state: borrow IamState, name: Slice<u8>) -> usize? {
+    for (i in 0..state.groups.length) {
+        if (sameNameIgnoringCase(state.groups[i].name.view(), name)) { return Some(i); }
+    }
+    return null;
+}
+
+fn copyManaged(p: borrow IamManagedPolicy) -> Result<IamManagedPolicy, AllocError> {
+    var versions = Vector<IamPolicyVersion>.create();
+    for (v in 0..p.versions.length) {
+        versions.push(IamPolicyVersion {
+            number: p.versions[v].number,
+            text: copyBytes(p.versions[v].text.view())?,
+            createdMs: p.versions[v].createdMs,
+        })?;
+    }
+    return Ok(IamManagedPolicy {
+        name: copyBytes(p.name.view())?,
+        id: copyBytes(p.id.view())?,
+        path: copyBytes(p.path.view())?,
+        description: copyBytes(p.description.view())?,
+        createdMs: p.createdMs,
+        updatedMs: p.updatedMs,
+        tags: copyTags(p.tags.view())?,
+        versions: versions,
+        defaultVersion: p.defaultVersion,
+        nextVersion: p.nextVersion,
+    });
+}
+
+/// How many users, roles and groups have the policy `arn` attached.
+fn attachmentCount(state: borrow IamState, arn: Slice<u8>) -> u64 {
+    var n: u64 = 0;
+    for (i in 0..state.users.length) {
+        if (namedExactly(state.users[i].attached.view(), arn)) { n += 1; }
+    }
+    for (i in 0..state.roles.length) {
+        if (namedExactly(state.roles[i].attached.view(), arn)) { n += 1; }
+    }
+    for (i in 0..state.groups.length) {
+        if (namedExactly(state.groups[i].attached.view(), arn)) { n += 1; }
+    }
+    return n;
+}
+
+fn namedExactly(names: Slice<Vector<u8>>, name: Slice<u8>) -> bool {
+    for (i in 0..names.length) {
+        if (names[i].view() == name) { return true; }
+    }
+    return false;
+}
+
+/// A path IAM takes: `/`, or `/` … `/`, 1 to 512 of the printable ASCII characters.
+fn iamPathOk(path: Slice<u8>) -> bool {
+    if (path.length < 1 || path.length > 512 || path[0] != '/' || path[path.length - 1] != '/') { return false; }
+    for (c in path) {
+        if (c < 0x21 || c > 0x7E) { return false; }
+    }
+    return true;
+}
+
+/// A version id, `v<n>`.
+fn versionNumberOf(id: Slice<u8>) -> u32? {
+    if (id.length < 2 || id[0] != 'v') { return null; }
+    let n = parseDecimal(id[1..]) ?? { return null; };
+    return checkedTruncate<u32>(n);
+}
+
+fn appendPolicyVersionId(out: borrow mut Vector<u8>, n: u32) -> Result<void, AllocError> {
+    out.push('v')?;
+    appendDecimal(out, n as u64)?;
+    return Ok();
+}
+
+/// A managed policy's ARN.
+fn appendManagedArn(out: borrow mut Vector<u8>, p: borrow IamManagedPolicy) -> Result<void, AllocError> {
+    out.extend(IAM_POLICY_ARN.bytes())?;
+    out.extend(p.path.view())?;
+    out.extend(p.name.view())?;
+    return Ok();
+}
+
+/// The name an ARN ends with.
+fn nameOfArn(arn: Slice<u8>) -> Slice<u8> {
+    var at = arn.length;
+    while (at > 0 && arn[at - 1] != '/') { at -= 1; }
+    return arn[at..];
+}
+
+/// A policy document a managed policy takes: IAM's size, and an identity policy.
+fn managedTextOutcome(text: Slice<u8>) -> Result<IamOutcome?, StoreError> {
+    if (text.length > IAM_MANAGED_MAX_TEXT) { return Ok(Some(IamOutcome.LimitExceeded)); }
+    return match (parseIdentityPolicy(text)) {
+        Ok(_) => Ok(null),
+        Err(S3Fail.OutOfMemory(e)) => Err(StoreError.OutOfMemory(e)),
+        Err(_) => Ok(Some(IamOutcome.MalformedPolicyDocument)),
+    };
+}
+
+/// `arn` attached to, or detached from, `attached`.
+fn changeAttached(
+    attached: borrow mut Vector<Vector<u8>>,
+    arn: Slice<u8>,
+    attach: bool,
+) -> Result<ManagedApplied, StoreError> {
+    var at: usize? = null;
+    for (i in 0..attached.length) {
+        if (attached[i].view() == arn) { at = Some(i); }
+    }
+    if (attach) {
+        // Attached already: done, as on AWS.
+        if (at.isSome()) { return Ok(ManagedApplied.Changed(null)); }
+        if (attached.length >= IAM_MAX_ATTACHED) { return Ok(ManagedApplied.Refused(IamOutcome.LimitExceeded)); }
+        attached.push(copyBytes(arn)?)?;
+    } else {
+        let _ = attached.remove(at ?? { return Ok(ManagedApplied.Refused(IamOutcome.NoSuchEntity)); });
+    }
+    return Ok(ManagedApplied.Changed(null));
+}
+
+/// An attachment's change, to what `to` and `name` name: NoSuchEntity when that is not the API's.
+fn attachment(
+    state: borrow mut IamState,
+    to: borrow AttachTo,
+    name: Slice<u8>,
+    arn: Slice<u8>,
+    attach: bool,
+) -> Result<ManagedApplied, StoreError> {
+    if (attach && !managedArnKnown(state, arn)) { return Ok(ManagedApplied.Refused(IamOutcome.NoSuchEntity)); }
+    return match (to) {
+        AttachTo.User => match (userAt(state, name)) {
+            Some(u) => changeAttached(mut state.users[u].attached, arn, attach),
+            null => Ok(ManagedApplied.Refused(IamOutcome.NoSuchEntity)),
+        },
+        AttachTo.Role => match (roleAtIam(state, name)) {
+            Some(r) => changeAttached(mut state.roles[r].attached, arn, attach),
+            null => Ok(ManagedApplied.Refused(IamOutcome.NoSuchEntity)),
+        },
+        AttachTo.Group => match (groupAt(state, name)) {
+            Some(g) => changeAttached(mut state.groups[g].attached, arn, attach),
+            null => Ok(ManagedApplied.Refused(IamOutcome.NoSuchEntity)),
+        },
+    };
+}
+
+/// A managed change, applied to `state` (the record, read under the store's lock: `applyIamCall` writes it back).
+fn applyManagedCall(
+    state: borrow mut IamState,
+    call: borrow ManagedCall,
+    nowMs: i64,
+) -> Result<ManagedApplied, StoreError> {
+    match (call) {
+        ManagedCall.CreatePolicy(name, path, description, text, tags) => {
+            for (i in 0..state.managed.length) {
+                if (sameNameIgnoringCase(state.managed[i].name.view(), name.view())) {
+                    return Ok(ManagedApplied.Refused(IamOutcome.EntityAlreadyExists));
+                }
+            }
+            match (managedTextOutcome(text.view())?) {
+                Some(o) => { return Ok(ManagedApplied.Refused(o)); }
+                null => {}
+            }
+            var id = copyBytes("ANPA".bytes())?;
+            if (!randomText(mut id, 17, IAM_ID_CHARS)?) { return Err(StoreError.DataCorrupt); }
+            var versions = Vector<IamPolicyVersion>.create();
+            versions.push(IamPolicyVersion { number: 1, text: copyBytes(text.view())?, createdMs: nowMs })?;
+            state.managed.push(IamManagedPolicy {
+                name: copyBytes(name.view())?,
+                id: id,
+                path: copyBytes(path.view())?,
+                description: copyBytes(description.view())?,
+                createdMs: nowMs,
+                updatedMs: nowMs,
+                tags: copyTags(tags.view())?,
+                versions: versions,
+                defaultVersion: 1,
+                nextVersion: 2,
+            })?;
+            return Ok(ManagedApplied.Changed(Some(copyManaged(borrow state.managed[state.managed.length - 1])?)));
+        }
+        ManagedCall.DeletePolicy(arn) => {
+            let m = managedAt(state, arn.view()) ?? { return Ok(ManagedApplied.Refused(IamOutcome.NoSuchEntity)); };
+            // As on AWS: detached, and its versions but the default deleted, first.
+            if (attachmentCount(state, arn.view()) > 0 || state.managed[m].versions.length > 1) {
+                return Ok(ManagedApplied.Refused(IamOutcome.DeleteConflict));
+            }
+            let _ = state.managed.remove(m);
+        }
+        ManagedCall.CreatePolicyVersion(arn, text, setDefault) => {
+            let m = managedAt(state, arn.view()) ?? { return Ok(ManagedApplied.Refused(IamOutcome.NoSuchEntity)); };
+            if (state.managed[m].versions.length >= IAM_MANAGED_MAX_VERSIONS) {
+                return Ok(ManagedApplied.Refused(IamOutcome.LimitExceeded));
+            }
+            match (managedTextOutcome(text.view())?) {
+                Some(o) => { return Ok(ManagedApplied.Refused(o)); }
+                null => {}
+            }
+            let number = state.managed[m].nextVersion;
+            state.managed[m].versions.push(IamPolicyVersion {
+                number: number,
+                text: copyBytes(text.view())?,
+                createdMs: nowMs,
+            })?;
+            state.managed[m].nextVersion = number + 1;
+            if (*setDefault) { state.managed[m].defaultVersion = number; }
+            state.managed[m].updatedMs = nowMs;
+            return Ok(ManagedApplied.Changed(Some(copyManaged(borrow state.managed[m])?)));
+        }
+        ManagedCall.DeletePolicyVersion(arn, number) => {
+            let m = managedAt(state, arn.view()) ?? { return Ok(ManagedApplied.Refused(IamOutcome.NoSuchEntity)); };
+            if (state.managed[m].defaultVersion == *number) {
+                return Ok(ManagedApplied.Refused(IamOutcome.DeleteConflict));
+            }
+            var at: usize? = null;
+            for (v in 0..state.managed[m].versions.length) {
+                if (state.managed[m].versions[v].number == *number) { at = Some(v); }
+            }
+            let _ = state.managed[m].versions.remove(
+                at ?? { return Ok(ManagedApplied.Refused(IamOutcome.NoSuchEntity)); },
+            );
+        }
+        ManagedCall.SetDefaultPolicyVersion(arn, number) => {
+            let m = managedAt(state, arn.view()) ?? { return Ok(ManagedApplied.Refused(IamOutcome.NoSuchEntity)); };
+            var found = false;
+            for (v in 0..state.managed[m].versions.length) {
+                if (state.managed[m].versions[v].number == *number) { found = true; }
+            }
+            if (!found) { return Ok(ManagedApplied.Refused(IamOutcome.NoSuchEntity)); }
+            state.managed[m].defaultVersion = *number;
+            state.managed[m].updatedMs = nowMs;
+        }
+        ManagedCall.Attach(to, name, arn) => { return attachment(state, to, name.view(), arn.view(), true); }
+        ManagedCall.Detach(to, name, arn) => { return attachment(state, to, name.view(), arn.view(), false); }
+    }
+    return Ok(ManagedApplied.Changed(null));
+}
+
+// ---- The answers ----
+
+fn appendTags(out: borrow mut Vector<u8>, tags: Slice<IamTag>) -> Result<void, AllocError> {
+    if (tags.length == 0) { return Ok(); }
+    out.extend("<Tags>".bytes())?;
+    for (i in 0..tags.length) {
+        out.extend("<member>".bytes())?;
+        xmlTextElement(out, "Key", tags[i].key.view())?;
+        xmlTextElement(out, "Value", tags[i].value.view())?;
+        out.extend("</member>".bytes())?;
+    }
+    out.extend("</Tags>".bytes())?;
+    return Ok();
+}
+
+/// `<Policy>…</Policy>`'s inside for the account's policy.
+fn appendManagedPolicy(
+    out: borrow mut Vector<u8>,
+    p: borrow IamManagedPolicy,
+    attachments: u64,
+    withTags: bool,
+) -> Result<void, AllocError> {
+    xmlTextElement(out, "PolicyName", p.name.view())?;
+    out.extend("<DefaultVersionId>".bytes())?;
+    appendPolicyVersionId(out, p.defaultVersion)?;
+    out.extend("</DefaultVersionId>".bytes())?;
+    xmlTextElement(out, "PolicyId", p.id.view())?;
+    xmlTextElement(out, "Path", p.path.view())?;
+    var arn = Vector<u8>.create();
+    appendManagedArn(mut arn, p)?;
+    xmlTextElement(out, "Arn", arn.view())?;
+    out.extend("<AttachmentCount>".bytes())?;
+    appendDecimal(out, attachments)?;
+    out.extend("</AttachmentCount><PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>".bytes())?;
+    out.extend("<IsAttachable>true</IsAttachable>".bytes())?;
+    if (p.description.length > 0) { xmlTextElement(out, "Description", p.description.view())?; }
+    out.extend("<CreateDate>".bytes())?;
+    appendIso8601(out, p.createdMs)?;
+    out.extend("</CreateDate><UpdateDate>".bytes())?;
+    appendIso8601(out, p.updatedMs)?;
+    out.extend("</UpdateDate>".bytes())?;
+    if (withTags) { appendTags(out, p.tags.view())?; }
+    return Ok();
+}
+
+/// `<Policy>…</Policy>`'s inside for one of AWS's four.
+fn appendAwsPolicy(out: borrow mut Vector<u8>, name: Slice<u8>, attachments: u64) -> Result<void, AllocError> {
+    xmlTextElement(out, "PolicyName", name)?;
+    out.extend("<DefaultVersionId>v1</DefaultVersionId><PolicyId>ANPAAWSMANAGED".bytes())?;
+    appendXmlEscaped(out, name)?;
+    out.extend("</PolicyId><Path>/</Path><Arn>".bytes())?;
+    out.extend(AWS_POLICY_ARN.bytes())?;
+    appendXmlEscaped(out, name)?;
+    out.extend("</Arn><AttachmentCount>".bytes())?;
+    appendDecimal(out, attachments)?;
+    out.extend("</AttachmentCount><PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>".bytes())?;
+    out.extend("<IsAttachable>true</IsAttachable><CreateDate>".bytes())?;
+    appendIso8601(out, 0)?;
+    out.extend("</CreateDate><UpdateDate>".bytes())?;
+    appendIso8601(out, 0)?;
+    out.extend("</UpdateDate>".bytes())?;
+    return Ok();
+}
+
+/// `<PolicyVersion>…</PolicyVersion>`'s inside; the document URL-encoded, as IAM answers it, when `withDocument`.
+fn appendPolicyVersion(
+    out: borrow mut Vector<u8>,
+    text: Slice<u8>,
+    number: u32,
+    isDefault: bool,
+    createdMs: i64,
+    withDocument: bool,
+) -> Result<void, AllocError> {
+    if (withDocument) {
+        var encoded = Vector<u8>.create();
+        appendUriEncoded(mut encoded, text, false)?;
+        xmlTextElement(out, "Document", encoded.view())?;
+    }
+    out.extend("<VersionId>".bytes())?;
+    appendPolicyVersionId(out, number)?;
+    out.extend(if (isDefault) "</VersionId><IsDefaultVersion>true</IsDefaultVersion><CreateDate>".bytes()
+        else "</VersionId><IsDefaultVersion>false</IsDefaultVersion><CreateDate>".bytes())?;
+    appendIso8601(out, createdMs)?;
+    out.extend("</CreateDate>".bytes())?;
+    return Ok();
+}
+
+const AWS_POLICY_NAMES: [StringView; 4] = [
+    "AdministratorAccess", "AmazonS3FullAccess", "AmazonS3ReadOnlyAccess", "IAMReadOnlyAccess",
+];
+
+/// The resource an IAM policy decides a call about policy `arn` on: `iam:policy/<path><name>` for the account's, a
+/// resource no statement of this account names for another's (AWS's own).
+fn policyResourceOf(arn: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    if (startsWithBytes(arn, IAM_ACCOUNT_ARN.bytes())) {
+        out.extend("iam:".bytes())?;
+        out.extend(arn[IAM_ACCOUNT_ARN.length..])?;
+    } else {
+        out.extend("iam:foreign/".bytes())?;
+        out.extend(nameOfArn(arn))?;
+    }
+    return Ok(out);
+}
+
+/// A call's error for an outcome.
+async fn managedRefused(
+    exchange: borrow mut Exchange,
+    outcome: borrow IamOutcome,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    return match (outcome) {
+        IamOutcome.NotReady => await iamError(
+            exchange,
+            503,
+            "ServiceUnavailable",
+            "The IAM records are not ready yet; try again.",
+            requestId,
+        ),
+        IamOutcome.NoSuchEntity => await iamError(
+            exchange,
+            404,
+            "NoSuchEntity",
+            "The policy, version, user, role or group named is not the API's.",
+            requestId,
+        ),
+        IamOutcome.EntityAlreadyExists => await iamError(
+            exchange,
+            409,
+            "EntityAlreadyExists",
+            "A policy with this name already exists.",
+            requestId,
+        ),
+        IamOutcome.LimitExceeded => await iamError(
+            exchange,
+            409,
+            "LimitExceeded",
+            "Cannot exceed the quota: 5 versions a policy, 10 policies attached, 6,144 characters a document.",
+            requestId,
+        ),
+        IamOutcome.DeleteConflict => await iamError(
+            exchange,
+            409,
+            "DeleteConflict",
+            "Detach the policy and delete its other versions first; a default version is not deleted.",
+            requestId,
+        ),
+        IamOutcome.MalformedPolicyDocument => await iamError(
+            exchange,
+            400,
+            "MalformedPolicyDocument",
+            "The policy document is not one taken here.",
+            requestId,
+        ),
+        _ => await iamError(
+            exchange,
+            409,
+            "ConcurrentModification",
+            "The IAM records changed meanwhile; try again.",
+            requestId,
+        ),
+    };
+}
+
+/// `Tags.member.N.Key` and `.Value`: null when one has no key, or there are more than 50.
+fn formTags(body: Slice<u8>) -> Result<Vector<IamTag>?, AllocError> {
+    var out = Vector<IamTag>.create();
+    var n: u64 = 1;
+    while (true) {
+        var keyName = textOf("Tags.member.");
+        var number = Vector<u8>.create();
+        appendDecimal(mut number, n)?;
+        keyName.append(StringView.fromUtf8(number.view()) ?? "")?;
+        var valueName = textOf(keyName.view());
+        keyName.append(".Key")?;
+        valueName.append(".Value")?;
+        var key = Vector<u8>.create();
+        if (!formValue(body, keyName.view(), mut key)?) { break; }
+        if (key.length == 0 || key.length > 128) { return Ok(null); }
+        let value = formText(body, valueName.view())?;
+        if (value.length > 256) { return Ok(null); }
+        out.push(IamTag { key: key, value: value })?;
+        if (out.length > IAM_MAX_TAGS) { return Ok(null); }
+        n += 1;
+    }
+    return Ok(Some(out));
+}
+
+/// A managed call, under the store's lock, tried again when the record changed meanwhile.
+async fn applyIamRetrying(app: borrow S3App, call: borrow IamCall) -> Result<IamOutcome, S3Fail> {
+    var outcome = IamOutcome.Conflict;
+    for (attempt in 0..3) {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let nowMs = Clock.unixMillis();
+        let none = Vector<Vector<u8>>.create();
+        let users = none.view();
+        let roles = none.view();
+        outcome = match (await Async.blocking(() => applyIamCall(store, call, users, roles, nowMs))) {
+            Ok(o) => o,
+            Err(e) => { return Err(storeFail(e, 0)); }
+        };
+        match (outcome) {
+            IamOutcome.Conflict => {}
+            _ => { break; }
+        }
+    }
+    return Ok(outcome);
+}
+
+/// A managed policy's call or an attachment's (ADR-0108 §3): decided (`iam:<Action>` on the policy, or on the user or
+/// role it is attached to), then read from the record or changed through `applyIamCall`.
+async fn serveIamManaged(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+    a: Slice<u8>,
+    body: Slice<u8>,
+    who: borrow Requester,
+    decided: bool,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    let snapshot = await readIamSnapshot(borrow app.store) ?? {
+        return await iamError(exchange, 500, "ServiceFailure", "The IAM records do not read.", requestId);
+    };
+    let state = borrow snapshot.state;
+    let userName = formText(body, "UserName")?;
+    let roleName = formText(body, "RoleName")?;
+    let arn = formText(body, "PolicyArn")?;
+    let onUser = a == "AttachUserPolicy".bytes() || a == "DetachUserPolicy".bytes() ||
+        a == "ListAttachedUserPolicies".bytes();
+    let onRole = a == "AttachRolePolicy".bytes() || a == "DetachRolePolicy".bytes() ||
+        a == "ListAttachedRolePolicies".bytes();
+    let path = if (a == "CreatePolicy".bytes()) {
+        let given = formText(body, "Path")?;
+        if (given.length == 0) copyBytes("/".bytes())? else given
+    } else copyBytes("/".bytes())?;
+    if (!iamPathOk(path.view())) {
+        return await iamError(exchange, 400, "ValidationError", "Path is / or /…/, 1 to 512 characters.", requestId);
+    }
+    let policyName = formText(body, "PolicyName")?;
+    if (a == "CreatePolicy".bytes() && !policyNameOk(policyName.view())) {
+        return await iamError(
+            exchange,
+            400,
+            "ValidationError",
+            "PolicyName is 1 to 128 of A-Z a-z 0-9 + = , . @ _ -.",
+            requestId,
+        );
+    }
+    let needsArn = !(a == "CreatePolicy".bytes() || a == "ListPolicies".bytes() ||
+        a == "ListAttachedUserPolicies".bytes() || a == "ListAttachedRolePolicies".bytes());
+    if (needsArn && !startsWithBytes(arn.view(), "arn:aws:iam::".bytes())) {
+        return await iamError(exchange, 400, "ValidationError", "PolicyArn is an IAM policy's ARN.", requestId);
+    }
+    // The resource it is decided on.
+    var resource = Vector<u8>.create();
+    if (onUser) {
+        resource.extend("iam:user/".bytes())?;
+        match (userAt(state, userName.view())) {
+            Some(u) => { resource.extend(state.users[u].name.view())?; }
+            null => { resource.extend(userName.view())?; }
+        }
+    } else if (onRole) {
+        resource.extend("iam:role/".bytes())?;
+        match (roleAtIam(state, roleName.view())) {
+            Some(r) => { resource.extend(state.roles[r].name.view())?; }
+            null => { resource.extend(roleName.view())?; }
+        }
+    } else if (a == "CreatePolicy".bytes()) {
+        resource.extend("iam:policy".bytes())?;
+        resource.extend(path.view())?;
+        resource.extend(policyName.view())?;
+    } else if (a == "ListPolicies".bytes()) {
+        resource.extend("iam:policy/*".bytes())?;
+    } else {
+        resource = policyResourceOf(arn.view())?;
+    }
+    if (decided) {
+        var iamAction = copyBytes("iam:".bytes())?;
+        iamAction.extend(a)?;
+        if (!sessionAllows(app, req, who, StringView.fromUtf8(iamAction.view()) ?? "", resource.view())?) {
+            return await iamError(
+                exchange,
+                403,
+                "AccessDenied",
+                "Not authorized to perform this IAM action.",
+                requestId,
+            );
+        }
+    }
+    var result = Vector<u8>.create();
+    // The reads.
+    if (a == "ListPolicies".bytes()) {
+        let scope = formText(body, "Scope")?;
+        let onlyAttached = formText(body, "OnlyAttached")?.view() == "true".bytes();
+        let prefix = formText(body, "PathPrefix")?;
+        let local = scope.length == 0 || scope.view() == "All".bytes() || scope.view() == "Local".bytes();
+        let aws = scope.length == 0 || scope.view() == "All".bytes() || scope.view() == "AWS".bytes();
+        result.extend("<IsTruncated>false</IsTruncated><Policies>".bytes())?;
+        if (aws && (prefix.length == 0 || prefix.view() == "/".bytes())) {
+            for (n in AWS_POLICY_NAMES) {
+                var full = copyBytes(AWS_POLICY_ARN.bytes())?;
+                full.extend(n.bytes())?;
+                let count = attachmentCount(state, full.view());
+                if (onlyAttached && count == 0) { continue; }
+                result.extend("<member>".bytes())?;
+                appendAwsPolicy(mut result, n.bytes(), count)?;
+                result.extend("</member>".bytes())?;
+            }
+        }
+        if (local) {
+            for (i in 0..state.managed.length) {
+                let p = borrow state.managed[i];
+                if (prefix.length > 0 && !startsWithBytes(p.path.view(), prefix.view())) { continue; }
+                var full = Vector<u8>.create();
+                appendManagedArn(mut full, p)?;
+                let count = attachmentCount(state, full.view());
+                if (onlyAttached && count == 0) { continue; }
+                result.extend("<member>".bytes())?;
+                appendManagedPolicy(mut result, p, count, false)?;
+                result.extend("</member>".bytes())?;
+            }
+        }
+        result.extend("</Policies>".bytes())?;
+        return await iamAnswer(exchange, a, result.view(), requestId);
+    }
+    if (a == "ListAttachedUserPolicies".bytes() || a == "ListAttachedRolePolicies".bytes()) {
+        let attached = if (onUser) match (userAt(state, userName.view())) {
+            Some(u) => Some(borrow state.users[u].attached),
+            null => null,
+        } else match (roleAtIam(state, roleName.view())) {
+            Some(r) => Some(borrow state.roles[r].attached),
+            null => null,
+        };
+        let list = attached ?? {
+            return await iamError(
+                exchange,
+                404,
+                "NoSuchEntity",
+                "The user or role named is not the API's.",
+                requestId,
+            );
+        };
+        result.extend("<AttachedPolicies>".bytes())?;
+        for (i in 0..list.length) {
+            result.extend("<member>".bytes())?;
+            xmlTextElement(mut result, "PolicyName", nameOfArn(list[i].view()))?;
+            xmlTextElement(mut result, "PolicyArn", list[i].view())?;
+            result.extend("</member>".bytes())?;
+        }
+        result.extend("</AttachedPolicies><IsTruncated>false</IsTruncated>".bytes())?;
+        return await iamAnswer(exchange, a, result.view(), requestId);
+    }
+    if (a == "GetPolicy".bytes() || a == "GetPolicyVersion".bytes() || a == "ListPolicyVersions".bytes() ||
+        a == "ListEntitiesForPolicy".bytes()) {
+        let count = attachmentCount(state, arn.view());
+        let wanted = formText(body, "VersionId")?;
+        match (awsManagedPolicy(arn.view())) {
+            Some(doc) => {
+                if (a == "GetPolicy".bytes()) {
+                    result.extend("<Policy>".bytes())?;
+                    appendAwsPolicy(mut result, nameOfArn(arn.view()), count)?;
+                    result.extend("</Policy>".bytes())?;
+                    return await iamAnswer(exchange, a, result.view(), requestId);
+                }
+                if (a == "GetPolicyVersion".bytes()) {
+                    if (wanted.view() != "v1".bytes()) {
+                        return await iamError(
+                            exchange,
+                            404,
+                            "NoSuchEntity",
+                            "The policy has no such version.",
+                            requestId,
+                        );
+                    }
+                    result.extend("<PolicyVersion>".bytes())?;
+                    appendPolicyVersion(mut result, doc.bytes(), 1, true, 0, true)?;
+                    result.extend("</PolicyVersion>".bytes())?;
+                    return await iamAnswer(exchange, a, result.view(), requestId);
+                }
+                if (a == "ListPolicyVersions".bytes()) {
+                    result.extend("<Versions><member>".bytes())?;
+                    appendPolicyVersion(mut result, doc.bytes(), 1, true, 0, false)?;
+                    result.extend("</member></Versions><IsTruncated>false</IsTruncated>".bytes())?;
+                    return await iamAnswer(exchange, a, result.view(), requestId);
+                }
+            }
+            null => {}
+        }
+        let isAws = awsManagedPolicy(arn.view()).isSome();
+        let m = if (isAws) null else managedAt(state, arn.view());
+        if (!isAws && m.isNull()) {
+            return await iamError(
+                exchange,
+                404,
+                "NoSuchEntity",
+                "The policy with this ARN is not the API's.",
+                requestId,
+            );
+        }
+        if (a == "ListEntitiesForPolicy".bytes()) {
+            let filter = formText(body, "EntityFilter")?;
+            let users = filter.length == 0 || filter.view() == "User".bytes();
+            let roles = filter.length == 0 || filter.view() == "Role".bytes();
+            let groups = filter.length == 0 || filter.view() == "Group".bytes();
+            result.extend("<PolicyGroups>".bytes())?;
+            if (groups) {
+                for (i in 0..state.groups.length) {
+                    if (!namedExactly(state.groups[i].attached.view(), arn.view())) { continue; }
+                    result.extend("<member>".bytes())?;
+                    xmlTextElement(mut result, "GroupName", state.groups[i].name.view())?;
+                    xmlTextElement(mut result, "GroupId", state.groups[i].id.view())?;
+                    result.extend("</member>".bytes())?;
+                }
+            }
+            result.extend("</PolicyGroups><PolicyUsers>".bytes())?;
+            if (users) {
+                for (i in 0..state.users.length) {
+                    if (!namedExactly(state.users[i].attached.view(), arn.view())) { continue; }
+                    result.extend("<member>".bytes())?;
+                    xmlTextElement(mut result, "UserName", state.users[i].name.view())?;
+                    xmlTextElement(mut result, "UserId", state.users[i].id.view())?;
+                    result.extend("</member>".bytes())?;
+                }
+            }
+            result.extend("</PolicyUsers><PolicyRoles>".bytes())?;
+            if (roles) {
+                for (i in 0..state.roles.length) {
+                    if (!namedExactly(state.roles[i].attached.view(), arn.view())) { continue; }
+                    result.extend("<member>".bytes())?;
+                    xmlTextElement(mut result, "RoleName", state.roles[i].name.view())?;
+                    xmlTextElement(mut result, "RoleId", state.roles[i].id.view())?;
+                    result.extend("</member>".bytes())?;
+                }
+            }
+            result.extend("</PolicyRoles><IsTruncated>false</IsTruncated>".bytes())?;
+            return await iamAnswer(exchange, a, result.view(), requestId);
+        }
+        let p = borrow state.managed[m ?? 0];
+        if (a == "GetPolicy".bytes()) {
+            result.extend("<Policy>".bytes())?;
+            appendManagedPolicy(mut result, p, count, true)?;
+            result.extend("</Policy>".bytes())?;
+        } else if (a == "ListPolicyVersions".bytes()) {
+            result.extend("<Versions>".bytes())?;
+            for (v in 0..p.versions.length) {
+                let version = borrow p.versions[v];
+                result.extend("<member>".bytes())?;
+                appendPolicyVersion(
+                    mut result,
+                    version.text.view(),
+                    version.number,
+                    version.number == p.defaultVersion,
+                    version.createdMs,
+                    false,
+                )?;
+                result.extend("</member>".bytes())?;
+            }
+            result.extend("</Versions><IsTruncated>false</IsTruncated>".bytes())?;
+        } else {
+            let number = versionNumberOf(wanted.view()) ?? 0;
+            var found: usize? = null;
+            for (v in 0..p.versions.length) {
+                if (p.versions[v].number == number) { found = Some(v); }
+            }
+            let v = found ?? {
+                return await iamError(exchange, 404, "NoSuchEntity", "The policy has no such version.", requestId);
+            };
+            let version = borrow p.versions[v];
+            result.extend("<PolicyVersion>".bytes())?;
+            appendPolicyVersion(
+                mut result,
+                version.text.view(),
+                version.number,
+                version.number == p.defaultVersion,
+                version.createdMs,
+                true,
+            )?;
+            result.extend("</PolicyVersion>".bytes())?;
+        }
+        return await iamAnswer(exchange, a, result.view(), requestId);
+    }
+    // The changes.
+    let versionOf = versionNumberOf(formText(body, "VersionId")?.view());
+    let needsVersion = a == "DeletePolicyVersion".bytes() || a == "SetDefaultPolicyVersion".bytes();
+    if (needsVersion && versionOf.isNull()) {
+        return await iamError(exchange, 400, "ValidationError", "VersionId is v and a number.", requestId);
+    }
+    let managed = if (a == "CreatePolicy".bytes()) {
+        let description = formText(body, "Description")?;
+        if (description.length > IAM_MANAGED_MAX_DESCRIPTION) {
+            return await iamError(
+                exchange,
+                400,
+                "ValidationError",
+                "Description is 1,000 characters at most.",
+                requestId,
+            );
+        }
+        let tags = formTags(body)? ?? {
+            return await iamError(
+                exchange,
+                400,
+                "ValidationError",
+                "Tags are 50 at most, each a key of 1 to 128 characters and a value of 256 at most.",
+                requestId,
+            );
+        };
+        ManagedCall.CreatePolicy(policyName, path, description, formText(body, "PolicyDocument")?, tags)
+    } else if (a == "DeletePolicy".bytes()) ManagedCall.DeletePolicy(arn)
+        else if (a == "CreatePolicyVersion".bytes()) ManagedCall.CreatePolicyVersion(
+            arn,
+            formText(body, "PolicyDocument")?,
+            formText(body, "SetAsDefault")?.view() == "true".bytes(),
+        )
+        else if (a == "DeletePolicyVersion".bytes()) ManagedCall.DeletePolicyVersion(arn, versionOf ?? 0)
+        else if (a == "SetDefaultPolicyVersion".bytes()) ManagedCall.SetDefaultPolicyVersion(arn, versionOf ?? 0)
+        else if (a == "AttachUserPolicy".bytes()) ManagedCall.Attach(AttachTo.User, userName, arn)
+        else if (a == "DetachUserPolicy".bytes()) ManagedCall.Detach(AttachTo.User, userName, arn)
+        else if (a == "AttachRolePolicy".bytes()) ManagedCall.Attach(AttachTo.Role, roleName, arn)
+        else ManagedCall.Detach(AttachTo.Role, roleName, arn);
+    let call = IamCall.Managed(managed);
+    let outcome = await applyIamRetrying(app, borrow call)?;
+    return match (borrow outcome) {
+        IamOutcome.Done(_, _, _, policy) => {
+            match (policy) {
+                Some(p) => {
+                    if (a == "CreatePolicy".bytes()) {
+                        result.extend("<Policy>".bytes())?;
+                        appendManagedPolicy(mut result, p, 0, true)?;
+                        result.extend("</Policy>".bytes())?;
+                    } else {
+                        // CreatePolicyVersion: the version made, the last.
+                        let version = borrow p.versions[p.versions.length - 1];
+                        result.extend("<PolicyVersion>".bytes())?;
+                        appendPolicyVersion(
+                            mut result,
+                            version.text.view(),
+                            version.number,
+                            version.number == p.defaultVersion,
+                            version.createdMs,
+                            false,
+                        )?;
+                        result.extend("</PolicyVersion>".bytes())?;
+                    }
+                }
+                null => {}
+            }
+            await iamAnswer(exchange, a, result.view(), requestId)
+        },
+        _ => await managedRefused(exchange, borrow outcome, requestId),
+    };
+}

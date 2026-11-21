@@ -916,6 +916,48 @@ aws iam delete-role-policy --role-name deployer --policy-name list > /dev/null 2
 aws iam delete-role --role-name deployer > /dev/null 2>&1
 aws iam delete-role --role-name locked > /dev/null 2>&1
 check "the API's roles gone, the file's listed" "$(aws iam list-roles --query 'Roles[].RoleName' --output text 2>&1)" reader
+# Managed policies (ADR-0108 §3): made, versioned and attached; a user may do what their default versions allow.
+pol1='{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::smoke"}}'
+pol2='{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:ListBucket","s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::smoke","arn:aws:s3:::smoke/mp.txt"]}}'
+parn=arn:aws:iam::000000000000:policy/team/smoke-list
+check "iam create-policy" "$(aws iam create-policy --policy-name smoke-list --path /team/ --policy-document "$pol1" --tags Key=team,Value=data --query 'Policy.[Arn,DefaultVersionId]' --output text 2>&1 | tr '\t' ' ')" "$parn v1"
+check "a policy's name twice" "$(code iam create-policy --policy-name smoke-list --policy-document "$pol1")" EntityAlreadyExists
+check "nor a path IAM does not take" "$(code iam create-policy --policy-name p2 --path team --policy-document "$pol1")" ValidationError
+check "iam get-policy" "$(aws iam get-policy --policy-arn $parn --query 'Policy.[PolicyName,Path,AttachmentCount,Tags[0].Value]' --output text 2>&1 | tr '\t' ' ')" "smoke-list /team/ 0 data"
+aws iam create-user --user-name mp > /dev/null 2>&1
+mpkey=$(aws iam create-access-key --user-name mp --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>&1)
+mpid=$(echo "$mpkey" | cut -f1); mpsecret=$(echo "$mpkey" | cut -f2)
+mp() { ( export AWS_ACCESS_KEY_ID="$mpid" AWS_SECRET_ACCESS_KEY="$mpsecret"; "$@" ); }
+aws iam attach-user-policy --user-name mp --policy-arn $parn > /dev/null 2>&1 && pass "iam attach-user-policy" || fail "iam attach-user-policy"
+check "listed attached" "$(aws iam list-attached-user-policies --user-name mp --query 'AttachedPolicies[].PolicyName' --output text 2>&1)" smoke-list
+check "a policy not there not attached" "$(code iam attach-user-policy --user-name mp --policy-arn arn:aws:iam::000000000000:policy/none)" NoSuchEntity
+sleep 3
+check "its default version allows" "$(mp aws s3api list-objects-v2 --bucket smoke --max-keys 1 --query KeyCount --output text 2>&1)" 1
+check "and no more" "$(mp code s3api put-object --bucket smoke --key mp.txt --body sse.txt)" AccessDenied
+check "iam create-policy-version" "$(aws iam create-policy-version --policy-arn $parn --policy-document "$pol2" --query 'PolicyVersion.[VersionId,IsDefaultVersion]' --output text 2>&1 | tr '\t' ' ')" "v2 False"
+sleep 3
+check "a version not the default allows nothing more" "$(mp code s3api put-object --bucket smoke --key mp.txt --body sse.txt)" AccessDenied
+aws iam set-default-policy-version --policy-arn $parn --version-id v2 > /dev/null 2>&1 && pass "iam set-default-policy-version" || fail "iam set-default-policy-version"
+check "its document read back" "$(aws iam get-policy-version --policy-arn $parn --version-id v2 --query 'PolicyVersion.[IsDefaultVersion,Document.Statement.Action[1]]' --output text 2>&1 | tr '\t' ' ')" "True s3:PutObject"
+check "the versions listed" "$(aws iam list-policy-versions --policy-arn $parn --query 'Versions[].VersionId' --output text 2>&1 | tr '\t' ' ')" "v1 v2"
+sleep 3
+check "the new default allows" "$(mp aws s3api put-object --bucket smoke --key mp.txt --body sse.txt > /dev/null 2>&1 && echo yes)" yes
+check "the default version not deleted" "$(code iam delete-policy-version --policy-arn $parn --version-id v2)" DeleteConflict
+check "nor an attached policy" "$(code iam delete-policy --policy-arn $parn)" DeleteConflict
+check "its users listed" "$(aws iam list-entities-for-policy --policy-arn $parn --query 'PolicyUsers[].UserName' --output text 2>&1)" mp
+check "AWS's read-only S3 policy" "$(aws iam get-policy-version --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess --version-id v1 --query 'PolicyVersion.Document.Statement[0].Action[0]' --output text 2>&1)" 's3:Get*'
+aws iam attach-user-policy --user-name mp --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess > /dev/null 2>&1
+check "listed among AWS's, attached" "$(aws iam list-policies --scope AWS --only-attached --query 'Policies[].PolicyName' --output text 2>&1)" AmazonS3ReadOnlyAccess
+check "and the account's" "$(aws iam list-policies --scope Local --query 'Policies[].[PolicyName,AttachmentCount]' --output text 2>&1 | tr '\t' ' ')" "smoke-list 1"
+mp aws s3api delete-object --bucket smoke --key mp.txt > /dev/null 2>&1
+aws iam delete-access-key --user-name mp --access-key-id "$mpid" > /dev/null 2>&1
+check "a user with policies attached not deleted" "$(code iam delete-user --user-name mp)" DeleteConflict
+aws iam detach-user-policy --user-name mp --policy-arn $parn > /dev/null 2>&1 && pass "iam detach-user-policy" || fail "iam detach-user-policy"
+aws iam detach-user-policy --user-name mp --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess > /dev/null 2>&1
+aws iam delete-user --user-name mp > /dev/null 2>&1 && pass "then deleted" || fail "then deleted"
+aws iam delete-policy-version --policy-arn $parn --version-id v1 > /dev/null 2>&1 && pass "iam delete-policy-version" || fail "iam delete-policy-version"
+aws iam delete-policy --policy-arn $parn > /dev/null 2>&1 && pass "iam delete-policy" || fail "iam delete-policy"
+check "gone" "$(code iam get-policy --policy-arn $parn)" NoSuchEntity
 check "a roles file's role got" "$(aws iam get-role --role-name reader --query 'Role.[Arn,MaxSessionDuration]' --output text 2>&1 | tr '\t' ' ')" "arn:aws:iam::000000000000:role/reader 3600"
 check "the account's keys listed" "$(aws iam list-access-keys --query "AccessKeyMetadata[?AccessKeyId=='$AWS_ACCESS_KEY_ID'].Status" --output text 2>&1)" Active
 check "another account's role is none" "$(code sts assume-role --role-arn arn:aws:iam::123456789012:role/reader --role-session-name smoke)" AccessDenied

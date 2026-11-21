@@ -1,0 +1,215 @@
+// The IAM API's managed policies (ADR-0108 §3): made, versioned, attached and deleted as AWS allows, on a state.
+
+fn managedText(action: StringView) -> Vector<u8> => iamPolicy("p", action).text;
+
+fn managedApplied(state: borrow mut IamState, call: ManagedCall) -> ManagedApplied =>
+    applyManagedCall(state, borrow call, 10)!;
+
+fn managedOutcome(state: borrow mut IamState, call: ManagedCall) -> String {
+    let a = managedApplied(state, call);
+    return refusedAs(borrow a);
+}
+
+fn refusedAs(a: borrow ManagedApplied) -> String => match (a) {
+    ManagedApplied.Refused(o) => textOf(outcomeName(o)),
+    ManagedApplied.Changed(_) => textOf("Changed"),
+};
+
+const WRITERS_ARN: StringView = "arn:aws:iam::000000000000:policy/team/writers";
+
+fn writersArn() -> Vector<u8> => copyBytes(WRITERS_ARN.bytes())!;
+
+/// A policy made, a second version made the default, the first deleted; its limits and refusals as AWS's.
+@test
+fn managedPoliciesVersionAsAws() -> Result<void, TestFailure> {
+    var s = sampleIam();
+    let made = managedApplied(
+        mut s,
+        ManagedCall.CreatePolicy(
+            copyBytes("writers".bytes())!,
+            copyBytes("/team/".bytes())!,
+            Vector<u8>.create(),
+            managedText("s3:PutObject"),
+            Vector<IamTag>.create(),
+        ),
+    );
+    match (made) {
+        ManagedApplied.Changed(Some(p)) => {
+            Check.equalBytes("ANPA".bytes(), p.id.view()[0..4])?;
+            Check.equalU64(1, p.defaultVersion as u64)?;
+        }
+        _ => { return Err(TestFailure.create("made")); }
+    }
+    let again = managedApplied(
+        mut s,
+        ManagedCall.CreatePolicy(
+            copyBytes("WRITERS".bytes())!,
+            copyBytes("/".bytes())!,
+            Vector<u8>.create(),
+            managedText("s3:PutObject"),
+            Vector<IamTag>.create(),
+        ),
+    );
+    Check.equalText("EntityAlreadyExists", refusedAs(borrow again).view())?;
+    let bad = managedApplied(
+        mut s,
+        ManagedCall.CreatePolicy(
+            copyBytes("bad".bytes())!,
+            copyBytes("/".bytes())!,
+            Vector<u8>.create(),
+            copyBytes("{\"Statement\":\"no\"}".bytes())!,
+            Vector<IamTag>.create(),
+        ),
+    );
+    Check.equalText("MalformedPolicyDocument", refusedAs(borrow bad).view())?;
+    // Versions 2 to 5; a sixth refused.
+    for (i in 0..4) {
+        let v = managedApplied(
+            mut s,
+            ManagedCall.CreatePolicyVersion(writersArn(), managedText("s3:GetObject"), i == 0),
+        );
+        Check.equalText("Changed", refusedAs(borrow v).view())?;
+    }
+    Check.equalU64(2, s.managed[0].defaultVersion as u64)?;
+    let sixth = managedApplied(
+        mut s,
+        ManagedCall.CreatePolicyVersion(writersArn(), managedText("s3:GetObject"), false),
+    );
+    Check.equalText("LimitExceeded", refusedAs(borrow sixth).view())?;
+    // The default is not deleted; another is, and its number is not used again.
+    Check.equalText("DeleteConflict", managedOutcome(mut s, ManagedCall.DeletePolicyVersion(writersArn(), 2)).view())?;
+    Check.equalText("Changed", managedOutcome(mut s, ManagedCall.DeletePolicyVersion(writersArn(), 5)).view())?;
+    Check.equalText(
+        "NoSuchEntity",
+        managedOutcome(mut s, ManagedCall.SetDefaultPolicyVersion(writersArn(), 5)).view(),
+    )?;
+    let next = managedApplied(mut s, ManagedCall.CreatePolicyVersion(writersArn(), managedText("s3:GetObject"), false));
+    match (next) {
+        ManagedApplied.Changed(Some(p)) => { Check.equalU64(6, p.versions[p.versions.length - 1].number as u64)?; }
+        _ => { return Err(TestFailure.create("a sixth number")); }
+    }
+    // A policy with versions besides its default is not deleted.
+    Check.equalText("DeleteConflict", managedOutcome(mut s, ManagedCall.DeletePolicy(writersArn())).view())?;
+    for (v in [1u32, 3, 4, 6]) {
+        Check.equalText("Changed", managedOutcome(mut s, ManagedCall.DeletePolicyVersion(writersArn(), v)).view())?;
+    }
+    Check.equalText("Changed", managedOutcome(mut s, ManagedCall.DeletePolicy(writersArn())).view())?;
+    Check.equalU64(0, s.managed.length as u64)?;
+    return Ok();
+}
+
+/// Attached to a user and a role, joined into their policies, counted, and refusing the policy's and the user's
+/// deletion until detached; AWS's four attach, another of AWS's does not.
+@test
+fn managedPoliciesAttach() -> Result<void, TestFailure> {
+    var s = sampleIam();
+    let _ = managedApplied(
+        mut s,
+        ManagedCall.CreatePolicy(
+            copyBytes("writers".bytes())!,
+            copyBytes("/team/".bytes())!,
+            Vector<u8>.create(),
+            managedText("s3:PutObject"),
+            Vector<IamTag>.create(),
+        ),
+    );
+    let alice = copyBytes("ALICE".bytes())!; // names as IAM matches them
+    Check.equalText(
+        "Changed",
+        managedOutcome(mut s, ManagedCall.Attach(AttachTo.User, copyBytes(alice.view())!, writersArn())).view(),
+    )?;
+    Check.equalText(
+        "Changed",
+        managedOutcome(mut s, ManagedCall.Attach(AttachTo.User, copyBytes(alice.view())!, writersArn())).view(),
+    )?;
+    Check.equalU64(1, s.users[0].attached.length as u64)?; // once
+    Check.equalText(
+        "Changed",
+        managedOutcome(mut s, ManagedCall.Attach(AttachTo.Role, copyBytes("deployer".bytes())!, writersArn())).view(),
+    )?;
+    Check.equalU64(2, attachmentCount(borrow s, WRITERS_ARN.bytes()))?;
+    let joined = joinedPolicy(userPolicyTexts(borrow s, 0)!.view())!!;
+    Check.isTrue(findBytes(joined.view(), "s3:PutObject".bytes(), 0).isSome(), "joined")?;
+    Check.equalText("DeleteConflict", managedOutcome(mut s, ManagedCall.DeletePolicy(writersArn())).view())?;
+    Check.equalText(
+        "NoSuchEntity",
+        managedOutcome(mut s, ManagedCall.Attach(AttachTo.User, copyBytes("nobody".bytes())!, writersArn())).view(),
+    )?;
+    let none = copyBytes("arn:aws:iam::000000000000:policy/none".bytes())!;
+    Check.equalText(
+        "NoSuchEntity",
+        managedOutcome(mut s, ManagedCall.Attach(AttachTo.User, copyBytes("bob".bytes())!, none)).view(),
+    )?;
+    let ec2 = copyBytes("arn:aws:iam::aws:policy/AmazonEC2FullAccess".bytes())!;
+    Check.equalText(
+        "NoSuchEntity",
+        managedOutcome(mut s, ManagedCall.Attach(AttachTo.User, copyBytes("bob".bytes())!, ec2)).view(),
+    )?;
+    let admin = copyBytes("arn:aws:iam::aws:policy/AdministratorAccess".bytes())!;
+    Check.equalText(
+        "Changed",
+        managedOutcome(mut s, ManagedCall.Attach(AttachTo.User, copyBytes("bob".bytes())!, admin)).view(),
+    )?;
+    // Detached: not attached is NoSuchEntity; then the policy is deleted.
+    Check.equalText(
+        "Changed",
+        managedOutcome(mut s, ManagedCall.Detach(AttachTo.User, copyBytes("alice".bytes())!, writersArn())).view(),
+    )?;
+    Check.equalText(
+        "NoSuchEntity",
+        managedOutcome(mut s, ManagedCall.Detach(AttachTo.User, copyBytes("alice".bytes())!, writersArn())).view(),
+    )?;
+    Check.equalText(
+        "Changed",
+        managedOutcome(mut s, ManagedCall.Detach(AttachTo.Role, copyBytes("deployer".bytes())!, writersArn())).view(),
+    )?;
+    Check.equalText("Changed", managedOutcome(mut s, ManagedCall.DeletePolicy(writersArn())).view())?;
+    return Ok();
+}
+
+/// Ten policies attached at most.
+@test
+fn managedAttachmentsAreTenAtMost() -> Result<void, TestFailure> {
+    var s = sampleIam();
+    for (i in 0..11) {
+        var name = textOf("p");
+        var n = Vector<u8>.create();
+        appendDecimal(mut n, truncate<u64>(i))!;
+        name.append(StringView.fromUtf8(n.view()) ?? "")!;
+        let _ = managedApplied(
+            mut s,
+            ManagedCall.CreatePolicy(
+                copyBytes(name.bytes())!,
+                copyBytes("/".bytes())!,
+                Vector<u8>.create(),
+                managedText("s3:GetObject"),
+                Vector<IamTag>.create(),
+            ),
+        );
+        var arn = textOf("arn:aws:iam::000000000000:policy/");
+        arn.append(name.view())!;
+        let r = managedApplied(
+            mut s,
+            ManagedCall.Attach(AttachTo.User, copyBytes("alice".bytes())!, copyBytes(arn.bytes())!),
+        );
+        Check.equalText(if (i < 10) "Changed" else "LimitExceeded", refusedAs(borrow r).view())?;
+    }
+    return Ok();
+}
+
+/// An identity policy may name a policy's or a group's ARN, with a path (ADR-0108 §3).
+@test
+fn identityPoliciesNameManagedPolicies() -> Result<void, TestFailure> {
+    let doc = """
+        {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"iam:GetPolicy","Resource":["arn:aws:iam::000000000000:policy/team/*","arn:aws:iam::000000000000:group/editors"]}}
+        """;
+    Check.isTrue(parseIdentityPolicy(doc.bytes()).isOk(), "it parses")?;
+    Check.isTrue(iamPathOk("/".bytes()) && iamPathOk("/team/a/".bytes()), "paths")?;
+    Check.isFalse(iamPathOk("team/".bytes()) || iamPathOk("/team".bytes()) || iamPathOk("/a b/".bytes()), "not paths")?;
+    Check.equalU64(12, (versionNumberOf("v12".bytes()) ?? 0) as u64)?;
+    Check.isTrue(versionNumberOf("12".bytes()).isNull() && versionNumberOf("v".bytes()).isNull(), "not versions")?;
+    Check.equalBytes("writers".bytes(), nameOfArn(WRITERS_ARN.bytes()))?;
+    let resource = policyResourceOf(WRITERS_ARN.bytes())!;
+    Check.equalBytes("iam:policy/team/writers".bytes(), resource.view())?;
+    return Ok();
+}

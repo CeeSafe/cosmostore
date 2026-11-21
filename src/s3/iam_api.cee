@@ -115,13 +115,16 @@ enum IamCall {
     DeleteRole(Vector<u8>),
     PutRolePolicy(Vector<u8>, Vector<u8>, Vector<u8>),
     DeleteRolePolicy(Vector<u8>, Vector<u8>),
+    /// A managed policy's change or an attachment's (`iam_managed.cee`, ADR-0108 §3).
+    Managed(ManagedCall),
 }
 
 /// What a change came to.
 enum IamOutcome {
     /// Done: the user it was about, as it is now (for CreateUser and CreateAccessKey's answers), the key made, and the
-    /// role made (CreateRole's answer: on a cluster the record is not read back until it commits).
-    Done(IamUser?, IamKey?, IamRole?),
+    /// role made (CreateRole's answer: on a cluster the record is not read back until it commits), and the managed
+    /// policy made or changed (CreatePolicy's and CreatePolicyVersion's).
+    Done(IamUser?, IamKey?, IamRole?, IamManagedPolicy?),
     /// The records' bucket is not made yet (a cluster's shard leader makes it, ADR-0104 §3): try again.
     NotReady,
     NoSuchEntity,
@@ -202,6 +205,7 @@ fn applyIamCall(
     var state = snapshot.state;
     var made: IamKey? = null;
     var madeRole: IamRole? = null;
+    var madePolicy: IamManagedPolicy? = null;
     var about: usize? = null;
     match (call) {
         IamCall.CreateUser(name) => {
@@ -373,6 +377,12 @@ fn applyIamCall(
             }
             let _ = state.roles[r].policies.remove(at ?? { return Ok(IamOutcome.NoSuchEntity); });
         }
+        IamCall.Managed(m) => {
+            match (applyManagedCall(mut state, m, nowMs)?) {
+                ManagedApplied.Refused(o) => { return Ok(o); }
+                ManagedApplied.Changed(p) => { madePolicy = p; }
+            }
+        }
     }
     let bytes = encodeIamState(borrow state)?;
     // On `serve` the bucket is made here; on a cluster its shard's leader makes it (ADR-0104 §3), as a bucket made in
@@ -393,7 +403,7 @@ fn applyIamCall(
         Some(u) => Some(copyUser(borrow state.users[u])?),
         null => null,
     };
-    return Ok(IamOutcome.Done(user, made, madeRole));
+    return Ok(IamOutcome.Done(user, made, madeRole, madePolicy));
 }
 
 // ---- The calls ----
@@ -495,7 +505,7 @@ async fn serveIam(
         "DeleteAccessKey", "PutUserPolicy", "GetUserPolicy", "ListUserPolicies", "DeleteUserPolicy", "CreateRole",
         "GetRole", "ListRoles", "DeleteRole", "PutRolePolicy", "GetRolePolicy", "DeleteRolePolicy",
     ];
-    var taken = false;
+    var taken = isManagedAction(action.view());
     for (k in known) {
         if (action.view() == k.bytes()) { taken = true; }
     }
@@ -504,7 +514,9 @@ async fn serveIam(
     }
     // A policy's name, when the call takes one: 1 to 128 of IAM's characters (the M19 exit review).
     let policyName = formText(body.view(), "PolicyName")?;
-    if (action.view().endsWith("Policy".bytes()) && !policyNameOk(policyName.view())) {
+    if (action.view().endsWith(
+        "Policy".bytes(),
+    ) && !isManagedAction(action.view()) && !policyNameOk(policyName.view())) {
         return await iamError(
             exchange,
             400,
@@ -520,6 +532,19 @@ async fn serveIam(
         Some(c) => Some(copyBytes(c.user.view())?),
         null => null,
     };
+    // A managed policy's call or an attachment's is decided on the policy, or what it is attached to.
+    if (isManagedAction(action.view())) {
+        return await serveIamManaged(
+            app,
+            req,
+            exchange,
+            action.view(),
+            body.view(),
+            borrow who,
+            callerUser.isSome(),
+            requestId,
+        );
+    }
     // A role's call is about the role it names (`iam:role/<name>`), a user's about the user.
     let roleCall = action.view() == "ListRoles".bytes() || action.view().endsWith("Role".bytes()) ||
         action.view().endsWith("RolePolicy".bytes());
@@ -645,7 +670,7 @@ async fn serveIam(
         }
     }
     return match (outcome) {
-        IamOutcome.Done(user, key, _) => await iamDone(exchange, a, user, key, requestId),
+        IamOutcome.Done(user, key, _, _) => await iamDone(exchange, a, user, key, requestId),
         IamOutcome.NotReady => await iamError(
             exchange,
             503,
@@ -1046,7 +1071,7 @@ async fn serveIamRole(
         }
     }
     return match (outcome) {
-        IamOutcome.Done(_, _, role) => {
+        IamOutcome.Done(_, _, role, _) => {
             match (role) {
                 Some(r) => {
                     result.extend("<Role>".bytes())?;
