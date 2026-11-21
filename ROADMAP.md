@@ -4674,3 +4674,26 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Tests:** the S3 smoke (with its compaction checks), the cluster smoke (206), the SDK matrix, and 427 unit tests
   pass.
 - **Next:** slice 7, the target smoke and the exit review.
+
+### 21 Nov 2026: M20 slice 7 and the exit review (ADR-0106)
+
+- **Slice 7 (M15 B5):** the S3 smoke removes a replication target while a delivery waits for it. The delivery fails
+  as an unknown target's does, and none is dropped or left waiting.
+- **The exit review** (`docs/m20-exit-review.md`): one Medium-High, three Mediums and five Lows.
+  - **Medium-High:** a node gave its counts before its keys line, so a removal's count could miss a write sealed
+    just before the key retired. A node now reports its keys first.
+  - **Mediums:**
+    - a version with no room for its restore mark stopped every restore's marks, and on a cluster the shard's
+      orphan sweeps; it is now skipped;
+    - a roles file's role's sessions revived under an API role of its name; role ids now match exactly;
+    - removing the first KMS key refused default-KMS writes for the whole removal; the retiring set now takes the
+      file's order.
+  - **Lows:**
+    - followers now prune their restore watches;
+    - compaction reads 8 bytes and then the footer only;
+    - ADR-0106's recount and older-binary text are corrected.
+  - **Recorded, not fixed:** a local replica refused for a retiring key is not tried again (B1).
+- **Tests:** the S3 smoke (and its compaction checks), the cluster smoke (206), the SDK matrix, and 427 unit tests
+  pass.
+- **Next:** the owner's decisions. They are ADR-0106 as amended, M17 B1 and M16 B1 to stay, M16 B5 as an item of its
+  own, and closing M20.

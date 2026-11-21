@@ -124,11 +124,11 @@ struct PendingInput {
     entry: usize;
     sequence: i64;
     partitionKey: Vector<u8>;
+    /// Its last 8 bytes, pinned under the lock; then its footer's, once their length is known (0: not joined).
     tail: PreparedReader;
+    footerLength: u64;
+    footer: PreparedReader?;
 }
-
-/// What a footer is read from: a file's last bytes, up to this many. A longer footer's file is not joined this run.
-const COMPACTION_FOOTER_TAIL: u64 = 262144;
 
 /// A plan made under the store's lock, its candidates' footers not yet read.
 struct CompactionDraft {
@@ -274,8 +274,8 @@ fn planCompaction(
                 metadataFind(info.metadata.view(), SSE_FIELD.bytes()).isSome()) {
                 continue;
             }
-            let from = if (fileSize > COMPACTION_FOOTER_TAIL) fileSize - COMPACTION_FOOTER_TAIL else 0;
-            let tail = match (store.prepareReaderOf(bucket, name, null, from, fileSize)) {
+            // Its last 8 bytes only (the M20 exit review): the footer's length, then the footer, as before.
+            let tail = match (store.prepareReaderOf(bucket, name, null, fileSize - 8, fileSize)) {
                 Ok(r) => r,
                 Err(_) => { continue; }
             };
@@ -293,6 +293,8 @@ fn planCompaction(
                 sequence: sequence,
                 partitionKey: partitionKey,
                 tail: tail,
+                footerLength: 0,
+                footer: null,
             })?;
         }
     }
@@ -314,24 +316,24 @@ fn planCompaction(
     return Ok(Some(CompactionDraft { plan: plan, pending: pending, target: target }));
 }
 
-/// A draft's footers read and its plan's bins made, off the store's lock (ADR-0106 §3): no bins when there is nothing
-/// to join. The readers' pins keep the bytes each candidate had when planned.
+/// A draft's footers read and its plan's bins made, off the store's lock (ADR-0106 §3), once `pinFooters` has pinned
+/// them: no bins when there is nothing to join. The readers' pins keep the bytes each candidate had when planned.
 fn finishPlan(d: borrow mut CompactionDraft) -> Result<void, TablesError> {
     var inputs = Vector<CompactionInput>.create();
     for (i in 0..d.pending.length) {
         let c = borrow mut d.pending[i];
-        let tail = match (readPrepared(mut c.tail)?) {
-            Some(t) => t,
-            null => { continue; }
+        if (c.footerLength == 0) { continue; }
+        let bytes = match (c.footer.asBorrowMut()) {
+            Some(r) => readPrepared(r)?,
+            null => null,
         };
-        if (tail.length < 12) { continue; }
-        let n = parquetFooterLength(tail.view()[tail.length - 8..], c.size) ?? { continue; };
-        if (n + 8 > tail.length as u64) { continue; } // a footer past the tail read: not this run
-        let at = tail.length - 8 - truncate<usize>(n);
-        let footer = match (parseParquetFooter(tail.view()[at..tail.length - 8], c.size)?) {
+        let footerBytes = bytes ?? { continue; };
+        if (footerBytes.length as u64 != c.footerLength) { continue; }
+        let footer = match (parseParquetFooter(footerBytes.view(), c.size)?) {
             Some(f) => f,
             null => { continue; }
         };
+        c.footer = null; // its pin let go
         var group = copyBytes(c.partitionKey.view())?;
         group.push(0)?;
         group.extend(footer.shape.view())?;
@@ -349,6 +351,41 @@ fn finishPlan(d: borrow mut CompactionDraft) -> Result<void, TablesError> {
     }
     d.plan.bins = binsOf(inputs, d.target)?;
     return Ok();
+}
+
+/// Each candidate's last 8 bytes read, off the lock: its footer's length (0 when it is not a Parquet file's).
+fn readFooterLengths(d: borrow mut CompactionDraft) -> Result<void, AllocError> {
+    for (i in 0..d.pending.length) {
+        let c = borrow mut d.pending[i];
+        let tail = readPrepared(mut c.tail)? ?? { continue; };
+        if (tail.length != 8) { continue; }
+        c.footerLength = parquetFooterLength(tail.view(), c.size) ?? 0;
+    }
+    return Ok();
+}
+
+/// Each candidate's footer pinned, under the lock, if its version is still the one planned.
+fn pinFooters(store: borrow mut ObjectStore, d: borrow mut CompactionDraft) {
+    let hidden = copyBytes(d.plan.hidden.view()).ok() ?? { return; };
+    for (i in 0..d.pending.length) {
+        let c = borrow mut d.pending[i];
+        if (c.footerLength == 0 || c.footerLength + 8 > c.size) {
+            c.footerLength = 0;
+            continue;
+        }
+        let bucket = catalogText(hidden.view());
+        let name = catalogText(c.key.view());
+        let same = match (store.headObject(bucket, name)) {
+            Ok(h) => h.generation == c.generation,
+            Err(_) => false,
+        };
+        if (!same) {
+            c.footerLength = 0;
+            continue;
+        }
+        c.footer = store.prepareReaderOf(bucket, name, null, c.size - 8 - c.footerLength, c.size - 8).ok();
+        if (c.footer.isNull()) { c.footerLength = 0; }
+    }
 }
 
 /// A pinned reader's bytes, whole; null when they cannot be read.
@@ -1171,6 +1208,21 @@ async fn compactTable(
         Some(d) => d,
         null => { return Ok(); }
     };
+    // The footers off the lock (ADR-0106 §3): their lengths from each file's last 8 bytes; then, under the lock, the
+    // footers pinned; then read, and the bins made.
+    match (await Async.blocking(() => readFooterLengths(mut draft))) {
+        Ok() => {}
+        Err(_) => { return Ok(); } // out of memory: the next run
+    }
+    {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let dr = borrow mut draft;
+        await Async.blocking(() => pinFooters(st, dr));
+    }
     match (await Async.blocking(() => finishPlan(mut draft))) {
         Ok() => {}
         Err(_) => { return Ok(); } // out of memory: the next run

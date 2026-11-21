@@ -24,6 +24,9 @@
        (400), as AWS does for a key pending deletion.
      - **The count:** taken only once every node reports the key retiring (`# keys` status lines, as M17's are). It
        then reaches 0 and stays there.
+     - **The order of a status (amended at the exit review):** a node reports its keys before its counts. A leader
+       checks a write's key and commits it under one hold of the store's lock. So once a node's keys line shows the
+       key retiring, none of the counts after it can miss a write sealed under the key.
    - **The other way:** every sealed write's commit checks the key against a cluster-wide list. That is a check per
      write, across the log.
 2. **A local replica whose source was deleted meanwhile is not checked at commit (M15 B3).**
@@ -54,7 +57,10 @@
    - **The roles file's roles (amended in slice 4):** they have no id, as the file has none to give. A file role
      removed refuses its sessions while it is out of the file (ADR-0096 §2). Putting it back is the operator's act,
      as before.
-   - **Sessions from before the change** do not name an id. They stay valid until they expire, at most 12 hours.
+   - **The match is exact (amended at the exit review):** a session's id must be its role's now, and a roles file's
+     role has none. So a file role's session is refused once an API role takes its name.
+   - **Sessions from before the change** name no id, so an API role's are refused. That fails closed, within their
+     12 hours at most.
 6. **CreateUser can take the name of a users file's user with no key (M19 B2).**
    - **The fix:** the files' names come from the users file itself, keyed or not, not from the live set.
 
@@ -65,7 +71,7 @@
 | M15 B1: a removal holds the lock for a full count | **Fixed in M17:** the count is the index's, kept as versions are written (ADR-0100 §1). Recorded as fixed. |
 | M15 B4: the status digests are of the files, not the keys in use | **Fixed:** the digest is of the keys a node uses, so `# files agree` means the keys agree. |
 | M17 B1: new bytes under the first key can never be taken | **Proposed to stay (amended in slice 5, the owner's to decide at the exit review):** an envelope names its key's id, not its bytes. Once new bytes take the id, nothing opens what the old bytes sealed, so no re-wrap can move it. A fix would change the envelope's format. **The way out works:** put a new id first; the old key's versions re-wrap under it, and its removal is then taken. The refusal's message says so. |
-| M17 B3: counts unknown (out of memory) refuse every removal until a restart | **Fixed:** the node walks to count again in its next upkeep, off the lock and in steps, and its counts are known again. |
+| M17 B3: counts unknown (out of memory) refuse every removal until a restart | **Fixed:** each upkeep counts again until the counts are known. Each count is one walk of the index from memory, under the store's lock, as a removal's count was before M17 (corrected at the exit review). |
 | M17 B5: a node's re-wrap gate is up to 10 s old | **Stays:** the operator's rule never removes the first key, and such a removal is refused anyway. |
 | M18 B5: a waiting removal is asked of every node every 2 s | **Fixed:** the asks back off, doubling to 60 s, and reset when the file changes. |
 
@@ -133,5 +139,8 @@
     ones.
   - **Older binaries:** an older binary refuses a restore record with a mark, so it cannot open a store holding one.
     A notification rule naming restore events reads as no rules to an older binary.
+  - **A rolling upgrade on a cluster:** a new leader writes the marks on its own once a restore is due. Followers
+    still on an older binary cannot apply those entries, so their replicas stop. Upgrade every node before any
+    restore is asked (added at the exit review).
 - **The cluster:** a new `retiring` mark in the key sets and their status lines, so nodes on an older binary do not
   report it. A removal waits until every node does, as M17's removals wait for every node's count.

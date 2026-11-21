@@ -742,6 +742,24 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
     var out = Vector<u8>.create();
     let ok = out.extend("shard role term leader last commit applied voters learners\n".bytes()).isOk();
     if (!ok) { return Err(NodeFault.OutOfMemory); }
+    // Before the counts below (ADR-0106 §1.1, the M20 exit review): a key shown retiring here was retired before any
+    // count was taken, and a leader checks a write's key and commits it under one hold of the store's lock, so no
+    // count misses a write sealed under it.
+    // The master keys the node holds now, by id and a tag of their bytes (ADR-0100 §4, the M17 exit review): a leader
+    // re-wraps only under a key every node holds, and a removal waits for every node to stop putting the key first.
+    for (mode in ["s3", "kms"]) {
+        let keys =
+            if (mode == "s3") shared.replication.sseKeys.get().view() else shared.replication.kmsKeys.get().view();
+        var line = out.extend("# keys ".bytes()).isOk() && out.extend(mode.bytes()).isOk() && out.push(0x20).isOk();
+        for (i in 0..keys.length) {
+            if (i > 0) { line = line && out.push(',').isOk(); }
+            line = line && out.extend(keys[i].id.view()).isOk() && out.push(':').isOk() &&
+                appendDecimal(mut out, keyTag(shared.secret.view(), borrow keys[i])).isOk();
+            // A KMS key being removed (ADR-0106 §1.1): a removal's count waits until every node has it so.
+            if (keys[i].retiring) { line = line && out.extend(":retiring".bytes()).isOk(); }
+        }
+        if (!(line && out.push(0x0A).isOk())) { return Err(NodeFault.OutOfMemory); }
+    }
     for (i in 0..shared.slots.length) {
         let slot = borrow shared.slots[i];
         var guard = match (await slot.replica.lock()) {
@@ -819,21 +837,6 @@ async fn statusText(shared: borrow NodeShared) -> Result<Vector<u8>, NodeFault> 
         appendDecimal(mut out, shared.received.load()).isOk() && out.push(0x20).isOk() &&
         appendDecimal(mut out, shared.refused.load()).isOk() && out.push(0x0A).isOk();
     if (!peer) { return Err(NodeFault.OutOfMemory); }
-    // The master keys the node holds now, by id and a tag of their bytes (ADR-0100 §4, the M17 exit review): a leader
-    // re-wraps only under a key every node holds, and a removal waits for every node to stop putting the key first.
-    for (mode in ["s3", "kms"]) {
-        let keys =
-            if (mode == "s3") shared.replication.sseKeys.get().view() else shared.replication.kmsKeys.get().view();
-        var line = out.extend("# keys ".bytes()).isOk() && out.extend(mode.bytes()).isOk() && out.push(0x20).isOk();
-        for (i in 0..keys.length) {
-            if (i > 0) { line = line && out.push(',').isOk(); }
-            line = line && out.extend(keys[i].id.view()).isOk() && out.push(':').isOk() &&
-                appendDecimal(mut out, keyTag(shared.secret.view(), borrow keys[i])).isOk();
-            // A KMS key being removed (ADR-0106 §1.1): a removal's count waits until every node has it so.
-            if (keys[i].retiring) { line = line && out.extend(":retiring".bytes()).isOk(); }
-        }
-        if (!(line && out.push(0x0A).isOk())) { return Err(NodeFault.OutOfMemory); }
-    }
     // The digests of the files the node was given (ADR-0096 §6), read now.
     let secret = shared.secret.view();
     let files = shared.files.view();

@@ -6153,7 +6153,8 @@ struct ObjectStore {
             this.lifecycleRan = now;
         }
         // Restores' times (ADR-0106 §4): on `serve` here; a shard's leader runs them itself, as a write.
-        if (!this.raft) { let _ = this.restoreRound(now)?; }
+        // A round that fails is tried at the next upkeep; it does not stop this one (the M20 exit review).
+        if (!this.raft) { let _ = this.restoreRound(now); }
         // Sealed counts not known (out of memory, ADR-0106 §2): made again, so a key removal is decided again.
         let _ = this.recountSealed();
         let total = this.upkeepHeld(started);
@@ -6500,6 +6501,35 @@ struct ObjectStore {
         return false;
     }
 
+    /// The watches done with dropped, writing nothing: a version gone, its state done with or not readable, its class
+    /// moved. A shard's followers run it, as only the leader runs `restoreRound` (the M20 exit review).
+    fn pruneRestoreWatches(borrow mut this) {
+        var at = this.state.index.restoreWatches().length;
+        while (at > 0) {
+            at -= 1;
+            var done = true;
+            {
+                let watches = this.state.index.restoreWatches();
+                let w = borrow watches[at];
+                match (this.state.index.find(borrow w.key, w.versionId)) {
+                    Some(v) => {
+                        let stored = metadataFind(v.metadata.view(), STORAGE_CLASS_FIELD.bytes()) ?? "".bytes();
+                        let value = metadataFind(v.metadata.view(), RESTORE_FIELD.bytes()) ?? "".bytes();
+                        match (restorePartsOf(value)) {
+                            Some(p) => {
+                                let made = if (p.classAt < p.classEnd) value[p.classAt..p.classEnd] else stored;
+                                done = made != stored || p.sent == RESTORE_SENT_EXPIRED;
+                            }
+                            null => {}
+                        }
+                    }
+                    null => {}
+                }
+            }
+            if (done) { this.state.index.unwatchRestore(at); }
+        }
+    }
+
     /// The watched restores whose times have come, marked (ADR-0106 §4): a copy ready gets ` c`, which raises
     /// s3:ObjectRestore:Completed as it applies; one expired after that gets ` d`, which raises :Delete. One step a
     /// version a round. Entries whose version is gone, whose state is done with, or whose class has moved are
@@ -6573,13 +6603,25 @@ struct ObjectStore {
                 values.push(next)?;
             }
         }
+        var staged: u64 = 0;
         for (i in 0..values.length) {
             let b = StringView.fromUtf8(buckets[i].view()) ?? "";
             let k = StringView.fromUtf8(names[i].view()) ?? "";
-            this.stageFieldOf(b, k, Some(versions[i]), values[i].view(), SET_RESTORE_FORMAT)?;
+            match (this.stageFieldOf(b, k, Some(versions[i]), values[i].view(), SET_RESTORE_FORMAT)) {
+                Ok() => { staged += 1; }
+                Err(StoreError.MetadataTooLarge) => {
+                    // No room for its mark (the M20 exit review): this version's later events are not raised, and the
+                    // others' still are.
+                    match (this.state.indexKey(buckets[i].view(), names[i].view())?) {
+                        Some(key) => { this.state.index.unwatchRestoreOf(borrow key, versions[i]); }
+                        null => {}
+                    }
+                }
+                Err(e) => { return Err(e); }
+            }
         }
-        if (values.length > 0) { this.commitStaged()?; }
-        return Ok(values.length as u64);
+        if (staged > 0) { this.commitStaged()?; }
+        return Ok(staged);
     }
 
     /// Whether the lifecycle rules are due at `nowMillis`, by the store's interval (a shard's leader runs them itself,

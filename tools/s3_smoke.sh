@@ -1165,8 +1165,27 @@ check "a destination that refuses: FAILED" "$st" FAILED
 kill "$server"; wait "$server" 2>/dev/null; start_server
 check "FAILED after a restart" "$(aws s3api head-object --bucket rsrc --key lost/x.txt --query ReplicationStatus --output text 2>&1)" FAILED
 check "COMPLETED after a restart" "$(aws s3api head-object --bucket rsrc --key f/multi.bin --query ReplicationStatus --output text 2>&1)" COMPLETED
+# A target removed while its deliveries wait (ADR-0106 §6, the M15 exit review's B5): the far server stopped, a
+# write waits for it; its target taken out of the file, the delivery fails as an unknown target's does, and nothing is
+# dropped or left waiting.
+kill "$remote"; wait "$remote" 2>/dev/null
+aws s3api put-object --bucket rsrc --key f/waits.txt --body r1.txt > /dev/null 2>&1
+sleep 2
+check "a delivery waits for its target" "$(aws s3api head-object --bucket rsrc --key f/waits.txt --query ReplicationStatus --output text 2>&1)" PENDING
+cp "$work/replication.targets" "$work/replication.targets.kept"
+printf 'other http://127.0.0.1:1 AKIAOTHERTARGET00001 other/secret/0123456789abcdefgh\n' > "$work/replication.targets"
+for i in $(seq 1 40); do grep -q "replication targets file reloaded" "$work/server.log" && break; sleep 0.25; done
+check "the target taken out, without a restart" "$(grep -c 'replication targets file reloaded' "$work/server.log")" 1
+for i in $(seq 1 300); do
+    st=$(aws s3api head-object --bucket rsrc --key f/waits.txt --query ReplicationStatus --output text 2>/dev/null)
+    [ "$st" = FAILED ] && break
+    sleep 0.25
+done
+check "its waiting delivery fails as an unknown target's" "$st" FAILED
+check "and none is dropped or left waiting" "$(stat eventsPending) $(stat eventsDropped)" "0 0"
+cp "$work/replication.targets.kept" "$work/replication.targets"
 aws s3api delete-bucket-replication --bucket rsrc > /dev/null 2>&1
-kill "$remote"
+kill "$remote" 2>/dev/null
 for b in rsrc rdst; do
     for kind in Versions DeleteMarkers; do
         aws s3api list-object-versions --bucket $b --query "$kind[].[Key,VersionId]" --output text | while read -r k v; do

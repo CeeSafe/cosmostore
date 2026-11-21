@@ -714,9 +714,10 @@ fn sealKeyHeld(sse: Slice<MasterKey>, kms: Slice<MasterKey>, metadata: Slice<u8>
     return false;
 }
 
-/// `keys`, with those whose ids are in `ids` marked retiring, and then `fresh`'s keys whose ids `keys` does not
-/// hold (ADR-0106 §1.1): the set a node takes before it counts what the cluster sealed under `ids`. Made at its full
-/// size, so no buffer is left behind as it grows (§1.3).
+/// The set a node takes before it counts what the cluster sealed under `ids` (ADR-0106 §1.1): in the file's new
+/// order (`fresh`), so its first key seals by default as soon as it can (the M20 exit review). A key of `ids` is kept
+/// with its old bytes, marked retiring: in its new place if the file still names its id, after the others if not.
+/// Made at its full size, so no buffer is left behind as it grows (§1.3).
 fn retiringSet(
     keys: Slice<MasterKey>,
     ids: Slice<Vector<u8>>,
@@ -724,23 +725,41 @@ fn retiringSet(
 ) -> Result<Vector<MasterKey>, AllocError> {
     var out = Vector<MasterKey>.create();
     out.reserve(keys.length + fresh.length)?;
+    for (j in 0..fresh.length) {
+        var dropped = false;
+        for (d in 0..ids.length) {
+            if (ids[d].view() == fresh[j].id.view()) { dropped = true; }
+        }
+        if (!dropped) {
+            let m = fresh[j].material();
+            out.push(MasterKey.create(copyBytes(fresh[j].id.view())?, m.b[..]))?;
+            continue;
+        }
+        // New bytes under a dropped id: the old ones, retiring, until nothing is sealed under them.
+        for (i in 0..keys.length) {
+            if (keys[i].id.view() == fresh[j].id.view()) {
+                let m = keys[i].material();
+                var k = MasterKey.create(copyBytes(keys[i].id.view())?, m.b[..]);
+                k.retiring = true;
+                out.push(k)?;
+            }
+        }
+    }
     for (i in 0..keys.length) {
+        var placed = false;
+        for (o in 0..out.length) {
+            if (out[o].id.view() == keys[i].id.view()) { placed = true; }
+        }
+        if (placed) { continue; }
+        var gone = false;
+        for (d in 0..ids.length) {
+            if (ids[d].view() == keys[i].id.view()) { gone = true; }
+        }
+        if (!gone) { continue; } // a key the file keeps is in `fresh` already
         let m = keys[i].material();
         var k = MasterKey.create(copyBytes(keys[i].id.view())?, m.b[..]);
-        k.retiring = keys[i].retiring;
-        for (d in 0..ids.length) {
-            if (ids[d].view() == keys[i].id.view()) { k.retiring = true; }
-        }
+        k.retiring = true;
         out.push(k)?;
-    }
-    for (j in 0..fresh.length) {
-        var held = false;
-        for (i in 0..keys.length) {
-            if (keys[i].id.view() == fresh[j].id.view()) { held = true; }
-        }
-        if (held) { continue; }
-        let m = fresh[j].material();
-        out.push(MasterKey.create(copyBytes(fresh[j].id.view())?, m.b[..]))?;
     }
     return Ok(out);
 }
