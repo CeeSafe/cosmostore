@@ -515,6 +515,10 @@ async fn serveSts(
     };
     var action = Vector<u8>.create();
     let _ = formValue(body.view(), "Action", mut action)?;
+    // Who is calling (ADR-0108 §3): any signed caller may ask, a session too, as on AWS; no policy decides it.
+    if (action.view() == "GetCallerIdentity".bytes()) {
+        return await serveCallerIdentity(app, exchange, borrow auth.session, parent, requestId);
+    }
     let isSession = action.view() == "GetSessionToken".bytes();
     let isRole = action.view() == "AssumeRole".bytes();
     if (!isSession && !isRole) {
@@ -712,5 +716,77 @@ async fn serveSts(
     exchange.header("content-type", "text/xml".bytes())?;
     await exchange.send(Status.ok(), out.view())?;
     Secret.wipe(mut out[..]);
+    return Ok();
+}
+
+/// GetCallerIdentity's answer: the account; the caller's ARN (the account's root, a user's with its path, or an assumed
+/// role's session) and its user id.
+async fn serveCallerIdentity(
+    app: borrow S3App,
+    exchange: borrow mut Exchange,
+    session: borrow StsSession?,
+    parent: usize,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    var arn = Vector<u8>.create();
+    var userId = Vector<u8>.create();
+    let assumed = match (session) {
+        Some(s) => s.role.length > 0,
+        null => false,
+    };
+    match (session) {
+        Some(s) => {
+            if (assumed) {
+                arn.extend("arn:aws:sts::000000000000:assumed-role/".bytes())?;
+                arn.extend(s.role.view())?;
+                arn.push('/')?;
+                arn.extend(s.name.view())?;
+                userId.extend(if (s.roleId.length > 0) s.roleId.view() else s.role.view())?;
+                userId.push(':')?;
+                userId.extend(s.name.view())?;
+            }
+        }
+        null => {}
+    }
+    if (!assumed) {
+        // A key's own identity, or a GetSessionToken session's, which is its parent key's.
+        let credentials = app.credentials.get();
+        let list = credentials.view();
+        let user = copyBytes(list[parent].user.view())?;
+        let userKey = copyBytes(list[parent].userKey.view())?;
+        let fromIam = list[parent].fromIam;
+        if (user.length == 0) {
+            arn.extend("arn:aws:iam::000000000000:root".bytes())?;
+            userId.extend("000000000000".bytes())?;
+        } else {
+            var path = copyBytes("/".bytes())?;
+            if (fromIam) {
+                match (await readIamSnapshot(borrow app.store)) {
+                    Some(snapshot) => {
+                        match (userAt(borrow snapshot.state, user.view())) {
+                            Some(u) => { path = copyBytes(snapshot.state.users[u].path.view())?; }
+                            null => {}
+                        }
+                    }
+                    null => {}
+                }
+            }
+            arn.extend("arn:aws:iam::000000000000:user".bytes())?;
+            arn.extend(path.view())?;
+            arn.extend(user.view())?;
+            userId.extend(idOfUserKey(userKey.view()))?;
+        }
+    }
+    var out = Vector<u8>.create();
+    out.extend("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetCallerIdentityResponse xmlns=\"".bytes())?;
+    out.extend(STS_XMLNS.bytes())?;
+    out.extend("\"><GetCallerIdentityResult>".bytes())?;
+    xmlTextElement(mut out, "Arn", arn.view())?;
+    xmlTextElement(mut out, "UserId", userId.view())?;
+    out.extend("<Account>000000000000</Account></GetCallerIdentityResult><ResponseMetadata><RequestId>".bytes())?;
+    out.extend(requestId)?;
+    out.extend("</RequestId></ResponseMetadata></GetCallerIdentityResponse>".bytes())?;
+    exchange.header("content-type", "text/xml".bytes())?;
+    await exchange.send(Status.ok(), out.view())?;
     return Ok();
 }

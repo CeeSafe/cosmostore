@@ -992,6 +992,56 @@ check "nor a group with a policy" "$(code iam delete-group --group-name smoke-ed
 aws iam delete-group-policy --group-name smoke-editors --policy-name list > /dev/null 2>&1 && pass "iam delete-group-policy" || fail "iam delete-group-policy"
 aws iam delete-group --group-name smoke-editors > /dev/null 2>&1 && pass "iam delete-group" || fail "iam delete-group"
 check "the group gone" "$(code iam get-group --group-name smoke-editors)" NoSuchEntity
+# Tags, paths, role updates, the refresh's reads, and GetCallerIdentity (ADR-0108 §3).
+check "a user made with a path and tags" "$(aws iam create-user --user-name tg --path /staff/ --tags Key=team,Value=data --query 'User.[Arn,Tags[0].Value]' --output text 2>&1 | tr '\t' ' ')" "arn:aws:iam::000000000000:user/staff/tg data"
+aws iam tag-user --user-name tg --tags Key=cost,Value=7 Key=team,Value=ops > /dev/null 2>&1 && pass "iam tag-user" || fail "iam tag-user"
+check "its tags listed, merged by key" "$(aws iam list-user-tags --user-name tg --query 'Tags[].[Key,Value]' --output text 2>&1 | tr '\t\n' '= ' | sed 's/ $//')" "team=ops cost=7"
+aws iam untag-user --user-name tg --tag-keys cost > /dev/null 2>&1 && pass "iam untag-user" || fail "iam untag-user"
+check "and in GetUser" "$(aws iam get-user --user-name tg --query 'User.[Path,Tags[].Key]' --output text 2>&1 | tr '\t\n' '  ' | sed 's/ *$//')" "/staff/ team"
+tgkey=$(aws iam create-access-key --user-name tg --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>&1)
+tgid=$(echo "$tgkey" | cut -f1); tgsecret=$(echo "$tgkey" | cut -f2)
+tg() { ( export AWS_ACCESS_KEY_ID="$tgid" AWS_SECRET_ACCESS_KEY="$tgsecret"; "$@" ); }
+check "a key never used" "$(aws iam get-access-key-last-used --access-key-id "$tgid" --query '[UserName,AccessKeyLastUsed.ServiceName]' --output text 2>&1 | tr '\t' ' ')" "tg N/A"
+check "no login profile" "$(code iam get-login-profile --user-name tg)" NoSuchEntity
+check "no MFA devices" "$(aws iam list-mfa-devices --user-name tg --query 'length(MFADevices)' --output text 2>&1)" 0
+check "no SSH keys" "$(aws iam list-ssh-public-keys --user-name tg --query 'length(SSHPublicKeys)' --output text 2>&1)" 0
+check "no signing certificates" "$(aws iam list-signing-certificates --user-name tg --query 'length(Certificates)' --output text 2>&1)" 0
+check "no service credentials" "$(aws iam list-service-specific-credentials --user-name tg --query 'length(ServiceSpecificCredentials)' --output text 2>&1)" 0
+# A policy naming the user by its ARN, path and all, allows; by the ARN without its path, nothing.
+aws iam put-user-policy --user-name tg --policy-name self --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"iam:ListUserTags","Resource":"arn:aws:iam::000000000000:user/staff/tg"}}' > /dev/null 2>&1
+sleep 3
+check "a policy on its ARN with its path" "$(tg aws iam list-user-tags --user-name tg --query 'Tags[0].Key' --output text 2>&1)" team
+aws iam put-user-policy --user-name tg --policy-name self --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"iam:ListUserTags","Resource":"arn:aws:iam::000000000000:user/tg"}}' > /dev/null 2>&1
+sleep 3
+check "and not without it" "$(tg code iam list-user-tags --user-name tg)" AccessDenied
+check "GetCallerIdentity, the account's" "$(aws sts get-caller-identity --query '[Account,Arn]' --output text 2>&1 | tr '\t' ' ')" "000000000000 arn:aws:iam::000000000000:root"
+tgwho=$(tg aws sts get-caller-identity --query '[Arn,UserId]' --output text 2>&1)
+check "a user's, with its path" "$(echo "$tgwho" | cut -f1) $(echo "$tgwho" | cut -f2 | cut -c1-4)" "arn:aws:iam::000000000000:user/staff/tg AIDA"
+check "a role made with a path and a description" "$(aws iam create-role --role-name tr --path /svc/ --description first --assume-role-policy-document '{"Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/nobody"},"Action":"sts:AssumeRole"}}' --tags Key=env,Value=test --query 'Role.[Arn,Description]' --output text 2>&1 | tr '\t' ' ')" "arn:aws:iam::000000000000:role/svc/tr first"
+aws iam update-role --role-name tr --description second --max-session-duration 7200 > /dev/null 2>&1 && pass "iam update-role" || fail "iam update-role"
+check "its description and sessions changed" "$(aws iam get-role --role-name tr --query 'Role.[Description,MaxSessionDuration,Tags[0].Value]' --output text 2>&1 | tr '\t' ' ')" "second 7200 test"
+aws iam tag-role --role-name tr --tags Key=owner,Value=ops > /dev/null 2>&1 && pass "iam tag-role" || fail "iam tag-role"
+check "its tags listed" "$(aws iam list-role-tags --role-name tr --query 'Tags[].Key' --output text 2>&1 | tr '\t' ' ')" "env owner"
+aws iam untag-role --role-name tr --tag-keys owner > /dev/null 2>&1
+check "its trust refuses the account" "$(code sts assume-role --role-arn arn:aws:iam::000000000000:role/svc/tr --role-session-name ss)" AccessDenied
+aws iam update-assume-role-policy --role-name tr --policy-document "$trustroot" > /dev/null 2>&1 && pass "iam update-assume-role-policy" || fail "iam update-assume-role-policy"
+aws iam put-role-policy --role-name tr --policy-name list --policy-document "$pol1" > /dev/null 2>&1
+check "its inline policies listed" "$(aws iam list-role-policies --role-name tr --query PolicyNames --output text 2>&1)" list
+check "no instance profiles" "$(aws iam list-instance-profiles-for-role --role-name tr --query 'length(InstanceProfiles)' --output text 2>&1)" 0
+sleep 3
+trcreds=$(aws sts assume-role --role-arn arn:aws:iam::000000000000:role/svc/tr --role-session-name smoke --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)
+check "the new trust lets the account assume it" "$(echo "$trcreds" | cut -c1-4)" ASIA
+check "GetCallerIdentity, a session's" "$( ( export AWS_ACCESS_KEY_ID="$(echo "$trcreds" | cut -f1)" AWS_SECRET_ACCESS_KEY="$(echo "$trcreds" | cut -f2)" AWS_SESSION_TOKEN="$(echo "$trcreds" | cut -f3)"; aws sts get-caller-identity --query Arn --output text 2>&1 ) )" "arn:aws:sts::000000000000:assumed-role/tr/smoke"
+aws iam create-policy --policy-name tagged --policy-document "$pol1" > /dev/null 2>&1
+aws iam tag-policy --policy-arn arn:aws:iam::000000000000:policy/tagged --tags Key=a,Value=b > /dev/null 2>&1 && pass "iam tag-policy" || fail "iam tag-policy"
+check "its tags listed" "$(aws iam list-policy-tags --policy-arn arn:aws:iam::000000000000:policy/tagged --query 'Tags[0].Value' --output text 2>&1)" b
+check "AWS's policies not tagged" "$(code iam tag-policy --policy-arn arn:aws:iam::aws:policy/AdministratorAccess --tags Key=a,Value=b)" NoSuchEntity
+aws iam delete-policy --policy-arn arn:aws:iam::000000000000:policy/tagged > /dev/null 2>&1
+aws iam delete-role-policy --role-name tr --policy-name list > /dev/null 2>&1
+aws iam delete-role --role-name tr > /dev/null 2>&1 && pass "the role deleted" || fail "the role deleted"
+aws iam delete-access-key --user-name tg --access-key-id "$tgid" > /dev/null 2>&1
+aws iam delete-user-policy --user-name tg --policy-name self > /dev/null 2>&1
+aws iam delete-user --user-name tg > /dev/null 2>&1 && pass "the user deleted" || fail "the user deleted"
 check "a roles file's role got" "$(aws iam get-role --role-name reader --query 'Role.[Arn,MaxSessionDuration]' --output text 2>&1 | tr '\t' ' ')" "arn:aws:iam::000000000000:role/reader 3600"
 check "the account's keys listed" "$(aws iam list-access-keys --query "AccessKeyMetadata[?AccessKeyId=='$AWS_ACCESS_KEY_ID'].Status" --output text 2>&1)" Active
 check "another account's role is none" "$(code sts assume-role --role-arn arn:aws:iam::123456789012:role/reader --role-session-name smoke)" AccessDenied

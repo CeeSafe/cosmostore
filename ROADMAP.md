@@ -4873,3 +4873,40 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     long; the check now compares the ARN and the id's `AGPA` alone.
 - **Next:** slice 4: tags, paths, `UpdateRole`, `UpdateAssumeRolePolicy`, the refresh's reads, and
   `GetCallerIdentity`.
+
+### 22 Nov 2026: M21 slice 4, tags, paths, role updates, the refresh's reads, GetCallerIdentity (ADR-0108 §3)
+
+- **Tags** (`src/s3/iam_tags.cee`):
+  - `Tag`, `Untag` and `List…Tags` of users, roles and the account's policies;
+  - CreateUser's, CreateRole's and CreatePolicy's `Tags` are kept, shown in GetUser and GetRole;
+  - merged by key, 50 at most.
+- **Paths:**
+  - CreateUser and CreateRole take a `Path`, shown in the answers and ARNs;
+  - each IAM call is decided on the ARN with its path (a policy on `user/staff/tg` allows; on `user/tg`, nothing).
+  - **Narrower than ADR-0108 §3, for the exit review:** `sts:AssumeRole` is still decided on `iam:role/<name>`, without
+    the role's path, as the role set carries none.
+- **Role updates:**
+  - `UpdateRole` (description, sessions' longest), whose answer carries an empty `UpdateRoleResult`, as botocore reads
+    it;
+  - `UpdateAssumeRolePolicy`, which takes what CreateRole takes;
+  - CreateRole's `Description`;
+  - `ListRolePolicies`.
+- **The refresh's reads, answered as AWS answers for none:**
+  - `GetAccessKeyLastUsed` (`N/A`);
+  - `GetLoginProfile` (NoSuchEntity);
+  - `ListMFADevices`, `ListSSHPublicKeys`, `ListServiceSpecificCredentials`, `ListSigningCertificates`,
+    `ListInstanceProfilesForRole`.
+- **STS's `GetCallerIdentity`:** the account's root, a user's ARN with its path and id, or an assumed role's session.
+  Any signed caller may ask, a session too; no policy decides it.
+- **Tests:**
+  - 2 new unit tests (437 in all);
+  - 42 AWS CLI checks in the S3 smoke;
+  - the cluster smoke (206);
+  - the SDK matrix.
+- **The first smoke run failed 9 checks:**
+  - **Two bugs, now fixed:**
+    - TagPolicy, UntagPolicy and UpdateAssumeRolePolicy were refused by M19's PolicyName check (their names end in
+      `Policy`);
+    - UpdateRole's answer had no result element, so the CLI failed after the change was made.
+  - **Two faults of the checks:** a user id cut too long, and a session name shorter than the CLI takes.
+- **Next:** slice 5, `tools/terraform_check.sh`.

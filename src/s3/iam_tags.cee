@@ -1,0 +1,434 @@
+// The IAM API's tags, role updates, and the reads a tool's refresh makes (ADR-0108 §3): tags on users, roles and
+// managed policies; `UpdateRole` and `UpdateAssumeRolePolicy`; and, for what CosmoStore has none of (login profiles,
+// MFA devices, SSH keys, service credentials, signing certificates, instance profiles), the answers AWS gives for none.
+import web_core;
+import web_http;
+import web_server;
+
+/// What a tag is on.
+enum TagOn {
+    User,
+    Role,
+    Policy,
+}
+
+/// A tag's change or a role's.
+enum TagCall {
+    /// What the tags are on, its name (a policy's ARN), and the tags, each replacing one of its key.
+    Tag(TagOn, Vector<u8>, Vector<IamTag>),
+    /// The keys removed.
+    Untag(TagOn, Vector<u8>, Vector<Vector<u8>>),
+    /// A role's name, its description when `true` (set, maybe empty), and its sessions' longest when not 0.
+    UpdateRole(Vector<u8>, Vector<u8>, bool, u64),
+    /// A role's name and its trust policy.
+    UpdateAssumeRolePolicy(Vector<u8>, Vector<u8>),
+}
+
+/// The actions this file answers.
+fn isTagAction(a: Slice<u8>) -> bool {
+    for (k in [
+        "TagUser", "UntagUser", "ListUserTags", "TagRole", "UntagRole", "ListRoleTags", "TagPolicy", "UntagPolicy",
+        "ListPolicyTags", "UpdateRole", "UpdateAssumeRolePolicy", "ListRolePolicies", "GetAccessKeyLastUsed",
+        "ListInstanceProfilesForRole", "GetLoginProfile", "ListMFADevices", "ListSSHPublicKeys",
+        "ListServiceSpecificCredentials", "ListSigningCertificates",
+    ]) {
+        if (a == k.bytes()) { return true; }
+    }
+    return false;
+}
+
+/// `tags` merged into `into`, a key's value replaced: LimitExceeded past 50.
+fn mergeTags(into: borrow mut Vector<IamTag>, tags: Slice<IamTag>) -> Result<IamOutcome?, StoreError> {
+    for (t in 0..tags.length) {
+        var replaced = false;
+        for (i in 0..into.length) {
+            if (into[i].key.view() == tags[t].key.view()) {
+                into[i].value = copyBytes(tags[t].value.view())?;
+                replaced = true;
+            }
+        }
+        if (!replaced) {
+            into.push(IamTag { key: copyBytes(tags[t].key.view())?, value: copyBytes(tags[t].value.view())? })?;
+        }
+    }
+    if (into.length > IAM_MAX_TAGS) { return Ok(Some(IamOutcome.LimitExceeded)); }
+    return Ok(null);
+}
+
+/// The tags of `keys` removed from `from`; a key it has not is no error, as on AWS.
+fn removeTags(from: borrow mut Vector<IamTag>, keys: Slice<Vector<u8>>) {
+    var i: usize = 0;
+    while (i < from.length) {
+        var gone = false;
+        for (k in 0..keys.length) {
+            if (from[i].key.view() == keys[k].view()) { gone = true; }
+        }
+        if (gone) {
+            let _ = from.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// The tags of what `on` and `name` name, changed by `change`.
+fn changeTags(
+    tags: borrow mut Vector<IamTag>,
+    adding: Slice<IamTag>,
+    removing: Slice<Vector<u8>>,
+) -> Result<IamOutcome?, StoreError> {
+    removeTags(tags, removing);
+    return mergeTags(tags, adding);
+}
+
+fn tagsChanged(
+    state: borrow mut IamState,
+    on: borrow TagOn,
+    name: Slice<u8>,
+    adding: Slice<IamTag>,
+    removing: Slice<Vector<u8>>,
+) -> Result<IamOutcome?, StoreError> {
+    return match (on) {
+        TagOn.User => match (userAt(state, name)) {
+            Some(u) => changeTags(mut state.users[u].tags, adding, removing),
+            null => Ok(Some(IamOutcome.NoSuchEntity)),
+        },
+        TagOn.Role => match (roleAtIam(state, name)) {
+            Some(r) => changeTags(mut state.roles[r].tags, adding, removing),
+            null => Ok(Some(IamOutcome.NoSuchEntity)),
+        },
+        TagOn.Policy => match (managedAt(state, name)) {
+            Some(m) => changeTags(mut state.managed[m].tags, adding, removing),
+            null => Ok(Some(IamOutcome.NoSuchEntity)),
+        },
+    };
+}
+
+/// A tag's or a role's change, applied to `state` (the record, read under the store's lock: `applyIamCall` writes it
+/// back); an outcome when it is refused.
+fn applyTagCall(state: borrow mut IamState, call: borrow TagCall) -> Result<IamOutcome?, StoreError> {
+    match (call) {
+        TagCall.Tag(on, name, tags) => {
+            let none = Vector<Vector<u8>>.create();
+            return tagsChanged(state, on, name.view(), tags.view(), none.view());
+        }
+        TagCall.Untag(on, name, keys) => {
+            let none = Vector<IamTag>.create();
+            return tagsChanged(state, on, name.view(), none.view(), keys.view());
+        }
+        TagCall.UpdateRole(name, description, setsDescription, seconds) => {
+            let r = roleAtIam(state, name.view()) ?? { return Ok(Some(IamOutcome.NoSuchEntity)); };
+            if (*setsDescription) { state.roles[r].description = copyBytes(description.view())?; }
+            if (*seconds > 0) { state.roles[r].maxSeconds = *seconds; }
+        }
+        TagCall.UpdateAssumeRolePolicy(name, trust) => {
+            let r = roleAtIam(state, name.view()) ?? { return Ok(Some(IamOutcome.NoSuchEntity)); };
+            // A trust policy CreateRole takes (ADR-0104 §7).
+            let doc = parseJson(trust.view())? ?? { return Ok(Some(IamOutcome.MalformedPolicyDocument)); };
+            if (!trustSupported(borrow doc)) { return Ok(Some(IamOutcome.MalformedPolicyDocument)); }
+            state.roles[r].trust = copyBytes(trust.view())?;
+        }
+    }
+    return Ok(null);
+}
+
+/// `TagKeys.member.N`: null when one is empty, or there are more than 50.
+fn formTagKeys(body: Slice<u8>) -> Result<Vector<Vector<u8>>?, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    var n: u64 = 1;
+    while (true) {
+        var name = textOf("TagKeys.member.");
+        var number = Vector<u8>.create();
+        appendDecimal(mut number, n)?;
+        name.append(StringView.fromUtf8(number.view()) ?? "")?;
+        var key = Vector<u8>.create();
+        if (!formValue(body, name.view(), mut key)?) { break; }
+        if (key.length == 0 || key.length > 128) { return Ok(null); }
+        out.push(key)?;
+        if (out.length > IAM_MAX_TAGS) { return Ok(null); }
+        n += 1;
+    }
+    return Ok(Some(out));
+}
+
+/// Whether `name` is a user the files hold (not the API's).
+fn fileUserNamed(app: borrow S3App, state: borrow IamState, name: Slice<u8>) -> Result<bool, AllocError> {
+    let files = fileUsersOf(app.credentials.get().view(), app.credentials.get().fileUserKeys(), state)?;
+    for (i in 0..files.length) {
+        if (sameNameIgnoringCase(nameOfUserKey(files[i].view()), name)) { return Ok(true); }
+    }
+    return Ok(false);
+}
+
+/// Whether `name` is a role the roles file holds (not the API's).
+fn fileRoleNamed(app: borrow S3App, name: Slice<u8>) -> bool {
+    let roles = app.roles.get().view();
+    for (i in 0..roles.length) {
+        if (!roles[i].removed && roles[i].id.length == 0 && roles[i].name.view() == name) { return true; }
+    }
+    return false;
+}
+
+/// `<Tags>…</Tags>`, empty or not, and IsTruncated: a tag list's answer.
+fn appendTagList(out: borrow mut Vector<u8>, tags: Slice<IamTag>) -> Result<void, AllocError> {
+    out.extend("<Tags>".bytes())?;
+    for (i in 0..tags.length) {
+        out.extend("<member>".bytes())?;
+        xmlTextElement(out, "Key", tags[i].key.view())?;
+        xmlTextElement(out, "Value", tags[i].value.view())?;
+        out.extend("</member>".bytes())?;
+    }
+    out.extend("</Tags><IsTruncated>false</IsTruncated>".bytes())?;
+    return Ok();
+}
+
+/// A tag's call, a role's update, or one of the refresh's reads (ADR-0108 §3): decided (`iam:<Action>` on the user,
+/// role or policy), then read from the record or changed through `applyIamCall`.
+async fn serveIamTags(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+    a: Slice<u8>,
+    body: Slice<u8>,
+    who: borrow Requester,
+    callerUser: Slice<u8>,
+    decided: bool,
+    requestId: Slice<u8>,
+) -> Result<void, S3Fail> {
+    let snapshot = await readIamSnapshot(borrow app.store) ?? {
+        return await iamError(exchange, 500, "ServiceFailure", "The IAM records do not read.", requestId);
+    };
+    let state = borrow snapshot.state;
+    let onPolicy = a == "TagPolicy".bytes() || a == "UntagPolicy".bytes() || a == "ListPolicyTags".bytes();
+    let onRole = a == "TagRole".bytes() || a == "UntagRole".bytes() || a == "ListRoleTags".bytes() ||
+        a == "UpdateRole".bytes() || a == "UpdateAssumeRolePolicy".bytes() || a == "ListRolePolicies".bytes() ||
+        a == "ListInstanceProfilesForRole".bytes();
+    let arn = formText(body, "PolicyArn")?;
+    let roleName = formText(body, "RoleName")?;
+    // A user's call names a user, or the caller (as IAM's do when UserName is left out); GetAccessKeyLastUsed, the key's.
+    var userName = formText(body, "UserName")?;
+    if (a == "GetAccessKeyLastUsed".bytes()) {
+        let key = formText(body, "AccessKeyId")?;
+        for (u in 0..state.users.length) {
+            for (k in 0..state.users[u].keys.length) {
+                if (state.users[u].keys[k].accessKey.view() == key.view()) {
+                    userName = copyBytes(state.users[u].name.view())?;
+                }
+            }
+        }
+        if (userName.length == 0) {
+            return await iamError(exchange, 404, "NoSuchEntity", "The access key is not the API's.", requestId);
+        }
+    } else if (userName.length == 0 && !onRole && !onPolicy) {
+        userName = copyBytes(callerUser)?;
+    }
+    if (onPolicy && !startsWithBytes(arn.view(), "arn:aws:iam::".bytes())) {
+        return await iamError(exchange, 400, "ValidationError", "PolicyArn is an IAM policy's ARN.", requestId);
+    }
+    if (onRole && (!roleNameOk(roleName.view()) || roleName.view() == "*".bytes())) {
+        return await iamError(exchange, 400, "ValidationError", "RoleName is 1 to 64 of \\w+=,.@-.", requestId);
+    }
+    if (!onRole && !onPolicy && !userNameOk(userName.view())) {
+        return await iamError(
+            exchange,
+            400,
+            "ValidationError",
+            "UserName is 1 to 64 of A-Z a-z 0-9 + = , . @ _ -.",
+            requestId,
+        );
+    }
+    // The resource it is decided on: the user's, role's or policy's ARN, path and all.
+    var resource = Vector<u8>.create();
+    if (onPolicy) {
+        resource = policyResourceOf(arn.view())?;
+    } else if (onRole) {
+        resource.extend("iam:role".bytes())?;
+        match (roleAtIam(state, roleName.view())) {
+            Some(r) => {
+                resource.extend(state.roles[r].path.view())?;
+                resource.extend(state.roles[r].name.view())?;
+            }
+            null => {
+                resource.push('/')?;
+                resource.extend(roleName.view())?;
+            }
+        }
+    } else {
+        resource.extend("iam:user".bytes())?;
+        match (userAt(state, userName.view())) {
+            Some(u) => {
+                resource.extend(state.users[u].path.view())?;
+                resource.extend(state.users[u].name.view())?;
+            }
+            null => {
+                resource.push('/')?;
+                resource.extend(userName.view())?;
+            }
+        }
+    }
+    if (decided) {
+        var iamAction = copyBytes("iam:".bytes())?;
+        iamAction.extend(a)?;
+        if (!sessionAllows(app, req, who, StringView.fromUtf8(iamAction.view()) ?? "", resource.view())?) {
+            return await iamError(
+                exchange,
+                403,
+                "AccessDenied",
+                "Not authorized to perform this IAM action.",
+                requestId,
+            );
+        }
+    }
+    var result = Vector<u8>.create();
+    let user = if (onRole || onPolicy) null else userAt(state, userName.view());
+    let role = if (onRole) roleAtIam(state, roleName.view()) else null;
+    // What it is about: the API's, or the files' (read as having none of it).
+    let fileUser = !onRole && !onPolicy && user.isNull() && fileUserNamed(app, state, userName.view())?;
+    let fileRole = onRole && role.isNull() && fileRoleNamed(app, roleName.view());
+    let known = if (onPolicy) managedAt(state, arn.view()).isSome() || awsManagedPolicy(arn.view()).isSome()
+        else if (onRole) role.isSome() || fileRole else user.isSome() || fileUser;
+    if (!known) {
+        return await iamError(
+            exchange,
+            404,
+            "NoSuchEntity",
+            "The user, role or policy with the name given cannot be found.",
+            requestId,
+        );
+    }
+    // The reads.
+    if (a == "ListUserTags".bytes() || a == "ListRoleTags".bytes() || a == "ListPolicyTags".bytes()) {
+        let none = Vector<IamTag>.create();
+        let tags = match (user) {
+            Some(u) => state.users[u].tags.view(),
+            null => match (role) {
+                Some(r) => state.roles[r].tags.view(),
+                null => match (if (onPolicy) managedAt(state, arn.view()) else null) {
+                    Some(m) => state.managed[m].tags.view(),
+                    null => none.view(),
+                },
+            },
+        };
+        appendTagList(mut result, tags)?;
+        return await iamAnswer(exchange, a, result.view(), requestId);
+    }
+    if (a == "ListRolePolicies".bytes()) {
+        result.extend("<PolicyNames>".bytes())?;
+        match (role) {
+            Some(r) => {
+                for (p in 0..state.roles[r].policies.length) {
+                    result.extend("<member>".bytes())?;
+                    appendXmlEscaped(mut result, state.roles[r].policies[p].name.view())?;
+                    result.extend("</member>".bytes())?;
+                }
+            }
+            null => {}
+        }
+        result.extend("</PolicyNames><IsTruncated>false</IsTruncated>".bytes())?;
+        return await iamAnswer(exchange, a, result.view(), requestId);
+    }
+    if (a == "GetLoginProfile".bytes()) {
+        return await iamError(
+            exchange,
+            404,
+            "NoSuchEntity",
+            "The user has no login profile: there is no console.",
+            requestId,
+        );
+    }
+    let empty = if (a == "ListMFADevices".bytes()) Some("<MFADevices></MFADevices><IsTruncated>false</IsTruncated>")
+        else if (a == "ListSSHPublicKeys".bytes()) Some(
+            "<SSHPublicKeys></SSHPublicKeys><IsTruncated>false</IsTruncated>",
+        )
+        else if (a == "ListServiceSpecificCredentials".bytes()) Some(
+            "<ServiceSpecificCredentials></ServiceSpecificCredentials>",
+        )
+        else if (a == "ListSigningCertificates".bytes()) Some(
+            "<Certificates></Certificates><IsTruncated>false</IsTruncated>",
+        )
+        else if (a == "ListInstanceProfilesForRole".bytes()) Some(
+            "<InstanceProfiles></InstanceProfiles><IsTruncated>false</IsTruncated>",
+        )
+        else null;
+    match (empty) {
+        Some(text) => { return await iamAnswer(exchange, a, text.bytes(), requestId); }
+        null => {}
+    }
+    if (a == "GetAccessKeyLastUsed".bytes()) {
+        // No use is recorded, as AWS answers for a key never used.
+        xmlTextElement(mut result, "UserName", userName.view())?;
+        result.extend(
+            "<AccessKeyLastUsed><Region>N/A</Region><ServiceName>N/A</ServiceName></AccessKeyLastUsed>".bytes(),
+        )?;
+        return await iamAnswer(exchange, a, result.view(), requestId);
+    }
+    // The changes: to the API's, not the files'.
+    if (fileUser || fileRole || (onPolicy && managedAt(state, arn.view()).isNull())) {
+        return await iamError(
+            exchange,
+            404,
+            "NoSuchEntity",
+            "The user, role or policy named is not the API's: the files' and AWS's are not changed here.",
+            requestId,
+        );
+    }
+    let on = if (onPolicy) TagOn.Policy else if (onRole) TagOn.Role else TagOn.User;
+    let name = if (onPolicy) copyBytes(arn.view())? else if (onRole) copyBytes(roleName.view())?
+        else copyBytes(userName.view())?;
+    let change = if (a == "TagUser".bytes() || a == "TagRole".bytes() || a == "TagPolicy".bytes()) {
+        let tags = formTags(body)? ?? {
+            return await iamError(
+                exchange,
+                400,
+                "ValidationError",
+                "Tags are 50 at most, each a key of 1 to 128 characters and a value of 256 at most.",
+                requestId,
+            );
+        };
+        TagCall.Tag(on, name, tags)
+    } else if (a == "UntagUser".bytes() || a == "UntagRole".bytes() || a == "UntagPolicy".bytes()) {
+        let keys = formTagKeys(body)? ?? {
+            return await iamError(
+                exchange,
+                400,
+                "ValidationError",
+                "TagKeys are 50 at most, each 1 to 128 characters.",
+                requestId,
+            );
+        };
+        TagCall.Untag(on, name, keys)
+    } else if (a == "UpdateRole".bytes()) {
+        var description = Vector<u8>.create();
+        let setsDescription = formValue(body, "Description", mut description)?;
+        if (description.length > 1000) {
+            return await iamError(
+                exchange,
+                400,
+                "ValidationError",
+                "Description is 1,000 characters at most.",
+                requestId,
+            );
+        }
+        let given = formText(body, "MaxSessionDuration")?;
+        var seconds: u64 = 0;
+        if (given.length > 0) {
+            seconds = parseDecimal(given.view()) ?? 0;
+            if (seconds < 3600 || seconds > 43200) {
+                return await iamError(
+                    exchange,
+                    400,
+                    "ValidationError",
+                    "MaxSessionDuration is 3600 to 43200.",
+                    requestId,
+                );
+            }
+        }
+        TagCall.UpdateRole(name, description, setsDescription, seconds)
+    } else TagCall.UpdateAssumeRolePolicy(name, formText(body, "PolicyDocument")?);
+    let call = IamCall.Tags(change);
+    let outcome = await applyIamRetrying(app, borrow call)?;
+    return match (borrow outcome) {
+        IamOutcome.Done(_, _, _, _, _) => await iamAnswer(exchange, a, "".bytes(), requestId),
+        _ => await managedRefused(exchange, borrow outcome, requestId),
+    };
+}

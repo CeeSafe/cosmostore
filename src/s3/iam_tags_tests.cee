@@ -1,0 +1,95 @@
+// The IAM API's tags and role updates (ADR-0108 §3), on a state.
+
+fn tagOutcome(state: borrow mut IamState, call: TagCall) -> String {
+    let o = applyTagCall(state, borrow call)!;
+    return match (o) {
+        Some(x) => textOf(outcomeName(borrow x)),
+        null => textOf("Changed"),
+    };
+}
+
+fn iamTagOf(key: StringView, value: StringView) -> IamTag => IamTag { key: iamName(key), value: iamName(value) };
+
+/// Tags merged by key, removed by key (a key not there is no error), 50 at most; on users, roles and the account's
+/// policies, not on what is not the API's.
+@test
+fn tagsMergeAndRemove() -> Result<void, TestFailure> {
+    var s = sampleIamWithGroups();
+    var tags = Vector<IamTag>.create();
+    tags.push(iamTagOf("team", "data"))!;
+    tags.push(iamTagOf("cost", "7"))!;
+    Check.equalText("Changed", tagOutcome(mut s, TagCall.Tag(TagOn.User, iamName("alice"), tags)).view())?;
+    // alice had cost=42: replaced, team added.
+    Check.equalU64(2, s.users[0].tags.length as u64)?;
+    Check.equalBytes("7".bytes(), s.users[0].tags[0].value.view())?;
+    var keys = Vector<Vector<u8>>.create();
+    keys.push(iamName("cost"))!;
+    keys.push(iamName("absent"))!;
+    Check.equalText("Changed", tagOutcome(mut s, TagCall.Untag(TagOn.User, iamName("ALICE"), keys)).view())?;
+    Check.equalU64(1, s.users[0].tags.length as u64)?;
+    Check.equalBytes("team".bytes(), s.users[0].tags[0].key.view())?;
+    var many = Vector<IamTag>.create();
+    for (i in 0..50) {
+        var key = textOf("k");
+        var n = Vector<u8>.create();
+        appendDecimal(mut n, truncate<u64>(i))!;
+        key.append(StringView.fromUtf8(n.view()) ?? "")!;
+        many.push(IamTag { key: copyBytes(key.bytes())!, value: iamName("v") })!;
+    }
+    Check.equalText("LimitExceeded", tagOutcome(mut s, TagCall.Tag(TagOn.User, iamName("alice"), many)).view())?;
+    var one = Vector<IamTag>.create();
+    one.push(iamTagOf("env", "prod"))!;
+    Check.equalText("Changed", tagOutcome(mut s, TagCall.Tag(TagOn.Role, iamName("deployer"), one)).view())?;
+    Check.equalBytes("prod".bytes(), s.roles[0].tags[0].value.view())?;
+    var two = Vector<IamTag>.create();
+    two.push(iamTagOf("env", "prod"))!;
+    Check.equalText(
+        "Changed",
+        tagOutcome(
+            mut s,
+            TagCall.Tag(TagOn.Policy, iamName("arn:aws:iam::000000000000:policy/team/writers"), two),
+        ).view(),
+    )?;
+    Check.equalU64(2, s.managed[0].tags.length as u64)?;
+    var three = Vector<IamTag>.create();
+    three.push(iamTagOf("env", "prod"))!;
+    Check.equalText("NoSuchEntity", tagOutcome(mut s, TagCall.Tag(TagOn.User, iamName("carol"), three)).view())?;
+    // The record keeps them.
+    let back = decodeIamState(encodeIamState(borrow s)!.view())!!;
+    Check.equalBytes("prod".bytes(), back.roles[0].tags[0].value.view())?;
+    return Ok();
+}
+
+/// UpdateRole sets a description and a session length, each only when given; UpdateAssumeRolePolicy takes what
+/// CreateRole takes.
+@test
+fn rolesUpdate() -> Result<void, TestFailure> {
+    var s = sampleIam();
+    Check.equalText(
+        "Changed",
+        tagOutcome(mut s, TagCall.UpdateRole(iamName("deployer"), iamName("deploys"), true, 0)).view(),
+    )?;
+    Check.equalBytes("deploys".bytes(), s.roles[0].description.view())?;
+    Check.equalU64(3600, s.roles[0].maxSeconds)?;
+    Check.equalText(
+        "Changed",
+        tagOutcome(mut s, TagCall.UpdateRole(iamName("deployer"), Vector<u8>.create(), false, 7200)).view(),
+    )?;
+    Check.equalBytes("deploys".bytes(), s.roles[0].description.view())?;
+    Check.equalU64(7200, s.roles[0].maxSeconds)?;
+    Check.equalText(
+        "NoSuchEntity",
+        tagOutcome(mut s, TagCall.UpdateRole(iamName("nobody"), Vector<u8>.create(), true, 0)).view(),
+    )?;
+    let trust = iamName(
+        "{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:root\"},\"Action\":\"sts:AssumeRole\"}}",
+    );
+    Check.equalText("Changed", tagOutcome(mut s, TagCall.UpdateAssumeRolePolicy(iamName("deployer"), trust)).view())?;
+    Check.isTrue(findBytes(s.roles[0].trust.view(), ":root".bytes(), 0).isSome(), "the new trust")?;
+    let refused = iamName("{\"Statement\":\"no\"}");
+    Check.equalText(
+        "MalformedPolicyDocument",
+        tagOutcome(mut s, TagCall.UpdateAssumeRolePolicy(iamName("deployer"), refused)).view(),
+    )?;
+    return Ok();
+}

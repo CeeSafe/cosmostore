@@ -48,7 +48,9 @@ async fn iamAnswer(
     out.extend("Response xmlns=\"".bytes())?;
     out.extend(IAM_XMLNS.bytes())?;
     out.extend("\">".bytes())?;
-    if (result.length > 0) {
+    // UpdateRole's answer has a result with nothing in it, which the SDKs read (botocore asks for `UpdateRoleResult`);
+    // a change with no answer has none.
+    if (result.length > 0 || action == "UpdateRole".bytes()) {
         out.push('<')?;
         out.extend(action)?;
         out.extend("Result>".bytes())?;
@@ -69,18 +71,36 @@ async fn iamAnswer(
 }
 
 /// `<User>…</User>`.
-fn appendUser(out: borrow mut Vector<u8>, name: Slice<u8>, id: Slice<u8>, createdMs: i64) -> Result<void, AllocError> {
-    out.extend("<Path>/</Path>".bytes())?;
+fn appendUser(out: borrow mut Vector<u8>, name: Slice<u8>, id: Slice<u8>, createdMs: i64) -> Result<void, AllocError> =>
+    appendUserAt(out, name, id, "/".bytes(), createdMs);
+
+/// `<User>…</User>`'s inside for a user with a path (ADR-0108 §3), shown in its ARN.
+fn appendUserAt(
+    out: borrow mut Vector<u8>,
+    name: Slice<u8>,
+    id: Slice<u8>,
+    path: Slice<u8>,
+    createdMs: i64,
+) -> Result<void, AllocError> {
+    xmlTextElement(out, "Path", path)?;
     xmlTextElement(out, "UserName", name)?;
     xmlTextElement(out, "UserId", id)?;
     out.extend("<Arn>".bytes())?;
     out.extend(IAM_ACCOUNT_ARN.bytes())?;
-    out.extend("user/".bytes())?;
+    out.extend("user".bytes())?;
+    appendXmlEscaped(out, path)?;
     appendXmlEscaped(out, name)?;
     out.extend("</Arn><CreateDate>".bytes())?;
     appendIso8601(out, createdMs)?;
     out.extend("</CreateDate>".bytes())?;
     return Ok();
+}
+
+/// A path and a name, as an ARN ends.
+fn pathAndName(path: Slice<u8>, name: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var out = copyBytes(path)?;
+    out.extend(name)?;
+    return Ok(out);
 }
 
 /// `n` characters of `alphabet`, at random.
@@ -101,7 +121,8 @@ const IAM_SECRET_CHARS: StringView = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop
 
 /// A change the IAM API asks.
 enum IamCall {
-    CreateUser(Vector<u8>),
+    /// A user's name, path and tags.
+    CreateUser(Vector<u8>, Vector<u8>, Vector<IamTag>),
     DeleteUser(Vector<u8>),
     CreateAccessKey(Vector<u8>),
     /// A user's key, made active or not.
@@ -110,8 +131,8 @@ enum IamCall {
     /// A user's policy, by name, and its document.
     PutUserPolicy(Vector<u8>, Vector<u8>, Vector<u8>),
     DeleteUserPolicy(Vector<u8>, Vector<u8>),
-    /// A role, its trust policy, and its sessions' longest (MaxSessionDuration).
-    CreateRole(Vector<u8>, Vector<u8>, u64),
+    /// A role, its trust policy, its sessions' longest (MaxSessionDuration), its path, description and tags.
+    CreateRole(Vector<u8>, Vector<u8>, u64, Vector<u8>, Vector<u8>, Vector<IamTag>),
     DeleteRole(Vector<u8>),
     PutRolePolicy(Vector<u8>, Vector<u8>, Vector<u8>),
     DeleteRolePolicy(Vector<u8>, Vector<u8>),
@@ -119,6 +140,8 @@ enum IamCall {
     Managed(ManagedCall),
     /// A group's change (`iam_groups.cee`).
     Group(GroupCall),
+    /// A tag's change or a role's update (`iam_tags.cee`).
+    Tags(TagCall),
 }
 
 /// What a change came to.
@@ -211,7 +234,7 @@ fn applyIamCall(
     var madeGroup: IamGroup? = null;
     var about: usize? = null;
     match (call) {
-        IamCall.CreateUser(name) => {
+        IamCall.CreateUser(name, path, tags) => {
             if (userAt(borrow state, name.view()).isSome() || namedIn(fileNames, name.view())) {
                 return Ok(IamOutcome.EntityAlreadyExists);
             }
@@ -223,8 +246,8 @@ fn applyIamCall(
                 createdMs: nowMs,
                 keys: Vector<IamKey>.create(),
                 policies: Vector<IamPolicy>.create(),
-                path: copyBytes("/".bytes())?,
-                tags: Vector<IamTag>.create(),
+                path: copyBytes(path.view())?,
+                tags: copyTags(tags.view())?,
                 attached: Vector<Vector<u8>>.create(),
             })?;
             about = Some(state.users.length - 1);
@@ -320,7 +343,7 @@ fn applyIamCall(
             }
             let _ = state.users[u].policies.remove(at ?? { return Ok(IamOutcome.NoSuchEntity); });
         }
-        IamCall.CreateRole(name, trust, seconds) => {
+        IamCall.CreateRole(name, trust, seconds, path, description, tags) => {
             if (roleAtIam(borrow state, name.view()).isSome() || namedIn(fileRoles, name.view())) {
                 return Ok(IamOutcome.EntityAlreadyExists);
             }
@@ -336,10 +359,10 @@ fn applyIamCall(
                 trust: copyBytes(trust.view())?,
                 policies: Vector<IamPolicy>.create(),
                 maxSeconds: *seconds,
-                path: copyBytes("/".bytes())?,
-                tags: Vector<IamTag>.create(),
+                path: copyBytes(path.view())?,
+                tags: copyTags(tags.view())?,
                 attached: Vector<Vector<u8>>.create(),
-                description: Vector<u8>.create(),
+                description: copyBytes(description.view())?,
             });
             state.roles.push(IamRole {
                 name: copyBytes(name.view())?,
@@ -348,10 +371,10 @@ fn applyIamCall(
                 trust: copyBytes(trust.view())?,
                 policies: Vector<IamPolicy>.create(),
                 maxSeconds: *seconds,
-                path: copyBytes("/".bytes())?,
-                tags: Vector<IamTag>.create(),
+                path: copyBytes(path.view())?,
+                tags: copyTags(tags.view())?,
                 attached: Vector<Vector<u8>>.create(),
-                description: Vector<u8>.create(),
+                description: copyBytes(description.view())?,
             })?;
         }
         IamCall.DeleteRole(name) => {
@@ -390,6 +413,12 @@ fn applyIamCall(
             match (applyGroupCall(mut state, g, nowMs)?) {
                 GroupApplied.Refused(o) => { return Ok(o); }
                 GroupApplied.Changed(groupMade) => { madeGroup = groupMade; }
+            }
+        }
+        IamCall.Tags(t) => {
+            match (applyTagCall(mut state, t)?) {
+                Some(o) => { return Ok(o); }
+                null => {}
             }
         }
     }
@@ -514,7 +543,7 @@ async fn serveIam(
         "DeleteAccessKey", "PutUserPolicy", "GetUserPolicy", "ListUserPolicies", "DeleteUserPolicy", "CreateRole",
         "GetRole", "ListRoles", "DeleteRole", "PutRolePolicy", "GetRolePolicy", "DeleteRolePolicy",
     ];
-    var taken = isManagedAction(action.view()) || isGroupAction(action.view());
+    var taken = isManagedAction(action.view()) || isGroupAction(action.view()) || isTagAction(action.view());
     for (k in known) {
         if (action.view() == k.bytes()) { taken = true; }
     }
@@ -523,9 +552,10 @@ async fn serveIam(
     }
     // A policy's name, when the call takes one: 1 to 128 of IAM's characters (the M19 exit review).
     let policyName = formText(body.view(), "PolicyName")?;
-    if (action.view().endsWith(
-        "Policy".bytes(),
-    ) && !isManagedAction(action.view()) && !policyNameOk(policyName.view())) {
+    // Not the managed calls' (a PolicyArn) nor the tag calls' (TagPolicy, UpdateAssumeRolePolicy: no PolicyName).
+    let namesPolicy = action.view().endsWith("Policy".bytes()) && !isManagedAction(action.view()) &&
+        !isTagAction(action.view());
+    if (namesPolicy && !policyNameOk(policyName.view())) {
         return await iamError(
             exchange,
             400,
@@ -554,6 +584,23 @@ async fn serveIam(
             requestId,
         );
     }
+    if (isTagAction(action.view())) {
+        let callerName = match (borrow callerUser) {
+            Some(n) => copyBytes(n.view())?,
+            null => Vector<u8>.create(),
+        };
+        return await serveIamTags(
+            app,
+            req,
+            exchange,
+            action.view(),
+            body.view(),
+            borrow who,
+            callerName.view(),
+            callerUser.isSome(),
+            requestId,
+        );
+    }
     if (isGroupAction(action.view())) {
         return await serveIamGroup(
             app,
@@ -578,27 +625,31 @@ async fn serveIam(
     if (callerUser.isSome()) {
         var iamAction = copyBytes("iam:".bytes())?;
         iamAction.extend(action.view())?;
-        var resource = copyBytes(if (roleCall) "iam:role/".bytes() else "iam:user/".bytes())?;
+        var resource = copyBytes(if (roleCall) "iam:role".bytes() else "iam:user".bytes())?;
         // A list is about every user or role; anything else about the record's own name, as names match ignoring
         // case (the M19 exit review: a policy on `user/BOB` allowed acting on `bob`, and ListUsers on oneself listed
         // everyone).
         let listing = action.view() == "ListUsers".bytes() || action.view() == "ListRoles".bytes();
         if (listing) {
-            resource.extend("*".bytes())?;
+            resource.extend("/*".bytes())?;
         } else {
             let snapshot = await readIamSnapshot(borrow app.store) ?? {
                 return await iamError(exchange, 500, "ServiceFailure", "The IAM records do not read.", requestId);
             };
+            // The record's path and name (ADR-0108 §3): a policy names a user or role by its ARN, path and all.
             let found = if (roleCall) match (roleAtIam(borrow snapshot.state, aboutName)) {
-                Some(i) => Some(copyBytes(snapshot.state.roles[i].name.view())?),
+                Some(i) => Some(pathAndName(snapshot.state.roles[i].path.view(), snapshot.state.roles[i].name.view())?),
                 null => null,
             } else match (userAt(borrow snapshot.state, aboutName)) {
-                Some(i) => Some(copyBytes(snapshot.state.users[i].name.view())?),
+                Some(i) => Some(pathAndName(snapshot.state.users[i].path.view(), snapshot.state.users[i].name.view())?),
                 null => null,
             };
             match (found) {
                 Some(n) => { resource.extend(n.view())?; }
-                null => { resource.extend(aboutName)?; }
+                null => {
+                    resource.push('/')?;
+                    resource.extend(aboutName)?;
+                }
             }
         }
         if (!sessionAllows(app, req, borrow who, StringView.fromUtf8(iamAction.view()) ?? "", resource.view())?) {
@@ -640,7 +691,21 @@ async fn serveIam(
         );
     }
     // The changes.
-    let call = if (a == "CreateUser".bytes()) IamCall.CreateUser(name)
+    let path = formText(body.view(), "Path")?;
+    let givenPath = if (path.length == 0) copyBytes("/".bytes())? else path;
+    let tags = formTags(body.view())? ?? {
+        return await iamError(
+            exchange,
+            400,
+            "ValidationError",
+            "Tags are 50 at most, each a key of 1 to 128 characters and a value of 256 at most.",
+            requestId,
+        );
+    };
+    if (!iamPathOk(givenPath.view())) {
+        return await iamError(exchange, 400, "ValidationError", "Path is / or /…/, 1 to 512 characters.", requestId);
+    }
+    let call = if (a == "CreateUser".bytes()) IamCall.CreateUser(name, givenPath, tags)
         else if (a == "DeleteUser".bytes()) IamCall.DeleteUser(name)
         else if (a == "CreateAccessKey".bytes()) IamCall.CreateAccessKey(name)
         else if (a == "UpdateAccessKey".bytes()) {
@@ -768,7 +833,8 @@ async fn iamDone(
                 }
                 null => {
                     result.extend("<User>".bytes())?;
-                    appendUser(mut result, u.name.view(), u.id.view(), u.createdMs)?;
+                    appendUserAt(mut result, u.name.view(), u.id.view(), u.path.view(), u.createdMs)?;
+                    appendTags(mut result, u.tags.view())?;
                     result.extend("</User>".bytes())?;
                 }
             }
@@ -816,7 +882,13 @@ async fn iamRead(
         }
         for (i in 0..state.users.length) {
             result.extend("<member>".bytes())?;
-            appendUser(mut result, state.users[i].name.view(), state.users[i].id.view(), state.users[i].createdMs)?;
+            appendUserAt(
+                mut result,
+                state.users[i].name.view(),
+                state.users[i].id.view(),
+                state.users[i].path.view(),
+                state.users[i].createdMs,
+            )?;
             result.extend("</member>".bytes())?;
         }
         result.extend("</Users>".bytes())?;
@@ -864,7 +936,8 @@ async fn iamRead(
     let user = borrow state.users[u];
     if (action == "GetUser".bytes()) {
         result.extend("<User>".bytes())?;
-        appendUser(mut result, user.name.view(), user.id.view(), user.createdMs)?;
+        appendUserAt(mut result, user.name.view(), user.id.view(), user.path.view(), user.createdMs)?;
+        appendTags(mut result, user.tags.view())?;
         result.extend("</User>".bytes())?;
     } else if (action == "ListAccessKeys".bytes()) {
         result.extend("<AccessKeyMetadata>".bytes())?;
@@ -923,12 +996,13 @@ fn fileRolesOf(roles: Slice<StsRole>, state: borrow IamState) -> Result<Vector<V
 
 /// `<Role>…</Role>`'s inside.
 fn appendRole(out: borrow mut Vector<u8>, r: borrow IamRole) -> Result<void, AllocError> {
-    out.extend("<Path>/</Path>".bytes())?;
+    xmlTextElement(out, "Path", r.path.view())?;
     xmlTextElement(out, "RoleName", r.name.view())?;
     xmlTextElement(out, "RoleId", r.id.view())?;
     out.extend("<Arn>".bytes())?;
     out.extend(IAM_ACCOUNT_ARN.bytes())?;
-    out.extend("role/".bytes())?;
+    out.extend("role".bytes())?;
+    appendXmlEscaped(out, r.path.view())?;
     appendXmlEscaped(out, r.name.view())?;
     out.extend("</Arn><CreateDate>".bytes())?;
     appendIso8601(out, r.createdMs)?;
@@ -939,6 +1013,9 @@ fn appendRole(out: borrow mut Vector<u8>, r: borrow IamRole) -> Result<void, All
     out.extend("<MaxSessionDuration>".bytes())?;
     appendDecimal(out, r.maxSeconds)?;
     out.extend("</MaxSessionDuration>".bytes())?;
+    if (r.description.length > 0) { xmlTextElement(out, "Description", r.description.view())?; }
+    appendTags(out, r.tags.view())?;
+    out.extend("<RoleLastUsed></RoleLastUsed>".bytes())?;
     return Ok();
 }
 
@@ -1064,7 +1141,37 @@ async fn serveIamRole(
                 );
             }
         }
-        IamCall.CreateRole(owned, trust, seconds)
+        let path = formText(body, "Path")?;
+        let givenPath = if (path.length == 0) copyBytes("/".bytes())? else path;
+        if (!iamPathOk(givenPath.view())) {
+            return await iamError(
+                exchange,
+                400,
+                "ValidationError",
+                "Path is / or /…/, 1 to 512 characters.",
+                requestId,
+            );
+        }
+        let description = formText(body, "Description")?;
+        if (description.length > 1000) {
+            return await iamError(
+                exchange,
+                400,
+                "ValidationError",
+                "Description is 1,000 characters at most.",
+                requestId,
+            );
+        }
+        let tags = formTags(body)? ?? {
+            return await iamError(
+                exchange,
+                400,
+                "ValidationError",
+                "Tags are 50 at most, each a key of 1 to 128 characters and a value of 256 at most.",
+                requestId,
+            );
+        };
+        IamCall.CreateRole(owned, trust, seconds, givenPath, description, tags)
     } else if (a == "DeleteRole".bytes()) IamCall.DeleteRole(owned)
         else if (a == "PutRolePolicy".bytes()) IamCall.PutRolePolicy(
             owned,
