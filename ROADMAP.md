@@ -4968,3 +4968,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - the Terraform check (19).
 - **ADR-0108** has its As built section.
 - **Next:** the owner's decisions: ADR-0108's acceptance as amended, and closing M21.
+
+### 22 Nov 2026: M21 closed (ADR-0108 accepted as amended)
+
+- **The owner's decision:** "Accept and close". ADR-0108 is accepted as amended by its As built section.
+- **M21 is closed.** The exit review's B1 to B5 are recorded in `docs/m21-exit-review.md`.
+- **Next:** M22, when the owner asks. Candidates on record:
+  - ADR-0107's B, table maintenance on a cluster as gated writes;
+  - ADR-0107's C, compaction that re-encodes, after CeeSafe's snappy and zstd (ADR 0196's phases 2 and 3);
+  - M21's recorded Lows.

@@ -1,6 +1,7 @@
 # ADR-0108: IAM for tools: managed policies, groups, tags, and Terraform (M21)
 
-**Status:** proposed, 22 Nov 2026, with the owner's choices made: AWS's four managed policies that matter here ("The
+**Status:** accepted, 22 Nov 2026, as amended by its As built section (the owner: "Accept and close"). Proposed the
+same day with the owner's choices made: AWS's four managed policies that matter here ("The
 four that matter"), and the Terraform check run locally ("Locally"). M21 is item A of ADR-0107 (the owner: "A: IAM for
 tools"), with Terraform as the bar (the owner: "Terraform").
 
