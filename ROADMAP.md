@@ -4986,3 +4986,22 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - a crash sweep over the leader's run as A's crash bar;
   - CeeSafe's snappy and zstd not yet.
 - **Next:** ADR-0110, the design.
+
+### 23 Nov 2026: ADR-0110 proposed, M22's design (cluster table maintenance as gated steps)
+
+- **The design:** a cluster leader's maintenance is its own run of gated steps:
+  - each bin's put, with its own extent push;
+  - the commit;
+  - snapshot management;
+  - removal's deletes, 1,000 at a time.
+
+  The bytes are copied off the gate, and no request's timeout applies.
+- **The run is the leader's loop's,** not a request to its own front.
+- **The crash sweep has two levels:**
+  - the store's, at every I/O point, as M20's restore record's;
+  - the cluster's, with the leader stopped at each step.
+- **The owner's choices:**
+  - a test-only `node --tables-copy-pause-ms` for the smoke's long run;
+  - a client's maintenance-run on a cluster answered at once, the run started.
+- **Eight slices.**
+- **Next:** slice 1, the gated step.
