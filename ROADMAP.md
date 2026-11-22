@@ -4977,3 +4977,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - ADR-0107's B, table maintenance on a cluster as gated writes;
   - ADR-0107's C, compaction that re-encodes, after CeeSafe's snappy and zstd (ADR 0196's phases 2 and 3);
   - M21's recorded Lows.
+
+### 23 Nov 2026: M22 is cluster table maintenance as gated writes, with M21's B1 and B2 (ADR-0109)
+
+- **M22 proposed and chosen:** ADR-0109's item A, cluster table maintenance as gated writes, with M21's B1 (bucket
+  policies naming users with paths) and B2 (the IAM record's other bounds) as its last slices.
+- **The owner's choices:**
+  - a crash sweep over the leader's run as A's crash bar;
+  - CeeSafe's snappy and zstd not yet.
+- **Next:** ADR-0110, the design.
