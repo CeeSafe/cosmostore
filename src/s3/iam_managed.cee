@@ -11,6 +11,10 @@ const IAM_MANAGED_MAX_DESCRIPTION: usize = 1000;
 const IAM_MANAGED_MAX_VERSIONS: usize = 5;
 const IAM_MAX_ATTACHED: usize = 10;
 const IAM_MAX_TAGS: usize = 50;
+/// AWS's default quotas for an account: 1,500 managed policies, 300 groups (the M21 exit review's finding 6: the
+/// record, read whole, had no bound).
+const IAM_MAX_MANAGED: usize = 1500;
+const IAM_MAX_GROUPS: usize = 300;
 
 /// What a managed policy is attached to.
 enum AttachTo {
@@ -116,7 +120,7 @@ fn iamPathOk(path: Slice<u8>) -> bool {
 
 /// A version id, `v<n>`.
 fn versionNumberOf(id: Slice<u8>) -> u32? {
-    if (id.length < 2 || id[0] != 'v') { return null; }
+    if (id.length < 2 || id[0] != 'v' || id[1] == '0') { return null; } // `v01` is not `v1`
     let n = parseDecimal(id[1..]) ?? { return null; };
     return checkedTruncate<u32>(n);
 }
@@ -210,6 +214,9 @@ fn applyManagedCall(
                 if (sameNameIgnoringCase(state.managed[i].name.view(), name.view())) {
                     return Ok(ManagedApplied.Refused(IamOutcome.EntityAlreadyExists));
                 }
+            }
+            if (state.managed.length >= IAM_MAX_MANAGED) {
+                return Ok(ManagedApplied.Refused(IamOutcome.LimitExceeded));
             }
             match (managedTextOutcome(text.view())?) {
                 Some(o) => { return Ok(ManagedApplied.Refused(o)); }
@@ -389,7 +396,8 @@ fn policyResourceOf(arn: Slice<u8>) -> Result<Vector<u8>, AllocError> {
         out.extend("iam:".bytes())?;
         out.extend(arn[IAM_ACCOUNT_ARN.length..])?;
     } else {
-        out.extend("iam:foreign/".bytes())?;
+        // As an identity policy's `arn:aws:iam::aws:policy/<name>` parses (the M21 exit review's finding 9).
+        out.extend("iam:foreign/policy/".bytes())?;
         out.extend(nameOfArn(arn))?;
     }
     return Ok(out);

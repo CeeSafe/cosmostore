@@ -1,0 +1,124 @@
+// The M21 exit review's fixes (docs/m21-exit-review.md): joined policies past a policy's size, paths in trust
+// policies, AWS's policies as resources.
+
+/// A managed policy's document of about `n` bytes: one statement of many actions.
+fn bigPolicyText(n: usize) -> Vector<u8> {
+    var text = textOf("{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\"");
+    var i: usize = 0;
+    while (text.length < n) {
+        text.append(",\"s3:GetObjectVersion")!;
+        var d = Vector<u8>.create();
+        appendDecimal(mut d, i as u64)!;
+        text.append(StringView.fromUtf8(d.view()) ?? "")!;
+        text.append("\"")!;
+        i += 1;
+    }
+    text.append("],\"Resource\":\"*\"}}")!;
+    return copyBytes(text.bytes())!;
+}
+
+/// Finding 1: a change that would make a user's joined policy no policy (past its size) is refused, LimitExceeded;
+/// and a user whose policies do not join is still given a set, allowed nothing, with the other users' taken.
+@test
+fn joinedPoliciesPastTheirSizeAreRefused() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("iam-review-big");
+    var s = ObjectStore.open(dir.view(), spaceConfig(0, 0))!;
+    let files = Vector<Vector<u8>>.create();
+    Check.equalBytes(
+        "Done".bytes(),
+        iamCall(
+            mut s,
+            IamCall.CreateUser(iamName("alice"), iamName("/"), Vector<IamTag>.create()),
+            files.view(),
+        ).view(),
+    )?;
+    var outcomes = Vector<Vector<u8>>.create();
+    for (i in 0..4) {
+        var name = textOf("big");
+        var d = Vector<u8>.create();
+        appendDecimal(mut d, truncate<u64>(i))!;
+        name.append(StringView.fromUtf8(d.view()) ?? "")!;
+        let made = iamCall(
+            mut s,
+            IamCall.Managed(
+                ManagedCall.CreatePolicy(
+                    copyBytes(name.bytes())!,
+                    iamName("/"),
+                    Vector<u8>.create(),
+                    bigPolicyText(5900),
+                    Vector<IamTag>.create(),
+                ),
+            ),
+            files.view(),
+        );
+        Check.equalBytes("Done".bytes(), made.view())?;
+        var arn = textOf("arn:aws:iam::000000000000:policy/");
+        arn.append(name.view())!;
+        outcomes.push(
+            iamCall(
+                mut s,
+                IamCall.Managed(ManagedCall.Attach(AttachTo.User, iamName("alice"), copyBytes(arn.bytes())!)),
+                files.view(),
+            ),
+        )!;
+    }
+    // Three fit in a policy's 20,480 bytes; the fourth does not.
+    Check.equalBytes("Done".bytes(), outcomes[2].view())?;
+    Check.equalBytes("LimitExceeded".bytes(), outcomes[3].view())?;
+    // A state that is past it already (written by hand): the user is allowed nothing, and the others are taken.
+    var state = sampleIam();
+    for (i in 0..4) {
+        var policy = iamPolicy("p", "s3:GetObject");
+        policy.text = bigPolicyText(5900);
+        var name = textOf("p");
+        var d = Vector<u8>.create();
+        appendDecimal(mut d, truncate<u64>(i))!;
+        name.append(StringView.fromUtf8(d.view()) ?? "")!;
+        policy.name = copyBytes(name.bytes())!;
+        state.users[0].policies.push(policy)!;
+    }
+    Check.equalU64(1, unjoinableEntities(borrow state)!.length as u64)?;
+    let fileKeys = parseCredentials("AKIAACCOUNT000000001 account/secret\n".bytes())!;
+    var keys = withIamKeys(fileKeys, borrow state)!;
+    var skipped = Vector<Vector<u8>>.create();
+    let users = withIamUsers(null, keys.view(), borrow state, mut skipped).ok()!!;
+    Check.isTrue(applyUsers(mut keys, borrow users).isOk(), "the set is taken")?;
+    Check.equalBytes(IAM_NO_POLICY.bytes(), users.users[0].policyText.view())?;
+    return Ok();
+}
+
+/// Finding 5: a trust policy names a user by its ARN with its path.
+@test
+fn trustPoliciesNameUsersWithTheirPaths() -> Result<void, TestFailure> {
+    let trust = """
+        {"Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/tf/dave"},"Action":"sts:AssumeRole"}}
+        """;
+    let atPath: Vector<u8>? = Some(iamName("/tf/dave"));
+    let atRoot: Vector<u8>? = Some(iamName("/dave"));
+    let bare: Vector<u8>? = Some(iamName("dave"));
+    Check.isTrue(trustAllows(trust.bytes(), atPath.asBorrow())!, "the user at its path")?;
+    Check.isFalse(trustAllows(trust.bytes(), atRoot.asBorrow())!, "not one of its name at /")?;
+    Check.isFalse(trustAllows(trust.bytes(), bare.asBorrow())!, "nor a name alone")?;
+    return Ok();
+}
+
+/// Finding 9: AWS's policy as a resource is as an identity policy's ARN parses; finding 10: `v01` is not a version.
+@test
+fn awsPoliciesAsResources() -> Result<void, TestFailure> {
+    let resource = policyResourceOf("arn:aws:iam::aws:policy/AdministratorAccess".bytes())!;
+    Check.equalBytes("iam:foreign/policy/AdministratorAccess".bytes(), resource.view())?;
+    let doc = """
+        {"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"iam:GetPolicy","Resource":"arn:aws:iam::aws:policy/AdministratorAccess"}}
+        """;
+    let policy = parseIdentityPolicy(doc.bytes())!;
+    let facts = plainFacts();
+    Check.isTrue(
+        match (decidePolicy(borrow policy, null, "iam:GetPolicy", resource.view(), borrow facts)) {
+            PolicyDecision.Allow => true,
+            _ => false,
+        },
+        "the ARN allows it",
+    )?;
+    Check.isTrue(versionNumberOf("v01".bytes()).isNull(), "v01")?;
+    return Ok();
+}

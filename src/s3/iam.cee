@@ -552,6 +552,56 @@ fn joinedPolicy(texts: Slice<Vector<u8>>) -> Result<Vector<u8>?, AllocError> {
     return Ok(Some(out));
 }
 
+/// Whether `texts` joined are an identity policy the sets take: not past its size, say (the M21 exit review's finding
+/// 1). Null when out of memory.
+fn joinsToPolicy(texts: Slice<Vector<u8>>) -> Result<bool, AllocError> {
+    let joined = joinedPolicy(texts)? ?? { return Ok(false); };
+    return match (parseIdentityPolicy(joined.view())) {
+        Ok(_) => Ok(true),
+        Err(S3Fail.OutOfMemory(e)) => Err(e),
+        Err(_) => Ok(false),
+    };
+}
+
+/// The API's users and roles whose joined policies are not a policy, as `user:<name>` and `role:<name>`.
+fn unjoinableEntities(iam: borrow IamState) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    for (u in 0..iam.users.length) {
+        let texts = userPolicyTexts(iam, u)?;
+        if (!joinsToPolicy(texts.view())?) {
+            var n = copyBytes("user:".bytes())?;
+            n.extend(iam.users[u].name.view())?;
+            out.push(n)?;
+        }
+    }
+    for (r in 0..iam.roles.length) {
+        let texts = rolePolicyTexts(iam, r)?;
+        if (!joinsToPolicy(texts.view())?) {
+            var n = copyBytes("role:".bytes())?;
+            n.extend(iam.roles[r].name.view())?;
+            out.push(n)?;
+        }
+    }
+    return Ok(out);
+}
+
+/// The policy a user or role of the API is given: its documents joined, or, when they do not join to a policy (past
+/// its size, say), one that allows nothing, said on stderr: it fails closed, and the rest of the set is taken (the M21
+/// exit review's finding 1: one user's policy had frozen the set for every user).
+fn effectivePolicy(texts: Slice<Vector<u8>>, kind: StringView, name: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    if (joinsToPolicy(texts)?) { return Ok(joinedPolicy(texts)? ?? copyBytes(IAM_NO_POLICY.bytes())?); }
+    var line = String.create();
+    let _ = line.append("cosmostore: the IAM API's ");
+    let _ = line.append(kind);
+    let _ = line.append(" ");
+    let _ = line.append(StringView.fromUtf8(name) ?? "?");
+    let _ = line.append(
+        ": its policies joined are not a policy (past its size?); it is allowed nothing until they are",
+    );
+    Console.writeErrorLine(line.view());
+    return copyBytes(IAM_NO_POLICY.bytes());
+}
+
 /// The credentials file's keys and the API's active keys, in that order.
 fn withIamKeys(fileKeys: Vector<Credential>, iam: borrow IamState) -> Result<Vector<Credential>, AllocError> {
     var out = fileKeys;
@@ -573,6 +623,7 @@ fn withIamKeys(fileKeys: Vector<Credential>, iam: borrow IamState) -> Result<Vec
                 userKey: Vector<u8>.create(),
                 policyText: Vector<u8>.create(),
                 policy: null,
+                path: Vector<u8>.create(),
                 fromIam: true,
             })?;
         }
@@ -650,15 +701,13 @@ fn withIamUsers(
             }
         }
         let texts = userPolicyTexts(iam, u).ok() ?? { return Err(oom); };
-        let policy = match (joinedPolicy(texts.view())) {
-            Ok(Some(p)) => p,
-            _ => { return Err(oom); }
-        };
+        let policy = effectivePolicy(texts.view(), "user", user.name.view()).ok() ?? { return Err(oom); };
         let entry = UserEntry {
             name: copyBytes(user.name.view()).ok() ?? { return Err(oom); },
             id: copyBytes(user.id.view()).ok() ?? { return Err(oom); },
             keys: keys,
             policyText: policy,
+            path: copyBytes(user.path.view()).ok() ?? { return Err(oom); },
         };
         if (kept.push(entry).isErr()) { return Err(oom); }
     }
@@ -689,7 +738,9 @@ fn withIamRoles(
     for (r in 0..iam.roles.length) {
         let role = borrow iam.roles[r];
         let texts = rolePolicyTexts(iam, r)?;
-        let text = joinedPolicy(texts.view())? ?? { continue; };
+        // A role whose policies do not join is kept, allowed nothing (the M21 exit review's finding 4: it had left the
+        // set unsaid).
+        let text = effectivePolicy(texts.view(), "role", role.name.view())?;
         let policy = match (parseIdentityPolicy(text.view())) {
             Ok(p) => p,
             Err(S3Fail.OutOfMemory(e)) => { return Err(e); }
@@ -703,6 +754,7 @@ fn withIamRoles(
                 removed: false,
                 trust: copyBytes(role.trust.view())?,
                 id: copyBytes(role.id.view())?,
+                path: copyBytes(role.path.view())?,
             },
         )?;
     }
@@ -792,7 +844,10 @@ fn trustAllows(trust: Slice<u8>, user: borrow Vector<u8>?) -> Result<bool, Alloc
     principals.push(copyBytes("arn:aws:iam::000000000000:root".bytes())?)?;
     match (user) {
         Some(u) => {
-            var arn = copyBytes("arn:aws:iam::000000000000:user/".bytes())?;
+            // `u` is the user's path and name (`/tf/dave`), or a name at `/`: its ARN with its path (the M21 exit
+            // review's finding 5).
+            var arn = copyBytes("arn:aws:iam::000000000000:user".bytes())?;
+            if (!startsWithBytes(u.view(), "/".bytes())) { arn.push('/')?; }
             arn.extend(u.view())?;
             principals.push(arn)?;
         }

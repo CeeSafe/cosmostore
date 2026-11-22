@@ -1032,6 +1032,22 @@ sleep 3
 trcreds=$(aws sts assume-role --role-arn arn:aws:iam::000000000000:role/svc/tr --role-session-name smoke --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>&1)
 check "the new trust lets the account assume it" "$(echo "$trcreds" | cut -c1-4)" ASIA
 check "GetCallerIdentity, a session's" "$( ( export AWS_ACCESS_KEY_ID="$(echo "$trcreds" | cut -f1)" AWS_SECRET_ACCESS_KEY="$(echo "$trcreds" | cut -f2)" AWS_SESSION_TOKEN="$(echo "$trcreds" | cut -f3)"; aws sts get-caller-identity --query Arn --output text 2>&1 ) )" "arn:aws:sts::000000000000:assumed-role/tr/smoke"
+# The M21 exit review's findings 2, 3 and 5: AssumeRole takes the role's own path only and is decided on its ARN with
+# it; a trust policy names a user with its path; CreateUser is decided at the Path given.
+check "a RoleArn with another path refused" "$(code sts assume-role --role-arn arn:aws:iam::000000000000:role/other/tr --role-session-name ss)" AccessDenied
+aws iam update-assume-role-policy --role-name tr --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/staff/tg"},"Action":"sts:AssumeRole"}}' > /dev/null 2>&1
+aws iam put-user-policy --user-name tg --policy-name assume --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::000000000000:role/svc/tr"}}' > /dev/null 2>&1
+sleep 3
+check "a user its trust names with its path, allowed the role's ARN with its path, assumes it" "$(tg aws sts assume-role --role-arn arn:aws:iam::000000000000:role/svc/tr --role-session-name tg --query 'Credentials.AccessKeyId' --output text 2>&1 | cut -c1-4)" ASIA
+aws iam put-user-policy --user-name tg --policy-name assume --policy-document '{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::000000000000:role/tr"}}' > /dev/null 2>&1
+sleep 3
+check "but not allowed it on its ARN without the path" "$(tg code sts assume-role --role-arn arn:aws:iam::000000000000:role/svc/tr --role-session-name tg)" AccessDenied
+aws iam put-user-policy --user-name tg --policy-name assume --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:CreateUser","Resource":"*"},{"Effect":"Deny","Action":"iam:CreateUser","Resource":"arn:aws:iam::000000000000:user/admin/*"}]}' > /dev/null 2>&1
+sleep 3
+check "a user denied user/admin/* does not make one there" "$(tg code iam create-user --user-name boss --path /admin/)" AccessDenied
+check "but may elsewhere" "$(tg aws iam create-user --user-name notboss --path /ok/ --query User.Path --output text 2>&1)" /ok/
+aws iam delete-user --user-name notboss > /dev/null 2>&1
+aws iam delete-user-policy --user-name tg --policy-name assume > /dev/null 2>&1
 aws iam create-policy --policy-name tagged --policy-document "$pol1" > /dev/null 2>&1
 aws iam tag-policy --policy-arn arn:aws:iam::000000000000:policy/tagged --tags Key=a,Value=b > /dev/null 2>&1 && pass "iam tag-policy" || fail "iam tag-policy"
 check "its tags listed" "$(aws iam list-policy-tags --policy-arn arn:aws:iam::000000000000:policy/tagged --query 'Tags[0].Value' --output text 2>&1)" b

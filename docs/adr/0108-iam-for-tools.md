@@ -104,3 +104,33 @@ tools"), with Terraform as the bar (the owner: "Terraform").
   alone. A store moved back to an older binary loses the API's users and roles until it is moved forward again.
 - **Size:** the record grows with groups and policies. At AWS's limits, a thousand users with a policy each stays well
   under a megabyte. The record is read whole each round, as in M19.
+
+## As built (M21 slices 1 to 5, and the exit review)
+
+- **Built as decided:**
+  - **The record's form 2:** groups, managed policies with their versions, paths, tags and attachments. Form 1 is
+    still read.
+  - **The joined identity policies,** and AWS's four managed policies.
+  - **The calls of §3:**
+    - managed policies: `src/s3/iam_managed.cee`;
+    - groups: `iam_groups.cee`;
+    - tags, role updates and the refresh's reads: `iam_tags.cee`;
+    - `GetCallerIdentity`: `sts.cee`.
+  - **`tools/terraform_check.sh`,** run locally (§6).
+- **Amended by the exit review** (`docs/m21-exit-review.md`):
+  - **§2, the joined policies:**
+    - a change after which a user's or role's joined policy is no longer a policy (past its size, say) is refused,
+      LimitExceeded;
+    - a user or role whose policies still do not join is allowed nothing, said on stderr, and the rest of the set is
+      taken.
+  - **§3, paths:**
+    - AssumeRole requires the RoleArn's path to be the role's, and is decided on the ARN with it;
+    - CreateUser and CreateRole are decided at the Path given;
+    - a trust policy names a user by its ARN with its path;
+    - the credential set and the role set carry each user's and role's path.
+  - **§1, limits:** AWS's default quotas of 300 groups and 1,500 managed policies.
+- **Narrower than decided:**
+  - a bucket policy cannot name a user by an ARN with a path; it is refused as NotImplemented, failing closed;
+  - users, roles, and inline policies' total sizes have no bound beyond M19's (the review's B1 and B2).
+- **§6 as built:** Terraform 1.9.8, its SHA-256 pinned for macOS arm64 and Linux x86-64; the AWS provider 5.80.0,
+  its signature checked by `terraform init`.

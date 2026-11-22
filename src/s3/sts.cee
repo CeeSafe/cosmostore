@@ -43,6 +43,9 @@ struct StsRole {
     /// An IAM API role's id (`AROA…`), which its sessions name (ADR-0106 §1.5): a role deleted and made again under
     /// its name has a new one, so the old role's sessions are refused. Empty for a roles file's.
     id: Vector<u8>;
+    /// Its path (ADR-0108 §3): `/` for a roles file's. AssumeRole's RoleArn must name it, and is decided on the ARN
+    /// with it (the M21 exit review's finding 2).
+    path: Vector<u8>;
 }
 
 /// The most role sets a server takes in its life: the first, and a reload for each of the others.
@@ -101,6 +104,7 @@ fn nextRoles(old: Slice<StsRole>, fresh: Slice<StsRole>) -> Result<Vector<StsRol
                     removed: false,
                     trust: copyBytes(fresh[j].trust.view())?,
                     id: copyBytes(fresh[j].id.view())?,
+                    path: copyBytes(fresh[j].path.view())?,
                 })?;
             }
             null => {
@@ -111,6 +115,7 @@ fn nextRoles(old: Slice<StsRole>, fresh: Slice<StsRole>) -> Result<Vector<StsRol
                     removed: true,
                     trust: copyBytes(old[i].trust.view())?,
                     id: copyBytes(old[i].id.view())?,
+                    path: copyBytes(old[i].path.view())?,
                 })?;
             }
         }
@@ -128,6 +133,7 @@ fn nextRoles(old: Slice<StsRole>, fresh: Slice<StsRole>) -> Result<Vector<StsRol
             removed: false,
             trust: copyBytes(fresh[j].trust.view())?,
             id: copyBytes(fresh[j].id.view())?,
+            path: copyBytes(fresh[j].path.view())?,
         })?;
     }
     return Ok(out);
@@ -330,6 +336,10 @@ fn parseRolesFile(text: Slice<u8>) -> Result<Vector<StsRole>, RolesFault> {
             Ok(n) => n,
             Err(_) => { return Err(RolesFault.OutOfMemory); }
         };
+        let root = match (copyBytes("/".bytes())) {
+            Ok(p) => p,
+            Err(_) => { return Err(RolesFault.OutOfMemory); }
+        };
         if (out.push(
             StsRole {
                 name: named,
@@ -338,6 +348,7 @@ fn parseRolesFile(text: Slice<u8>) -> Result<Vector<StsRole>, RolesFault> {
                 removed: false,
                 trust: Vector<u8>.create(),
                 id: Vector<u8>.create(),
+                path: root,
             },
         ).isErr()) {
             return Err(RolesFault.OutOfMemory);
@@ -571,18 +582,37 @@ async fn serveSts(
                 requestId,
             );
         }
-        // A role with a path (`role/path/name`) is named by its last part.
-        var name = arn[(marker ?? 0) + 6..];
+        // A role with a path (`role/path/name`) is named by its last part; the path given must be the role's (the M21
+        // exit review's finding 2: any path had been taken, and a policy on the ARN with its path did not match).
+        let pathAndName = arn[(marker ?? 0) + 5..];
+        var name = pathAndName[1..];
         var slash = name.length;
         for (i in 0..name.length) {
             if (name[i] == '/') { slash = i; }
         }
         if (slash < name.length) { name = name[slash + 1..]; }
-        // A user assumes a role its identity policy lets it (`sts:AssumeRole` on the role's ARN, ADR-0088 §4); the
-        // account's keys may assume any.
+        let givenPath = pathAndName[0..pathAndName.length - name.length];
+        let found = roleAt(app, name);
+        let rolesSet = app.roles.get();
+        let roleList = rolesSet.view();
+        let pathMatches = match (found) {
+            Some(r) => roleList[r].path.view() == givenPath,
+            null => true,
+        };
+        if (!pathMatches) {
+            return await stsError(
+                exchange,
+                403,
+                "AccessDenied",
+                "No such role, or not authorized to assume it.",
+                requestId,
+            );
+        }
+        // A user assumes a role its identity policy lets it (`sts:AssumeRole` on the role's ARN, path and all,
+        // ADR-0088 §4); the account's keys may assume any.
         let assumer = requesterOf(Some(parent), null);
-        var roleResource = copyBytes("iam:role/".bytes())?;
-        roleResource.extend(name)?;
+        var roleResource = copyBytes("iam:role".bytes())?;
+        roleResource.extend(pathAndName)?;
         if (!sessionAllows(app, req, borrow assumer, "sts:AssumeRole", roleResource.view())?) {
             return await stsError(exchange, 403, "AccessDenied", "Not authorized to assume this role.", requestId);
         }
@@ -603,7 +633,11 @@ async fn serveSts(
         let trust = rolesNow[role].trust.view();
         if (trust.length > 0) {
             let callerUser = match (userOfRequester(credentials, borrow assumer)) {
-                Some(c) => Some(copyBytes(c.user.view())?),
+                Some(c) => {
+                    var named = copyBytes(if (c.path.length > 0) c.path.view() else "/".bytes())?;
+                    named.extend(c.user.view())?;
+                    Some(named)
+                },
                 null => null,
             };
             if (!trustAllows(trust, callerUser.asBorrow())?) {
@@ -754,23 +788,14 @@ async fn serveCallerIdentity(
         let list = credentials.view();
         let user = copyBytes(list[parent].user.view())?;
         let userKey = copyBytes(list[parent].userKey.view())?;
-        let fromIam = list[parent].fromIam;
+        let userPath = copyBytes(list[parent].path.view())?;
         if (user.length == 0) {
             arn.extend("arn:aws:iam::000000000000:root".bytes())?;
             userId.extend("000000000000".bytes())?;
         } else {
-            var path = copyBytes("/".bytes())?;
-            if (fromIam) {
-                match (await readIamSnapshot(borrow app.store)) {
-                    Some(snapshot) => {
-                        match (userAt(borrow snapshot.state, user.view())) {
-                            Some(u) => { path = copyBytes(snapshot.state.users[u].path.view())?; }
-                            null => {}
-                        }
-                    }
-                    null => {}
-                }
-            }
+            // Its path, as the set has it: on a cluster STS's shard may not hold the IAM record (the M21 exit
+            // review's finding 7).
+            let path = if (userPath.length > 0) copyBytes(userPath.view())? else copyBytes("/".bytes())?;
             arn.extend("arn:aws:iam::000000000000:user".bytes())?;
             arn.extend(path.view())?;
             arn.extend(user.view())?;

@@ -4934,3 +4934,37 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **boto3 and JS** also check the user writing by the attached policy and listing by the group's;
   - **Go** is Terraform's: the AWS provider is the Go SDK v2.
 - **Next:** slice 6, the exit review.
+
+### 22 Nov 2026: M21 slice 6, the exit review (ADR-0108)
+
+- **The exit review** (`docs/m21-exit-review.md`): one High, one Medium-High, two Mediums, one Low-Medium and five
+  Lows.
+  - **High:** one user's joined policy past a policy's size froze the credential set for every user, unsaid.
+    - **Now:** a change that would do it is refused, LimitExceeded; a user whose policies do not join is allowed
+      nothing, and the rest are taken.
+  - **Medium-High:** AssumeRole ignored the role's path. It now requires it and is decided on the ARN with it.
+  - **Mediums:**
+    - CreateUser and CreateRole were decided without their Path;
+    - a role whose policies did not join left the role set unsaid.
+  - **Low-Medium:** trust policies could not name a user with a path. The credential set carries users' paths now,
+    which also gives GetCallerIdentity a user's path on a cluster.
+  - **Lows:**
+    - the encoded record is wiped after it is written;
+    - AWS's policies can be named in a policy;
+    - `v01` is refused;
+    - ListUsers and ListRoles take `PathPrefix`;
+    - 300 groups and 1,500 managed policies at most.
+  - **Recorded, not fixed (B1 to B5):**
+    - B1: bucket policies naming users with paths (refused, so failing closed);
+    - B2: the other bounds of the record;
+    - B3: tag keys' case and characters;
+    - B4: the whole record decoded per call;
+    - B5: a failed users file's report.
+- **Tests, all passing:**
+  - 440 unit tests;
+  - the S3 smoke, with the fixes' checks;
+  - the cluster smoke (206);
+  - the SDK matrix;
+  - the Terraform check (19).
+- **ADR-0108** has its As built section.
+- **Next:** the owner's decisions: ADR-0108's acceptance as amended, and closing M21.

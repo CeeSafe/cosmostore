@@ -230,6 +230,9 @@ fn applyIamCall(
     var state = snapshot.state;
     var made: IamKey? = null;
     var madeRole: IamRole? = null;
+    // Whose joined policies are not a policy before the change: a change that adds one is refused (the M21 exit review's
+    // finding 1), and one that leaves those as they were is not.
+    let unjoinable = unjoinableEntities(borrow state)?;
     var madePolicy: IamManagedPolicy? = null;
     var madeGroup: IamGroup? = null;
     var about: usize? = null;
@@ -422,7 +425,11 @@ fn applyIamCall(
             }
         }
     }
-    let bytes = encodeIamState(borrow state)?;
+    let unjoinableAfter = unjoinableEntities(borrow state)?;
+    for (i in 0..unjoinableAfter.length) {
+        if (!namedExactly(unjoinable.view(), unjoinableAfter[i].view())) { return Ok(IamOutcome.LimitExceeded); }
+    }
+    var bytes = encodeIamState(borrow state)?;
     // On `serve` the bucket is made here; on a cluster its shard's leader makes it (ADR-0104 §3), as a bucket made in
     // this request would not be seen by its write: until then, try again.
     if (!store.bucketExists(IAM_BUCKET)?) {
@@ -432,7 +439,9 @@ fn applyIamCall(
     let condition = if (snapshot.generation == 0) PutCondition.IfAbsent else PutCondition.IfGeneration(
         snapshot.generation,
     );
-    match (store.putObject(IAM_BUCKET, IAM_STATE_KEY, "application/json", bytes.view(), condition)) {
+    let put = store.putObject(IAM_BUCKET, IAM_STATE_KEY, "application/json", bytes.view(), condition);
+    Secret.wipe(mut bytes[..]); // the record holds every key's secret (the M21 exit review's finding 8)
+    match (put) {
         Ok(_) => {}
         Err(StoreError.PreconditionFailed) => { return Ok(IamOutcome.Conflict); }
         Err(e) => { return Err(e); }
@@ -647,7 +656,15 @@ async fn serveIam(
             match (found) {
                 Some(n) => { resource.extend(n.view())?; }
                 null => {
-                    resource.push('/')?;
+                    // One not there yet: CreateUser's and CreateRole's at the Path given (the M21 exit review's
+                    // finding 3: a Deny on `user/admin/*` had not stopped making `user/admin/boss`).
+                    let given = formText(body.view(), "Path")?;
+                    let making = action.view() == "CreateUser".bytes() || action.view() == "CreateRole".bytes();
+                    if (making && given.length > 0) {
+                        resource.extend(given.view())?;
+                    } else {
+                        resource.push('/')?;
+                    }
                     resource.extend(aboutName)?;
                 }
             }
@@ -874,13 +891,18 @@ async fn iamRead(
         return await iamAnswer(exchange, action, result.view(), requestId);
     }
     if (action == "ListUsers".bytes()) {
+        // PathPrefix, as on AWS (the M21 exit review's finding 10): the files' users are at `/`.
+        let prefix = formText(body, "PathPrefix")?;
+        let filesShown = prefix.length == 0 || prefix.view() == "/".bytes();
         result.extend("<IsTruncated>false</IsTruncated><Users>".bytes())?;
         for (i in 0..files.length) {
+            if (!filesShown) { continue; }
             result.extend("<member>".bytes())?;
             appendUser(mut result, nameOfUserKey(files[i].view()), idOfUserKey(files[i].view()), 0)?;
             result.extend("</member>".bytes())?;
         }
         for (i in 0..state.users.length) {
+            if (prefix.length > 0 && !startsWithBytes(state.users[i].path.view(), prefix.view())) { continue; }
             result.extend("<member>".bytes())?;
             appendUserAt(
                 mut result,
@@ -1053,7 +1075,10 @@ async fn serveIamRole(
         result.extend("<IsTruncated>false</IsTruncated><Roles>".bytes())?;
         // The roles file's too (ADR-0106 §5), as ListUsers lists the users file's users.
         let roles = app.roles.get().view();
+        let prefix = formText(body, "PathPrefix")?;
+        let filesShown = prefix.length == 0 || prefix.view() == "/".bytes();
         for (i in 0..roles.length) {
+            if (!filesShown) { continue; }
             if (roles[i].removed || roles[i].id.length > 0 || roleAtIam(
                 borrow snapshot.state,
                 roles[i].name.view(),
@@ -1065,6 +1090,8 @@ async fn serveIamRole(
             result.extend("</member>".bytes())?;
         }
         for (i in 0..snapshot.state.roles.length) {
+            let path = snapshot.state.roles[i].path.view();
+            if (prefix.length > 0 && !startsWithBytes(path, prefix.view())) { continue; }
             result.extend("<member>".bytes())?;
             appendRole(mut result, borrow snapshot.state.roles[i])?;
             result.extend("</member>".bytes())?;

@@ -26,6 +26,7 @@ check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1: expected [$3], got 
 pause() { perl -e "select(undef, undef, undef, $1)"; }
 
 cleanup() {
+    exec 2> /dev/null # the shell's word on each node it stops
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     for i in $(seq 1 50); do
         alive=""
