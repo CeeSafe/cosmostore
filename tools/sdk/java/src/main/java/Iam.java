@@ -91,6 +91,31 @@ class Iam {
                 .build();
             Check.check("iam its session reads", reads(session), "read me");
         }
+        // M21 (ADR-0108 §3): a managed policy versioned and attached, a group, tags, UpdateRole, and GetCallerIdentity
+        // as the user; then all of it undone.
+        String writes = "{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:PutObject\",\"Resource\":\"arn:aws:s3:::" + B + "/m21\"}}";
+        String arn = iam.createPolicy(r -> r.policyName("java-writes").path("/java/").policyDocument(writes)).policy().arn();
+        Check.check("iam CreatePolicy", arn, "arn:aws:iam::000000000000:policy/java/java-writes");
+        Check.check("iam CreatePolicyVersion", iam.createPolicyVersion(r -> r.policyArn(arn).policyDocument(writes).setAsDefault(true)).policyVersion().versionId(), "v2");
+        iam.attachUserPolicy(r -> r.userName("java-dev").policyArn(arn));
+        Check.check("iam attached", iam.listAttachedUserPolicies(r -> r.userName("java-dev")).attachedPolicies().get(0).policyName(), "java-writes");
+        Check.check("iam CreateGroup", iam.createGroup(r -> r.groupName("java-group")).group().groupId().substring(0, 4), "AGPA");
+        iam.addUserToGroup(r -> r.groupName("java-group").userName("java-dev"));
+        Check.check("iam GetGroup", iam.getGroup(r -> r.groupName("java-group")).users().get(0).userName(), "java-dev");
+        iam.tagUser(r -> r.userName("java-dev").tags(t -> t.key("team").value("java")));
+        Check.check("iam ListUserTags", iam.listUserTags(r -> r.userName("java-dev")).tags().get(0).value(), "java");
+        StsClient devSts = StsClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+            .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(made.accessKeyId(), made.secretAccessKey())))
+            .build();
+        Check.check("iam GetCallerIdentity as the user", devSts.getCallerIdentity().arn(), "arn:aws:iam::000000000000:user/java-dev");
+        iam.updateRole(r -> r.roleName("java-role").maxSessionDuration(7200));
+        Check.check("iam UpdateRole", iam.getRole(r -> r.roleName("java-role")).role().maxSessionDuration(), 7200);
+        iam.detachUserPolicy(r -> r.userName("java-dev").policyArn(arn));
+        iam.deletePolicyVersion(r -> r.policyArn(arn).versionId("v1"));
+        iam.deletePolicy(r -> r.policyArn(arn));
+        iam.removeUserFromGroup(r -> r.groupName("java-group").userName("java-dev"));
+        iam.deleteGroup(r -> r.groupName("java-group"));
+        Check.check("iam the group gone", codeOf(() -> iam.getGroup(r -> r.groupName("java-group"))), "NoSuchEntity");
         Check.check("iam a user with keys not deleted", codeOf(() -> iam.deleteUser(r -> r.userName("java-dev"))), "DeleteConflict");
         iam.deleteAccessKey(r -> r.userName("java-dev").accessKeyId(made.accessKeyId()));
         iam.deleteUserPolicy(r -> r.userName("java-dev").policyName("reads"));

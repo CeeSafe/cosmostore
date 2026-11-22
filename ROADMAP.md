@@ -4910,3 +4910,27 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     - UpdateRole's answer had no result element, so the CLI failed after the change was made.
   - **Two faults of the checks:** a user id cut too long, and a session name shorter than the CLI takes.
 - **Next:** slice 5, `tools/terraform_check.sh`.
+
+### 22 Nov 2026: M21 slice 5, the Terraform check, and the SDKs' checks of the new calls (ADR-0108 §6)
+
+- **`tools/terraform_check.sh <binary> [port base]`, M21's bar:**
+  - **Terraform 1.9.8** is downloaded into `TERRAFORM_DIR` and checked against HashiCorp's SHA-256, pinned for macOS
+    arm64 and Linux x86-64. The AWS provider is pinned to 5.80.0, and `terraform init` checks its signature.
+  - **`tools/terraform/main.tf`** has:
+    - `aws_iam_user` (path, tags), `aws_iam_access_key`, `aws_iam_user_policy`;
+    - two `aws_iam_group`s, `aws_iam_group_membership`, `aws_iam_user_group_membership`, `aws_iam_group_policy`;
+    - `aws_iam_policy` (path, description, tags), `aws_iam_user_policy_attachment`;
+    - `aws_iam_group_policy_attachment` of AWS's `AmazonS3ReadOnlyAccess`;
+    - `aws_iam_role` (path, description, 7,200 s, tags), `aws_iam_role_policy`, `aws_iam_role_policy_attachment`.
+  - **The steps,** on `serve` and then through one node of a three-node cluster:
+    1. apply;
+    2. a plan with no change (`-detailed-exitcode` 0);
+    3. the key writing and listing as its policies allow, and refused CreateBucket;
+    4. destroy, after which no user, group, role or policy is left.
+  - **19 checks, all passed on the first run.**
+- **The SDKs' checks:**
+  - **boto3, JS, Java and .NET:** a managed policy versioned and attached, a group with a member, tags, UpdateRole, and
+    GetCallerIdentity as the user;
+  - **boto3 and JS** also check the user writing by the attached policy and listing by the group's;
+  - **Go** is Terraform's: the AWS provider is the Go SDK v2.
+- **Next:** slice 6, the exit review.

@@ -544,6 +544,30 @@ foreach (var sessions in new[] { false })
     }, 25);
     Check("iam the role assumed", iamAssumed?.AccessKeyId?.StartsWith("ASIA") ?? false, true);
     if (iamAssumed != null) { Check("iam its session reads", await Read(As(iamAssumed), m7, "logged.txt"), "logged"); }
+    // M21 (ADR-0108 §3): a managed policy versioned and attached, a group, tags, UpdateRole, and GetCallerIdentity as
+    // the user; then all of it undone.
+    var iamWrites = "{\"Version\":\"2012-10-17\",\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:PutObject\",\"Resource\":\"arn:aws:s3:::" + m7 + "/m21\"}}";
+    var polArn = (await im.CreatePolicyAsync(new Amazon.IdentityManagement.Model.CreatePolicyRequest { PolicyName = "dotnet-writes", Path = "/dotnet/", PolicyDocument = iamWrites })).Policy.Arn;
+    Check("iam CreatePolicy", polArn, "arn:aws:iam::000000000000:policy/dotnet/dotnet-writes");
+    Check("iam CreatePolicyVersion", (await im.CreatePolicyVersionAsync(new Amazon.IdentityManagement.Model.CreatePolicyVersionRequest { PolicyArn = polArn, PolicyDocument = iamWrites, SetAsDefault = true })).PolicyVersion.VersionId, "v2");
+    await im.AttachUserPolicyAsync(new Amazon.IdentityManagement.Model.AttachUserPolicyRequest { UserName = "dotnet-dev", PolicyArn = polArn });
+    Check("iam attached", (await im.ListAttachedUserPoliciesAsync(new Amazon.IdentityManagement.Model.ListAttachedUserPoliciesRequest { UserName = "dotnet-dev" })).AttachedPolicies[0].PolicyName, "dotnet-writes");
+    Check("iam CreateGroup", (await im.CreateGroupAsync(new Amazon.IdentityManagement.Model.CreateGroupRequest { GroupName = "dotnet-group" })).Group.GroupId[..4], "AGPA");
+    await im.AddUserToGroupAsync(new Amazon.IdentityManagement.Model.AddUserToGroupRequest { GroupName = "dotnet-group", UserName = "dotnet-dev" });
+    Check("iam GetGroup", (await im.GetGroupAsync(new Amazon.IdentityManagement.Model.GetGroupRequest { GroupName = "dotnet-group" })).Users[0].UserName, "dotnet-dev");
+    await im.TagUserAsync(new Amazon.IdentityManagement.Model.TagUserRequest { UserName = "dotnet-dev", Tags = new List<Amazon.IdentityManagement.Model.Tag> { new() { Key = "team", Value = "dotnet" } } });
+    Check("iam ListUserTags", (await im.ListUserTagsAsync(new Amazon.IdentityManagement.Model.ListUserTagsRequest { UserName = "dotnet-dev" })).Tags[0].Value, "dotnet");
+    var devSts = new Amazon.SecurityToken.AmazonSecurityTokenServiceClient(new Amazon.Runtime.BasicAWSCredentials(iamKey.AccessKeyId, iamKey.SecretAccessKey),
+        new Amazon.SecurityToken.AmazonSecurityTokenServiceConfig { ServiceURL = endpoint, AuthenticationRegion = "us-east-1" });
+    Check("iam GetCallerIdentity as the user", (await devSts.GetCallerIdentityAsync(new Amazon.SecurityToken.Model.GetCallerIdentityRequest())).Arn, "arn:aws:iam::000000000000:user/dotnet-dev");
+    await im.UpdateRoleAsync(new Amazon.IdentityManagement.Model.UpdateRoleRequest { RoleName = "dotnet-role", MaxSessionDuration = 7200 });
+    Check("iam UpdateRole", (await im.GetRoleAsync(new Amazon.IdentityManagement.Model.GetRoleRequest { RoleName = "dotnet-role" })).Role.MaxSessionDuration ?? 0, 7200);
+    await im.DetachUserPolicyAsync(new Amazon.IdentityManagement.Model.DetachUserPolicyRequest { UserName = "dotnet-dev", PolicyArn = polArn });
+    await im.DeletePolicyVersionAsync(new Amazon.IdentityManagement.Model.DeletePolicyVersionRequest { PolicyArn = polArn, VersionId = "v1" });
+    await im.DeletePolicyAsync(new Amazon.IdentityManagement.Model.DeletePolicyRequest { PolicyArn = polArn });
+    await im.RemoveUserFromGroupAsync(new Amazon.IdentityManagement.Model.RemoveUserFromGroupRequest { GroupName = "dotnet-group", UserName = "dotnet-dev" });
+    await im.DeleteGroupAsync(new Amazon.IdentityManagement.Model.DeleteGroupRequest { GroupName = "dotnet-group" });
+    Check("iam the group gone", await CodeOf(() => im.GetGroupAsync(new Amazon.IdentityManagement.Model.GetGroupRequest { GroupName = "dotnet-group" })), "NoSuchEntity");
     Check("iam a user with keys not deleted", await CodeOf(() => im.DeleteUserAsync(new Amazon.IdentityManagement.Model.DeleteUserRequest { UserName = "dotnet-dev" })), "DeleteConflict");
     await im.DeleteAccessKeyAsync(new Amazon.IdentityManagement.Model.DeleteAccessKeyRequest { UserName = "dotnet-dev", AccessKeyId = iamKey.AccessKeyId });
     await im.DeleteUserPolicyAsync(new Amazon.IdentityManagement.Model.DeleteUserPolicyRequest { UserName = "dotnet-dev", PolicyName = "reads" });

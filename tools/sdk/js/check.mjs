@@ -17,11 +17,15 @@ import {
   GetAccessPointScopeCommand, ListAccessPointsForDirectoryBucketsCommand,
   S3ControlClient, CreateAccessPointCommand, GetAccessPointCommand, ListAccessPointsCommand, DeleteAccessPointCommand,
 } from "@aws-sdk/client-s3-control";
-import { STSClient, GetSessionTokenCommand, AssumeRoleCommand } from "@aws-sdk/client-sts";
+import { STSClient, GetSessionTokenCommand, AssumeRoleCommand, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import {
   IAMClient, CreateUserCommand, GetUserCommand, DeleteUserCommand, CreateAccessKeyCommand, ListAccessKeysCommand,
   DeleteAccessKeyCommand, PutUserPolicyCommand, GetUserPolicyCommand, DeleteUserPolicyCommand, CreateRoleCommand,
   GetRoleCommand, DeleteRoleCommand, PutRolePolicyCommand, DeleteRolePolicyCommand,
+  CreatePolicyCommand, CreatePolicyVersionCommand, GetPolicyVersionCommand, DeletePolicyVersionCommand, DeletePolicyCommand,
+  AttachUserPolicyCommand, DetachUserPolicyCommand, ListAttachedUserPoliciesCommand, CreateGroupCommand, GetGroupCommand,
+  AddUserToGroupCommand, RemoveUserFromGroupCommand, PutGroupPolicyCommand, DeleteGroupPolicyCommand, DeleteGroupCommand,
+  TagUserCommand, ListUserTagsCommand, UpdateRoleCommand,
 } from "@aws-sdk/client-iam";
 import {
   S3TablesClient, CreateTableBucketCommand, ListTableBucketsCommand, CreateNamespaceCommand, CreateTableCommand,
@@ -394,6 +398,41 @@ for (const sessions of [true, false]) {
   }, 25);
   check("iam the role assumed", (creds?.AccessKeyId ?? "").slice(0, 4), "ASIA");
   if (creds) check("iam its session reads", await read(as(creds), M7, "logged.txt"), "logged");
+  // M21 (ADR-0108 §3): a managed policy versioned and attached, a group with a policy, tags, UpdateRole, and
+  // GetCallerIdentity as the user; then all of it undone.
+  const writes = JSON.stringify({ Version: "2012-10-17", Statement: { Effect: "Allow", Action: "s3:PutObject", Resource: `arn:aws:s3:::${M7}/js-m21` } });
+  const pol = (await iam.send(new CreatePolicyCommand({ PolicyName: "js-writes", Path: "/js/", PolicyDocument: writes }))).Policy;
+  check("iam CreatePolicy", pol.Arn, `arn:aws:iam::${ACCOUNT}:policy/js/js-writes`);
+  check("iam CreatePolicyVersion", (await iam.send(new CreatePolicyVersionCommand({ PolicyArn: pol.Arn, PolicyDocument: writes, SetAsDefault: true }))).PolicyVersion.VersionId, "v2");
+  const v2 = (await iam.send(new GetPolicyVersionCommand({ PolicyArn: pol.Arn, VersionId: "v2" }))).PolicyVersion;
+  check("iam GetPolicyVersion", [v2.IsDefaultVersion, JSON.parse(decodeURIComponent(v2.Document)).Statement.Action], [true, "s3:PutObject"]);
+  await iam.send(new AttachUserPolicyCommand({ UserName: "js-dev", PolicyArn: pol.Arn }));
+  check("iam attached", (await iam.send(new ListAttachedUserPoliciesCommand({ UserName: "js-dev" }))).AttachedPolicies.map((a) => a.PolicyName), ["js-writes"]);
+  check("iam CreateGroup", (await iam.send(new CreateGroupCommand({ GroupName: "js-group" }))).Group.GroupId.slice(0, 4), "AGPA");
+  await iam.send(new AddUserToGroupCommand({ GroupName: "js-group", UserName: "js-dev" }));
+  await iam.send(new PutGroupPolicyCommand({ GroupName: "js-group", PolicyName: "lists",
+    PolicyDocument: JSON.stringify({ Version: "2012-10-17", Statement: { Effect: "Allow", Action: "s3:ListBucket", Resource: `arn:aws:s3:::${M7}` } }) }));
+  check("iam GetGroup", (await iam.send(new GetGroupCommand({ GroupName: "js-group" }))).Users.map((u) => u.UserName), ["js-dev"]);
+  await iam.send(new TagUserCommand({ UserName: "js-dev", Tags: [{ Key: "team", Value: "js" }] }));
+  check("iam ListUserTags", (await iam.send(new ListUserTagsCommand({ UserName: "js-dev" }))).Tags, [{ Key: "team", Value: "js" }]);
+  const devSts = new STSClient({ endpoint, region: "us-east-1", credentials: { accessKeyId: made.AccessKeyId, secretAccessKey: made.SecretAccessKey } });
+  check("iam GetCallerIdentity as the user", (await devSts.send(new GetCallerIdentityCommand({}))).Arn, `arn:aws:iam::${ACCOUNT}:user/js-dev`);
+  check("iam writes by the attached policy", await until(async () => {
+    try { await dev.send(new PutObjectCommand({ Bucket: M7, Key: "js-m21", Body: "m21" })); return true; } catch (e) { return false; }
+  }, 25), true);
+  check("iam lists by the group's", await until(async () => {
+    try { await dev.send(new ListObjectsV2Command({ Bucket: M7, MaxKeys: 1 })); return true; } catch (e) { return false; }
+  }, 25), true);
+  await s3.send(new DeleteObjectCommand({ Bucket: M7, Key: "js-m21" }));
+  await iam.send(new UpdateRoleCommand({ RoleName: "js-role", MaxSessionDuration: 7200 }));
+  check("iam UpdateRole", (await iam.send(new GetRoleCommand({ RoleName: "js-role" }))).Role.MaxSessionDuration, 7200);
+  await iam.send(new DetachUserPolicyCommand({ UserName: "js-dev", PolicyArn: pol.Arn }));
+  await iam.send(new DeletePolicyVersionCommand({ PolicyArn: pol.Arn, VersionId: "v1" }));
+  await iam.send(new DeletePolicyCommand({ PolicyArn: pol.Arn }));
+  await iam.send(new RemoveUserFromGroupCommand({ GroupName: "js-group", UserName: "js-dev" }));
+  await iam.send(new DeleteGroupPolicyCommand({ GroupName: "js-group", PolicyName: "lists" }));
+  await iam.send(new DeleteGroupCommand({ GroupName: "js-group" }));
+  check("iam the group gone", await codeOf(iam.send(new GetGroupCommand({ GroupName: "js-group" }))), "NoSuchEntityException");
   check("iam a user with keys not deleted", await codeOf(iam.send(new DeleteUserCommand({ UserName: "js-dev" }))), "DeleteConflictException");
   await iam.send(new DeleteAccessKeyCommand({ UserName: "js-dev", AccessKeyId: made.AccessKeyId }));
   await iam.send(new DeleteUserPolicyCommand({ UserName: "js-dev", PolicyName: "reads" }));

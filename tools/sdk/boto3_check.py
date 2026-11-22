@@ -786,6 +786,57 @@ creds = until(assumed, 25)
 check("iam the role assumed", (creds or {}).get("AccessKeyId", "")[:4], "ASIA")
 if creds:
     check("iam its session reads", as_creds(creds).get_object(Bucket=M7, Key="logged.txt")["Body"].read(), b"logged")
+# M21 (ADR-0108 §3): a managed policy versioned and attached, a group with a path and a policy, tags, UpdateRole, and
+# GetCallerIdentity as the user; then all of it undone.
+writes = json.dumps({"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3:PutObject",
+                                                             "Resource": "arn:aws:s3:::%s/py-m21" % M7}})
+pol = iam.create_policy(PolicyName="py-writes", Path="/py/", PolicyDocument=writes, Tags=[{"Key": "a", "Value": "b"}])["Policy"]
+check("iam create_policy", (pol["Arn"], pol["DefaultVersionId"]), ("arn:aws:iam::000000000000:policy/py/py-writes", "v1"))
+iam.create_policy_version(PolicyArn=pol["Arn"], PolicyDocument=writes, SetAsDefault=True)
+check("iam its versions", [v["VersionId"] for v in iam.list_policy_versions(PolicyArn=pol["Arn"])["Versions"]], ["v1", "v2"])
+iam.attach_user_policy(UserName="py-dev", PolicyArn=pol["Arn"])
+check("iam attached", [a["PolicyName"] for a in iam.list_attached_user_policies(UserName="py-dev")["AttachedPolicies"]], ["py-writes"])
+check("iam the policy's tags", iam.list_policy_tags(PolicyArn=pol["Arn"])["Tags"], [{"Key": "a", "Value": "b"}])
+check("iam create_group", iam.create_group(GroupName="py-group", Path="/py/")["Group"]["Arn"], "arn:aws:iam::000000000000:group/py/py-group")
+iam.add_user_to_group(GroupName="py-group", UserName="py-dev")
+iam.put_group_policy(GroupName="py-group", PolicyName="lists", PolicyDocument=json.dumps({"Version": "2012-10-17",
+    "Statement": {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::%s" % M7}}))
+check("iam its members", [u["UserName"] for u in iam.get_group(GroupName="py-group")["Users"]], ["py-dev"])
+iam.tag_user(UserName="py-dev", Tags=[{"Key": "team", "Value": "py"}])
+check("iam the user's tags", iam.list_user_tags(UserName="py-dev")["Tags"], [{"Key": "team", "Value": "py"}])
+check("iam GetCallerIdentity as the user", boto3.client("sts", endpoint_url=endpoint, region_name="us-east-1",
+      aws_access_key_id=made["AccessKeyId"], aws_secret_access_key=made["SecretAccessKey"]).get_caller_identity()["Arn"],
+      "arn:aws:iam::000000000000:user/py-dev")
+
+
+def dev_writes():
+    try:
+        dev.put_object(Bucket=M7, Key="py-m21", Body=b"m21")
+        return True
+    except ClientError:
+        return False
+
+
+def dev_lists():
+    try:
+        dev.list_objects_v2(Bucket=M7, MaxKeys=1)
+        return True
+    except ClientError:
+        return False
+
+
+check("iam writes by the attached policy", until(dev_writes, 25), True)
+check("iam lists by the group's", until(dev_lists, 25), True)
+client().delete_object(Bucket=M7, Key="py-m21")
+iam.update_role(RoleName="py-role", Description="py", MaxSessionDuration=7200)
+check("iam update_role", iam.get_role(RoleName="py-role")["Role"]["MaxSessionDuration"], 7200)
+iam.detach_user_policy(UserName="py-dev", PolicyArn=pol["Arn"])
+iam.delete_policy_version(PolicyArn=pol["Arn"], VersionId="v1")
+iam.delete_policy(PolicyArn=pol["Arn"])
+iam.remove_user_from_group(GroupName="py-group", UserName="py-dev")
+iam.delete_group_policy(GroupName="py-group", PolicyName="lists")
+iam.delete_group(GroupName="py-group")
+check("iam the group gone", code_of(lambda: iam.get_group(GroupName="py-group")), "NoSuchEntity")
 check("iam a user with keys not deleted", code_of(lambda: iam.delete_user(UserName="py-dev")), "DeleteConflict")
 iam.delete_access_key(UserName="py-dev", AccessKeyId=made["AccessKeyId"])
 iam.delete_user_policy(UserName="py-dev", PolicyName="reads")
