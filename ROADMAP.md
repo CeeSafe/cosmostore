@@ -5119,3 +5119,23 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **CeeSafe's snappy (ADR 0196 phase 2)** is being built in a CeeSafe worktree. Its release waits for the owner's
   word.
 - **Next:** the page reader, beginning with what needs no codec (uncompressed and gzip pages).
+
+### 23 Nov 2026: M23 slice 3 begun, Parquet's page reader (ADR-0112 §1)
+
+- **`src/s3/parquet_pages.cee`** reads:
+  - **The schema:** a file's leaf columns, with their greatest definition and repetition levels.
+  - **The pages:** a column chunk's dictionary page and data pages, v1 and v2.
+  - **The values:** PLAIN, PLAIN_DICTIONARY and RLE_DICTIONARY, the RLE/bit-packed hybrid, DELTA_BINARY_PACKED,
+    DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT, for every physical type but INT96.
+  - **The codecs:** none and gzip. SNAPPY and ZSTD are refused until CeeSafe's codecs, which are being built.
+- **The corpus:** `tools/parquet_page_fixtures.py` writes `parquet_page_fixtures.cee`, seven pyarrow files (21.6 KB).
+  - **Flat columns of every type with nulls:** v1 and v2, dictionary and PLAIN, gzip, and the DELTA and
+    BYTE_STREAM_SPLIT encodings.
+  - **Nested:** a struct, a list and a map, v1 dictionary and v2 gzip.
+  - **What a reader must find:** each column's levels and values, from a Dremel shredding of the rows, not from
+    pyarrow's reading.
+- **Tests:**
+  - all 7 fixtures read exactly;
+  - thousands of files with a byte changed, or cut short, read or are refused, never a panic;
+  - 455 unit tests in all.
+- **Next:** the writer (slice 4), and snappy and zstd once CeeSafe releases them.

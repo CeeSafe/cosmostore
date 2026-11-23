@@ -1,0 +1,168 @@
+// Parquet's page reader (ADR-0112 slice 3): each fixture pyarrow wrote read column by column, its levels and values
+// those tools/parquet_page_fixtures.py shredded from the rows that made it.
+
+/// A column read, as the fixtures' expected lines are written.
+fn renderedColumn(leaf: borrow PageLeaf, v: borrow ColumnValues) -> String {
+    var line = String.create();
+    line.append(StringView.fromUtf8(leaf.path.view()) ?? "?")!;
+    line.append("|")!;
+    line.appendNumber(leaf.maxDef as i64)!;
+    line.append("|")!;
+    line.appendNumber(leaf.maxRep as i64)!;
+    line.append("|")!;
+    for (r in v.reps.view()) { line.appendNumber(r as i64)!; }
+    line.append("|")!;
+    for (d in v.defs.view()) { line.appendNumber(d as i64)!; }
+    line.append("|")!;
+    for (i in 0..v.count) {
+        if (i > 0) { line.append(",")!; }
+        let bytes = valueAt(v, leaf, i);
+        if (leaf.physical == PQ_INT32) {
+            line.appendNumber(truncate<i32>(bytes.readLE<u32>(0)) as i64)!;
+        } else if (leaf.physical == PQ_INT64) {
+            line.appendNumber(truncate<i64>(bytes.readLE<u64>(0)))!;
+        } else if (leaf.physical == PQ_BOOLEAN) {
+            line.appendNumber(bytes[0] as i64)!;
+        } else {
+            var hex = Vector<u8>.create();
+            appendHexBytes(mut hex, bytes)!;
+            line.append(StringView.fromUtf8(hex.view()) ?? "?")!;
+        }
+    }
+    return line;
+}
+
+/// Every column of a fixture's first row group read, and as its expected lines say.
+fn checkFixture(name: StringView, chunks: Slice<StringView>, expected: Slice<StringView>) -> Result<void, TestFailure> {
+    let bytes = fixtureBytes(chunks);
+    let n = parquetFooterLength(bytes.view()[bytes.length - 8..], bytes.length as u64) ?? {
+        return Err(TestFailure.create("a footer"));
+    };
+    let start = bytes.length - 8 - n as usize;
+    let footer = parseParquetFooter(bytes.view()[start..bytes.length - 8], bytes.length as u64)!!;
+    let leaves = schemaLeaves(borrow footer.meta)! ?? { return Err(TestFailure.create("a schema read")); };
+    Check.equalU64(expected.length as u64, leaves.length as u64)?;
+    let groups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? {
+        return Err(TestFailure.create("row groups"));
+    };
+    let group = match (borrow groups[0]) {
+        ThriftValue.Struct(f) => f,
+        _ => { return Err(TestFailure.create("a row group")); }
+    };
+    let columns = structItems(group, PQ_GROUP_COLUMNS) ?? { return Err(TestFailure.create("columns")); };
+    for (c in 0..columns.length) {
+        let chunk = match (borrow columns[c]) {
+            ThriftValue.Struct(f) => f,
+            _ => { return Err(TestFailure.create("a column chunk")); }
+        };
+        let values = match (readColumnChunk(bytes.view(), chunk, borrow leaves[c])!) {
+            Some(v) => v,
+            null => {
+                var why = textOf(name);
+                why.append(": a column chunk not read: ")!;
+                why.append(StringView.fromUtf8(leaves[c].path.view()) ?? "?")!;
+                return Err(TestFailure.create(why.view()));
+            }
+        };
+        let got = renderedColumn(borrow leaves[c], borrow values);
+        Check.equalText(expected[c], got.view())?;
+    }
+    return Ok();
+}
+
+@test
+fn pagesFlatV1Dictionary() -> Result<void, TestFailure> =>
+    checkFixture("FLAT_V1_DICT", PAGES_FLAT_V1_DICT[..], PAGES_FLAT_V1_DICT_EXPECTED[..]);
+
+@test
+fn pagesFlatV2DictionaryGzip() -> Result<void, TestFailure> =>
+    checkFixture("FLAT_V2_DICT_GZIP", PAGES_FLAT_V2_DICT_GZIP[..], PAGES_FLAT_V2_DICT_GZIP_EXPECTED[..]);
+
+@test
+fn pagesFlatV1Plain() -> Result<void, TestFailure> =>
+    checkFixture("FLAT_V1_PLAIN", PAGES_FLAT_V1_PLAIN[..], PAGES_FLAT_V1_PLAIN_EXPECTED[..]);
+
+@test
+fn pagesFlatV2Delta() -> Result<void, TestFailure> =>
+    checkFixture("FLAT_V2_DELTA", PAGES_FLAT_V2_DELTA[..], PAGES_FLAT_V2_DELTA_EXPECTED[..]);
+
+@test
+fn pagesFlatV1DeltaBytes() -> Result<void, TestFailure> =>
+    checkFixture("FLAT_V1_DELTA_BYTES", PAGES_FLAT_V1_DELTA_BYTES[..], PAGES_FLAT_V1_DELTA_BYTES_EXPECTED[..]);
+
+@test
+fn pagesNestedV1() -> Result<void, TestFailure> =>
+    checkFixture("NESTED_V1", PAGES_NESTED_V1[..], PAGES_NESTED_V1_EXPECTED[..]);
+
+@test
+fn pagesNestedV2Gzip() -> Result<void, TestFailure> =>
+    checkFixture("NESTED_V2_GZIP", PAGES_NESTED_V2_GZIP[..], PAGES_NESTED_V2_GZIP_EXPECTED[..]);
+
+/// Every column of a file read, whatever its bytes: a value or a refusal, never a panic. How many were read.
+fn readAllColumns(bytes: Slice<u8>) -> usize {
+    if (bytes.length < 12) { return 0; }
+    let n = parquetFooterLength(bytes[bytes.length - 8..], bytes.length as u64) ?? { return 0; };
+    let start = bytes.length - 8 - n as usize;
+    let footer = match (parseParquetFooter(bytes[start..bytes.length - 8], bytes.length as u64)) {
+        Ok(Some(f)) => f,
+        _ => { return 0; }
+    };
+    let leaves = match (schemaLeaves(borrow footer.meta)) {
+        Ok(Some(l)) => l,
+        _ => { return 0; }
+    };
+    let groups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? { return 0; };
+    var read: usize = 0;
+    for (g in 0..groups.length) {
+        let group = match (borrow groups[g]) {
+            ThriftValue.Struct(f) => f,
+            _ => { continue; }
+        };
+        let columns = structItems(group, PQ_GROUP_COLUMNS) ?? { continue; };
+        for (c in 0..columns.length) {
+            if (c >= leaves.length) { break; }
+            let chunk = match (borrow columns[c]) {
+                ThriftValue.Struct(f) => f,
+                _ => { continue; }
+            };
+            match (readColumnChunk(bytes, chunk, borrow leaves[c])) {
+                Ok(Some(_)) => { read += 1; }
+                _ => {}
+            }
+        }
+    }
+    return read;
+}
+
+/// Hostile bytes are refused, not trusted (ADR-0112 §5): each fixture with a byte changed at each of many places, or
+/// cut short, reads or is refused, and never panics.
+@test
+fn pagesRefuseWhatDoesNotAddUp() -> Result<void, TestFailure> {
+    var tried: u64 = 0;
+    for (fixture in [
+        PAGES_FLAT_V1_DICT[..],
+        PAGES_FLAT_V2_DICT_GZIP[..],
+        PAGES_FLAT_V2_DELTA[..],
+        PAGES_NESTED_V1[..],
+    ]) {
+        let good = fixtureBytes(fixture);
+        let whole = readAllColumns(good.view());
+        Check.isTrue(whole > 0, "the fixture reads")?;
+        var x: u32 = 2463534242;
+        // The data's bytes (the footer's are the footer reader's): each changed by a pseudo-random amount.
+        for (at in 4..good.length - 8) {
+            x = x ^ (x << 13);
+            x = x ^ (x >> 17);
+            x = x ^ (x << 5);
+            var bad = copyBytes(good.view())!;
+            bad[at] = bad[at] ^ truncate<u8>(x | 1);
+            let _ = readAllColumns(bad.view());
+            tried += 1;
+        }
+        for (cut in [good.length / 2, good.length - 9, good.length - 1]) {
+            let _ = readAllColumns(good.view()[0..cut]);
+        }
+    }
+    Check.isTrue(tried > 5000, "thousands of changed files")?;
+    return Ok();
+}

@@ -1,0 +1,670 @@
+// Parquet's pages read (ADR-0112 §1, slice 3): a file's schema as its leaf columns with their levels; a column chunk's
+// dictionary and data pages (v1 and v2), each decompressed, into its repetition and definition levels and its values.
+// Encodings: PLAIN, PLAIN_DICTIONARY and RLE_DICTIONARY, the RLE/bit-packed hybrid, DELTA_BINARY_PACKED,
+// DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT. A page, codec, encoding or type not one of these,
+// or bytes that do not add up, is refused (null): not knowing is not compacting (ADR-0098).
+
+// Parquet's physical types.
+const PQ_BOOLEAN: i64 = 0;
+const PQ_INT32: i64 = 1;
+const PQ_INT64: i64 = 2;
+const PQ_INT96: i64 = 3;
+const PQ_FLOAT: i64 = 4;
+const PQ_DOUBLE: i64 = 5;
+const PQ_BYTE_ARRAY: i64 = 6;
+const PQ_FIXED: i64 = 7;
+
+// Encodings.
+const PQ_ENC_PLAIN: i64 = 0;
+const PQ_ENC_PLAIN_DICTIONARY: i64 = 2;
+const PQ_ENC_RLE: i64 = 3;
+const PQ_ENC_DELTA_BINARY_PACKED: i64 = 5;
+const PQ_ENC_DELTA_LENGTH_BYTE_ARRAY: i64 = 6;
+const PQ_ENC_DELTA_BYTE_ARRAY: i64 = 7;
+const PQ_ENC_RLE_DICTIONARY: i64 = 8;
+const PQ_ENC_BYTE_STREAM_SPLIT: i64 = 9;
+
+// Codecs.
+const PQ_CODEC_UNCOMPRESSED: i64 = 0;
+const PQ_CODEC_GZIP: i64 = 2;
+
+// Page types.
+const PQ_PAGE_DATA: i64 = 0;
+const PQ_PAGE_INDEX: i64 = 1;
+const PQ_PAGE_DICTIONARY: i64 = 2;
+const PQ_PAGE_DATA_V2: i64 = 3;
+
+// A column chunk's metadata fields (ColumnMetaData).
+const PQ_META_TYPE: i16 = 1;
+const PQ_META_CODEC: i16 = 4;
+const PQ_META_NUM_VALUES: i16 = 5;
+const PQ_META_DATA_OFFSET: i16 = 9;
+const PQ_META_DICT_OFFSET: i16 = 11;
+const PQ_META_TOTAL_COMPRESSED: i16 = 7;
+
+/// A page's decompressed bytes are 64 MB at most, a chunk's values 1 GB: past them a file is refused, not read.
+const PQ_MAX_PAGE: usize = 67108864;
+const PQ_MAX_CHUNK: usize = 1073741824;
+/// Levels are a byte each: a schema deeper than this is refused.
+const PQ_MAX_LEVEL: u32 = 64;
+
+/// A leaf column of a file's schema: its path (names joined by `.`, the root's left out), its physical type and
+/// length, and its greatest definition and repetition levels.
+struct PageLeaf {
+    path: Vector<u8>;
+    physical: i64;
+    typeLength: usize;
+    maxDef: u32;
+    maxRep: u32;
+}
+
+/// A column's levels and values: a byte a level; its non-null values one after another, each its type's width (a
+/// BOOLEAN one byte, 0 or 1), or, for BYTE_ARRAY, its bytes with its end in `ends`.
+struct ColumnValues {
+    reps: Vector<u8>;
+    defs: Vector<u8>;
+    data: Vector<u8>;
+    ends: Vector<u32>;
+    count: usize;
+}
+
+fn emptyValues() -> ColumnValues => ColumnValues {
+    reps: Vector<u8>.create(),
+    defs: Vector<u8>.create(),
+    data: Vector<u8>.create(),
+    ends: Vector<u32>.create(),
+    count: 0,
+};
+
+/// The width of a value of `leaf`'s type; 0 for BYTE_ARRAY (its own length), null for INT96 or a type not known.
+fn valueWidth(leaf: borrow PageLeaf) -> usize? {
+    if (leaf.physical == PQ_BOOLEAN) { return Some(1); }
+    if (leaf.physical == PQ_INT32 || leaf.physical == PQ_FLOAT) { return Some(4); }
+    if (leaf.physical == PQ_INT64 || leaf.physical == PQ_DOUBLE) { return Some(8); }
+    if (leaf.physical == PQ_BYTE_ARRAY) { return Some(0); }
+    if (leaf.physical == PQ_FIXED && leaf.typeLength > 0) { return Some(leaf.typeLength); }
+    return null;
+}
+
+/// Value `i`'s bytes.
+fn valueAt<region a>(v: borrow(a) ColumnValues, leaf: borrow PageLeaf, i: usize) -> Slice<a, u8> {
+    let w = valueWidth(leaf) ?? 0;
+    if (w > 0) { return v.data.view()[i * w..(i + 1) * w]; }
+    let start: usize = if (i == 0) 0 else v.ends[i - 1] as usize;
+    return v.data.view()[start..v.ends[i] as usize];
+}
+
+fn pushValue(v: borrow mut ColumnValues, leaf: borrow PageLeaf, bytes: Slice<u8>) -> Result<bool, AllocError> {
+    if (v.data.length + bytes.length > PQ_MAX_CHUNK) { return Ok(false); }
+    v.data.extend(bytes)?;
+    if (leaf.physical == PQ_BYTE_ARRAY) {
+        v.ends.push(checkedTruncate<u32>(v.data.length) ?? { return Ok(false); })?;
+    }
+    v.count += 1;
+    return Ok(true);
+}
+
+// ---- The schema ----
+
+fn schemaText(fields: borrow Vector<ThriftField>, id: i16) -> Slice<u8>? => match (thriftField(fields, id)) {
+    Some(v) => match (v) {
+        ThriftValue.Binary(b) => Some(b.view()),
+        _ => null,
+    },
+    null => null,
+};
+
+/// A file's leaf columns, in the schema's order; null when the schema is not one read here.
+fn schemaLeaves(meta: borrow Vector<ThriftField>) -> Result<Vector<PageLeaf>?, AllocError> {
+    let elements = structItems(meta, PQ_FILE_SCHEMA) ?? { return Ok(null); };
+    if (elements.length == 0) { return Ok(null); }
+    var out = Vector<PageLeaf>.create();
+    var at: usize = 1;
+    let root = match (borrow elements[0]) {
+        ThriftValue.Struct(f) => f,
+        _ => { return Ok(null); }
+    };
+    let children = thriftInt(root, 5) ?? 0;
+    for (c in 0..children) {
+        if (!(walkSchema(elements, mut at, "".bytes(), 0, 0, 0, mut out)?)) { return Ok(null); }
+        if (c > 100000) { return Ok(null); }
+    }
+    if (at != elements.length) { return Ok(null); }
+    return Ok(Some(out));
+}
+
+fn walkSchema(
+    elements: borrow Vector<ThriftValue>,
+    at: borrow mut usize,
+    prefix: Slice<u8>,
+    def: u32,
+    rep: u32,
+    depth: u32,
+    out: borrow mut Vector<PageLeaf>,
+) -> Result<bool, AllocError> {
+    if (*at >= elements.length || depth > PQ_MAX_LEVEL) { return Ok(false); }
+    let e = match (borrow elements[*at]) {
+        ThriftValue.Struct(f) => f,
+        _ => { return Ok(false); }
+    };
+    *at += 1;
+    let name = schemaText(e, 4) ?? { return Ok(false); };
+    let repetition = thriftInt(e, 3) ?? 0;
+    if (repetition < 0 || repetition > 2) { return Ok(false); }
+    let d = def + (if (repetition >= 1) 1u32 else 0u32);
+    let r = rep + (if (repetition == 2) 1u32 else 0u32);
+    if (d > PQ_MAX_LEVEL || r > PQ_MAX_LEVEL) { return Ok(false); }
+    var path = copyBytes(prefix)?;
+    if (path.length > 0) { path.push('.')?; }
+    path.extend(name)?;
+    match (thriftInt(e, 5)) {
+        Some(children) => {
+            if (children < 0 || children > 100000) { return Ok(false); }
+            for (c in 0..children) {
+                if (!(walkSchema(elements, at, path.view(), d, r, depth + 1, out)?)) { return Ok(false); }
+            }
+        }
+        null => {
+            let physical = thriftInt(e, 1) ?? { return Ok(false); };
+            let length = thriftInt(e, 2) ?? 0;
+            out.push(PageLeaf {
+                path: path,
+                physical: physical,
+                typeLength: checkedTruncate<usize>(length) ?? { return Ok(false); },
+                maxDef: d,
+                maxRep: r,
+            })?;
+        }
+    }
+    return Ok(true);
+}
+
+// ---- Bits ----
+
+/// The bits a level of up to `max` takes.
+fn bitWidthOf(max: u32) -> u32 {
+    var w: u32 = 0;
+    while (w < 32 && (1u64 << (w as u64)) <= (max as u64)) { w += 1; }
+    return w;
+}
+
+/// An unsigned LEB128 at `at`; null past `end` or over 64 bits.
+fn readUleb(data: Slice<u8>, at: borrow mut usize, end: usize) -> u64? {
+    var v: u64 = 0;
+    var shift: u64 = 0;
+    while (true) {
+        if (*at >= end || shift > 63) { return null; }
+        let b = data[*at];
+        *at += 1;
+        v = v | (((b & 0x7F) as u64) << shift);
+        if (b & 0x80 == 0) { return Some(v); }
+        shift += 7;
+    }
+    return null;
+}
+
+fn unzigzag(v: u64) -> i64 => truncate<i64>((v >> 1) ^ (0u64.wrappingSub(v & 1)));
+
+/// `count` values of `width` bits, packed least significant bit first from `at`, into `out`; false past `end`.
+fn unpackBits(
+    data: Slice<u8>,
+    at: usize,
+    end: usize,
+    width: u32,
+    count: usize,
+    out: borrow mut Vector<u64>,
+) -> Result<bool, AllocError> {
+    if (width == 0) {
+        for (i in 0..count) { out.push(0)?; }
+        return Ok(true);
+    }
+    if (width > 64) { return Ok(false); }
+    let bits = count as u64 * width as u64;
+    let bytes = checkedTruncate<usize>((bits + 7) / 8) ?? { return Ok(false); };
+    if (at + bytes > end) { return Ok(false); }
+    var bit: u64 = 0;
+    for (i in 0..count) {
+        var v: u64 = 0;
+        for (k in 0..width) {
+            let pos = bit + k as u64;
+            let byte = data[at + (pos / 8) as usize];
+            if ((byte >> truncate<u8>(pos % 8)) & 1 != 0) { v = v | (1u64 << (k as u64)); }
+        }
+        bit += width as u64;
+        out.push(v)?;
+    }
+    return Ok(true);
+}
+
+/// The RLE/bit-packed hybrid (Parquet's RLE encoding) between `at` and `end`: `count` values of `width` bits.
+fn readHybrid(
+    data: Slice<u8>,
+    at: usize,
+    end: usize,
+    width: u32,
+    count: usize,
+    out: borrow mut Vector<u64>,
+) -> Result<bool, AllocError> {
+    if (width > 32) { return Ok(false); }
+    let start = out.length;
+    var pos = at;
+    while (out.length - start < count) {
+        if (pos >= end) {
+            // A width of 0 may store nothing: every value is 0.
+            if (width == 0) {
+                while (out.length - start < count) { out.push(0)?; }
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        let header = readUleb(data, mut pos, end) ?? { return Ok(false); };
+        if (header & 1 == 0) {
+            let run = checkedTruncate<usize>(header >> 1) ?? { return Ok(false); };
+            let bytes = ((width + 7) / 8) as usize;
+            if (pos + bytes > end) { return Ok(false); }
+            var v: u64 = 0;
+            for (k in 0..bytes) { v = v | ((data[pos + k] as u64) << ((k * 8) as u64)); }
+            pos += bytes;
+            let take = if (run > count - (out.length - start)) count - (out.length - start) else run;
+            for (i in 0..take) { out.push(v)?; }
+        } else {
+            let groups = checkedTruncate<usize>(header >> 1) ?? { return Ok(false); };
+            if (groups > PQ_MAX_PAGE) { return Ok(false); }
+            let n = groups * 8;
+            let bytes = groups * width as usize;
+            if (pos + bytes > end) { return Ok(false); }
+            var unpacked = Vector<u64>.create();
+            if (!(unpackBits(data, pos, end, width, n, mut unpacked)?)) { return Ok(false); }
+            pos += bytes;
+            let need = count - (out.length - start);
+            let take = if (n > need) need else n;
+            for (i in 0..take) { out.push(unpacked[i])?; }
+        }
+    }
+    return Ok(true);
+}
+
+// ---- Values ----
+
+/// `n` PLAIN values of `leaf`'s type from `data[at..end]`; the position after them, or null.
+fn readPlain(
+    data: Slice<u8>,
+    at: usize,
+    end: usize,
+    leaf: borrow PageLeaf,
+    n: usize,
+    out: borrow mut ColumnValues,
+) -> Result<usize?, AllocError> {
+    var pos = at;
+    if (leaf.physical == PQ_BOOLEAN) {
+        var bits = Vector<u64>.create();
+        if (!(unpackBits(data, pos, end, 1, n, mut bits)?)) { return Ok(null); }
+        for (i in 0..n) {
+            if (!(pushValue(out, leaf, [truncate<u8>(bits[i])][..])?)) { return Ok(null); }
+        }
+        return Ok(Some(pos + (n + 7) / 8));
+    }
+    let w = valueWidth(leaf) ?? { return Ok(null); };
+    for (i in 0..n) {
+        if (w > 0) {
+            if (w > end - pos) { return Ok(null); } // a schema's length is not trusted to add
+            if (!(pushValue(out, leaf, data[pos..pos + w])?)) { return Ok(null); }
+            pos += w;
+        } else {
+            if (pos + 4 > end) { return Ok(null); }
+            let len = data[pos..pos + 4].readLE<u32>(0) as usize;
+            pos += 4;
+            if (len > end - pos) { return Ok(null); }
+            if (!(pushValue(out, leaf, data[pos..pos + len])?)) { return Ok(null); }
+            pos += len;
+        }
+    }
+    return Ok(Some(pos));
+}
+
+/// DELTA_BINARY_PACKED from `at`: its values, wrapping as `bits` (32 or 64) wide integers, into `out`; the position
+/// after the last block it needed, or null.
+fn readDeltaPacked(
+    data: Slice<u8>,
+    at: usize,
+    end: usize,
+    bits: u32,
+    out: borrow mut Vector<i64>,
+) -> Result<usize?, AllocError> {
+    var pos = at;
+    let blockSize = readUleb(data, mut pos, end) ?? { return Ok(null); };
+    let miniblocks = readUleb(data, mut pos, end) ?? { return Ok(null); };
+    let total = readUleb(data, mut pos, end) ?? { return Ok(null); };
+    let first = unzigzag(readUleb(data, mut pos, end) ?? { return Ok(null); });
+    if (blockSize == 0 || blockSize % 128 != 0 || miniblocks == 0 || blockSize % miniblocks != 0) { return Ok(null); }
+    let perMini = blockSize / miniblocks;
+    if (perMini % 32 != 0 || total > PQ_MAX_PAGE as u64 || miniblocks > 256) { return Ok(null); }
+    let count = total as usize;
+    if (count == 0) { return Ok(Some(pos)); }
+    var value = first;
+    out.push(wrapTo(value, bits))?;
+    while (out.length < count) {
+        let minDelta = unzigzag(readUleb(data, mut pos, end) ?? { return Ok(null); });
+        let m = miniblocks as usize;
+        if (pos + m > end) { return Ok(null); }
+        let widths = data[pos..pos + m];
+        pos += m;
+        for (k in 0..m) {
+            if (out.length >= count) { break; }
+            let width = widths[k] as u32;
+            if (width > 64) { return Ok(null); }
+            var deltas = Vector<u64>.create();
+            if (!(unpackBits(data, pos, end, width, perMini as usize, mut deltas)?)) { return Ok(null); }
+            pos += (perMini as usize * width as usize + 7) / 8;
+            for (j in 0..deltas.length) {
+                if (out.length >= count) { break; }
+                value = wrapTo(value.wrappingAdd(minDelta).wrappingAdd(truncate<i64>(deltas[j])), bits);
+                out.push(value)?;
+            }
+        }
+    }
+    return Ok(Some(pos));
+}
+
+/// `v` wrapped as a `bits`-wide two's complement integer.
+fn wrapTo(v: i64, bits: u32) -> i64 => if (bits == 32) truncate<i32>(v) as i64 else v;
+
+/// `n` values of `encoding` from `data[at..end]` into `out`, a dictionary's values for the dictionary encodings.
+fn readEncoded(
+    data: Slice<u8>,
+    at: usize,
+    end: usize,
+    leaf: borrow PageLeaf,
+    encoding: i64,
+    n: usize,
+    dictionary: borrow ColumnValues?,
+    out: borrow mut ColumnValues,
+) -> Result<bool, AllocError> {
+    if (n == 0) { return Ok(true); }
+    if (encoding == PQ_ENC_PLAIN) { return Ok(readPlain(data, at, end, leaf, n, out)?.isSome()); }
+    if (encoding == PQ_ENC_PLAIN_DICTIONARY || encoding == PQ_ENC_RLE_DICTIONARY) {
+        let dict = dictionary ?? { return Ok(false); };
+        if (at >= end) { return Ok(false); }
+        let width = data[at] as u32;
+        var indexes = Vector<u64>.create();
+        if (!(readHybrid(data, at + 1, end, width, n, mut indexes)?)) { return Ok(false); }
+        for (i in 0..n) {
+            let ix = checkedTruncate<usize>(indexes[i]) ?? { return Ok(false); };
+            if (ix >= dict.count) { return Ok(false); }
+            if (!(pushValue(out, leaf, valueAt(dict, leaf, ix))?)) { return Ok(false); }
+        }
+        return Ok(true);
+    }
+    if (encoding == PQ_ENC_RLE && leaf.physical == PQ_BOOLEAN) {
+        if (at + 4 > end) { return Ok(false); }
+        let len = data[at..at + 4].readLE<u32>(0) as usize;
+        if (len > end - at - 4) { return Ok(false); }
+        var bits = Vector<u64>.create();
+        if (!(readHybrid(data, at + 4, at + 4 + len, 1, n, mut bits)?)) { return Ok(false); }
+        for (i in 0..n) {
+            if (!(pushValue(out, leaf, [truncate<u8>(bits[i])][..])?)) { return Ok(false); }
+        }
+        return Ok(true);
+    }
+    if (encoding == PQ_ENC_DELTA_BINARY_PACKED && (leaf.physical == PQ_INT32 || leaf.physical == PQ_INT64)) {
+        var values = Vector<i64>.create();
+        let bits: u32 = if (leaf.physical == PQ_INT32) 32 else 64;
+        if (readDeltaPacked(data, at, end, bits, mut values)?.isNull() || values.length != n) { return Ok(false); }
+        for (i in 0..n) {
+            var b = Vector<u8>.create();
+            if (bits == 32) { b.pushLE(truncate<u32>(values[i]))?; } else { b.pushLE(truncate<u64>(values[i]))?; }
+            if (!(pushValue(out, leaf, b.view())?)) { return Ok(false); }
+        }
+        return Ok(true);
+    }
+    if (encoding == PQ_ENC_DELTA_LENGTH_BYTE_ARRAY && leaf.physical == PQ_BYTE_ARRAY) {
+        var lengths = Vector<i64>.create();
+        var pos = readDeltaPacked(data, at, end, 32, mut lengths)? ?? { return Ok(false); };
+        if (lengths.length != n) { return Ok(false); }
+        for (i in 0..n) {
+            let len = checkedTruncate<usize>(lengths[i]) ?? { return Ok(false); };
+            if (len > end - pos) { return Ok(false); }
+            if (!(pushValue(out, leaf, data[pos..pos + len])?)) { return Ok(false); }
+            pos += len;
+        }
+        return Ok(true);
+    }
+    if (encoding == PQ_ENC_DELTA_BYTE_ARRAY && (leaf.physical == PQ_BYTE_ARRAY || leaf.physical == PQ_FIXED)) {
+        var prefixes = Vector<i64>.create();
+        let afterPrefixes = readDeltaPacked(data, at, end, 32, mut prefixes)? ?? { return Ok(false); };
+        var suffixes = Vector<i64>.create();
+        var pos = readDeltaPacked(data, afterPrefixes, end, 32, mut suffixes)? ?? { return Ok(false); };
+        if (prefixes.length != n || suffixes.length != n) { return Ok(false); }
+        var previous = Vector<u8>.create();
+        for (i in 0..n) {
+            let p = checkedTruncate<usize>(prefixes[i]) ?? { return Ok(false); };
+            let s = checkedTruncate<usize>(suffixes[i]) ?? { return Ok(false); };
+            if (p > previous.length || s > end - pos) { return Ok(false); }
+            var value = copyBytes(previous.view()[0..p])?;
+            value.extend(data[pos..pos + s])?;
+            pos += s;
+            if (leaf.physical == PQ_FIXED && value.length != leaf.typeLength) { return Ok(false); }
+            if (!(pushValue(out, leaf, value.view())?)) { return Ok(false); }
+            previous = value;
+        }
+        return Ok(true);
+    }
+    if (encoding == PQ_ENC_BYTE_STREAM_SPLIT && leaf.physical != PQ_BOOLEAN && leaf.physical != PQ_BYTE_ARRAY) {
+        let w = valueWidth(leaf) ?? { return Ok(false); };
+        let need = n.checkedMul(w) ?? { return Ok(false); };
+        if (w == 0 || (end - at) < need) { return Ok(false); }
+        for (i in 0..n) {
+            var value = Vector<u8>.create();
+            for (k in 0..w) { value.push(data[at + k * n + i])?; }
+            if (!(pushValue(out, leaf, value.view())?)) { return Ok(false); }
+        }
+        return Ok(true);
+    }
+    return Ok(false);
+}
+
+// ---- Pages ----
+
+/// A page's bytes decompressed by the chunk's codec, `size` of them; null for a codec not read here or bytes that do
+/// not decompress to that size.
+fn decompressPage(codec: i64, bytes: Slice<u8>, size: usize) -> Result<Vector<u8>?, AllocError> {
+    if (size > PQ_MAX_PAGE) { return Ok(null); }
+    if (codec == PQ_CODEC_UNCOMPRESSED) {
+        if (bytes.length != size) { return Ok(null); }
+        return Ok(Some(copyBytes(bytes)?));
+    }
+    var out = Vector<u8>.create();
+    if (codec == PQ_CODEC_GZIP) {
+        return match (Gzip.decompress(bytes, size, mut out)) {
+            Ok() => if (out.length == size) Ok(Some(out)) else Ok(null),
+            Err(DecodeError.OutOfMemory(e)) => Err(e),
+            Err(_) => Ok(null),
+        };
+    }
+    return Ok(null); // SNAPPY and ZSTD come with CeeSafe's codecs (ADR 0196 phases 2 and 3)
+}
+
+/// Levels of `width` bits for `n` values, the hybrid between `at` and `end`, appended a byte each to `out`.
+fn readLevels(
+    data: Slice<u8>,
+    at: usize,
+    end: usize,
+    max: u32,
+    n: usize,
+    out: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    var levels = Vector<u64>.create();
+    if (!(readHybrid(data, at, end, bitWidthOf(max), n, mut levels)?)) { return Ok(false); }
+    for (i in 0..n) {
+        if (levels[i] > max as u64) { return Ok(false); }
+        out.push(truncate<u8>(levels[i]))?;
+    }
+    return Ok(true);
+}
+
+/// The values a page's levels hold: those at the greatest definition level.
+fn presentCount(defs: Slice<u8>, maxDef: u32) -> usize {
+    var n: usize = 0;
+    for (d in defs) {
+        if (d as u32 == maxDef) { n += 1; }
+    }
+    return n;
+}
+
+/// A column chunk of `file` read: its levels and values. Null when a page, codec, encoding or type is not read here,
+/// or the bytes do not add up.
+fn readColumnChunk(
+    file: Slice<u8>,
+    chunk: borrow Vector<ThriftField>,
+    leaf: borrow PageLeaf,
+) -> Result<ColumnValues?, AllocError> {
+    let meta = match (thriftField(chunk, PQ_CHUNK_META)) {
+        Some(v) => match (v) {
+            ThriftValue.Struct(f) => f,
+            _ => { return Ok(null); }
+        },
+        null => { return Ok(null); }
+    };
+    if (thriftInt(meta, PQ_META_TYPE) != Some(leaf.physical) || valueWidth(leaf).isNull()) { return Ok(null); }
+    let codec = thriftInt(meta, PQ_META_CODEC) ?? { return Ok(null); };
+    let numValues = checkedTruncate<usize>(thriftInt(meta, PQ_META_NUM_VALUES) ?? -1) ?? { return Ok(null); };
+    let dataOffset = checkedTruncate<usize>(thriftInt(meta, PQ_META_DATA_OFFSET) ?? -1) ?? { return Ok(null); };
+    let total = checkedTruncate<usize>(thriftInt(meta, PQ_META_TOTAL_COMPRESSED) ?? -1) ?? { return Ok(null); };
+    var start = dataOffset;
+    match (thriftInt(meta, PQ_META_DICT_OFFSET)) {
+        Some(d) => {
+            let off = checkedTruncate<usize>(d) ?? { return Ok(null); };
+            if (off > 0 && off < start) { start = off; }
+        }
+        null => {}
+    }
+    if (start > file.length || total > file.length - start) { return Ok(null); }
+    let end = start + total;
+    var out = emptyValues();
+    var dictionary: ColumnValues? = null;
+    var at = start;
+    var levels: usize = 0;
+    while (at < end) {
+        let header = readThriftStruct(file[0..end], at)? ?? { return Ok(null); };
+        let h = borrow header.fields;
+        let kind = thriftInt(h, 1) ?? { return Ok(null); };
+        let size = checkedTruncate<usize>(thriftInt(h, 2) ?? -1) ?? { return Ok(null); };
+        let compressed = checkedTruncate<usize>(thriftInt(h, 3) ?? -1) ?? { return Ok(null); };
+        let body = header.end;
+        if (compressed > end - body) { return Ok(null); }
+        let raw = file[body..body + compressed];
+        at = body + compressed;
+        if (kind == PQ_PAGE_INDEX) { continue; }
+        if (kind == PQ_PAGE_DICTIONARY) {
+            if (dictionary.isSome() || levels > 0) { return Ok(null); }
+            let dh = match (thriftField(h, 7)) {
+                Some(v) => match (v) {
+                    ThriftValue.Struct(f) => f,
+                    _ => { return Ok(null); }
+                },
+                null => { return Ok(null); }
+            };
+            let n = checkedTruncate<usize>(thriftInt(dh, 1) ?? -1) ?? { return Ok(null); };
+            let encoding = thriftInt(dh, 2) ?? PQ_ENC_PLAIN;
+            if (encoding != PQ_ENC_PLAIN && encoding != PQ_ENC_PLAIN_DICTIONARY) { return Ok(null); }
+            let page = decompressPage(codec, raw, size)? ?? { return Ok(null); };
+            var dict = emptyValues();
+            if (readPlain(page.view(), 0, page.length, leaf, n, mut dict)?.isNull()) { return Ok(null); }
+            dictionary = Some(dict);
+            continue;
+        }
+        if (kind == PQ_PAGE_DATA) {
+            let dh = match (thriftField(h, 5)) {
+                Some(v) => match (v) {
+                    ThriftValue.Struct(f) => f,
+                    _ => { return Ok(null); }
+                },
+                null => { return Ok(null); }
+            };
+            let n = checkedTruncate<usize>(thriftInt(dh, 1) ?? -1) ?? { return Ok(null); };
+            let encoding = thriftInt(dh, 2) ?? { return Ok(null); };
+            if (n > PQ_MAX_PAGE) { return Ok(null); }
+            let page = decompressPage(codec, raw, size)? ?? { return Ok(null); };
+            let p = page.view();
+            var pos: usize = 0;
+            // v1: each level block is its 4-byte length and the hybrid.
+            if (leaf.maxRep > 0) {
+                if (pos + 4 > p.length) { return Ok(null); }
+                let len = p[pos..pos + 4].readLE<u32>(0) as usize;
+                if (len > p.length - pos - 4) { return Ok(null); }
+                if (!(readLevels(p, pos + 4, pos + 4 + len, leaf.maxRep, n, mut out.reps)?)) { return Ok(null); }
+                pos += 4 + len;
+            } else {
+                for (i in 0..n) { out.reps.push(0)?; }
+            }
+            let defsFrom = out.defs.length;
+            if (leaf.maxDef > 0) {
+                if (pos + 4 > p.length) { return Ok(null); }
+                let len = p[pos..pos + 4].readLE<u32>(0) as usize;
+                if (len > p.length - pos - 4) { return Ok(null); }
+                if (!(readLevels(p, pos + 4, pos + 4 + len, leaf.maxDef, n, mut out.defs)?)) { return Ok(null); }
+                pos += 4 + len;
+            } else {
+                for (i in 0..n) { out.defs.push(0)?; }
+            }
+            let present = presentCount(out.defs.view()[defsFrom..], leaf.maxDef);
+            if (!(readEncoded(p, pos, p.length, leaf, encoding, present, dictionary.asBorrow(), mut out)?)) {
+                return Ok(null);
+            }
+            levels += n;
+            continue;
+        }
+        if (kind == PQ_PAGE_DATA_V2) {
+            let dh = match (thriftField(h, 8)) {
+                Some(v) => match (v) {
+                    ThriftValue.Struct(f) => f,
+                    _ => { return Ok(null); }
+                },
+                null => { return Ok(null); }
+            };
+            let n = checkedTruncate<usize>(thriftInt(dh, 1) ?? -1) ?? { return Ok(null); };
+            let encoding = thriftInt(dh, 4) ?? { return Ok(null); };
+            let defLength = checkedTruncate<usize>(thriftInt(dh, 5) ?? -1) ?? { return Ok(null); };
+            let repLength = checkedTruncate<usize>(thriftInt(dh, 6) ?? -1) ?? { return Ok(null); };
+            let isCompressed = match (thriftField(dh, 7)) {
+                Some(v) => match (v) {
+                    ThriftValue.Bool(b) => *b,
+                    _ => true,
+                },
+                null => true,
+            };
+            if (n > PQ_MAX_PAGE || repLength > raw.length || defLength > raw.length - repLength) { return Ok(null); }
+            // v2: the levels uncompressed, without lengths; then the values, compressed unless it says not.
+            if (leaf.maxRep > 0) {
+                if (!(readLevels(raw, 0, repLength, leaf.maxRep, n, mut out.reps)?)) { return Ok(null); }
+            } else {
+                for (i in 0..n) { out.reps.push(0)?; }
+            }
+            let defsFrom = out.defs.length;
+            if (leaf.maxDef > 0) {
+                if (!(readLevels(raw, repLength, repLength + defLength, leaf.maxDef, n, mut out.defs)?)) {
+                    return Ok(null);
+                }
+            } else {
+                for (i in 0..n) { out.defs.push(0)?; }
+            }
+            let rest = raw[repLength + defLength..];
+            if (size < repLength + defLength) { return Ok(null); }
+            let values = if (isCompressed && codec != PQ_CODEC_UNCOMPRESSED) decompressPage(
+                codec,
+                rest,
+                size - repLength - defLength,
+            )? ?? { return Ok(null); } else copyBytes(rest)?;
+            let present = presentCount(out.defs.view()[defsFrom..], leaf.maxDef);
+            let v = values.view();
+            if (!(readEncoded(v, 0, v.length, leaf, encoding, present, dictionary.asBorrow(), mut out)?)) {
+                return Ok(null);
+            }
+            levels += n;
+            continue;
+        }
+        return Ok(null);
+    }
+    if (at != end || levels != numValues) { return Ok(null); }
+    return Ok(Some(out));
+}
