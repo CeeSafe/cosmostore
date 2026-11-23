@@ -33,4 +33,7 @@ for name in names:
 if not names:
     print("FAIL no files")
     failed = True
-sys.exit(1 if failed else 0)
+# os._exit, not sys.exit: under heavy load Arrow's thread pool can deadlock in its shutdown at interpreter exit,
+# after every file has been read.
+sys.stdout.flush()
+os._exit(1 if failed else 0)

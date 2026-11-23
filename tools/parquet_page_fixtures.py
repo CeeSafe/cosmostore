@@ -4,8 +4,8 @@ version, encoding and physical type the page reader takes, with nulls, structs, 
 column, what a reader must find: its repetition and definition levels and its values, from a Dremel shredding of the
 rows here (not from pyarrow's reading).
 
-usage: tools/parquet_page_fixtures.py OUT.cee          (needs pyarrow; the codecs here are none and gzip; snappy and
-                                                       zstd come with CeeSafe's codecs, ADR 0196 phases 2 and 3)
+usage: tools/parquet_page_fixtures.py OUT.cee          (needs pyarrow; the codecs here are none, gzip and snappy; zstd
+                                                       comes with CeeSafe's zstd decoder, ADR 0196 phase 3)
 """
 import io
 import struct
@@ -183,6 +183,10 @@ fixtures = [
     ("NESTED_V2_GZIP", "a struct, a list and a map: v2 pages, PLAIN, gzip", write(nested_schema, nested_rows,
         compression="gzip", use_dictionary=False, data_page_version="2.0", max_rows_per_page=6),
         nested_nodes, nested_rows),
+    ("FLAT_V1_SNAPPY", "v1 pages, dictionary, snappy (Spark's default codec)", write(flat_schema, flat_rows,
+        compression="snappy", data_page_version="1.0", max_rows_per_page=8), flat_nodes, flat_rows),
+    ("NESTED_V2_SNAPPY", "a struct, a list and a map: v2 pages, dictionary, snappy", write(nested_schema, nested_rows,
+        compression="snappy", data_page_version="2.0", max_rows_per_page=6), nested_nodes, nested_rows),
 ]
 
 # Each file read back by pyarrow as the rows here: the fixtures are what they say.
