@@ -5234,3 +5234,25 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - the manifest's counts and bounds from the rows written;
   - M23's B1 (a merge's inputs read a row group at a time) as the first slice.
 - **Next:** the design ADR.
+
+### 23 Nov 2026: ADR-0114 proposed, M24's design (compaction that applies deletes)
+
+- **The design:**
+  - **Inputs** are read a row group at a time (M23's B1), so a merge holds two row groups.
+  - **Merged files' counts and bounds** come from the rows written, by the table's metrics mode.
+  - **Deletes:** position and equality deletes are applied by Iceberg's rules. A delete file is dropped once it
+    applies to no live file.
+  - **Sequence numbers:** the new files take the starting sequence number.
+- **The owner's choices:**
+  - partitions with another spec's or a global delete are left as today;
+  - the table's metrics mode;
+  - a single file with deletes is rewritten alone.
+- **Seven slices:**
+  1. inputs by row group;
+  2. exact metrics;
+  3. deletes read and matched;
+  4. rows dropped;
+  5. the commit;
+  6. the checks;
+  7. the exit review.
+- **Next:** slice 1.
