@@ -5322,3 +5322,25 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   length); 486 unit tests, the smokes unchanged (`COMPACTION_APPLIES_DELETES` is still off).
 - **Next:** slice 5, the commit: new files at the starting sequence number, delete files that apply to nothing live
   removed, and the summary.
+
+### 23 Nov 2026: M24 slice 5, the commit, and deletes applied (ADR-0114 §5)
+
+- **New files:** a file whose bin applied deletes takes the table's sequence number at the plan, so no delete
+  committed before it applies to it. Other bins' files take the largest of their inputs', as before.
+- **Delete files removed:** a planned delete file is marked DELETED in its manifest when Iceberg's rule says it
+  applies to no data file left live after the commit. A file the commit adds counts for an equality delete only: its
+  path is new, so no position delete names it.
+- **The summary:**
+  - `deleted-records` is the inputs' own;
+  - `removed-delete-files`, `removed-position-delete-files`, `removed-equality-delete-files`,
+    `removed-position-deletes` and `removed-equality-deletes` are counted;
+  - the totals are lowered by what was removed.
+- **`COMPACTION_APPLIES_DELETES` is on.**
+- **`tools/compaction_check.py`, on `serve` and through a cluster (80 checks):**
+  - **A position delete:** its partition merges with the delete applied, and the delete file is removed. The summary
+    counts it, 4 records removed and 3 added.
+  - **An equality delete:** its id's older rows are dropped and a row of the same id appended after the delete is
+    kept, by the sequence rule. The delete file is removed, and the merged file's metrics are PyIceberg's.
+  - **How equality tables are read:** PyIceberg plans no scan of a table with equality deletes, so their files are
+    listed from the manifests, and the rows before compaction are stated.
+- **Next:** slice 6, the crash sweep with deletes, and the rest of the checks.

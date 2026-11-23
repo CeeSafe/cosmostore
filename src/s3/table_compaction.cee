@@ -11,9 +11,9 @@ import web_server;
 
 /// A file is compacted when it is under this share of the target, in percent (ADR-0098 §2).
 const COMPACTION_SMALL_PERCENT: u64 = 75;
-/// Whether partitions with delete files are compacted, their deletes applied (ADR-0114). Off until rows are dropped
-/// and the commit removes delete files; every partition with a delete file stays as it is until then.
-const COMPACTION_APPLIES_DELETES: bool = false;
+/// Whether partitions with delete files are compacted, their deletes applied (ADR-0114); off, every partition with a
+/// delete file stays as it is (ADR-0098 §2).
+const COMPACTION_APPLIES_DELETES: bool = true;
 /// The most files one run reads the footers of: a table of more is compacted over several runs.
 const COMPACTION_MAX_CANDIDATES: usize = 10000;
 
@@ -1110,6 +1110,64 @@ fn outputRows(output: borrow CompactionOutput, bin: borrow CompactionBin) -> i64
     null => bin.join.rows,
 };
 
+/// A written file's data sequence number: the table's at the plan when its bin applied deletes (ADR-0114 §5), else
+/// the largest of its inputs' (ADR-0098 §3).
+fn outputSequence(bin: borrow CompactionBin, startSequence: i64) -> i64 {
+    if (bin.deletes.length > 0) { return startSequence; }
+    var most: i64 = 0;
+    for (i in 0..bin.inputs.length) {
+        if (bin.inputs[i].sequence > most) { most = bin.inputs[i].sequence; }
+    }
+    return most;
+}
+
+/// Whether delete file `d` may still apply to a live data file after the commit: one of the current snapshot's
+/// data files it keeps (not in `gone`), or one it adds, by Iceberg's rule (partition and sequence number).
+fn deleteStillApplies(
+    plan: borrow CompactionPlan,
+    d: borrow DeleteFile,
+    gone: Slice<Vector<usize>>,
+    outputs: borrow Vector<CompactionOutput>,
+    bins: Slice<usize>,
+    startSequence: i64,
+) -> Result<bool, AllocError> {
+    // A file this commit adds has a new path, which no position delete names; an equality delete is checked by its
+    // rule.
+    for (o in 0..outputs.length) {
+        if (d.content == DELETE_CONTENT_POSITION) { break; }
+        let bin = borrow plan.bins[bins[o]];
+        if (deleteApplies(
+            d,
+            bin.inputs[0].partitionKey.view(),
+            outputSequence(bin, startSequence),
+        )) { return Ok(true); }
+    }
+    for (i in 0..plan.list.records.length) {
+        if (recordInt(borrow plan.list.records[i], "content", 0) != 0) { continue; }
+        let spec = recordInt(borrow plan.list.records[i], "partition_spec_id", 0);
+        let manifestSequence = recordInt(borrow plan.list.records[i], "sequence_number", 0);
+        for (e in 0..plan.manifests[i].records.length) {
+            let entry = borrow plan.manifests[i].records[e];
+            if (recordInt(entry, "status", 0) == 2 || holdsIndex(gone[i].view(), e)) { continue; }
+            let file = jsonMember(entry, "data_file") ?? { continue; };
+            if (recordInt(file, "content", 0) != 0) { continue; }
+            var k = Vector<u8>.create();
+            appendDecimal(mut k, truncate<u64>(spec))?;
+            k.push(' ')?;
+            match (jsonMember(file, "partition")) {
+                Some(p) => { k.extend(jsonTextOf(p)?.view())?; }
+                null => {}
+            }
+            let sequence = match (jsonMember(entry, "sequence_number")) {
+                Some(v) => jsonI64(v) ?? manifestSequence,
+                null => manifestSequence,
+            };
+            if (deleteApplies(d, k.view(), sequence)) { return Ok(true); }
+        }
+    }
+    return Ok(false);
+}
+
 /// A data file record's metrics map `name` set to `items`, when its manifest's schema has it.
 fn setMetric(file: borrow mut Json, name: StringView, items: Slice<Json>) -> Result<void, AllocError> {
     if (jsonMember(file, name).isNull()) { return Ok(); }
@@ -1460,6 +1518,10 @@ fn commitWritten(
     var removedBytes: i64 = 0;
     var addedBytes: i64 = 0;
     var inputsCount: i64 = 0;
+    var removedRows: i64 = 0;
+    // The table's sequence number at the plan: a file whose bin applied deletes takes it (ADR-0114 §5), so that no
+    // delete committed before applies to it.
+    let startSequence = sequence - 1;
     for (o in 0..outputs.length) {
         let bin = borrow plan.bins[bins[o]];
         addedBytes += truncate<i64>(outputs[o].length);
@@ -1467,7 +1529,22 @@ fn commitWritten(
         for (i in 0..bin.inputs.length) {
             gone[bin.inputs[i].manifest].push(bin.inputs[i].entry)?;
             removedBytes += truncate<i64>(bin.inputs[i].size);
+            let rows = match (dataFileOf(plan, borrow bin.inputs[i])) {
+                Some(d) => recordInt(d, "record_count", 0),
+                null => 0,
+            };
+            removedRows = addChecked(removedRows, rows) ?? { return Ok(false); };
             inputsCount += 1;
+        }
+    }
+    // The delete files that apply to nothing live any more (ADR-0114 §5), removed: no data file left after this
+    // commit, nor one it adds, that Iceberg's rule says each may apply to.
+    var removedDeletes = Vector<usize>.create();
+    for (x in 0..plan.deletes.length) {
+        let d = borrow plan.deletes[x];
+        if (!deleteStillApplies(plan, d, gone.view(), outputs, bins, startSequence)?) {
+            gone[d.manifest].push(d.entry)?;
+            removedDeletes.push(x)?;
         }
     }
     // A manifest of the joined files per partition spec (the M16 exit review): each written by a manifest of that
@@ -1536,11 +1613,7 @@ fn commitWritten(
             jsonSet(mut entry, "status", jsonInteger(1)?)?;
             jsonSet(mut entry, "snapshot_id", jsonInteger(snapshot)?)?;
             if (v2) {
-                // The largest of its inputs' data sequence numbers (ADR-0098 §3).
-                var most: i64 = 0;
-                for (i in 0..bin.inputs.length) {
-                    if (bin.inputs[i].sequence > most) { most = bin.inputs[i].sequence; }
-                }
+                let most = outputSequence(bin, startSequence);
                 if (most < leastSequence) { leastSequence = most; }
                 jsonSet(mut entry, "sequence_number", jsonInteger(most)?)?;
                 jsonSet(mut entry, "file_sequence_number", Json.Null)?;
@@ -1701,13 +1774,47 @@ fn commitWritten(
     summaryCount(mut summary, "added-data-files", truncate<i64>(outputs.length))?;
     summaryCount(mut summary, "deleted-data-files", inputsCount)?;
     summaryCount(mut summary, "added-records", addedRows)?;
-    summaryCount(mut summary, "deleted-records", addedRows)?;
+    summaryCount(mut summary, "deleted-records", removedRows)?;
+    // The delete files removed, and their deletes (ADR-0114 §5).
+    var removedPositionFiles: i64 = 0;
+    var removedEqualityFiles: i64 = 0;
+    var removedPositions: i64 = 0;
+    var removedEqualities: i64 = 0;
+    for (r in 0..removedDeletes.length) {
+        let d = borrow plan.deletes[removedDeletes[r]];
+        let rows = match (jsonMember(borrow plan.manifests[d.manifest].records[d.entry], "data_file")) {
+            Some(f) => recordInt(f, "record_count", 0),
+            null => 0,
+        };
+        if (d.content == DELETE_CONTENT_POSITION) {
+            removedPositionFiles += 1;
+            removedPositions = addChecked(removedPositions, rows) ?? { return Ok(false); };
+        } else {
+            removedEqualityFiles += 1;
+            removedEqualities = addChecked(removedEqualities, rows) ?? { return Ok(false); };
+        }
+    }
+    if (removedDeletes.length > 0) {
+        summaryCount(mut summary, "removed-delete-files", truncate<i64>(removedDeletes.length))?;
+        summaryCount(mut summary, "removed-position-delete-files", removedPositionFiles)?;
+        summaryCount(mut summary, "removed-equality-delete-files", removedEqualityFiles)?;
+        summaryCount(mut summary, "removed-position-deletes", removedPositions)?;
+        summaryCount(mut summary, "removed-equality-deletes", removedEqualities)?;
+    }
     summaryCount(mut summary, "added-files-size", addedBytes)?;
     summaryCount(mut summary, "removed-files-size", removedBytes)?;
     let previous = previousSummary(borrow plan.metadata, plan.snapshot);
-    for (total in ["total-records", "total-delete-files", "total-position-deletes", "total-equality-deletes"]) {
-        match (summaryValue(previous, total)) {
-            Some(v) => { summaryCount(mut summary, total, v)?; }
+    // The totals less what the commit removed (rows its deletes dropped, the delete files it removed); a total that
+    // would go below 0 (a writer's text, not trusted) is left out.
+    let lessRecords = removedRows - addedRows;
+    let lessDeleteFiles = truncate<i64>(removedDeletes.length);
+    let totals = ["total-records", "total-delete-files", "total-position-deletes", "total-equality-deletes"];
+    let less = [lessRecords, lessDeleteFiles, removedPositions, removedEqualities];
+    for (t in 0..totals.length) {
+        match (summaryValue(previous, totals[t])) {
+            Some(v) => {
+                if (v >= less[t]) { summaryCount(mut summary, totals[t], v - less[t])?; }
+            }
             null => {}
         }
     }
