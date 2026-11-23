@@ -346,9 +346,21 @@ fn finishPlan(d: borrow mut CompactionDraft) -> Result<void, TablesError> {
             null => { continue; }
         };
         c.footer = null; // its pin let go
+        // Files whose pages all read are grouped by their columns (ADR-0112 §2: by field id, whatever their writer);
+        // others by their shape, to be joined as before.
         var group = copyBytes(c.partitionKey.view())?;
         group.push(0)?;
-        group.extend(footer.shape.view())?;
+        let mergeable = if (pagesReadable(borrow footer.meta)?) schemaLeaves(borrow footer.meta)? else null;
+        match (mergeable) {
+            Some(leaves) => {
+                group.push('M')?;
+                group.extend(mergeKeyOf(leaves.view())?.view())?;
+            }
+            null => {
+                group.push('J')?;
+                group.extend(footer.shape.view())?;
+            }
+        }
         inputs.push(CompactionInput {
             path: copyBytes(c.path.view())?,
             key: copyBytes(c.key.view())?,
@@ -498,7 +510,19 @@ fn closeBin(bins: borrow mut Vector<CompactionBin>, inputs: Vector<CompactionInp
     }
     match (joinParquet(footers.view())?) {
         Some(join) => { bins.push(CompactionBin { inputs: inputs, join: join, merge: merge })?; }
-        null => {}
+        null => {
+            // Files of other writers' shapes merge, but cannot be joined: their join is only their row count.
+            if (!merge) { return Ok(); }
+            var rows: i64 = 0;
+            for (i in 0..footers.length) { rows = addChecked(rows, footers[i].rows) ?? { return Ok(); }; }
+            let join = ParquetJoin {
+                copies: Vector<ParquetCopy>.create(),
+                tail: Vector<u8>.create(),
+                rows: rows,
+                length: 0,
+            };
+            bins.push(CompactionBin { inputs: inputs, join: join, merge: true })?;
+        }
     }
     return Ok();
 }
@@ -595,7 +619,8 @@ fn copyBin(c: borrow mut BinCopy, tail: Slice<u8>) -> Result<FinishedObject?, St
 
 /// A bin's files merged (ADR-0112 §2), without the store's lock: each input read whole and its row groups decoded,
 /// their values written as row groups of about `rowGroupBytes` (measured by the values' bytes), by the first input's
-/// schema; then the footer. Null when an input reads short, does not decode, or has other columns than the first.
+/// schema, each input's columns matched to its by key (field id); then the footer. Null when an input reads short,
+/// does not decode, or has other columns than the first.
 fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
     if (c.writer.write(PARQUET_MAGIC.bytes()).isErr()) { return Ok(null); }
     var written: u64 = 4;
@@ -616,12 +641,20 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
         };
         let these = schemaLeaves(borrow footer.meta)? ?? { return Ok(null); };
         if (firstMeta.isNull()) {
-            for (k in 0..these.length) { columns.push(emptyValues())?; }
-            leaves = these;
+            for (k in 0..these.length) {
+                columns.push(emptyValues())?;
+                leaves.push(PageLeaf {
+                    path: copyBytes(these[k].path.view())?,
+                    key: copyBytes(these[k].key.view())?,
+                    physical: these[k].physical,
+                    typeLength: these[k].typeLength,
+                    maxDef: these[k].maxDef,
+                    maxRep: these[k].maxRep,
+                })?;
+            }
             firstMeta = Some(cloneFields(borrow footer.meta)?);
-        } else if (!sameLeaves(leaves.view(), these.view())) {
-            return Ok(null);
         }
+        let order = leafOrder(leaves.view(), these.view())? ?? { return Ok(null); };
         let fileGroups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? { return Ok(null); };
         for (g in 0..fileGroups.length) {
             let group = match (borrow fileGroups[g]) {
@@ -630,15 +663,15 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
             };
             let groupRows = thriftInt(group, PQ_GROUP_NUM_ROWS) ?? { return Ok(null); };
             let chunks = structItems(group, PQ_GROUP_COLUMNS) ?? { return Ok(null); };
-            if (chunks.length != leaves.length) { return Ok(null); }
+            if (chunks.length != these.length) { return Ok(null); }
             for (k in 0..chunks.length) {
                 let chunk = match (borrow chunks[k]) {
                     ThriftValue.Struct(f) => f,
                     _ => { return Ok(null); }
                 };
-                let values = readColumnChunk(bytes.view(), chunk, borrow leaves[k])? ?? { return Ok(null); };
+                let values = readColumnChunk(bytes.view(), chunk, borrow these[k])? ?? { return Ok(null); };
                 held += values.data.length as u64 + values.defs.length as u64;
-                if (!(appendValues(mut columns[k], borrow values)?)) { return Ok(null); }
+                if (!(appendValues(mut columns[order[k]], borrow values)?)) { return Ok(null); }
             }
             rows += groupRows;
             totalRows += groupRows;

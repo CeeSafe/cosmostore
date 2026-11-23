@@ -39,6 +39,16 @@ for i in range(23):
         "fx": None if i % 8 == 6 else bytes([i, 255 - i, i * 3 % 256, 7]),
     })
 
+# The flat rows again with Iceberg's field ids, and as another writer might lay out the same Iceberg schema: its
+# columns in the other order and under other names, their ids the same (compaction matches them by id, ADR-0112 §2).
+def with_id(field, i, name=None):
+    return pa.field(name or field.name, field.type, nullable=field.nullable, metadata={b"PARQUET:field_id": str(i).encode()})
+
+
+ids_schema = pa.schema([with_id(f, i + 1) for i, f in enumerate(flat_schema)])
+renamed_schema = pa.schema([with_id(f, i + 1, "c_" + f.name) for i, f in reversed(list(enumerate(flat_schema)))])
+renamed_rows = [{"c_" + k: r[k] for k in reversed(list(r))} for r in flat_rows]
+
 nested_schema = pa.schema([
     pa.field("id", pa.int32(), nullable=False),
     pa.field("st", pa.struct([pa.field("a", pa.int32()), pa.field("b", pa.string())])),
@@ -59,6 +69,7 @@ for i in range(17):
 flat_nodes = [("prim", "id", False, "i64"), ("prim", "i32", True, "i32"), ("prim", "f", True, "f32"),
               ("prim", "d", True, "f64"), ("prim", "b", True, "bool"), ("prim", "s", True, "bytes"),
               ("prim", "fx", True, "bytes")]
+renamed_nodes = [(n[0], "c_" + n[1], n[2], n[3]) for n in reversed(flat_nodes)]
 nested_nodes = [
     ("prim", "id", False, "i32"),
     ("struct", "st", True, [("prim", "a", True, "i32"), ("prim", "b", True, "bytes")]),
@@ -187,6 +198,11 @@ fixtures = [
         compression="snappy", data_page_version="1.0", max_rows_per_page=8), flat_nodes, flat_rows),
     ("NESTED_V2_SNAPPY", "a struct, a list and a map: v2 pages, dictionary, snappy", write(nested_schema, nested_rows,
         compression="snappy", data_page_version="2.0", max_rows_per_page=6), nested_nodes, nested_rows),
+    ("FLAT_IDS", "v1 pages, dictionary, snappy, with Iceberg's field ids", write(ids_schema, flat_rows,
+        compression="snappy", data_page_version="1.0"), flat_nodes, flat_rows),
+    ("FLAT_IDS_RENAMED", "the same columns and ids, in the other order and renamed: v2 pages, PLAIN, none", write(
+        renamed_schema, renamed_rows, compression="none", use_dictionary=False, data_page_version="2.0"),
+        renamed_nodes, renamed_rows),
 ]
 
 # Each file read back by pyarrow as the rows here: the fixtures are what they say.

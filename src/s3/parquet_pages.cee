@@ -50,9 +50,13 @@ const PQ_MAX_CHUNK: usize = 1073741824;
 const PQ_MAX_LEVEL: u32 = 64;
 
 /// A leaf column of a file's schema: its path (names joined by `.`, the root's left out), its physical type and
-/// length, and its greatest definition and repetition levels.
+/// length, and its greatest definition and repetition levels; and `key`, which names it across writers (ADR-0112 §2).
 struct PageLeaf {
     path: Vector<u8>;
+    /// Each element from the root's child down: its repetition, and its Iceberg field id (its name when it has none);
+    /// then the leaf's type, length, converted and logical types, scale and precision. Two files' leaves of one key
+    /// hold the same values, whatever their writers named a list's or map's groups.
+    key: Vector<u8>;
     physical: i64;
     typeLength: usize;
     maxDef: u32;
@@ -127,7 +131,7 @@ fn schemaLeaves(meta: borrow Vector<ThriftField>) -> Result<Vector<PageLeaf>?, A
     };
     let children = thriftInt(root, 5) ?? 0;
     for (c in 0..children) {
-        if (!(walkSchema(elements, mut at, "".bytes(), 0, 0, 0, mut out)?)) { return Ok(null); }
+        if (!(walkSchema(elements, mut at, "".bytes(), "".bytes(), 0, 0, 0, mut out)?)) { return Ok(null); }
         if (c > 100000) { return Ok(null); }
     }
     if (at != elements.length) { return Ok(null); }
@@ -138,6 +142,7 @@ fn walkSchema(
     elements: borrow Vector<ThriftValue>,
     at: borrow mut usize,
     prefix: Slice<u8>,
+    keyPrefix: Slice<u8>,
     def: u32,
     rep: u32,
     depth: u32,
@@ -158,18 +163,39 @@ fn walkSchema(
     var path = copyBytes(prefix)?;
     if (path.length > 0) { path.push('.')?; }
     path.extend(name)?;
+    var key = copyBytes(keyPrefix)?;
+    key.push(truncate<u8>(repetition) + '0')?;
+    match (thriftInt(e, 9)) {
+        Some(id) => {
+            key.push('i')?;
+            appendDecimal(mut key, checkedTruncate<u64>(id) ?? { return Ok(false); })?;
+        }
+        null => {
+            key.push('n')?;
+            key.extend(name)?;
+        }
+    }
+    key.push('/')?;
     match (thriftInt(e, 5)) {
         Some(children) => {
             if (children < 0 || children > 100000) { return Ok(false); }
             for (c in 0..children) {
-                if (!(walkSchema(elements, at, path.view(), d, r, depth + 1, out)?)) { return Ok(false); }
+                if (!(walkSchema(elements, at, path.view(), key.view(), d, r, depth + 1, out)?)) { return Ok(false); }
             }
         }
         null => {
             let physical = thriftInt(e, 1) ?? { return Ok(false); };
             let length = thriftInt(e, 2) ?? 0;
+            for (id in [1i16, 2, 6, 7, 8, 10]) {
+                key.push(truncate<u8>(id))?;
+                match (thriftField(e, id)) {
+                    Some(v) => { writeValue(mut key, v)?; }
+                    null => { key.push(0xFF)?; }
+                }
+            }
             out.push(PageLeaf {
                 path: path,
+                key: key,
                 physical: physical,
                 typeLength: checkedTruncate<usize>(length) ?? { return Ok(false); },
                 maxDef: d,
@@ -748,14 +774,46 @@ fn appendValues(into: borrow mut ColumnValues, from: borrow ColumnValues) -> Res
     return Ok(true);
 }
 
-/// Whether two files' leaves are the same columns: path, type, length and levels.
-fn sameLeaves(a: Slice<PageLeaf>, b: Slice<PageLeaf>) -> bool {
-    if (a.length != b.length) { return false; }
-    for (i in 0..a.length) {
-        if (a[i].path.view() != b[i].path.view() || a[i].physical != b[i].physical ||
-            a[i].typeLength != b[i].typeLength || a[i].maxDef != b[i].maxDef || a[i].maxRep != b[i].maxRep) {
-            return false;
+/// Where each of `these` leaves is among `first`'s, matched by key (ADR-0112 §2: by Iceberg field id, in any order);
+/// null when they are not the same columns.
+fn leafOrder(first: Slice<PageLeaf>, these: Slice<PageLeaf>) -> Result<Vector<usize>?, AllocError> {
+    if (first.length != these.length) { return Ok(null); }
+    var order = Vector<usize>.create();
+    var taken = Vector<bool>.create();
+    taken.resize(first.length, false)?;
+    for (k in 0..these.length) {
+        var found: usize? = null;
+        for (j in 0..first.length) {
+            if (!taken[j] && first[j].key.view() == these[k].key.view() && first[j].maxDef == these[k].maxDef &&
+                first[j].maxRep == these[k].maxRep) {
+                found = Some(j);
+                break;
+            }
         }
+        let j = found ?? { return Ok(null); };
+        taken[j] = true;
+        order.push(j)?;
     }
-    return true;
+    return Ok(Some(order));
+}
+
+/// The key that groups files whose columns merge (ADR-0112 §2): their leaves' keys and levels, sorted, so that files
+/// of one schema whose writers order or name its columns otherwise group together.
+fn mergeKeyOf(leaves: Slice<PageLeaf>) -> Result<Vector<u8>, AllocError> {
+    var keys = Vector<Vector<u8>>.create();
+    for (k in 0..leaves.length) {
+        var one = copyBytes(leaves[k].key.view())?;
+        appendDecimal(mut one, leaves[k].maxDef as u64)?;
+        one.push(',')?;
+        appendDecimal(mut one, leaves[k].maxRep as u64)?;
+        keys.push(one)?;
+    }
+    keys.sortBy((a, b) => compareBytes(a.view(), b.view()));
+    var out = Vector<u8>.create();
+    for (k in 0..keys.length) {
+        appendDecimal(mut out, keys[k].length as u64)?;
+        out.push(':')?;
+        out.extend(keys[k].view())?;
+    }
+    return Ok(out);
 }

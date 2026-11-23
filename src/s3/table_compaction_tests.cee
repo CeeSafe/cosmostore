@@ -323,17 +323,97 @@ fn compactionMergesReadableFiles() -> Result<void, TestFailure> {
     let s = ObjectStore.open(dir.view(), storeConfig())!;
     Check.equalU64(1, checkCompactedRows(borrow s, 46)? as u64)?;
     // The merged file: one row group, every column read, the first fixture's values then the second's.
-    let rec = tableRecord(borrow s, "compact".bytes(), "ns".bytes(), "t".bytes())!;
-    let m = readMetadata(borrow s, COMPACT_HIDDEN.bytes(), jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+    let bytes = compactedFile(borrow s)?;
+    let n = parquetFooterLength(bytes.view()[bytes.length - 8..], bytes.length as u64)!;
+    let start = bytes.length - 8 - n as usize;
+    let footer = parseParquetFooter(bytes.view()[start..bytes.length - 8], bytes.length as u64)!!;
+    let groups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? { return Err(TestFailure.create("groups")); };
+    Check.equalU64(1, groups.length as u64)?;
+    Check.equalU64(46, truncate<u64>(footer.rows))?;
+    Check.equalU64(7, readAllColumns(bytes.view()) as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// Files of one schema from writers that order and name its columns otherwise merge (ADR-0112 §2): the renamed file's
+/// columns, matched by field id, follow the first's own in its order and under its names.
+@test
+fn compactionMergesByFieldId() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("compact-merge-ids");
+    fixtureCompactStoreOf(
+        dir.bytes(),
+        storeConfig(),
+        fixtureBytes(PAGES_FLAT_IDS[..]),
+        23,
+        fixtureBytes(PAGES_FLAT_IDS_RENAMED[..]),
+        23,
+    );
+    compactionWorkload(dir.bytes(), storeConfig());
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(1, checkCompactedRows(borrow s, 46)? as u64)?;
+    let bytes = compactedFile(borrow s)?;
+    let n = parquetFooterLength(bytes.view()[bytes.length - 8..], bytes.length as u64)!;
+    let start = bytes.length - 8 - n as usize;
+    let footer = parseParquetFooter(bytes.view()[start..bytes.length - 8], bytes.length as u64)!!;
+    let leaves = schemaLeaves(borrow footer.meta)!!;
+    let groups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? { return Err(TestFailure.create("groups")); };
+    Check.equalU64(1, groups.length as u64)?;
+    let group = match (borrow groups[0]) {
+        ThriftValue.Struct(f) => f,
+        _ => { return Err(TestFailure.create("a row group")); }
+    };
+    let chunks = structItems(group, PQ_GROUP_COLUMNS) ?? { return Err(TestFailure.create("columns")); };
+    Check.equalU64(7, chunks.length as u64)?;
+    for (c in 0..chunks.length) {
+        let chunk = match (borrow chunks[c]) {
+            ThriftValue.Struct(f) => f,
+            _ => { return Err(TestFailure.create("a column chunk")); }
+        };
+        let values = readColumnChunk(bytes.view(), chunk, borrow leaves[c])! ?? {
+            return Err(TestFailure.create("a column read"));
+        };
+        let want = twiceOver(PAGES_FLAT_IDS_EXPECTED[c]);
+        Check.equalText(want.view(), renderedColumn(borrow leaves[c], borrow values).view())?;
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// A fixture's expected line for its rows twice over: `path|def|rep|reps|defs|values`, levels and values doubled.
+fn twiceOver(line: StringView) -> String {
+    var parts = Vector<StringView>.create();
+    for (p in line.split("|")) { parts.push(p)!; }
+    var out = String.create();
+    for (i in 0..3) {
+        out.append(parts[i])!;
+        out.append("|")!;
+    }
+    for (i in 3..5) {
+        out.append(parts[i])!;
+        out.append(parts[i])!;
+        out.append("|")!;
+    }
+    out.append(parts[5])!;
+    if (parts[5].length > 0) {
+        out.append(",")!;
+        out.append(parts[5])!;
+    }
+    return out;
+}
+
+/// The bytes of the one compacted file the table's current snapshot names.
+fn compactedFile(s: borrow ObjectStore) -> Result<Vector<u8>, TestFailure> {
+    let rec = tableRecord(s, "compact".bytes(), "ns".bytes(), "t".bytes())!;
+    let m = readMetadata(s, COMPACT_HIDDEN.bytes(), jsonMemberText(borrow rec.json, "metadataLocation")!)!;
     let list = readWarehouseAvro(
-        borrow s,
+        s,
         COMPACT_HIDDEN.bytes(),
         snapshotListPath(borrow m, jsonMemberI64(borrow m, "current-snapshot-id")!)!,
     )!!;
     var path = Vector<u8>.create();
     for (i in 0..list.records.length) {
         let manifest = readWarehouseAvro(
-            borrow s,
+            s,
             COMPACT_HIDDEN.bytes(),
             jsonMemberText(borrow list.records[i], "manifest_path")!,
         )!!;
@@ -346,14 +426,5 @@ fn compactionMergesReadableFiles() -> Result<void, TestFailure> {
         }
     }
     let key = path.view()["s3://compact--table-s3/".bytes().length..];
-    let bytes = s.getObject(COMPACT_HIDDEN, StringView.fromUtf8(key) ?? "")!;
-    let n = parquetFooterLength(bytes.view()[bytes.length - 8..], bytes.length as u64)!;
-    let start = bytes.length - 8 - n as usize;
-    let footer = parseParquetFooter(bytes.view()[start..bytes.length - 8], bytes.length as u64)!!;
-    let groups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? { return Err(TestFailure.create("groups")); };
-    Check.equalU64(1, groups.length as u64)?;
-    Check.equalU64(46, truncate<u64>(footer.rows))?;
-    Check.equalU64(7, readAllColumns(bytes.view()) as u64)?;
-    removeTree(dir.view());
-    return Ok();
+    return Ok(s.getObject(COMPACT_HIDDEN, StringView.fromUtf8(key) ?? "")!);
 }
