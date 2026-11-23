@@ -39,6 +39,13 @@
     sometimes node 1. It asks through the two nodes still up.
   - **By pyarrow:** its thread pool can deadlock at interpreter exit under load, after the check's reads are done.
     The check scripts exit with `os._exit`.
+- **CI's perf gate on the move to 0.94.4 (bc87f88):** large GETs at 32 clients ran 0.74 and 0.77 of the base's
+  ops/s in both passes, and failed one pass of the rerun, which passed.
+  - **Why it is not the compiler:** 9b879f4's source was built with 0.94.0 and with 0.94.4 (their binaries 32 bytes
+    apart) and gated against each other here, 5 rounds of large objects at 32 clients, at a load of 3 to 8. With
+    0.94.4, large GETs did 1.07 times the ops/s, at 0.82 times the p99, and large writes were level.
+  - **What else changed between them:** 0.94.1 to 0.94.3 are screen readers in the window runtime, which a server
+    does not use, and 0.94.4 adds the zstd decoder, which GETs do not call.
 - **The review:** an agent read the ADR and the merge's code, with no reading of mine, and confirmed its findings with
   probe tests in a scratch copy. It found no input whose honest rows merge to different rows.
 
