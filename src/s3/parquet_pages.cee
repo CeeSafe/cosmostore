@@ -668,3 +668,84 @@ fn readColumnChunk(
     if (at != end || levels != numValues) { return Ok(null); }
     return Ok(Some(out));
 }
+
+/// Whether every column chunk of a file, by its footer alone, is one the reader takes: its codec, its encodings, its
+/// type (ADR-0112 §4: a bin merges only when all its files' pages can be read; otherwise it is joined as before).
+fn pagesReadable(meta: borrow Vector<ThriftField>) -> Result<bool, AllocError> {
+    let leaves = schemaLeaves(meta)? ?? { return Ok(false); };
+    let groups = structItems(meta, PQ_FILE_ROW_GROUPS) ?? { return Ok(false); };
+    for (g in 0..groups.length) {
+        let group = match (borrow groups[g]) {
+            ThriftValue.Struct(f) => f,
+            _ => { return Ok(false); }
+        };
+        let chunks = structItems(group, PQ_GROUP_COLUMNS) ?? { return Ok(false); };
+        if (chunks.length != leaves.length) { return Ok(false); }
+        for (c in 0..chunks.length) {
+            let chunk = match (borrow chunks[c]) {
+                ThriftValue.Struct(f) => f,
+                _ => { return Ok(false); }
+            };
+            let cm = match (thriftField(chunk, PQ_CHUNK_META)) {
+                Some(v) => match (v) {
+                    ThriftValue.Struct(f) => f,
+                    _ => { return Ok(false); }
+                },
+                null => { return Ok(false); }
+            };
+            if (valueWidth(borrow leaves[c]).isNull()) { return Ok(false); }
+            let codec = thriftInt(cm, PQ_META_CODEC) ?? { return Ok(false); };
+            if (!codecRead(codec)) { return Ok(false); }
+            match (thriftField(cm, 2)) {
+                Some(v) => {
+                    match (v) {
+                        ThriftValue.List(_, _, items) => {
+                            for (i in 0..items.length) {
+                                let e = match (borrow items[i]) {
+                                    ThriftValue.Int(_, n) => *n,
+                                    _ => { return Ok(false); }
+                                };
+                                let known = e == PQ_ENC_PLAIN || e == PQ_ENC_PLAIN_DICTIONARY || e == PQ_ENC_RLE ||
+                                    e == 4 || e == PQ_ENC_DELTA_BINARY_PACKED || e == PQ_ENC_DELTA_LENGTH_BYTE_ARRAY ||
+                                    e == PQ_ENC_DELTA_BYTE_ARRAY ||
+                                    e == PQ_ENC_RLE_DICTIONARY || e == PQ_ENC_BYTE_STREAM_SPLIT;
+                                if (!known) { return Ok(false); }
+                            }
+                        }
+                        _ => { return Ok(false); }
+                    }
+                }
+                null => { return Ok(false); }
+            }
+        }
+    }
+    return Ok(true);
+}
+
+/// The codecs read here: none and gzip, and SNAPPY and ZSTD once CeeSafe has them (ADR 0196 phases 2 and 3).
+fn codecRead(codec: i64) -> bool => codec == PQ_CODEC_UNCOMPRESSED || codec == PQ_CODEC_GZIP;
+
+/// `from`'s levels and values appended to `into`'s, a byte array's ends moved past what `into` held.
+fn appendValues(into: borrow mut ColumnValues, from: borrow ColumnValues) -> Result<bool, AllocError> {
+    into.reps.extend(from.reps.view())?;
+    into.defs.extend(from.defs.view())?;
+    let base = into.data.length;
+    into.data.extend(from.data.view())?;
+    for (i in 0..from.ends.length) {
+        into.ends.push(checkedTruncate<u32>(base + from.ends[i] as usize) ?? { return Ok(false); })?;
+    }
+    into.count += from.count;
+    return Ok(true);
+}
+
+/// Whether two files' leaves are the same columns: path, type, length and levels.
+fn sameLeaves(a: Slice<PageLeaf>, b: Slice<PageLeaf>) -> bool {
+    if (a.length != b.length) { return false; }
+    for (i in 0..a.length) {
+        if (a[i].path.view() != b[i].path.view() || a[i].physical != b[i].physical ||
+            a[i].typeLength != b[i].typeLength || a[i].maxDef != b[i].maxDef || a[i].maxRep != b[i].maxRep) {
+            return false;
+        }
+    }
+    return true;
+}

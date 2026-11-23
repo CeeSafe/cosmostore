@@ -5156,3 +5156,25 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - each fixture, written again uncompressed and gzip, reads back to its expected levels and values;
   - `tools/parquet_writer_check.py` has pyarrow read all 10 written files as their fixtures' tables, with statistics.
 - **Next:** SNAPPY once CeeSafe's snappy is released; then the rewrite in compaction (slice 5).
+
+### 23 Nov 2026: M23 slice 5 begun, the merge in compaction (ADR-0112 §2, §4)
+
+- **A bin merges** when every input's footer says its pages read here: codec, encodings, types (`pagesReadable`). Its
+  copy step then:
+  1. reads each input whole;
+  2. decodes its row groups, its columns checked to be the first input's;
+  3. writes the values as row groups of about the table's `write.parquet.row-group-size-bytes` (128 MB by default),
+     then the footer, the first input's schema kept.
+- **Other bins are joined as before.**
+- **Interim, to finish before the exit review:**
+  - **The codec:** merged files are GZIP until CeeSafe's snappy is released, then SNAPPY (the owner's choice; one
+    constant, `COMPACTION_PAGE_CODEC`).
+  - **ZSTD tables,** PyIceberg's default, do not merge until CeeSafe's zstd decoder.
+  - **Merging across writer shapes** (ADR-0112 §2) is not done yet: bins are still made by shape.
+- **Tests:**
+  - `compactionMergesReadableFiles`: two uncompressed pyarrow files of 23 rows become one file of one 46-row row
+    group, every column read back;
+  - the compaction sweeps pass on the join path;
+  - 458 unit tests in all. `snapshotsFaultsTorn` timed out once at a load average of about 250 (other sessions'
+    contract tests) and passed alone.
+- **CeeSafe's snappy (ADR 0196 phase 2):** five commits on its branch. Its contract tests are running.

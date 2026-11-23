@@ -49,13 +49,14 @@ fn compactEntry(template: borrow Json, path: Slice<u8>, size: usize, rows: i64) 
 /// A table bucket `compact` with table `ns.t`, partitioned by identity on field 2 as PyIceberg's fixture table is: one
 /// snapshot of two data files in one partition (Parquet fixtures A and B, 3 and 2 rows), both under compaction's
 /// target, so a run joins them into one.
-fn fixtureCompactStore(dir: Slice<u8>, config: StoreConfig) {
+fn fixtureCompactStore(dir: Slice<u8>, config: StoreConfig) =>
+    fixtureCompactStoreOf(dir, config, fixtureBytes(PARQUET_FIXTURE_A[..]), 3, fixtureBytes(PARQUET_FIXTURE_B[..]), 2);
+
+/// The table of `fixtureCompactStore` with data files `a` and `b` of `aRows` and `bRows` rows.
+fn fixtureCompactStoreOf(dir: Slice<u8>, config: StoreConfig, a: Vector<u8>, aRows: i64, b: Vector<u8>, bRows: i64) {
     var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", config)!;
     s.createBucket(COMPACT_HIDDEN)!;
     let hidden = COMPACT_HIDDEN.bytes();
-    // The data files.
-    let a = fixtureBytes(PARQUET_FIXTURE_A[..]);
-    let b = fixtureBytes(PARQUET_FIXTURE_B[..]);
     let aKey = compactKey("data/kind=a/a.parquet");
     let bKey = compactKey("data/kind=a/b.parquet");
     let _ = s.putObject(COMPACT_HIDDEN, StringView.fromUtf8(aKey.view()) ?? "", "", a.view(), PutCondition.None)!;
@@ -63,8 +64,12 @@ fn fixtureCompactStore(dir: Slice<u8>, config: StoreConfig) {
     // Their manifest, written as PyIceberg's fixture is, its entries pointed at them.
     let fixture = readAvro(fixtureBytes(AVRO_FIXTURE_MANIFEST[..]).view())!;
     var entries = Vector<Json>.create();
-    entries.push(compactEntry(borrow fixture.records[0], compactPath("data/kind=a/a.parquet").view(), a.length, 3))!;
-    entries.push(compactEntry(borrow fixture.records[0], compactPath("data/kind=a/b.parquet").view(), b.length, 2))!;
+    entries.push(
+        compactEntry(borrow fixture.records[0], compactPath("data/kind=a/a.parquet").view(), a.length, aRows),
+    )!;
+    entries.push(
+        compactEntry(borrow fixture.records[0], compactPath("data/kind=a/b.parquet").view(), b.length, bRows),
+    )!;
     let manifest = writeAvro(fixture.metadata.view(), entries.view())!!;
     let mKey = compactKey("metadata/m0.avro");
     let _ = s.putObject(
@@ -83,7 +88,7 @@ fn fixtureCompactStore(dir: Slice<u8>, config: StoreConfig) {
     jsonSet(mut item, "sequence_number", jsonInteger(1)!)!;
     jsonSet(mut item, "min_sequence_number", jsonInteger(1)!)!;
     jsonSet(mut item, "added_files_count", jsonInteger(2)!)!;
-    jsonSet(mut item, "added_rows_count", jsonInteger(5)!)!;
+    jsonSet(mut item, "added_rows_count", jsonInteger(aRows + bRows)!)!;
     var items = Vector<Json>.create();
     items.push(item)!;
     let list = writeAvro(listFixture.metadata.view(), items.view())!!;
@@ -157,7 +162,10 @@ fn compactionWorkload(dir: Slice<u8>, config: StoreConfig) {
 
 /// A recovered store's table: its metadata names snapshot 1 (before) or a replace after it, every data file its
 /// current snapshot's manifests name is there with its size, and they hold the 5 rows. Returns how many data files.
-fn checkCompacted(s: borrow ObjectStore) -> Result<usize, TestFailure> {
+fn checkCompacted(s: borrow ObjectStore) -> Result<usize, TestFailure> => checkCompactedRows(s, 5);
+
+/// `checkCompacted`, for a table of `want` rows.
+fn checkCompactedRows(s: borrow ObjectStore, want: i64) -> Result<usize, TestFailure> {
     if (!s.bucketExists(COMPACT_HIDDEN)!) { return Err(TestFailure.create("the table bucket is gone")); }
     let rec = match (tableRecord(s, "compact".bytes(), "ns".bytes(), "t".bytes())) {
         Ok(r) => r,
@@ -218,7 +226,7 @@ fn checkCompacted(s: borrow ObjectStore) -> Result<usize, TestFailure> {
             files += 1;
         }
     }
-    Check.equalU64(5, truncate<u64>(rows))?;
+    Check.equalU64(truncate<u64>(want), truncate<u64>(rows))?;
     return Ok(files);
 }
 
@@ -297,3 +305,55 @@ fn compactionFaultsTorn() -> Result<void, TestFailure> => sweepCompaction("compa
 
 @test
 fn compactionFaultsCrash() -> Result<void, TestFailure> => sweepCompaction("compact-crash", SweepMode.Crash);
+
+/// A bin whose pages all read is merged (ADR-0112): two uncompressed pyarrow files of 23 rows, one written with a
+/// dictionary and one PLAIN, become one file of one row group of 46 rows that the page reader reads whole.
+@test
+fn compactionMergesReadableFiles() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("compact-merge");
+    fixtureCompactStoreOf(
+        dir.bytes(),
+        storeConfig(),
+        fixtureBytes(PAGES_FLAT_V1_DICT[..]),
+        23,
+        fixtureBytes(PAGES_FLAT_V1_PLAIN[..]),
+        23,
+    );
+    compactionWorkload(dir.bytes(), storeConfig());
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(1, checkCompactedRows(borrow s, 46)? as u64)?;
+    // The merged file: one row group, every column read, the first fixture's values then the second's.
+    let rec = tableRecord(borrow s, "compact".bytes(), "ns".bytes(), "t".bytes())!;
+    let m = readMetadata(borrow s, COMPACT_HIDDEN.bytes(), jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+    let list = readWarehouseAvro(
+        borrow s,
+        COMPACT_HIDDEN.bytes(),
+        snapshotListPath(borrow m, jsonMemberI64(borrow m, "current-snapshot-id")!)!,
+    )!!;
+    var path = Vector<u8>.create();
+    for (i in 0..list.records.length) {
+        let manifest = readWarehouseAvro(
+            borrow s,
+            COMPACT_HIDDEN.bytes(),
+            jsonMemberText(borrow list.records[i], "manifest_path")!,
+        )!!;
+        for (e in 0..manifest.records.length) {
+            if (jsonMemberI64(borrow manifest.records[e], "status") == Some(2i64)) { continue; }
+            let file = jsonMember(borrow manifest.records[e], "data_file") ?? {
+                return Err(TestFailure.create("a file"));
+            };
+            path = copyBytes(jsonMemberText(file, "file_path")!)!;
+        }
+    }
+    let key = path.view()["s3://compact--table-s3/".bytes().length..];
+    let bytes = s.getObject(COMPACT_HIDDEN, StringView.fromUtf8(key) ?? "")!;
+    let n = parquetFooterLength(bytes.view()[bytes.length - 8..], bytes.length as u64)!;
+    let start = bytes.length - 8 - n as usize;
+    let footer = parseParquetFooter(bytes.view()[start..bytes.length - 8], bytes.length as u64)!!;
+    let groups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? { return Err(TestFailure.create("groups")); };
+    Check.equalU64(1, groups.length as u64)?;
+    Check.equalU64(46, truncate<u64>(footer.rows))?;
+    Check.equalU64(7, readAllColumns(bytes.view()) as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
