@@ -233,7 +233,6 @@ fn planCompaction(
     // The live delete files (ADR-0114 §3). A partition whose deletes are all read here is compacted with them applied;
     // one with any other (not Parquet, not here, too large, an equality delete without its ids) stays as it is
     // (ADR-0098 §2), and so does every partition while deletes are not applied (`COMPACTION_APPLIES_DELETES`).
-    var deleted = Vector<Vector<u8>>.create();
     var blocked = Vector<Vector<u8>>.create();
     var deletes = Vector<DeleteFile>.create();
     var deleteSpecs = Vector<i64>.create();
@@ -245,17 +244,10 @@ fn planCompaction(
             let entry = borrow manifests[i].records[e];
             if (recordInt(entry, "status", 0) == 2) { continue; }
             let file = jsonMember(entry, "data_file");
-            let partition = match (file) {
-                Some(d) => match (jsonMember(d, "partition")) {
-                    Some(p) => jsonTextOf(p)?,
-                    null => Vector<u8>.create(),
-                },
-                null => Vector<u8>.create(),
+            let k = match (file) {
+                Some(d) => partitionKeyOf(spec, jsonMember(d, "partition"))?,
+                null => partitionKeyOf(spec, null)?,
             };
-            var k = Vector<u8>.create();
-            appendDecimal(mut k, truncate<u64>(spec))?;
-            k.push(' ')?;
-            k.extend(partition.view())?;
             if (!holdsId(deleteSpecs.view(), spec)) { deleteSpecs.push(spec)?; }
             let read = match (file) {
                 Some(d) => if (COMPACTION_APPLIES_DELETES) deleteFileOf(store, hidden.view(), d, k.view())? else null,
@@ -271,7 +263,6 @@ fn planCompaction(
                         null => manifestSequence,
                     };
                     deletes.push(one)?;
-                    deleted.push(k)?;
                 }
                 null => { blocked.push(k)?; }
             }
@@ -306,13 +297,7 @@ fn planCompaction(
                 RefPlace.Here => {}
                 _ => { continue; }
             }
-            var partitionKey = Vector<u8>.create();
-            appendDecimal(mut partitionKey, truncate<u64>(spec))?;
-            partitionKey.push(' ')?;
-            match (jsonMember(file, "partition")) {
-                Some(p) => { partitionKey.extend(jsonTextOf(p)?.view())?; }
-                null => {}
-            }
+            let partitionKey = partitionKeyOf(spec, jsonMember(file, "partition"))?;
             var inBlocked = false;
             for (d in 0..blocked.length) {
                 if (blocked[d].view() == partitionKey.view()) { inBlocked = true; }
@@ -518,6 +503,31 @@ fn rowGroupBytesOf(m: borrow Json) -> u64 {
     return if (n < 1048576) 1048576 else if (n > COMPACTION_MAX_ROW_GROUP_BYTES) COMPACTION_MAX_ROW_GROUP_BYTES else n;
 }
 
+/// A file's partition key: its spec, and its partition's values in their order, without their names (the M24 exit
+/// review's S1: writers that name a partition field otherwise, as Avro's names are made, still match).
+fn partitionKeyOf(spec: i64, partition: borrow Json?) -> Result<Vector<u8>, AllocError> {
+    var k = Vector<u8>.create();
+    appendDecimal(mut k, truncate<u64>(spec))?;
+    k.push(' ')?;
+    match (partition) {
+        Some(p) => {
+            match (p) {
+                Json.Object(members) => {
+                    k.push('[')?;
+                    for (m in 0..members.length) {
+                        if (m > 0) { k.push(',')?; }
+                        k.extend(jsonTextOf(borrow members[m].value)?.view())?;
+                    }
+                    k.push(']')?;
+                }
+                _ => { k.extend(jsonTextOf(p)?.view())?; }
+            }
+        }
+        null => {}
+    }
+    return Ok(k);
+}
+
 /// A live delete file's entry, when it is one read here (ADR-0114 §3): position or equality, Parquet, in the table's
 /// warehouse, at its size and not sealed, at most DELETE_FILE_MAX_BYTES, an equality delete with its field ids.
 fn deleteFileOf(
@@ -531,6 +541,9 @@ fn deleteFileOf(
     if (!equalsIgnoreCase(jsonMemberText(d, "file_format") ?? "".bytes(), "PARQUET".bytes())) { return Ok(null); }
     let size = recordInt(d, "file_size_in_bytes", -1);
     if (size <= 0 || truncate<u64>(size) > DELETE_FILE_MAX_BYTES) { return Ok(null); }
+    // Its rows as its manifest states them, within DELETE_FILE_MAX_ROWS (its decoding checks them again).
+    let rows = recordInt(d, "record_count", -1);
+    if (rows < 0 || truncate<u64>(rows) > DELETE_FILE_MAX_ROWS as u64) { return Ok(null); }
     let path = jsonMemberText(d, "file_path") ?? { return Ok(null); };
     match (refPlace(path, hidden)) {
         RefPlace.Here => {}
@@ -890,6 +903,11 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
             equalityAt.push(x)?;
         }
     }
+    // All of the bin's deletes together within DELETE_BIN_MAX_ROWS (the M24 exit review's H2).
+    var deleteRows: usize = 0;
+    for (q in 0..positionSets.length) { deleteRows += positionSets[q].rows; }
+    for (q in 0..equalitySets.length) { deleteRows += equalitySets[q].rows; }
+    if (deleteRows > DELETE_BIN_MAX_ROWS) { return Ok(null); }
     for (i in 0..c.footers.length) {
         let footer = borrow c.footers[i];
         let these = schemaLeaves(borrow footer.meta)? ?? { return Ok(null); };
@@ -901,6 +919,7 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
                     path: copyBytes(these[k].path.view())?,
                     key: copyBytes(these[k].key.view())?,
                     fieldId: these[k].fieldId,
+                    unit: these[k].unit,
                     physical: these[k].physical,
                     typeLength: these[k].typeLength,
                     maxDef: these[k].maxDef,
@@ -920,7 +939,7 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
             let sequence = c.inputSequences[i];
             for (q in 0..positionSets.length) {
                 if (sequence > c.binDeletes[positionAt[q]].sequence) { continue; }
-                match (positionsOf(borrow positionSets[q], c.inputPaths[i].view())) {
+                match (positionsOf(borrow positionSets[q], c.inputPaths[i].view())?) {
                     Some(ps) => { drops.extend(ps)?; }
                     null => {}
                 }
@@ -990,6 +1009,7 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
                                 path: Vector<u8>.create(),
                                 key: Vector<u8>.create(),
                                 fieldId: these[k].fieldId,
+                                unit: these[k].unit,
                                 physical: these[k].physical,
                                 typeLength: these[k].typeLength,
                                 maxDef: these[k].maxDef,
@@ -1121,6 +1141,14 @@ fn outputSequence(bin: borrow CompactionBin, startSequence: i64) -> i64 {
     return most;
 }
 
+/// A spec's prefix of a partition key: its id and a space.
+fn specPrefix(spec: i64) -> Result<Vector<u8>, AllocError> {
+    var k = Vector<u8>.create();
+    appendDecimal(mut k, truncate<u64>(spec))?;
+    k.push(' ')?;
+    return Ok(k);
+}
+
 /// Whether delete file `d` may still apply to a live data file after the commit: one of the current snapshot's
 /// data files it keeps (not in `gone`), or one it adds, by Iceberg's rule (partition and sequence number).
 fn deleteStillApplies(
@@ -1151,13 +1179,10 @@ fn deleteStillApplies(
             if (recordInt(entry, "status", 0) == 2 || holdsIndex(gone[i].view(), e)) { continue; }
             let file = jsonMember(entry, "data_file") ?? { continue; };
             if (recordInt(file, "content", 0) != 0) { continue; }
-            var k = Vector<u8>.create();
-            appendDecimal(mut k, truncate<u64>(spec))?;
-            k.push(' ')?;
-            match (jsonMember(file, "partition")) {
-                Some(p) => { k.extend(jsonTextOf(p)?.view())?; }
-                null => {}
-            }
+            // A live data file of another spec: a delete written under an unpartitioned spec applies to every spec's
+            // older files (Iceberg's global equality deletes, the M24 exit review's H1), so none is removed then.
+            if (!d.partitionKey.view().startsWith(specPrefix(spec)?.view())) { return Ok(true); }
+            let k = partitionKeyOf(spec, jsonMember(file, "partition"))?;
             let sequence = match (jsonMember(entry, "sequence_number")) {
                 Some(v) => jsonI64(v) ?? manifestSequence,
                 null => manifestSequence,
@@ -1542,6 +1567,12 @@ fn commitWritten(
     var removedDeletes = Vector<usize>.create();
     for (x in 0..plan.deletes.length) {
         let d = borrow plan.deletes[x];
+        // Only a delete a committed bin applied (the M24 exit review: not one whose partition merely matched no file).
+        var applied = false;
+        for (o in 0..outputs.length) {
+            if (holdsIndex(plan.bins[bins[o]].deletes.view(), x)) { applied = true; }
+        }
+        if (!applied) { continue; }
         if (!deleteStillApplies(plan, d, gone.view(), outputs, bins, startSequence)?) {
             gone[d.manifest].push(d.entry)?;
             removedDeletes.push(x)?;

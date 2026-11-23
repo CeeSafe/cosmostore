@@ -509,11 +509,12 @@ check "and listed through node 1" "$(on 1 s3api list-objects-v2 --bucket tail-c 
 on 3 s3api put-object --bucket tail-c --key g --body one.txt --storage-class GLACIER > /dev/null 2>&1
 check "an archive class taken through node 3, its read refused through node 1" "$(code 1 s3api get-object --bucket tail-c --key g g.out)" InvalidObjectState
 # A restore on a cluster (ADR-0102 §7): asked through node 2, its state through the shard's log, read through node 1
-# once ready (an hour is a second: Standard's 4 hours take 4 s).
-on 2 s3api restore-object --bucket tail-c --key g --restore-request '{"Days":1}' > /dev/null 2>&1
+# once ready (an hour is a second: Bulk's 8 hours on GLACIER take 8 s, long enough that a second ask under a loaded
+# machine's slow clients still finds it in progress, where Standard's 4 s was not).
+on 2 s3api restore-object --bucket tail-c --key g --restore-request '{"Days":1,"GlacierJobParameters":{"Tier":"Bulk"}}' > /dev/null 2>&1
 check "restoring, seen through node 3" "$(on 3 s3api head-object --bucket tail-c --key g --query Restore --output text 2>&1)" 'ongoing-request="true"'
-check "a second restore through node 1" "$(code 1 s3api restore-object --bucket tail-c --key g --restore-request '{"Days":1}')" RestoreAlreadyInProgress
-pause 5
+check "a second restore through node 1" "$(code 1 s3api restore-object --bucket tail-c --key g --restore-request '{"Days":1,"GlacierJobParameters":{"Tier":"Bulk"}}')" RestoreAlreadyInProgress
+pause 9
 check "restored: read through node 1" "$(on 1 s3 cp s3://tail-c/g - 2>&1)" "$(cat one.txt)"
 on 1 s3api put-bucket-lifecycle-configuration --bucket tail-c --lifecycle-configuration '{"Rules":[{"ID":"tiers","Status":"Enabled","Filter":{},"Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"}]}]}' > /dev/null 2>&1
 check "lifecycle transitions through node 1, read through node 2" "$(on 2 s3api get-bucket-lifecycle-configuration --bucket tail-c --query 'Rules[0].Transitions[0].StorageClass' --output text 2>&1)" STANDARD_IA

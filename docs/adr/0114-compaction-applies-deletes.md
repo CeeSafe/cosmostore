@@ -142,3 +142,16 @@ written ("From rows written") and M23's B1 as the first slice ("First slice").
     - metrics compared with PyIceberg's.
     - **One limit:** PyIceberg reads no table with equality deletes (apache/iceberg#6568), so that table's rows before
       compaction are stated and its files listed from the manifests.
+
+## Amended by the exit review (`docs/m24-exit-review.md`)
+
+- **§3, delete files bounded in rows:** at most 8 M rows each, as their manifest states them and as they decode (a
+  chunk's stated count checked before it is decoded), and 16 M for a bin's together. Position deletes find their
+  path through a hash map.
+- **§3, partitions** are keyed by their spec and their values in order, without the fields' names.
+- **§2 and §4, time units:** a leaf carries its time unit. A time or timestamp has an Iceberg value only in Iceberg's
+  unit: otherwise it has no bound, and an equality delete on it leaves its bin as it is.
+- **§4:** every NaN is one equality key.
+- **§2:** metrics modes are matched without case.
+- **§5, delete files removed:** only one a committed bin applied, and none while a live data file of another spec
+  remains, since an equality delete written under an unpartitioned spec applies to every spec's older files.

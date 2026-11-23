@@ -36,13 +36,13 @@ fn deletesApplyBySequenceAndPartition() -> Result<void, TestFailure> {
 fn positionDeletesRead() -> Result<void, TestFailure> {
     let bytes = fixtureBytes(PAGES_DELETES_POSITION[..]);
     let d = readPositionDeletes(bytes.view())! ?? { return Err(TestFailure.create("read")); };
-    let a = positionsOf(borrow d, "s3://b/x/a.parquet".bytes()) ?? { return Err(TestFailure.create("a")); };
+    let a = positionsOf(borrow d, "s3://b/x/a.parquet".bytes())! ?? { return Err(TestFailure.create("a")); };
     Check.equalU64(2, a.length as u64)?;
     Check.equalU64(1, truncate<u64>(a[0]))?;
     Check.equalU64(3, truncate<u64>(a[1]))?;
-    let b = positionsOf(borrow d, "s3://b/x/b.parquet".bytes()) ?? { return Err(TestFailure.create("b")); };
+    let b = positionsOf(borrow d, "s3://b/x/b.parquet".bytes())! ?? { return Err(TestFailure.create("b")); };
     Check.equalU64(1, b.length as u64)?;
-    Check.isTrue(positionsOf(borrow d, "s3://b/x/c.parquet".bytes()).isNull(), "a path it does not name")?;
+    Check.isTrue(positionsOf(borrow d, "s3://b/x/c.parquet".bytes())!.isNull(), "a path it does not name")?;
     // A data file is not a position delete file.
     Check.isTrue(readPositionDeletes(fixtureBytes(PAGES_FLAT_IDS[..]).view())!.isNull(), "not one")?;
     return Ok();
@@ -68,6 +68,7 @@ fn equalityDeletesMatchRows() -> Result<void, TestFailure> {
             path: copyBytes(data.leaves[k].path.view())!,
             key: copyBytes(data.leaves[k].key.view())!,
             fieldId: data.leaves[k].fieldId,
+            unit: data.leaves[k].unit,
             physical: data.leaves[k].physical,
             typeLength: data.leaves[k].typeLength,
             maxDef: data.leaves[k].maxDef,
@@ -135,5 +136,44 @@ fn rowsKeptWhole() -> Result<void, TestFailure> {
             "short",
         )?;
     }
+    return Ok();
+}
+
+/// A delete file's rows bounded as it decodes (the M24 exit review's H2): 3 rows read under a limit of 3, not of 2.
+@test
+fn deleteRowsBounded() -> Result<void, TestFailure> {
+    let bytes = fixtureBytes(PAGES_DELETES_POSITION[..]);
+    Check.isTrue(readPositionDeletesWithin(bytes.view(), 3)!.isSome(), "within")?;
+    Check.isTrue(readPositionDeletesWithin(bytes.view(), 2)!.isNull(), "past it")?;
+    return Ok();
+}
+
+/// Every NaN one equality key (the M24 exit review's L3), as Java's comparison has them equal.
+@test
+fn nanKeysAreOne() -> Result<void, TestFailure> {
+    let leaf = PageLeaf {
+        path: copyBytes("f".bytes())!,
+        key: copyBytes("f".bytes())!,
+        fieldId: 3,
+        unit: PQ_UNIT_NONE,
+        physical: PQ_FLOAT,
+        typeLength: 0,
+        maxDef: 0,
+        maxRep: 0,
+    };
+    var v = emptyValues();
+    for (nan in [[0u8, 0, 0xC0, 0x7F], [1u8, 0, 0xC0, 0x7F], [0u8, 0, 0xC0, 0xFF]]) {
+        v.reps.push(0)!;
+        v.defs.push(0)!;
+        let _ = pushValue(mut v, borrow leaf, nan[..])!;
+    }
+    var leaves = Vector<PageLeaf>.create();
+    leaves.push(leaf)!;
+    var columns = Vector<ColumnValues>.create();
+    columns.push(v)!;
+    var kinds = Vector<Vector<u8>>.create();
+    kinds.push(copyBytes("float".bytes())!)!;
+    let keys = rowKeys(leaves.view(), kinds.view(), columns.view())!!;
+    Check.isTrue(keys[0].view() == keys[1].view() && keys[1].view() == keys[2].view(), "one key")?;
     return Ok();
 }

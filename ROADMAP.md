@@ -5361,3 +5361,24 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Totals:** 491 unit tests; 588,000 sanitized fuzz mutants; 80 compaction checks on `serve` and through a cluster.
 - **ADR-0114's As built** written.
 - **Next:** slice 7, the exit review.
+
+### 24 Nov 2026: M24 slice 7, the exit review (ADR-0114)
+
+- **`docs/m24-exit-review.md`:** an agent reviewed the code with no reading of mine.
+- **Fixed:**
+  - High: an equality delete under an unpartitioned spec could be removed while another spec's older files still
+    needed it. None is removed while another spec's data is live.
+  - High: a delete file within 64 MB could decode to billions of values. Rows are bounded at 8 M a file (stated and
+    decoded) and 16 M a bin.
+  - Position deletes' paths found by a hash map.
+  - Time units carried by a leaf: bounds and keys only in Iceberg's unit.
+  - NaN equality keys made one.
+  - Metrics modes matched without case.
+  - Partitions keyed by their values without names.
+  - Delete files removed only when a committed bin applied them.
+- **Recorded, B1 to B4:** a 0-row file when all of a bin's rows are deleted; partitions that stay as they are, never
+  wrongly; position delete files removed conservatively; partition values matched as the Avro reader gives them.
+- **The cluster smoke's restore check** used Standard's 4 s, which a loaded machine's slow clients outran (twice at a
+  load of 130). It uses Bulk's 8 s now.
+- **Results:** 495 unit tests; the smokes; 80 compaction checks on `serve` and through a cluster.
+- **Next:** the owner's decisions: ADR-0114's acceptance as amended, and closing M24.

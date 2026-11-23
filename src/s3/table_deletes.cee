@@ -18,6 +18,13 @@ const DELETE_CONTENT_POSITION: i64 = 1;
 const DELETE_CONTENT_EQUALITY: i64 = 2;
 /// The largest delete file read: a partition with a larger one is left as it is.
 const DELETE_FILE_MAX_BYTES: u64 = 67108864;
+/// The most rows a delete file may hold, as its manifest states and as it decodes (the M24 exit review's H2: a few
+/// bytes of RLE state millions of values, so bytes alone do not bound it), and all of a bin's delete files together.
+const DELETE_FILE_MAX_ROWS: usize = 8388608;
+const DELETE_BIN_MAX_ROWS: usize = 16777216;
+/// The NaN every NaN is keyed as, little-endian.
+const CANONICAL_NAN_FLOAT: [u8; 4] = [0, 0, 0xC0, 0x7F];
+const CANONICAL_NAN_DOUBLE: [u8; 8] = [0, 0, 0, 0, 0, 0, 0xF8, 0x7F];
 
 /// A live delete file of a partition compacted with its deletes.
 struct DeleteFile {
@@ -49,14 +56,18 @@ fn deleteApplies(d: borrow DeleteFile, partitionKey: Slice<u8>, sequence: i64) -
 struct PositionDeletes {
     paths: Vector<Vector<u8>>;
     positions: Vector<Vector<i64>>;
+    /// Each path's index (the M24 exit review's M1: a scan per row was quadratic in the paths named).
+    index: HashMap<Vector<u8>, usize>;
+    rows: usize;
 }
 
 /// The positions deleted in `path`, sorted; null when it names none.
-fn positionsOf<region a>(d: borrow(a) PositionDeletes, path: Slice<u8>) -> Slice<a, i64>? {
-    for (i in 0..d.paths.length) {
-        if (d.paths[i].view() == path) { return Some(d.positions[i].view()); }
-    }
-    return null;
+fn positionsOf<region a>(d: borrow(a) PositionDeletes, path: Slice<u8>) -> Result<Slice<a, i64>?, AllocError> {
+    let key = copyBytes(path)?;
+    return Ok(match (d.index.get(borrow key)) {
+        Some(i) => Some(d.positions[*i].view()),
+        null => null,
+    });
 }
 
 /// A file's footer and leaves, from its whole bytes; null when it is not a Parquet file read here.
@@ -92,6 +103,7 @@ fn wholeColumns(
     bytes: Slice<u8>,
     f: borrow DeleteFooter,
     wanted: Slice<usize>,
+    maxRows: usize,
 ) -> Result<Vector<ColumnValues>?, AllocError> {
     var out = Vector<ColumnValues>.create();
     for (w in 0..wanted.length) { out.push(emptyValues())?; }
@@ -109,6 +121,16 @@ fn wholeColumns(
                 ThriftValue.Struct(x) => x,
                 _ => { return Ok(null); }
             };
+            // Its stated values checked before it is decoded: a file past DELETE_FILE_MAX_ROWS is not read.
+            let stated = match (thriftField(chunk, PQ_CHUNK_META)) {
+                Some(m) => match (m) {
+                    ThriftValue.Struct(meta) => thriftInt(meta, PQ_META_NUM_VALUES) ?? -1,
+                    _ => -1,
+                },
+                null => -1,
+            };
+            let more = checkedTruncate<usize>(stated) ?? { return Ok(null); };
+            if (more > maxRows || out[w].defs.length > maxRows - more) { return Ok(null); }
             let values = readColumnChunk(bytes, chunk, borrow f.leaves[k])? ?? { return Ok(null); };
             if (!(appendValues(mut out[w], borrow values)?)) { return Ok(null); }
         }
@@ -118,7 +140,11 @@ fn wholeColumns(
 
 /// A position delete file's rows; null when it is not one read here (its columns by Iceberg's reserved ids, both
 /// required).
-fn readPositionDeletes(bytes: Slice<u8>) -> Result<PositionDeletes?, AllocError> {
+fn readPositionDeletes(bytes: Slice<u8>) -> Result<PositionDeletes?, AllocError> =>
+    readPositionDeletesWithin(bytes, DELETE_FILE_MAX_ROWS);
+
+/// `readPositionDeletes`, of at most `maxRows` rows.
+fn readPositionDeletesWithin(bytes: Slice<u8>, maxRows: usize) -> Result<PositionDeletes?, AllocError> {
     let f = deleteFooterOf(bytes)? ?? { return Ok(null); };
     let pathAt = leafOfId(f.leaves.view(), ICEBERG_DELETE_FILE_PATH) ?? { return Ok(null); };
     let posAt = leafOfId(f.leaves.view(), ICEBERG_DELETE_POS) ?? { return Ok(null); };
@@ -128,7 +154,7 @@ fn readPositionDeletes(bytes: Slice<u8>) -> Result<PositionDeletes?, AllocError>
         posLeaf.maxRep != 0) {
         return Ok(null);
     }
-    let columns = wholeColumns(bytes, borrow f, [pathAt, posAt][..])? ?? { return Ok(null); };
+    let columns = wholeColumns(bytes, borrow f, [pathAt, posAt][..], maxRows)? ?? { return Ok(null); };
     let paths = borrow columns[0];
     let positions = borrow columns[1];
     // Both required: as many values as rows, none null.
@@ -136,24 +162,33 @@ fn readPositionDeletes(bytes: Slice<u8>) -> Result<PositionDeletes?, AllocError>
         positions.count != positions.defs.length || paths.count != positions.count) {
         return Ok(null);
     }
-    var out = PositionDeletes { paths: Vector<Vector<u8>>.create(), positions: Vector<Vector<i64>>.create() };
+    var out = PositionDeletes {
+        paths: Vector<Vector<u8>>.create(),
+        positions: Vector<Vector<i64>>.create(),
+        index: HashMap<Vector<u8>, usize>.create(),
+        rows: paths.count,
+    };
     for (i in 0..paths.count) {
         let path = valueAt(paths, pathLeaf, i);
         let pos = truncate<i64>(valueAt(positions, posLeaf, i).readLE<u64>(0));
         if (pos < 0) { return Ok(null); }
-        var at: usize? = null;
         // Rows are sorted by path in a well-written file, so the last path is the likely one.
+        var at: usize? = null;
         if (out.paths.length > 0 && out.paths[out.paths.length - 1].view() == path) {
             at = Some(out.paths.length - 1);
         } else {
-            for (p in 0..out.paths.length) {
-                if (out.paths[p].view() == path) { at = Some(p); }
+            let key = copyBytes(path)?;
+            match (out.index.get(borrow key)) {
+                Some(p) => { at = Some(*p); }
+                null => {}
             }
         }
         match (at) {
             Some(p) => { out.positions[p].push(pos)?; }
             null => {
+                let p = out.paths.length;
                 out.paths.push(copyBytes(path)?)?;
+                let _ = out.index.put(copyBytes(path)?, p)?;
                 var one = Vector<i64>.create();
                 one.push(pos)?;
                 out.positions.push(one)?;
@@ -168,6 +203,7 @@ fn readPositionDeletes(bytes: Slice<u8>) -> Result<PositionDeletes?, AllocError>
 /// a map, or of a type whose Iceberg form is not made here).
 struct EqualityDeletes {
     keys: HashMap<Vector<u8>, u8>;
+    rows: usize;
 }
 
 /// A key part: null as one byte, a value as a marker, its length and its Iceberg form.
@@ -204,8 +240,18 @@ fn rowKeys(
                 appendKeyPart(mut keys[r], null)?;
                 continue;
             }
-            let ice = icebergValue(kinds[c].view(), leaf, valueAt(v, leaf, value))? ?? { return Ok(null); };
+            let raw = valueAt(v, leaf, value);
             value += 1;
+            // Every NaN one key, as Java's comparison of floats has them equal (the M24 exit review's L3).
+            if (isNaNValue(leaf.physical, raw)) {
+                if (leaf.physical == PQ_FLOAT) {
+                    appendKeyPart(mut keys[r], Some(CANONICAL_NAN_FLOAT[..]))?;
+                } else {
+                    appendKeyPart(mut keys[r], Some(CANONICAL_NAN_DOUBLE[..]))?;
+                }
+                continue;
+            }
+            let ice = icebergValue(kinds[c].view(), leaf, raw)? ?? { return Ok(null); };
             appendKeyPart(mut keys[r], Some(ice.view()))?;
         }
     }
@@ -229,15 +275,16 @@ fn readEqualityDeletes(
             path: copyBytes(f.leaves[k].path.view())?,
             key: copyBytes(f.leaves[k].key.view())?,
             fieldId: f.leaves[k].fieldId,
+            unit: f.leaves[k].unit,
             physical: f.leaves[k].physical,
             typeLength: f.leaves[k].typeLength,
             maxDef: f.leaves[k].maxDef,
             maxRep: f.leaves[k].maxRep,
         })?;
     }
-    let columns = wholeColumns(bytes, borrow f, wanted.view())? ?? { return Ok(null); };
+    let columns = wholeColumns(bytes, borrow f, wanted.view(), DELETE_FILE_MAX_ROWS)? ?? { return Ok(null); };
     let keys = rowKeys(leaves.view(), kinds, columns.view())? ?? { return Ok(null); };
-    var out = EqualityDeletes { keys: HashMap<Vector<u8>, u8>.create() };
+    var out = EqualityDeletes { keys: HashMap<Vector<u8>, u8>.create(), rows: keys.length };
     for (r in 0..keys.length) { let _ = out.keys.put(copyBytes(keys[r].view())?, 1)?; }
     return Ok(Some(out));
 }
@@ -287,6 +334,7 @@ fn nullLeaf() -> Result<PageLeaf, AllocError> => Ok(PageLeaf {
     path: Vector<u8>.create(),
     key: Vector<u8>.create(),
     fieldId: -1,
+    unit: PQ_UNIT_NONE,
     physical: PQ_BYTE_ARRAY,
     typeLength: 0,
     maxDef: 1,

@@ -56,6 +56,57 @@ const PQ_MAX_DELTA_BLOCK: u64 = 65536;
 const PQ_MAX_CHUNK: usize = 1073741824;
 /// Levels are a byte each: a schema deeper than this is refused.
 const PQ_MAX_LEVEL: u32 = 64;
+const PQ_UNIT_NONE: u8 = 0;
+const PQ_UNIT_MILLIS: u8 = 1;
+const PQ_UNIT_MICROS: u8 = 2;
+const PQ_UNIT_NANOS: u8 = 3;
+
+/// A schema element's time unit: its logical type's TIME (7) or TIMESTAMP (8) unit, or its converted type's
+/// (TIME_MILLIS 7, TIME_MICROS 8, TIMESTAMP_MILLIS 9, TIMESTAMP_MICROS 10).
+fn timeUnitOf(e: borrow Vector<ThriftField>) -> u8 {
+    match (thriftField(e, 10)) {
+        Some(lt) => {
+            match (lt) {
+                ThriftValue.Struct(kinds) => {
+                    for (id in [7i16, 8]) {
+                        match (thriftField(kinds, id)) {
+                            Some(t) => {
+                                match (t) {
+                                    ThriftValue.Struct(tf) => {
+                                        match (thriftField(tf, 2)) {
+                                            Some(u) => {
+                                                match (u) {
+                                                    ThriftValue.Struct(uf) => {
+                                                        if (thriftField(uf, 1).isSome()) { return PQ_UNIT_MILLIS; }
+                                                        if (thriftField(uf, 2).isSome()) { return PQ_UNIT_MICROS; }
+                                                        if (thriftField(uf, 3).isSome()) { return PQ_UNIT_NANOS; }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            null => {}
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            null => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    return match (thriftInt(e, 6)) {
+        Some(7) => PQ_UNIT_MILLIS,
+        Some(8) => PQ_UNIT_MICROS,
+        Some(9) => PQ_UNIT_MILLIS,
+        Some(10) => PQ_UNIT_MICROS,
+        _ => PQ_UNIT_NONE,
+    };
+}
 
 /// A leaf column of a file's schema: its path (names joined by `.`, the root's left out), its physical type and
 /// length, and its greatest definition and repetition levels; and `key`, which names it across writers (ADR-0112 §2).
@@ -67,6 +118,9 @@ struct PageLeaf {
     key: Vector<u8>;
     /// Its Iceberg field id, -1 when the file names none.
     fieldId: i64;
+    /// A time or timestamp's unit, by its logical or converted type: PQ_UNIT_MILLIS, _MICROS or _NANOS; PQ_UNIT_NONE
+    /// for another column (the M24 exit review's M2: Iceberg's timestamps are microseconds, or nanoseconds).
+    unit: u8;
     physical: i64;
     typeLength: usize;
     maxDef: u32;
@@ -207,6 +261,7 @@ fn walkSchema(
                 path: path,
                 key: key,
                 fieldId: thriftInt(e, 9) ?? -1,
+                unit: timeUnitOf(e),
                 physical: physical,
                 typeLength: checkedTruncate<usize>(length) ?? { return Ok(false); },
                 maxDef: d,
