@@ -11,6 +11,9 @@ import web_server;
 
 /// A file is compacted when it is under this share of the target, in percent (ADR-0098 §2).
 const COMPACTION_SMALL_PERCENT: u64 = 75;
+/// Whether partitions with delete files are compacted, their deletes applied (ADR-0114). Off until rows are dropped
+/// and the commit removes delete files; every partition with a delete file stays as it is until then.
+const COMPACTION_APPLIES_DELETES: bool = false;
 /// The most files one run reads the footers of: a table of more is compacted over several runs.
 const COMPACTION_MAX_CANDIDATES: usize = 10000;
 
@@ -27,6 +30,8 @@ struct CompactionInput {
     entry: usize;
     /// Its data sequence number (format v2): the entry's, or its manifest's when the entry inherits it.
     sequence: i64;
+    /// Its spec and partition (as JSON), as a delete file's.
+    partitionKey: Vector<u8>;
     /// Its spec, partition (as JSON) and shape: the files of a bin share them.
     group: Vector<u8>;
 }
@@ -38,6 +43,9 @@ struct CompactionBin {
     /// Its files' pages all read here (ADR-0112 §4): their values are rewritten as row groups of the target size,
     /// rather than their chunks copied.
     merge: bool;
+    /// The plan's delete files that apply to its files (ADR-0114 §3): applied as it merges. Such a bin is never
+    /// joined, since a position delete names its files' paths.
+    deletes: Vector<usize>;
 }
 
 /// Iceberg's default row group size, when the table sets none (`write.parquet.row-group-size-bytes`).
@@ -69,6 +77,8 @@ struct CompactionPlan {
     bins: Vector<CompactionBin>;
     /// The row groups a merged file is written in, about this many bytes each.
     rowGroupBytes: u64;
+    /// The live delete files of the partitions compacted with their deletes (ADR-0114 §3).
+    deletes: Vector<DeleteFile>;
 }
 
 /// A file a run wrote: its key and path, and its length.
@@ -220,16 +230,22 @@ fn planCompaction(
             }
         }
     }
-    // The partitions that have a live delete file (ADR-0098 §2, the owner's choice): their files stay as they are.
+    // The live delete files (ADR-0114 §3). A partition whose deletes are all read here is compacted with them applied;
+    // one with any other (not Parquet, not here, too large, an equality delete without its ids) stays as it is
+    // (ADR-0098 §2), and so does every partition while deletes are not applied (`COMPACTION_APPLIES_DELETES`).
     var deleted = Vector<Vector<u8>>.create();
+    var blocked = Vector<Vector<u8>>.create();
+    var deletes = Vector<DeleteFile>.create();
     var deleteSpecs = Vector<i64>.create();
     for (i in 0..list.records.length) {
         if (recordInt(borrow list.records[i], "content", 0) != 1) { continue; }
         let spec = recordInt(borrow list.records[i], "partition_spec_id", 0);
+        let manifestSequence = recordInt(borrow list.records[i], "sequence_number", 0);
         for (e in 0..manifests[i].records.length) {
             let entry = borrow manifests[i].records[e];
             if (recordInt(entry, "status", 0) == 2) { continue; }
-            let partition = match (jsonMember(entry, "data_file")) {
+            let file = jsonMember(entry, "data_file");
+            let partition = match (file) {
                 Some(d) => match (jsonMember(d, "partition")) {
                     Some(p) => jsonTextOf(p)?,
                     null => Vector<u8>.create(),
@@ -240,8 +256,25 @@ fn planCompaction(
             appendDecimal(mut k, truncate<u64>(spec))?;
             k.push(' ')?;
             k.extend(partition.view())?;
-            deleted.push(k)?;
             if (!holdsId(deleteSpecs.view(), spec)) { deleteSpecs.push(spec)?; }
+            let read = match (file) {
+                Some(d) => if (COMPACTION_APPLIES_DELETES) deleteFileOf(store, hidden.view(), d, k.view())? else null,
+                null => null,
+            };
+            match (read) {
+                Some(found) => {
+                    var one = found;
+                    one.manifest = i;
+                    one.entry = e;
+                    one.sequence = match (jsonMember(entry, "sequence_number")) {
+                        Some(v) => jsonI64(v) ?? manifestSequence,
+                        null => manifestSequence,
+                    };
+                    deletes.push(one)?;
+                    deleted.push(k)?;
+                }
+                null => { blocked.push(k)?; }
+            }
         }
     }
     // The candidates, by group, in path order: their footers read after, off the lock.
@@ -280,11 +313,11 @@ fn planCompaction(
                 Some(p) => { partitionKey.extend(jsonTextOf(p)?.view())?; }
                 null => {}
             }
-            var inDeleted = false;
-            for (d in 0..deleted.length) {
-                if (deleted[d].view() == partitionKey.view()) { inDeleted = true; }
+            var inBlocked = false;
+            for (d in 0..blocked.length) {
+                if (blocked[d].view() == partitionKey.view()) { inBlocked = true; }
             }
-            if (inDeleted) { continue; }
+            if (inBlocked) { continue; }
             let key = refKey(path);
             // Its tail pinned, to be read off the lock (ADR-0106 §3): the version as it is now, its generation with it.
             let bucket = catalogText(hidden.view());
@@ -338,6 +371,7 @@ fn planCompaction(
         manifests: manifests,
         bins: Vector<CompactionBin>.create(),
         rowGroupBytes: rowGroupBytes,
+        deletes: deletes,
     };
     return Ok(Some(CompactionDraft { plan: plan, pending: pending, target: target }));
 }
@@ -384,10 +418,11 @@ fn finishPlan(d: borrow mut CompactionDraft) -> Result<void, TablesError> {
             manifest: c.manifest,
             entry: c.entry,
             sequence: c.sequence,
+            partitionKey: copyBytes(c.partitionKey.view())?,
             group: group,
         })?;
     }
-    d.plan.bins = binsOf(inputs, d.target)?;
+    d.plan.bins = binsOf(inputs, d.target, d.plan.deletes.view())?;
     return Ok();
 }
 
@@ -483,8 +518,60 @@ fn rowGroupBytesOf(m: borrow Json) -> u64 {
     return if (n < 1048576) 1048576 else if (n > COMPACTION_MAX_ROW_GROUP_BYTES) COMPACTION_MAX_ROW_GROUP_BYTES else n;
 }
 
+/// A live delete file's entry, when it is one read here (ADR-0114 §3): position or equality, Parquet, in the table's
+/// warehouse, at its size and not sealed, at most DELETE_FILE_MAX_BYTES, an equality delete with its field ids.
+fn deleteFileOf(
+    store: borrow ObjectStore,
+    hidden: Slice<u8>,
+    d: borrow Json,
+    partitionKey: Slice<u8>,
+) -> Result<DeleteFile?, AllocError> {
+    let content = recordInt(d, "content", 0);
+    if (content != DELETE_CONTENT_POSITION && content != DELETE_CONTENT_EQUALITY) { return Ok(null); }
+    if (!equalsIgnoreCase(jsonMemberText(d, "file_format") ?? "".bytes(), "PARQUET".bytes())) { return Ok(null); }
+    let size = recordInt(d, "file_size_in_bytes", -1);
+    if (size <= 0 || truncate<u64>(size) > DELETE_FILE_MAX_BYTES) { return Ok(null); }
+    let path = jsonMemberText(d, "file_path") ?? { return Ok(null); };
+    match (refPlace(path, hidden)) {
+        RefPlace.Here => {}
+        _ => { return Ok(null); }
+    }
+    let key = refKey(path);
+    let info = match (store.headObject(catalogText(hidden), catalogText(key))) {
+        Ok(h) => h,
+        Err(_) => { return Ok(null); }
+    };
+    if (info.size != truncate<u64>(size) || metadataFind(info.metadata.view(), SSE_FIELD.bytes()).isSome()) {
+        return Ok(null);
+    }
+    var ids = Vector<i64>.create();
+    match (memberItems(d, "equality_ids")) {
+        Some(items) => {
+            for (k in 0..items.length) { ids.push(jsonI64(borrow items[k]) ?? { return Ok(null); })?; }
+        }
+        null => {}
+    }
+    if (content == DELETE_CONTENT_EQUALITY && ids.length == 0) { return Ok(null); }
+    return Ok(Some(DeleteFile {
+        path: copyBytes(path)?,
+        key: copyBytes(key)?,
+        size: truncate<u64>(size),
+        generation: info.generation,
+        content: content,
+        sequence: 0,
+        equalityIds: ids,
+        partitionKey: copyBytes(partitionKey)?,
+        manifest: 0,
+        entry: 0,
+    }));
+}
+
 /// The bins of `inputs` (ADR-0098 §2): by group, in path order, each up to `target` bytes; a bin of one file is left.
-fn binsOf(inputs: Vector<CompactionInput>, target: u64) -> Result<Vector<CompactionBin>, AllocError> {
+fn binsOf(
+    inputs: Vector<CompactionInput>,
+    target: u64,
+    deletes: Slice<DeleteFile>,
+) -> Result<Vector<CompactionBin>, AllocError> {
     var rest = inputs;
     rest.sortBy(
         (a, b) => compareBytes(a.group.view(), b.group.view()) * 2 + compareBytes(a.path.view(), b.path.view()),
@@ -496,20 +583,35 @@ fn binsOf(inputs: Vector<CompactionInput>, target: u64) -> Result<Vector<Compact
         let next = rest.remove(0);
         let sameGroup = current.length == 0 || current[0].group.view() == next.group.view();
         if (!sameGroup || bytes + next.size > target) {
-            closeBin(mut bins, current)?;
+            closeBin(mut bins, current, deletes)?;
             current = Vector<CompactionInput>.create();
             bytes = 0;
         }
         bytes += next.size;
         current.push(next)?;
     }
-    closeBin(mut bins, current)?;
+    closeBin(mut bins, current, deletes)?;
     return Ok(bins);
 }
 
 /// A bin kept when it joins two files or more.
-fn closeBin(bins: borrow mut Vector<CompactionBin>, inputs: Vector<CompactionInput>) -> Result<void, AllocError> {
-    if (inputs.length < 2) { return Ok(); }
+fn closeBin(
+    bins: borrow mut Vector<CompactionBin>,
+    inputs: Vector<CompactionInput>,
+    deletes: Slice<DeleteFile>,
+) -> Result<void, AllocError> {
+    // The deletes that apply to its files: a file with deletes is worth rewriting alone (ADR-0114 §3).
+    var applying = Vector<usize>.create();
+    for (x in 0..deletes.length) {
+        for (i in 0..inputs.length) {
+            if (deleteApplies(borrow deletes[x], inputs[i].partitionKey.view(), inputs[i].sequence)) {
+                applying.push(x)?;
+                break;
+            }
+        }
+    }
+    if (inputs.length < 2 && applying.length == 0) { return Ok(); }
+    if (inputs.length == 0) { return Ok(); }
     var footers = Vector<ParquetFooter>.create();
     for (i in 0..inputs.length) {
         footers.push(ParquetFooter {
@@ -523,8 +625,10 @@ fn closeBin(bins: borrow mut Vector<CompactionBin>, inputs: Vector<CompactionInp
     for (i in 0..footers.length) {
         if (!(pagesReadable(borrow footers[i].meta)?)) { merge = false; }
     }
+    // Deletes are applied only by merging: a bin that does not merge leaves its files and their deletes as they are.
+    if (applying.length > 0 && !merge) { return Ok(); }
     match (joinParquet(footers.view())?) {
-        Some(join) => { bins.push(CompactionBin { inputs: inputs, join: join, merge: merge })?; }
+        Some(join) => { bins.push(CompactionBin { inputs: inputs, join: join, merge: merge, deletes: applying })?; }
         null => {
             // Files of other writers' shapes merge, but cannot be joined: their join is only their row count.
             if (!merge) { return Ok(); }
@@ -536,7 +640,7 @@ fn closeBin(bins: borrow mut Vector<CompactionBin>, inputs: Vector<CompactionInp
                 rows: rows,
                 length: 0,
             };
-            bins.push(CompactionBin { inputs: inputs, join: join, merge: true })?;
+            bins.push(CompactionBin { inputs: inputs, join: join, merge: true, deletes: applying })?;
         }
     }
     return Ok();
@@ -1663,7 +1767,10 @@ async fn copiedBin(
                 _ => {}
             }
         }
-        if (!plan.bins[b].merge || plan.bins[b].join.copies.length == 0) { return Ok(null); }
+        // Joined as before only when no delete applies: a position delete names the inputs' paths.
+        if (!plan.bins[b].merge || plan.bins[b].join.copies.length == 0 || plan.bins[b].deletes.length > 0) {
+            return Ok(null);
+        }
         plan.bins[b].merge = false;
     }
     return Ok(null);

@@ -1,0 +1,94 @@
+// Iceberg's delete files read, and which apply (ADR-0114 §3).
+
+fn deleteOf(content: i64, sequence: i64, partition: StringView) -> DeleteFile => DeleteFile {
+    path: copyBytes("s3://b/d.parquet".bytes())!,
+    key: copyBytes("d.parquet".bytes())!,
+    size: 1,
+    generation: 1,
+    content: content,
+    sequence: sequence,
+    equalityIds: Vector<i64>.create(),
+    partitionKey: copyBytes(partition.bytes())!,
+    manifest: 0,
+    entry: 0,
+};
+
+/// Iceberg's rules: a position delete applies to data files at or below its sequence number, an equality delete to
+/// those below it; neither outside its partition.
+@test
+fn deletesApplyBySequenceAndPartition() -> Result<void, TestFailure> {
+    let position = deleteOf(DELETE_CONTENT_POSITION, 5, "0 {\"p\":\"a\"}");
+    let equality = deleteOf(DELETE_CONTENT_EQUALITY, 5, "0 {\"p\":\"a\"}");
+    let here = "0 {\"p\":\"a\"}".bytes();
+    Check.isTrue(deleteApplies(borrow position, here, 4), "position, below")?;
+    Check.isTrue(deleteApplies(borrow position, here, 5), "position, equal")?;
+    Check.isTrue(!deleteApplies(borrow position, here, 6), "position, above")?;
+    Check.isTrue(deleteApplies(borrow equality, here, 4), "equality, below")?;
+    Check.isTrue(!deleteApplies(borrow equality, here, 5), "equality, equal")?;
+    Check.isTrue(!deleteApplies(borrow equality, here, 6), "equality, above")?;
+    Check.isTrue(!deleteApplies(borrow position, "0 {\"p\":\"b\"}".bytes(), 1), "another partition")?;
+    Check.isTrue(!deleteApplies(borrow position, "1 {\"p\":\"a\"}".bytes(), 1), "another spec")?;
+    return Ok();
+}
+
+/// A position delete file's rows by path, sorted.
+@test
+fn positionDeletesRead() -> Result<void, TestFailure> {
+    let bytes = fixtureBytes(PAGES_DELETES_POSITION[..]);
+    let d = readPositionDeletes(bytes.view())! ?? { return Err(TestFailure.create("read")); };
+    let a = positionsOf(borrow d, "s3://b/x/a.parquet".bytes()) ?? { return Err(TestFailure.create("a")); };
+    Check.equalU64(2, a.length as u64)?;
+    Check.equalU64(1, truncate<u64>(a[0]))?;
+    Check.equalU64(3, truncate<u64>(a[1]))?;
+    let b = positionsOf(borrow d, "s3://b/x/b.parquet".bytes()) ?? { return Err(TestFailure.create("b")); };
+    Check.equalU64(1, b.length as u64)?;
+    Check.isTrue(positionsOf(borrow d, "s3://b/x/c.parquet".bytes()).isNull(), "a path it does not name")?;
+    // A data file is not a position delete file.
+    Check.isTrue(readPositionDeletes(fixtureBytes(PAGES_FLAT_IDS[..]).view())!.isNull(), "not one")?;
+    return Ok();
+}
+
+/// An equality delete file's rows as keys: FLAT_IDS's rows 2 and 4 match them (row 4 by its null `s`), no other.
+@test
+fn equalityDeletesMatchRows() -> Result<void, TestFailure> {
+    var kinds = Vector<Vector<u8>>.create();
+    kinds.push(copyBytes("long".bytes())!)!;
+    kinds.push(copyBytes("string".bytes())!)!;
+    let bytes = fixtureBytes(PAGES_DELETES_EQUALITY[..]);
+    let d = readEqualityDeletes(bytes.view(), [1i64, 6][..], kinds.view())! ?? {
+        return Err(TestFailure.create("read"));
+    };
+    Check.equalU64(3, d.keys.length() as u64)?;
+    let data = readFixture(fixtureBytes(PAGES_FLAT_IDS[..]).view())?;
+    var leaves = Vector<PageLeaf>.create();
+    var columns = Vector<ColumnValues>.create();
+    for (id in [1i64, 6]) {
+        let k = leafOfId(data.leaves.view(), id) ?? { return Err(TestFailure.create("a column")); };
+        leaves.push(PageLeaf {
+            path: copyBytes(data.leaves[k].path.view())!,
+            key: copyBytes(data.leaves[k].key.view())!,
+            fieldId: data.leaves[k].fieldId,
+            physical: data.leaves[k].physical,
+            typeLength: data.leaves[k].typeLength,
+            maxDef: data.leaves[k].maxDef,
+            maxRep: data.leaves[k].maxRep,
+        })!;
+        columns.push(emptyValues())!;
+        let last = columns.length - 1;
+        Check.isTrue(appendValues(mut columns[last], borrow data.columns[k])!, "copied")?;
+    }
+    let keys = rowKeys(leaves.view(), kinds.view(), columns.view())! ?? { return Err(TestFailure.create("keys")); };
+    Check.equalU64(23, keys.length as u64)?;
+    for (r in 0..keys.length) {
+        let deleted = d.keys.get(borrow keys[r]).isSome();
+        Check.isTrue(deleted == (r == 2 || r == 4), "rows 2 and 4 only")?;
+    }
+    // A type that is not the column's: no key is made, so the file is not read.
+    var wrong = Vector<Vector<u8>>.create();
+    wrong.push(copyBytes("int".bytes())!)!;
+    wrong.push(copyBytes("string".bytes())!)!;
+    Check.isTrue(readEqualityDeletes(bytes.view(), [1i64, 6][..], wrong.view())!.isNull(), "int is not long")?;
+    // A field the file does not hold.
+    Check.isTrue(readEqualityDeletes(bytes.view(), [1i64, 7][..], kinds.view())!.isNull(), "no field 7")?;
+    return Ok();
+}

@@ -68,6 +68,22 @@ for i in range(17):
 flat_nodes = [("prim", "id", False, "i64"), ("prim", "i32", True, "i32"), ("prim", "f", True, "f32"),
               ("prim", "d", True, "f64"), ("prim", "b", True, "bool"), ("prim", "s", True, "bytes"),
               ("prim", "fx", True, "bytes")]
+# Delete files (ADR-0114 §3): a position delete file by Iceberg's reserved field ids, its rows out of order; an
+# equality delete file on FLAT_IDS's `id` (1) and `s` (6), two rows matching FLAT_IDS's rows 2 and 4 (the latter's
+# `s` null) and one matching none.
+position_schema = pa.schema([
+    pa.field("file_path", pa.string(), nullable=False, metadata={b"PARQUET:field_id": b"2147483546"}),
+    pa.field("pos", pa.int64(), nullable=False, metadata={b"PARQUET:field_id": b"2147483545"}),
+])
+position_rows = [{"file_path": "s3://b/x/a.parquet", "pos": 3}, {"file_path": "s3://b/x/a.parquet", "pos": 1},
+                 {"file_path": "s3://b/x/b.parquet", "pos": 0}]
+position_nodes = [("prim", "file_path", False, "bytes"), ("prim", "pos", False, "i64")]
+equality_schema = pa.schema([with_id(flat_schema.field("id"), 1), with_id(flat_schema.field("s"), 6)])
+equality_rows = [{"id": flat_rows[2]["id"], "s": flat_rows[2]["s"]}, {"id": flat_rows[4]["id"], "s": None},
+                 {"id": 12345, "s": "none"}]
+equality_nodes = [("prim", "id", False, "i64"), ("prim", "s", True, "bytes")]
+assert flat_rows[4]["s"] is None
+
 renamed_nodes = [(n[0], "c_" + n[1], n[2], n[3]) for n in reversed(flat_nodes)]
 nested_nodes = [
     ("prim", "id", False, "i32"),
@@ -209,6 +225,10 @@ fixtures = [
     ("FLAT_IDS_RENAMED", "the same columns and ids, in the other order and renamed: v2 pages, PLAIN, none", write(
         renamed_schema, renamed_rows, compression="none", use_dictionary=False, data_page_version="2.0"),
         renamed_nodes, renamed_rows),
+    ("DELETES_POSITION", "a position delete file: v1 pages, snappy", write(position_schema, position_rows,
+        compression="snappy", data_page_version="1.0"), position_nodes, position_rows),
+    ("DELETES_EQUALITY", "an equality delete file on id and s: v2 pages, zstd", write(equality_schema, equality_rows,
+        compression="zstd", data_page_version="2.0"), equality_nodes, equality_rows),
 ]
 
 # Each file read back by pyarrow as the rows here: the fixtures are what they say.

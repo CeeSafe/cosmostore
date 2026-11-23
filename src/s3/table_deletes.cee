@@ -1,0 +1,243 @@
+// Iceberg's delete files, for compaction that applies them (ADR-0114 §3, §4).
+//
+// - A position delete file holds `(file_path, pos)` rows: a data file's path and a row's position in it, from 0. It
+//   applies to a data file of its partition whose data sequence number is at most its own.
+// - An equality delete file holds rows of its `equality_ids` columns: a data file's row whose values in those columns
+//   equal one of them is deleted, null equal to null. It applies to a data file of its partition whose data sequence
+//   number is below its own.
+//
+// Both are read whole by the page reader (they are small; a larger one leaves its partition as it is). An equality
+// row is a key: each column's value in Iceberg's single-value form for the field's type in the table's schema, so that
+// a data file written before a type was widened (int to long) matches a delete written after.
+
+/// Iceberg's reserved field ids of a position delete file's columns.
+const ICEBERG_DELETE_FILE_PATH: i64 = 2147483546;
+const ICEBERG_DELETE_POS: i64 = 2147483545;
+/// A delete file's content in its manifest entry.
+const DELETE_CONTENT_POSITION: i64 = 1;
+const DELETE_CONTENT_EQUALITY: i64 = 2;
+/// The largest delete file read: a partition with a larger one is left as it is.
+const DELETE_FILE_MAX_BYTES: u64 = 67108864;
+
+/// A live delete file of a partition compacted with its deletes.
+struct DeleteFile {
+    path: Vector<u8>;
+    key: Vector<u8>;
+    size: u64;
+    generation: u64;
+    content: i64;
+    /// Its data sequence number.
+    sequence: i64;
+    equalityIds: Vector<i64>;
+    /// Its spec and partition, as a data file's `partitionKey`.
+    partitionKey: Vector<u8>;
+    /// Its manifest (an index into the plan's) and its entry there, for its removal.
+    manifest: usize;
+    entry: usize;
+}
+
+/// Whether delete file `d` may apply to a data file of `partitionKey` and data sequence number `sequence` (a
+/// position delete then applies to the rows it names in that file's path only).
+fn deleteApplies(d: borrow DeleteFile, partitionKey: Slice<u8>, sequence: i64) -> bool {
+    if (d.partitionKey.view() != partitionKey) { return false; }
+    if (d.content == DELETE_CONTENT_POSITION) { return sequence <= d.sequence; }
+    if (d.content == DELETE_CONTENT_EQUALITY) { return sequence < d.sequence; }
+    return false;
+}
+
+/// A position delete file's rows: each path it names, with its positions sorted.
+struct PositionDeletes {
+    paths: Vector<Vector<u8>>;
+    positions: Vector<Vector<i64>>;
+}
+
+/// The positions deleted in `path`, sorted; null when it names none.
+fn positionsOf<region a>(d: borrow(a) PositionDeletes, path: Slice<u8>) -> Slice<a, i64>? {
+    for (i in 0..d.paths.length) {
+        if (d.paths[i].view() == path) { return Some(d.positions[i].view()); }
+    }
+    return null;
+}
+
+/// A file's footer and leaves, from its whole bytes; null when it is not a Parquet file read here.
+struct DeleteFooter {
+    meta: Vector<ThriftField>;
+    leaves: Vector<PageLeaf>;
+}
+
+fn deleteFooterOf(bytes: Slice<u8>) -> Result<DeleteFooter?, AllocError> {
+    if (bytes.length < 12) { return Ok(null); }
+    let n = parquetFooterLength(bytes[bytes.length - 8..], bytes.length as u64) ?? { return Ok(null); };
+    if (n + 12 > bytes.length as u64) { return Ok(null); }
+    let start = bytes.length - 8 - n as usize;
+    let footer = parseParquetFooter(bytes[start..bytes.length - 8], bytes.length as u64)? ?? { return Ok(null); };
+    let leaves = schemaLeaves(borrow footer.meta)? ?? { return Ok(null); };
+    return Ok(Some(DeleteFooter { meta: footer.meta, leaves: leaves }));
+}
+
+/// The leaf of field id `id`; null when there is none, or more than one.
+fn leafOfId(leaves: Slice<PageLeaf>, id: i64) -> usize? {
+    var found: usize? = null;
+    for (k in 0..leaves.length) {
+        if (leaves[k].fieldId == id) {
+            if (found.isSome()) { return null; }
+            found = Some(k);
+        }
+    }
+    return found;
+}
+
+/// Each of `wanted`'s leaves, every row group's values appended; null when a chunk does not read.
+fn wholeColumns(
+    bytes: Slice<u8>,
+    f: borrow DeleteFooter,
+    wanted: Slice<usize>,
+) -> Result<Vector<ColumnValues>?, AllocError> {
+    var out = Vector<ColumnValues>.create();
+    for (w in 0..wanted.length) { out.push(emptyValues())?; }
+    let groups = structItems(borrow f.meta, PQ_FILE_ROW_GROUPS) ?? { return Ok(null); };
+    for (g in 0..groups.length) {
+        let group = match (borrow groups[g]) {
+            ThriftValue.Struct(x) => x,
+            _ => { return Ok(null); }
+        };
+        let chunks = structItems(group, PQ_GROUP_COLUMNS) ?? { return Ok(null); };
+        if (chunks.length != f.leaves.length) { return Ok(null); }
+        for (w in 0..wanted.length) {
+            let k = wanted[w];
+            let chunk = match (borrow chunks[k]) {
+                ThriftValue.Struct(x) => x,
+                _ => { return Ok(null); }
+            };
+            let values = readColumnChunk(bytes, chunk, borrow f.leaves[k])? ?? { return Ok(null); };
+            if (!(appendValues(mut out[w], borrow values)?)) { return Ok(null); }
+        }
+    }
+    return Ok(Some(out));
+}
+
+/// A position delete file's rows; null when it is not one read here (its columns by Iceberg's reserved ids, both
+/// required).
+fn readPositionDeletes(bytes: Slice<u8>) -> Result<PositionDeletes?, AllocError> {
+    let f = deleteFooterOf(bytes)? ?? { return Ok(null); };
+    let pathAt = leafOfId(f.leaves.view(), ICEBERG_DELETE_FILE_PATH) ?? { return Ok(null); };
+    let posAt = leafOfId(f.leaves.view(), ICEBERG_DELETE_POS) ?? { return Ok(null); };
+    let pathLeaf = borrow f.leaves[pathAt];
+    let posLeaf = borrow f.leaves[posAt];
+    if (pathLeaf.physical != PQ_BYTE_ARRAY || posLeaf.physical != PQ_INT64 || pathLeaf.maxRep != 0 ||
+        posLeaf.maxRep != 0) {
+        return Ok(null);
+    }
+    let columns = wholeColumns(bytes, borrow f, [pathAt, posAt][..])? ?? { return Ok(null); };
+    let paths = borrow columns[0];
+    let positions = borrow columns[1];
+    // Both required: as many values as rows, none null.
+    if (paths.count != paths.defs.length ||
+        positions.count != positions.defs.length || paths.count != positions.count) {
+        return Ok(null);
+    }
+    var out = PositionDeletes { paths: Vector<Vector<u8>>.create(), positions: Vector<Vector<i64>>.create() };
+    for (i in 0..paths.count) {
+        let path = valueAt(paths, pathLeaf, i);
+        let pos = truncate<i64>(valueAt(positions, posLeaf, i).readLE<u64>(0));
+        if (pos < 0) { return Ok(null); }
+        var at: usize? = null;
+        // Rows are sorted by path in a well-written file, so the last path is the likely one.
+        if (out.paths.length > 0 && out.paths[out.paths.length - 1].view() == path) {
+            at = Some(out.paths.length - 1);
+        } else {
+            for (p in 0..out.paths.length) {
+                if (out.paths[p].view() == path) { at = Some(p); }
+            }
+        }
+        match (at) {
+            Some(p) => { out.positions[p].push(pos)?; }
+            null => {
+                out.paths.push(copyBytes(path)?)?;
+                var one = Vector<i64>.create();
+                one.push(pos)?;
+                out.positions.push(one)?;
+            }
+        }
+    }
+    for (p in 0..out.positions.length) { out.positions[p].sortBy((a, b) => if (a < b) -1 else if (a > b) 1 else 0); }
+    return Ok(Some(out));
+}
+
+/// An equality delete file's rows, as keys; null when it is not one read here (a column missing, or inside a list or
+/// a map, or of a type whose Iceberg form is not made here).
+struct EqualityDeletes {
+    keys: HashMap<Vector<u8>, u8>;
+}
+
+/// A key part: null as one byte, a value as a marker, its length and its Iceberg form.
+fn appendKeyPart(key: borrow mut Vector<u8>, value: Slice<u8>?) -> Result<void, AllocError> {
+    match (value) {
+        Some(v) => {
+            key.push(1)?;
+            key.pushLE(truncate<u32>(v.length))?;
+            key.extend(v)?;
+        }
+        null => { key.push(0)?; }
+    }
+    return Ok();
+}
+
+/// Each row's key over `columns` (each the leaf of an equality field, outside lists and maps), by the fields'
+/// Iceberg types `kinds`; null when a value's Iceberg form is not made here.
+fn rowKeys(
+    leaves: Slice<PageLeaf>,
+    kinds: Slice<Vector<u8>>,
+    columns: Slice<ColumnValues>,
+) -> Result<Vector<Vector<u8>>?, AllocError> {
+    if (leaves.length != columns.length || kinds.length != columns.length || columns.length == 0) { return Ok(null); }
+    let rows = columns[0].defs.length;
+    var keys = Vector<Vector<u8>>.create();
+    for (r in 0..rows) { keys.push(Vector<u8>.create())?; }
+    for (c in 0..columns.length) {
+        let leaf = borrow leaves[c];
+        let v = borrow columns[c];
+        if (leaf.maxRep != 0 || v.defs.length != rows) { return Ok(null); }
+        var value: usize = 0;
+        for (r in 0..rows) {
+            if ((v.defs[r] as u32) < leaf.maxDef) {
+                appendKeyPart(mut keys[r], null)?;
+                continue;
+            }
+            let ice = icebergValue(kinds[c].view(), leaf, valueAt(v, leaf, value))? ?? { return Ok(null); };
+            value += 1;
+            appendKeyPart(mut keys[r], Some(ice.view()))?;
+        }
+    }
+    return Ok(Some(keys));
+}
+
+/// An equality delete file's rows, its `ids` columns by their Iceberg types `kinds`.
+fn readEqualityDeletes(
+    bytes: Slice<u8>,
+    ids: Slice<i64>,
+    kinds: Slice<Vector<u8>>,
+) -> Result<EqualityDeletes?, AllocError> {
+    if (ids.length == 0 || ids.length != kinds.length) { return Ok(null); }
+    let f = deleteFooterOf(bytes)? ?? { return Ok(null); };
+    var wanted = Vector<usize>.create();
+    var leaves = Vector<PageLeaf>.create();
+    for (i in 0..ids.length) {
+        let k = leafOfId(f.leaves.view(), ids[i]) ?? { return Ok(null); };
+        wanted.push(k)?;
+        leaves.push(PageLeaf {
+            path: copyBytes(f.leaves[k].path.view())?,
+            key: copyBytes(f.leaves[k].key.view())?,
+            fieldId: f.leaves[k].fieldId,
+            physical: f.leaves[k].physical,
+            typeLength: f.leaves[k].typeLength,
+            maxDef: f.leaves[k].maxDef,
+            maxRep: f.leaves[k].maxRep,
+        })?;
+    }
+    let columns = wholeColumns(bytes, borrow f, wanted.view())? ?? { return Ok(null); };
+    let keys = rowKeys(leaves.view(), kinds, columns.view())? ?? { return Ok(null); };
+    var out = EqualityDeletes { keys: HashMap<Vector<u8>, u8>.create() };
+    for (r in 0..keys.length) { let _ = out.keys.put(copyBytes(keys[r].view())?, 1)?; }
+    return Ok(Some(out));
+}

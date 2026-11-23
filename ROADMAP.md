@@ -5285,3 +5285,23 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Results:** 64 checks on `serve` and through a cluster; 482 unit tests, with modes, truncation (surrogates,
   U+10FFFF), decimals and floats.
 - **Next:** slice 3, the delete files read, and which apply.
+
+### 23 Nov 2026: M24 slice 3, delete files read and which apply (ADR-0114 §3)
+
+- **`src/s3/table_deletes.cee`:**
+  - **Position delete files** are read by Iceberg's reserved field ids, as each path's sorted positions.
+  - **Equality delete files** become row keys: each equality field in Iceberg's single-value form for its type in
+    the table's schema (an int written before widening matches a long), null as a marker of its own.
+  - **`deleteApplies`** is Iceberg's rule: the same partition, and a data sequence number at most the delete's
+    (position) or below it (equality).
+- **The plan** collects the live delete files it can apply. Others leave their partition as it is: not Parquet, not
+  in the warehouse, past 64 MB, or an equality delete without its ids. Each bin lists the deletes that apply to its
+  files, and a file with deletes is a bin of its own.
+- **No join for a bin with deletes:** it is never joined, not even as the merge's fallback, since a position delete
+  names its inputs' paths.
+- **Gated:** `COMPACTION_APPLIES_DELETES` stays off until rows are dropped (slice 4) and the commit removes delete
+  files (slice 5). Until then every delete leaves its partition as today.
+- **Tests:** pyarrow's position and equality delete files (`DELETES_POSITION`, `DELETES_EQUALITY`). The sequence
+  rules; the positions sorted; FLAT_IDS's rows 2 and 4 matched by the equality deletes, row 4 by its null; a wrong
+  type or a missing field refused. 485 unit tests, the smokes unchanged.
+- **Next:** slice 4, rows dropped while merging.
