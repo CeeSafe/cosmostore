@@ -5,6 +5,9 @@
 
 /// A data page holds this many levels at most, and starts at a row (a repetition level of 0).
 const PQ_PAGE_LEVELS: usize = 20000;
+/// A page is cut at a row's start once its values reach this many bytes (pyarrow's 1 MB): pages of wide values stay
+/// far below the 64 MB the reader takes (the M23 exit review).
+const PQ_PAGE_BYTES: usize = 1048576;
 /// A dictionary holds this many values at most; a chunk with more is PLAIN.
 const PQ_DICTIONARY_MAX: usize = 65535;
 /// What compaction names itself as in a file's `created_by`.
@@ -268,10 +271,16 @@ fn writeColumnChunk(
     var level: usize = 0;
     var value: usize = 0;
     while (level < v.defs.length) {
-        // The page's levels: up to PQ_PAGE_LEVELS, ending before a row's start.
-        var to = level + 1;
-        while (to < v.defs.length && (to - level < PQ_PAGE_LEVELS || v.reps[to] != 0)) {
-            if (to - level >= PQ_PAGE_LEVELS && v.reps[to] == 0) { break; }
+        // The page's levels: up to PQ_PAGE_LEVELS, or its values to PQ_PAGE_BYTES, ending before a row's start.
+        var to = level;
+        var bytes: usize = 0;
+        var at = value;
+        while (to < v.defs.length) {
+            if (to > level && v.reps[to] == 0 && (to - level >= PQ_PAGE_LEVELS || bytes >= PQ_PAGE_BYTES)) { break; }
+            if (v.defs[to] as u32 == leaf.maxDef) {
+                bytes += valueAt(v, leaf, at).length;
+                at += 1;
+            }
             to += 1;
         }
         let present = presentCount(v.defs.view()[level..to], leaf.maxDef);
@@ -407,6 +416,11 @@ fn parquetTail(
         null => {}
     }
     meta.push(tBinary(PQ_FILE_CREATED_BY, PQ_CREATED_BY.bytes())?)?;
+    // The column orders, as the schema's (its leaves the same): without them parquet-mr does not trust min and max.
+    match (thriftField(inputMeta, PQ_FILE_COLUMN_ORDERS)) {
+        Some(orders) => { meta.push(ThriftField { id: PQ_FILE_COLUMN_ORDERS, value: cloneThrift(orders)? })?; }
+        null => {}
+    }
     var out = Vector<u8>.create();
     writeThriftStruct(mut out, meta.view())?;
     let length = out.length;

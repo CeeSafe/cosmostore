@@ -46,6 +46,13 @@ const PQ_META_TOTAL_COMPRESSED: i16 = 7;
 
 /// A page's decompressed bytes are 64 MB at most, a chunk's values 1 GB: past them a file is refused, not read.
 const PQ_MAX_PAGE: usize = 67108864;
+/// The most levels a page may hold (its rows and nulls), and a column chunk (the M23 exit review: a few bytes of RLE
+/// may state millions of levels, and each level is held). Writers cut pages at 20,000 rows (parquet-mr's, pyarrow's
+/// and ours), and compaction's row groups at PQ_GROUP_LEVELS.
+const PQ_MAX_PAGE_LEVELS: usize = 4194304;
+const PQ_MAX_CHUNK_LEVELS: usize = 33554432;
+/// DELTA_BINARY_PACKED's largest block (writers use 128 values).
+const PQ_MAX_DELTA_BLOCK: u64 = 65536;
 const PQ_MAX_CHUNK: usize = 1073741824;
 /// Levels are a byte each: a schema deeper than this is refused.
 const PQ_MAX_LEVEL: u32 = 64;
@@ -303,11 +310,13 @@ fn readHybrid(
             let n = groups * 8;
             let bytes = groups * width as usize;
             if (pos + bytes > end) { return Ok(false); }
-            var unpacked = Vector<u64>.create();
-            if (!(unpackBits(data, pos, end, width, n, mut unpacked)?)) { return Ok(false); }
-            pos += bytes;
+            // Only the values still needed are unpacked (the M23 exit review: at width 0 a few bytes state groups
+            // without end).
             let need = count - (out.length - start);
             let take = if (n > need) need else n;
+            var unpacked = Vector<u64>.create();
+            if (!(unpackBits(data, pos, end, width, take, mut unpacked)?)) { return Ok(false); }
+            pos += bytes;
             for (i in 0..take) { out.push(unpacked[i])?; }
         }
     }
@@ -366,7 +375,8 @@ fn readDeltaPacked(
     let miniblocks = readUleb(data, mut pos, end) ?? { return Ok(null); };
     let total = readUleb(data, mut pos, end) ?? { return Ok(null); };
     let first = unzigzag(readUleb(data, mut pos, end) ?? { return Ok(null); });
-    if (blockSize == 0 || blockSize % 128 != 0 || miniblocks == 0 || blockSize % miniblocks != 0) { return Ok(null); }
+    if (blockSize == 0 || blockSize % 128 != 0 || blockSize > PQ_MAX_DELTA_BLOCK || miniblocks == 0 ||
+        blockSize % miniblocks != 0) { return Ok(null); }
     let perMini = blockSize / miniblocks;
     if (perMini % 32 != 0 || total > PQ_MAX_PAGE as u64 || miniblocks > 256) { return Ok(null); }
     let count = total as usize;
@@ -383,9 +393,14 @@ fn readDeltaPacked(
             if (out.length >= count) { break; }
             let width = widths[k] as u32;
             if (width > 64) { return Ok(null); }
+            // The miniblock's bytes all there, its values unpacked only as far as needed.
+            let full = (perMini as usize * width as usize + 7) / 8;
+            if (pos + full > end) { return Ok(null); }
+            let left = count - out.length;
+            let want = if (perMini as usize > left) left else perMini as usize;
             var deltas = Vector<u64>.create();
-            if (!(unpackBits(data, pos, end, width, perMini as usize, mut deltas)?)) { return Ok(null); }
-            pos += (perMini as usize * width as usize + 7) / 8;
+            if (!(unpackBits(data, pos, end, width, want, mut deltas)?)) { return Ok(null); }
+            pos += full;
             for (j in 0..deltas.length) {
                 if (out.length >= count) { break; }
                 value = wrapTo(value.wrappingAdd(minDelta).wrappingAdd(truncate<i64>(deltas[j])), bits);
@@ -574,6 +589,7 @@ fn readColumnChunk(
     if (thriftInt(meta, PQ_META_TYPE) != Some(leaf.physical) || valueWidth(leaf).isNull()) { return Ok(null); }
     let codec = thriftInt(meta, PQ_META_CODEC) ?? { return Ok(null); };
     let numValues = checkedTruncate<usize>(thriftInt(meta, PQ_META_NUM_VALUES) ?? -1) ?? { return Ok(null); };
+    if (numValues > PQ_MAX_CHUNK_LEVELS) { return Ok(null); }
     let dataOffset = checkedTruncate<usize>(thriftInt(meta, PQ_META_DATA_OFFSET) ?? -1) ?? { return Ok(null); };
     let total = checkedTruncate<usize>(thriftInt(meta, PQ_META_TOTAL_COMPRESSED) ?? -1) ?? { return Ok(null); };
     var start = dataOffset;
@@ -629,7 +645,10 @@ fn readColumnChunk(
             };
             let n = checkedTruncate<usize>(thriftInt(dh, 1) ?? -1) ?? { return Ok(null); };
             let encoding = thriftInt(dh, 2) ?? { return Ok(null); };
-            if (n > PQ_MAX_PAGE) { return Ok(null); }
+            if (n > PQ_MAX_PAGE_LEVELS || n > numValues - levels) { return Ok(null); }
+            // Levels BIT_PACKED (the deprecated encoding 4) are not read: only where a column has none.
+            if (leaf.maxDef > 0 && (thriftInt(dh, 3) ?? PQ_ENC_RLE) != PQ_ENC_RLE) { return Ok(null); }
+            if (leaf.maxRep > 0 && (thriftInt(dh, 4) ?? PQ_ENC_RLE) != PQ_ENC_RLE) { return Ok(null); }
             let page = decompressPage(codec, raw, size)? ?? { return Ok(null); };
             let p = page.view();
             var pos: usize = 0;
@@ -679,7 +698,8 @@ fn readColumnChunk(
                 },
                 null => true,
             };
-            if (n > PQ_MAX_PAGE || repLength > raw.length || defLength > raw.length - repLength) { return Ok(null); }
+            if (n > PQ_MAX_PAGE_LEVELS || n > numValues - levels || repLength > raw.length ||
+                defLength > raw.length - repLength) { return Ok(null); }
             // v2: the levels uncompressed, without lengths; then the values, compressed unless it says not.
             if (leaf.maxRep > 0) {
                 if (!(readLevels(raw, 0, repLength, leaf.maxRep, n, mut out.reps)?)) { return Ok(null); }

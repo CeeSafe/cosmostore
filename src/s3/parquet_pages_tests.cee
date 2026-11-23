@@ -267,3 +267,73 @@ fn chunkStartingWithinARowRefused() -> Result<void, TestFailure> {
     }
     return Ok();
 }
+
+// ---- The M23 exit review's finds ----
+
+/// A bit-packed run of width 0 states groups without end in a few bytes: only the values asked for are made (before,
+/// 2^25 groups were 2^28 values, 2 GB).
+@test
+fn hybridWidthZeroMakesOnlyWhatIsAsked() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    writeUleb(mut bytes, (33554432u64 << 1) | 1)!;
+    var out = Vector<u64>.create();
+    Check.isTrue(readHybrid(bytes.view(), 0, bytes.length, 0, 1, mut out)!, "decoded")?;
+    Check.equalU64(1, out.length as u64)?;
+    return Ok();
+}
+
+/// DELTA_BINARY_PACKED's block is bounded (before, a block of 2^25 at width 0 made 2^25 deltas for two values).
+@test
+fn deltaBlockBounded() -> Result<void, TestFailure> {
+    for (block in [33554432u64, 32768]) {
+        var bytes = Vector<u8>.create();
+        writeUleb(mut bytes, block)!;
+        writeUleb(mut bytes, 1)!; // one miniblock
+        writeUleb(mut bytes, 2)!; // two values
+        writeUleb(mut bytes, 0)!; // the first, 0
+        writeUleb(mut bytes, 0)!; // min delta 0
+        bytes.push(0)!;           // width 0
+        var out = Vector<i64>.create();
+        let at = readDeltaPacked(bytes.view(), 0, bytes.length, 64, mut out)!;
+        Check.isTrue(at.isSome() == (block == 32768), "a block of 2^15 read, of 2^25 refused")?;
+    }
+    return Ok();
+}
+
+/// Wide values are cut into pages of about 1 MB (before, 20,000 values of 4,000 bytes were one 80 MB page, which the
+/// reader refuses): the writer's own chunk reads back.
+@test
+fn wideValuesReadBack() -> Result<void, TestFailure> {
+    let leaf = PageLeaf {
+        path: copyBytes("blob".bytes())!,
+        key: copyBytes("x".bytes())!,
+        physical: PQ_BYTE_ARRAY,
+        typeLength: 0,
+        maxDef: 0,
+        maxRep: 0,
+    };
+    var v = emptyValues();
+    var value = Vector<u8>.create();
+    value.resize(4000, 7)!;
+    for (k in 0..20000) {
+        let i = truncate<u32>(k);
+        value[0] = truncate<u8>(i);
+        value[1] = truncate<u8>(i >> 8);
+        v.reps.push(0)!;
+        v.defs.push(0)!;
+        let _ = pushValue(mut v, borrow leaf, value.view())!;
+    }
+    var out = Vector<u8>.create();
+    let chunk = writeColumnChunk(mut out, 0, borrow leaf, borrow v, PQ_CODEC_UNCOMPRESSED)! ?? {
+        return Err(TestFailure.create("not written"));
+    };
+    let fields = match (borrow chunk) {
+        ThriftValue.Struct(f) => f,
+        _ => { return Err(TestFailure.create("a chunk")); }
+    };
+    let back = readColumnChunk(out.view(), fields, borrow leaf)! ?? {
+        return Err(TestFailure.create("the writer's own chunk not read back"));
+    };
+    Check.isTrue(back.data.view() == v.data.view(), "the same values")?;
+    return Ok();
+}

@@ -42,6 +42,12 @@ struct CompactionBin {
 
 /// Iceberg's default row group size, when the table sets none (`write.parquet.row-group-size-bytes`).
 const COMPACTION_ROW_GROUP_BYTES: u64 = 134217728;
+/// The largest row group a merge writes: its decoded values are held while it is written.
+const COMPACTION_MAX_ROW_GROUP_BYTES: u64 = 268435456;
+/// A merge's row group is written at this many levels in a column too, below the reader's PQ_MAX_CHUNK_LEVELS, so
+/// that a merged file is always one the next merge reads.
+const COMPACTION_GROUP_LEVELS: usize = 16777216;
+
 /// The codec merged files are written with: SNAPPY, the owner's choice (ADR-0111), lib/std's since ceesafec 0.94.0.
 const COMPACTION_PAGE_CODEC: i64 = 1;
 
@@ -460,12 +466,13 @@ fn readWarehouseAvro(store: borrow ObjectStore, hidden: Slice<u8>, path: Slice<u
     };
 }
 
-/// The table's row group size, `write.parquet.row-group-size-bytes`, or Iceberg's default; 1 MB at least.
+/// The table's row group size, `write.parquet.row-group-size-bytes`, or Iceberg's default; 1 MB at least, and 256 MB
+/// at most (the M23 exit review: a merge holds a row group's decoded values, so the table may not set it without end).
 fn rowGroupBytesOf(m: borrow Json) -> u64 {
     let props = jsonMember(m, "properties") ?? { return COMPACTION_ROW_GROUP_BYTES; };
     let text = jsonMemberText(props, "write.parquet.row-group-size-bytes") ?? { return COMPACTION_ROW_GROUP_BYTES; };
     let n = parseDecimal(text) ?? { return COMPACTION_ROW_GROUP_BYTES; };
-    return if (n < 1048576) 1048576 else n;
+    return if (n < 1048576) 1048576 else if (n > COMPACTION_MAX_ROW_GROUP_BYTES) COMPACTION_MAX_ROW_GROUP_BYTES else n;
 }
 
 /// The bins of `inputs` (ADR-0098 §2): by group, in path order, each up to `target` bytes; a bin of one file is left.
@@ -670,12 +677,20 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
                     _ => { return Ok(null); }
                 };
                 let values = readColumnChunk(bytes.view(), chunk, borrow these[k])? ?? { return Ok(null); };
-                held += values.data.length as u64 + values.defs.length as u64;
+                // Its rows are the row group's (the M23 exit review: a footer's count is not trusted alone).
+                if (rowsOf(borrow these[k], borrow values) != groupRows) { return Ok(null); }
+                // Everything a column holds: values, both levels, a byte array's ends.
+                held += values.data.length as u64 + values.defs.length as u64 + values.reps.length as u64 +
+                    values.ends.length as u64 * 4;
                 if (!(appendValues(mut columns[order[k]], borrow values)?)) { return Ok(null); }
             }
             rows += groupRows;
             totalRows += groupRows;
-            if (held >= c.rowGroupBytes) {
+            var most: usize = 0;
+            for (k in 0..columns.length) {
+                if (columns[k].defs.length > most) { most = columns[k].defs.length; }
+            }
+            if (held >= c.rowGroupBytes || most >= COMPACTION_GROUP_LEVELS) {
                 if (!(flushGroup(c, mut written, leaves.view(), mut columns, rows, mut groups)?)) { return Ok(null); }
                 held = 0;
                 rows = 0;
@@ -690,6 +705,16 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
         Ok(o) => Ok(Some(o)),
         Err(_) => Ok(null),
     };
+}
+
+/// The rows a chunk's values hold: its levels that start a row (every level when the column does not repeat).
+fn rowsOf(leaf: borrow PageLeaf, v: borrow ColumnValues) -> i64 {
+    if (leaf.maxRep == 0) { return truncate<i64>(v.defs.length); }
+    var n: i64 = 0;
+    for (r in v.reps.view()) {
+        if (r == 0) { n += 1; }
+    }
+    return n;
 }
 
 /// The values held written as a row group, and let go.
@@ -1069,6 +1094,11 @@ fn commitWritten(
                     jsonSet(mut file, name, mergedMetrics(plan, bin, name, 0)?)?;
                 }
             }
+            // A merged file's columns are encoded again: the inputs' sizes are not its (the M23 exit review). The
+            // counts and bounds are, as they describe the same values.
+            if (bin.merge && jsonMember(borrow file, "column_sizes").isSome()) {
+                jsonSet(mut file, "column_sizes", Json.Null)?;
+            }
             if (jsonMember(borrow file, "lower_bounds").isSome()) {
                 jsonSet(mut file, "lower_bounds", mergedMetrics(plan, bin, "lower_bounds", -1)?)?;
             }
@@ -1423,16 +1453,11 @@ async fn compactTable(
     var outputs = Vector<CompactionOutput>.create();
     var joined = Vector<usize>.create();
     for (b in 0..plan.bins.length) {
+        let obj = match (await copiedBin(store, mut plan, b)?) {
+            Some(o) => o,
+            null => { continue; }
+        };
         let p = borrow plan;
-        var copy = match (await lockedPrepare(store, p, b)?) {
-            Some(c) => c,
-            null => { continue; } // an input changed: this bin waits for the next run
-        };
-        let tail = plan.bins[b].join.tail.view();
-        let obj = match (await Async.blocking(() => copyBin(mut copy, tail))) {
-            Ok(Some(o)) => o,
-            _ => { continue; }
-        };
         var guard = match (await store.get().lock()) {
             Ok(g) => g,
             Err(_) => { return Err(NetError.Closed); }
@@ -1461,6 +1486,33 @@ async fn compactTable(
 /// The keys a failed commit wrote, deleted (on a cluster, a gated step after the commit's, ADR-0110 §2).
 fn deleteLeftovers(store: borrow mut ObjectStore, hidden: Slice<u8>, keys: Slice<Vector<u8>>) {
     for (i in 0..keys.length) { let _ = store.deleteObject(catalogText(hidden), catalogText(keys[i].view())); }
+}
+
+/// A bin's file written, off the lock: merged when its files' pages read, and joined as before when its merge fails
+/// and its files can be joined (the M23 exit review: a file whose footer reads but whose pages do not would otherwise
+/// keep its bin from compacting at every run). Null when an input changed, or neither way writes it.
+async fn copiedBin(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    plan: borrow mut CompactionPlan,
+    b: usize,
+) -> Result<FinishedObject?, NetError> {
+    for (attempt in 0..2) {
+        {
+            let p = plan;
+            var copy = match (await lockedPrepare(store, p, b)?) {
+                Some(c) => c,
+                null => { return Ok(null); } // an input changed: this bin waits for the next run
+            };
+            let tail = p.bins[b].join.tail.view();
+            match (await Async.blocking(() => copyBin(mut copy, tail))) {
+                Ok(Some(o)) => { return Ok(Some(o)); }
+                _ => {}
+            }
+        }
+        if (!plan.bins[b].merge || plan.bins[b].join.copies.length == 0) { return Ok(null); }
+        plan.bins[b].merge = false;
+    }
+    return Ok(null);
 }
 
 /// A bin's readers and writer, under the store.
