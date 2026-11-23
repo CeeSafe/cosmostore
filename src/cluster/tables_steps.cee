@@ -4,14 +4,20 @@
 // functions `serve`'s run calls (`table_compaction.cee`); the run is the leader's own, not a request, so no front
 // timeout applies to it (§5).
 
-/// Before a gated step, under the gate: this replica leads, and everything it holds is applied (as `leadWrite`
-/// waits). False when it does not lead, or nothing settled within FRONT_COMMIT_MS.
-async fn stepReady(slot: borrow ShardSlot) -> Result<bool, NodeFault> {
+/// Before a gated step, under the gate: this replica leads, in the run's term (`term`: 0 for the run's first step,
+/// which sets it), and everything it holds is applied (as `leadWrite` waits). False when it does not lead, its term
+/// changed since the run began (ADR-0110 §1, the M22 exit review's finding 5), or nothing settled within
+/// FRONT_COMMIT_MS.
+async fn stepReady(slot: borrow ShardSlot, term: borrow mut u64) -> Result<bool, NodeFault> {
     var waited = 0u64;
     while (true) {
         let v = await viewOf(slot)?;
         if (!v.leads) { return Ok(false); }
-        if (v.applied == v.last && v.coreLast == v.last) { return Ok(true); }
+        if (*term != 0 && v.term != *term) { return Ok(false); }
+        if (v.applied == v.last && v.coreLast == v.last) {
+            *term = v.term;
+            return Ok(true);
+        }
         if (waited >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(false); }
         waited += FRONT_POLL_MS;
     }
@@ -53,6 +59,7 @@ async fn compactOnShard(
 ) -> Result<void, NodeFault> {
     let slot = borrow shared.slots[at];
     let store = borrow slot.store;
+    var term: u64 = 0;
     // The plan: a gated step, as it may write the job's status (a strategy not done, a table it cannot plan): a write
     // staged off the gate would be proposed by no one, and hold up the shard's every write after it.
     var planned: CompactionDraft? = null;
@@ -62,7 +69,7 @@ async fn compactOnShard(
             Err(_) => { return Err(NodeFault.Net); }
         };
         let _held = gate.data();
-        if (!(await stepReady(slot)?)) { return Ok(); }
+        if (!(await stepReady(slot, mut term)?)) { return Ok(); }
         planned = match (await lockedPlan(store, t, nowMs)) {
             Ok(d) => d,
             Err(_) => null,
@@ -93,6 +100,7 @@ async fn compactOnShard(
     var plan = draft.plan;
     var outputs = Vector<CompactionOutput>.create();
     var joined = Vector<usize>.create();
+    var outOfMemory = false;
     for (b in 0..plan.bins.length) {
         let p = borrow plan;
         var copy = match (await lockedPrepare(store, p, b)) {
@@ -111,7 +119,7 @@ async fn compactOnShard(
             Err(_) => { return Err(NodeFault.Net); }
         };
         let _held = gate.data();
-        if (!(await stepReady(slot)?)) { return Ok(); }
+        if (!(await stepReady(slot, mut term)?)) { return Ok(); }
         {
             var guard = match (await store.get().lock()) {
                 Ok(g) => g,
@@ -120,20 +128,23 @@ async fn compactOnShard(
             let st = guard.data();
             match (await Async.blocking(() => putBin(st, p, b, borrow obj))) {
                 Ok(Some(o)) => {
-                    if (outputs.push(o).isErr() || joined.push(b).isErr()) { return Err(NodeFault.OutOfMemory); }
+                    if (outputs.push(o).isErr() || joined.push(b).isErr()) { outOfMemory = true; }
                 }
                 _ => {}
             }
         }
-        if (!(await stepCommit(shared, slot)?)) { return Ok(); }
+        // Committed even when out of memory: what the step staged must be proposed, or the shard's every write after
+        // it waits (the M22 exit review's finding 2); the run ends after.
+        if (!(await stepCommit(shared, slot)?) || outOfMemory) { return Ok(); }
     }
     // The commit, or the job's status when there is nothing to commit: one gated step.
+    var leftover = Vector<Vector<u8>>.create();
     var gate = match (await slot.gate.lock()) {
         Ok(g) => g,
         Err(_) => { return Err(NodeFault.Net); }
     };
     let _held = gate.data();
-    if (!(await stepReady(slot)?)) { return Ok(); }
+    if (!(await stepReady(slot, mut term)?)) { return Ok(); }
     {
         var guard = match (await store.get().lock()) {
             Ok(g) => g,
@@ -142,7 +153,21 @@ async fn compactOnShard(
         let st = guard.data();
         let o = borrow outputs;
         let j = joined.view();
-        let _ = await Async.blocking(() => finishCompaction(st, mut plan, o, j, nowMs));
+        let lo = borrow mut leftover;
+        let _ = await Async.blocking(() => finishCompaction(st, mut plan, o, j, nowMs, lo));
+    }
+    if (!(await stepCommit(shared, slot)?) || leftover.length == 0) { return Ok(); }
+    // A failed commit's files, written in its own step and so not deleted there: deleted in one more (finding 1).
+    if (!(await stepReady(slot, mut term)?)) { return Ok(); }
+    {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let hidden = plan.hidden.view();
+        let keys = leftover.view();
+        await Async.blocking(() => deleteLeftovers(st, hidden, keys));
     }
     let _ = await stepCommit(shared, slot)?;
     return Ok();
@@ -157,12 +182,13 @@ async fn snapshotsOnShard(
     dayMs: i64,
 ) -> Result<void, NodeFault> {
     let slot = borrow shared.slots[at];
+    var term: u64 = 0;
     var gate = match (await slot.gate.lock()) {
         Ok(g) => g,
         Err(_) => { return Err(NodeFault.Net); }
     };
     let _held = gate.data();
-    if (!(await stepReady(slot)?)) { return Ok(); }
+    if (!(await stepReady(slot, mut term)?)) { return Ok(); }
     {
         var guard = match (await slot.store.get().lock()) {
             Ok(g) => g,
@@ -189,12 +215,13 @@ async fn removeOnShard(
         Ok(Some(r)) => r,
         _ => { return Ok(); }
     };
+    var term: u64 = 0;
     var gate = match (await slot.gate.lock()) {
         Ok(g) => g,
         Err(_) => { return Err(NodeFault.Net); }
     };
     let _held = gate.data();
-    if (!(await stepReady(slot)?)) { return Ok(); }
+    if (!(await stepReady(slot, mut term)?)) { return Ok(); }
     {
         var guard = match (await slot.store.get().lock()) {
             Ok(g) => g,

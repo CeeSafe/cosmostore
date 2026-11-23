@@ -5052,3 +5052,31 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - the SDK matrix;
   - the Terraform check.
 - **Next:** the exit review.
+
+### 23 Nov 2026: M22 slice 8, the exit review (ADR-0110)
+
+- **The exit review** (`docs/m22-exit-review.md`): two Mediums, one Low-Medium and four Lows, all read only.
+  - **Medium, narrowed:** a failed commit on a cluster could not delete the files written in its own step. The
+    reviewer's scenario, a client commit mid-run, cannot happen under the gate, but the failures after the writes
+    could. The files are now deleted in one more gated step.
+  - **Medium:** the crash sweep now reads rows from the Parquet footers and checks the job status.
+  - **Low-Medium:** an ask made while its job runs is answered by that run, and the smoke sends asks through two nodes.
+  - **Lows:**
+    - out of memory after a bin's put still commits the step;
+    - each step is bound to the run's term;
+    - a `user/` principal is MalformedPolicy;
+    - inline sizes count UTF-8 characters.
+  - **Recorded, not fixed (B1 to B5):**
+    - B1: the sweep is single-node, with no removal after it;
+    - B2: an ask lost to a change of leader;
+    - B3: one loop for every shard;
+    - B4: the user quota counts the API's users only;
+    - B5: `//` in a path.
+- **Tests, all passing:**
+  - 447 unit tests;
+  - the S3 smoke;
+  - the cluster smoke (209);
+  - the cluster maintenance smoke (17);
+  - the SDK matrix;
+  - the Terraform check.
+- **Next:** the owner's decisions: ADR-0110's acceptance as amended, and closing M22.

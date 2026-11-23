@@ -151,7 +151,8 @@ fn compactionWorkload(dir: Slice<u8>, config: StoreConfig) {
             _ => {}
         }
     }
-    let _ = finishCompaction(mut s, mut plan, borrow outputs, joined.view(), 50000);
+    var leftover = Vector<Vector<u8>>.create();
+    let _ = finishCompaction(mut s, mut plan, borrow outputs, joined.view(), 50000, mut leftover);
 }
 
 /// A recovered store's table: its metadata names snapshot 1 (before) or a replace after it, every data file its
@@ -197,7 +198,23 @@ fn checkCompacted(s: borrow ObjectStore) -> Result<usize, TestFailure> {
                 Err(_) => { return Err(TestFailure.create("a data file the table names is not there")); }
             };
             Check.equalU64(truncate<u64>(jsonMemberI64(file, "file_size_in_bytes") ?? -1), info.size)?;
-            rows += jsonMemberI64(file, "record_count") ?? 0;
+            // Its rows read from the Parquet file's own footer, not the manifest's count (the M22 exit review's
+            // finding 3): a file of the right size and wrong bytes does not pass.
+            let bytes = match (s.getObject(COMPACT_HIDDEN, StringView.fromUtf8(key) ?? "")) {
+                Ok(b) => b,
+                Err(_) => { return Err(TestFailure.create("a data file does not read")); }
+            };
+            if (bytes.length < 12) { return Err(TestFailure.create("a data file too short")); }
+            let n = parquetFooterLength(bytes.view()[bytes.length - 8..], bytes.length as u64) ?? {
+                return Err(TestFailure.create("a data file that is not Parquet"));
+            };
+            let start = bytes.length - 8 - n as usize;
+            let footer = match (parseParquetFooter(bytes.view()[start..bytes.length - 8], bytes.length as u64)) {
+                Ok(Some(f)) => f,
+                _ => { return Err(TestFailure.create("a data file whose footer does not read")); }
+            };
+            Check.equalU64(truncate<u64>(jsonMemberI64(file, "record_count") ?? -1), truncate<u64>(footer.rows))?;
+            rows += footer.rows;
             files += 1;
         }
     }
@@ -217,6 +234,13 @@ fn compactionJoinsTheFixtureTable() -> Result<void, TestFailure> {
     compactionWorkload(dir.bytes(), storeConfig());
     let s = ObjectStore.open(dir.view(), storeConfig())!;
     Check.equalU64(1, checkCompacted(borrow s)? as u64)?;
+    // Its job's status, written with the commit.
+    let status = maintenanceDocument(
+        borrow s,
+        COMPACT_HIDDEN.bytes(),
+        jobStatusKey(COMPACT_ID.bytes(), COMPACTION)!.view(),
+    )!;
+    Check.equalBytes("Successful".bytes(), jsonMemberText(borrow status, "status")!)?;
     removeTree(dir.view());
     return Ok();
 }

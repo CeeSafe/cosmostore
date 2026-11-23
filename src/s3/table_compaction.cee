@@ -798,6 +798,7 @@ fn commitCompaction(
     outputs: borrow Vector<CompactionOutput>,
     bins: Slice<usize>,
     nowMs: i64,
+    leftover: borrow mut Vector<Vector<u8>>,
 ) -> Result<bool, TablesError> {
     var written = Vector<Vector<u8>>.create();
     for (i in 0..outputs.length) { written.push(copyBytes(outputs[i].key.view())?)?; }
@@ -809,8 +810,14 @@ fn commitCompaction(
         Err(_) => false,
     };
     if (!done) {
+        // Each deleted. On a cluster's leader a key written in this same step is not applied yet, so its delete does
+        // nothing: it is handed back, for one more gated step to delete (the M22 exit review's finding 1).
         for (i in 0..written.length) {
             let _ = store.deleteObject(catalogText(plan.hidden.view()), catalogText(written[i].view()));
+            match (copyBytes(written[i].view())) {
+                Ok(k) => { let _ = leftover.push(k); }
+                Err(_) => {}
+            }
         }
     }
     return outcome;
@@ -1272,8 +1279,15 @@ async fn compactTable(
     let st = guard.data();
     let o = borrow outputs;
     let j = joined.view();
-    let _ = await Async.blocking(() => finishCompaction(st, mut plan, o, j, nowMs));
+    var leftover = Vector<Vector<u8>>.create();
+    let lo = borrow mut leftover;
+    let _ = await Async.blocking(() => finishCompaction(st, mut plan, o, j, nowMs, lo));
     return Ok();
+}
+
+/// The keys a failed commit wrote, deleted (on a cluster, a gated step after the commit's, ADR-0110 §2).
+fn deleteLeftovers(store: borrow mut ObjectStore, hidden: Slice<u8>, keys: Slice<Vector<u8>>) {
+    for (i in 0..keys.length) { let _ = store.deleteObject(catalogText(hidden), catalogText(keys[i].view())); }
 }
 
 /// A bin's readers and writer, under the store.
@@ -1318,13 +1332,14 @@ fn finishCompaction(
     outputs: borrow Vector<CompactionOutput>,
     bins: Slice<usize>,
     nowMs: i64,
+    leftover: borrow mut Vector<Vector<u8>>,
 ) -> Result<void, TablesError> {
     if (outputs.length == 0) {
         return writeJobStatus(store, plan.hidden.view(), plan.id.view(), COMPACTION, "Successful", "", nowMs);
     }
     let hidden = copyBytes(plan.hidden.view())?;
     let id = copyBytes(plan.id.view())?;
-    match (commitCompaction(store, plan, outputs, bins, nowMs)) {
+    match (commitCompaction(store, plan, outputs, bins, nowMs, leftover)) {
         Ok(true) => { return writeJobStatus(store, hidden.view(), id.view(), COMPACTION, "Successful", "", nowMs); }
         Ok(false) => {
             return writeJobStatus(

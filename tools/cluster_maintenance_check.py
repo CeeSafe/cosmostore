@@ -5,6 +5,7 @@
   job ENDPOINT BUCKET TABLE    the compaction job's status
   files ENDPOINT BUCKET TABLE  "<data files> <rows> <ids>", the ids sorted
   write ENDPOINT BUCKET NAME   a namespace made in the table bucket (a write to its shard): the seconds it took
+  ask ENDPOINT BUCKET TABLE KIND  CosmoStore's `maintenance-run` asked for the job: its HTTP status
 
 AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are a key of the cluster's (needs pyiceberg with pyarrow, boto3).
 """
@@ -64,6 +65,23 @@ elif what == "files":
     files = list(t.scan().plan_files())
     rows = t.scan().to_arrow()
     print(len(files), rows.num_rows, ",".join(str(i) for i in sorted(rows.column("id").to_pylist())))
+elif what == "ask":
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    url = "%s/tables/%s/ns/%s/maintenance-run?type=%s" % (endpoint, urllib.parse.quote(arn, safe=""), sys.argv[4],
+                                                         sys.argv[5])
+    req = AWSRequest(method="POST", url=url, data=b"")
+    SigV4Auth(Credentials(os.environ["AWS_ACCESS_KEY_ID"], os.environ["AWS_SECRET_ACCESS_KEY"]), "s3tables",
+              region).add_auth(req)
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=b"", method="POST", headers=dict(req.headers))) as r:
+            print(r.status)
+    except urllib.error.HTTPError as e:
+        print(e.code)
 elif what == "write":
     start = time.time()
     tables.create_namespace(tableBucketARN=arn, namespace=[sys.argv[4]])

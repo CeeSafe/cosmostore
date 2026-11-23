@@ -169,3 +169,14 @@
     the same rows, and the new leader compacts it.
 - **§7, the long run:** `node --tables-copy-pause-ms` (a test option). The smoke's run takes 40 s, and a write to
   its shard meanwhile takes under 3 s. CI runs this smoke.
+
+## Amended by the exit review (`docs/m22-exit-review.md`)
+
+- **§1, terms:** each gated step requires the term its run began in. A change of term ends the run.
+- **§2, a failed commit's files:** they are handed back, and deleted in one more gated step, as a step's own writes
+  are not applied within it.
+- **§2, out of memory after a bin's put:** the step is committed, so nothing it staged waits unproposed, and then the
+  run ends.
+- **§5, asks:** an ask made while its job runs is answered by that run.
+- **§6, the crash sweep:** it reads each file's rows from its Parquet footer and checks the job's status.
+- **Recorded, not fixed:** the review's B1 to B5.
