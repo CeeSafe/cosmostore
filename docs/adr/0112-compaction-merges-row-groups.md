@@ -1,6 +1,7 @@
 # ADR-0112: compaction that merges row groups (M23)
 
-**Status:** proposed, 23 Nov 2026, with the owner's choices made:
+**Status:** accepted, 23 Nov 2026, as amended by its As built and exit-review sections (the owner: "Accept and
+close"). Proposed the same day with the owner's choices made:
 - lists and maps in M23 ("In M23");
 - dictionary pages when smaller ("Yes, when smaller");
 - small fixtures in the repo ("Small fixtures in repo").

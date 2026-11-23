@@ -5178,3 +5178,50 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - 458 unit tests in all. `snapshotsFaultsTorn` timed out once at a load average of about 250 (other sessions'
     contract tests) and passed alone.
 - **CeeSafe's snappy (ADR 0196 phase 2):** five commits on its branch. Its contract tests are running.
+
+### 23 Nov 2026: M23 slice 5 finished, the merge across writers (ADR-0112 §2)
+
+- **SNAPPY:** CeeSafe 0.94.0 released from here with lib/std's `Snappy`. Parquet's SNAPPY pages are read and
+  written, compaction writes SNAPPY, and Avro's snappy blocks are read. The toolchain moved to 0.94.0.
+- **Merging across writers:** files whose pages all read are grouped by their columns' keys (field id, or name, and
+  types), sorted, not by the footer's shape. Each input's columns are matched to the first's by key.
+- **CI's maintenance smoke** asked through nodes 1 and 2 after killing the shard's leader, which was sometimes
+  node 1. It asks through the two nodes still up.
+
+### 23 Nov 2026: M23 slices 2 and 6, ZSTD and the checks (ADR-0112 §5)
+
+- **ZSTD:** CeeSafe 0.94.4 released from here with lib/std's zstd decoder (ADR 0196 phase 3). It was prepared as
+  0.94.1, 0.94.2 and 0.94.3, each taken meanwhile by another session's releases.
+  - Parquet's ZSTD pages and Avro's zstandard blocks are read, so PyIceberg's tables merge.
+  - The toolchain moved to 0.94.4.
+- **The page fuzzer:** in every test run, and under ASan and UBSan with `tools/page_fuzz.sh`. It found two decoder
+  bugs, fixed: a run's value wider than its bit width, and a chunk that starts within a row.
+- **The merge's crash sweep:** once, sticky, torn and crash over files that can only be merged.
+- **Real tables, on `serve` and through a cluster:** PyIceberg's ZSTD files, and a nested SNAPPY table of twelve
+  files, each merge into one row group, read the same by PyIceberg and pyarrow.
+
+### 23 Nov 2026: M23 slice 7, the exit review (ADR-0112)
+
+- **`docs/m23-exit-review.md`:** an agent reviewed the merge with no reading of mine. It found no input whose honest
+  rows merge otherwise.
+- **Fixed:**
+  - High: hostile pages could allocate gigabytes;
+  - the writer's pages past the reader's limit;
+  - a failed merge now joins as before;
+  - the row group's ceiling and what a merge holds;
+  - a merged file's column sizes;
+  - rows checked against chunks;
+  - the footer's column orders.
+- **Recorded, B1 to B6:** inputs are read whole; statistics' order for types outside Iceberg's;
+  `total_uncompressed_size`; names with `.`; width-0 dictionaries; no test of the join fallback itself.
+- **CI's perf gate on the move to 0.94.4:** large GETs at 32 clients failed in CI. Gated here against each other,
+  0.94.0 and 0.94.4 builds of one source showed no regression.
+
+### 23 Nov 2026: M23 closed (ADR-0112 accepted as amended)
+
+- **The owner's decision:** "Accept and close". ADR-0112 is accepted as amended.
+- **M23 is closed.** The exit review's B1 to B6 are recorded in `docs/m23-exit-review.md`.
+- **Next:** M24, when the owner asks. Candidates on record:
+  - B1, reading a merge's inputs row group by row group;
+  - CeeSafe's zstd encoder (ADR 0196 phase 4), so that ZSTD tables stay ZSTD;
+  - M21's to M23's recorded Lows.
