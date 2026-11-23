@@ -105,9 +105,11 @@ check "the new leader compacts it" "$done" yes
 check "two files, the same rows" "$(step "$up" files lake t2)" "2 4 0,1,2,3"
 
 # A client's ask (ADR-0110 §5): answered at once, through a node that may not lead the shard; a kind not done refused.
-check "maintenance-run asked through node 1, answered at once" "$(step 1 ask lake t1 icebergSnapshotManagement)" 204
-check "and through node 2" "$(step 2 ask lake t1 icebergUnreferencedFileRemoval)" 204
-check "a kind not done refused" "$(step 1 ask lake t1 sorting)" 400
+# Through the two nodes still up: the killed leader may have been any of the three.
+other=$(( up % 3 + 1 ))
+check "maintenance-run asked through node $up, answered at once" "$(step "$up" ask lake t1 icebergSnapshotManagement)" 204
+check "and through node $other" "$(step "$other" ask lake t1 icebergUnreferencedFileRemoval)" 204
+check "a kind not done refused" "$(step "$up" ask lake t1 sorting)" 400
 
 if [ "$failed" = 0 ]; then echo "cluster maintenance smoke: all passed"; else echo "cluster maintenance smoke: FAILED"; fi
 exit "$failed"
