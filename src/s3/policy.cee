@@ -207,12 +207,16 @@ fn revokedRequester(credentials: Slice<Credential>, who: borrow Requester) -> bo
 }
 
 /// Whether a key of `credentials` belongs to the user `name`.
-fn configuredUser(credentials: Slice<Credential>, name: Slice<u8>) -> bool {
+/// Whether the set has user `name` at `path` (an empty path in the set is `/`); any path when `anyPath`.
+fn configuredUserAt(credentials: Slice<Credential>, name: Slice<u8>, path: Slice<u8>, anyPath: bool) -> bool {
     for (i in 0..credentials.length) {
-        if (!credentials[i].revoked && credentials[i].user.view() == name) { return true; }
+        if (credentials[i].revoked || credentials[i].user.view() != name) { continue; }
+        let has = if (credentials[i].path.length == 0) "/".bytes() else credentials[i].path.view();
+        if (anyPath || has == path) { return true; }
     }
     return false;
 }
+
 const POLICY_S3_ARN: StringView = "arn:aws:s3:::";
 
 /// `Principal` or `NotPrincipal`: `"*"`, or `{"AWS": ...}` with `*` and user ARNs naming access keys (ADR-0043 §3).
@@ -257,14 +261,24 @@ fn parsePrincipal<region a>(
                 let colon = pieceEnd(v, iam.length, ':');
                 let tail = if (colon < v.length) v[colon + 1..] else "".bytes();
                 let user = "user/".bytes();
-                if (startsWithBytes(tail, user) && userNameOk(tail[user.length..])) {
+                // A user with a path, `user/tf/dave` (M21's B1): its name the last part, and, when the policy is put,
+                // a user of the set at that path.
+                let rest = if (startsWithBytes(tail, user)) tail[user.length..] else "".bytes();
+                var cut: usize = 0;
+                for (k in 0..rest.length) {
+                    if (rest[k] == '/') { cut = k + 1; }
+                }
+                let name = rest[cut..];
+                var path = copyBytes("/".bytes())?;
+                path.extend(rest[0..cut])?;
+                if (startsWithBytes(tail, user) && userNameOk(name) && iamPathOk(path.view())) {
                     // Checked when a policy is put: one stored before this rule still reads (it names no user here).
                     if (checkKeys && v[iam.length..colon] != POLICY_ACCOUNT.bytes()) { return Err(malformedPolicy()); }
                     if (v[iam.length..colon] != POLICY_ACCOUNT.bytes()) { continue; }
-                    if (checkKeys && !configuredUser(credentials, tail[user.length..])) {
+                    if (checkKeys && !configuredUserAt(credentials, name, path.view(), false)) {
                         return Err(malformedPolicy());
                     }
-                    st.users.push(copyBytes(tail[user.length..])?)?;
+                    st.users.push(copyBytes(name)?)?;
                     continue;
                 }
             }

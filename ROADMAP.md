@@ -5035,3 +5035,20 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - the SDK matrix;
   - the Terraform check.
 - **Next:** slice 6 (M21's B1) and slice 7 (B2), then the exit review.
+
+### 23 Nov 2026: M22 slices 6 and 7, M21's B1 and B2 (ADR-0110 §8)
+
+- **Slice 6 (B1):** a bucket policy names a user by its ARN with its path (`user/tf/dave`). When the policy is put, the
+  user must be the set's at that path; `user/dave` is a user at `/`, as AWS matches.
+  - The set's paths are M21's finding 5's.
+  - An older test's `user/bad/name`, now a valid ARN, became `user/bad name`.
+- **Slice 7 (B2):** AWS's default quotas, LimitExceeded past them:
+  - 5,000 users and 1,000 roles;
+  - inline policies' total size, whitespace not counted: 2,048 characters a user, 10,240 a role, 5,120 a group.
+- **Tests:**
+  - 447 unit tests;
+  - the S3 smoke;
+  - the cluster smoke (209);
+  - the SDK matrix;
+  - the Terraform check.
+- **Next:** the exit review.

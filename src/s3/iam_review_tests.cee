@@ -122,3 +122,58 @@ fn awsPoliciesAsResources() -> Result<void, TestFailure> {
     Check.isTrue(versionNumberOf("v01".bytes()).isNull(), "v01")?;
     return Ok();
 }
+
+/// M21's B1 (M22 slice 6): a bucket policy names a user by its ARN with its path, and only at that path.
+@test
+fn bucketPoliciesNameUsersWithTheirPaths() -> Result<void, TestFailure> {
+    var keys = policyKeys();
+    keys[0].user = iamName("dave");
+    keys[0].path = iamName("/tf/");
+    keys[1].user = iamName("erin");
+    let at = """
+        {"Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/tf/dave"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}}
+        """;
+    let policy = parseBucketPolicy(at.bytes(), "pub".bytes(), keys.view(), true);
+    Check.isTrue(policy.isOk(), "the user at its path")?;
+    let rooted = """
+        {"Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/dave"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}}
+        """;
+    Check.isTrue(parseBucketPolicy(rooted.bytes(), "pub".bytes(), keys.view(), true).isErr(), "not at /")?;
+    let elsewhere = """
+        {"Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/ops/dave"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}}
+        """;
+    Check.isTrue(
+        parseBucketPolicy(elsewhere.bytes(), "pub".bytes(), keys.view(), true).isErr(),
+        "nor at another path",
+    )?;
+    let erin = """
+        {"Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/erin"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}}
+        """;
+    Check.isTrue(parseBucketPolicy(erin.bytes(), "pub".bytes(), keys.view(), true).isOk(), "a user at / as before")?;
+    return Ok();
+}
+
+/// M21's B2 (M22 slice 7): inline policies' total size as AWS counts it, whitespace not, and refused past 2,048 a user.
+@test
+fn inlinePoliciesHaveTheirSize() -> Result<void, TestFailure> {
+    var policies = Vector<IamPolicy>.create();
+    policies.push(IamPolicy { name: iamName("a"), text: iamName("{ \"x\" :\n 1 }") })!;
+    Check.equalU64(7, inlineSize(policies.view()) as u64)?;
+    let dir = scratchDirectory("iam-review-inline");
+    var s = ObjectStore.open(dir.view(), spaceConfig(0, 0))!;
+    let files = Vector<Vector<u8>>.create();
+    Check.equalBytes(
+        "Done".bytes(),
+        iamCall(mut s, IamCall.CreateUser(iamName("ina"), iamName("/"), Vector<IamTag>.create()), files.view()).view(),
+    )?;
+    let small = iamPolicy("small", "s3:GetObject").text;
+    Check.equalBytes(
+        "Done".bytes(),
+        iamCall(mut s, IamCall.PutUserPolicy(iamName("ina"), iamName("small"), small), files.view()).view(),
+    )?;
+    Check.equalBytes(
+        "LimitExceeded".bytes(),
+        iamCall(mut s, IamCall.PutUserPolicy(iamName("ina"), iamName("big"), bigPolicyText(2100)), files.view()).view(),
+    )?;
+    return Ok();
+}
