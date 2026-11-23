@@ -176,6 +176,14 @@ fn pagesNestedV2Snappy() -> Result<void, TestFailure> =>
     checkFixture("NESTED_V2_SNAPPY", PAGES_NESTED_V2_SNAPPY[..], PAGES_NESTED_V2_SNAPPY_EXPECTED[..]);
 
 @test
+fn pagesFlatV1Zstd() -> Result<void, TestFailure> =>
+    checkFixture("FLAT_V1_ZSTD", PAGES_FLAT_V1_ZSTD[..], PAGES_FLAT_V1_ZSTD_EXPECTED[..]);
+
+@test
+fn pagesNestedV2Zstd() -> Result<void, TestFailure> =>
+    checkFixture("NESTED_V2_ZSTD", PAGES_NESTED_V2_ZSTD[..], PAGES_NESTED_V2_ZSTD_EXPECTED[..]);
+
+@test
 fn pagesFlatWithFieldIds() -> Result<void, TestFailure> =>
     checkFixture("FLAT_IDS", PAGES_FLAT_IDS[..], PAGES_FLAT_IDS_EXPECTED[..]);
 
@@ -206,4 +214,56 @@ fn fixtureLeaves(chunks: Slice<StringView>) -> Vector<PageLeaf> {
     let start = bytes.length - 8 - n as usize;
     let footer = parseParquetFooter(bytes.view()[start..bytes.length - 8], bytes.length as u64)!!;
     return schemaLeaves(borrow footer.meta)!!;
+}
+
+/// An RLE run's value wider than its bit width is refused (found by the page fuzzer: a BOOLEAN run of 7).
+@test
+fn hybridRefusesARunWiderThanItsWidth() -> Result<void, TestFailure> {
+    var out = Vector<u64>.create();
+    Check.isTrue(readHybrid([2u8, 1][..], 0, 2, 1, 1, mut out)!, "a run of one 1")?;
+    Check.equalU64(1, out[0])?;
+    Check.isTrue(!readHybrid([2u8, 7][..], 0, 2, 1, 1, mut out)!, "a run of one 7, at width 1")?;
+    Check.isTrue(!readHybrid([2u8, 0x10][..], 0, 2, 4, 1, mut out)!, "a run of one 16, at width 4")?;
+    Check.isTrue(readHybrid([2u8, 0x0F][..], 0, 2, 4, 1, mut out)!, "a run of one 15, at width 4")?;
+    return Ok();
+}
+
+/// A chunk whose first value continues a row is refused (found by the page fuzzer): merged, it would join another
+/// file's last row.
+@test
+fn chunkStartingWithinARowRefused() -> Result<void, TestFailure> {
+    let read = readFixture(fixtureBytes(PAGES_NESTED_V1[..]).view())?;
+    var k: usize = 0;
+    while (read.leaves[k].maxRep == 0) { k += 1; }
+    let leaf = borrow read.leaves[k];
+    var one = Vector<PageLeaf>.create();
+    one.push(PageLeaf {
+        path: copyBytes(leaf.path.view())!,
+        key: copyBytes(leaf.key.view())!,
+        physical: leaf.physical,
+        typeLength: leaf.typeLength,
+        maxDef: leaf.maxDef,
+        maxRep: leaf.maxRep,
+    })!;
+    for (first in [0u8, 1]) {
+        var columns = Vector<ColumnValues>.create();
+        columns.push(emptyValues())!;
+        Check.isTrue(appendValues(mut columns[0], borrow read.columns[k])!, "copied")?;
+        columns[0].reps[0] = first;
+        let g = encodeRowGroup(4, one.view(), columns.view(), read.rows, PQ_CODEC_UNCOMPRESSED)!!;
+        var file = copyBytes(PARQUET_MAGIC.bytes())!;
+        file.extend(g.bytes.view())!;
+        let group = match (borrow g.group) {
+            ThriftValue.Struct(f) => f,
+            _ => { return Err(TestFailure.create("a group")); }
+        };
+        let chunks = structItems(group, PQ_GROUP_COLUMNS) ?? { return Err(TestFailure.create("chunks")); };
+        let chunk = match (borrow chunks[0]) {
+            ThriftValue.Struct(f) => f,
+            _ => { return Err(TestFailure.create("a chunk")); }
+        };
+        let back = readColumnChunk(file.view(), chunk, leaf)!;
+        Check.isTrue(back.isSome() == (first == 0), "read only when it starts a row")?;
+    }
+    return Ok();
 }

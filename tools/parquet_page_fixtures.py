@@ -4,8 +4,7 @@ version, encoding and physical type the page reader takes, with nulls, structs, 
 column, what a reader must find: its repetition and definition levels and its values, from a Dremel shredding of the
 rows here (not from pyarrow's reading).
 
-usage: tools/parquet_page_fixtures.py OUT.cee          (needs pyarrow; the codecs here are none, gzip and snappy; zstd
-                                                       comes with CeeSafe's zstd decoder, ADR 0196 phase 3)
+usage: tools/parquet_page_fixtures.py OUT.cee          (needs pyarrow; the codecs here are none, gzip, snappy and zstd)
 """
 import io
 import struct
@@ -198,6 +197,11 @@ fixtures = [
         compression="snappy", data_page_version="1.0", max_rows_per_page=8), flat_nodes, flat_rows),
     ("NESTED_V2_SNAPPY", "a struct, a list and a map: v2 pages, dictionary, snappy", write(nested_schema, nested_rows,
         compression="snappy", data_page_version="2.0", max_rows_per_page=6), nested_nodes, nested_rows),
+    ("FLAT_V1_ZSTD", "v1 pages, dictionary, zstd (PyIceberg's default codec)", write(flat_schema, flat_rows,
+        compression="zstd", data_page_version="1.0", max_rows_per_page=8), flat_nodes, flat_rows),
+    ("NESTED_V2_ZSTD", "a struct, a list and a map: v2 pages, PLAIN, zstd at level 19", write(nested_schema,
+        nested_rows, compression="zstd", compression_level=19, use_dictionary=False, data_page_version="2.0",
+        max_rows_per_page=6), nested_nodes, nested_rows),
     ("FLAT_IDS", "v1 pages, dictionary, snappy, with Iceberg's field ids", write(ids_schema, flat_rows,
         compression="snappy", data_page_version="1.0"), flat_nodes, flat_rows),
     ("FLAT_IDS_RENAMED", "the same columns and ids, in the other order and renamed: v2 pages, PLAIN, none", write(

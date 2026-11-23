@@ -354,7 +354,8 @@ fn readAvro(bytes: Slice<u8>) -> Result<AvroFile, AvroError> {
         if (k == "avro.schema".bytes()) { schemaText = copyBytes(v)?; }
         if (k == "avro.codec".bytes()) { codec = copyBytes(v)?; }
     }
-    if (codec.view() != "null".bytes() && codec.view() != "deflate".bytes() && codec.view() != "snappy".bytes()) {
+    if (codec.view() != "null".bytes() && codec.view() != "deflate".bytes() && codec.view() != "snappy".bytes() &&
+        codec.view() != "zstandard".bytes()) {
         return Err(AvroError.Codec(codec));
     }
     let schema = parseJson(schemaText.view())? ?? { return Err(AvroError.Malformed); };
@@ -397,6 +398,15 @@ fn readAvro(bytes: Slice<u8>) -> Result<AvroFile, AvroError> {
             let crc = raw[raw.length - 4..];
             let want = (crc[0] as u32 << 24) | (crc[1] as u32 << 16) | (crc[2] as u32 << 8) | crc[3] as u32;
             if (Crc32.of(inflated.view()) != want) { return Err(AvroError.Malformed); }
+            inflated.view()
+        } else if (codec.view() == "zstandard".bytes()) {
+            // Avro's `zstandard`: a zstd frame (lib/std's Zstd since ceesafec 0.94.4, CeeSafe ADR 0196 phase 3).
+            let left = AVRO_MAX_FILE - decoded;
+            match (Zstd.decompress(raw, if (left < AVRO_MAX_BLOCK) left else AVRO_MAX_BLOCK, mut inflated)) {
+                Ok() => {}
+                Err(DecodeError.OutOfMemory(e)) => { return Err(AvroError.OutOfMemory(e)); }
+                Err(_) => { return Err(AvroError.Malformed); }
+            }
             inflated.view()
         } else raw;
         // Each record takes a byte at least, and the file's blocks decode to AVRO_MAX_FILE at most (B2).

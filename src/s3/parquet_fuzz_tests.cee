@@ -1,0 +1,291 @@
+// A mutational fuzzer for Parquet's page decoder (ADR-0112 §5), as CeeSafe's codecs are fuzzed (its ADR 0196 §4.3).
+// Seeds: every page fixture pyarrow wrote, and each of them written again by the page writer (SNAPPY). Each mutant
+// (mostly the pages and their headers changed in place: bits flipped, bytes set, zeroed or copied; now and then the
+// whole file, bytes inserted, deleted, the end cut) has its footer read and every column chunk decoded, and none of
+// these may fail for a chunk that decodes:
+//  1. no input panics the decoder (the test's process would end), nor, under tools/page_fuzz.sh, makes ASan or UBSan
+//     report;
+//  2. its levels: as many repetition levels as definition levels (none when the column does not repeat), none past
+//     the schema's, and a chunk starts at a row;
+//  3. its values: as many as the definition levels at the maximum; each its type's width, or, for BYTE_ARRAY, ends
+//     that rise to the data's length; a BOOLEAN 0 or 1;
+//  4. written again by the page writer (SNAPPY, a dictionary when smaller) and read back, the same levels and values.
+// A broken invariant prints the mutant in hex and fails the test.
+//
+// In `ceesafec test` it tries COSMO_PAGE_FUZZ_MUTANTS mutants (1500); with COSMO_PAGE_FUZZ_SECONDS, as many as that
+// many seconds allow (tools/page_fuzz.sh). COSMO_PAGE_FUZZ_SEED picks the mutants (1).
+
+/// xorshift64*.
+struct PageRng {
+    s: u64;
+
+    fn next(borrow mut this) -> u64 {
+        this.s = this.s ^ (this.s >> 12);
+        this.s = this.s ^ (this.s << 25);
+        this.s = this.s ^ (this.s >> 27);
+        return this.s.wrappingMul(2685821657736338717);
+    }
+
+    fn below(borrow mut this, n: usize) -> usize => if (n == 0) 0 else truncate<usize>(this.next() % (n as u64));
+}
+
+/// What the fuzzer found: mutants tried, footers read, chunks decoded and written back.
+struct PageFuzzCounts {
+    mutants: u64;
+    footers: u64;
+    decoded: u64;
+}
+
+/// Bytes a decoder's lengths and tags turn on.
+const PAGE_FUZZ_BYTES: [u8; 9] = [0, 1, 2, 0x15, 0x7F, 0x80, 0xFF, 0x40, 0x20];
+
+fn pageFuzzSetting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; }
+    };
+    return text.parseInt<u64>() ?? otherwise;
+}
+
+/// Where a file's footer starts (its data's end); its length when it has none.
+fn footerStartOf(bytes: Slice<u8>) -> usize {
+    if (bytes.length < 12) { return bytes.length; }
+    let n = parquetFooterLength(bytes[bytes.length - 8..], bytes.length as u64) ?? { return bytes.length; };
+    if (n + 12 > bytes.length as u64) { return bytes.length; }
+    return bytes.length - 8 - n as usize;
+}
+
+/// `from` changed: in place within its pages (after `PAR1`, before `dataEnd`), or, one time in five, anywhere, its
+/// length changed too.
+fn mutatePages(rng: borrow mut PageRng, from: Slice<u8>, dataEnd: usize, out: borrow mut Vector<u8>) {
+    out.extend(from)!;
+    let whole = rng.below(5) == 0;
+    let edits = 1 + rng.below(if (rng.below(3) == 0) 10 else 3);
+    for (e in 0..edits) {
+        let n = out.length;
+        let limit = if (whole || dataEnd > n) n else dataEnd;
+        if (limit <= 4) { return; }
+        let at = 4 + rng.below(limit - 4);
+        let kind = rng.below(if (whole) 8 else 5);
+        if (kind == 0) {
+            out[at] ^= truncate<u8>(1u64 << (rng.next() % 8));
+        } else if (kind == 1) {
+            out[at] = truncate<u8>(rng.next());
+        } else if (kind == 2) {
+            out[at] = PAGE_FUZZ_BYTES[rng.below(PAGE_FUZZ_BYTES.length)];
+        } else if (kind == 3) {
+            let end = at + 1 + rng.below(16);
+            for (k in at..(if (end < limit) end else limit)) { out[k] = 0; }
+        } else if (kind == 4) {
+            let b = out[4 + rng.below(limit - 4)];
+            out[at] = b;
+        } else if (kind == 5) {
+            out.insert(at, truncate<u8>(rng.next()))!;
+        } else if (kind == 6) {
+            let _ = out.remove(at);
+        } else {
+            out.truncate(at);
+        }
+    }
+}
+
+/// A broken invariant: the mutant printed in hex, and the test failed.
+fn pageFuzzBroken(what: StringView, input: Slice<u8>) -> TestFailure {
+    var hex = Vector<u8>.create();
+    appendHexBytes(mut hex, input)!;
+    Console.write("page fuzzer: invariant broken: ");
+    Console.writeLine(what);
+    Console.writeLine(StringView.fromUtf8(hex.view()) ?? "");
+    return TestFailure.create(what);
+}
+
+/// Every column chunk of a mutant decoded, and each that decodes checked.
+fn fuzzPageFile(bytes: Slice<u8>, counts: borrow mut PageFuzzCounts) -> Result<void, TestFailure> {
+    let start = footerStartOf(bytes);
+    if (start == bytes.length) { return Ok(); }
+    let footer = match (parseParquetFooter(bytes[start..bytes.length - 8], bytes.length as u64)) {
+        Ok(Some(f)) => f,
+        _ => { return Ok(); }
+    };
+    let leaves = match (schemaLeaves(borrow footer.meta)) {
+        Ok(Some(l)) => l,
+        _ => { return Ok(); }
+    };
+    counts.footers += 1;
+    let _ = pagesReadable(borrow footer.meta);
+    let groups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? { return Ok(); };
+    for (g in 0..groups.length) {
+        let group = match (borrow groups[g]) {
+            ThriftValue.Struct(f) => f,
+            _ => { continue; }
+        };
+        let chunks = structItems(group, PQ_GROUP_COLUMNS) ?? { continue; };
+        for (c in 0..chunks.length) {
+            if (c >= leaves.length) { break; }
+            let chunk = match (borrow chunks[c]) {
+                ThriftValue.Struct(f) => f,
+                _ => { continue; }
+            };
+            match (readColumnChunk(bytes, chunk, borrow leaves[c])) {
+                Ok(Some(v)) => {
+                    counts.decoded += 1;
+                    checkDecoded(borrow leaves[c], borrow v, bytes)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    return Ok();
+}
+
+/// A decoded chunk's levels and values as they must be (invariants 2 to 4).
+fn checkDecoded(leaf: borrow PageLeaf, v: borrow ColumnValues, input: Slice<u8>) -> Result<void, TestFailure> {
+    let repeats = leaf.maxRep > 0;
+    if (repeats && v.reps.length != v.defs.length) {
+        return Err(pageFuzzBroken("as many repetition levels as definition levels", input));
+    }
+    if (!repeats && v.reps.length != 0 && v.reps.length != v.defs.length) {
+        return Err(pageFuzzBroken("repetition levels of a column that does not repeat", input));
+    }
+    for (r in v.reps.view()) {
+        if (r as u32 > leaf.maxRep) { return Err(pageFuzzBroken("a repetition level past the schema's", input)); }
+    }
+    if (repeats && v.reps.length > 0 && v.reps[0] != 0) {
+        return Err(pageFuzzBroken("a chunk that starts within a row", input));
+    }
+    var present: usize = 0;
+    for (d in v.defs.view()) {
+        if (d as u32 > leaf.maxDef) { return Err(pageFuzzBroken("a definition level past the schema's", input)); }
+        if (d as u32 == leaf.maxDef) { present += 1; }
+    }
+    if (present != v.count) { return Err(pageFuzzBroken("as many values as levels at the maximum", input)); }
+    let w = valueWidth(leaf) ?? { return Err(pageFuzzBroken("a type decoded that is not read", input)); };
+    if (w > 0) {
+        if (v.data.length != v.count * w) { return Err(pageFuzzBroken("values of the type's width", input)); }
+    } else {
+        if (v.ends.length != v.count) { return Err(pageFuzzBroken("an end a value", input)); }
+        var last: u32 = 0;
+        for (e in v.ends.view()) {
+            if (e < last) { return Err(pageFuzzBroken("ends that rise", input)); }
+            last = e;
+        }
+        if (last as usize != v.data.length) { return Err(pageFuzzBroken("ends that reach the data's", input)); }
+    }
+    if (leaf.physical == PQ_BOOLEAN) {
+        for (b in v.data.view()) {
+            if (b > 1) { return Err(pageFuzzBroken("a BOOLEAN of 0 or 1", input)); }
+        }
+    }
+    return roundTrips(leaf, v, input);
+}
+
+/// The chunk written again and read back the same (invariant 4).
+fn roundTrips(leaf: borrow PageLeaf, v: borrow ColumnValues, input: Slice<u8>) -> Result<void, TestFailure> {
+    var rows: usize = 0;
+    if (leaf.maxRep > 0) {
+        for (r in v.reps.view()) {
+            if (r == 0) { rows += 1; }
+        }
+    } else {
+        rows = v.defs.length;
+    }
+    var one = Vector<PageLeaf>.create();
+    one.push(PageLeaf {
+        path: copyBytes(leaf.path.view())!,
+        key: copyBytes(leaf.key.view())!,
+        physical: leaf.physical,
+        typeLength: leaf.typeLength,
+        maxDef: leaf.maxDef,
+        maxRep: leaf.maxRep,
+    })!;
+    var columns = Vector<ColumnValues>.create();
+    columns.push(emptyValues())!;
+    if (!appendValues(mut columns[0], v)!) { return Err(pageFuzzBroken("values copied", input)); }
+    let g = encodeRowGroup(4, one.view(), columns.view(), truncate<i64>(rows), PQ_CODEC_SNAPPY)! ?? {
+        return Err(pageFuzzBroken("values decoded that are not written", input));
+    };
+    var file = copyBytes(PARQUET_MAGIC.bytes())!;
+    file.extend(g.bytes.view())!;
+    let group = match (borrow g.group) {
+        ThriftValue.Struct(f) => f,
+        _ => { return Err(pageFuzzBroken("a row group written", input)); }
+    };
+    let chunks = structItems(group, PQ_GROUP_COLUMNS) ?? { return Err(pageFuzzBroken("its chunk", input)); };
+    let chunk = match (borrow chunks[0]) {
+        ThriftValue.Struct(f) => f,
+        _ => { return Err(pageFuzzBroken("its chunk", input)); }
+    };
+    let back = readColumnChunk(file.view(), chunk, leaf)! ?? {
+        return Err(pageFuzzBroken("written, and not read back", input));
+    };
+    let same = back.defs.view() == v.defs.view() && back.data.view() == v.data.view() && back.count == v.count &&
+        back.ends.view() == v.ends.view() && (leaf.maxRep == 0 || back.reps.view() == v.reps.view());
+    if (!same) { return Err(pageFuzzBroken("written and read back the same", input)); }
+    return Ok();
+}
+
+@test
+fn pagesFuzzed() -> Result<void, TestFailure> {
+    let seconds = pageFuzzSetting("COSMO_PAGE_FUZZ_SECONDS", 0);
+    let mutants = pageFuzzSetting("COSMO_PAGE_FUZZ_MUTANTS", 1500);
+    let seed = pageFuzzSetting("COSMO_PAGE_FUZZ_SEED", 1);
+    var rng = PageRng { s: seed.wrappingMul(0x9E3779B97F4A7C15) | 1 };
+    var seeds = Vector<Vector<u8>>.create();
+    for (chunks in [
+        PAGES_FLAT_V1_DICT[..],
+        PAGES_FLAT_V2_DICT_GZIP[..],
+        PAGES_FLAT_V1_PLAIN[..],
+        PAGES_FLAT_V2_DELTA[..],
+        PAGES_FLAT_V1_DELTA_BYTES[..],
+        PAGES_NESTED_V1[..],
+        PAGES_NESTED_V2_GZIP[..],
+        PAGES_FLAT_V1_SNAPPY[..],
+        PAGES_NESTED_V2_SNAPPY[..],
+        PAGES_FLAT_V1_ZSTD[..],
+        PAGES_NESTED_V2_ZSTD[..],
+        PAGES_FLAT_IDS[..],
+        PAGES_FLAT_IDS_RENAMED[..],
+    ]) {
+        seeds.push(fixtureBytes(chunks))!;
+    }
+    // The page writer's own files of each: v1 pages, its RLE hybrid, its dictionaries.
+    let pyarrows = seeds.length;
+    for (i in 0..pyarrows) {
+        let read = readFixture(seeds[i].view())?;
+        let written = writeParquetFile(
+            borrow read.meta,
+            read.leaves.view(),
+            read.columns.view(),
+            read.rows,
+            PQ_CODEC_SNAPPY,
+        )! ?? { return Err(TestFailure.create("a seed written")); };
+        seeds.push(written)!;
+    }
+    var counts = PageFuzzCounts { mutants: 0, footers: 0, decoded: 0 };
+    for (i in 0..seeds.length) { fuzzPageFile(seeds[i].view(), mut counts)?; }
+    let whole = counts.decoded;
+    Check.isTrue(whole > 0, "the seeds decode")?;
+    let begun = Clock.monotonicNanos();
+    while (true) {
+        if (seconds > 0) {
+            if (Clock.monotonicNanos() - begun >= seconds * 1000000000) { break; }
+        } else if (counts.mutants >= mutants) {
+            break;
+        }
+        let from = rng.below(seeds.length);
+        var mutant = Vector<u8>.create();
+        mutatePages(mut rng, seeds[from].view(), footerStartOf(seeds[from].view()), mut mutant);
+        counts.mutants += 1;
+        fuzzPageFile(mutant.view(), mut counts)?;
+    }
+    Console.write("page fuzzer: ");
+    Console.write(counts.mutants);
+    Console.write(" mutants, ");
+    Console.write(counts.footers);
+    Console.write(" footers read, ");
+    Console.write(counts.decoded);
+    Console.writeLine(" chunks decoded and written back: no invariant broken");
+    // The mutants reach the decoder: most of a file's chunks are untouched by a few edits, and decode.
+    Check.isTrue(counts.decoded > counts.mutants, "the mutants' chunks decode")?;
+    return Ok();
+}

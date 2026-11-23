@@ -76,8 +76,10 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
   holding it has been synced (ADR-0001).
 - All file and directory I/O goes through `DurableFile`/`Fs` (`src/storage/io/durable.cee`), so the fault
   injector and crash model of ADR-0004 cover it. A durability change needs a fault sweep.
-- **Toolchain: ceesafec 0.94.0 or later**, which `ceesafe.toml` requires (`ceesafec = ">=0.94.0"`, CeeSafe ADR 0076):
+- **Toolchain: ceesafec 0.94.4 or later**, which `ceesafe.toml` requires (`ceesafec = ">=0.94.4"`, CeeSafe ADR 0076):
   an older compiler stops at that line.
+  - **What 0.94.4 gives CosmoStore:** lib/std's `Zstd`: Parquet's ZSTD pages read (PyIceberg's default codec, so its
+    tables' files are merged, ADR-0112), and Avro's zstandard blocks (ADR 0196 phase 3).
   - **What 0.94.0 gives CosmoStore:** lib/std's `Snappy`: Parquet's SNAPPY pages read and written (compaction writes
     SNAPPY, ADR-0112), and Avro's snappy blocks read (ADR 0196 phase 2).
   - **What 0.90.0 gives CosmoStore:** lib/std's `Deflate` for Avro's deflate blocks and `Gzip` for the inventory
@@ -88,9 +90,9 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
     - the master key's cells as `[AtomicU64; 4]` (G41, ADR 0198);
     - lib/std's `Crc32` and `Sha1` in place of its own (G26, ADR 0194).
   - **Also since 0.85.1:** `ceesafec test` needs no `-fbracket-depth` (G36, ADR 0195).
-  - **CI** installs the release `CEESAFE_VERSION` names (v0.94.0) in every job, and
+  - **CI** installs the release `CEESAFE_VERSION` names (v0.94.4) in every job, and
   CeeSafe.Web's pinned commit (CI's `CEESAFE_WEB_REF`, `ccda03a`, its main) needs 0.53; move both together, after
-  `ceesafec check`, `test` and the smokes pass with them. Earlier floors, for the record: 0.90.0, 0.87.0 and 0.85.1 (21 Nov 2026, briefly); 0.54.0 (CI's
+  `ceesafec check`, `test` and the smokes pass with them. Earlier floors, for the record: 0.94.0 (23 Nov 2026, briefly), 0.90.0, 0.87.0 and 0.85.1 (21 Nov 2026, briefly); 0.54.0 (CI's
   v0.56.0 until 21 Nov 2026); 0.44 (`AsyncError.Closed`,
   CeeSafe ADR 0128; 0.27 made its route handlers `Send + Share`, ADR 0084); 0.30.0 adds `Crc32c` on the CPU's instruction (ADR 0089, G31);
   0.36.0 runs `Async.blocking` on a pool of reused threads (ADR 0094, G28); 0.38.0 resizes into zeroed memory, removes

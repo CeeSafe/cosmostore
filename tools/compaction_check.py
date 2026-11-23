@@ -2,7 +2,9 @@
 """Compaction end to end (ADR-0098): PyIceberg tables of small files compacted by the maintenance pass, by copying
 row groups, and read back the same.
 
-- An unpartitioned table's six one-row files become one file of six row groups.
+- An unpartitioned table's six one-row files (PyIceberg's ZSTD) are merged: one file of one row group, SNAPPY.
+- A SNAPPY table's twelve small files, with a struct, a list and a map, are merged (ADR-0112): one file of one row
+  group, SNAPPY, read by PyIceberg and by pyarrow as the same rows.
 - A partitioned table's files are compacted each partition apart.
 - The sort strategy is not done, and the job's status says so.
 - Appends work after compaction.
@@ -90,7 +92,8 @@ check("its job Successful", job("flat")["status"], "Successful")
 path = data_files("flat")[0]
 bucket, key = path[5:].split("/", 1)
 f = pq.ParquetFile(io.BytesIO(s3.get_object(Bucket=bucket, Key=key)["Body"].read()))
-check("the file's row groups are the six files'", f.metadata.num_row_groups, 6)
+check("one row group, the six files' values merged", f.metadata.num_row_groups, 1)
+check("written SNAPPY, from ZSTD", f.metadata.row_group(0).column(0).compression, "SNAPPY")
 check("its rows", f.metadata.num_rows, 6)
 entry = next(iter(t.scan().plan_files()))
 check("its manifest's record count", entry.file.record_count, 6)
@@ -98,6 +101,41 @@ check("its bounds: the least id", int.from_bytes(entry.file.lower_bounds[1], "li
 check("its bounds: the greatest id", int.from_bytes(entry.file.upper_bounds[1], "little", signed=True), 5)
 t.append(pa.table({"id": [6], "item": ["row 6"]}, schema=schema))
 check("an append after", catalog.load_table("ns.flat").scan().to_arrow().num_rows, 7)
+
+# A SNAPPY table (Spark's codec), nested: its pages read and its values written again as one row group (ADR-0112).
+nested = pa.schema([
+    pa.field("id", pa.int64(), nullable=False),
+    pa.field("item", pa.string()),
+    pa.field("st", pa.struct([pa.field("a", pa.int32()), pa.field("b", pa.string())])),
+    pa.field("lst", pa.list_(pa.int32())),
+    pa.field("m", pa.map_(pa.string(), pa.int64())),
+])
+catalog.create_table("ns.snappy", schema=nested, properties={"write.parquet.compression-codec": "snappy"})
+compaction("snappy", "disabled")
+for i in range(12):
+    rows = [{"id": i * 10 + k, "item": None if k == 1 else "item %d" % (i * 10 + k),
+             "st": None if k == 2 else {"a": None if i % 3 == 0 else i * k, "b": "b%d" % k},
+             "lst": None if k == 0 else [i + j for j in range(k)],
+             "m": None if (i + k) % 4 == 0 else [("k%d" % j, None if j == 1 else i * 100 + j) for j in range(k)]}
+            for k in range(3)]
+    catalog.load_table("ns.snappy").append(pa.Table.from_pylist(rows, schema=nested))
+snappy_before = catalog.load_table("ns.snappy").scan().to_arrow().sort_by("id")
+check("SNAPPY: twelve files before", len(data_files("snappy")), 12)
+compaction("snappy", "enabled")
+wait_for("SNAPPY: merged to one file", lambda: len(data_files("snappy")) == 1, 4 * day)
+t = catalog.load_table("ns.snappy")
+check("SNAPPY: the same rows, by PyIceberg", t.scan().to_arrow().sort_by("id").equals(snappy_before), True)
+path = data_files("snappy")[0]
+bucket, key = path[5:].split("/", 1)
+f = pq.ParquetFile(io.BytesIO(s3.get_object(Bucket=bucket, Key=key)["Body"].read()))
+check("SNAPPY: one row group, the files' values merged", f.metadata.num_row_groups, 1)
+check("SNAPPY: its rows", f.metadata.num_rows, 36)
+check("SNAPPY: written SNAPPY", f.metadata.row_group(0).column(0).compression, "SNAPPY")
+check("SNAPPY: the same rows, by pyarrow", f.read().sort_by("id").to_pylist(), snappy_before.to_pylist())
+entry = next(iter(t.scan().plan_files()))
+check("SNAPPY: its manifest's record count", entry.file.record_count, 36)
+check("SNAPPY: its bounds", (int.from_bytes(entry.file.lower_bounds[1], "little", signed=True),
+                             int.from_bytes(entry.file.upper_bounds[1], "little", signed=True)), (0, 112))
 
 # A partitioned table: each partition compacted apart.
 pschema = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("part", pa.string(), nullable=False)])
@@ -202,7 +240,7 @@ check("its rows, the delete still applied", sorted(catalog.load_table("ns.delete
       rows_before)
 check("three rows of four", len(rows_before), 3)
 
-for name in ("flat", "parts", "sorted", "deletes"):
+for name in ("flat", "snappy", "parts", "sorted", "deletes"):
     catalog.purge_table("ns." + name)
 catalog.drop_namespace("ns")
 for attempt in range(3):

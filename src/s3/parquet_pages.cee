@@ -28,6 +28,7 @@ const PQ_ENC_BYTE_STREAM_SPLIT: i64 = 9;
 const PQ_CODEC_UNCOMPRESSED: i64 = 0;
 const PQ_CODEC_SNAPPY: i64 = 1;
 const PQ_CODEC_GZIP: i64 = 2;
+const PQ_CODEC_ZSTD: i64 = 6;
 
 // Page types.
 const PQ_PAGE_DATA: i64 = 0;
@@ -291,6 +292,8 @@ fn readHybrid(
             if (pos + bytes > end) { return Ok(false); }
             var v: u64 = 0;
             for (k in 0..bytes) { v = v | ((data[pos + k] as u64) << ((k * 8) as u64)); }
+            // A run's value is stored in whole bytes: one wider than the width is not the format's (a BOOLEAN of 7).
+            if (v >> (width as u64) != 0) { return Ok(false); }
             pos += bytes;
             let take = if (run > count - (out.length - start)) count - (out.length - start) else run;
             for (i in 0..take) { out.push(v)?; }
@@ -516,7 +519,15 @@ fn decompressPage(codec: i64, bytes: Slice<u8>, size: usize) -> Result<Vector<u8
             Err(_) => Ok(null),
         };
     }
-    return Ok(null); // ZSTD comes with CeeSafe's zstd decoder (ADR 0196 phase 3)
+    if (codec == PQ_CODEC_ZSTD) {
+        // PyIceberg's default codec: lib/std's since ceesafec 0.94.4 (CeeSafe ADR 0196 phase 3).
+        return match (Zstd.decompress(bytes, size, mut out)) {
+            Ok() => if (out.length == size) Ok(Some(out)) else Ok(null),
+            Err(DecodeError.OutOfMemory(e)) => Err(e),
+            Err(_) => Ok(null),
+        };
+    }
+    return Ok(null);
 }
 
 /// Levels of `width` bits for `n` values, the hybrid between `at` and `end`, appended a byte each to `out`.
@@ -701,6 +712,9 @@ fn readColumnChunk(
         return Ok(null);
     }
     if (at != end || levels != numValues) { return Ok(null); }
+    // A chunk starts at a row: one whose first value continues a row (found by the page fuzzer) would join it to the
+    // row before, another file's when merged.
+    if (leaf.maxRep > 0 && out.reps.length > 0 && out.reps[0] != 0) { return Ok(null); }
     return Ok(Some(out));
 }
 
@@ -759,7 +773,7 @@ fn pagesReadable(meta: borrow Vector<ThriftField>) -> Result<bool, AllocError> {
 
 /// The codecs read here: none, SNAPPY and gzip; ZSTD once CeeSafe has its decoder (ADR 0196 phase 3).
 fn codecRead(codec: i64) -> bool =>
-    codec == PQ_CODEC_UNCOMPRESSED || codec == PQ_CODEC_SNAPPY || codec == PQ_CODEC_GZIP;
+    codec == PQ_CODEC_UNCOMPRESSED || codec == PQ_CODEC_SNAPPY || codec == PQ_CODEC_GZIP || codec == PQ_CODEC_ZSTD;
 
 /// `from`'s levels and values appended to `into`'s, a byte array's ends moved past what `into` held.
 fn appendValues(into: borrow mut ColumnValues, from: borrow ColumnValues) -> Result<bool, AllocError> {

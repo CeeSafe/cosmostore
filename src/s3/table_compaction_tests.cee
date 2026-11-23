@@ -253,13 +253,25 @@ fn compactionJoinsTheFixtureTable() -> Result<void, TestFailure> {
     return Ok();
 }
 
-fn sweepCompaction(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+fn sweepCompaction(name: StringView, mode: SweepMode) -> Result<void, TestFailure> =>
+    sweepCompactionOf(name, mode, PARQUET_FIXTURE_A[..], 3, PARQUET_FIXTURE_B[..], 2);
+
+/// The sweep over a table of the data files `a` and `b`, of `aRows` and `bRows` rows.
+fn sweepCompactionOf(
+    name: StringView,
+    mode: SweepMode,
+    a: Slice<StringView>,
+    aRows: i64,
+    b: Slice<StringView>,
+    bRows: i64,
+) -> Result<void, TestFailure> {
+    let rows = aRows + bRows;
     Faults.elideSyncs(true);
     let base = scratchDirectory(name);
     let dir = base.view();
     removeTree(dir);
     Fs.ensureDirectory(dir)!;
-    fixtureCompactStore(dir.bytes(), faultStoreConfig());
+    fixtureCompactStoreOf(dir.bytes(), faultStoreConfig(), fixtureBytes(a), aRows, fixtureBytes(b), bRows);
     Faults.countOperations();
     compactionWorkload(dir.bytes(), faultStoreConfig());
     Faults.disarm();
@@ -267,12 +279,12 @@ fn sweepCompaction(name: StringView, mode: SweepMode) -> Result<void, TestFailur
     Check.isTrue(points > 10, "the run performs I/O")?;
     {
         let s = ObjectStore.open(dir, faultStoreConfig())!;
-        Check.equalU64(1, checkCompacted(borrow s)? as u64)?;
+        Check.equalU64(1, checkCompactedRows(borrow s, rows)? as u64)?;
     }
     for (n in 1..points + 1) {
         removeTree(dir);
         Fs.ensureDirectory(dir)!;
-        fixtureCompactStore(dir.bytes(), faultStoreConfig());
+        fixtureCompactStoreOf(dir.bytes(), faultStoreConfig(), fixtureBytes(a), aRows, fixtureBytes(b), bRows);
         armMode(borrow mode, n);
         compactionWorkload(dir.bytes(), faultStoreConfig());
         Faults.disarm();
@@ -282,11 +294,11 @@ fn sweepCompaction(name: StringView, mode: SweepMode) -> Result<void, TestFailur
         }
         {
             var s = ObjectStore.open(dir, faultStoreConfig())!;
-            let _ = checkCompacted(borrow s)?;
+            let _ = checkCompactedRows(borrow s, rows)?;
             let _ = s.checkpoint()!;
         }
         let s = ObjectStore.open(dir, faultStoreConfig())!;
-        let files = checkCompacted(borrow s)?;
+        let files = checkCompactedRows(borrow s, rows)?;
         Check.isTrue(files == 1 || files == 2, "the table as before or as after")?;
     }
     removeTree(dir);
@@ -428,3 +440,20 @@ fn compactedFile(s: borrow ObjectStore) -> Result<Vector<u8>, TestFailure> {
     let key = path.view()["s3://compact--table-s3/".bytes().length..];
     return Ok(s.getObject(COMPACT_HIDDEN, StringView.fromUtf8(key) ?? "")!);
 }
+
+/// The sweep over a merge (ADR-0112 §5): two files of one schema from writers whose shapes differ, so that they are
+/// never joined, only merged (by field id) into one.
+fn sweepMerge(name: StringView, mode: SweepMode) -> Result<void, TestFailure> =>
+    sweepCompactionOf(name, mode, PAGES_FLAT_IDS[..], 23, PAGES_FLAT_IDS_RENAMED[..], 23);
+
+@test
+fn compactionMergeFaultsOnce() -> Result<void, TestFailure> => sweepMerge("merge-once", SweepMode.Once);
+
+@test
+fn compactionMergeFaultsSticky() -> Result<void, TestFailure> => sweepMerge("merge-sticky", SweepMode.Sticky);
+
+@test
+fn compactionMergeFaultsTorn() -> Result<void, TestFailure> => sweepMerge("merge-torn", SweepMode.StickyTorn);
+
+@test
+fn compactionMergeFaultsCrash() -> Result<void, TestFailure> => sweepMerge("merge-crash", SweepMode.Crash);
