@@ -133,3 +133,39 @@
   for at most one of them.
 - **A bin's extent is still pushed whole,** one bin at a time. Its size is bounded by the compaction's target file
   size.
+
+## As built (slices 1 to 5)
+
+- **The gated step** (`src/cluster/tables_steps.cee`):
+  - `stepReady` waits, under the gate, until this replica leads and has applied everything;
+  - `stepCommit` pushes the step's extents, proposes, and waits until applied in its term.
+- **The runner, narrower than §1:** the cluster has its own short run of the same step functions `serve` calls,
+  rather than one runner both use.
+  - **Why:** a closure is not `Share`, so it cannot be given to `Async.blocking` on a worker thread, and the steps
+    must run there.
+  - **What is shared:** the steps themselves: plan, footers, prepare, copy, put, commit; removal's read and its
+    finish.
+- **Compaction (§2):**
+  - **Gated steps:** the plan, each bin's put, and the commit. The plan is gated because it may write the job's
+    status.
+  - **Off the gate:** the footers and the bins' copies.
+  - **The bug that showed it:** the cluster smoke's first run had the plan off the gate. Its status writes were
+    staged and proposed by no one, so every later write to the shard answered 503.
+- **Removal (§4), narrower:** its reads are off the gate, and its sweep is one gated step, not batches of 1,000.
+  - **Why:** the sweep's deletes are small entries with no extents to push.
+- **The run (§5):**
+  - **The loop:** `tablesMaintenanceClusterForever` runs the steps itself every hour of a day, and the asked runs
+    within a second.
+  - **The ask:** a client's `maintenance-run` on a cluster is authorized as before, queued on its shard's S3 app
+    (`askedRuns`, deduplicated) and answered 204.
+  - **Removed:** the old self-request, `maintenanceRunThroughFront`.
+- **The crash sweep (§6):**
+  - **The store's:** `table_compaction_tests.cee` builds a table of two Parquet fixtures, with PyIceberg's fixture
+    manifests pointed at them. Its compaction is swept once, sticky, torn and as a crash at every I/O point, and the
+    table must read as before (2 files) or after (1 file), every named file there at its size, with its 5 rows.
+    This is also compaction's first unit test.
+  - **The cluster's, narrower than §6:** it is `tools/cluster_maintenance_smoke.sh` on a real cluster, not
+    in-process replicas, whose harness has no front or gate. The shard's leader is killed mid-run. The table reads
+    the same rows, and the new leader compacts it.
+- **§7, the long run:** `node --tables-copy-pause-ms` (a test option). The smoke's run takes 40 s, and a write to
+  its shard meanwhile takes under 3 s. CI runs this smoke.

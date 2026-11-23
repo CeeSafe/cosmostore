@@ -464,6 +464,41 @@ async fn runMaintenance(
         var guard = await lockStore(app)?;
         let store = guard.data();
         await Async.blocking(() => maintenanceRunAllowed(store, caller, tr))?;
+    }
+    // On a cluster, queued for the shard's leader's run and answered at once (ADR-0110 §5); asked again while it
+    // waits, the same.
+    match (borrow app.askedRuns) {
+        Some(q) => {
+            var queue = match (await q.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(TablesError.Internal); }
+            };
+            let runs = queue.data();
+            var there = false;
+            for (i in 0..runs.length) {
+                let r = borrow runs[i];
+                if (r.kind.view() == kind && r.table.bucket.view() == t.bucket.view() &&
+                    r.table.ns.view() == t.ns.view() && r.table.name.view() == t.name.view()) {
+                    there = true;
+                }
+            }
+            if (!there) {
+                runs.push(AskedRun {
+                    table: MaintainedTable {
+                        bucket: copyBytes(t.bucket.view())?,
+                        ns: copyBytes(t.ns.view())?,
+                        name: copyBytes(t.name.view())?,
+                    },
+                    kind: copyBytes(kind)?,
+                })?;
+            }
+            return Ok(tablesNoContent());
+        }
+        null => {}
+    }
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
         if (kind == SNAPSHOT_MANAGEMENT.bytes()) {
             let now = Clock.unixMillis();
             await Async.blocking(() => maintainTable(store, tr, now, dayMs))?;
@@ -500,6 +535,12 @@ struct MaintainedTable {
     bucket: Vector<u8>;
     ns: Vector<u8>;
     name: Vector<u8>;
+}
+
+/// A job asked for on a cluster (ADR-0110 §5): the table and the job's kind.
+struct AskedRun {
+    table: MaintainedTable;
+    kind: Vector<u8>;
 }
 
 /// Every table of every table bucket in the store.

@@ -1,116 +1,41 @@
-// Table maintenance on a cluster (ADR-0086 §5): every hour of a day, each shard this node leads lists its tables from
-// its store, and asks each for its jobs, one request each (`maintenance-run`), signed for `s3tables` through the node's
-// own front. Each job is then a shard's write, behind its gate and committed by Raft as a client's is.
-import web_core;
-import web_transport;
-import web_http;
-import web_client;
+// Table maintenance on a cluster (ADR-0086 §5, ADR-0110): every hour of a day, each shard this node leads lists its
+// tables from its store and runs each one's jobs as the leader's gated steps (`tables_steps.cee`), not as requests to
+// its own front; the runs a client asked for (`maintenance-run`) within a second.
 
-/// The SHA-256 of an empty body, as an `s3tables` signature names it.
-const EMPTY_BODY_SHA256: StringView = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-/// `POST /tables/<arn>/<ns>/<name>/maintenance-run?type=<kind>`, signed for `s3tables`, through the front; its
-/// status (0 when it could not be sent).
-async fn maintenanceRunThroughFront(
-    target: borrow ReplicationTarget,
-    client: borrow Client,
-    t: borrow MaintainedTable,
-    kind: StringView,
-) -> Result<u16, AllocError> {
-    let host = match (endpointAuthority(target.url.view())) {
-        Some(h) => h,
-        null => { return Ok(0); }
-    };
-    var arn = copyBytes("arn:aws:s3tables:".bytes())?;
-    arn.extend(target.region.view())?;
-    arn.extend(":000000000000:bucket/".bytes())?;
-    arn.extend(t.bucket.view())?;
-    var path = copyBytes("/tables/".bytes())?;
-    appendUriEncoded(mut path, arn.view(), false)?;
-    path.push('/')?;
-    appendUriEncoded(mut path, t.ns.view(), false)?;
-    path.push('/')?;
-    appendUriEncoded(mut path, t.name.view(), false)?;
-    path.extend("/maintenance-run".bytes())?;
-    var query = copyBytes("type=".bytes())?;
-    query.extend(kind.bytes())?;
-    var amzDate = Vector<u8>.create();
-    appendAmzDate(mut amzDate, Clock.unixMillis())?;
-    var headers = Vector<HeaderPair>.create();
-    headers.push(remotePair("host".bytes(), host)?)?;
-    headers.push(remotePair("x-amz-date".bytes(), amzDate.view())?)?;
-    // SigV4 for a service other than S3: the path encoded once more in the canonical request (ADR-0083 §1).
-    var canonicalPath = Vector<u8>.create();
-    encodePathAgain(path.view(), mut canonicalPath)?;
-    var canonical = Vector<u8>.create();
-    let _ = canonicalRequest(
-        "POST".bytes(),
-        canonicalPath.view(),
-        query.view(),
-        headers.view(),
-        "host;x-amz-date".bytes(),
-        EMPTY_BODY_SHA256.bytes(),
-        mut canonical,
-    )?;
-    var scope = Vector<u8>.create();
-    scope.extend(amzDate.view()[0..8])?;
-    scope.push('/')?;
-    scope.extend(target.region.view())?;
-    scope.extend("/s3tables/aws4_request".bytes())?;
-    let key = signingKey(target.secret.view(), amzDate.view()[0..8], target.region.view(), "s3tables".bytes())?;
-    var signature = Vector<u8>.create();
-    seedSignature(borrow key, amzDate.view(), scope.view(), canonical.view(), mut signature)?;
-    var auth = copyBytes("AWS4-HMAC-SHA256 Credential=".bytes())?;
-    auth.extend(target.accessKey.view())?;
-    auth.push('/')?;
-    auth.extend(scope.view())?;
-    auth.extend(", SignedHeaders=host;x-amz-date, Signature=".bytes())?;
-    auth.extend(signature.view())?;
-    var url = copyBytes(target.url.view())?;
-    url.extend(path.view())?;
-    url.push('?')?;
-    url.extend(query.view())?;
-    var request = match (ClientRequest.create(Method.Post, StringView.fromUtf8(url.view()) ?? "")) {
-        Ok(r) => r,
-        Err(_) => { return Ok(0); }
-    };
-    if (request.header("x-amz-date", amzDate.view()).isErr() || request.header("authorization", auth.view()).isErr()) {
-        return Ok(0);
-    }
-    var body = NoBody {};
-    var response = match (await client.send(request, mut body)) {
-        Ok(r) => r,
-        Err(_) => { return Ok(0); }
-    };
-    let status = response.status();
-    var drained = Vector<u8>.create();
-    let _ = await response.readToEnd(mut drained, 65536);
-    let _ = await response.finish(client);
-    return Ok(status);
-}
-
-/// Every hour of a day: for each shard this node leads, each table's two jobs (ADR-0086 §5). A shard it does not lead
-/// is its leader's to maintain.
+/// Every hour of a day, for each shard this node leads, each table's jobs, run as the leader's gated steps
+/// (ADR-0110 §5); and, within a second, the runs its S3 servers were asked for. A shard it does not lead is its
+/// leader's to maintain.
 async fn tablesMaintenanceClusterForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
-    var options = ClientOptions.defaults();
-    options.totalMs = 300000;
-    options.retry = RetryPolicy.never();
-    let client = match (Client.create(options, deliveryConnector())) {
-        Ok(c) => c,
-        Err(_) => { return Err(NodeFault.OutOfMemory); }
-    };
     let every = if (shared.tablesDayMs / 24 > 0) shared.tablesDayMs / 24 else 1;
+    var sincePass: u64 = 0;
+    let tick: u64 = if (every < 1000) every else 1000;
     while (true) {
-        if (!(await frontPause(every))) { return Err(NodeFault.Net); }
-        let target = match (selfTarget(shared)) {
-            Ok(Some(t)) => t,
-            Ok(null) => { continue; }
-            Err(_) => { return Err(NodeFault.OutOfMemory); }
-        };
+        if (!(await frontPause(tick))) { return Err(NodeFault.Net); }
+        sincePass += tick;
+        let pass = sincePass >= every;
+        if (pass) { sincePass = 0; }
         for (i in 0..shared.slots.length) {
             let slot = borrow shared.slots[i];
             if (slot.shard == GROUP0_SHARD || slot.failed.load() != 0) { continue; }
+            // The runs asked for, taken from the queue: a shard this node does not lead drops them (its leader's
+            // server is asked instead).
+            var asked = Vector<AskedRun>.create();
+            {
+                var queue = match (await slot.asked.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NodeFault.Net); }
+                };
+                let runs = queue.data();
+                while (runs.length > 0) {
+                    if (asked.push(runs.remove(0)).isErr()) { return Err(NodeFault.OutOfMemory); }
+                }
+            }
+            if (!pass && asked.length == 0) { continue; }
             if (!(await leadsShard(slot)?)) { continue; }
+            for (k in 0..asked.length) {
+                await maintainOnShard(shared, i, borrow asked[k].table, asked[k].kind.view())?;
+            }
+            if (!pass) { continue; }
             var tables = Vector<MaintainedTable>.create();
             {
                 var guard = match (await slot.store.get().lock()) {
@@ -126,18 +51,7 @@ async fn tablesMaintenanceClusterForever(shared: borrow NodeShared) -> Result<vo
             for (k in 0..tables.length) {
                 // Compaction between them, as `serve` runs it (ADR-0098 §4).
                 for (kind in [SNAPSHOT_MANAGEMENT, COMPACTION, UNREFERENCED_REMOVAL]) {
-                    let status = match (await maintenanceRunThroughFront(
-                        borrow target,
-                        borrow client,
-                        borrow tables[k],
-                        kind,
-                    )) {
-                        Ok(s) => s,
-                        Err(_) => { return Err(NodeFault.OutOfMemory); }
-                    };
-                    if (status != 204 && status != 404) {
-                        let _ = await AsyncConsole.writeError("cosmostore: a table's maintenance could not run\n");
-                    }
+                    await maintainOnShard(shared, i, borrow tables[k], kind.bytes())?;
                 }
             }
         }

@@ -1,0 +1,275 @@
+// Compaction's crash sweep (ADR-0110 §6, the owner's bar): a table of two small Parquet files compacted by the same
+// steps `compactTable` and a cluster leader's run take, with a fault at every I/O point (once, sticky, torn) or a
+// crash there; then the store reopened and the table read: its metadata the old or the new, every file it names there,
+// and its rows the same.
+
+const COMPACT_ID: StringView = "c0c0c0c0-1111-4222-8333-444444444444";
+const COMPACT_HIDDEN: StringView = "compact--table-s3";
+
+fn compactPath(rest: StringView) -> Vector<u8> {
+    var p = copyBytes("s3://compact--table-s3/".bytes())!;
+    p.extend(COMPACT_ID.bytes())!;
+    p.push('/')!;
+    p.extend(rest.bytes())!;
+    return p;
+}
+
+fn compactKey(rest: StringView) -> Vector<u8> {
+    var k = copyBytes(COMPACT_ID.bytes())!;
+    k.push('/')!;
+    k.extend(rest.bytes())!;
+    return k;
+}
+
+fn compactTableName() -> MaintainedTable =>
+    MaintainedTable {
+        bucket: copyBytes("compact".bytes())!,
+        ns: copyBytes("ns".bytes())!,
+        name: copyBytes("t".bytes())!,
+    };
+
+/// A data file's manifest entry: the fixture manifest's first, at `path`, of `size` bytes and `rows` rows, added by
+/// snapshot 1 with its sequence number inherited.
+fn compactEntry(template: borrow Json, path: Slice<u8>, size: usize, rows: i64) -> Json {
+    var entry = cloneJson(template)!;
+    let dataFile = jsonMember(template, "data_file") ?? { return Json.Null; };
+    var file = cloneJson(dataFile)!;
+    jsonSet(mut file, "file_path", Json.Text(copyBytes(path)!))!;
+    jsonSet(mut file, "file_size_in_bytes", jsonInteger(truncate<i64>(size))!)!;
+    jsonSet(mut file, "record_count", jsonInteger(rows)!)!;
+    jsonSet(mut file, "split_offsets", Json.Null)!;
+    jsonSet(mut entry, "data_file", file)!;
+    jsonSet(mut entry, "status", jsonInteger(1)!)!;
+    jsonSet(mut entry, "snapshot_id", jsonInteger(1)!)!;
+    jsonSet(mut entry, "sequence_number", Json.Null)!;
+    jsonSet(mut entry, "file_sequence_number", Json.Null)!;
+    return entry;
+}
+
+/// A table bucket `compact` with table `ns.t`, partitioned by identity on field 2 as PyIceberg's fixture table is: one
+/// snapshot of two data files in one partition (Parquet fixtures A and B, 3 and 2 rows), both under compaction's
+/// target, so a run joins them into one.
+fn fixtureCompactStore(dir: Slice<u8>, config: StoreConfig) {
+    var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", config)!;
+    s.createBucket(COMPACT_HIDDEN)!;
+    let hidden = COMPACT_HIDDEN.bytes();
+    // The data files.
+    let a = fixtureBytes(PARQUET_FIXTURE_A[..]);
+    let b = fixtureBytes(PARQUET_FIXTURE_B[..]);
+    let aKey = compactKey("data/kind=a/a.parquet");
+    let bKey = compactKey("data/kind=a/b.parquet");
+    let _ = s.putObject(COMPACT_HIDDEN, StringView.fromUtf8(aKey.view()) ?? "", "", a.view(), PutCondition.None)!;
+    let _ = s.putObject(COMPACT_HIDDEN, StringView.fromUtf8(bKey.view()) ?? "", "", b.view(), PutCondition.None)!;
+    // Their manifest, written as PyIceberg's fixture is, its entries pointed at them.
+    let fixture = readAvro(fixtureBytes(AVRO_FIXTURE_MANIFEST[..]).view())!;
+    var entries = Vector<Json>.create();
+    entries.push(compactEntry(borrow fixture.records[0], compactPath("data/kind=a/a.parquet").view(), a.length, 3))!;
+    entries.push(compactEntry(borrow fixture.records[0], compactPath("data/kind=a/b.parquet").view(), b.length, 2))!;
+    let manifest = writeAvro(fixture.metadata.view(), entries.view())!!;
+    let mKey = compactKey("metadata/m0.avro");
+    let _ = s.putObject(
+        COMPACT_HIDDEN,
+        StringView.fromUtf8(mKey.view()) ?? "",
+        "",
+        manifest.view(),
+        PutCondition.None,
+    )!;
+    // The manifest list.
+    let listFixture = readAvro(fixtureBytes(AVRO_FIXTURE_LIST[..]).view())!;
+    var item = cloneJson(borrow listFixture.records[0])!;
+    jsonSet(mut item, "manifest_path", Json.Text(compactPath("metadata/m0.avro")))!;
+    jsonSet(mut item, "manifest_length", jsonInteger(truncate<i64>(manifest.length))!)!;
+    jsonSet(mut item, "added_snapshot_id", jsonInteger(1)!)!;
+    jsonSet(mut item, "sequence_number", jsonInteger(1)!)!;
+    jsonSet(mut item, "min_sequence_number", jsonInteger(1)!)!;
+    jsonSet(mut item, "added_files_count", jsonInteger(2)!)!;
+    jsonSet(mut item, "added_rows_count", jsonInteger(5)!)!;
+    var items = Vector<Json>.create();
+    items.push(item)!;
+    let list = writeAvro(listFixture.metadata.view(), items.view())!!;
+    let lKey = compactKey("metadata/snap-1.avro");
+    let _ = s.putObject(COMPACT_HIDDEN, StringView.fromUtf8(lKey.view()) ?? "", "", list.view(), PutCondition.None)!;
+    // The table's metadata: the fixture's schema and spec, and snapshot 1.
+    let request = parseJson(
+        """
+        {"schema":{"type":"struct","fields":[{"id":1,"name":"id","type":"long","required":true},{"id":2,"name":"kind","type":"string","required":false}]},"partition-spec":{"fields":[{"source-id":2,"field-id":1000,"transform":"identity","name":"kind"}]}}
+        """.bytes(),
+    )!!;
+    var warehouse = copyBytes("s3://compact--table-s3/".bytes())!;
+    warehouse.extend(COMPACT_ID.bytes())!;
+    var m = newTableMetadata(borrow request, warehouse.view())!!;
+    var updates = textOf("[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":1,\"sequence-number\":1,");
+    updates.append("\"timestamp-ms\":1000,\"summary\":{\"operation\":\"append\"},\"manifest-list\":\"")!;
+    let listPath = compactPath("metadata/snap-1.avro");
+    updates.append(StringView.fromUtf8(listPath.view()) ?? "")!;
+    updates.append(
+        "\"}},{\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",\"type\":\"branch\",\"snapshot-id\":1}]",
+    )!;
+    let u = parseJson(updates.bytes())!!;
+    if (applyUpdates(mut m, borrow u, warehouse.view())!.isSome()) { return; }
+    let location = writeMetadata(mut s, hidden, COMPACT_ID.bytes(), 0, borrow m)!;
+    var ns = jsonObject();
+    jsonSet(mut ns, "id", jsonString("ns-id".bytes())!)!;
+    let _ = writeRecord(mut s, hidden, ".s3tables/namespaces/ns".bytes(), borrow ns, PutCondition.None)!;
+    var rec = jsonObject();
+    jsonSet(mut rec, "id", jsonString(COMPACT_ID.bytes())!)!;
+    jsonSet(mut rec, "metadataLocation", Json.Text(location))!;
+    let _ = writeRecord(mut s, hidden, ".s3tables/tables/ns/t".bytes(), borrow rec, PutCondition.None)!;
+}
+
+/// A compaction run, step by step as `compactTable` takes them (its locked steps here in one thread): the plan, the
+/// footers, each bin's copy and put, the commit. A step that fails ends the run, as a fault does a real one.
+fn compactionWorkload(dir: Slice<u8>, config: StoreConfig) {
+    var s = match (ObjectStore.open(StringView.fromUtf8(dir) ?? "", config)) {
+        Ok(s) => s,
+        Err(_) => { return; }
+    };
+    let t = compactTableName();
+    var draft = match (planCompaction(mut s, borrow t, 50000)) {
+        Ok(Some(d)) => d,
+        _ => { return; }
+    };
+    if (readFooterLengths(mut draft).isErr()) { return; }
+    pinFooters(mut s, mut draft);
+    if (finishPlan(mut draft).isErr()) { return; }
+    var plan = draft.plan;
+    var outputs = Vector<CompactionOutput>.create();
+    var joined = Vector<usize>.create();
+    for (b in 0..plan.bins.length) {
+        var copy = match (prepareBin(mut s, borrow plan, b)) {
+            Ok(Some(c)) => c,
+            _ => { continue; }
+        };
+        let obj = match (copyBin(mut copy, plan.bins[b].join.tail.view())) {
+            Ok(Some(o)) => o,
+            _ => { continue; }
+        };
+        match (putBin(mut s, borrow plan, b, borrow obj)) {
+            Ok(Some(o)) => {
+                if (outputs.push(o).isErr() || joined.push(b).isErr()) { return; }
+            }
+            _ => {}
+        }
+    }
+    let _ = finishCompaction(mut s, mut plan, borrow outputs, joined.view(), 50000);
+}
+
+/// A recovered store's table: its metadata names snapshot 1 (before) or a replace after it, every data file its
+/// current snapshot's manifests name is there with its size, and they hold the 5 rows. Returns how many data files.
+fn checkCompacted(s: borrow ObjectStore) -> Result<usize, TestFailure> {
+    if (!s.bucketExists(COMPACT_HIDDEN)!) { return Err(TestFailure.create("the table bucket is gone")); }
+    let rec = match (tableRecord(s, "compact".bytes(), "ns".bytes(), "t".bytes())) {
+        Ok(r) => r,
+        Err(_) => { return Err(TestFailure.create("the table's record does not read")); }
+    };
+    let location = jsonMemberText(borrow rec.json, "metadataLocation") ?? {
+        return Err(TestFailure.create("no metadata"));
+    };
+    let m = match (readMetadata(s, COMPACT_HIDDEN.bytes(), location)) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("the metadata it names is not there")); }
+    };
+    let current = jsonMemberI64(borrow m, "current-snapshot-id") ?? { return Err(TestFailure.create("no snapshot")); };
+    let listPath = snapshotListPath(borrow m, current) ?? { return Err(TestFailure.create("no manifest list")); };
+    let list = match (readWarehouseAvro(s, COMPACT_HIDDEN.bytes(), listPath)) {
+        Ok(Some(l)) => l,
+        _ => { return Err(TestFailure.create("the manifest list is not there")); }
+    };
+    var rows: i64 = 0;
+    var files: usize = 0;
+    for (i in 0..list.records.length) {
+        let path = jsonMemberText(borrow list.records[i], "manifest_path") ?? {
+            return Err(TestFailure.create("a manifest path"));
+        };
+        let manifest = match (readWarehouseAvro(s, COMPACT_HIDDEN.bytes(), path)) {
+            Ok(Some(f)) => f,
+            _ => { return Err(TestFailure.create("a manifest is not there")); }
+        };
+        for (e in 0..manifest.records.length) {
+            let entry = borrow manifest.records[e];
+            if (jsonMemberI64(entry, "status") == Some(2i64)) { continue; } // deleted
+            let file = jsonMember(entry, "data_file") ?? { return Err(TestFailure.create("a data file")); };
+            let filePath = jsonMemberText(file, "file_path") ?? { return Err(TestFailure.create("a file path")); };
+            let prefix = "s3://compact--table-s3/".bytes();
+            let key = filePath[prefix.length..];
+            let info = match (s.headObject(COMPACT_HIDDEN, StringView.fromUtf8(key) ?? "")) {
+                Ok(found) => found,
+                Err(_) => { return Err(TestFailure.create("a data file the table names is not there")); }
+            };
+            Check.equalU64(truncate<u64>(jsonMemberI64(file, "file_size_in_bytes") ?? -1), info.size)?;
+            rows += jsonMemberI64(file, "record_count") ?? 0;
+            files += 1;
+        }
+    }
+    Check.equalU64(5, truncate<u64>(rows))?;
+    return Ok(files);
+}
+
+/// Without faults the two files are compacted into one, the 5 rows kept.
+@test
+fn compactionJoinsTheFixtureTable() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("compact-plain");
+    fixtureCompactStore(dir.bytes(), storeConfig());
+    {
+        let s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.equalU64(2, checkCompacted(borrow s)? as u64)?;
+    }
+    compactionWorkload(dir.bytes(), storeConfig());
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(1, checkCompacted(borrow s)? as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+fn sweepCompaction(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let base = scratchDirectory(name);
+    let dir = base.view();
+    removeTree(dir);
+    Fs.ensureDirectory(dir)!;
+    fixtureCompactStore(dir.bytes(), faultStoreConfig());
+    Faults.countOperations();
+    compactionWorkload(dir.bytes(), faultStoreConfig());
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 10, "the run performs I/O")?;
+    {
+        let s = ObjectStore.open(dir, faultStoreConfig())!;
+        Check.equalU64(1, checkCompacted(borrow s)? as u64)?;
+    }
+    for (n in 1..points + 1) {
+        removeTree(dir);
+        Fs.ensureDirectory(dir)!;
+        fixtureCompactStore(dir.bytes(), faultStoreConfig());
+        armMode(borrow mode, n);
+        compactionWorkload(dir.bytes(), faultStoreConfig());
+        Faults.disarm();
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir)!;
+        }
+        {
+            var s = ObjectStore.open(dir, faultStoreConfig())!;
+            let _ = checkCompacted(borrow s)?;
+            let _ = s.checkpoint()!;
+        }
+        let s = ObjectStore.open(dir, faultStoreConfig())!;
+        let files = checkCompacted(borrow s)?;
+        Check.isTrue(files == 1 || files == 2, "the table as before or as after")?;
+    }
+    removeTree(dir);
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn compactionFaultsOnce() -> Result<void, TestFailure> => sweepCompaction("compact-once", SweepMode.Once);
+
+@test
+fn compactionFaultsSticky() -> Result<void, TestFailure> => sweepCompaction("compact-sticky", SweepMode.Sticky);
+
+@test
+fn compactionFaultsTorn() -> Result<void, TestFailure> => sweepCompaction("compact-torn", SweepMode.StickyTorn);
+
+@test
+fn compactionFaultsCrash() -> Result<void, TestFailure> => sweepCompaction("compact-crash", SweepMode.Crash);

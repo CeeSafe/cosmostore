@@ -1,0 +1,224 @@
+// Table maintenance on a cluster as the leader's gated steps (ADR-0110 §1, §2): each step that writes takes the
+// shard's gate, stages its entries under the store's lock, pushes its extents, proposes, and waits until they are
+// applied, as `leadWrite` does after its forward; the reads and the copies run off the gate. The steps are the same
+// functions `serve`'s run calls (`table_compaction.cee`); the run is the leader's own, not a request, so no front
+// timeout applies to it (§5).
+
+/// Before a gated step, under the gate: this replica leads, and everything it holds is applied (as `leadWrite`
+/// waits). False when it does not lead, or nothing settled within FRONT_COMMIT_MS.
+async fn stepReady(slot: borrow ShardSlot) -> Result<bool, NodeFault> {
+    var waited = 0u64;
+    while (true) {
+        let v = await viewOf(slot)?;
+        if (!v.leads) { return Ok(false); }
+        if (v.applied == v.last && v.coreLast == v.last) { return Ok(true); }
+        if (waited >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(false); }
+        waited += FRONT_POLL_MS;
+    }
+    return Ok(false);
+}
+
+/// After a gated step staged its entries, still under the gate: its extents on a majority, its entries proposed, and
+/// committed and applied in the term they were proposed in. True when they are (or it staged nothing and still
+/// leads); false when this replica stopped leading or a majority did not take them, and the run ends there.
+async fn stepCommit(shared: borrow NodeShared, slot: borrow ShardSlot) -> Result<bool, NodeFault> {
+    if (!(await pushExtents(shared, slot)?)) {
+        await abandonStaged(slot);
+        return Ok(false);
+    }
+    let proposed = match (await proposeStaged(shared, slot, null, "".bytes())?) {
+        Some(p) => p,
+        null => { return Ok((await viewOf(slot)?).leads); }
+    };
+    var waited = 0u64;
+    while (true) {
+        let v = await viewOf(slot)?;
+        if (v.applied >= proposed.last) { return Ok((await entryTermOf(slot, proposed.last))? == proposed.term); }
+        if (!v.leads || v.term != proposed.term) { return Ok(false); }
+        if (waited >= FRONT_COMMIT_MS || !(await frontPause(FRONT_POLL_MS))) { return Ok(false); }
+        waited += FRONT_POLL_MS;
+    }
+    return Ok(false);
+}
+
+/// A table's compaction on the shard this replica leads (ADR-0110 §2): the plan and footers read off the gate; each
+/// bin's bytes copied off it, then its put one gated step; the commit one gated step. A step that fails because this
+/// replica stopped leading ends the run: what it put is no snapshot's, and unreferenced removal takes it.
+async fn compactOnShard(
+    shared: borrow NodeShared,
+    at: usize,
+    t: borrow MaintainedTable,
+    nowMs: i64,
+    pauseMs: u64,
+) -> Result<void, NodeFault> {
+    let slot = borrow shared.slots[at];
+    let store = borrow slot.store;
+    // The plan: a gated step, as it may write the job's status (a strategy not done, a table it cannot plan): a write
+    // staged off the gate would be proposed by no one, and hold up the shard's every write after it.
+    var planned: CompactionDraft? = null;
+    {
+        var gate = match (await slot.gate.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let _held = gate.data();
+        if (!(await stepReady(slot)?)) { return Ok(); }
+        planned = match (await lockedPlan(store, t, nowMs)) {
+            Ok(d) => d,
+            Err(_) => null,
+        };
+        if (!(await stepCommit(shared, slot)?)) { return Ok(); }
+    }
+    var draft = match (planned) {
+        Some(d) => d,
+        null => { return Ok(); }
+    };
+    match (await Async.blocking(() => readFooterLengths(mut draft))) {
+        Ok() => {}
+        Err(_) => { return Ok(); }
+    }
+    {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let dr = borrow mut draft;
+        await Async.blocking(() => pinFooters(st, dr));
+    }
+    match (await Async.blocking(() => finishPlan(mut draft))) {
+        Ok() => {}
+        Err(_) => { return Ok(); }
+    }
+    var plan = draft.plan;
+    var outputs = Vector<CompactionOutput>.create();
+    var joined = Vector<usize>.create();
+    for (b in 0..plan.bins.length) {
+        let p = borrow plan;
+        var copy = match (await lockedPrepare(store, p, b)) {
+            Ok(Some(c)) => c,
+            _ => { continue; } // an input changed: this bin waits for the next run
+        };
+        let tail = plan.bins[b].join.tail.view();
+        let obj = match (await Async.blocking(() => copyBin(mut copy, tail))) {
+            Ok(Some(o)) => o,
+            _ => { continue; }
+        };
+        if (pauseMs > 0 && !(await frontPause(pauseMs))) { return Err(NodeFault.Net); }
+        // The bin's put: one gated step, with its own extent push.
+        var gate = match (await slot.gate.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let _held = gate.data();
+        if (!(await stepReady(slot)?)) { return Ok(); }
+        {
+            var guard = match (await store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let st = guard.data();
+            match (await Async.blocking(() => putBin(st, p, b, borrow obj))) {
+                Ok(Some(o)) => {
+                    if (outputs.push(o).isErr() || joined.push(b).isErr()) { return Err(NodeFault.OutOfMemory); }
+                }
+                _ => {}
+            }
+        }
+        if (!(await stepCommit(shared, slot)?)) { return Ok(); }
+    }
+    // The commit, or the job's status when there is nothing to commit: one gated step.
+    var gate = match (await slot.gate.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let _held = gate.data();
+    if (!(await stepReady(slot)?)) { return Ok(); }
+    {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let o = borrow outputs;
+        let j = joined.view();
+        let _ = await Async.blocking(() => finishCompaction(st, mut plan, o, j, nowMs));
+    }
+    let _ = await stepCommit(shared, slot)?;
+    return Ok();
+}
+
+/// Snapshot management on the shard this replica leads (ADR-0110 §3): one gated step.
+async fn snapshotsOnShard(
+    shared: borrow NodeShared,
+    at: usize,
+    t: borrow MaintainedTable,
+    nowMs: i64,
+    dayMs: i64,
+) -> Result<void, NodeFault> {
+    let slot = borrow shared.slots[at];
+    var gate = match (await slot.gate.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let _held = gate.data();
+    if (!(await stepReady(slot)?)) { return Ok(); }
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let _ = await Async.blocking(() => maintainTable(st, t, nowMs, dayMs));
+    }
+    let _ = await stepCommit(shared, slot)?;
+    return Ok();
+}
+
+/// Unreferenced removal on the shard this replica leads (ADR-0110 §4): its reads off the gate; its sweep (or its
+/// failure's status) one gated step.
+async fn removeOnShard(
+    shared: borrow NodeShared,
+    at: usize,
+    t: borrow MaintainedTable,
+    nowMs: i64,
+    dayMs: i64,
+) -> Result<void, NodeFault> {
+    let slot = borrow shared.slots[at];
+    var read = match (await readUnreferenced(borrow slot.store, t)) {
+        Ok(Some(r)) => r,
+        _ => { return Ok(); }
+    };
+    var gate = match (await slot.gate.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let _held = gate.data();
+    if (!(await stepReady(slot)?)) { return Ok(); }
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let r = borrow mut read;
+        let _ = await Async.blocking(() => finishUnreferenced(st, r, nowMs, dayMs));
+    }
+    let _ = await stepCommit(shared, slot)?;
+    return Ok();
+}
+
+/// One job of a table on the shard this replica leads, by its kind.
+async fn maintainOnShard(
+    shared: borrow NodeShared,
+    at: usize,
+    t: borrow MaintainedTable,
+    kind: Slice<u8>,
+) -> Result<void, NodeFault> {
+    let nowMs = Clock.unixMillis();
+    let dayMs = truncate<i64>(shared.tablesDayMs);
+    if (kind == SNAPSHOT_MANAGEMENT.bytes()) { return await snapshotsOnShard(shared, at, t, nowMs, dayMs); }
+    if (kind == COMPACTION.bytes()) { return await compactOnShard(shared, at, t, nowMs, shared.tablesCopyPauseMs); }
+    if (kind == UNREFERENCED_REMOVAL.bytes()) { return await removeOnShard(shared, at, t, nowMs, dayMs); }
+    return Ok();
+}

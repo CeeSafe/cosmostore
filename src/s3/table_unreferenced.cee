@@ -463,6 +463,12 @@ fn failUnreferenced(
     );
 }
 
+/// What a removal read: the run, and the references found (or why it failed).
+struct UnreferencedRead {
+    run: UnreferencedRun;
+    refs: References;
+}
+
 /// Unreferenced file removal for one table (ADR-0086 §3): the store held for each read and for the sweep, the
 /// manifests decoded between. Running out of memory ends it with nothing deleted.
 async fn removeUnreferenced(
@@ -471,6 +477,41 @@ async fn removeUnreferenced(
     nowMs: i64,
     dayMs: i64,
 ) -> Result<void, NetError> {
+    var read = match (await readUnreferenced(store, t)?) {
+        Some(r) => r,
+        null => { return Ok(); }
+    };
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NetError.Closed); }
+    };
+    let st = guard.data();
+    let r = borrow mut read;
+    let _ = await Async.blocking(() => finishUnreferenced(st, r, nowMs, dayMs));
+    return Ok();
+}
+
+/// The removal's last step, under the store (on a cluster, one gated step, ADR-0110 §4): the run's failure noted,
+/// or the sweep.
+fn finishUnreferenced(
+    store: borrow mut ObjectStore,
+    read: borrow mut UnreferencedRead,
+    nowMs: i64,
+    dayMs: i64,
+) -> Result<void, TablesError> {
+    if (read.refs.failure.length > 0) {
+        let why = copyBytes(read.refs.failure.view())?;
+        return failUnreferenced(store, borrow read.run, why.view(), nowMs);
+    }
+    return sweepUnreferenced(store, borrow read.run, mut read.refs, nowMs, dayMs);
+}
+
+/// The removal's reads (ADR-0086 §3): the run, under the store; each manifest list and manifest read under it and
+/// decoded outside it. Null when there is nothing to do, or it ran out of memory.
+async fn readUnreferenced(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    t: borrow MaintainedTable,
+) -> Result<UnreferencedRead?, NetError> {
     var started: UnreferencedRun? = null;
     {
         var guard = match (await store.get().lock()) {
@@ -480,21 +521,21 @@ async fn removeUnreferenced(
         let st = guard.data();
         started = match (await Async.blocking(() => unreferencedRun(st, t))) {
             Ok(r) => r,
-            Err(_) => { return Ok(); }
+            Err(_) => { return Ok(null); }
         };
     }
     let run = match (started) {
         Some(r) => r,
-        null => { return Ok(); }
+        null => { return Ok(null); }
     };
     var refs = match (newReferences(run.hidden.view(), run.id.view())) {
         Ok(r) => r,
-        Err(_) => { return Ok(); }
+        Err(_) => { return Ok(null); }
     };
     if (run.failure.length > 0) {
-        if (refs.failure.extend(run.failure.view()).isErr()) { return Ok(); }
+        if (refs.failure.extend(run.failure.view()).isErr()) { return Ok(null); }
     } else {
-        if (metadataReferences(borrow run.metadata, run.location.view(), mut refs).isErr()) { return Ok(); }
+        if (metadataReferences(borrow run.metadata, run.location.view(), mut refs).isErr()) { return Ok(null); }
     }
     // Each manifest list, then each manifest it names (or a format 1 snapshot names): read under the store, decoded
     // outside it.
@@ -502,7 +543,7 @@ async fn removeUnreferenced(
     while (at < refs.toRead.length && refs.failure.length == 0) {
         let key = match (copyBytes(refs.toRead[at].view())) {
             Ok(k) => k,
-            Err(_) => { return Ok(); }
+            Err(_) => { return Ok(null); }
         };
         let isList = refs.toReadIsList[at];
         at += 1;
@@ -529,7 +570,7 @@ async fn removeUnreferenced(
             null => {
                 let why =
                     if (unreadable) "A manifest could not be read" else "A manifest the metadata names is missing";
-                if (failRun(mut refs, why, key.view()).isErr()) { return Ok(); }
+                if (failRun(mut refs, why, key.view()).isErr()) { return Ok(null); }
                 continue;
             }
         };
@@ -543,27 +584,14 @@ async fn removeUnreferenced(
                     "A manifest's codec is not one read here (null and deflate are)",
                     name.view(),
                 ).isErr()) {
-                    return Ok();
+                    return Ok(null);
                 }
             }
-            Err(AvroError.OutOfMemory(_)) => { return Ok(); }
+            Err(AvroError.OutOfMemory(_)) => { return Ok(null); }
             Err(AvroError.Malformed) => {
-                if (failRun(mut refs, "A manifest could not be read", key.view()).isErr()) { return Ok(); }
+                if (failRun(mut refs, "A manifest could not be read", key.view()).isErr()) { return Ok(null); }
             }
         }
     }
-    var guard = match (await store.get().lock()) {
-        Ok(g) => g,
-        Err(_) => { return Err(NetError.Closed); }
-    };
-    let st = guard.data();
-    let rr = borrow run;
-    if (refs.failure.length > 0) {
-        let why = refs.failure.view();
-        let _ = await Async.blocking(() => failUnreferenced(st, rr, why, nowMs));
-        return Ok();
-    }
-    let found = borrow mut refs;
-    let _ = await Async.blocking(() => sweepUnreferenced(st, rr, found, nowMs, dayMs));
-    return Ok();
+    return Ok(Some(UnreferencedRead { run: run, refs: refs }));
 }

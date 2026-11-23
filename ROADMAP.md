@@ -5005,3 +5005,33 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - a client's maintenance-run on a cluster answered at once, the run started.
 - **Eight slices.**
 - **Next:** slice 1, the gated step.
+
+### 23 Nov 2026: M22 slices 1 to 5, cluster table maintenance as the leader's gated steps (ADR-0110)
+
+- **What is built:**
+  - the gated step;
+  - compaction, snapshot management and removal as steps, run by the leader's loop rather than through its front;
+  - a client's ask queued and answered at once;
+  - the test pause.
+- **The store's crash sweep:** compaction swept once, sticky, torn and as a crash at every I/O point.
+- **`tools/cluster_maintenance_smoke.sh` (14 checks), added to CI:**
+  - a run of 40 s, past the front's 30 s;
+  - a write to its shard meanwhile in under 3 s;
+  - the leader killed mid-run, the rows kept, and the new leader compacts.
+- **Found on the way:**
+  - **A bug:** the plan staged its status writes off the gate, so the shard's writes answered 503. It is now a
+    gated step.
+  - **A gap in my checks:** my local cluster smoke runs had not set `ICEBERG_PYTHON`, so their maintenance,
+    compaction and PyIceberg checks were skipped. CI sets it. They are run now: 209 checks.
+- **Narrower than ADR-0110,** in its As built:
+  - the cluster's own run of the shared steps, as closures cannot reach `Async.blocking`;
+  - removal's sweep as one step;
+  - the cluster's crash check as a smoke, not in-process.
+- **Tests:**
+  - 445 unit tests;
+  - the S3 smoke;
+  - the cluster smoke (209);
+  - the cluster maintenance smoke (14);
+  - the SDK matrix;
+  - the Terraform check.
+- **Next:** slice 6 (M21's B1) and slice 7 (B2), then the exit review.
