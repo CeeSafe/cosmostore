@@ -5225,3 +5225,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - B1, reading a merge's inputs row group by row group;
   - CeeSafe's zstd encoder (ADR 0196 phase 4), so that ZSTD tables stay ZSTD;
   - M21's to M23's recorded Lows.
+
+### 23 Nov 2026: M24 is compaction that applies deletes (ADR-0113)
+
+- **M24 proposed and chosen:** ADR-0113's item A. A partition's position and equality delete files are applied while
+  its files are merged, and delete files that then apply to no live file are dropped.
+- **The owner's choices:**
+  - the manifest's counts and bounds from the rows written;
+  - M23's B1 (a merge's inputs read a row group at a time) as the first slice.
+- **Next:** the design ADR.
