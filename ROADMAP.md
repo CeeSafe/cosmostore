@@ -5088,3 +5088,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Next:** M23, when the owner asks. Candidates on record:
   - ADR-0107's C, compaction that re-encodes, after CeeSafe's snappy and zstd (ADR 0196's phases 2 and 3);
   - M21's and M22's recorded Lows.
+
+### 23 Nov 2026: M23 is compaction that merges row groups (ADR-0111)
+
+- **M23 proposed and chosen:** ADR-0111's item A.
+  - **First:** CeeSafe's snappy and zstd decoder (ADR 0196 phases 2 and 3), released from here by its
+    `docs/release.md`.
+  - **Then:** Parquet's pages decoded and encoded, and a bin's rows written as row groups of the target size.
+- **The owner's choices:** SNAPPY as the codec compaction writes until a zstd encoder; the releases made here.
+- **Next:** the design ADR; then CeeSafe's snappy (phase 2).
