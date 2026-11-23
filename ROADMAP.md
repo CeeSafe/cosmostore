@@ -5344,3 +5344,20 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **How equality tables are read:** PyIceberg plans no scan of a table with equality deletes, so their files are
     listed from the manifests, and the rows before compaction are stated.
 - **Next:** slice 6, the crash sweep with deletes, and the rest of the checks.
+
+### 24 Nov 2026: M24 slice 6, the checks (ADR-0114 §6)
+
+- **The crash sweep with deletes:** once, sticky, torn and as a crash at every I/O point. The table is two files of
+  one schema with a position and an equality delete at a higher sequence number. Every state a run leaves must be
+  one of these, by file paths and rows:
+  - before;
+  - either file compacted alone with its deletes applied and both delete files kept (a fault in the plan can leave
+    one file out);
+  - after: one file of 39 rows, with no delete file.
+  - The sweep's first run left one file compacted alone, which the first check did not allow. It is right: the rows
+    with deletes applied are the same.
+- **A plain run:** each id appears in the merged file as many times as the deletes leave it.
+- **`tableCounts`** separates data files from delete files.
+- **Totals:** 491 unit tests; 588,000 sanitized fuzz mutants; 80 compaction checks on `serve` and through a cluster.
+- **ADR-0114's As built** written.
+- **Next:** slice 7, the exit review.

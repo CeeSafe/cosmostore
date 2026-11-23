@@ -53,7 +53,20 @@ fn fixtureCompactStore(dir: Slice<u8>, config: StoreConfig) =>
     fixtureCompactStoreOf(dir, config, fixtureBytes(PARQUET_FIXTURE_A[..]), 3, fixtureBytes(PARQUET_FIXTURE_B[..]), 2);
 
 /// The table of `fixtureCompactStore` with data files `a` and `b` of `aRows` and `bRows` rows.
-fn fixtureCompactStoreOf(dir: Slice<u8>, config: StoreConfig, a: Vector<u8>, aRows: i64, b: Vector<u8>, bRows: i64) {
+fn fixtureCompactStoreOf(dir: Slice<u8>, config: StoreConfig, a: Vector<u8>, aRows: i64, b: Vector<u8>, bRows: i64) =>
+    fixtureCompactStoreWith(dir, config, a, aRows, b, bRows, false);
+
+/// The same, and with `withDeletes` a position and an equality delete file in its partition at sequence number 2
+/// (above the data files' 1): `DELETES_COMPACT_POSITION` and `DELETES_COMPACT_EQUALITY` (ADR-0114 §6).
+fn fixtureCompactStoreWith(
+    dir: Slice<u8>,
+    config: StoreConfig,
+    a: Vector<u8>,
+    aRows: i64,
+    b: Vector<u8>,
+    bRows: i64,
+    withDeletes: bool,
+) {
     var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", config)!;
     s.createBucket(COMPACT_HIDDEN)!;
     let hidden = COMPACT_HIDDEN.bytes();
@@ -79,6 +92,52 @@ fn fixtureCompactStoreOf(dir: Slice<u8>, config: StoreConfig, a: Vector<u8>, aRo
         manifest.view(),
         PutCondition.None,
     )!;
+    // The delete files, and their manifest.
+    var deleteManifest = Vector<u8>.create();
+    if (withDeletes) {
+        var deleteEntries = Vector<Json>.create();
+        for (k in 0..2) {
+            let name = if (k == 0) "data/kind=a/position-deletes.parquet" else "data/kind=a/equality-deletes.parquet";
+            var bytes = Vector<u8>.create();
+            if (k == 0) {
+                bytes = fixtureBytes(PAGES_DELETES_COMPACT_POSITION[..]);
+            } else {
+                bytes = fixtureBytes(PAGES_DELETES_COMPACT_EQUALITY[..]);
+            }
+            let key = compactKey(name);
+            let _ = s.putObject(
+                COMPACT_HIDDEN,
+                StringView.fromUtf8(key.view()) ?? "",
+                "",
+                bytes.view(),
+                PutCondition.None,
+            )!;
+            var entry = compactEntry(
+                borrow fixture.records[0],
+                compactPath(name).view(),
+                bytes.length,
+                if (k == 0) 3 else 2,
+            );
+            var file = cloneJson(jsonMember(borrow entry, "data_file")!)!;
+            jsonSet(mut file, "content", jsonInteger(if (k == 0) 1 else 2)!)!;
+            if (k == 1) {
+                var ids = Vector<Json>.create();
+                ids.push(jsonInteger(1)!)!;
+                jsonSet(mut file, "equality_ids", Json.Array(ids))!;
+            }
+            jsonSet(mut entry, "data_file", file)!;
+            deleteEntries.push(entry)!;
+        }
+        deleteManifest = writeAvro(fixture.metadata.view(), deleteEntries.view())!!;
+        let dKey = compactKey("metadata/m1.avro");
+        let _ = s.putObject(
+            COMPACT_HIDDEN,
+            StringView.fromUtf8(dKey.view()) ?? "",
+            "",
+            deleteManifest.view(),
+            PutCondition.None,
+        )!;
+    }
     // The manifest list.
     let listFixture = readAvro(fixtureBytes(AVRO_FIXTURE_LIST[..]).view())!;
     var item = cloneJson(borrow listFixture.records[0])!;
@@ -91,6 +150,18 @@ fn fixtureCompactStoreOf(dir: Slice<u8>, config: StoreConfig, a: Vector<u8>, aRo
     jsonSet(mut item, "added_rows_count", jsonInteger(aRows + bRows)!)!;
     var items = Vector<Json>.create();
     items.push(item)!;
+    if (withDeletes) {
+        var deletesItem = cloneJson(borrow listFixture.records[0])!;
+        jsonSet(mut deletesItem, "manifest_path", Json.Text(compactPath("metadata/m1.avro")))!;
+        jsonSet(mut deletesItem, "manifest_length", jsonInteger(truncate<i64>(deleteManifest.length))!)!;
+        jsonSet(mut deletesItem, "content", jsonInteger(1)!)!;
+        jsonSet(mut deletesItem, "added_snapshot_id", jsonInteger(1)!)!;
+        jsonSet(mut deletesItem, "sequence_number", jsonInteger(2)!)!;
+        jsonSet(mut deletesItem, "min_sequence_number", jsonInteger(2)!)!;
+        jsonSet(mut deletesItem, "added_files_count", jsonInteger(2)!)!;
+        jsonSet(mut deletesItem, "added_rows_count", jsonInteger(5)!)!;
+        items.push(deletesItem)!;
+    }
     let list = writeAvro(listFixture.metadata.view(), items.view())!!;
     let lKey = compactKey("metadata/snap-1.avro");
     let _ = s.putObject(COMPACT_HIDDEN, StringView.fromUtf8(lKey.view()) ?? "", "", list.view(), PutCondition.None)!;
@@ -103,7 +174,8 @@ fn fixtureCompactStoreOf(dir: Slice<u8>, config: StoreConfig, a: Vector<u8>, aRo
     var warehouse = copyBytes("s3://compact--table-s3/".bytes())!;
     warehouse.extend(COMPACT_ID.bytes())!;
     var m = newTableMetadata(borrow request, warehouse.view())!!;
-    var updates = textOf("[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":1,\"sequence-number\":1,");
+    var updates = textOf("[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":1,\"sequence-number\":");
+    updates.append(if (withDeletes) "2," else "1,")!;
     updates.append("\"timestamp-ms\":1000,\"summary\":{\"operation\":\"append\"},\"manifest-list\":\"")!;
     let listPath = compactPath("metadata/snap-1.avro");
     updates.append(StringView.fromUtf8(listPath.view()) ?? "")!;
@@ -168,6 +240,24 @@ fn checkCompacted(s: borrow ObjectStore) -> Result<usize, TestFailure> => checkC
 
 /// `checkCompacted`, for a table of `want` rows.
 fn checkCompactedRows(s: borrow ObjectStore, want: i64) -> Result<usize, TestFailure> {
+    let c = tableCounts(s)?;
+    Check.equalU64(truncate<u64>(want), truncate<u64>(c.dataRows))?;
+    Check.equalU64(0, c.deleteFiles as u64)?;
+    return Ok(c.dataFiles);
+}
+
+/// A recovered table's live files: its data files and their rows (each file there at its size, its rows its
+/// footer's), and its delete files.
+struct TableCounts {
+    dataFiles: usize;
+    dataRows: i64;
+    deleteFiles: usize;
+    /// Each data file's path and rows.
+    paths: Vector<Vector<u8>>;
+    fileRows: Vector<i64>;
+}
+
+fn tableCounts(s: borrow ObjectStore) -> Result<TableCounts, TestFailure> {
     if (!s.bucketExists(COMPACT_HIDDEN)!) { return Err(TestFailure.create("the table bucket is gone")); }
     let rec = match (tableRecord(s, "compact".bytes(), "ns".bytes(), "t".bytes())) {
         Ok(r) => r,
@@ -188,6 +278,9 @@ fn checkCompactedRows(s: borrow ObjectStore, want: i64) -> Result<usize, TestFai
     };
     var rows: i64 = 0;
     var files: usize = 0;
+    var deletes: usize = 0;
+    var paths = Vector<Vector<u8>>.create();
+    var fileRows = Vector<i64>.create();
     for (i in 0..list.records.length) {
         let path = jsonMemberText(borrow list.records[i], "manifest_path") ?? {
             return Err(TestFailure.create("a manifest path"));
@@ -224,12 +317,17 @@ fn checkCompactedRows(s: borrow ObjectStore, want: i64) -> Result<usize, TestFai
                 _ => { return Err(TestFailure.create("a data file whose footer does not read")); }
             };
             Check.equalU64(truncate<u64>(jsonMemberI64(file, "record_count") ?? -1), truncate<u64>(footer.rows))?;
+            if ((jsonMemberI64(file, "content") ?? 0) != 0) {
+                deletes += 1;
+                continue;
+            }
             rows += footer.rows;
             files += 1;
+            paths.push(copyBytes(filePath)!)!;
+            fileRows.push(footer.rows)!;
         }
     }
-    Check.equalU64(truncate<u64>(want), truncate<u64>(rows))?;
-    return Ok(files);
+    return Ok(TableCounts { dataFiles: files, dataRows: rows, deleteFiles: deletes, paths: paths, fileRows: fileRows });
 }
 
 /// Without faults the two files are compacted into one, the 5 rows kept.
@@ -473,3 +571,145 @@ fn compactionMergeFaultsTorn() -> Result<void, TestFailure> => sweepMerge("merge
 
 @test
 fn compactionMergeFaultsCrash() -> Result<void, TestFailure> => sweepMerge("merge-crash", SweepMode.Crash);
+
+// ---- Deletes applied (ADR-0114 §6) ----
+
+/// The table with deletes in one of the states a run may leave it in, each its rows with the deletes applied the
+/// same 39: before (the two files, 46 rows, and both delete files); one file compacted alone with its deletes applied
+/// (the other as it was, both delete files kept: they still apply to it), the first leaving 19 rows and the second 20;
+/// or after (one file of 39 rows, no delete file). Returns how many data files.
+fn checkDeletesTable(s: borrow ObjectStore) -> Result<usize, TestFailure> {
+    let c = tableCounts(s)?;
+    let a = compactPath("data/kind=a/a.parquet");
+    let b = compactPath("data/kind=a/b.parquet");
+    if (c.dataFiles == 1 && c.dataRows == 39 && c.deleteFiles == 0 && c.paths[0].view() != a.view() &&
+        c.paths[0].view() != b.view()) {
+        return Ok(1);
+    }
+    if (c.dataFiles == 2 && c.deleteFiles == 2) {
+        var original: usize = 0;
+        var other: usize = 0;
+        var otherRows: i64 = 0;
+        var kept = Vector<u8>.create();
+        for (f in 0..2) {
+            if (c.paths[f].view() == a.view() || c.paths[f].view() == b.view()) {
+                if (c.fileRows[f] != 23) { return Err(TestFailure.create("an original file changed")); }
+                original += 1;
+                kept = copyBytes(c.paths[f].view())!;
+            } else {
+                other += 1;
+                otherRows = c.fileRows[f];
+            }
+        }
+        if (original == 2) { return Ok(2); }
+        // One compacted alone: the first's leaves 19 rows (positions 0 and 5, ids of rows 2 and 7), the second's 20.
+        if (original == 1 && other == 1) {
+            let want: i64 = if (kept.view() == b.view()) 19 else 20;
+            if (otherRows == want) { return Ok(2); }
+        }
+    }
+    var why = textOf("not a state a run leaves: ");
+    why.appendNumber(truncate<i64>(c.dataFiles))!;
+    why.append(" files, ")!;
+    why.appendNumber(c.dataRows)!;
+    why.append(" rows, ")!;
+    why.appendNumber(truncate<i64>(c.deleteFiles))!;
+    why.append(" delete files")!;
+    return Err(TestFailure.create(why.view()));
+}
+
+fn deletesStore(dir: Slice<u8>, config: StoreConfig) =>
+    fixtureCompactStoreWith(
+        dir,
+        config,
+        fixtureBytes(PAGES_FLAT_IDS[..]),
+        23,
+        fixtureBytes(PAGES_FLAT_IDS_RENAMED[..]),
+        23,
+        true,
+    );
+
+/// Compaction applies a position and an equality delete (ADR-0114 §4, §5): one file of 39 rows, each id as many
+/// times as the deletes leave it, and both delete files removed.
+@test
+fn compactionAppliesDeletes() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("compact-deletes");
+    deletesStore(dir.bytes(), storeConfig());
+    {
+        let s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.equalU64(2, checkDeletesTable(borrow s)? as u64)?;
+    }
+    compactionWorkload(dir.bytes(), storeConfig());
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(1, checkDeletesTable(borrow s)? as u64)?;
+    // Row r's id is r * 1000003 - 7 in both files: rows 2 and 7 deleted by id from both, rows 0 and 5 by position
+    // from the first, row 1 from the second.
+    let read = readFixture(compactedFile(borrow s)?.view())?;
+    let k = leafOfId(read.leaves.view(), 1) ?? { return Err(TestFailure.create("the id column")); };
+    let ids = borrow read.columns[k];
+    for (r in 0..23) {
+        let id = truncate<i64>(r) * 1000003 - 7;
+        var seen: u64 = 0;
+        for (i in 0..ids.count) {
+            if (truncate<i64>(valueAt(ids, borrow read.leaves[k], i).readLE<u64>(0)) == id) { seen += 1; }
+        }
+        let want: u64 = if (r == 2 || r == 7) 0 else if (r == 0 || r == 5 || r == 1) 1 else 2;
+        Check.equalU64(want, seen)?;
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// Compaction with deletes swept for faults and crashes at every I/O point: the table as before or as after, never
+/// a row brought back or lost.
+fn sweepDeletes(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let base = scratchDirectory(name);
+    let dir = base.view();
+    removeTree(dir);
+    Fs.ensureDirectory(dir)!;
+    deletesStore(dir.bytes(), faultStoreConfig());
+    Faults.countOperations();
+    compactionWorkload(dir.bytes(), faultStoreConfig());
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 10, "the run performs I/O")?;
+    {
+        let s = ObjectStore.open(dir, faultStoreConfig())!;
+        Check.equalU64(1, checkDeletesTable(borrow s)? as u64)?;
+    }
+    for (n in 1..points + 1) {
+        removeTree(dir);
+        Fs.ensureDirectory(dir)!;
+        deletesStore(dir.bytes(), faultStoreConfig());
+        armMode(borrow mode, n);
+        compactionWorkload(dir.bytes(), faultStoreConfig());
+        Faults.disarm();
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir)!;
+        }
+        {
+            var s = ObjectStore.open(dir, faultStoreConfig())!;
+            let _ = checkDeletesTable(borrow s)?;
+            let _ = s.checkpoint()!;
+        }
+        let s = ObjectStore.open(dir, faultStoreConfig())!;
+        let _ = checkDeletesTable(borrow s)?;
+    }
+    removeTree(dir);
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn compactionDeletesFaultsOnce() -> Result<void, TestFailure> => sweepDeletes("deletes-once", SweepMode.Once);
+
+@test
+fn compactionDeletesFaultsSticky() -> Result<void, TestFailure> => sweepDeletes("deletes-sticky", SweepMode.Sticky);
+
+@test
+fn compactionDeletesFaultsTorn() -> Result<void, TestFailure> => sweepDeletes("deletes-torn", SweepMode.StickyTorn);
+
+@test
+fn compactionDeletesFaultsCrash() -> Result<void, TestFailure> => sweepDeletes("deletes-crash", SweepMode.Crash);

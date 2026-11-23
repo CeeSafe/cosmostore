@@ -96,3 +96,49 @@ written ("From rows written") and M23's B1 as the first slice ("First slice").
   read the same by PyIceberg before and after, and no delete lost that still applies to a live file.
 - **Merged files' manifest entries become exact,** where they were the inputs' combined.
 - **A merge's memory is bounded by two row groups,** where it was an input's whole file.
+
+## As built (slices 1 to 6)
+
+- **§1, inputs a row group at a time:** `prepareBin` pins each input row group's span (its chunks' bytes, from the
+  plan's footer), a reader each, and `mergeBin` decodes one at a time (`readColumnChunkIn`). A merge holds one input
+  row group and one output row group. Tested with a fixture of three row groups (`FLAT_V1_GROUPS`).
+- **§2, metrics from the rows written** (`src/s3/table_metrics.cee`), for every merged file:
+  - **Their source:** each leaf's Iceberg type and mode come from the table's metadata, under its lock. `mergeBin`
+    folds each written row group into the stats.
+  - **The modes:** `write.metadata.metrics.default` (`truncate(16)` when unset, and Iceberg's 100-column default),
+    and `write.metadata.metrics.column.*` by the field's full name.
+  - **The bounds:** in Iceberg's single-value form, with int to long promoted, decimals in the fewest bytes, floats in
+    total order, and NaN counted but never a bound. Strings and binary are truncated, the upper bound raised.
+  - **Wider than PyIceberg in one place:** a struct's fields keep their bounds, as Iceberg Java's writers do;
+    PyIceberg keeps none for nested fields. Fields inside lists and maps have none.
+  - **Checked:** against PyIceberg's own metrics from the file's footer, under the table's properties.
+- **§3, which deletes apply** (`src/s3/table_deletes.cee`):
+  - **Read:** position deletes by Iceberg's reserved ids; equality deletes as row keys in Iceberg's single-value form
+    (so an int written before widening matches a long), null as its own marker.
+  - **What blocks a partition:** a delete file that is not Parquet, not in the warehouse, past 64 MB, or an equality
+    delete without its ids; and, as before, a delete file of another spec.
+  - **A bin with deletes is never joined,** not even as the fallback of a failed merge, since a position delete names
+    its inputs' paths.
+- **§4, rows dropped:** a row whose position a delete names, or whose key an equality delete holds, is dropped whole
+  (`keptRows`): every level and value in every column. A field a data file lacks is null. The written file's rows are
+  carried to the commit with its metrics.
+- **§5, the commit:**
+  - **Sequence numbers:** a file whose bin applied deletes takes the table's sequence number at the plan.
+  - **Delete files removed:** a planned delete file is removed when Iceberg's rule says it applies to no data file
+    left live. Files the commit adds count only for equality deletes: their paths are new, so no position delete
+    names them. This is narrower than exact for position deletes: one stays while any live file of its partition is
+    at or below its sequence number, whether or not it names that file.
+  - **The summary:** `deleted-records` is the inputs' own; the removed delete files and deletes are counted, and the
+    totals lowered.
+- **§6, the checks:**
+  - **The crash sweep:** once, sticky, torn and as a crash, over a table of two files with a position and an
+    equality delete. Every state it may leave must be one of these, by path and rows:
+    - before;
+    - either file compacted alone, with its deletes applied and both delete files kept;
+    - after: one file of 39 rows, with no delete file.
+  - **Real tables (`tools/compaction_check.py`), on `serve` and through a cluster's node:**
+    - a position delete applied and its file removed;
+    - an equality delete applied to the older rows of an id, and not to a row of that id appended after it;
+    - metrics compared with PyIceberg's.
+    - **One limit:** PyIceberg reads no table with equality deletes (apache/iceberg#6568), so that table's rows before
+      compaction are stated and its files listed from the manifests.

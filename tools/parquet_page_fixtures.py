@@ -83,6 +83,13 @@ equality_rows = [{"id": flat_rows[2]["id"], "s": flat_rows[2]["s"]}, {"id": flat
                  {"id": 12345, "s": "none"}]
 equality_nodes = [("prim", "id", False, "i64"), ("prim", "s", True, "bytes")]
 assert flat_rows[4]["s"] is None
+# The deletes of the compaction sweep's table (src/s3/table_compaction_tests.cee): positions 0 and 5 of its first file
+# and 1 of its second, and the ids of FLAT_IDS's rows 2 and 7, which both files hold.
+compact_path = "s3://compact--table-s3/c0c0c0c0-1111-4222-8333-444444444444/data/kind=a/%s.parquet"
+compact_position_rows = [{"file_path": compact_path % "a", "pos": 0}, {"file_path": compact_path % "a", "pos": 5},
+                         {"file_path": compact_path % "b", "pos": 1}]
+compact_equality_schema = pa.schema([with_id(flat_schema.field("id"), 1)])
+compact_equality_rows = [{"id": flat_rows[2]["id"]}, {"id": flat_rows[7]["id"]}]
 
 renamed_nodes = [(n[0], "c_" + n[1], n[2], n[3]) for n in reversed(flat_nodes)]
 nested_nodes = [
@@ -229,6 +236,10 @@ fixtures = [
         compression="snappy", data_page_version="1.0"), position_nodes, position_rows),
     ("DELETES_EQUALITY", "an equality delete file on id and s: v2 pages, zstd", write(equality_schema, equality_rows,
         compression="zstd", data_page_version="2.0"), equality_nodes, equality_rows),
+    ("DELETES_COMPACT_POSITION", "the compaction sweep's position deletes", write(position_schema,
+        compact_position_rows, compression="snappy"), position_nodes, compact_position_rows),
+    ("DELETES_COMPACT_EQUALITY", "the compaction sweep's equality deletes, on id", write(compact_equality_schema,
+        compact_equality_rows, compression="snappy"), [("prim", "id", False, "i64")], compact_equality_rows),
 ]
 
 # Each file read back by pyarrow as the rows here: the fixtures are what they say.
