@@ -1,0 +1,429 @@
+// Parquet's pages written (ADR-0112 §1, §2, slice 4): a row group's columns, each one column chunk of v1 data pages,
+// with a dictionary page when that is smaller than PLAIN, levels in the RLE/bit-packed hybrid, compressed by the
+// chunk's codec, and statistics; then the footer, the inputs' schema kept as it was (Iceberg's field ids with it).
+// A row group's bytes are made one at a time, so a file's memory is a row group's.
+
+/// A data page holds this many levels at most, and starts at a row (a repetition level of 0).
+const PQ_PAGE_LEVELS: usize = 20000;
+/// A dictionary holds this many values at most; a chunk with more is PLAIN.
+const PQ_DICTIONARY_MAX: usize = 65535;
+/// What compaction names itself as in a file's `created_by`.
+const PQ_CREATED_BY: StringView = "CosmoStore compaction (ADR-0112)";
+
+fn tInt(id: i16, v: i64) -> ThriftField => ThriftField { id: id, value: ThriftValue.Int(THRIFT_I32, v) };
+
+fn tLong(id: i16, v: i64) -> ThriftField => ThriftField { id: id, value: ThriftValue.Int(THRIFT_I64, v) };
+
+fn tBinary(id: i16, b: Slice<u8>) -> Result<ThriftField, AllocError> =>
+    Ok(ThriftField { id: id, value: ThriftValue.Binary(copyBytes(b)?) });
+
+fn tStruct(id: i16, fields: Vector<ThriftField>) -> ThriftField =>
+    ThriftField { id: id, value: ThriftValue.Struct(fields) };
+
+// ---- The hybrid ----
+
+fn writeUleb(out: borrow mut Vector<u8>, value: u64) -> Result<void, AllocError> {
+    var v = value;
+    while (v >= 0x80) {
+        out.push(truncate<u8>(v & 0x7F) | 0x80)?;
+        v = v >> 7;
+    }
+    out.push(truncate<u8>(v))?;
+    return Ok();
+}
+
+/// `values` of `width` bits in the RLE/bit-packed hybrid: a run of 8 or more equal values as an RLE run, the others
+/// bit-packed 8 at a time (the last group padded, as the end of the hybrid may be).
+fn writeHybrid(out: borrow mut Vector<u8>, values: Slice<u64>, width: u32) -> Result<void, AllocError> {
+    var i: usize = 0;
+    let bytes = ((width + 7) / 8) as usize;
+    while (i < values.length) {
+        var run: usize = 1;
+        while (i + run < values.length && values[i + run] == values[i]) { run += 1; }
+        if (run >= 8 || width == 0) {
+            writeUleb(out, (run as u64) << 1)?;
+            for (k in 0..bytes) { out.push(truncate<u8>(values[i] >> ((k * 8) as u64)))?; }
+            i += run;
+            continue;
+        }
+        // Eight values bit-packed: one group.
+        writeUleb(out, (1u64 << 1) | 1)?;
+        var acc: u64 = 0;
+        var accBits: u32 = 0;
+        for (k in 0..8) {
+            let v = if (i + k < values.length) values[i + k] else 0;
+            for (b in 0..width) {
+                if ((v >> (b as u64)) & 1 != 0) { acc = acc | (1u64 << (accBits as u64)); }
+                accBits += 1;
+                if (accBits == 8) {
+                    out.push(truncate<u8>(acc))?;
+                    acc = 0;
+                    accBits = 0;
+                }
+            }
+        }
+        i += if (values.length - i < 8) values.length - i else 8;
+    }
+    return Ok();
+}
+
+/// Levels for v1 pages: their length, 4 bytes, and the hybrid.
+fn writeLevels(out: borrow mut Vector<u8>, levels: Slice<u8>, max: u32) -> Result<void, AllocError> {
+    var values = Vector<u64>.create();
+    for (l in levels) { values.push(l as u64)?; }
+    var body = Vector<u8>.create();
+    writeHybrid(mut body, values.view(), bitWidthOf(max))?;
+    out.pushLE(truncate<u32>(body.length))?;
+    out.extend(body.view())?;
+    return Ok();
+}
+
+// ---- Values ----
+
+/// A value written PLAIN (a BOOLEAN's bit is packed by the caller).
+fn writePlainValue(out: borrow mut Vector<u8>, leaf: borrow PageLeaf, bytes: Slice<u8>) -> Result<void, AllocError> {
+    if (leaf.physical == PQ_BYTE_ARRAY) { out.pushLE(truncate<u32>(bytes.length))?; }
+    out.extend(bytes)?;
+    return Ok();
+}
+
+/// Values `from..to` of `v` written PLAIN.
+fn writePlainRange(
+    out: borrow mut Vector<u8>,
+    leaf: borrow PageLeaf,
+    v: borrow ColumnValues,
+    from: usize,
+    to: usize,
+) -> Result<void, AllocError> {
+    if (leaf.physical == PQ_BOOLEAN) {
+        var acc: u8 = 0;
+        var bits: u32 = 0;
+        for (i in from..to) {
+            if (valueAt(v, leaf, i)[0] != 0) { acc = acc | (1u8 << truncate<u8>(bits)); }
+            bits += 1;
+            if (bits == 8) {
+                out.push(acc)?;
+                acc = 0;
+                bits = 0;
+            }
+        }
+        if (bits > 0) { out.push(acc)?; }
+        return Ok();
+    }
+    for (i in from..to) { writePlainValue(out, leaf, valueAt(v, leaf, i))?; }
+    return Ok();
+}
+
+/// How two values of `leaf`'s type order; null when their order is not sure here (a FIXED value's, as a decimal's is
+/// signed; a NaN), and the statistics then leave min and max out.
+fn compareValues(leaf: borrow PageLeaf, a: Slice<u8>, b: Slice<u8>) -> i32? {
+    if (leaf.physical == PQ_INT32) {
+        let x = truncate<i32>(a.readLE<u32>(0));
+        let y = truncate<i32>(b.readLE<u32>(0));
+        return Some(if (x < y) -1 else if (x > y) 1 else 0);
+    }
+    if (leaf.physical == PQ_INT64) {
+        let x = truncate<i64>(a.readLE<u64>(0));
+        let y = truncate<i64>(b.readLE<u64>(0));
+        return Some(if (x < y) -1 else if (x > y) 1 else 0);
+    }
+    if (leaf.physical == PQ_FLOAT || leaf.physical == PQ_DOUBLE) {
+        let x = if (leaf.physical == PQ_FLOAT) f32.fromBits(
+            a.readLE<u32>(0),
+        ) as f64 else f64.fromBits(a.readLE<u64>(0));
+        let y = if (leaf.physical == PQ_FLOAT) f32.fromBits(
+            b.readLE<u32>(0),
+        ) as f64 else f64.fromBits(b.readLE<u64>(0));
+        if (x != x || y != y) { return null; }
+        return Some(if (x < y) -1 else if (x > y) 1 else 0);
+    }
+    if (leaf.physical == PQ_BOOLEAN || leaf.physical == PQ_BYTE_ARRAY) { return Some(compareBytes(a, b)); }
+    return null;
+}
+
+/// A chunk's statistics: its nulls, and its least and greatest values when their order is sure.
+fn statisticsOf(leaf: borrow PageLeaf, v: borrow ColumnValues) -> Result<Vector<ThriftField>, AllocError> {
+    var nulls: i64 = 0;
+    for (d in v.defs.view()) {
+        if ((d as u32) < leaf.maxDef) { nulls += 1; }
+    }
+    var out = Vector<ThriftField>.create();
+    out.push(tLong(3, nulls))?;
+    if (v.count == 0) { return Ok(out); }
+    var least: usize = 0;
+    var most: usize = 0;
+    for (i in 1..v.count) {
+        let c = compareValues(leaf, valueAt(v, leaf, i), valueAt(v, leaf, least)) ?? { return Ok(out); };
+        if (c < 0) { least = i; }
+        let d = compareValues(leaf, valueAt(v, leaf, i), valueAt(v, leaf, most)) ?? { return Ok(out); };
+        if (d > 0) { most = i; }
+    }
+    if (compareValues(leaf, valueAt(v, leaf, 0), valueAt(v, leaf, 0)).isNull()) { return Ok(out); }
+    out.push(tBinary(5, valueAt(v, leaf, most))?)?;
+    out.push(tBinary(6, valueAt(v, leaf, least))?)?;
+    return Ok(out);
+}
+
+// ---- A column chunk ----
+
+/// A page's bytes compressed by `codec`; null for a codec not written here.
+fn compressPage(codec: i64, page: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
+    if (codec == PQ_CODEC_UNCOMPRESSED) { return Ok(Some(copyBytes(page)?)); }
+    if (codec == PQ_CODEC_GZIP) {
+        var out = Vector<u8>.create();
+        Gzip.compress(page, 6, mut out)?;
+        return Ok(Some(out));
+    }
+    return Ok(null); // SNAPPY comes with CeeSafe's snappy (ADR 0196 phase 2)
+}
+
+/// A page's header and its (compressed) bytes, appended to `out`.
+fn writePage(
+    out: borrow mut Vector<u8>,
+    codec: i64,
+    kind: i64,
+    page: Slice<u8>,
+    detail: ThriftField,
+) -> Result<bool, AllocError> {
+    let compressed = compressPage(codec, page)? ?? { return Ok(false); };
+    var header = Vector<ThriftField>.create();
+    header.push(tInt(1, kind))?;
+    header.push(tInt(2, truncate<i64>(page.length)))?;
+    header.push(tInt(3, truncate<i64>(compressed.length)))?;
+    header.push(detail)?;
+    writeThriftStruct(out, header.view())?;
+    out.extend(compressed.view())?;
+    return Ok(true);
+}
+
+/// The dictionary of a chunk's values, when it is smaller than PLAIN: its values (PLAIN, in first-seen order) and
+/// each value's index into them.
+struct ChunkDictionary {
+    values: Vector<u8>;
+    count: usize;
+    indexes: Vector<u64>;
+}
+
+fn dictionaryOf(leaf: borrow PageLeaf, v: borrow ColumnValues) -> Result<ChunkDictionary?, AllocError> {
+    if (leaf.physical == PQ_BOOLEAN || v.count == 0) { return Ok(null); }
+    var seen = HashMap<Vector<u8>, u64>.create();
+    var values = Vector<u8>.create();
+    var indexes = Vector<u64>.create();
+    var plain: usize = 0;
+    for (i in 0..v.count) {
+        let bytes = valueAt(v, leaf, i);
+        plain += bytes.length + (if (leaf.physical == PQ_BYTE_ARRAY) 4 else 0);
+        let key = copyBytes(bytes)?;
+        match (seen.get(borrow key)) {
+            Some(ix) => { indexes.push(*ix)?; }
+            null => {
+                if (seen.length() >= PQ_DICTIONARY_MAX) { return Ok(null); }
+                let ix = seen.length() as u64;
+                writePlainValue(mut values, leaf, bytes)?;
+                let _ = seen.put(key, ix)?;
+                indexes.push(ix)?;
+            }
+        }
+    }
+    let width = bitWidthOf(truncate<u32>(seen.length() - 1));
+    let encoded = values.length + (v.count * width as usize + 7) / 8 + 16;
+    if (encoded >= plain) { return Ok(null); }
+    return Ok(Some(ChunkDictionary { values: values, count: seen.length(), indexes: indexes }));
+}
+
+/// A column's chunk, at `offset` in the file: its pages appended to `out`, and its ColumnChunk; null when its codec or
+/// type is not written here.
+fn writeColumnChunk(
+    out: borrow mut Vector<u8>,
+    offset: u64,
+    leaf: borrow PageLeaf,
+    v: borrow ColumnValues,
+    codec: i64,
+) -> Result<ThriftValue?, AllocError> {
+    if (valueWidth(leaf).isNull() || v.reps.length != v.defs.length) { return Ok(null); }
+    let start = out.length;
+    let dictionary = dictionaryOf(leaf, v)?;
+    var dictionaryOffset: u64? = null;
+    match (borrow dictionary) {
+        Some(d) => {
+            dictionaryOffset = Some(offset + (out.length - start) as u64);
+            var detail = Vector<ThriftField>.create();
+            detail.push(tInt(1, truncate<i64>(d.count)))?;
+            detail.push(tInt(2, PQ_ENC_PLAIN))?;
+            if (!(writePage(out, codec, PQ_PAGE_DICTIONARY, d.values.view(), tStruct(7, detail))?)) { return Ok(null); }
+        }
+        null => {}
+    }
+    let dataOffset = offset + (out.length - start) as u64;
+    let width = match (borrow dictionary) {
+        Some(d) => bitWidthOf(truncate<u32>(d.count - 1)),
+        null => 0,
+    };
+    var uncompressedTotal: i64 = 0;
+    var level: usize = 0;
+    var value: usize = 0;
+    while (level < v.defs.length) {
+        // The page's levels: up to PQ_PAGE_LEVELS, ending before a row's start.
+        var to = level + 1;
+        while (to < v.defs.length && (to - level < PQ_PAGE_LEVELS || v.reps[to] != 0)) {
+            if (to - level >= PQ_PAGE_LEVELS && v.reps[to] == 0) { break; }
+            to += 1;
+        }
+        let present = presentCount(v.defs.view()[level..to], leaf.maxDef);
+        var page = Vector<u8>.create();
+        if (leaf.maxRep > 0) { writeLevels(mut page, v.reps.view()[level..to], leaf.maxRep)?; }
+        if (leaf.maxDef > 0) { writeLevels(mut page, v.defs.view()[level..to], leaf.maxDef)?; }
+        let encoding = match (borrow dictionary) {
+            Some(d) => {
+                page.push(truncate<u8>(width))?;
+                writeHybrid(mut page, d.indexes.view()[value..value + present], width)?;
+                PQ_ENC_RLE_DICTIONARY
+            },
+            null => {
+                writePlainRange(mut page, leaf, v, value, value + present)?;
+                PQ_ENC_PLAIN
+            },
+        };
+        uncompressedTotal += truncate<i64>(page.length);
+        var detail = Vector<ThriftField>.create();
+        detail.push(tInt(1, truncate<i64>(to - level)))?;
+        detail.push(tInt(2, encoding))?;
+        detail.push(tInt(3, PQ_ENC_RLE))?;
+        detail.push(tInt(4, PQ_ENC_RLE))?;
+        if (!(writePage(out, codec, PQ_PAGE_DATA, page.view(), tStruct(5, detail))?)) { return Ok(null); }
+        level = to;
+        value += present;
+    }
+    if (v.defs.length == 0) { return Ok(null); }
+    // Its metadata.
+    var encodings = Vector<ThriftValue>.create();
+    encodings.push(ThriftValue.Int(THRIFT_I32, if (dictionary.isSome()) PQ_ENC_RLE_DICTIONARY else PQ_ENC_PLAIN))?;
+    encodings.push(ThriftValue.Int(THRIFT_I32, PQ_ENC_RLE))?;
+    if (dictionary.isSome()) { encodings.push(ThriftValue.Int(THRIFT_I32, PQ_ENC_PLAIN))?; }
+    var path = Vector<ThriftValue>.create();
+    var part = Vector<u8>.create();
+    for (c in leaf.path.view()) {
+        if (c == '.') {
+            path.push(ThriftValue.Binary(part))?;
+            part = Vector<u8>.create();
+        } else {
+            part.push(c)?;
+        }
+    }
+    path.push(ThriftValue.Binary(part))?;
+    let total = truncate<i64>(out.length - start);
+    var meta = Vector<ThriftField>.create();
+    meta.push(tInt(PQ_META_TYPE, leaf.physical))?;
+    meta.push(ThriftField { id: 2, value: ThriftValue.List(THRIFT_LIST, THRIFT_I32, encodings) })?;
+    meta.push(ThriftField { id: 3, value: ThriftValue.List(THRIFT_LIST, THRIFT_BINARY, path) })?;
+    meta.push(tInt(PQ_META_CODEC, codec))?;
+    meta.push(tLong(PQ_META_NUM_VALUES, truncate<i64>(v.defs.length)))?;
+    meta.push(tLong(6, uncompressedTotal))?;
+    meta.push(tLong(PQ_META_TOTAL_COMPRESSED, total))?;
+    meta.push(tLong(PQ_META_DATA_OFFSET, truncate<i64>(dataOffset)))?;
+    match (dictionaryOffset) {
+        Some(d) => { meta.push(tLong(PQ_META_DICT_OFFSET, truncate<i64>(d)))?; }
+        null => {}
+    }
+    meta.push(tStruct(12, statisticsOf(leaf, v)?))?;
+    var chunk = Vector<ThriftField>.create();
+    chunk.push(tLong(PQ_CHUNK_FILE_OFFSET, truncate<i64>(dictionaryOffset ?? dataOffset)))?;
+    chunk.push(tStruct(PQ_CHUNK_META, meta))?;
+    return Ok(Some(ThriftValue.Struct(chunk)));
+}
+
+// ---- Row groups and the file ----
+
+/// A row group, encoded: its bytes, to be written at the offset it was made for, and its RowGroup.
+struct EncodedGroup {
+    bytes: Vector<u8>;
+    group: ThriftValue;
+    rows: i64;
+}
+
+/// `rows` rows' columns (one ColumnValues a leaf, in the schema's order) as a row group at `offset`; null when a
+/// column is not written here.
+fn encodeRowGroup(
+    offset: u64,
+    leaves: Slice<PageLeaf>,
+    columns: Slice<ColumnValues>,
+    rows: i64,
+    codec: i64,
+) -> Result<EncodedGroup?, AllocError> {
+    if (leaves.length != columns.length || leaves.length == 0) { return Ok(null); }
+    var bytes = Vector<u8>.create();
+    var chunks = Vector<ThriftValue>.create();
+    var uncompressed: i64 = 0;
+    for (c in 0..leaves.length) {
+        let at = offset + bytes.length as u64;
+        let chunk = writeColumnChunk(
+            mut bytes,
+            at,
+            borrow leaves[c],
+            borrow columns[c],
+            codec,
+        )? ?? { return Ok(null); };
+        uncompressed += match (borrow chunk) {
+            ThriftValue.Struct(f) => match (thriftField(f, PQ_CHUNK_META)) {
+                Some(m) => match (m) {
+                    ThriftValue.Struct(mf) => thriftInt(mf, 6) ?? 0,
+                    _ => 0,
+                },
+                null => 0,
+            },
+            _ => 0,
+        };
+        chunks.push(chunk)?;
+    }
+    var group = Vector<ThriftField>.create();
+    group.push(ThriftField { id: PQ_GROUP_COLUMNS, value: ThriftValue.List(THRIFT_LIST, THRIFT_STRUCT, chunks) })?;
+    group.push(tLong(2, uncompressed))?;
+    group.push(tLong(PQ_GROUP_NUM_ROWS, rows))?;
+    group.push(tLong(PQ_GROUP_FILE_OFFSET, truncate<i64>(offset)))?;
+    group.push(tLong(6, truncate<i64>(bytes.length)))?;
+    return Ok(Some(EncodedGroup { bytes: bytes, group: ThriftValue.Struct(group), rows: rows }));
+}
+
+/// The file's end: the footer (the inputs' schema and key-value metadata as they were, the row groups written), its
+/// length, and the magic.
+fn parquetTail(
+    inputMeta: borrow Vector<ThriftField>,
+    groups: Vector<ThriftValue>,
+    rows: i64,
+) -> Result<Vector<u8>?, AllocError> {
+    var meta = Vector<ThriftField>.create();
+    meta.push(tInt(1, 1))?; // version
+    let schema = thriftField(inputMeta, PQ_FILE_SCHEMA) ?? { return Ok(null); };
+    meta.push(ThriftField { id: PQ_FILE_SCHEMA, value: cloneThrift(schema)? })?;
+    meta.push(tLong(PQ_FILE_NUM_ROWS, rows))?;
+    meta.push(ThriftField { id: PQ_FILE_ROW_GROUPS, value: ThriftValue.List(THRIFT_LIST, THRIFT_STRUCT, groups) })?;
+    match (thriftField(inputMeta, 5)) {
+        Some(kv) => { meta.push(ThriftField { id: 5, value: cloneThrift(kv)? })?; }
+        null => {}
+    }
+    meta.push(tBinary(PQ_FILE_CREATED_BY, PQ_CREATED_BY.bytes())?)?;
+    var out = Vector<u8>.create();
+    writeThriftStruct(mut out, meta.view())?;
+    let length = out.length;
+    out.pushLE(truncate<u32>(length))?;
+    out.extend(PARQUET_MAGIC.bytes())?;
+    return Ok(Some(out));
+}
+
+/// A whole file of one row group, in memory (the tests'; compaction writes a row group at a time).
+fn writeParquetFile(
+    inputMeta: borrow Vector<ThriftField>,
+    leaves: Slice<PageLeaf>,
+    columns: Slice<ColumnValues>,
+    rows: i64,
+    codec: i64,
+) -> Result<Vector<u8>?, AllocError> {
+    var out = copyBytes(PARQUET_MAGIC.bytes())?;
+    let g = encodeRowGroup(out.length as u64, leaves, columns, rows, codec)? ?? { return Ok(null); };
+    out.extend(g.bytes.view())?;
+    var groups = Vector<ThriftValue>.create();
+    groups.push(g.group)?;
+    let tail = parquetTail(inputMeta, groups, rows)? ?? { return Ok(null); };
+    out.extend(tail.view())?;
+    return Ok(Some(out));
+}

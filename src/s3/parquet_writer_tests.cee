@@ -1,0 +1,109 @@
+// Parquet's page writer (ADR-0112 slice 4): each fixture's columns read, written again (uncompressed and gzip), and
+// read back the same; the files are left in the package's `out/parquet-written` (not committed) for
+// tools/parquet_writer_check.py, which has pyarrow read each as its fixture.
+
+/// A fixture's footer and every column of its row group.
+struct ReadFixture {
+    meta: Vector<ThriftField>;
+    leaves: Vector<PageLeaf>;
+    columns: Vector<ColumnValues>;
+    rows: i64;
+}
+
+fn readFixture(bytes: Slice<u8>) -> Result<ReadFixture, TestFailure> {
+    let n = parquetFooterLength(bytes[bytes.length - 8..], bytes.length as u64) ?? {
+        return Err(TestFailure.create("a footer"));
+    };
+    let start = bytes.length - 8 - n as usize;
+    let footer = parseParquetFooter(bytes[start..bytes.length - 8], bytes.length as u64)!!;
+    let leaves = schemaLeaves(borrow footer.meta)! ?? { return Err(TestFailure.create("a schema")); };
+    var columns = Vector<ColumnValues>.create();
+    {
+        let groups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? {
+            return Err(TestFailure.create("groups"));
+        };
+        let group = match (borrow groups[0]) {
+            ThriftValue.Struct(f) => f,
+            _ => { return Err(TestFailure.create("a row group")); }
+        };
+        let chunks = structItems(group, PQ_GROUP_COLUMNS) ?? { return Err(TestFailure.create("columns")); };
+        for (c in 0..chunks.length) {
+            let chunk = match (borrow chunks[c]) {
+                ThriftValue.Struct(f) => f,
+                _ => { return Err(TestFailure.create("a chunk")); }
+            };
+            columns.push(readColumnChunk(bytes, chunk, borrow leaves[c])!!)!;
+        }
+    }
+    return Ok(ReadFixture { meta: footer.meta, leaves: leaves, columns: columns, rows: footer.rows });
+}
+
+/// A fixture written again by `codec`, read back as its expected lines say, and left for pyarrow as `<name>-<codec>`.
+fn rewriteFixture(
+    name: StringView,
+    chunks: Slice<StringView>,
+    expected: Slice<StringView>,
+    codec: i64,
+    dir: StringView,
+) -> Result<void, TestFailure> {
+    let original = fixtureBytes(chunks);
+    let read = readFixture(original.view())?;
+    let written = writeParquetFile(borrow read.meta, read.leaves.view(), read.columns.view(), read.rows, codec)! ?? {
+        return Err(TestFailure.create("written"));
+    };
+    let back = readFixture(written.view())?;
+    Check.equalU64(truncate<u64>(read.rows), truncate<u64>(back.rows))?;
+    for (c in 0..back.columns.length) {
+        let got = renderedColumn(borrow back.leaves[c], borrow back.columns[c]);
+        Check.equalText(expected[c], got.view())?;
+    }
+    var path = textOf(dir);
+    path.append("/")!;
+    path.append(name)!;
+    path.append(if (codec == PQ_CODEC_GZIP) "-gzip.parquet" else "-none.parquet")!;
+    let f = DurableFile.createNew(path.view())!;
+    f.writeAt(written.view(), 0)!;
+    return Ok();
+}
+
+@test
+fn pagesWrittenReadBackTheSame() -> Result<void, TestFailure> {
+    // The package's `out/`, which the test runner leaves (its temporary directory it does not).
+    let dir = textOf("out/parquet-written");
+    Fs.ensureDirectory("out")!;
+    removeTree(dir.view());
+    Fs.ensureDirectory(dir.view())!;
+    for (codec in [PQ_CODEC_UNCOMPRESSED, PQ_CODEC_GZIP]) {
+        rewriteFixture("FLAT_V1_DICT", PAGES_FLAT_V1_DICT[..], PAGES_FLAT_V1_DICT_EXPECTED[..], codec, dir.view())?;
+        rewriteFixture("FLAT_V2_DELTA", PAGES_FLAT_V2_DELTA[..], PAGES_FLAT_V2_DELTA_EXPECTED[..], codec, dir.view())?;
+        rewriteFixture("FLAT_V1_PLAIN", PAGES_FLAT_V1_PLAIN[..], PAGES_FLAT_V1_PLAIN_EXPECTED[..], codec, dir.view())?;
+        rewriteFixture("NESTED_V1", PAGES_NESTED_V1[..], PAGES_NESTED_V1_EXPECTED[..], codec, dir.view())?;
+        rewriteFixture(
+            "NESTED_V2_GZIP",
+            PAGES_NESTED_V2_GZIP[..],
+            PAGES_NESTED_V2_GZIP_EXPECTED[..],
+            codec,
+            dir.view(),
+        )?;
+    }
+    return Ok();
+}
+
+/// The hybrid written is read back, for runs, short groups and every width.
+@test
+fn hybridRoundTrips() -> Result<void, TestFailure> {
+    for (width in [0u32, 1, 2, 3, 7, 8, 13, 20, 32]) {
+        var values = Vector<u64>.create();
+        let top: u64 = if (width == 0) 0 else if (width == 32) 4294967295 else (1u64 << (width as u64)) - 1;
+        for (i in 0..300) {
+            let v: u64 = if (i % 50 < 20) 0 else if (top == 0) 0 else truncate<u64>(i * 7919) % (top + 1);
+            values.push(v)!;
+        }
+        var bytes = Vector<u8>.create();
+        writeHybrid(mut bytes, values.view(), width)!;
+        var back = Vector<u64>.create();
+        Check.isTrue(readHybrid(bytes.view(), 0, bytes.length, width, values.length, mut back)!, "read")?;
+        for (i in 0..values.length) { Check.equalU64(values[i], back[i])?; }
+    }
+    return Ok();
+}

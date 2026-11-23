@@ -5139,3 +5139,20 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - thousands of files with a byte changed, or cut short, read or are refused, never a panic;
   - 455 unit tests in all.
 - **Next:** the writer (slice 4), and snappy and zstd once CeeSafe releases them.
+
+### 23 Nov 2026: M23 slice 4, Parquet's page writer (ADR-0112 §1, §2)
+
+- **`src/s3/parquet_writer.cee`** writes a row group's columns as column chunks of v1 data pages:
+  - pages that start at a row;
+  - levels in the RLE/bit-packed hybrid (RLE runs of 8 or more, otherwise bit-packed 8 at a time);
+  - a dictionary page when it is smaller than PLAIN, as pyarrow chooses;
+  - each page compressed by the chunk's codec, none or gzip until CeeSafe's snappy;
+  - statistics: nulls, and min and max where the order is sure (not FIXED, which may be a signed decimal, and not
+    NaN).
+- **The footer** keeps the inputs' schema (Iceberg's field ids) and key-value metadata. `encodeRowGroup` makes one
+  row group's bytes at a time, so compaction's memory is a row group's.
+- **Tests:**
+  - the hybrid round-trips at every width;
+  - each fixture, written again uncompressed and gzip, reads back to its expected levels and values;
+  - `tools/parquet_writer_check.py` has pyarrow read all 10 written files as their fixtures' tables, with statistics.
+- **Next:** SNAPPY once CeeSafe's snappy is released; then the rewrite in compaction (slice 5).
