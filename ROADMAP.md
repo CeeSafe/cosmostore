@@ -5097,3 +5097,25 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **Then:** Parquet's pages decoded and encoded, and a bin's rows written as row groups of the target size.
 - **The owner's choices:** SNAPPY as the codec compaction writes until a zstd encoder; the releases made here.
 - **Next:** the design ADR; then CeeSafe's snappy (phase 2).
+
+### 23 Nov 2026: ADR-0112 proposed, M23's design (compaction that merges row groups)
+
+- **The design:** a Parquet page codec (`parquet_pages.cee`) and a rewrite in compaction.
+  - **The codec reads** every codec, page version, encoding and physical type pyarrow and Spark write.
+  - **The rewrite** writes SNAPPY v1 pages as row groups of the target size, with statistics, matched by Iceberg field
+    id. A bin it cannot decode is joined as today.
+- **The owner's choices:**
+  - lists and maps in M23;
+  - dictionary pages when smaller;
+  - the corpus as small fixtures in the repo.
+- **Seven slices:**
+  1. CeeSafe's snappy;
+  2. CeeSafe's zstd decoder;
+  3. the reader;
+  4. the writer;
+  5. the rewrite;
+  6. the checks;
+  7. the exit review.
+- **CeeSafe's snappy (ADR 0196 phase 2)** is being built in a CeeSafe worktree. Its release waits for the owner's
+  word.
+- **Next:** the page reader, beginning with what needs no codec (uncompressed and gzip pages).
