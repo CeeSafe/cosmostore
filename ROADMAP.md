@@ -5080,3 +5080,11 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - the SDK matrix;
   - the Terraform check.
 - **Next:** the owner's decisions: ADR-0110's acceptance as amended, and closing M22.
+
+### 23 Nov 2026: M22 closed (ADR-0110 accepted as amended)
+
+- **The owner's decision:** "Accept and close". ADR-0110 is accepted as amended.
+- **M22 is closed.** The exit review's B1 to B5 are recorded in `docs/m22-exit-review.md`.
+- **Next:** M23, when the owner asks. Candidates on record:
+  - ADR-0107's C, compaction that re-encodes, after CeeSafe's snappy and zstd (ADR 0196's phases 2 and 3);
+  - M21's and M22's recorded Lows.

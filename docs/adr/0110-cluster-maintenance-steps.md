@@ -1,10 +1,9 @@
 # ADR-0110: table maintenance on a cluster as gated writes (M22)
 
-**Status:** proposed, 23 Nov 2026, with the owner's choices made:
-- a test-only pause for the long run ("Test-only pause");
-- a client's maintenance-run on a cluster answered at once, the run started ("At once, started").
-- M22 is ADR-0109's item A, with M21's B1 and B2 as its last slices (the owner: "A + B1, B2").
-- The crash bar is a crash sweep (the owner: "A crash sweep").
+**Status:** accepted, 23 Nov 2026, as amended by its As built and exit-review sections (the owner: "Accept and
+close"). Proposed the same day with the owner's choices:
+- a test-only pause for the long run;
+- a client's maintenance-run on a cluster answered at once.
 
 ## Context
 
