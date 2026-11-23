@@ -5305,3 +5305,20 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   rules; the positions sorted; FLAT_IDS's rows 2 and 4 matched by the equality deletes, row 4 by its null; a wrong
   type or a missing field refused. 485 unit tests, the smokes unchanged.
 - **Next:** slice 4, rows dropped while merging.
+
+### 23 Nov 2026: M24 slice 4, rows dropped while merging (ADR-0114 §4), still gated off
+
+- **`prepareBin`** pins each delete file that applies to the bin, whole, at its planned size and generation. It gives
+  the merge each delete's content, data sequence number, and an equality delete's field ids with their Iceberg types.
+- **`mergeBin`** reads the deletes first; one that does not read leaves the bin as it is. For each input:
+  - **Position deletes** at or above its sequence number: the rows they name in its path, by position in the file
+    across its row groups.
+  - **Equality deletes** above its sequence number: rows whose key one holds. A field the file lacks (added after it
+    was written) is null, as Iceberg reads it.
+  - **Dropped whole:** each dropped row loses all its levels and values in every column (`keptRows`), lists and maps
+    included.
+- **Its rows** are carried with its metrics, and the commit's record count and added rows are the written file's.
+- **Tests:** `keptRows` over a flat and a nested fixture (every row, none, a mask and its complement, a wrong
+  length); 486 unit tests, the smokes unchanged (`COMPACTION_APPLIES_DELETES` is still off).
+- **Next:** slice 5, the commit: new files at the starting sequence number, delete files that apply to nothing live
+  removed, and the summary.

@@ -662,6 +662,22 @@ struct BinCopy {
     /// For a merge: how each of the first input's leaves keeps its metrics, and the metrics once written.
     metricsPlan: Vector<LeafMetricsPlan>;
     metrics: FileMetrics?;
+    /// For a merge with deletes (ADR-0114 §4): each applying delete file, whole, and how it applies; each input's path
+    /// and data sequence number.
+    deleteReaders: Vector<PreparedReader>;
+    deleteSizes: Vector<u64>;
+    binDeletes: Vector<BinDelete>;
+    inputPaths: Vector<Vector<u8>>;
+    inputSequences: Vector<i64>;
+}
+
+/// A delete file applied by a merge: its content, its data sequence number, and an equality delete's field ids with
+/// their Iceberg types.
+struct BinDelete {
+    content: i64;
+    sequence: i64;
+    ids: Vector<i64>;
+    kinds: Vector<Vector<u8>>;
 }
 
 /// A merge's reader: an input's row group, its chunks' span in the file from `start` (ADR-0114 §1: a merge reads a
@@ -735,7 +751,44 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
                 dataEnd: footer.dataEnd,
             })?;
         }
+        // Its deletes, each whole and as planned (ADR-0114 §4): one changed since leaves the bin for the next run.
+        var deleteReaders = Vector<PreparedReader>.create();
+        var deleteSizes = Vector<u64>.create();
+        var binDeletes = Vector<BinDelete>.create();
+        for (x in 0..bin.deletes.length) {
+            let d = borrow plan.deletes[bin.deletes[x]];
+            match (store.headObject(bucket, catalogText(d.key.view()))) {
+                Ok(info) => {
+                    if (info.size != d.size || info.generation != d.generation) { return Ok(null); }
+                }
+                Err(_) => { return Ok(null); }
+            }
+            match (store.prepareReaderOf(bucket, catalogText(d.key.view()), null, 0, d.size)) {
+                Ok(r) => { deleteReaders.push(r)?; }
+                Err(_) => { return Ok(null); }
+            }
+            deleteSizes.push(d.size)?;
+            var kinds = Vector<Vector<u8>>.create();
+            for (k in 0..d.equalityIds.length) {
+                let kind = fieldTypeOf(borrow plan.metadata, d.equalityIds[k]) ?? { return Ok(null); };
+                kinds.push(copyBytes(kind)?)?;
+            }
+            var ids = Vector<i64>.create();
+            ids.extend(d.equalityIds.view())?;
+            binDeletes.push(BinDelete { content: d.content, sequence: d.sequence, ids: ids, kinds: kinds })?;
+        }
+        var inputPaths = Vector<Vector<u8>>.create();
+        var inputSequences = Vector<i64>.create();
+        for (i in 0..bin.inputs.length) {
+            inputPaths.push(copyBytes(bin.inputs[i].path.view())?)?;
+            inputSequences.push(bin.inputs[i].sequence)?;
+        }
         return Ok(Some(BinCopy {
+            deleteReaders: deleteReaders,
+            deleteSizes: deleteSizes,
+            binDeletes: binDeletes,
+            inputPaths: inputPaths,
+            inputSequences: inputSequences,
             readers: readers,
             lengths: lengths,
             writer: store.newWriter()?,
@@ -769,6 +822,11 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
         pieces: Vector<MergePiece>.create(),
         metricsPlan: Vector<LeafMetricsPlan>.create(),
         metrics: null,
+        deleteReaders: Vector<PreparedReader>.create(),
+        deleteSizes: Vector<u64>.create(),
+        binDeletes: Vector<BinDelete>.create(),
+        inputPaths: Vector<Vector<u8>>.create(),
+        inputSequences: Vector<i64>.create(),
     }));
 }
 
@@ -813,6 +871,25 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
     var groups = Vector<ThriftValue>.create();
     var stats = Vector<LeafStats>.create();
     var piece: usize = 0;
+    // The bin's deletes, read first (ADR-0114 §4); one that does not read leaves the bin as it is.
+    var positionSets = Vector<PositionDeletes>.create();
+    var positionAt = Vector<usize>.create();
+    var equalitySets = Vector<EqualityDeletes>.create();
+    var equalityAt = Vector<usize>.create();
+    for (x in 0..c.binDeletes.length) {
+        let bytes = readPrepared(mut c.deleteReaders[x])? ?? { return Ok(null); };
+        if (bytes.length as u64 != c.deleteSizes[x]) { return Ok(null); }
+        let d = borrow c.binDeletes[x];
+        if (d.content == DELETE_CONTENT_POSITION) {
+            positionSets.push(readPositionDeletes(bytes.view())? ?? { return Ok(null); })?;
+            positionAt.push(x)?;
+        } else {
+            equalitySets.push(readEqualityDeletes(bytes.view(), d.ids.view(), d.kinds.view())? ?? {
+                return Ok(null);
+            })?;
+            equalityAt.push(x)?;
+        }
+    }
     for (i in 0..c.footers.length) {
         let footer = borrow c.footers[i];
         let these = schemaLeaves(borrow footer.meta)? ?? { return Ok(null); };
@@ -834,6 +911,27 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
         }
         let order = leafOrder(leaves.view(), these.view())? ?? { return Ok(null); };
         let fileGroups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? { return Ok(null); };
+        // The rows its position deletes name (by Iceberg's rule, those at or above its sequence number), sorted, and
+        // the equality deletes above it.
+        var drops = Vector<i64>.create();
+        var equalities = Vector<usize>.create();
+        if (c.binDeletes.length > 0) {
+            if (i >= c.inputPaths.length || i >= c.inputSequences.length) { return Ok(null); }
+            let sequence = c.inputSequences[i];
+            for (q in 0..positionSets.length) {
+                if (sequence > c.binDeletes[positionAt[q]].sequence) { continue; }
+                match (positionsOf(borrow positionSets[q], c.inputPaths[i].view())) {
+                    Some(ps) => { drops.extend(ps)?; }
+                    null => {}
+                }
+            }
+            drops.sortBy((a, b) => if (a < b) -1 else if (a > b) 1 else 0);
+            for (q in 0..equalitySets.length) {
+                if (sequence < c.binDeletes[equalityAt[q]].sequence) { equalities.push(q)?; }
+            }
+        }
+        var fileRow: i64 = 0;
+        var nextDrop: usize = 0;
         for (g in 0..fileGroups.length) {
             let group = match (borrow fileGroups[g]) {
                 ThriftValue.Struct(f) => f,
@@ -850,6 +948,7 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
             if (bytes.length as u64 != c.lengths[piece]) { return Ok(null); }
             let base = checkedTruncate<usize>(c.pieces[piece].start) ?? { return Ok(null); };
             piece += 1;
+            var groupValues = Vector<ColumnValues>.create();
             for (k in 0..chunks.length) {
                 let chunk = match (borrow chunks[k]) {
                     ThriftValue.Struct(f) => f,
@@ -858,13 +957,77 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
                 let values = readColumnChunkIn(bytes.view(), base, chunk, borrow these[k])? ?? { return Ok(null); };
                 // Its rows are the row group's (the M23 exit review: a footer's count is not trusted alone).
                 if (rowsOf(borrow these[k], borrow values) != groupRows) { return Ok(null); }
-                // Everything a column holds: values, both levels, a byte array's ends.
-                held += values.data.length as u64 + values.defs.length as u64 + values.reps.length as u64 +
-                    values.ends.length as u64 * 4;
-                if (!(appendValues(mut columns[order[k]], borrow values)?)) { return Ok(null); }
+                groupValues.push(values)?;
             }
-            rows += groupRows;
-            totalRows += groupRows;
+            // The rows its deletes drop (ADR-0114 §4): positions in the file, and rows whose key an equality delete
+            // holds.
+            let count = checkedTruncate<usize>(groupRows) ?? { return Ok(null); };
+            var keep = Vector<bool>.create();
+            keep.resize(count, true)?;
+            var dropped: usize = 0;
+            while (nextDrop < drops.length && drops[nextDrop] < fileRow + groupRows) {
+                match (checkedTruncate<usize>(drops[nextDrop] - fileRow)) {
+                    Some(at) => {
+                        if (keep[at]) {
+                            keep[at] = false;
+                            dropped += 1;
+                        }
+                    }
+                    null => {} // before this file's first row: names none of its rows
+                }
+                nextDrop += 1;
+            }
+            for (q in 0..equalities.length) {
+                let set = borrow equalitySets[equalities[q]];
+                let d = borrow c.binDeletes[equalityAt[equalities[q]]];
+                var eqLeaves = Vector<PageLeaf>.create();
+                var eqColumns = Vector<ColumnValues>.create();
+                for (f in 0..d.ids.length) {
+                    match (leafOfId(these.view(), d.ids[f])) {
+                        Some(k) => {
+                            if (these[k].maxRep != 0) { return Ok(null); }
+                            eqLeaves.push(PageLeaf {
+                                path: Vector<u8>.create(),
+                                key: Vector<u8>.create(),
+                                fieldId: these[k].fieldId,
+                                physical: these[k].physical,
+                                typeLength: these[k].typeLength,
+                                maxDef: these[k].maxDef,
+                                maxRep: 0,
+                            })?;
+                            var copy = emptyValues();
+                            if (!(appendValues(mut copy, borrow groupValues[k])?)) { return Ok(null); }
+                            eqColumns.push(copy)?;
+                        }
+                        null => {
+                            eqLeaves.push(nullLeaf()?)?;
+                            eqColumns.push(nullColumn(count)?)?;
+                        }
+                    }
+                }
+                let keys = rowKeys(eqLeaves.view(), d.kinds.view(), eqColumns.view())? ?? { return Ok(null); };
+                if (keys.length != count) { return Ok(null); }
+                for (r in 0..count) {
+                    if (keep[r] && set.keys.get(borrow keys[r]).isSome()) {
+                        keep[r] = false;
+                        dropped += 1;
+                    }
+                }
+            }
+            for (k in 0..groupValues.length) {
+                if (dropped == 0) {
+                    held += heldBytes(borrow groupValues[k]);
+                    if (!(appendValues(mut columns[order[k]], borrow groupValues[k])?)) { return Ok(null); }
+                } else {
+                    let kept = keptRows(borrow these[k], borrow groupValues[k], keep.view())? ?? { return Ok(null); };
+                    held += heldBytes(borrow kept);
+                    if (!(appendValues(mut columns[order[k]], borrow kept)?)) { return Ok(null); }
+                }
+            }
+            fileRow += groupRows;
+            let kept = groupRows - truncate<i64>(dropped);
+            rows += kept;
+            totalRows += kept;
             var most: usize = 0;
             for (k in 0..columns.length) {
                 if (columns[k].defs.length > most) { most = columns[k].defs.length; }
@@ -896,9 +1059,8 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
         mut stats,
     )?)) { return Ok(null); }
     let meta = firstMeta ?? { return Ok(null); };
-    if (stats.length == leaves.length && c.metricsPlan.length == leaves.length) {
-        c.metrics = Some(fileMetricsOf(leaves.view(), c.metricsPlan.view(), stats.view())?);
-    }
+    // Always: its rows are the commit's record count (ADR-0114 §4).
+    c.metrics = Some(fileMetricsOf(leaves.view(), c.metricsPlan.view(), stats.view(), totalRows)?);
     let tail = parquetTail(borrow meta, groups, totalRows)? ?? { return Ok(null); };
     if (c.writer.write(tail.view()).isErr()) { return Ok(null); }
     return match (c.writer.finish()) {
@@ -906,6 +1068,10 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
         Err(_) => Ok(null),
     };
 }
+
+/// Everything a column's values hold: values, both levels, a byte array's ends.
+fn heldBytes(v: borrow ColumnValues) -> u64 =>
+    v.data.length as u64 + v.defs.length as u64 + v.reps.length as u64 + v.ends.length as u64 * 4;
 
 /// The rows a chunk's values hold: its levels that start a row (every level when the column does not repeat).
 fn rowsOf(leaf: borrow PageLeaf, v: borrow ColumnValues) -> i64 {
@@ -937,6 +1103,12 @@ fn chunkCompressedSize(group: borrow ThriftValue, k: usize) -> i64 {
         null => 0,
     };
 }
+
+/// A written file's rows: a merged file's own (its deletes dropped, ADR-0114 §4), a joined file's its inputs'.
+fn outputRows(output: borrow CompactionOutput, bin: borrow CompactionBin) -> i64 => match (output.metrics.asBorrow()) {
+    Some(m) => m.rows,
+    null => bin.join.rows,
+};
 
 /// A data file record's metrics map `name` set to `items`, when its manifest's schema has it.
 fn setMetric(file: borrow mut Json, name: StringView, items: Slice<Json>) -> Result<void, AllocError> {
@@ -1291,7 +1463,7 @@ fn commitWritten(
     for (o in 0..outputs.length) {
         let bin = borrow plan.bins[bins[o]];
         addedBytes += truncate<i64>(outputs[o].length);
-        addedRows += bin.join.rows;
+        addedRows += outputRows(borrow outputs[o], bin);
         for (i in 0..bin.inputs.length) {
             gone[bin.inputs[i].manifest].push(bin.inputs[i].entry)?;
             removedBytes += truncate<i64>(bin.inputs[i].size);
@@ -1321,13 +1493,13 @@ fn commitWritten(
             ) != specs[sp]) { continue; }
             if (specFiles == 0) { template = bin.inputs[0].manifest; }
             specFiles += 1;
-            specRows = addChecked(specRows, bin.join.rows) ?? { return Ok(false); };
+            specRows = addChecked(specRows, outputRows(borrow outputs[o], bin)) ?? { return Ok(false); };
             let first = borrow bin.inputs[0];
             var entry = cloneJson(borrow plan.manifests[first.manifest].records[first.entry])?;
             var file = cloneJson(dataFileOf(plan, first) ?? { return Ok(false); })?;
             jsonSet(mut file, "file_path", Json.Text(copyBytes(outputs[o].path.view())?))?;
             jsonSet(mut file, "file_size_in_bytes", jsonInteger(truncate<i64>(outputs[o].length))?)?;
-            jsonSet(mut file, "record_count", jsonInteger(bin.join.rows)?)?;
+            jsonSet(mut file, "record_count", jsonInteger(outputRows(borrow outputs[o], bin))?)?;
             match (outputs[o].metrics.asBorrow()) {
                 Some(m) => {
                     // A merged file's own metrics, from its rows (ADR-0114 §2).

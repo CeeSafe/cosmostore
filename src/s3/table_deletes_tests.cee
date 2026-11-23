@@ -92,3 +92,48 @@ fn equalityDeletesMatchRows() -> Result<void, TestFailure> {
     Check.isTrue(readEqualityDeletes(bytes.view(), [1i64, 7][..], kinds.view())!.isNull(), "no field 7")?;
     return Ok();
 }
+
+/// Rows dropped whole (ADR-0114 §4): for every column of a flat and a nested fixture (a list and a map among them),
+/// keeping every row changes nothing, keeping none leaves nothing, and a mask and its complement keep exactly their
+/// rows, between them every level and value.
+@test
+fn rowsKeptWhole() -> Result<void, TestFailure> {
+    for (chunks in [PAGES_FLAT_IDS[..], PAGES_NESTED_V1[..]]) {
+        let read = readFixture(fixtureBytes(chunks).view())?;
+        let rows = checkedTruncate<usize>(read.rows) ?? { return Err(TestFailure.create("rows")); };
+        var all = Vector<bool>.create();
+        all.resize(rows, true)!;
+        var none = Vector<bool>.create();
+        none.resize(rows, false)!;
+        var some = Vector<bool>.create();
+        var other = Vector<bool>.create();
+        var keptCount: usize = 0;
+        for (r in 0..rows) {
+            let k = r % 3 != 1;
+            some.push(k)!;
+            other.push(!k)!;
+            if (k) { keptCount += 1; }
+        }
+        for (c in 0..read.columns.length) {
+            let leaf = borrow read.leaves[c];
+            let v = borrow read.columns[c];
+            let whole = keptRows(leaf, v, all.view())! ?? { return Err(TestFailure.create("all kept")); };
+            Check.isTrue(whole.defs.view() == v.defs.view() && whole.data.view() == v.data.view(), "unchanged")?;
+            let empty = keptRows(leaf, v, none.view())! ?? { return Err(TestFailure.create("none kept")); };
+            Check.equalU64(0, empty.defs.length as u64)?;
+            let a = keptRows(leaf, v, some.view())! ?? { return Err(TestFailure.create("a mask")); };
+            let b = keptRows(leaf, v, other.view())! ?? { return Err(TestFailure.create("its complement")); };
+            Check.equalU64(keptCount as u64, truncate<u64>(rowsOf(leaf, borrow a)))?;
+            Check.equalU64((rows - keptCount) as u64, truncate<u64>(rowsOf(leaf, borrow b)))?;
+            Check.equalU64(v.defs.length as u64, (a.defs.length + b.defs.length) as u64)?;
+            Check.equalU64(v.count as u64, (a.count + b.count) as u64)?;
+            Check.equalU64(v.data.length as u64, (a.data.length + b.data.length) as u64)?;
+        }
+        // A mask of another length: refused.
+        Check.isTrue(
+            keptRows(borrow read.leaves[0], borrow read.columns[0], all.view()[0..rows - 1])!.isNull(),
+            "short",
+        )?;
+    }
+    return Ok();
+}
