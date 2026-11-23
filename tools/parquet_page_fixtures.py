@@ -202,6 +202,8 @@ fixtures = [
     ("NESTED_V2_ZSTD", "a struct, a list and a map: v2 pages, PLAIN, zstd at level 19", write(nested_schema,
         nested_rows, compression="zstd", compression_level=19, use_dictionary=False, data_page_version="2.0",
         max_rows_per_page=6), nested_nodes, nested_rows),
+    ("FLAT_V1_GROUPS", "v1 pages, dictionary, snappy, in row groups of 8 rows (3 row groups)", write(flat_schema,
+        flat_rows, compression="snappy", data_page_version="1.0", row_group_size=8), flat_nodes, flat_rows),
     ("FLAT_IDS", "v1 pages, dictionary, snappy, with Iceberg's field ids", write(ids_schema, flat_rows,
         compression="snappy", data_page_version="1.0"), flat_nodes, flat_rows),
     ("FLAT_IDS_RENAMED", "the same columns and ids, in the other order and renamed: v2 pages, PLAIN, none", write(

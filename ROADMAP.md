@@ -5256,3 +5256,13 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   6. the checks;
   7. the exit review.
 - **Next:** slice 1.
+
+### 23 Nov 2026: M24 slice 1, a merge reads its inputs a row group at a time (ADR-0114 §1, M23's B1)
+
+- **`prepareBin`** pins each input row group's span (its chunks' bytes, from the plan's footer), a reader each;
+  **`mergeBin`** reads and decodes one at a time (`readColumnChunkIn`, a chunk read from a piece of its file). A
+  merge holds one input row group and one output row group, never a whole file.
+- **Tests:** `FLAT_V1_GROUPS` (three row groups) merged with a file of the same rows, every value in its column; the
+  merge sweeps; the fuzzer with it as a seed (598,000 sanitized mutants, clean); 478 unit tests; the S3, cluster and
+  maintenance smokes.
+- **Next:** slice 2, counts and bounds from the rows written.

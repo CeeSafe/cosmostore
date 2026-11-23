@@ -541,9 +541,38 @@ struct BinCopy {
     readers: Vector<PreparedReader>;
     lengths: Vector<u64>;
     writer: ObjectWriter;
-    /// Each reader a whole input, its values rewritten (ADR-0112), rather than a range copied.
+    /// Each reader a row group of an input, its values rewritten (ADR-0112), rather than a range copied.
     merge: bool;
     rowGroupBytes: u64;
+    /// For a merge: each input's footer (the plan's), and which row group each reader is.
+    footers: Vector<ParquetFooter>;
+    pieces: Vector<MergePiece>;
+}
+
+/// A merge's reader: an input's row group, its chunks' span in the file from `start` (ADR-0114 §1: a merge reads a
+/// row group at a time, never a whole file).
+struct MergePiece {
+    input: usize;
+    group: usize;
+    start: u64;
+}
+
+/// The bytes a row group's chunks span in their file; null when a chunk is not one this reads.
+fn groupSpan(group: borrow Vector<ThriftField>, dataEnd: u64) -> ChunkRange? {
+    let chunks = structItems(group, PQ_GROUP_COLUMNS) ?? { return null; };
+    if (chunks.length == 0) { return null; }
+    var least: u64 = dataEnd;
+    var most: u64 = 0;
+    for (k in 0..chunks.length) {
+        let r = match (borrow chunks[k]) {
+            ThriftValue.Struct(f) => chunkRange(f, dataEnd) ?? { return null; },
+            _ => { return null; }
+        };
+        if (r.start < least) { least = r.start; }
+        if (r.start + r.length > most) { most = r.start + r.length; }
+    }
+    if (most <= least) { return null; }
+    return Some(ChunkRange { start: least, length: most - least });
 }
 
 /// A bin's readers and writer, under the store; null when an input changed since the plan (gone, or another size).
@@ -565,13 +594,31 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
     var readers = Vector<PreparedReader>.create();
     var lengths = Vector<u64>.create();
     if (bin.merge) {
-        // Each input whole: its pages are decoded.
+        // Each input's row groups, a reader each: their pages are decoded one row group at a time (ADR-0114 §1).
+        var footers = Vector<ParquetFooter>.create();
+        var pieces = Vector<MergePiece>.create();
         for (i in 0..bin.inputs.length) {
-            match (store.prepareReaderOf(bucket, catalogText(bin.inputs[i].key.view()), null, 0, bin.inputs[i].size)) {
-                Ok(p) => { readers.push(p)?; }
-                Err(_) => { return Ok(null); }
+            let footer = borrow bin.inputs[i].footer;
+            let groups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? { return Ok(null); };
+            for (g in 0..groups.length) {
+                let span = match (borrow groups[g]) {
+                    ThriftValue.Struct(f) => groupSpan(f, footer.dataEnd) ?? { return Ok(null); },
+                    _ => { return Ok(null); }
+                };
+                let key = catalogText(bin.inputs[i].key.view());
+                match (store.prepareReaderOf(bucket, key, null, span.start, span.start + span.length)) {
+                    Ok(p) => { readers.push(p)?; }
+                    Err(_) => { return Ok(null); }
+                }
+                lengths.push(span.length)?;
+                pieces.push(MergePiece { input: i, group: g, start: span.start })?;
             }
-            lengths.push(bin.inputs[i].size)?;
+            footers.push(ParquetFooter {
+                meta: cloneFields(borrow footer.meta)?,
+                rows: footer.rows,
+                shape: copyBytes(footer.shape.view())?,
+                dataEnd: footer.dataEnd,
+            })?;
         }
         return Ok(Some(BinCopy {
             readers: readers,
@@ -579,6 +626,8 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
             writer: store.newWriter()?,
             merge: true,
             rowGroupBytes: plan.rowGroupBytes,
+            footers: footers,
+            pieces: pieces,
         }));
     }
     for (c in 0..bin.join.copies.length) {
@@ -596,6 +645,8 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
         writer: store.newWriter()?,
         merge: false,
         rowGroupBytes: plan.rowGroupBytes,
+        footers: Vector<ParquetFooter>.create(),
+        pieces: Vector<MergePiece>.create(),
     }));
 }
 
@@ -638,14 +689,9 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
     var rows: i64 = 0;
     var totalRows: i64 = 0;
     var groups = Vector<ThriftValue>.create();
-    for (i in 0..c.readers.length) {
-        let bytes = readPrepared(mut c.readers[i])? ?? { return Ok(null); };
-        if (bytes.length as u64 != c.lengths[i] || bytes.length < 12) { return Ok(null); }
-        let n = parquetFooterLength(bytes.view()[bytes.length - 8..], bytes.length as u64) ?? { return Ok(null); };
-        let start = bytes.length - 8 - n as usize;
-        let footer = parseParquetFooter(bytes.view()[start..bytes.length - 8], bytes.length as u64)? ?? {
-            return Ok(null);
-        };
+    var piece: usize = 0;
+    for (i in 0..c.footers.length) {
+        let footer = borrow c.footers[i];
         let these = schemaLeaves(borrow footer.meta)? ?? { return Ok(null); };
         if (firstMeta.isNull()) {
             for (k in 0..these.length) {
@@ -671,12 +717,20 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
             let groupRows = thriftInt(group, PQ_GROUP_NUM_ROWS) ?? { return Ok(null); };
             let chunks = structItems(group, PQ_GROUP_COLUMNS) ?? { return Ok(null); };
             if (chunks.length != these.length) { return Ok(null); }
+            // This row group's bytes alone (ADR-0114 §1).
+            if (piece >= c.pieces.length || c.pieces[piece].input != i || c.pieces[piece].group != g) {
+                return Ok(null);
+            }
+            let bytes = readPrepared(mut c.readers[piece])? ?? { return Ok(null); };
+            if (bytes.length as u64 != c.lengths[piece]) { return Ok(null); }
+            let base = checkedTruncate<usize>(c.pieces[piece].start) ?? { return Ok(null); };
+            piece += 1;
             for (k in 0..chunks.length) {
                 let chunk = match (borrow chunks[k]) {
                     ThriftValue.Struct(f) => f,
                     _ => { return Ok(null); }
                 };
-                let values = readColumnChunk(bytes.view(), chunk, borrow these[k])? ?? { return Ok(null); };
+                let values = readColumnChunkIn(bytes.view(), base, chunk, borrow these[k])? ?? { return Ok(null); };
                 // Its rows are the row group's (the M23 exit review: a footer's count is not trusted alone).
                 if (rowsOf(borrow these[k], borrow values) != groupRows) { return Ok(null); }
                 // Everything a column holds: values, both levels, a byte array's ends.
@@ -691,13 +745,27 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
                 if (columns[k].defs.length > most) { most = columns[k].defs.length; }
             }
             if (held >= c.rowGroupBytes || most >= COMPACTION_GROUP_LEVELS) {
-                if (!(flushGroup(c, mut written, leaves.view(), mut columns, rows, mut groups)?)) { return Ok(null); }
+                if (!(flushGroup(
+                    mut c.writer,
+                    mut written,
+                    leaves.view(),
+                    mut columns,
+                    rows,
+                    mut groups,
+                )?)) { return Ok(null); }
                 held = 0;
                 rows = 0;
             }
         }
     }
-    if (rows > 0 && !(flushGroup(c, mut written, leaves.view(), mut columns, rows, mut groups)?)) { return Ok(null); }
+    if (rows > 0 && !(flushGroup(
+        mut c.writer,
+        mut written,
+        leaves.view(),
+        mut columns,
+        rows,
+        mut groups,
+    )?)) { return Ok(null); }
     let meta = firstMeta ?? { return Ok(null); };
     let tail = parquetTail(borrow meta, groups, totalRows)? ?? { return Ok(null); };
     if (c.writer.write(tail.view()).isErr()) { return Ok(null); }
@@ -719,7 +787,7 @@ fn rowsOf(leaf: borrow PageLeaf, v: borrow ColumnValues) -> i64 {
 
 /// The values held written as a row group, and let go.
 fn flushGroup(
-    c: borrow mut BinCopy,
+    writer: borrow mut ObjectWriter,
     written: borrow mut u64,
     leaves: Slice<PageLeaf>,
     columns: borrow mut Vector<ColumnValues>,
@@ -733,7 +801,7 @@ fn flushGroup(
         rows,
         COMPACTION_PAGE_CODEC,
     )? ?? { return Ok(false); };
-    if (c.writer.write(encoded.bytes.view()).isErr()) { return Ok(false); }
+    if (writer.write(encoded.bytes.view()).isErr()) { return Ok(false); }
     *written += encoded.bytes.length as u64;
     groups.push(encoded.group)?;
     for (k in 0..columns.length) { columns[k] = emptyValues(); }
