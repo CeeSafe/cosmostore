@@ -5266,3 +5266,22 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   merge sweeps; the fuzzer with it as a seed (598,000 sanitized mutants, clean); 478 unit tests; the S3, cluster and
   maintenance smokes.
 - **Next:** slice 2, counts and bounds from the rows written.
+
+### 23 Nov 2026: M24 slice 2, a merged file's metrics from its rows (ADR-0114 §2)
+
+- **`src/s3/table_metrics.cee`:** each leaf's plan is its Iceberg type and its metrics mode, from the table's
+  `write.metadata.metrics.default` (`truncate(16)` when unset, with Iceberg's 100-column default) and per-column
+  settings. `mergeBin` folds each row group into each leaf's stats as it writes it.
+- **What the stats hold:** value, null and NaN counts, compressed sizes, and lower and upper bounds in Iceberg's
+  single-value form. That form covers int to long, decimals in the fewest bytes, and floats in total order, NaN
+  never a bound.
+- **Truncation:** strings and binary are truncated, the upper bound raised past its last kept character.
+- **Where bounds are kept:** none inside lists or maps; a struct's fields keep theirs, as Iceberg Java does.
+- **The commit** uses a merged file's own metrics in place of its inputs' combined. They are carried from the copy to
+  the commit by `copiedBin`, on `serve` and a cluster.
+- **Checked against PyIceberg:** `tools/compaction_check.py` compares each merged file's metrics with PyIceberg's own
+  from its footer, under the table's properties, for a ZSTD table, a nested SNAPPY table and a table of metrics modes.
+  A struct's fields' bounds, which PyIceberg leaves out, must be the columns' own least and greatest.
+- **Results:** 64 checks on `serve` and through a cluster; 482 unit tests, with modes, truncation (surrogates,
+  U+10FFFF), decimals and floats.
+- **Next:** slice 3, the delete files read, and which apply.

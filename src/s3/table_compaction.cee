@@ -76,6 +76,14 @@ struct CompactionOutput {
     key: Vector<u8>;
     path: Vector<u8>;
     length: u64;
+    /// A merged file's metrics from its rows (ADR-0114 §2); null for a joined file, whose are its inputs' combined.
+    metrics: FileMetrics?;
+}
+
+/// A bin's file written, and a merged one's metrics.
+struct BinWritten {
+    obj: FinishedObject;
+    metrics: FileMetrics?;
 }
 
 // ---- The plan ----
@@ -547,6 +555,9 @@ struct BinCopy {
     /// For a merge: each input's footer (the plan's), and which row group each reader is.
     footers: Vector<ParquetFooter>;
     pieces: Vector<MergePiece>;
+    /// For a merge: how each of the first input's leaves keeps its metrics, and the metrics once written.
+    metricsPlan: Vector<LeafMetricsPlan>;
+    metrics: FileMetrics?;
 }
 
 /// A merge's reader: an input's row group, its chunks' span in the file from `start` (ADR-0114 §1: a merge reads a
@@ -626,6 +637,11 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
             writer: store.newWriter()?,
             merge: true,
             rowGroupBytes: plan.rowGroupBytes,
+            metricsPlan: match (schemaLeaves(borrow bin.inputs[0].footer.meta)?) {
+                Some(leaves) => metricsPlanOf(borrow plan.metadata, leaves.view())?,
+                null => { return Ok(null); }
+            },
+            metrics: null,
             footers: footers,
             pieces: pieces,
         }));
@@ -647,6 +663,8 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
         rowGroupBytes: plan.rowGroupBytes,
         footers: Vector<ParquetFooter>.create(),
         pieces: Vector<MergePiece>.create(),
+        metricsPlan: Vector<LeafMetricsPlan>.create(),
+        metrics: null,
     }));
 }
 
@@ -689,6 +707,7 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
     var rows: i64 = 0;
     var totalRows: i64 = 0;
     var groups = Vector<ThriftValue>.create();
+    var stats = Vector<LeafStats>.create();
     var piece: usize = 0;
     for (i in 0..c.footers.length) {
         let footer = borrow c.footers[i];
@@ -696,9 +715,11 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
         if (firstMeta.isNull()) {
             for (k in 0..these.length) {
                 columns.push(emptyValues())?;
+                stats.push(emptyStats())?;
                 leaves.push(PageLeaf {
                     path: copyBytes(these[k].path.view())?,
                     key: copyBytes(these[k].key.view())?,
+                    fieldId: these[k].fieldId,
                     physical: these[k].physical,
                     typeLength: these[k].typeLength,
                     maxDef: these[k].maxDef,
@@ -752,6 +773,8 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
                     mut columns,
                     rows,
                     mut groups,
+                    c.metricsPlan.view(),
+                    mut stats,
                 )?)) { return Ok(null); }
                 held = 0;
                 rows = 0;
@@ -765,8 +788,13 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
         mut columns,
         rows,
         mut groups,
+        c.metricsPlan.view(),
+        mut stats,
     )?)) { return Ok(null); }
     let meta = firstMeta ?? { return Ok(null); };
+    if (stats.length == leaves.length && c.metricsPlan.length == leaves.length) {
+        c.metrics = Some(fileMetricsOf(leaves.view(), c.metricsPlan.view(), stats.view())?);
+    }
     let tail = parquetTail(borrow meta, groups, totalRows)? ?? { return Ok(null); };
     if (c.writer.write(tail.view()).isErr()) { return Ok(null); }
     return match (c.writer.finish()) {
@@ -785,6 +813,36 @@ fn rowsOf(leaf: borrow PageLeaf, v: borrow ColumnValues) -> i64 {
     return n;
 }
 
+/// A written row group's `k`th chunk's compressed bytes (0 when not stated).
+fn chunkCompressedSize(group: borrow ThriftValue, k: usize) -> i64 {
+    let fields = match (group) {
+        ThriftValue.Struct(f) => f,
+        _ => { return 0; }
+    };
+    let chunks = structItems(fields, PQ_GROUP_COLUMNS) ?? { return 0; };
+    if (k >= chunks.length) { return 0; }
+    let chunk = match (borrow chunks[k]) {
+        ThriftValue.Struct(f) => f,
+        _ => { return 0; }
+    };
+    return match (thriftField(chunk, PQ_CHUNK_META)) {
+        Some(v) => match (v) {
+            ThriftValue.Struct(meta) => thriftInt(meta, PQ_META_TOTAL_COMPRESSED) ?? 0,
+            _ => 0,
+        },
+        null => 0,
+    };
+}
+
+/// A data file record's metrics map `name` set to `items`, when its manifest's schema has it.
+fn setMetric(file: borrow mut Json, name: StringView, items: Slice<Json>) -> Result<void, AllocError> {
+    if (jsonMember(file, name).isNull()) { return Ok(); }
+    var out = Vector<Json>.create();
+    for (k in 0..items.length) { out.push(cloneJson(borrow items[k])?)?; }
+    jsonSet(file, name, Json.Array(out))?;
+    return Ok();
+}
+
 /// The values held written as a row group, and let go.
 fn flushGroup(
     writer: borrow mut ObjectWriter,
@@ -793,6 +851,8 @@ fn flushGroup(
     columns: borrow mut Vector<ColumnValues>,
     rows: i64,
     groups: borrow mut Vector<ThriftValue>,
+    plans: Slice<LeafMetricsPlan>,
+    stats: borrow mut Vector<LeafStats>,
 ) -> Result<bool, AllocError> {
     let encoded = encodeRowGroup(
         *written,
@@ -803,6 +863,13 @@ fn flushGroup(
     )? ?? { return Ok(false); };
     if (writer.write(encoded.bytes.view()).isErr()) { return Ok(false); }
     *written += encoded.bytes.length as u64;
+    // The file's metrics from the values written (ADR-0114 §2), each chunk's size its compressed bytes.
+    if (plans.length == leaves.length && stats.length == leaves.length) {
+        for (k in 0..leaves.length) {
+            let size = chunkCompressedSize(borrow encoded.group, k);
+            foldStats(mut stats[k], borrow plans[k], borrow leaves[k], borrow columns[k], size)?;
+        }
+    }
     groups.push(encoded.group)?;
     for (k in 0..columns.length) { columns[k] = emptyValues(); }
     return Ok(true);
@@ -836,7 +903,7 @@ fn putBin(
     let pathSlash = lastSlash(first.path.view());
     var path = copyBytes(first.path.view()[0..pathSlash])?;
     path.extend(key.view()[slash..])?;
-    return Ok(Some(CompactionOutput { key: key, path: path, length: obj.size }));
+    return Ok(Some(CompactionOutput { key: key, path: path, length: obj.size, metrics: null }));
 }
 
 /// The length of a key's or path's directory, its last `/` included (0 when it has none).
@@ -1157,21 +1224,34 @@ fn commitWritten(
             jsonSet(mut file, "file_path", Json.Text(copyBytes(outputs[o].path.view())?))?;
             jsonSet(mut file, "file_size_in_bytes", jsonInteger(truncate<i64>(outputs[o].length))?)?;
             jsonSet(mut file, "record_count", jsonInteger(bin.join.rows)?)?;
-            for (name in ["column_sizes", "value_counts", "null_value_counts", "nan_value_counts"]) {
-                if (jsonMember(borrow file, name).isSome()) {
-                    jsonSet(mut file, name, mergedMetrics(plan, bin, name, 0)?)?;
+            match (outputs[o].metrics.asBorrow()) {
+                Some(m) => {
+                    // A merged file's own metrics, from its rows (ADR-0114 §2).
+                    setMetric(mut file, "column_sizes", m.sizes.view())?;
+                    setMetric(mut file, "value_counts", m.valueCounts.view())?;
+                    setMetric(mut file, "null_value_counts", m.nullCounts.view())?;
+                    setMetric(mut file, "nan_value_counts", m.nanCounts.view())?;
+                    setMetric(mut file, "lower_bounds", m.lower.view())?;
+                    setMetric(mut file, "upper_bounds", m.upper.view())?;
                 }
-            }
-            // A merged file's columns are encoded again: the inputs' sizes are not its (the M23 exit review). The
-            // counts and bounds are, as they describe the same values.
-            if (bin.merge && jsonMember(borrow file, "column_sizes").isSome()) {
-                jsonSet(mut file, "column_sizes", Json.Null)?;
-            }
-            if (jsonMember(borrow file, "lower_bounds").isSome()) {
-                jsonSet(mut file, "lower_bounds", mergedMetrics(plan, bin, "lower_bounds", -1)?)?;
-            }
-            if (jsonMember(borrow file, "upper_bounds").isSome()) {
-                jsonSet(mut file, "upper_bounds", mergedMetrics(plan, bin, "upper_bounds", 1)?)?;
+                null => {
+                    for (name in ["column_sizes", "value_counts", "null_value_counts", "nan_value_counts"]) {
+                        if (jsonMember(borrow file, name).isSome()) {
+                            jsonSet(mut file, name, mergedMetrics(plan, bin, name, 0)?)?;
+                        }
+                    }
+                    // A merged file's columns are encoded again: the inputs' sizes are not its (the M23 exit review). The
+                    // counts and bounds are, as they describe the same values.
+                    if (bin.merge && jsonMember(borrow file, "column_sizes").isSome()) {
+                        jsonSet(mut file, "column_sizes", Json.Null)?;
+                    }
+                    if (jsonMember(borrow file, "lower_bounds").isSome()) {
+                        jsonSet(mut file, "lower_bounds", mergedMetrics(plan, bin, "lower_bounds", -1)?)?;
+                    }
+                    if (jsonMember(borrow file, "upper_bounds").isSome()) {
+                        jsonSet(mut file, "upper_bounds", mergedMetrics(plan, bin, "upper_bounds", 1)?)?;
+                    }
+                }
             }
             for (name in ["split_offsets", "key_metadata", "sort_order_id", "equality_ids", "distinct_counts"]) {
                 if (jsonMember(borrow file, name).isSome()) { jsonSet(mut file, name, Json.Null)?; }
@@ -1521,8 +1601,8 @@ async fn compactTable(
     var outputs = Vector<CompactionOutput>.create();
     var joined = Vector<usize>.create();
     for (b in 0..plan.bins.length) {
-        let obj = match (await copiedBin(store, mut plan, b)?) {
-            Some(o) => o,
+        var written = match (await copiedBin(store, mut plan, b)?) {
+            Some(w) => w,
             null => { continue; }
         };
         let p = borrow plan;
@@ -1531,9 +1611,12 @@ async fn compactTable(
             Err(_) => { return Err(NetError.Closed); }
         };
         let st = guard.data();
-        match (await Async.blocking(() => putBin(st, p, b, borrow obj))) {
+        let obj = borrow written.obj;
+        match (await Async.blocking(() => putBin(st, p, b, obj))) {
             Ok(Some(o)) => {
-                if (outputs.push(o).isErr() || joined.push(b).isErr()) { return Err(NetError.Closed); }
+                var out = o;
+                out.metrics = written.metrics;
+                if (outputs.push(out).isErr() || joined.push(b).isErr()) { return Err(NetError.Closed); }
             }
             _ => {}
         }
@@ -1563,7 +1646,7 @@ async fn copiedBin(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     plan: borrow mut CompactionPlan,
     b: usize,
-) -> Result<FinishedObject?, NetError> {
+) -> Result<BinWritten?, NetError> {
     for (attempt in 0..2) {
         {
             let p = plan;
@@ -1573,7 +1656,10 @@ async fn copiedBin(
             };
             let tail = p.bins[b].join.tail.view();
             match (await Async.blocking(() => copyBin(mut copy, tail))) {
-                Ok(Some(o)) => { return Ok(Some(o)); }
+                Ok(Some(o)) => {
+                    let metrics = copy.metrics;
+                    return Ok(Some(BinWritten { obj: o, metrics: metrics }));
+                }
                 _ => {}
             }
         }

@@ -1,0 +1,108 @@
+// A merged file's Iceberg metrics (ADR-0114 §2): modes, Iceberg's single-value forms, their order, and truncation.
+
+@test
+fn metricsModesParsed() -> Result<void, TestFailure> {
+    Check.equalU64(METRICS_NONE as u64, metricsModeOf("none".bytes())!.mode as u64)?;
+    Check.equalU64(METRICS_COUNTS as u64, metricsModeOf("counts".bytes())!.mode as u64)?;
+    Check.equalU64(METRICS_FULL as u64, metricsModeOf("full".bytes())!.mode as u64)?;
+    let t = metricsModeOf("truncate(4)".bytes())!;
+    Check.equalU64(METRICS_TRUNCATE as u64, t.mode as u64)?;
+    Check.equalU64(4, t.length as u64)?;
+    for (bad in ["truncate(0)", "truncate()", "truncate(x)", "Full", ""]) {
+        Check.isTrue(metricsModeOf(bad.bytes()).isNull(), bad)?;
+    }
+    return Ok();
+}
+
+@test
+fn stringBoundsTruncated() -> Result<void, TestFailure> {
+    Check.equalBytes("abc".bytes(), utf8Prefix("abcdef".bytes(), 3))?;
+    Check.equalBytes("δέλ".bytes(), utf8Prefix("δέλτα".bytes(), 3))?;
+    Check.equalBytes("abcdef".bytes(), utf8UpperBound("abcdef".bytes(), 16)!!.view())?;
+    Check.equalBytes("abd".bytes(), utf8UpperBound("abcdef".bytes(), 3)!!.view())?;
+    Check.equalBytes("δέμ".bytes(), utf8UpperBound("δέλτα".bytes(), 3)!!.view())?;
+    // U+D7FF raised skips the surrogates; U+10FFFF cannot be raised and is dropped, its predecessor raised.
+    var below = Vector<u8>.create();
+    appendCodePoint(mut below, 'a' as u32)!;
+    appendCodePoint(mut below, 0xD7FF)!;
+    below.extend("zz".bytes())!;
+    var raised = Vector<u8>.create();
+    appendCodePoint(mut raised, 'a' as u32)!;
+    appendCodePoint(mut raised, 0xE000)!;
+    Check.equalBytes(raised.view(), utf8UpperBound(below.view(), 2)!!.view())?;
+    var top = Vector<u8>.create();
+    top.extend("a".bytes())!;
+    appendCodePoint(mut top, 0x10FFFF)!;
+    top.extend("z".bytes())!;
+    Check.equalBytes("b".bytes(), utf8UpperBound(top.view(), 2)!!.view())?;
+    var all = Vector<u8>.create();
+    appendCodePoint(mut all, 0x10FFFF)!;
+    appendCodePoint(mut all, 0x10FFFF)!;
+    Check.isTrue(utf8UpperBound(all.view(), 1)!.isNull(), "no bound above U+10FFFF")?;
+    Check.isTrue(utf8UpperBound([0xFFu8, 0x41, 0x42][..], 1)!.isNull(), "not UTF-8: no bound")?;
+    return Ok();
+}
+
+@test
+fn binaryBoundsTruncated() -> Result<void, TestFailure> {
+    Check.equalBytes([1u8, 2][..], binaryUpperBound([1u8, 2][..], 4)!!.view())?;
+    Check.equalBytes([1u8, 3][..], binaryUpperBound([1u8, 2, 9][..], 2)!!.view())?;
+    Check.equalBytes([2u8][..], binaryUpperBound([1u8, 0xFF, 9][..], 2)!!.view())?;
+    Check.isTrue(binaryUpperBound([0xFFu8, 0xFF, 1][..], 2)!.isNull(), "all 0xFF: no bound")?;
+    return Ok();
+}
+
+fn leafOf(physical: i64, typeLength: usize) -> PageLeaf => PageLeaf {
+    path: copyBytes("c".bytes())!,
+    key: copyBytes("c".bytes())!,
+    fieldId: 1,
+    physical: physical,
+    typeLength: typeLength,
+    maxDef: 1,
+    maxRep: 0,
+};
+
+@test
+fn icebergValuesAndTheirOrder() -> Result<void, TestFailure> {
+    // Decimals in the fewest big-endian bytes, from INT32 and FIXED.
+    let i32Leaf = leafOf(PQ_INT32, 0);
+    var v = Vector<u8>.create();
+    v.pushLE(1i32)!;
+    Check.equalBytes([1u8][..], icebergValue("decimal(9,2)".bytes(), borrow i32Leaf, v.view())!!.view())?;
+    v = Vector<u8>.create();
+    v.pushLE(-1i32)!;
+    Check.equalBytes([0xFFu8][..], icebergValue("decimal(9,2)".bytes(), borrow i32Leaf, v.view())!!.view())?;
+    v = Vector<u8>.create();
+    v.pushLE(128i32)!;
+    Check.equalBytes([0u8, 0x80][..], icebergValue("decimal(9,2)".bytes(), borrow i32Leaf, v.view())!!.view())?;
+    let fixed = leafOf(PQ_FIXED, 4);
+    Check.equalBytes(
+        [0xFFu8, 0x7F][..],
+        icebergValue("decimal(9,2)".bytes(), borrow fixed, [0xFFu8, 0xFF, 0xFF, 0x7F][..])!!.view(),
+    )?;
+    // An int promoted to long: sign-extended to 8 bytes.
+    v = Vector<u8>.create();
+    v.pushLE(-2i32)!;
+    var want = Vector<u8>.create();
+    want.pushLE(-2i64)!;
+    Check.equalBytes(want.view(), icebergValue("long".bytes(), borrow i32Leaf, v.view())!!.view())?;
+    // A type and physical type that do not go together: no value, so no bounds.
+    Check.isTrue(icebergValue("string".bytes(), borrow i32Leaf, v.view())!.isNull(), "an int is not a string")?;
+    // Decimals by value: -129 < -1 < 0 < 1 < 128.
+    let d = "decimal(9,2)".bytes();
+    Check.isTrue(compareIceberg(d, [0xFFu8, 0x7F][..], [0xFFu8][..]) < 0, "-129 < -1")?;
+    Check.isTrue(compareIceberg(d, [0xFFu8][..], [0u8][..]) < 0, "-1 < 0")?;
+    Check.isTrue(compareIceberg(d, [1u8][..], [0u8, 0x80][..]) < 0, "1 < 128")?;
+    // Floats: -1 < -0.0 < +0.0 < 1.
+    var a = Vector<u8>.create();
+    a.pushLE(0x80000000u32)!; // -0.0
+    var b = Vector<u8>.create();
+    b.pushLE(0u32)!; // +0.0
+    var c = Vector<u8>.create();
+    c.pushLE(0xBF800000u32)!; // -1.0
+    Check.isTrue(compareIceberg("float".bytes(), a.view(), b.view()) < 0, "-0.0 < +0.0")?;
+    Check.isTrue(compareIceberg("float".bytes(), c.view(), a.view()) < 0, "-1 < -0.0")?;
+    Check.isTrue(isNaNValue(PQ_FLOAT, [0u8, 0, 0xC0, 0x7F][..]), "NaN")?;
+    Check.isTrue(!isNaNValue(PQ_FLOAT, [0u8, 0, 0x80, 0x7F][..]), "infinity is not NaN")?;
+    return Ok();
+}

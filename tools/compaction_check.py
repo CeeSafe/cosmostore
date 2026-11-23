@@ -71,6 +71,36 @@ def data_files(name):
     return sorted(f.file.file_path for f in catalog.load_table("ns." + name).scan().plan_files())
 
 
+def check_metrics(name, t, f):
+    """The merged file's manifest metrics against PyIceberg's own from its footer, under the table's properties
+    (ADR-0114 §2: counts and bounds from the rows written, by the table's metrics mode)."""
+    from pyiceberg.io.pyarrow import (compute_statistics_plan, data_file_statistics_from_parquet_metadata,
+                                      parquet_path_to_id_mapping)
+    want = data_file_statistics_from_parquet_metadata(
+        f.metadata, compute_statistics_plan(t.schema(), t.properties), parquet_path_to_id_mapping(t.schema())
+    ).to_serialized_dict()
+    got = next(iter(t.scan().plan_files())).file
+    for k in ("value_counts", "null_value_counts", "column_sizes"):
+        check("%s: its %s, as PyIceberg's" % (name, k), dict(getattr(got, k) or {}), dict(want.get(k) or {}))
+    # Bounds: PyIceberg's, and also a struct's fields', which Iceberg Java keeps and PyIceberg does not; those must be
+    # the column's least and greatest values.
+    import pyarrow.compute as pc
+    from pyiceberg.conversions import to_bytes
+    rows = t.scan().to_arrow().flatten()
+    for k, pick in (("lower_bounds", "min"), ("upper_bounds", "max")):
+        g, w = dict(getattr(got, k) or {}), dict(want.get(k) or {})
+        extra = {}
+        for fid in set(g) - set(w):
+            column = t.schema().find_column_name(fid)
+            field = t.schema().find_field(fid)
+            if column in rows.column_names and "." in column:
+                extra[fid] = to_bytes(field.field_type, pc.min_max(rows.column(column))[pick].as_py())
+        check("%s: its %s, as PyIceberg's" % (name, k), {i: v for i, v in g.items() if i in w}, w)
+        check("%s: its %s of a struct's fields, the columns' own" % (name, k), {i: g[i] for i in extra}, extra)
+        check("%s: its %s beyond PyIceberg's are a struct's fields only" % (name, k), sorted(set(g) - set(w)),
+              sorted(extra))
+
+
 def job(name):
     return tables.get_table_maintenance_job_status(tableBucketARN=arn, namespace="ns", name=name)["status"]["icebergCompaction"]
 
@@ -99,6 +129,7 @@ entry = next(iter(t.scan().plan_files()))
 check("its manifest's record count", entry.file.record_count, 6)
 check("its bounds: the least id", int.from_bytes(entry.file.lower_bounds[1], "little", signed=True), 0)
 check("its bounds: the greatest id", int.from_bytes(entry.file.upper_bounds[1], "little", signed=True), 5)
+check_metrics("flat", t, f)
 t.append(pa.table({"id": [6], "item": ["row 6"]}, schema=schema))
 check("an append after", catalog.load_table("ns.flat").scan().to_arrow().num_rows, 7)
 
@@ -133,6 +164,7 @@ check("SNAPPY: its rows", f.metadata.num_rows, 36)
 check("SNAPPY: written SNAPPY", f.metadata.row_group(0).column(0).compression, "SNAPPY")
 check("SNAPPY: the same rows, by pyarrow", f.read().sort_by("id").to_pylist(), snappy_before.to_pylist())
 entry = next(iter(t.scan().plan_files()))
+check_metrics("SNAPPY", t, f)
 check("SNAPPY: its manifest's record count", entry.file.record_count, 36)
 check("SNAPPY: its bounds", (int.from_bytes(entry.file.lower_bounds[1], "little", signed=True),
                              int.from_bytes(entry.file.upper_bounds[1], "little", signed=True)), (0, 112))
@@ -240,7 +272,24 @@ check("its rows, the delete still applied", sorted(catalog.load_table("ns.delete
       rows_before)
 check("three rows of four", len(rows_before), 3)
 
-for name in ("flat", "snappy", "parts", "sorted", "deletes"):
+# The table's metrics mode (ADR-0114 §2): counts by default, one column's strings truncated to 4 characters.
+catalog.create_table("ns.modes", schema=schema, properties={
+    "write.metadata.metrics.default": "counts", "write.metadata.metrics.column.item": "truncate(4)"})
+compaction("modes", "disabled")
+for i in range(4):
+    catalog.load_table("ns.modes").append(pa.table({"id": [i, i + 100], "item": ["δέλτα-%d" % i, None]}, schema=schema))
+compaction("modes", "enabled")
+wait_for("modes: merged to one file", lambda: len(data_files("modes")) == 1, 4 * day)
+t = catalog.load_table("ns.modes")
+path = data_files("modes")[0]
+bucket, key = path[5:].split("/", 1)
+f = pq.ParquetFile(io.BytesIO(s3.get_object(Bucket=bucket, Key=key)["Body"].read()))
+check_metrics("modes", t, f)
+got = next(iter(t.scan().plan_files())).file
+check("modes: no bounds for id (counts)", 1 in (got.lower_bounds or {}), False)
+check("modes: item's lower bound, 4 characters", (got.lower_bounds or {}).get(2), "δέλτ".encode())
+
+for name in ("flat", "snappy", "modes", "parts", "sorted", "deletes"):
     catalog.purge_table("ns." + name)
 catalog.drop_namespace("ns")
 for attempt in range(3):

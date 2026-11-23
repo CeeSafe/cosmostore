@@ -1,0 +1,486 @@
+// A merged file's Iceberg metrics from the rows it holds (ADR-0114 §2): its manifest entry's value, null and NaN
+// counts, column sizes, and lower and upper bounds, by field id, as Iceberg's writers keep them under the table's
+// metrics mode (`write.metadata.metrics.default`, `truncate(16)` when unset, and `write.metadata.metrics.column.*`).
+//
+// Bounds are Iceberg's single-value form of the field's type in the table's schema, and are kept only for fields
+// outside lists and maps; NaN is counted, never a bound. Strings and binary are truncated under `truncate(n)`, the
+// upper bound raised at its last kept character so that it stays above every value.
+
+const METRICS_NONE: u8 = 0;
+const METRICS_COUNTS: u8 = 1;
+const METRICS_TRUNCATE: u8 = 2;
+const METRICS_FULL: u8 = 3;
+/// Iceberg's `truncate(16)`, the mode when the table sets none.
+const METRICS_DEFAULT_LENGTH: usize = 16;
+/// With no default set, Iceberg's writers keep metrics for this many columns, and none for the rest
+/// (`write.metadata.metrics.max-inferred-column-defaults`).
+const METRICS_INFERRED_COLUMNS: usize = 100;
+
+/// How a leaf's metrics are kept: its Iceberg type (empty when not a primitive known here) and mode.
+struct LeafMetricsPlan {
+    kind: Vector<u8>;
+    mode: u8;
+    length: usize;
+}
+
+/// A leaf's metrics so far.
+struct LeafStats {
+    values: i64;
+    nulls: i64;
+    nans: i64;
+    size: i64;
+    lower: Vector<u8>;
+    upper: Vector<u8>;
+    /// A value seen that is neither null nor NaN, so the bounds hold one.
+    bounded: bool;
+    /// A value whose Iceberg form is not made here: no bounds.
+    unbounded: bool;
+}
+
+fn emptyStats() -> LeafStats => LeafStats {
+    values: 0,
+    nulls: 0,
+    nans: 0,
+    size: 0,
+    lower: Vector<u8>.create(),
+    upper: Vector<u8>.create(),
+    bounded: false,
+    unbounded: false,
+};
+
+/// A merged file's metrics, each a manifest's array of `{key, value}`.
+struct FileMetrics {
+    valueCounts: Vector<Json>;
+    nullCounts: Vector<Json>;
+    nanCounts: Vector<Json>;
+    sizes: Vector<Json>;
+    lower: Vector<Json>;
+    upper: Vector<Json>;
+}
+
+/// A metrics mode's text: `none`, `counts`, `full` or `truncate(n)` with n above 0.
+fn metricsModeOf(text: Slice<u8>) -> LeafMetricsPlan? {
+    if (text == "none".bytes()) { return Some(metricsPlan(METRICS_NONE, 0)); }
+    if (text == "counts".bytes()) { return Some(metricsPlan(METRICS_COUNTS, 0)); }
+    if (text == "full".bytes()) { return Some(metricsPlan(METRICS_FULL, 0)); }
+    let open = "truncate(".bytes();
+    if (text.length > open.length + 1 && text[0..open.length] == open && text[text.length - 1] == ')') {
+        let n = parseDecimal(text[open.length..text.length - 1]) ?? { return null; };
+        if (n == 0 || n > 1000000) { return null; }
+        return Some(metricsPlan(METRICS_TRUNCATE, n as usize));
+    }
+    return null;
+}
+
+fn metricsPlan(mode: u8, length: usize) -> LeafMetricsPlan =>
+    LeafMetricsPlan { kind: Vector<u8>.create(), mode: mode, length: length };
+
+/// Each leaf's plan, by the table's metadata `m`: its type, and its mode by the table's properties.
+fn metricsPlanOf(m: borrow Json, leaves: Slice<PageLeaf>) -> Result<Vector<LeafMetricsPlan>, AllocError> {
+    let props = jsonMember(m, "properties");
+    var defaultText: Slice<u8>? = null;
+    match (props) {
+        Some(p) => { defaultText = jsonMemberText(p, "write.metadata.metrics.default"); }
+        null => {}
+    }
+    let explicit = defaultText.isSome();
+    let fallback = match (defaultText) {
+        Some(t) => metricsModeOf(t) ?? metricsPlan(METRICS_TRUNCATE, METRICS_DEFAULT_LENGTH),
+        null => metricsPlan(METRICS_TRUNCATE, METRICS_DEFAULT_LENGTH),
+    };
+    var out = Vector<LeafMetricsPlan>.create();
+    for (k in 0..leaves.length) {
+        var plan = metricsPlan(fallback.mode, fallback.length);
+        if (!explicit && k >= METRICS_INFERRED_COLUMNS) { plan.mode = METRICS_NONE; }
+        let id = leaves[k].fieldId;
+        if (id < 0) {
+            plan.mode = METRICS_NONE;
+            out.push(plan)?;
+            continue;
+        }
+        match (fieldTypeOf(m, id)) {
+            Some(t) => { plan.kind = copyBytes(t)?; }
+            null => {}
+        }
+        match (props) {
+            Some(p) => {
+                match (fieldNameOf(m, id)?) {
+                    Some(name) => {
+                        var key = copyBytes("write.metadata.metrics.column.".bytes())?;
+                        key.extend(name.view())?;
+                        match (jsonMemberText(p, StringView.fromUtf8(key.view()) ?? "")) {
+                            Some(t) => {
+                                match (metricsModeOf(t)) {
+                                    Some(mode) => {
+                                        plan.mode = mode.mode;
+                                        plan.length = mode.length;
+                                    }
+                                    null => {}
+                                }
+                            }
+                            null => {}
+                        }
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        out.push(plan)?;
+    }
+    return Ok(out);
+}
+
+/// A field's full name in the table's current schema (`a.b`, a list's `l.element`, a map's `m.key` and `m.value`).
+fn fieldNameOf(m: borrow Json, id: i64) -> Result<Vector<u8>?, AllocError> {
+    let current = jsonMemberI64(m, "current-schema-id") ?? 0;
+    match (memberItems(m, "schemas")) {
+        Some(schemas) => {
+            for (i in 0..schemas.length) {
+                if ((jsonMemberI64(borrow schemas[i], "schema-id") ?? 0) == current) {
+                    return nameIn(borrow schemas[i], id, "".bytes(), 0);
+                }
+            }
+        }
+        null => {}
+    }
+    return match (jsonMember(m, "schema")) {
+        Some(s) => nameIn(s, id, "".bytes(), 0),
+        null => Ok(null),
+    };
+}
+
+fn nameIn(t: borrow Json, id: i64, prefix: Slice<u8>, depth: usize) -> Result<Vector<u8>?, AllocError> {
+    if (depth > 32) { return Ok(null); }
+    match (memberItems(t, "fields")) {
+        Some(fields) => {
+            for (i in 0..fields.length) {
+                let f = borrow fields[i];
+                let name = jsonMemberText(f, "name") ?? { continue; };
+                var full = copyBytes(prefix)?;
+                if (full.length > 0) { full.push('.')?; }
+                full.extend(name)?;
+                if (jsonMemberI64(f, "id") == Some(id)) { return Ok(Some(full)); }
+                match (jsonMember(f, "type")) {
+                    Some(ft) => {
+                        match (nameIn(ft, id, full.view(), depth + 1)?) {
+                            Some(found) => { return Ok(Some(found)); }
+                            null => {}
+                        }
+                    }
+                    null => {}
+                }
+            }
+        }
+        null => {}
+    }
+    for (pair in [["element-id", "element"], ["key-id", "key"], ["value-id", "value"]]) {
+        match (jsonMember(t, pair[1])) {
+            Some(inner) => {
+                var full = copyBytes(prefix)?;
+                if (full.length > 0) { full.push('.')?; }
+                full.extend(pair[1].bytes())?;
+                if (jsonMemberI64(t, pair[0]) == Some(id)) { return Ok(Some(full)); }
+                match (nameIn(inner, id, full.view(), depth + 1)?) {
+                    Some(found) => { return Ok(Some(found)); }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+    }
+    return Ok(null);
+}
+
+fn kindIs(kind: Slice<u8>, names: Slice<StringView>) -> bool {
+    for (n in names) {
+        if (kind == n.bytes()) { return true; }
+    }
+    return false;
+}
+
+fn kindStarts(kind: Slice<u8>, prefix: StringView) -> bool =>
+    kind.length >= prefix.bytes().length && kind[0..prefix.bytes().length] == prefix.bytes();
+
+/// Whether a FLOAT's or DOUBLE's value is a NaN.
+fn isNaNValue(physical: i64, raw: Slice<u8>) -> bool {
+    if (physical == PQ_FLOAT && raw.length == 4) {
+        let bits = raw.readLE<u32>(0);
+        return (bits & 0x7F800000) == 0x7F800000 && (bits & 0x007FFFFF) != 0;
+    }
+    if (physical == PQ_DOUBLE && raw.length == 8) {
+        let bits = raw.readLE<u64>(0);
+        return (bits & 0x7FF0000000000000) == 0x7FF0000000000000 && (bits & 0x000FFFFFFFFFFFFF) != 0;
+    }
+    return false;
+}
+
+/// A value's Iceberg single-value form for a field of type `kind`; null when not made here (no bounds then).
+fn icebergValue(kind: Slice<u8>, leaf: borrow PageLeaf, raw: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
+    let p = leaf.physical;
+    if (kind == "boolean".bytes() && p == PQ_BOOLEAN) { return Ok(Some(copyBytes(raw)?)); }
+    if (kindIs(kind, ["int", "date"][..]) && p == PQ_INT32) { return Ok(Some(copyBytes(raw)?)); }
+    if (kindIs(kind, ["long", "time", "timestamp", "timestamptz", "timestamp_ns", "timestamptz_ns"][..])) {
+        if (p == PQ_INT64) { return Ok(Some(copyBytes(raw)?)); }
+        if (kind == "long".bytes() && p == PQ_INT32) {
+            // An int promoted to long: sign-extended.
+            var out = Vector<u8>.create();
+            out.pushLE(truncate<i32>(raw.readLE<u32>(0)) as i64)?;
+            return Ok(Some(out));
+        }
+        return Ok(null);
+    }
+    if (kind == "float".bytes() && p == PQ_FLOAT) { return Ok(Some(copyBytes(raw)?)); }
+    if (kind == "double".bytes() && p == PQ_DOUBLE) { return Ok(Some(copyBytes(raw)?)); }
+    if (kindIs(kind, ["string", "binary"][..]) && p == PQ_BYTE_ARRAY) { return Ok(Some(copyBytes(raw)?)); }
+    if ((kind == "uuid".bytes() || kindStarts(kind, "fixed[")) && p == PQ_FIXED) { return Ok(Some(copyBytes(raw)?)); }
+    if (kindStarts(kind, "decimal(")) {
+        // Iceberg's decimal: the unscaled value, big-endian two's complement, in the fewest bytes.
+        var be = Vector<u8>.create();
+        if (p == PQ_INT32 || p == PQ_INT64) {
+            for (k in 0..raw.length) { be.push(raw[raw.length - 1 - k])?; }
+        } else if (p == PQ_FIXED || p == PQ_BYTE_ARRAY) {
+            be.extend(raw)?;
+        } else {
+            return Ok(null);
+        }
+        if (be.length == 0) { return Ok(null); }
+        var from: usize = 0;
+        while (from + 1 < be.length) {
+            let lead = be[from];
+            let nextTop = be[from + 1] & 0x80;
+            if ((lead == 0 && nextTop == 0) || (lead == 0xFF && nextTop != 0)) { from += 1; } else { break; }
+        }
+        return Ok(Some(copyBytes(be.view()[from..])?));
+    }
+    return Ok(null);
+}
+
+/// A float's or double's bits as an unsigned key in the value's order (-0.0 below +0.0; not for NaN).
+fn floatKey(bits: u64, sign: u64) -> u64 => if (bits & sign != 0) bits ^ 0xFFFFFFFFFFFFFFFF else bits | sign;
+
+/// How two Iceberg values of type `kind` compare.
+fn compareIceberg(kind: Slice<u8>, a: Slice<u8>, b: Slice<u8>) -> i32 {
+    if (kindIs(kind, ["int", "date"][..]) && a.length == 4 && b.length == 4) {
+        let x = truncate<i32>(a.readLE<u32>(0));
+        let y = truncate<i32>(b.readLE<u32>(0));
+        return if (x < y) -1 else if (x > y) 1 else 0;
+    }
+    if (a.length == 8 && b.length == 8 &&
+        kindIs(kind, ["long", "time", "timestamp", "timestamptz", "timestamp_ns", "timestamptz_ns"][..])) {
+        let x = truncate<i64>(a.readLE<u64>(0));
+        let y = truncate<i64>(b.readLE<u64>(0));
+        return if (x < y) -1 else if (x > y) 1 else 0;
+    }
+    if (kind == "float".bytes() && a.length == 4 && b.length == 4) {
+        let x = floatKey(a.readLE<u32>(0) as u64, 0x80000000) & 0xFFFFFFFF;
+        let y = floatKey(b.readLE<u32>(0) as u64, 0x80000000) & 0xFFFFFFFF;
+        return if (x < y) -1 else if (x > y) 1 else 0;
+    }
+    if (kind == "double".bytes() && a.length == 8 && b.length == 8) {
+        let x = floatKey(a.readLE<u64>(0), 0x8000000000000000);
+        let y = floatKey(b.readLE<u64>(0), 0x8000000000000000);
+        return if (x < y) -1 else if (x > y) 1 else 0;
+    }
+    if (kindStarts(kind, "decimal(") && a.length > 0 && b.length > 0) {
+        let an = a[0] & 0x80 != 0;
+        let bn = b[0] & 0x80 != 0;
+        if (an != bn) { return if (an) -1 else 1; }
+        // The same sign: the longer is the larger in magnitude, so above for positives and below for negatives.
+        if (a.length != b.length) {
+            let longer = if (a.length > b.length) 1 else -1;
+            return if (an) -longer else longer;
+        }
+        return compareBytes(a, b);
+    }
+    return compareBytes(a, b);
+}
+
+/// One row group's column folded into its leaf's metrics; `size` its chunk's bytes.
+fn foldStats(
+    stats: borrow mut LeafStats,
+    plan: borrow LeafMetricsPlan,
+    leaf: borrow PageLeaf,
+    v: borrow ColumnValues,
+    size: i64,
+) -> Result<void, AllocError> {
+    if (plan.mode == METRICS_NONE) { return Ok(); }
+    stats.values += truncate<i64>(v.defs.length);
+    for (d in v.defs.view()) {
+        if ((d as u32) < leaf.maxDef) { stats.nulls += 1; }
+    }
+    stats.size += size;
+    let bounds = plan.mode >= METRICS_TRUNCATE && leaf.maxRep == 0 && plan.kind.length > 0 && !stats.unbounded;
+    for (i in 0..v.count) {
+        let raw = valueAt(v, leaf, i);
+        if (isNaNValue(leaf.physical, raw)) {
+            stats.nans += 1;
+            continue;
+        }
+        if (!bounds || stats.unbounded) { continue; }
+        let value = icebergValue(plan.kind.view(), leaf, raw)? ?? {
+            stats.unbounded = true;
+            continue;
+        };
+        if (!stats.bounded) {
+            stats.lower = copyBytes(value.view())?;
+            stats.upper = value;
+            stats.bounded = true;
+        } else {
+            if (compareIceberg(plan.kind.view(), value.view(), stats.lower.view()) < 0) {
+                stats.lower = copyBytes(value.view())?;
+            }
+            if (compareIceberg(plan.kind.view(), value.view(), stats.upper.view()) > 0) { stats.upper = value; }
+        }
+    }
+    return Ok();
+}
+
+/// The first `n` characters of a UTF-8 string (all of it when shorter).
+fn utf8Prefix(s: Slice<u8>, n: usize) -> Slice<u8> {
+    var chars: usize = 0;
+    var i: usize = 0;
+    while (i < s.length) {
+        if (s[i] & 0xC0 != 0x80) {
+            if (chars == n) { return s[0..i]; }
+            chars += 1;
+        }
+        i += 1;
+    }
+    return s;
+}
+
+/// The least string of at most `n` characters above every string that begins with `s`'s first `n`: its last
+/// character raised (past the surrogates), dropped when it cannot be; null when none can.
+fn utf8UpperBound(s: Slice<u8>, n: usize) -> Result<Vector<u8>?, AllocError> {
+    let prefix = utf8Prefix(s, n);
+    if (prefix.length == s.length) { return Ok(Some(copyBytes(s)?)); }
+    var points = decodeCodePoints(prefix)? ?? { return Ok(null); };
+    while (points.length > 0) {
+        var last = points[points.length - 1] + 1;
+        if (last >= 0xD800 && last <= 0xDFFF) { last = 0xE000; }
+        if (last <= 0x10FFFF) {
+            points[points.length - 1] = last;
+            var out = Vector<u8>.create();
+            for (p in points.view()) { appendCodePoint(mut out, p)?; }
+            return Ok(Some(out));
+        }
+        let _ = points.pop();
+    }
+    return Ok(null);
+}
+
+/// A UTF-8 string's code points; null when it is not UTF-8.
+fn decodeCodePoints(s: Slice<u8>) -> Result<Vector<u32>?, AllocError> {
+    var out = Vector<u32>.create();
+    var i: usize = 0;
+    while (i < s.length) {
+        let b = s[i] as u32;
+        let n: usize = if (b < 0x80) 1 else if (b & 0xE0 == 0xC0) 2 else if (b & 0xF0 == 0xE0) 3
+            else if (b & 0xF8 == 0xF0) 4 else 0;
+        if (n == 0 || i + n > s.length) { return Ok(null); }
+        var c = if (n == 1) b else if (n == 2) b & 0x1F else if (n == 3) b & 0x0F else b & 0x07;
+        for (k in 1..n) {
+            let next = s[i + k] as u32;
+            if (next & 0xC0 != 0x80) { return Ok(null); }
+            c = (c << 6) | (next & 0x3F);
+        }
+        out.push(c)?;
+        i += n;
+    }
+    return Ok(Some(out));
+}
+
+/// A code point's UTF-8 bytes.
+fn appendCodePoint(out: borrow mut Vector<u8>, c: u32) -> Result<void, AllocError> {
+    if (c < 0x80) {
+        out.push(truncate<u8>(c))?;
+    } else if (c < 0x800) {
+        out.push(truncate<u8>(0xC0 | (c >> 6)))?;
+        out.push(truncate<u8>(0x80 | (c & 0x3F)))?;
+    } else if (c < 0x10000) {
+        out.push(truncate<u8>(0xE0 | (c >> 12)))?;
+        out.push(truncate<u8>(0x80 | ((c >> 6) & 0x3F)))?;
+        out.push(truncate<u8>(0x80 | (c & 0x3F)))?;
+    } else {
+        out.push(truncate<u8>(0xF0 | (c >> 18)))?;
+        out.push(truncate<u8>(0x80 | ((c >> 12) & 0x3F)))?;
+        out.push(truncate<u8>(0x80 | ((c >> 6) & 0x3F)))?;
+        out.push(truncate<u8>(0x80 | (c & 0x3F)))?;
+    }
+    return Ok();
+}
+
+/// The least bytes of at most `n` above every value that begins with `s`'s first `n`: the last byte below 0xFF
+/// raised, those after it dropped; null when all are 0xFF.
+fn binaryUpperBound(s: Slice<u8>, n: usize) -> Result<Vector<u8>?, AllocError> {
+    if (s.length <= n) { return Ok(Some(copyBytes(s)?)); }
+    var out = copyBytes(s[0..n])?;
+    while (out.length > 0) {
+        let last = out.length - 1;
+        if (out[last] != 0xFF) {
+            out[last] += 1;
+            return Ok(Some(out));
+        }
+        let _ = out.pop();
+    }
+    return Ok(null);
+}
+
+fn metricPair(id: i64, value: Json) -> Result<Json, AllocError> {
+    var pair = jsonObject();
+    jsonSet(mut pair, "key", jsonInteger(id)?)?;
+    jsonSet(mut pair, "value", value)?;
+    return Ok(pair);
+}
+
+/// The metrics of a file whose leaves are `leaves`, from their stats.
+fn fileMetricsOf(
+    leaves: Slice<PageLeaf>,
+    plans: Slice<LeafMetricsPlan>,
+    stats: Slice<LeafStats>,
+) -> Result<FileMetrics, AllocError> {
+    var out = FileMetrics {
+        valueCounts: Vector<Json>.create(),
+        nullCounts: Vector<Json>.create(),
+        nanCounts: Vector<Json>.create(),
+        sizes: Vector<Json>.create(),
+        lower: Vector<Json>.create(),
+        upper: Vector<Json>.create(),
+    };
+    for (k in 0..leaves.length) {
+        let plan = borrow plans[k];
+        let s = borrow stats[k];
+        let id = leaves[k].fieldId;
+        if (plan.mode == METRICS_NONE || id < 0) { continue; }
+        out.valueCounts.push(metricPair(id, jsonInteger(s.values)?)?)?;
+        out.nullCounts.push(metricPair(id, jsonInteger(s.nulls)?)?)?;
+        out.sizes.push(metricPair(id, jsonInteger(s.size)?)?)?;
+        if (kindIs(plan.kind.view(), ["float", "double"][..])) {
+            out.nanCounts.push(metricPair(id, jsonInteger(s.nans)?)?)?;
+        }
+        if (plan.mode < METRICS_TRUNCATE || !s.bounded || s.unbounded || leaves[k].maxRep > 0) { continue; }
+        let kind = plan.kind.view();
+        let truncates = plan.mode == METRICS_TRUNCATE && kindIs(kind, ["string", "binary"][..]);
+        if (!truncates) {
+            out.lower.push(metricPair(id, Json.Text(copyBytes(s.lower.view())?))?)?;
+            out.upper.push(metricPair(id, Json.Text(copyBytes(s.upper.view())?))?)?;
+            continue;
+        }
+        if (kind == "string".bytes()) {
+            out.lower.push(metricPair(id, Json.Text(copyBytes(utf8Prefix(s.lower.view(), plan.length))?))?)?;
+            match (utf8UpperBound(s.upper.view(), plan.length)?) {
+                Some(u) => { out.upper.push(metricPair(id, Json.Text(u))?)?; }
+                null => {}
+            }
+        } else {
+            let n = if (s.lower.length < plan.length) s.lower.length else plan.length;
+            out.lower.push(metricPair(id, Json.Text(copyBytes(s.lower.view()[0..n])?))?)?;
+            match (binaryUpperBound(s.upper.view(), plan.length)?) {
+                Some(u) => { out.upper.push(metricPair(id, Json.Text(u))?)?; }
+                null => {}
+            }
+        }
+    }
+    return Ok(out);
+}
