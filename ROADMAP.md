@@ -5749,3 +5749,26 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **`v3CompactionAppliesDeletionVectors`:** a v3 table's two vectors applied, the rows they delete gone, the
     others keeping their row ids, and both removed. It fails with the removal taken out.
 - **Results:** 518 unit tests.
+
+### 25 Nov 2026: M28 slices 5 and 6, Iceberg Java's and PyIceberg's v3 tables (ADR-0122)
+
+- **`tools/iceberg_java_check.sh`** (iceberg-core 1.10.0's REST client with SigV4, S3FileIO; in CI after the smokes):
+  - Iceberg Java upgrades a v2 table to v3 by its property (`next-row-id` 0; its first v3 append's rows given 0
+    to 5);
+  - it makes a v3 table, appends three files, and commits a deletion vector written by its own `BaseDVFileWriter`;
+  - PyIceberg reads the table with the vector applied;
+  - compaction merges it: one file holding each live row with the `_row_id` it had, the deleted rows gone, no delete
+    left;
+  - PyIceberg and Java read the same rows; still v3, a replace whose first row id is the table's next before, and
+    `next-row-id` advanced. 20 checks.
+- **Found by it:**
+  - **A bug:** Iceberg Java's create sends `"write-order": null`, which the catalog took as the order, so Java could
+    not read the table back. A create's `null` members are now taken as absent (`icebergCreateTakesNullsAsAbsent`).
+    PyIceberg leaves them out.
+  - **A bug:** a merged v3 file's footer kept its inputs' `column_orders`, one fewer than its leaves for each lineage
+    column added. pyarrow refuses such a footer. They are now one a leaf, and the unit test checks the count.
+  - **Not a bug:** a table's compaction is enabled by default (as on S3 Tables), so a run fell between Java's
+    appends. Its result was right by Java's rules: the merged rows kept their ids 0 to 19, the new manifest took 20,
+    and Java's next append took 40. The check now disables compaction until it means to compact.
+- **PyIceberg 0.12** makes and reads v3 tables, deletion vectors included, but cannot append to one. Java is the v3
+  writer.

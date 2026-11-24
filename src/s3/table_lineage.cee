@@ -64,6 +64,9 @@ fn withLineageSchema(meta: borrow Vector<ThriftField>) -> Result<Vector<ThriftFi
     if (elements.length == 0) { return Ok(null); }
     var kept = Vector<ThriftValue>.create();
     var removed: i64 = 0;
+    // The leaves removed, by their place among the leaves (the footer's column orders are one a leaf).
+    var removedLeaves = Vector<usize>.create();
+    var leaf: usize = 0;
     // Each element's depth, by its parents' remaining children.
     var remaining = Vector<i64>.create();
     for (j in 0..elements.length) {
@@ -82,9 +85,11 @@ fn withLineageSchema(meta: borrow Vector<ThriftField>) -> Result<Vector<ThriftFi
         if (isLineage) {
             if (depth != 1 || children != 0) { return Ok(null); }
             removed += 1;
+            removedLeaves.push(leaf)?;
         } else {
             kept.push(ThriftValue.Struct(cloneFields(e)?))?;
         }
+        if (j > 0 && children == 0) { leaf += 1; }
         if (children > 0) { remaining.push(children)?; }
         while (remaining.length > 0 && remaining[remaining.length - 1] == 0) { let _ = remaining.pop(); }
     }
@@ -116,6 +121,25 @@ fn withLineageSchema(meta: borrow Vector<ThriftField>) -> Result<Vector<ThriftFi
         if (field.id == PQ_FILE_SCHEMA) {
             out.push(ThriftField { id: PQ_FILE_SCHEMA, value: ThriftValue.List(THRIFT_LIST, THRIFT_STRUCT, kept) })?;
             kept = Vector<ThriftValue>.create();
+        } else if (field.id == PQ_FILE_COLUMN_ORDERS) {
+            // One a leaf (readers refuse a footer whose count differs): the removed leaves' left out, and the type's
+            // own order for the two added.
+            let orders = structItems(meta, PQ_FILE_COLUMN_ORDERS) ?? { return Ok(null); };
+            if (orders.length != leaf) { return Ok(null); }
+            var keptOrders = Vector<ThriftValue>.create();
+            for (k in 0..orders.length) {
+                if (!holdsIndex(removedLeaves.view(), k)) { keptOrders.push(cloneThrift(borrow orders[k])?)?; }
+            }
+            for (n in 0..2) {
+                var typeDefined = Vector<ThriftField>.create();
+                typeDefined.push(ThriftField { id: 1, value: ThriftValue.Struct(Vector<ThriftField>.create()) })?;
+                keptOrders.push(ThriftValue.Struct(typeDefined))?;
+                let _ = n;
+            }
+            out.push(ThriftField {
+                id: PQ_FILE_COLUMN_ORDERS,
+                value: ThriftValue.List(THRIFT_LIST, THRIFT_STRUCT, keptOrders),
+            })?;
         } else {
             out.push(ThriftField { id: field.id, value: cloneThrift(borrow field.value)? })?;
         }
