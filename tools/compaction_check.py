@@ -133,10 +133,41 @@ check_metrics("flat", t, f)
 
 
 def avro_codec(path):
-    """An Avro file's codec, as its header names it."""
-    import fastavro
+    """An Avro file's codec, as its header names it (read here: the header is `Obj\\x01`, then a map of bytes in
+    blocks of zig-zag longs)."""
     b, k = path[5:].split("/", 1)
-    return fastavro.reader(io.BytesIO(s3.get_object(Bucket=b, Key=k)["Body"].read())).metadata.get("avro.codec")
+    data = s3.get_object(Bucket=b, Key=k)["Body"].read()
+    at = 4
+
+    def long():
+        nonlocal at
+        shift, n = 0, 0
+        while True:
+            byte = data[at]
+            at += 1
+            n |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                return (n >> 1) ^ -(n & 1)
+
+    def text():
+        nonlocal at
+        size = long()
+        at += size
+        return data[at - size:at]
+
+    meta = {}
+    while True:
+        count = long()
+        if count == 0:
+            break
+        if count < 0:
+            count = -count
+            long()
+        for _ in range(count):
+            key = text()
+            meta[key] = text()
+    return meta.get(b"avro.codec", b"null").decode()
 
 
 def run_codecs(table):
