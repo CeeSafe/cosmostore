@@ -5417,3 +5417,23 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   word.
 - **Next:** slices 2 and 3 for the codecs CeeSafe already has (snappy, gzip, deflate), and ZSTD once the encoder is
   released.
+
+### 24 Nov 2026: M25 slices 2 and 3, the table's codecs (ADR-0116 §1, §3)
+
+- **Pages:** a merged file's pages are in the table's `write.parquet.compression-codec` at its
+  `write.parquet.compression-level`: snappy, gzip (6 by default) or uncompressed. ZSTD is the default when the table
+  sets none. ZSTD is SNAPPY until CeeSafe's encoder is released (`COMPACTION_WRITES_ZSTD`), and a codec not written
+  here is SNAPPY.
+- **Manifests:** the run's manifests and manifest list are in the table's `write.avro.compression-codec`.
+  - Names: Iceberg Java's (`gzip`, `zstd`, `snappy`, `uncompressed`) and Avro's (`deflate`, `null`).
+  - Default: gzip (Avro's deflate). ZSTD is deflate until the encoder is released.
+  - Writer: `writeAvroIn`, with deflate and snappy blocks (snappy's with its CRC-32).
+- **Checks:**
+  - A unit test writes a manifest in each codec and reads it back.
+  - `tools/compaction_check.py` (85 checks on `serve` and through a cluster): the run's manifests are deflate by
+    default, and a table of gzip pages and null manifests keeps both.
+  - PyIceberg reads snappy manifests only with its optional python-snappy, and takes Avro's `null`, not
+    `uncompressed`.
+- **Results:** 496 unit tests; the smokes.
+- **Next:** ZSTD, once CeeSafe's encoder (ADR 0196 phase 4, being built) is released; then the checks and the exit
+  review.

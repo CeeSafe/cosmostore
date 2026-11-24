@@ -130,6 +130,24 @@ check("its manifest's record count", entry.file.record_count, 6)
 check("its bounds: the least id", int.from_bytes(entry.file.lower_bounds[1], "little", signed=True), 0)
 check("its bounds: the greatest id", int.from_bytes(entry.file.upper_bounds[1], "little", signed=True), 5)
 check_metrics("flat", t, f)
+
+
+def avro_codec(path):
+    """An Avro file's codec, as its header names it."""
+    import fastavro
+    b, k = path[5:].split("/", 1)
+    return fastavro.reader(io.BytesIO(s3.get_object(Bucket=b, Key=k)["Body"].read())).metadata.get("avro.codec")
+
+
+def run_codecs(table):
+    """The codecs of the current snapshot's manifest list and of the manifests it names that its run wrote."""
+    snap = table.current_snapshot()
+    return avro_codec(snap.manifest_list), sorted({avro_codec(m.manifest_path) for m in snap.manifests(table.io)
+                                                   if m.added_snapshot_id == snap.snapshot_id})
+
+
+# The run's manifests in the table's Avro codec (ADR-0116 §3): gzip (Avro's deflate) when it sets none.
+check("the run's manifest list and manifests in deflate", run_codecs(t), ("deflate", ["deflate"]))
 t.append(pa.table({"id": [6], "item": ["row 6"]}, schema=schema))
 check("an append after", catalog.load_table("ns.flat").scan().to_arrow().num_rows, 7)
 
@@ -328,6 +346,27 @@ check_metrics("equality", t, f)
 t.append(pa.table({"id": [9], "part": ["a"]}, schema=pschema))
 check("equality: an append after", ids_of("equality"), [1, 2, 4, 9])
 
+# A table's own codecs kept (ADR-0116): gzip pages, null manifests (Avro's name, which PyIceberg takes; Java's is
+# `uncompressed`) (not snappy: PyIceberg reads snappy
+# manifests only with its optional python-snappy, which this check's PyIceberg has not; the snappy writer is a unit
+# test's, read back by CosmoStore's own reader).
+catalog.create_table("ns.codecs", schema=schema, properties={
+    "write.parquet.compression-codec": "gzip", "write.parquet.compression-level": "4",
+    "write.avro.compression-codec": "null"})
+compaction("codecs", "disabled")
+for i in range(3):
+    catalog.load_table("ns.codecs").append(pa.table({"id": [i], "item": ["codec %d" % i]}, schema=schema))
+codecs_before = catalog.load_table("ns.codecs").scan().to_arrow().sort_by("id")
+compaction("codecs", "enabled")
+wait_for("codecs: merged to one file", lambda: len(data_files("codecs")) == 1, 4 * day)
+t = catalog.load_table("ns.codecs")
+check("codecs: the same rows", t.scan().to_arrow().sort_by("id").equals(codecs_before), True)
+path = data_files("codecs")[0]
+bucket, key = path[5:].split("/", 1)
+f = pq.ParquetFile(io.BytesIO(s3.get_object(Bucket=bucket, Key=key)["Body"].read()))
+check("codecs: written GZIP, the table's", f.metadata.row_group(0).column(0).compression, "GZIP")
+check("codecs: the run's manifests uncompressed, the table's", run_codecs(t), ("null", ["null"]))
+
 # The table's metrics mode (ADR-0114 §2): counts by default, one column's strings truncated to 4 characters.
 catalog.create_table("ns.modes", schema=schema, properties={
     "write.metadata.metrics.default": "counts", "write.metadata.metrics.column.item": "truncate(4)"})
@@ -345,7 +384,7 @@ got = next(iter(t.scan().plan_files())).file
 check("modes: no bounds for id (counts)", 1 in (got.lower_bounds or {}), False)
 check("modes: item's lower bound, 4 characters", (got.lower_bounds or {}).get(2), "δέλτ".encode())
 
-for name in ("flat", "snappy", "modes", "parts", "sorted", "deletes", "equality"):
+for name in ("flat", "snappy", "modes", "codecs", "parts", "sorted", "deletes", "equality"):
     catalog.purge_table("ns." + name)
 catalog.drop_namespace("ns")
 for attempt in range(3):

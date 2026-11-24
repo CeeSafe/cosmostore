@@ -170,11 +170,12 @@ fn statisticsOf(leaf: borrow PageLeaf, v: borrow ColumnValues) -> Result<Vector<
 // ---- A column chunk ----
 
 /// A page's bytes compressed by `codec`; null for a codec not written here.
-fn compressPage(codec: i64, page: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
+fn compressPage(codec: i64, level: u32, page: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
     if (codec == PQ_CODEC_UNCOMPRESSED) { return Ok(Some(copyBytes(page)?)); }
     if (codec == PQ_CODEC_GZIP) {
         var out = Vector<u8>.create();
-        Gzip.compress(page, 6, mut out)?;
+        // The table's level (ADR-0116), 6 when it sets none, as gzip's own default.
+        Gzip.compress(page, if (level == 0 || level > 9) 6 else level, mut out)?;
         return Ok(Some(out));
     }
     if (codec == PQ_CODEC_SNAPPY) {
@@ -189,11 +190,12 @@ fn compressPage(codec: i64, page: Slice<u8>) -> Result<Vector<u8>?, AllocError> 
 fn writePage(
     out: borrow mut Vector<u8>,
     codec: i64,
+    level: u32,
     kind: i64,
     page: Slice<u8>,
     detail: ThriftField,
 ) -> Result<bool, AllocError> {
-    let compressed = compressPage(codec, page)? ?? { return Ok(false); };
+    let compressed = compressPage(codec, level, page)? ?? { return Ok(false); };
     var header = Vector<ThriftField>.create();
     header.push(tInt(1, kind))?;
     header.push(tInt(2, truncate<i64>(page.length)))?;
@@ -247,6 +249,16 @@ fn writeColumnChunk(
     leaf: borrow PageLeaf,
     v: borrow ColumnValues,
     codec: i64,
+) -> Result<ThriftValue?, AllocError> => writeColumnChunkAt(out, offset, leaf, v, codec, 0);
+
+/// `writeColumnChunk` at the codec's `level` (0: its default; ADR-0116).
+fn writeColumnChunkAt(
+    out: borrow mut Vector<u8>,
+    offset: u64,
+    leaf: borrow PageLeaf,
+    v: borrow ColumnValues,
+    codec: i64,
+    codecLevel: u32,
 ) -> Result<ThriftValue?, AllocError> {
     if (valueWidth(leaf).isNull() || v.reps.length != v.defs.length) { return Ok(null); }
     let start = out.length;
@@ -258,7 +270,14 @@ fn writeColumnChunk(
             var detail = Vector<ThriftField>.create();
             detail.push(tInt(1, truncate<i64>(d.count)))?;
             detail.push(tInt(2, PQ_ENC_PLAIN))?;
-            if (!(writePage(out, codec, PQ_PAGE_DICTIONARY, d.values.view(), tStruct(7, detail))?)) { return Ok(null); }
+            if (!(writePage(
+                out,
+                codec,
+                codecLevel,
+                PQ_PAGE_DICTIONARY,
+                d.values.view(),
+                tStruct(7, detail),
+            )?)) { return Ok(null); }
         }
         null => {}
     }
@@ -304,7 +323,7 @@ fn writeColumnChunk(
         detail.push(tInt(2, encoding))?;
         detail.push(tInt(3, PQ_ENC_RLE))?;
         detail.push(tInt(4, PQ_ENC_RLE))?;
-        if (!(writePage(out, codec, PQ_PAGE_DATA, page.view(), tStruct(5, detail))?)) { return Ok(null); }
+        if (!(writePage(out, codec, codecLevel, PQ_PAGE_DATA, page.view(), tStruct(5, detail))?)) { return Ok(null); }
         level = to;
         value += present;
     }
@@ -363,6 +382,16 @@ fn encodeRowGroup(
     columns: Slice<ColumnValues>,
     rows: i64,
     codec: i64,
+) -> Result<EncodedGroup?, AllocError> => encodeRowGroupAt(offset, leaves, columns, rows, codec, 0);
+
+/// `encodeRowGroup` at the codec's `level` (0: its default; ADR-0116).
+fn encodeRowGroupAt(
+    offset: u64,
+    leaves: Slice<PageLeaf>,
+    columns: Slice<ColumnValues>,
+    rows: i64,
+    codec: i64,
+    level: u32,
 ) -> Result<EncodedGroup?, AllocError> {
     if (leaves.length != columns.length || leaves.length == 0) { return Ok(null); }
     var bytes = Vector<u8>.create();
@@ -370,12 +399,13 @@ fn encodeRowGroup(
     var uncompressed: i64 = 0;
     for (c in 0..leaves.length) {
         let at = offset + bytes.length as u64;
-        let chunk = writeColumnChunk(
+        let chunk = writeColumnChunkAt(
             mut bytes,
             at,
             borrow leaves[c],
             borrow columns[c],
             codec,
+            level,
         )? ?? { return Ok(null); };
         uncompressed += match (borrow chunk) {
             ThriftValue.Struct(f) => match (thriftField(f, PQ_CHUNK_META)) {

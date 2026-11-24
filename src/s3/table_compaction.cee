@@ -56,7 +56,11 @@ const COMPACTION_MAX_ROW_GROUP_BYTES: u64 = 268435456;
 /// that a merged file is always one the next merge reads.
 const COMPACTION_GROUP_LEVELS: usize = 16777216;
 
-/// The codec merged files are written with: SNAPPY, the owner's choice (ADR-0111), lib/std's since ceesafec 0.94.0.
+/// Whether ZSTD is written: lib/std's zstd encoder (ADR 0196 phase 4); until it is released, a table that asks for
+/// ZSTD gets SNAPPY pages (ADR-0111's choice) and deflate manifests.
+const COMPACTION_WRITES_ZSTD: bool = false;
+
+/// The codec merged files were written with before ADR-0116, and the one for a codec not written here.
 const COMPACTION_PAGE_CODEC: i64 = 1;
 
 /// What a run read under the store, and what it will join.
@@ -79,6 +83,10 @@ struct CompactionPlan {
     rowGroupBytes: u64;
     /// The live delete files of the partitions compacted with their deletes (ADR-0114 §3).
     deletes: Vector<DeleteFile>;
+    /// The codecs a merged file's pages and the run's manifests are written in: the table's (ADR-0116).
+    pageCodec: i64;
+    pageLevel: u32;
+    avroCodec: AvroCodec;
 }
 
 /// A file a run wrote: its key and path, and its length.
@@ -341,6 +349,9 @@ fn planCompaction(
         }
     }
     let rowGroupBytes = rowGroupBytesOf(borrow m);
+    let pageCodec = pageCodecOf(borrow m);
+    let pageLevel = codecLevelOf(borrow m, "write.parquet.compression-level");
+    let avroCodec = avroCodecOf(borrow m);
     let plan = CompactionPlan {
         bucket: copyBytes(t.bucket.view())?,
         hidden: hidden,
@@ -357,6 +368,9 @@ fn planCompaction(
         bins: Vector<CompactionBin>.create(),
         rowGroupBytes: rowGroupBytes,
         deletes: deletes,
+        pageCodec: pageCodec,
+        pageLevel: pageLevel,
+        avroCodec: avroCodec,
     };
     return Ok(Some(CompactionDraft { plan: plan, pending: pending, target: target }));
 }
@@ -579,6 +593,59 @@ fn deleteFileOf(
     }));
 }
 
+/// A table property's text, in lower case; null when it is not set.
+fn propertyLower(m: borrow Json, name: StringView) -> Result<Vector<u8>?, AllocError> {
+    let props = jsonMember(m, "properties") ?? { return Ok(null); };
+    let text = jsonMemberText(props, name) ?? { return Ok(null); };
+    var out = Vector<u8>.create();
+    for (b in text) { out.push(if (b >= 'A' && b <= 'Z') b + 32 else b)?; }
+    return Ok(Some(out));
+}
+
+/// The codec a merged file's pages are written in (ADR-0116 §1): the table's `write.parquet.compression-codec`, ZSTD
+/// when it sets none (Iceberg's default since 1.4, the owner's choice); SNAPPY for a codec not written here.
+fn pageCodecOf(m: borrow Json) -> i64 {
+    let zstd = if (COMPACTION_WRITES_ZSTD) PQ_CODEC_ZSTD else COMPACTION_PAGE_CODEC;
+    let name = match (propertyLower(m, "write.parquet.compression-codec")) {
+        Ok(Some(n)) => n,
+        Ok(null) => { return zstd; }
+        Err(_) => { return COMPACTION_PAGE_CODEC; }
+    };
+    let n = name.view();
+    if (n == "zstd".bytes()) { return zstd; }
+    if (n == "snappy".bytes()) { return PQ_CODEC_SNAPPY; }
+    if (n == "gzip".bytes()) { return PQ_CODEC_GZIP; }
+    if (n == "uncompressed".bytes() || n == "none".bytes()) { return PQ_CODEC_UNCOMPRESSED; }
+    return COMPACTION_PAGE_CODEC;
+}
+
+/// A codec's level from the table's property `name`: 1 to 9 (above 9 as 9), 0 for the codec's own default (ZSTD's
+/// 3, gzip's 6) when it sets none.
+fn codecLevelOf(m: borrow Json, name: StringView) -> u32 {
+    let props = jsonMember(m, "properties") ?? { return 0; };
+    let text = jsonMemberText(props, name) ?? { return 0; };
+    let n = parseDecimal(text) ?? { return 0; };
+    return if (n > 9) 9 else truncate<u32>(n);
+}
+
+/// The codec the run's manifests are written in (ADR-0116 §3): the table's `write.avro.compression-codec`, `gzip`
+/// (Avro's deflate) when it sets none, as Iceberg's writers do; deflate for one not written here.
+fn avroCodecOf(m: borrow Json) -> AvroCodec {
+    let level = codecLevelOf(m, "write.avro.compression-level");
+    let deflate = AvroCodec { kind: AVRO_WRITE_DEFLATE, level: level };
+    let name = match (propertyLower(m, "write.avro.compression-codec")) {
+        Ok(Some(n)) => n,
+        _ => { return deflate; }
+    };
+    let n = name.view();
+    // Iceberg Java's names and Avro's own, which PyIceberg takes too (`null`, `deflate`, `zstandard`).
+    if (n == "snappy".bytes()) { return AvroCodec { kind: AVRO_WRITE_SNAPPY, level: 0 }; }
+    if (n == "uncompressed".bytes() || n == "none".bytes() || n == "null".bytes()) {
+        return AvroCodec { kind: AVRO_WRITE_NULL, level: 0 };
+    }
+    return deflate;
+}
+
 /// The bins of `inputs` (ADR-0098 §2): by group, in path order, each up to `target` bytes; a bin of one file is left.
 fn binsOf(
     inputs: Vector<CompactionInput>,
@@ -675,6 +742,9 @@ struct BinCopy {
     /// For a merge: how each of the first input's leaves keeps its metrics, and the metrics once written.
     metricsPlan: Vector<LeafMetricsPlan>;
     metrics: FileMetrics?;
+    /// A merge's page codec and level: the table's (ADR-0116).
+    pageCodec: i64;
+    pageLevel: u32;
     /// For a merge with deletes (ADR-0114 §4): each applying delete file, whole, and how it applies; each input's path
     /// and data sequence number.
     deleteReaders: Vector<PreparedReader>;
@@ -812,6 +882,8 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
                 null => { return Ok(null); }
             },
             metrics: null,
+            pageCodec: plan.pageCodec,
+            pageLevel: plan.pageLevel,
             footers: footers,
             pieces: pieces,
         }));
@@ -835,6 +907,8 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
         pieces: Vector<MergePiece>.create(),
         metricsPlan: Vector<LeafMetricsPlan>.create(),
         metrics: null,
+        pageCodec: plan.pageCodec,
+        pageLevel: plan.pageLevel,
         deleteReaders: Vector<PreparedReader>.create(),
         deleteSizes: Vector<u64>.create(),
         binDeletes: Vector<BinDelete>.create(),
@@ -1062,6 +1136,8 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
                     mut groups,
                     c.metricsPlan.view(),
                     mut stats,
+                    c.pageCodec,
+                    c.pageLevel,
                 )?)) { return Ok(null); }
                 held = 0;
                 rows = 0;
@@ -1077,6 +1153,8 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
         mut groups,
         c.metricsPlan.view(),
         mut stats,
+        c.pageCodec,
+        c.pageLevel,
     )?)) { return Ok(null); }
     let meta = firstMeta ?? { return Ok(null); };
     // Always: its rows are the commit's record count (ADR-0114 §4).
@@ -1212,14 +1290,10 @@ fn flushGroup(
     groups: borrow mut Vector<ThriftValue>,
     plans: Slice<LeafMetricsPlan>,
     stats: borrow mut Vector<LeafStats>,
+    codec: i64,
+    level: u32,
 ) -> Result<bool, AllocError> {
-    let encoded = encodeRowGroup(
-        *written,
-        leaves,
-        columns.view(),
-        rows,
-        COMPACTION_PAGE_CODEC,
-    )? ?? { return Ok(false); };
+    let encoded = encodeRowGroupAt(*written, leaves, columns.view(), rows, codec, level)? ?? { return Ok(false); };
     if (writer.write(encoded.bytes.view()).isErr()) { return Ok(false); }
     *written += encoded.bytes.length as u64;
     // The file's metrics from the values written (ADR-0114 §2), each chunk's size its compressed bytes.
@@ -1651,7 +1725,11 @@ fn commitWritten(
             }
             entries.push(entry)?;
         }
-        let addedManifest = match (writeAvro(plan.manifests[template].metadata.view(), entries.view())?) {
+        let addedManifest = match (writeAvroIn(
+            plan.manifests[template].metadata.view(),
+            entries.view(),
+            AvroCodec { kind: plan.avroCodec.kind, level: plan.avroCodec.level },
+        )?) {
             Some(b) => b,
             null => { return Ok(false); }
         };
@@ -1739,7 +1817,11 @@ fn commitWritten(
             }
             kept.push(entry)?;
         }
-        let bytes = match (writeAvro(plan.manifests[i].metadata.view(), kept.view())?) {
+        let bytes = match (writeAvroIn(
+            plan.manifests[i].metadata.view(),
+            kept.view(),
+            AvroCodec { kind: plan.avroCodec.kind, level: plan.avroCodec.level },
+        )?) {
             Some(b) => b,
             null => { return Ok(false); }
         };
@@ -1781,7 +1863,11 @@ fn commitWritten(
         if (digits.length > 0) { value = Json.Text(digits); }
         listMeta.push(JsonMember { key: copyBytes(k)?, value: value })?;
     }
-    let listBytes = match (writeAvro(listMeta.view(), newList.view())?) {
+    let listBytes = match (writeAvroIn(
+        listMeta.view(),
+        newList.view(),
+        AvroCodec { kind: plan.avroCodec.kind, level: plan.avroCodec.level },
+    )?) {
         Some(b) => b,
         null => { return Ok(false); }
     };

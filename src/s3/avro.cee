@@ -427,7 +427,23 @@ fn readAvro(bytes: Slice<u8>) -> Result<AvroFile, AvroError> {
 
 /// A file of `records`, by the schema in `metadata`'s `avro.schema` (its other entries, Iceberg's among them, written
 /// as given), with the null codec, in one block; null when the schema does not parse or a record does not fit it.
-fn writeAvro(metadata: Slice<JsonMember>, records: Slice<Json>) -> Result<Vector<u8>?, AllocError> {
+fn writeAvro(metadata: Slice<JsonMember>, records: Slice<Json>) -> Result<Vector<u8>?, AllocError> =>
+    writeAvroIn(metadata, records, AvroCodec { kind: AVRO_WRITE_NULL, level: 0 });
+
+/// The codec an Avro file's blocks are written in (ADR-0116 §3).
+struct AvroCodec {
+    kind: u8;
+    /// Its level; 0 for its default.
+    level: u32;
+}
+
+const AVRO_WRITE_NULL: u8 = 0;
+const AVRO_WRITE_DEFLATE: u8 = 1;
+const AVRO_WRITE_SNAPPY: u8 = 2;
+
+/// `writeAvro`, its block in `codec`: deflate (raw RFC 1951, Avro's), or snappy (a raw block and the big-endian
+/// CRC-32 of what it holds).
+fn writeAvroIn(metadata: Slice<JsonMember>, records: Slice<Json>, codec: AvroCodec) -> Result<Vector<u8>?, AllocError> {
     var schemaText: Slice<u8>? = null;
     for (i in 0..metadata.length) {
         if (metadata[i].key.view() == "avro.schema".bytes()) {
@@ -446,7 +462,7 @@ fn writeAvro(metadata: Slice<JsonMember>, records: Slice<Json>) -> Result<Vector
     }
     var out = Vector<u8>.create();
     out.extend([0x4Fu8, 0x62, 0x6A, 0x01][..])?;
-    // The metadata, as one block of a map of bytes; the codec is always null here.
+    // The metadata, as one block of a map of bytes, its codec ours.
     var entries: i64 = 1;
     for (i in 0..metadata.length) {
         if (metadata[i].key.view() != "avro.codec".bytes()) { entries += 1; }
@@ -463,15 +479,30 @@ fn writeAvro(metadata: Slice<JsonMember>, records: Slice<Json>) -> Result<Vector
         writeAvroBytes(mut out, v)?;
     }
     writeAvroBytes(mut out, "avro.codec".bytes())?;
-    writeAvroBytes(mut out, "null".bytes())?;
+    writeAvroBytes(
+        mut out,
+        if (codec.kind == AVRO_WRITE_DEFLATE) "deflate".bytes()
+            else if (codec.kind == AVRO_WRITE_SNAPPY) "snappy".bytes()
+            else "null".bytes(),
+    )?;
     writeAvroLong(mut out, 0)?;
     var sync = [0u8; 16];
     if (Random.fill(mut sync[..]).isErr()) { return Ok(null); }
     out.extend(sync[..])?;
     if (records.length > 0) {
+        var coded = Vector<u8>.create();
+        if (codec.kind == AVRO_WRITE_DEFLATE) {
+            Deflate.compress(block.view(), if (codec.level == 0 || codec.level > 9) 6 else codec.level, mut coded)?;
+        } else if (codec.kind == AVRO_WRITE_SNAPPY) {
+            Snappy.compress(block.view(), 0, mut coded)?;
+            let crc = Crc32.of(block.view());
+            for (shift in [24u32, 16, 8, 0]) { coded.push(truncate<u8>(crc >> shift))?; }
+        } else {
+            coded = block;
+        }
         writeAvroLong(mut out, truncate<i64>(records.length))?;
-        writeAvroLong(mut out, truncate<i64>(block.length))?;
-        out.extend(block.view())?;
+        writeAvroLong(mut out, truncate<i64>(coded.length))?;
+        out.extend(coded.view())?;
         out.extend(sync[..])?;
     }
     return Ok(Some(out));
