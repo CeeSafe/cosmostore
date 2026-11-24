@@ -1292,7 +1292,11 @@ fn pushSchemaField(record: borrow mut Json, field: Json) {
 
 /// The fixture table made v3 (ADR-0122 §3): its manifests and list rewritten with `first_row_id`, the data manifest's
 /// 100 (a inherits it), b's own 500; the delete manifest's none; the table upgraded, its `next-row-id` 1000.
-fn makeV3(dir: Slice<u8>) {
+fn makeV3(dir: Slice<u8>) => makeV3As(dir, false);
+
+/// `makeV3`, or with `v2Manifests` its manifests left v2's (no `first_row_id` field, as an upgraded table's are): then
+/// b inherits too, from 123 on (the M28 exit review's L2).
+fn makeV3As(dir: Slice<u8>, v2Manifests: bool) {
     var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
     let listPath = compactPath("metadata/snap-1.avro");
     let list = readWarehouseAvro(borrow s, COMPACT_HIDDEN.bytes(), listPath.view())!!;
@@ -1308,11 +1312,15 @@ fn makeV3(dir: Slice<u8>) {
             var file = cloneJson(jsonMember(borrow entry, "data_file")!)!;
             let named = jsonMemberText(borrow file, "file_path")!;
             let isB = named.length > 9 && named[named.length - 9..] == "b.parquet".bytes();
-            jsonSet(mut file, "first_row_id", if (data && isB) jsonInteger(500)! else Json.Null)!;
+            if (!v2Manifests) {
+                jsonSet(mut file, "first_row_id", if (data && isB) jsonInteger(500)! else Json.Null)!;
+            }
             jsonSet(mut entry, "data_file", file)!;
             entries.push(entry)!;
         }
-        let bytes = writeAvro(withFirstRowIdField(manifest.metadata.view(), false).view(), entries.view())!!;
+        let metadataOf = if (v2Manifests) cloneMembers(manifest.metadata.view())
+            else withFirstRowIdField(manifest.metadata.view(), false);
+        let bytes = writeAvro(metadataOf.view(), entries.view())!!;
         let prefix = "s3://compact--table-s3/".bytes();
         let _ = s.putObject(
             COMPACT_HIDDEN,
@@ -1562,6 +1570,71 @@ fn v3CompactionAppliesDeletionVectors() -> Result<void, TestFailure> {
     Check.equalBytes("2".bytes(), removed ?? "-".bytes())?;
     removeTree(dir.view());
     return Ok();
+}
+
+fn cloneMembers(members: Slice<JsonMember>) -> Vector<JsonMember> {
+    var out = Vector<JsonMember>.create();
+    for (k in 0..members.length) {
+        out.push(JsonMember { key: copyBytes(members[k].key.view())!, value: cloneJson(borrow members[k].value)! })!;
+    }
+    return out;
+}
+
+/// An upgraded v3 table, its manifests still v2's (the M28 exit review's L2): compacted, each row keeping the id it
+/// inherited (a's 100 on, b's 123 on).
+@test
+fn v3CompactionOfV2Manifests() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("compact-v3-v2-manifests");
+    fixtureCompactStoreWith(
+        dir.bytes(),
+        storeConfig(),
+        fixtureBytes(PAGES_FLAT_IDS[..]),
+        23,
+        fixtureBytes(PAGES_FLAT_IDS_RENAMED[..]),
+        23,
+        false,
+        false,
+    );
+    makeV3As(dir.bytes(), true);
+    compactionWorkload(dir.bytes(), storeConfig());
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(1, tableCounts(borrow s)?.dataFiles as u64)?;
+    let ids = lineageOf(compactedFile(borrow s)?.view())?;
+    Check.equalU64(46, ids.length as u64)?;
+    for (i in 0..46) { Check.equalI64(100 + truncate<i64>(i), ids[i])?; }
+    removeTree(dir.view());
+    return Ok();
+}
+
+fn v3BrokenStore() -> String {
+    let dir = scratchDirectory("compact-v3-no-join");
+    fixtureCompactStoreOf(dir.bytes(), storeConfig(), fixtureBytes(PAGES_FLAT_IDS[..]), 23, brokenPages(), 23);
+    makeV3(dir.bytes());
+    return dir;
+}
+
+fn checkV3NotJoined(dir: StringView) -> Result<void, TestFailure> {
+    let s = ObjectStore.open(dir, storeConfig())!;
+    let c = tableCounts(borrow s)?;
+    Check.equalU64(2, c.dataFiles as u64)?;
+    removeTree(dir);
+    return Ok();
+}
+
+/// A v3 table's bin is never joined (the M28 exit review's H1): its merge failing, it stays as it is, where a v2
+/// table's is joined (`mergeFailureJoins`), since a joined file's rows would take new row ids.
+@test
+async fn v3MergeFailureDoesNotJoin() -> Result<void, TestFailure> {
+    let dir = await Async.blocking(() => v3BrokenStore());
+    let d = dir.view();
+    let store = await Async.blocking(() => ObjectStore.open(d, storeConfig()))!;
+    {
+        let locked = AsyncMutex<ObjectStore>.create(store)!;
+        let shared = Arc<AsyncMutex<ObjectStore>>.create(locked)!;
+        let t = compactTableName();
+        await compactTable(borrow shared, borrow t, 50000)!;
+    }
+    return await Async.blocking(() => checkV3NotJoined(d));
 }
 
 /// A table's metadata whose properties are `props` (a JSON object's members), for the codec choice's tests.

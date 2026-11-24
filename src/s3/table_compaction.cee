@@ -293,11 +293,9 @@ fn planCompaction(
         if (jsonMemberI64(borrow m, "next-row-id").isNull()) { return Ok(null); }
         for (i in 0..list.records.length) {
             if (recordInt(borrow list.records[i], "content", 0) != 0) { continue; }
+            // Its entries may be a v2 manifest's, without the field (an upgraded table's): they inherit, and a manifest
+            // rewritten is given the field (the M28 exit review's L2).
             if (jsonMemberI64(borrow list.records[i], "first_row_id").isNull()) { return Ok(null); }
-            for (e in 0..manifests[i].records.length) {
-                let file = jsonMember(borrow manifests[i].records[e], "data_file") ?? { return Ok(null); };
-                if (jsonMember(file, "first_row_id").isNull()) { return Ok(null); }
-            }
         }
     }
     // The candidates, by group, in path order: their footers read after, off the lock.
@@ -464,7 +462,7 @@ fn finishPlan(d: borrow mut CompactionDraft) -> Result<void, TablesError> {
             firstRowId: c.firstRowId,
         })?;
     }
-    d.plan.bins = binsOf(inputs, d.target, d.plan.deletes.view())?;
+    d.plan.bins = binsOf(inputs, d.target, d.plan.deletes.view(), d.plan.formatVersion >= 3)?;
     return Ok();
 }
 
@@ -716,6 +714,7 @@ fn binsOf(
     inputs: Vector<CompactionInput>,
     target: u64,
     deletes: Slice<DeleteFile>,
+    lineage: bool,
 ) -> Result<Vector<CompactionBin>, AllocError> {
     var rest = inputs;
     rest.sortBy(
@@ -728,14 +727,14 @@ fn binsOf(
         let next = rest.remove(0);
         let sameGroup = current.length == 0 || current[0].group.view() == next.group.view();
         if (!sameGroup || bytes + next.size > target) {
-            closeBin(mut bins, current, deletes)?;
+            closeBin(mut bins, current, deletes, lineage)?;
             current = Vector<CompactionInput>.create();
             bytes = 0;
         }
         bytes += next.size;
         current.push(next)?;
     }
-    closeBin(mut bins, current, deletes)?;
+    closeBin(mut bins, current, deletes, lineage)?;
     return Ok(bins);
 }
 
@@ -744,12 +743,15 @@ fn closeBin(
     bins: borrow mut Vector<CompactionBin>,
     inputs: Vector<CompactionInput>,
     deletes: Slice<DeleteFile>,
+    lineage: bool,
 ) -> Result<void, AllocError> {
-    // The deletes that apply to its files: a file with deletes is worth rewriting alone (ADR-0114 §3).
+    // The deletes that apply to its files: a file with deletes is worth rewriting alone (ADR-0114 §3). A deletion
+    // vector applies only to the one file it names (the M28 exit review's M1).
     var applying = Vector<usize>.create();
     for (x in 0..deletes.length) {
         for (i in 0..inputs.length) {
-            if (deleteApplies(borrow deletes[x], inputs[i].partitionKey.view(), inputs[i].sequence)) {
+            let named = deletes[x].referenced.length == 0 || deletes[x].referenced.view() == inputs[i].path.view();
+            if (named && deleteApplies(borrow deletes[x], inputs[i].partitionKey.view(), inputs[i].sequence)) {
                 applying.push(x)?;
                 break;
             }
@@ -772,6 +774,8 @@ fn closeBin(
     }
     // Deletes are applied only by merging: a bin that does not merge leaves its files and their deletes as they are.
     if (applying.length > 0 && !merge) { return Ok(); }
+    // Nor is a v3 table's bin joined: a joined file's rows would take new row ids (the M28 exit review's H1).
+    if (lineage && !merge) { return Ok(); }
     match (joinParquet(footers.view())?) {
         Some(join) => { bins.push(CompactionBin { inputs: inputs, join: join, merge: merge, deletes: applying })?; }
         null => {
@@ -1051,14 +1055,20 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
         let bytes = readPrepared(mut c.deleteReaders[x])? ?? { return Ok(null); };
         if (bytes.length as u64 != c.deleteSizes[x]) { return Ok(null); }
         let d = borrow c.binDeletes[x];
+        // Each read within what is left of the bin's bound, so that no set is decoded past it (the M28 exit review's
+        // M1: a run container of a few bytes states millions of positions).
+        var budget: usize = DELETE_BIN_MAX_ROWS;
+        for (q in 0..positionSets.length) { budget -= positionSets[q].rows; }
+        for (q in 0..equalitySets.length) {
+            budget = if (equalitySets[q].rows > budget) 0 else budget - equalitySets[q].rows;
+        }
+        let within = if (budget < DELETE_FILE_MAX_ROWS) budget else DELETE_FILE_MAX_ROWS;
         if (d.content == DELETE_CONTENT_POSITION && d.referenced.length > 0) {
             // A deletion vector: its blob, the positions of the one file it names (ADR-0122 §4).
-            positionSets.push(readDeletionVector(bytes.view(), d.referenced.view(), DELETE_FILE_MAX_ROWS)? ?? {
-                return Ok(null);
-            })?;
+            positionSets.push(readDeletionVector(bytes.view(), d.referenced.view(), within)? ?? { return Ok(null); })?;
             positionAt.push(x)?;
         } else if (d.content == DELETE_CONTENT_POSITION) {
-            positionSets.push(readPositionDeletes(bytes.view())? ?? { return Ok(null); })?;
+            positionSets.push(readPositionDeletesWithin(bytes.view(), within)? ?? { return Ok(null); })?;
             positionAt.push(x)?;
         } else {
             equalitySets.push(readEqualityDeletes(bytes.view(), d.ids.view(), d.kinds.view())? ?? {
@@ -1325,17 +1335,19 @@ fn addsNoFile(output: borrow CompactionOutput) -> bool => match (output.metrics.
     null => false,
 };
 
-/// Whether this commit removes the data file of `path`: an input of a bin written.
+/// Whether this commit removes the data file of `path` (an input of a bin written), that bin having applied delete
+/// `applied`.
 fn inputRemoved(
     plan: borrow CompactionPlan,
     outputs: borrow Vector<CompactionOutput>,
     bins: Slice<usize>,
     path: Slice<u8>,
+    applied: usize,
 ) -> bool {
     for (o in 0..outputs.length) {
         let bin = borrow plan.bins[bins[o]];
         for (i in 0..bin.inputs.length) {
-            if (bin.inputs[i].path.view() == path) { return true; }
+            if (bin.inputs[i].path.view() == path) { return holdsIndex(bin.deletes.view(), applied); }
         }
     }
     return false;
@@ -1831,7 +1843,8 @@ fn commitWritten(
         let d = borrow plan.deletes[x];
         // A deletion vector goes with the one file it names (ADR-0122 §4): removed when this commit removes it.
         if (d.referenced.length > 0) {
-            if (inputRemoved(plan, outputs, bins, d.referenced.view())) {
+            // ... and applied by the bin that held it (the M28 exit review's M2).
+            if (inputRemoved(plan, outputs, bins, d.referenced.view(), x)) {
                 gone[d.manifest].push(d.entry)?;
                 removedDeletes.push(x)?;
             }
@@ -2150,8 +2163,26 @@ fn commitWritten(
             }
             kept.push(entry)?;
         }
+        // A v2 manifest of a v3 table, its entries' ids now explicit: written with a v3 schema that holds them.
+        var v3Metadata: Vector<JsonMember>? = null;
+        if (lineageHere && plan.manifests[i].records.length > 0) {
+            match (jsonMember(borrow plan.manifests[i].records[0], "data_file")) {
+                Some(f) => {
+                    if (jsonMember(f, "first_row_id").isNull()) {
+                        v3Metadata = Some(
+                            withFirstRowIdSchema(plan.manifests[i].metadata.view())? ?? { return Ok(false); },
+                        );
+                    }
+                }
+                null => {}
+            }
+        }
+        let metadataOf = match (v3Metadata.asBorrow()) {
+            Some(m) => m.view(),
+            null => plan.manifests[i].metadata.view(),
+        };
         let bytes = match (writeAvroIn(
-            plan.manifests[i].metadata.view(),
+            metadataOf,
             kept.view(),
             AvroCodec { kind: plan.avroCodec.kind, level: plan.avroCodec.level },
         )?) {
@@ -2530,7 +2561,8 @@ async fn copiedBin(
             }
         }
         // Joined as before only when no delete applies: a position delete names the inputs' paths.
-        if (!plan.bins[b].merge || plan.bins[b].join.copies.length == 0 || plan.bins[b].deletes.length > 0) {
+        if (!plan.bins[b].merge || plan.bins[b].join.copies.length == 0 || plan.bins[b].deletes.length > 0 ||
+            plan.formatVersion >= 3) {
             return Ok(null);
         }
         plan.bins[b].merge = false;

@@ -5772,3 +5772,19 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     and Java's next append took 40. The check now disables compaction until it means to compact.
 - **PyIceberg 0.12** makes and reads v3 tables, deletion vectors included, but cannot append to one. Java is the v3
   writer.
+
+### 25 Nov 2026: M28's exit review (docs/m28-exit-review.md)
+
+- **Found by the Java check (slices 5 and 6):** a create's `null` write-order, and merged v3 files' column orders.
+  Both fixed.
+- **The review's High, fixed:** a v3 table's bin is never joined, since a joined file's rows would take new ids
+  (`v3MergeFailureDoesNotJoin`).
+- **Its Mediums, fixed:**
+  - a deletion vector goes only to the bin holding its file, read within the bin's bound;
+  - it is removed only when that bin applied it.
+- **Its L2, fixed:** an upgraded table's v2 manifests are compacted; a rewritten one is given `first_row_id` and
+  `format-version` 3 (`v3CompactionOfV2Manifests`).
+- **Recorded:** B1, `next-row-id` from `first-row-id`; B2, PyIceberg's v3 appends; B3, what v3 leaves undone.
+- **Results:** 521 unit tests, the fuzzer, the smokes (`compaction_check.py`'s 109 checks), and
+  `iceberg_java_check.sh`'s 20 checks. CI green on 2e75b42, with the Java check.
+- **Next:** the owner's word on ADR-0122 and on closing M28.

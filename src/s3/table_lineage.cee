@@ -193,3 +193,55 @@ fn lineageColumns(
     }
     return Ok(Some(out));
 }
+
+/// A v2 manifest's Avro metadata made v3's (the M28 exit review's L2): its data file record given `first_row_id`
+/// (field 142, an optional long), and its `format-version` 3, so that the explicit ids its entries are written with
+/// are read as such. Null when its schema is not a manifest's.
+fn withFirstRowIdSchema(metadata: Slice<JsonMember>) -> Result<Vector<JsonMember>?, AllocError> {
+    var out = Vector<JsonMember>.create();
+    var done = false;
+    for (k in 0..metadata.length) {
+        let key = metadata[k].key.view();
+        var value = cloneJson(borrow metadata[k].value)?;
+        if (key == "avro.schema".bytes()) {
+            let text = match (borrow metadata[k].value) {
+                Json.Text(t) => t.view(),
+                _ => { return Ok(null); }
+            };
+            var schema = parseJson(text)? ?? { return Ok(null); };
+            var fields = Vector<Json>.create();
+            for (f in (memberItems(borrow schema, "fields") ?? { return Ok(null); }).view()) {
+                var copy = cloneJson(f)?;
+                if (jsonMemberText(f, "name") == Some("data_file".bytes())) {
+                    var record = cloneJson(jsonMember(f, "type") ?? { return Ok(null); })?;
+                    var recordFields = Vector<Json>.create();
+                    for (g in (memberItems(borrow record, "fields") ?? { return Ok(null); }).view()) {
+                        if (jsonMemberText(g, "name") == Some("first_row_id".bytes())) { return Ok(null); }
+                        recordFields.push(cloneJson(g)?)?;
+                    }
+                    var field = jsonObject();
+                    jsonSet(mut field, "name", jsonString("first_row_id".bytes())?)?;
+                    var union = Vector<Json>.create();
+                    union.push(jsonString("null".bytes())?)?;
+                    union.push(jsonString("long".bytes())?)?;
+                    jsonSet(mut field, "type", Json.Array(union))?;
+                    jsonSet(mut field, "default", Json.Null)?;
+                    jsonSet(mut field, "field-id", jsonInteger(142)?)?;
+                    recordFields.push(field)?;
+                    jsonSet(mut record, "fields", Json.Array(recordFields))?;
+                    jsonSet(mut copy, "type", record)?;
+                    done = true;
+                }
+                fields.push(copy)?;
+            }
+            jsonSet(mut schema, "fields", Json.Array(fields))?;
+            var written = Vector<u8>.create();
+            writeJson(mut written, borrow schema)?;
+            value = Json.Text(written);
+        }
+        if (key == "format-version".bytes()) { value = jsonString("3".bytes())?; }
+        out.push(JsonMember { key: copyBytes(key)?, value: value })?;
+    }
+    if (!done) { return Ok(null); }
+    return Ok(Some(out));
+}
