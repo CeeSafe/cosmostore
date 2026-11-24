@@ -1003,6 +1003,129 @@ fn positionDeletesRewritten() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// The rewrite's table (ADR-0120 §6) in a state a run may leave, by its files' rows and delete files: before, or with
+/// its deletes rewritten only; after, with or without them rewritten; or a or b compacted alone. In every state each
+/// original file still live keeps every position deleted from it (a's 0, 3 and 5, b's 1, c's 0 and 2) in a live
+/// position delete file.
+fn checkRewriteTable(s: borrow ObjectStore) -> Result<void, TestFailure> {
+    let c = tableCounts(s)?;
+    let states = [[3i64, 69, 3], [3, 69, 2], [2, 61, 2], [2, 61, 3], [3, 64, 2], [3, 64, 3], [3, 66, 2], [3, 66, 3]];
+    var known = false;
+    for (st in states) {
+        if (truncate<i64>(c.dataFiles) == st[0] && c.dataRows == st[1] && truncate<i64>(c.deleteFiles) == st[2]) {
+            known = true;
+        }
+    }
+    if (!known) {
+        var why = textOf("not a state a run leaves: ");
+        why.appendNumber(truncate<i64>(c.dataFiles))!;
+        why.append(" files, ")!;
+        why.appendNumber(c.dataRows)!;
+        why.append(" rows, ")!;
+        why.appendNumber(truncate<i64>(c.deleteFiles))!;
+        why.append(" delete files")!;
+        return Err(TestFailure.create(why.view()));
+    }
+    let names = ["data/kind=a/a.parquet", "data/kind=a/b.parquet", "data/kind=a/c.parquet"];
+    let wanted = [[0i64, 3, 5], [1, -1, -1], [0, 2, -1]];
+    let prefix = "s3://compact--table-s3/".bytes();
+    for (f in 0..names.length) {
+        let named = compactPath(names[f]);
+        var live = false;
+        for (p in c.paths.view()) {
+            if (p.view() == named.view()) { live = true; }
+        }
+        if (!live) { continue; }
+        for (want in wanted[f]) {
+            if (want < 0) { continue; }
+            var covered = false;
+            for (k in 0..c.deletePaths.length) {
+                let path = c.deletePaths[k].view();
+                let bytes = s.getObject(COMPACT_HIDDEN, StringView.fromUtf8(path[prefix.length..]) ?? "")!;
+                let read = readPositionDeletes(bytes.view())! ?? { continue; };
+                match (positionsOf(borrow read, named.view())!) {
+                    Some(ps) => {
+                        for (p in ps) {
+                            if (p == want) { covered = true; }
+                        }
+                    }
+                    null => {}
+                }
+            }
+            Check.isTrue(covered, "a live file's deleted position still deleted")?;
+        }
+    }
+    return Ok();
+}
+
+fn rewriteStore(dir: Slice<u8>, config: StoreConfig) =>
+    fixtureCompactStoreFull(
+        dir,
+        config,
+        fixtureBytes(PAGES_FLAT_IDS[..]),
+        23,
+        fixtureBytes(PAGES_FLAT_IDS_RENAMED[..]),
+        23,
+        true,
+        true,
+        true,
+    );
+
+/// Compaction that rewrites position deletes, swept for faults and crashes at every I/O point (ADR-0120 §6).
+fn sweepRewrite(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+    Faults.elideSyncs(true);
+    let base = scratchDirectory(name);
+    let dir = base.view();
+    removeTree(dir);
+    Fs.ensureDirectory(dir)!;
+    rewriteStore(dir.bytes(), faultStoreConfig());
+    Faults.countOperations();
+    compactionWorkload(dir.bytes(), faultStoreConfig());
+    Faults.disarm();
+    let points = Faults.seen();
+    Check.isTrue(points > 10, "the run performs I/O")?;
+    {
+        let s = ObjectStore.open(dir, faultStoreConfig())!;
+        let c = tableCounts(borrow s)?;
+        Check.equalU64(2, c.deleteFiles as u64)?;
+        Check.equalI64(61, c.dataRows)?;
+    }
+    for (n in 1..points + 1) {
+        removeTree(dir);
+        Fs.ensureDirectory(dir)!;
+        rewriteStore(dir.bytes(), faultStoreConfig());
+        armMode(borrow mode, n);
+        compactionWorkload(dir.bytes(), faultStoreConfig());
+        Faults.disarm();
+        if (isCrash(borrow mode)) {
+            Check.equalU64(0, Faults.violations())?;
+            Faults.crash(dir)!;
+        }
+        {
+            var s = ObjectStore.open(dir, faultStoreConfig())!;
+            checkRewriteTable(borrow s)?;
+            let _ = s.checkpoint()!;
+        }
+        let s = ObjectStore.open(dir, faultStoreConfig())!;
+        checkRewriteTable(borrow s)?;
+    }
+    removeTree(dir);
+    Faults.elideSyncs(false);
+    return Ok();
+}
+
+@test
+fn rewriteDeletesFaultsOnce() -> Result<void, TestFailure> => sweepRewrite("rewrite-once", SweepMode.Once);
+
+@test
+fn rewriteDeletesFaultsSticky() -> Result<void, TestFailure> => sweepRewrite("rewrite-sticky", SweepMode.Sticky);
+
+@test
+fn rewriteDeletesFaultsTorn() -> Result<void, TestFailure> => sweepRewrite("rewrite-torn", SweepMode.StickyTorn);
+
+@test
+fn rewriteDeletesFaultsCrash() -> Result<void, TestFailure> => sweepRewrite("rewrite-crash", SweepMode.Crash);
+
 /// A table's metadata whose properties are `props` (a JSON object's members), for the codec choice's tests.
 fn metadataWith(props: StringView) -> Json {
     var text = textOf("{\"format-version\": 2, \"properties\": {");

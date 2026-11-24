@@ -5607,3 +5607,17 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **`compactionKeepsDeletesWithAnotherSpec`:** its position delete, naming only the merged files, is now rewritten
     away; the equality delete stays.
 - **Results:** 505 unit tests, the deletes sweeps among them.
+
+### 24 Nov 2026: M27 slice 4, the rewrite's fault and crash sweep (ADR-0120 §6)
+
+- **`rewriteDeletesFaults{Once,Sticky,Torn,Crash}`:** a table of a, b and c (another spec's live file) with two
+  position delete files and an equality delete, compacted with a fault or a crash at every I/O point.
+- **Every state left** is one of these, by files' rows and delete files:
+  - before;
+  - the deletes rewritten only;
+  - after, with or without the rewrite;
+  - a or b compacted alone.
+- **In each state,** every original file still live keeps each of its deleted positions in a live position delete
+  file.
+- **Found by the sweep:** the deletes-rewritten-only state (the bins failed, the rewrite committed), now named.
+- **Checked:** a keep rule that drops every row fails both the sweep and `positionDeletesRewritten`.
