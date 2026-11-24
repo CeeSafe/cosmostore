@@ -5552,3 +5552,14 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Results:** 504 unit tests, the writer check (36 files), the parquet-java check (1,343), the fuzzer, and the s3,
   cluster (209) and maintenance smokes.
 - **Next:** the owner's word on ADR-0118 and on closing M26.
+
+### 24 Nov 2026: M26 closed (ADR-0118 accepted)
+
+- **The owner's decision:** "Accept and close". ADR-0118 is accepted, with its As built.
+- **M26 is closed.** The exit review's B1 to B3 are recorded in `docs/m26-exit-review.md`. M23's B list is closed,
+  with M24's B1 and M25's B1 and B2.
+- **Next:** M27, when the owner asks. Candidates on record:
+  - Iceberg v3's deletes (ADR-0115's B, ADR-0117's A): deletion vectors, position delete files rewritten, exact
+    removal (M24's B3);
+  - the parquet-java check in CI (M26's B3);
+  - M21's, M22's, M24's and M25's remaining Lows.

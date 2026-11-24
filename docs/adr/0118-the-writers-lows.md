@@ -1,7 +1,8 @@
 # ADR-0118: the page writer's Lows closed (M26)
 
-**Status:** proposed, 24 Nov 2026. M26 is ADR-0117's item B (the owner: "B: writer's Lows"), with parquet-java as
-the second reader ("parquet-java").
+**Status:** accepted, 24 Nov 2026, as built below (the owner: "Accept and close", after M26's exit review,
+`docs/m26-exit-review.md`). Proposed the same day: M26 is ADR-0117's item B (the owner: "B: writer's Lows"), with
+parquet-java as the second reader ("parquet-java").
 
 ## Context
 
@@ -26,7 +27,7 @@ the second reader ("parquet-java").
 - **M25's B1:** snappy manifests have no outside reader in the checks.
 - **M25's B2:** a level is checked at the codec, not from the table's properties to the file.
 
-## Decision (proposed)
+## Decision
 
 1. **Statistics in each column's own order:**
    - **signed integers,** as today;
@@ -72,3 +73,13 @@ the second reader ("parquet-java").
 - **M23's B list is closed,** and M24's B1 and M25's B1 and B2 with it.
 - **The parquet-java check is a local tool, as the SDK matrix is:** it needs a JDK and Maven, which CI's check job
   does not install.
+
+## As built (M26)
+
+- **§1:** FIXED_LEN_BYTE_ARRAY's bounds are written now (unsigned bytes, or a DECIMAL's value), where they were left
+  out. FLOAT16 gets none.
+- **§5:** only a merged file of 0 rows is left out. A joined file's rows are its inputs' stated counts, so it is
+  always added. A file left out keeps no delete file (the exit review's L1).
+- **§6:** parquet-java reads rows through its example reader, not parquet-avro's, since Avro's names cannot hold a
+  `.`. Its bounds are compared with the fixture's, which pyarrow wrote, by parquet-java's comparator.
+- **The exit review's Lows** are recorded in `docs/m26-exit-review.md` (B1 to B3).
