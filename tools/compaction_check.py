@@ -123,7 +123,8 @@ path = data_files("flat")[0]
 bucket, key = path[5:].split("/", 1)
 f = pq.ParquetFile(io.BytesIO(s3.get_object(Bucket=bucket, Key=key)["Body"].read()))
 check("one row group, the six files' values merged", f.metadata.num_row_groups, 1)
-check("written SNAPPY, from ZSTD", f.metadata.row_group(0).column(0).compression, "SNAPPY")
+check("written ZSTD, PyIceberg's default and the table's (ADR-0116)", f.metadata.row_group(0).column(0).compression,
+      "ZSTD")
 check("its rows", f.metadata.num_rows, 6)
 entry = next(iter(t.scan().plan_files()))
 check("its manifest's record count", entry.file.record_count, 6)
@@ -398,6 +399,41 @@ f = pq.ParquetFile(io.BytesIO(s3.get_object(Bucket=bucket, Key=key)["Body"].read
 check("codecs: written GZIP, the table's", f.metadata.row_group(0).column(0).compression, "GZIP")
 check("codecs: the run's manifests uncompressed, the table's", run_codecs(t), ("null", ["null"]))
 
+# A ZSTD table at level 3 (ADR-0116 §4): merged to ZSTD of about pyarrow's (libzstd's) size at the same level, its
+# manifests in zstandard.
+catalog.create_table("ns.zstd", schema=schema, properties={
+    "write.parquet.compression-codec": "zstd", "write.parquet.compression-level": "3",
+    "write.avro.compression-codec": "zstd"})
+compaction("zstd", "disabled")
+words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
+for i in range(4):
+    ids = list(range(i * 5000, (i + 1) * 5000))
+    catalog.load_table("ns.zstd").append(pa.table(
+        {"id": ids, "item": ["%s %d %s" % (words[n % 8], n * 7919 % 100003, words[n * 3 % 8]) for n in ids]},
+        schema=schema))
+zstd_before = catalog.load_table("ns.zstd").scan().to_arrow().sort_by("id")
+compaction("zstd", "enabled")
+wait_for("ZSTD: merged to one file", lambda: len(data_files("zstd")) == 1, 4 * day)
+t = catalog.load_table("ns.zstd")
+check("ZSTD: the same rows, by PyIceberg", t.scan().to_arrow().sort_by("id").equals(zstd_before), True)
+path = data_files("zstd")[0]
+bucket, key = path[5:].split("/", 1)
+merged = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+f = pq.ParquetFile(io.BytesIO(merged))
+check("ZSTD: written ZSTD, the table's", sorted({f.metadata.row_group(0).column(c).compression
+                                                for c in range(f.metadata.num_columns)}), ["ZSTD"])
+check("ZSTD: the same rows, by pyarrow", f.read().sort_by("id").equals(zstd_before), True)
+check_metrics("ZSTD", t, f)
+check("ZSTD: the run's manifests in zstandard, the table's", run_codecs(t), ("zstandard", ["zstandard"]))
+# pyarrow's file of the same rows in one row group at level 3, without statistics' bytes counted twice: the merged
+# file's size against it. The writers' encodings differ (pyarrow's v1 pages, dictionaries for both columns), so the
+# bound is loose; the encoder's own sizes against libzstd's are CeeSafe's codec_check's.
+ref = io.BytesIO()
+pq.write_table(f.read().sort_by("id"), ref, compression="zstd", compression_level=3, row_group_size=1 << 30)
+ratio = len(merged) / len(ref.getvalue())
+print("     ZSTD: merged %d bytes, pyarrow's %d at level 3 (%.3f)" % (len(merged), len(ref.getvalue()), ratio))
+check("ZSTD: within 1.25 of pyarrow's size at the same level", ratio <= 1.25, True)
+
 # The table's metrics mode (ADR-0114 §2): counts by default, one column's strings truncated to 4 characters.
 catalog.create_table("ns.modes", schema=schema, properties={
     "write.metadata.metrics.default": "counts", "write.metadata.metrics.column.item": "truncate(4)"})
@@ -415,7 +451,7 @@ got = next(iter(t.scan().plan_files())).file
 check("modes: no bounds for id (counts)", 1 in (got.lower_bounds or {}), False)
 check("modes: item's lower bound, 4 characters", (got.lower_bounds or {}).get(2), "δέλτ".encode())
 
-for name in ("flat", "snappy", "modes", "codecs", "parts", "sorted", "deletes", "equality"):
+for name in ("flat", "snappy", "zstd", "modes", "codecs", "parts", "sorted", "deletes", "equality"):
     catalog.purge_table("ns." + name)
 catalog.drop_namespace("ns")
 for attempt in range(3):

@@ -5437,3 +5437,33 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Results:** 496 unit tests; the smokes.
 - **Next:** ZSTD, once CeeSafe's encoder (ADR 0196 phase 4, being built) is released; then the checks and the exit
   review.
+
+### 24 Nov 2026: M25 slices 1, 2 and 4, ZSTD written (ADR-0116)
+
+- **CeeSafe 0.95.1 released from here** (the owner: "Push and tag v0.95.1"), with lib/std's zstd encoder (ADR 0196
+  phase 4):
+  - `Zstd.compress` and `ZstdEncoder`, at levels 1 to 9 with libzstd's parameters;
+  - checked against libzstd 1.5.7 (and 1.5.5 on Linux): it read all 4,080 frames, and the sizes at each level are
+    0.999 to 1.003 of libzstd's;
+  - its fuzzer and its allocation sweep (376 points);
+  - the release workflow green.
+- **The toolchain moved to 0.95.1:** `ceesafe.toml`, CI's `CEESAFE_VERSION`, AGENTS.md.
+- **Pages:** ZSTD at the table's level (`Zstd.compress`, 0 being zstd's 3), `COMPACTION_WRITES_ZSTD` on. A table
+  that sets no codec, PyIceberg's default, compacts to ZSTD.
+- **Manifests:** zstandard blocks, for `zstd` or `zstandard`, at `write.avro.compression-level`.
+- **Checks:**
+  - **The writer:** each fixture in ZSTD at levels 1, 3 and 9, read back by itself and by pyarrow (30 files,
+    `tools/parquet_writer_check.py`, which now checks each file's codec too).
+  - **The page fuzzer's seeds:** the writer's files in ZSTD as well as SNAPPY.
+  - **A manifest written in zstandard,** read back by the unit test.
+  - **`tools/compaction_check.py`** (100 checks on `serve` and through a cluster):
+    - PyIceberg's default table compacts to ZSTD;
+    - a table set to ZSTD at level 3 with zstandard manifests compacts to ZSTD, and PyIceberg and pyarrow read the
+      same rows;
+    - its metrics match PyIceberg's, and its manifests are zstandard.
+  - **Size:** the merged file is 0.535 of pyarrow's level-3 file of the same 20,000 rows (87,881 bytes against
+    164,342). The encodings differ, so the check's bound is loose (1.25); the codec's own sizes are CeeSafe's
+    `codec_check`'s.
+- **Results:** 496 unit tests, the writer check, the fuzzer, and the s3, cluster (209) and maintenance smokes, on
+  0.95.1.
+- **Next:** the exit review.

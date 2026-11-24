@@ -24,7 +24,10 @@ for name in names:
     written = pq.ParquetFile(os.path.join(sys.argv[1], name))
     got = written.read()
     want = pq.read_table(io.BytesIO(fixtures[fixture]))
-    same = got.equals(want)
+    # The codec its name says (`-zstd3` is ZSTD at level 3, ADR-0116 §4).
+    codec = {"none": "UNCOMPRESSED", "snappy": "SNAPPY", "gzip": "GZIP"}.get(name.rsplit("-", 1)[1][:-8], "ZSTD")
+    same = got.equals(want) and all(written.metadata.row_group(0).column(c).compression == codec
+                                    for c in range(written.metadata.num_columns))
     stats = all(written.metadata.row_group(0).column(c).statistics is not None
                 for c in range(written.metadata.num_columns))
     print("%s %s: %d rows, codec %s, %s" % ("ok  " if same and stats else "FAIL", name, got.num_rows,
