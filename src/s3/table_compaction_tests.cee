@@ -770,3 +770,113 @@ fn compactionKeepsDeletesWithAnotherSpec() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// A table's metadata whose properties are `props` (a JSON object's members), for the codec choice's tests.
+fn metadataWith(props: StringView) -> Json {
+    var text = textOf("{\"format-version\": 2, \"properties\": {");
+    text.append(props)!;
+    text.append("}}")!;
+    return parseJson(text.view().bytes())!!;
+}
+
+/// The codecs and levels taken from the table's properties (ADR-0116 §1, §3; the M25 review's M1): names without
+/// case, the codecs not written here, levels out of range or not numbers.
+@test
+fn codecsFromProperties() -> Result<void, TestFailure> {
+    let none = metadataWith("");
+    Check.equalI64(PQ_CODEC_ZSTD, pageCodecOf(borrow none))?;
+    Check.equalU64(0, codecLevelOf(borrow none, "write.parquet.compression-level") as u64)?;
+    Check.equalU64(AVRO_WRITE_DEFLATE as u64, avroCodecOf(borrow none).kind as u64)?;
+    let names = [
+        "\"ZSTD\"",
+        "\"Snappy\"",
+        "\"gzip\"",
+        "\"uncompressed\"",
+        "\"none\"",
+        "\"lz4\"",
+        "\"brotli\"",
+        "\"x\"",
+    ];
+    let codecs = [
+        PQ_CODEC_ZSTD,
+        PQ_CODEC_SNAPPY,
+        PQ_CODEC_GZIP,
+        PQ_CODEC_UNCOMPRESSED,
+        PQ_CODEC_UNCOMPRESSED,
+        PQ_CODEC_SNAPPY,
+        PQ_CODEC_SNAPPY,
+        PQ_CODEC_SNAPPY,
+    ];
+    for (i in 0..names.length) {
+        var p = textOf("\"write.parquet.compression-codec\": ");
+        p.append(names[i])!;
+        let m = metadataWith(p.view());
+        Check.equalI64(codecs[i], pageCodecOf(borrow m))?;
+    }
+    let levels = ["\"1\"", "\"3\"", "\"9\"", "\"15\"", "\"22\"", "\"0\"", "\"-1\"", "\"abc\"", "\"\"", "\" 3\""];
+    let taken = [1u64, 3, 9, 9, 9, 0, 0, 0, 0, 0];
+    for (i in 0..levels.length) {
+        var p = textOf("\"write.parquet.compression-level\": ");
+        p.append(levels[i])!;
+        let m = metadataWith(p.view());
+        Check.equalU64(taken[i], codecLevelOf(borrow m, "write.parquet.compression-level") as u64)?;
+    }
+    let avroNames = [
+        "\"zstd\"",
+        "\"ZStandard\"",
+        "\"snappy\"",
+        "\"gzip\"",
+        "\"deflate\"",
+        "\"uncompressed\"",
+        "\"null\"",
+        "\"bzip2\"",
+    ];
+    let kinds = [
+        AVRO_WRITE_ZSTANDARD,
+        AVRO_WRITE_ZSTANDARD,
+        AVRO_WRITE_SNAPPY,
+        AVRO_WRITE_DEFLATE,
+        AVRO_WRITE_DEFLATE,
+        AVRO_WRITE_NULL,
+        AVRO_WRITE_NULL,
+        AVRO_WRITE_DEFLATE,
+    ];
+    for (i in 0..avroNames.length) {
+        var p = textOf("\"write.avro.compression-level\": \"7\", \"write.avro.compression-codec\": ");
+        p.append(avroNames[i])!;
+        let m = metadataWith(p.view());
+        let c = avroCodecOf(borrow m);
+        Check.equalU64(kinds[i] as u64, c.kind as u64)?;
+        let wantLevel: u64 = if (kinds[i] == AVRO_WRITE_ZSTANDARD || kinds[i] == AVRO_WRITE_DEFLATE) 7 else 0;
+        Check.equalU64(wantLevel, c.level as u64)?;
+    }
+    return Ok();
+}
+
+/// The level reaches the codec (the M25 review's M2): a page in ZSTD at levels 1, 3 and 9 is lib/std's frame at that
+/// level, byte for byte, and gzip's at 1 and 9 is `Gzip`'s.
+@test
+fn levelsReachTheCodec() -> Result<void, TestFailure> {
+    var page = Vector<u8>.create();
+    for (i in 0u64..200000) {
+        let n = truncate<u32>(i * 2654435761u64);
+        page.push(truncate<u8>(n >> 24) % 23 + 'a')!;
+    }
+    for (level in [1u32, 3, 9]) {
+        let got = compressPage(PQ_CODEC_ZSTD, level, page.view())!!;
+        var want = Vector<u8>.create();
+        Zstd.compress(page.view(), level, mut want)!;
+        Check.equalBytes(want.view(), got.view())?;
+    }
+    // The page is one whose frames differ by level, so a level dropped on the way would be seen.
+    let fast = compressPage(PQ_CODEC_ZSTD, 1, page.view())!!;
+    let slow = compressPage(PQ_CODEC_ZSTD, 9, page.view())!!;
+    Check.isTrue(fast.view() != slow.view(), "levels 1 and 9 differ")?;
+    for (level in [1u32, 9]) {
+        let got = compressPage(PQ_CODEC_GZIP, level, page.view())!!;
+        var want = Vector<u8>.create();
+        Gzip.compress(page.view(), level, mut want)!;
+        Check.equalBytes(want.view(), got.view())?;
+    }
+    return Ok();
+}

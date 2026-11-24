@@ -5467,3 +5467,15 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Results:** 496 unit tests, the writer check, the fuzzer, and the s3, cluster (209) and maintenance smokes, on
   0.95.1.
 - **Next:** the exit review.
+
+### 24 Nov 2026: M25's exit review (docs/m25-exit-review.md)
+
+- **The review:** no High finding.
+- **Fixed:**
+  - the codec and level choice unit-tested over every name and level case (`codecsFromProperties`);
+  - the level shown to reach the codec (`levelsReachTheCodec`);
+  - the writer check's codec oracle names each suffix.
+- **Recorded:** six Lows (B1 to B6), among them snappy manifests read only by CosmoStore's own reader, and M23's
+  B3 again.
+- **Results:** 498 unit tests, the writer check (30 files); CI green on 7cd9b49 (v0.95.1).
+- **Next:** the owner's word on ADR-0116 and on closing M25.

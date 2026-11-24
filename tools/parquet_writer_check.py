@@ -25,7 +25,9 @@ for name in names:
     got = written.read()
     want = pq.read_table(io.BytesIO(fixtures[fixture]))
     # The codec its name says (`-zstd3` is ZSTD at level 3, ADR-0116 §4).
-    codec = {"none": "UNCOMPRESSED", "snappy": "SNAPPY", "gzip": "GZIP"}.get(name.rsplit("-", 1)[1][:-8], "ZSTD")
+    suffix = name.rsplit("-", 1)[-1][:-len(".parquet")]
+    codec = {"none": "UNCOMPRESSED", "snappy": "SNAPPY", "gzip": "GZIP", "zstd1": "ZSTD", "zstd3": "ZSTD",
+             "zstd9": "ZSTD"}.get(suffix)
     same = got.equals(want) and all(written.metadata.row_group(0).column(c).compression == codec
                                     for c in range(written.metadata.num_columns))
     stats = all(written.metadata.row_group(0).column(c).statistics is not None
