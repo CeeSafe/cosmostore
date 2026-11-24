@@ -5684,3 +5684,17 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Slice 1 (M27's B1):** a partition whose one position delete file's `file_path` bounds name one file, live in it
   at or below its sequence number, is not read. `rewriteReadsOnlyWhatCouldChange` counts the reads (0 for that
   partition, 1 for two files), and fails with the check taken out. 511 unit tests.
+
+### 24 Nov 2026: M28 slice 2, the catalog's v3 tables (ADR-0122 §2)
+
+- **Create:** the `format-version` property makes a v3 table (2 by default; 1, above 3, or not a number refused), and
+  is not stored. A v3 table starts at `next-row-id` 0.
+- **Upgrade:** 2 to 3, `next-row-id` 0; never down; 3 to 3 is nothing.
+- **A v3 snapshot:** refused without `first-row-id` or `added-rows`. One below `next-row-id` is a conflict (409), as a
+  commit made from older metadata is. Taken, it advances `next-row-id` to `first-row-id + added-rows`, which never
+  gives an id twice (Java and PyIceberg add to `next-row-id`; the same when the client sends it).
+- **v3's types and defaults** are stored as given.
+- **Compaction** leaves v3 tables as they are until slice 3 (`COMPACTION_MAX_FORMAT`).
+- **The unreferenced-file sweep** reads v3 metadata; format 4 ends its run.
+- **Tests:** `icebergV3Tables`; the sweep's and the updates' tests moved to format 4 as the one refused. 512 unit
+  tests.

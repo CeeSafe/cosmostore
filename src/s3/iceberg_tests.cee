@@ -163,7 +163,8 @@ fn icebergRequirementsAndUpdates() -> Result<void, TestFailure> {
     for (bad in [
         "[{\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",\"type\":\"branch\",\"snapshot-id\":1}]",
         "[{\"action\":\"set-location\",\"location\":\"s3://elsewhere/t\"}]",
-        "[{\"action\":\"upgrade-format-version\",\"format-version\":3}]",
+        "[{\"action\":\"upgrade-format-version\",\"format-version\":4}]",
+        "[{\"action\":\"upgrade-format-version\",\"format-version\":1}]",
         "[{\"action\":\"set-statistics\",\"snapshot-id\":1}]",
         "[{\"action\":\"add-schema\",\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[]}}]",
     ]) {
@@ -184,5 +185,62 @@ fn icebergRequirementsAndUpdates() -> Result<void, TestFailure> {
     encodedSegment("arn:aws:s3tables:us-east-1:0:bucket/b1".bytes(), mut seg)!;
     Check.equalBytes("arn%3Aaws%3As3tables%3Aus-east-1%3A0%3Abucket%2Fb1".bytes(), seg.view())?;
     let _ = textOfJson(borrow m);
+    return Ok();
+}
+
+/// Iceberg v3 tables (ADR-0122 §2): made by the `format-version` property (not stored), upgraded from 2, and each
+/// snapshot's row lineage taken: `first-row-id` and `added-rows` required, one below `next-row-id` a conflict, and
+/// `next-row-id` advanced past the rows assigned.
+@test
+fn icebergV3Tables() -> Result<void, TestFailure> {
+    let request = jsonOf(
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"},{\"id\":2,\"name\":\"t\",\"required\":false,\"type\":\"timestamp_ns\",\"initial-default\":null}]},\"properties\":{\"format-version\":\"3\",\"k\":\"v\"}}",
+    );
+    var m = newTableMetadata(borrow request, "s3://w--table-s3/id".bytes())!!;
+    Check.isTrue(jsonMemberI64(borrow m, "format-version") == Some(3i64), "version 3")?;
+    Check.isTrue(jsonMemberI64(borrow m, "next-row-id") == Some(0i64), "next-row-id 0")?;
+    let props = jsonMember(borrow m, "properties")!;
+    Check.isTrue(jsonMember(props, "format-version").isNull(), "the property not stored")?;
+    Check.equalBytes("v".bytes(), jsonMemberText(props, "k")!)?;
+    for (bad in ["1", "4", "x"]) {
+        var text = textOf(
+            "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]},\"properties\":{\"format-version\":\"",
+        );
+        text.append(bad)!;
+        text.append("\"}}")!;
+        let r = parseJson(text.view().bytes())!!;
+        Check.isTrue(newTableMetadata(borrow r, "s3://w--table-s3/id".bytes())!.isNull(), bad)?;
+    }
+    // A snapshot without lineage refused; one at next-row-id taken, advancing it by its added rows.
+    var copy = cloneJson(borrow m)!;
+    Check.isTrue(!applied(
+        mut copy,
+        "[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":1,\"sequence-number\":1,\"timestamp-ms\":1,\"manifest-list\":\"s3://w--table-s3/id/metadata/s1.avro\",\"summary\":{\"operation\":\"append\"}}}]",
+    ), "no first-row-id")?;
+    Check.isTrue(applied(
+        mut m,
+        "[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":1,\"sequence-number\":1,\"timestamp-ms\":1,\"manifest-list\":\"s3://w--table-s3/id/metadata/s1.avro\",\"summary\":{\"operation\":\"append\"},\"first-row-id\":0,\"added-rows\":30}}]",
+    ), "lineage taken")?;
+    Check.isTrue(jsonMemberI64(borrow m, "next-row-id") == Some(30i64), "advanced to 30")?;
+    // One made from the older metadata (first-row-id 0 again): a conflict, retried on the new.
+    let stale = jsonOf(
+        "[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":2,\"parent-snapshot-id\":1,\"sequence-number\":2,\"timestamp-ms\":2,\"manifest-list\":\"s3://w--table-s3/id/metadata/s2.avro\",\"summary\":{\"operation\":\"append\"},\"first-row-id\":0,\"added-rows\":5}}]",
+    );
+    var again = cloneJson(borrow m)!;
+    match (applyUpdates(mut again, borrow stale, "s3://w--table-s3/id".bytes())!) {
+        Some(CommitRefusal.Requirement) => {}
+        _ => { return Err(TestFailure.create("a stale first-row-id is a conflict")); }
+    }
+    // A v2 table upgraded: version 3, next-row-id 0; never down again.
+    let v2 = jsonOf(
+        "{\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}",
+    );
+    var up = newTableMetadata(borrow v2, "s3://w--table-s3/id".bytes())!!;
+    Check.isTrue(jsonMemberI64(borrow up, "next-row-id").isNull(), "a v2 table has none")?;
+    Check.isTrue(applied(mut up, "[{\"action\":\"upgrade-format-version\",\"format-version\":3}]"), "upgraded")?;
+    Check.isTrue(jsonMemberI64(borrow up, "format-version") == Some(3i64), "now 3")?;
+    Check.isTrue(jsonMemberI64(borrow up, "next-row-id") == Some(0i64), "from 0")?;
+    Check.isTrue(!applied(mut up, "[{\"action\":\"upgrade-format-version\",\"format-version\":2}]"), "not down")?;
+    Check.isTrue(applied(mut up, "[{\"action\":\"upgrade-format-version\",\"format-version\":3}]"), "3 to 3")?;
     return Ok();
 }

@@ -426,9 +426,11 @@ fn assignPartitionFieldIds(spec: borrow mut Json) -> Result<bool, AllocError> {
     return Ok(true);
 }
 
-/// A new table's first metadata (format version 2) from a CreateTableRequest: its schema as schema 0, its spec as
-/// spec 0, its order, its properties, and the warehouse as its location. Null if the schema, spec or order is not
-/// valid: field ids missing or repeated, a spec or order naming a column the schema has not.
+/// A new table's first metadata from a CreateTableRequest: its schema as schema 0, its spec as spec 0, its order, its
+/// properties, and the warehouse as its location; format version 2, or 3 when its `format-version` property asks
+/// (ADR-0122 §2; the property itself not stored, as Iceberg's catalogs do). Null if the schema, spec or order is not
+/// valid (field ids missing or repeated, a spec or order naming a column the schema has not), or the version is not 2
+/// or 3.
 fn newTableMetadata(request: borrow Json, location: Slice<u8>) -> Result<Json?, TablesError> {
     var schema = match (jsonMember(request, "schema")) {
         Some(s) => cloneJson(s)?,
@@ -473,14 +475,28 @@ fn newTableMetadata(request: borrow Json, location: Slice<u8>) -> Result<Json?, 
     // Order 0 is the unsorted order, so a sorted one is order 1 (as Iceberg's catalogs assign a new table's).
     let orderId: i64 = if (arrayLength(borrow order, "fields") == 0) 0 else 1;
     jsonSet(mut order, "order-id", jsonInteger(orderId)?)?;
-    let properties = match (jsonMember(request, "properties")) {
+    var properties = match (jsonMember(request, "properties")) {
         Some(p) => cloneJson(p)?,
         null => jsonObject(),
     };
+    let version: i64 = match (jsonMember(borrow properties, "format-version")) {
+        Some(v) => match (v) {
+            Json.Text(t) => match (parseDecimal(t.view())) {
+                Some(2) => 2,
+                Some(3) => 3,
+                _ => { return Ok(null); }
+            },
+            _ => { return Ok(null); }
+        },
+        null => 2,
+    };
+    jsonRemove(mut properties, "format-version".bytes());
     var uuid = Vector<u8>.create();
     if (!newUuid(mut uuid)?) { return Err(TablesError.Internal); }
     var m = jsonObject();
-    jsonSet(mut m, "format-version", jsonInteger(2)?)?;
+    jsonSet(mut m, "format-version", jsonInteger(version)?)?;
+    // Row lineage's counter (v3): the next snapshot's `first-row-id`.
+    if (version >= 3) { jsonSet(mut m, "next-row-id", jsonInteger(0)?)?; }
     jsonSet(mut m, "table-uuid", Json.Text(uuid))?;
     jsonSet(mut m, "location", jsonString(location)?)?;
     jsonSet(mut m, "last-sequence-number", jsonInteger(0)?)?;
@@ -590,8 +606,16 @@ fn applyUpdates(m: borrow mut Json, updates: borrow Json, warehouse: Slice<u8>) 
             if (uuid.length == 0) { return Ok(Some(CommitRefusal.Update)); }
             jsonSet(m, "table-uuid", jsonString(uuid)?)?;
         } else if (action == "upgrade-format-version".bytes()) {
+            // 2 or 3, never down (ADR-0122 §2); to 3, row lineage's counter from 0.
             let v = jsonMemberI64(u, "format-version") ?? 0;
-            if (v != 2) { return Ok(Some(CommitRefusal.Update)); } // version 2 tables only
+            let current = jsonMemberI64(m, "format-version") ?? 1;
+            if (v < current || v < 2 || v > 3) { return Ok(Some(CommitRefusal.Update)); }
+            if (v > current) {
+                jsonSet(m, "format-version", jsonInteger(v)?)?;
+                if (v >= 3 && jsonMemberI64(m, "next-row-id").isNull()) {
+                    jsonSet(m, "next-row-id", jsonInteger(0)?)?;
+                }
+            }
         } else if (action == "add-schema".bytes()) {
             let schema = match (jsonMember(u, "schema")) {
                 Some(s) => cloneJson(s)?,
@@ -661,6 +685,19 @@ fn applyUpdates(m: borrow mut Json, updates: borrow Json, warehouse: Slice<u8>) 
                     jsonSet(m, "last-sequence-number", jsonInteger(s)?)?;
                 }
                 null => {}
+            }
+            // Row lineage (v3, ADR-0122 §2): the snapshot's first row id at or above the table's next, which its added
+            // rows then advance. One below it was made from older metadata: a conflict, retried on the new.
+            if ((jsonMemberI64(m, "format-version") ?? 1) >= 3) {
+                let first = jsonMemberI64(borrow snapshot, "first-row-id") ?? {
+                    return Ok(Some(CommitRefusal.Update));
+                };
+                let added = jsonMemberI64(borrow snapshot, "added-rows") ?? { return Ok(Some(CommitRefusal.Update)); };
+                let next = jsonMemberI64(m, "next-row-id") ?? 0;
+                if (added < 0) { return Ok(Some(CommitRefusal.Update)); }
+                if (first < next) { return Ok(Some(CommitRefusal.Requirement)); }
+                let advanced = addChecked(first, added) ?? { return Ok(Some(CommitRefusal.Update)); };
+                jsonSet(m, "next-row-id", jsonInteger(advanced)?)?;
             }
             let stamp = jsonMemberI64(borrow snapshot, "timestamp-ms") ?? now;
             appendTo(m, "snapshots", snapshot)?;
