@@ -1,6 +1,10 @@
 # ADR-0121: M28, after position deletes rewritten (proposed)
 
-**Status:** proposed, 24 Nov 2026 (the owner: "continue", after M27 was closed the same day).
+**Status:** decided, 24 Nov 2026. The owner chose:
+- A, with B as its first slice ("A with B first");
+- deletion vectors applied by compaction, none written ("Apply, write none").
+
+Proposed the same day (the owner: "continue", after M27 was closed the same day).
 
 ## Context
 
