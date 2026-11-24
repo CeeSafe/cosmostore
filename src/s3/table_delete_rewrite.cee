@@ -89,18 +89,28 @@ fn deleteRewritesOf(
     return Ok(chosen);
 }
 
-/// The data files live after this run's commit, by path, with their data sequence numbers: every live data entry of
-/// the plan's manifests but the inputs of the bins written (`joined`).
-fn liveDataFiles(plan: borrow CompactionPlan, joined: Slice<usize>) -> Result<HashMap<Vector<u8>, i64>, AllocError> {
+/// A data file live after the run: its data sequence number and its spec and partition.
+struct LiveFile {
+    sequence: i64;
+    partitionKey: Vector<u8>;
+}
+
+/// The data files live after this run's commit, by path: every live data entry of the plan's manifests but the inputs
+/// of the bins written (`joined`).
+fn liveDataFiles(
+    plan: borrow CompactionPlan,
+    joined: Slice<usize>,
+) -> Result<HashMap<Vector<u8>, LiveFile>, AllocError> {
     var removed = HashMap<Vector<u8>, u8>.create();
     for (j in 0..joined.length) {
         let bin = borrow plan.bins[joined[j]];
         for (i in 0..bin.inputs.length) { let _ = removed.put(copyBytes(bin.inputs[i].path.view())?, 1)?; }
     }
-    var out = HashMap<Vector<u8>, i64>.create();
+    var out = HashMap<Vector<u8>, LiveFile>.create();
     for (i in 0..plan.list.records.length) {
         if (recordInt(borrow plan.list.records[i], "content", 0) != 0) { continue; }
         let manifestSequence = recordInt(borrow plan.list.records[i], "sequence_number", 0);
+        let spec = recordInt(borrow plan.list.records[i], "partition_spec_id", 0);
         for (e in 0..plan.manifests[i].records.length) {
             let entry = borrow plan.manifests[i].records[e];
             if (recordInt(entry, "status", 0) == 2) { continue; }
@@ -112,7 +122,8 @@ fn liveDataFiles(plan: borrow CompactionPlan, joined: Slice<usize>) -> Result<Ha
                 Some(v) => jsonI64(v) ?? manifestSequence,
                 null => manifestSequence,
             };
-            let _ = out.put(path, sequence)?;
+            let partitionKey = partitionKeyOf(spec, jsonMember(file, "partition"))?;
+            let _ = out.put(path, LiveFile { sequence: sequence, partitionKey: partitionKey })?;
         }
     }
     return Ok(out);
@@ -120,6 +131,7 @@ fn liveDataFiles(plan: borrow CompactionPlan, joined: Slice<usize>) -> Result<Ha
 
 /// A partition's delete files pinned, under the store, and a writer for what replaces them.
 struct DeleteRewriteCopy {
+    partitionKey: Vector<u8>;
     readers: Vector<PreparedReader>;
     sizes: Vector<u64>;
     sequences: Vector<i64>;
@@ -154,6 +166,7 @@ fn prepareDeleteRewrite(
         sequences.push(d.sequence)?;
     }
     return Ok(Some(DeleteRewriteCopy {
+        partitionKey: copyBytes(plan.deleteRewrites[r].partitionKey.view())?,
         readers: readers,
         sizes: sizes,
         sequences: sequences,
@@ -182,7 +195,7 @@ struct KeptPositions {
 /// (a column besides `file_path` and `pos`), or a file does not read.
 fn writeDeleteRewrite(
     c: borrow mut DeleteRewriteCopy,
-    live: borrow HashMap<Vector<u8>, i64>,
+    live: borrow HashMap<Vector<u8>, LiveFile>,
 ) -> Result<DeleteRewriteWritten?, StoreError> {
     var kept = KeptPositions {
         index: HashMap<Vector<u8>, usize>.create(),
@@ -206,7 +219,13 @@ fn writeDeleteRewrite(
         for (p in 0..deletes.paths.length) {
             // Kept when the file it names stays live and the delete applied to it (ADR-0120 §3).
             let applies = match (live.get(borrow deletes.paths[p])) {
-                Some(s) => *s <= sequence,
+                Some(found) => {
+                    // A row naming a file of another partition: readers scope a delete file by its partition, or
+                    // by path when its `file_path` bounds are equal, and merging or dropping rows could move it
+                    // from one to the other. Such a partition stays as it is (the M27 exit review's L2).
+                    if (found.partitionKey.view() != c.partitionKey.view()) { return Ok(null); }
+                    found.sequence <= sequence
+                }
                 null => false,
             };
             if (!applies) {

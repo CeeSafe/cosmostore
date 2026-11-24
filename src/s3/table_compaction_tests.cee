@@ -98,6 +98,18 @@ fn fixtureCompactStoreFull(
     entries.push(
         compactEntry(borrow fixture.records[0], compactPath("data/kind=a/b.parquet").view(), b.length, bRows),
     )!;
+    if (secondPositions && !otherSpec) {
+        // c, live in a's partition and spec, which compaction does not rewrite: its manifest names it ORC (ADR-0120's
+        // tests: the rows naming it are kept).
+        let c = fixtureBytes(PAGES_FLAT_IDS[..]);
+        let cKey = compactKey("data/kind=a/c.parquet");
+        let _ = s.putObject(COMPACT_HIDDEN, StringView.fromUtf8(cKey.view()) ?? "", "", c.view(), PutCondition.None)!;
+        var cEntry = compactEntry(borrow fixture.records[0], compactPath("data/kind=a/c.parquet").view(), c.length, 23);
+        var cFile = cloneJson(jsonMember(borrow cEntry, "data_file")!)!;
+        jsonSet(mut cFile, "file_format", jsonString("ORC".bytes())!)!;
+        jsonSet(mut cEntry, "data_file", cFile)!;
+        entries.push(cEntry)!;
+    }
     let manifest = writeAvro(fixture.metadata.view(), entries.view())!!;
     let mKey = compactKey("metadata/m0.avro");
     let _ = s.putObject(
@@ -959,23 +971,14 @@ fn compactionKeepsDeletesWithAnotherSpec() -> Result<void, TestFailure> {
     return Ok();
 }
 
-/// A partition's two position delete files rewritten as one (ADR-0120): of the second's rows, c's kept (sorted, once
+/// A partition's two position delete files rewritten as one (ADR-0120): of the second's rows, c's (a live file of the
+/// partition the run does not rewrite) kept (sorted, once
 /// each), the gone file's and a's dropped; the first's, naming only merged files, dropped whole. The new file takes
 /// the largest sequence number of those it replaces (2), and the equality delete stays.
 @test
 fn positionDeletesRewritten() -> Result<void, TestFailure> {
     let dir = scratchDirectory("compact-rewrite-deletes");
-    fixtureCompactStoreFull(
-        dir.bytes(),
-        storeConfig(),
-        fixtureBytes(PAGES_FLAT_IDS[..]),
-        23,
-        fixtureBytes(PAGES_FLAT_IDS_RENAMED[..]),
-        23,
-        true,
-        true,
-        true,
-    );
+    rewriteStore(dir.bytes(), storeConfig());
     compactionWorkload(dir.bytes(), storeConfig());
     let s = ObjectStore.open(dir.view(), storeConfig())!;
     let c = tableCounts(borrow s)?;
@@ -1067,7 +1070,7 @@ fn rewriteStore(dir: Slice<u8>, config: StoreConfig) =>
         fixtureBytes(PAGES_FLAT_IDS_RENAMED[..]),
         23,
         true,
-        true,
+        false,
         true,
     );
 
@@ -1125,6 +1128,36 @@ fn rewriteDeletesFaultsTorn() -> Result<void, TestFailure> => sweepRewrite("rewr
 
 @test
 fn rewriteDeletesFaultsCrash() -> Result<void, TestFailure> => sweepRewrite("rewrite-crash", SweepMode.Crash);
+
+/// A partition whose delete rows name a file of another partition stays as it is (the M27 exit review's L2): c is
+/// under another spec here, so the second position delete file, naming it, is neither rewritten nor removed.
+@test
+fn crossPartitionRowsLeaveTheRewrite() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("compact-rewrite-cross");
+    fixtureCompactStoreFull(
+        dir.bytes(),
+        storeConfig(),
+        fixtureBytes(PAGES_FLAT_IDS[..]),
+        23,
+        fixtureBytes(PAGES_FLAT_IDS_RENAMED[..]),
+        23,
+        true,
+        true,
+        true,
+    );
+    compactionWorkload(dir.bytes(), storeConfig());
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    let c = tableCounts(borrow s)?;
+    Check.equalU64(2, c.dataFiles as u64)?;
+    let second = compactPath("data/kind=a/position-deletes-2.parquet");
+    var kept = false;
+    for (p in c.deletePaths.view()) {
+        if (p.view() == second.view()) { kept = true; }
+    }
+    Check.isTrue(kept, "the second position delete file as it was")?;
+    removeTree(dir.view());
+    return Ok();
+}
 
 /// A table's metadata whose properties are `props` (a JSON object's members), for the codec choice's tests.
 fn metadataWith(props: StringView) -> Json {

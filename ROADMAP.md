@@ -5631,3 +5631,18 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     row. After the run they are one file: b's five rows, sorted, the dangling row dropped.
   - PyIceberg reads the same rows, and the summary counts 1 position delete file added and 6 removed.
 - **CI** (slice 1) ran the readers step: pyarrow's 36 files and parquet-java's 1,343 checks pass.
+
+### 24 Nov 2026: M27's exit review (docs/m27-exit-review.md)
+
+- **The review:** no High finding.
+- **Fixed:**
+  - **M1:** one added manifest per source manifest, so each entry is written with the Avro schema it was read with
+    (compaction's data manifest too, since M16);
+  - **L2:** a partition whose rows name a file of another partition is left as it is
+    (`crossPartitionRowsLeaveTheRewrite`);
+  - **L3:** the summary's sizes count delete files.
+- **Recorded:** B1, the cost of reading every partition's deletes at every run; B2, the new file's footer; B3, M24's
+  related case.
+- **Results:** 510 unit tests, the fuzzer, and the s3, cluster (209) and maintenance smokes, `compaction_check.py`'s
+  109 checks on `serve` and through a cluster.
+- **Next:** the owner's word on ADR-0120 and on closing M27.
