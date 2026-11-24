@@ -5398,3 +5398,22 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **First:** CeeSafe's zstd encoder (ADR 0196 phase 4), levels 1 to 9, released here by its `docs/release.md`.
   - **Then:** compaction writes the table's own codec.
 - **Next:** the encoder, in a CeeSafe worktree; the design ADR here.
+
+### 24 Nov 2026: ADR-0116 proposed, M25's design (compaction keeps the table's codec)
+
+- **The design:**
+  - merged files' pages in the table's `write.parquet.compression-codec`, at its level;
+  - the manifests in its `write.avro.compression-codec`.
+- **The owner's choices:**
+  - ZSTD at level 3 when the table sets no codec;
+  - the manifests in the table's codec.
+- **Five slices:**
+  1. CeeSafe's zstd encoder, released;
+  2. the codec and level;
+  3. the manifests' codec;
+  4. the checks;
+  5. the exit review.
+- **CeeSafe's encoder (ADR 0196 phase 4)** is being built in a CeeSafe worktree. Its release waits for the owner's
+  word.
+- **Next:** slices 2 and 3 for the codecs CeeSafe already has (snappy, gzip, deflate), and ZSTD once the encoder is
+  released.
