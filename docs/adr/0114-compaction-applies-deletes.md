@@ -1,6 +1,7 @@
 # ADR-0114: compaction that applies deletes (M24)
 
-**Status:** proposed, 23 Nov 2026, with the owner's choices made:
+**Status:** accepted, 24 Nov 2026, as amended by its As built and exit-review sections (the owner: "Accept and
+close"). Proposed on 23 Nov 2026 with the owner's choices made:
 - partitions whose deletes cannot all be applied here are left as today ("Left as today");
 - the table's metrics mode ("The table's");
 - a single data file with deletes rewritten alone ("Rewritten alone").

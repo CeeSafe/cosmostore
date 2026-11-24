@@ -5382,3 +5382,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   load of 130). It uses Bulk's 8 s now.
 - **Results:** 495 unit tests; the smokes; 80 compaction checks on `serve` and through a cluster.
 - **Next:** the owner's decisions: ADR-0114's acceptance as amended, and closing M24.
+
+### 24 Nov 2026: M24 closed (ADR-0114 accepted as amended)
+
+- **The owner's decision:** "Accept and close". ADR-0114 is accepted as amended.
+- **M24 is closed.** The exit review's B1 to B4 are recorded in `docs/m24-exit-review.md`.
+- **Next:** M25, when the owner asks. Candidates on record:
+  - CeeSafe's zstd encoder (ADR 0196 phase 4), so that ZSTD tables stay ZSTD;
+  - Iceberg v3's deletion vectors, and rewriting position delete files;
+  - M21's to M24's recorded Lows.
