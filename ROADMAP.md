@@ -5479,3 +5479,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   B3 again.
 - **Results:** 498 unit tests, the writer check (30 files); CI green on 7cd9b49 (v0.95.1).
 - **Next:** the owner's word on ADR-0116 and on closing M25.
+
+### 24 Nov 2026: M25 closed (ADR-0116 accepted)
+
+- **The owner's decision:** "Accept and close". ADR-0116 is accepted, with its As built.
+- **M25 is closed.** The exit review's B1 to B6 are recorded in `docs/m25-exit-review.md`.
+- **Next:** M26, when the owner asks. Candidates on record:
+  - Iceberg v3's deletion vectors, and rewriting position delete files (ADR-0115's B);
+  - M21's to M25's recorded Lows (ADR-0115's C), among them M23's B3 (`total_uncompressed_size`), which real
+    compression now makes matter more.

@@ -1,6 +1,7 @@
 # ADR-0116: compaction keeps the table's codec (M25)
 
-**Status:** proposed, 24 Nov 2026, with the owner's choices made:
+**Status:** accepted, 24 Nov 2026, as built below (the owner: "Accept and close", after M25's exit review,
+`docs/m25-exit-review.md`). Proposed the same day with the owner's choices made:
 - ZSTD at level 3 when the table sets no codec ("ZSTD at level 3");
 - the manifests in the table's `write.avro.compression-codec` ("The table's").
 
@@ -20,7 +21,7 @@ released here ("Here, by release.md").
 - **What CeeSafe gives:** deflate both ways (0.90.0), snappy both ways (0.94.0), the zstd decoder (0.94.4), and, once
   released, the zstd encoder at levels 1 to 9 (ADR 0196 phase 4).
 
-## Decision (proposed)
+## Decision
 
 1. **The codec a merged file's pages are written in** is the table's `write.parquet.compression-codec`:
    - **`zstd`,** at `write.parquet.compression-level` (taken from 1 to 9; above 9 as 9);
@@ -62,3 +63,16 @@ released here ("Here, by release.md").
 
 - **A table's files keep its codec through compaction,** and ZSTD tables' compacted files are about libzstd's size.
 - **Compaction's speed** follows the codec: ZSTD at level 3 compresses more slowly than SNAPPY.
+
+## As built (M25, CeeSafe 0.95.1)
+
+- **§1:** `none` is taken as uncompressed too. A level that is not a number, or is 0 or negative, is the codec's
+  default: ZSTD's 3, gzip's 6.
+- **§2:** v1 pages name their chunk's codec, so every page of a chunk is in that codec even when it does not
+  shrink.
+- **§3:** `zstandard` is taken as an Avro name beside `zstd`. The level is `write.avro.compression-level`, for
+  deflate and zstandard.
+- **§4:** the merged ZSTD file is 0.535 of pyarrow's level-3 file of the same rows. The encodings differ, so the
+  check's bound is 1.25. The encoder's sizes against libzstd's, 0.999 to 1.003 at each level, are CeeSafe's
+  `codec_check`'s.
+- **The exit review's Lows,** recorded in `docs/m25-exit-review.md` (B1 to B6).
