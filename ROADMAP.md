@@ -5574,3 +5574,15 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **C:** the operational Lows (the parquet-java check in CI, M22's B2 and B3).
 - **The recommendation is B, with C's CI step first.**
 - **Next:** the owner's choice.
+
+### 24 Nov 2026: M27 decided, ADR-0120 proposed, slice 1 (the readers in CI)
+
+- **The owner's choices:** B, position deletes rewritten, with C's CI step first; the rewrite made within
+  compaction's run.
+- **ADR-0120** (proposed): within a run, a partition's position delete files rewritten when a row dangles or it
+  has two or more:
+  - a row kept when the file it names stays live and is at or below its delete's sequence number;
+  - one file written, sorted, at the largest sequence number of those it replaces;
+  - none written when no row is kept.
+- **Slice 1:** CI's check job runs `tools/parquet_writer_check.py` (pyarrow) and `tools/parquet_java_check.sh`
+  (Temurin 21, Maven 3.9.9 with its SHA-512 checked, `~/.m2` cached) after the tests (M26's B3).

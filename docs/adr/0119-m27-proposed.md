@@ -1,6 +1,10 @@
 # ADR-0119: M27, after the writer's Lows (proposed)
 
-**Status:** proposed, 24 Nov 2026 (the owner: "continue", after M26 was closed the same day).
+**Status:** decided, 24 Nov 2026. The owner chose:
+- B, with C's CI step first ("B + CI step");
+- position deletes rewritten within compaction's run ("In compaction's run").
+
+Proposed the same day (the owner: "continue", after M26 was closed the same day).
 
 ## Context
 
