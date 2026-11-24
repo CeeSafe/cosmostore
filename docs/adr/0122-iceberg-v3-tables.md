@@ -1,7 +1,8 @@
 # ADR-0122: Iceberg v3 tables (M28)
 
-**Status:** proposed, 24 Nov 2026. M28 is ADR-0121's item A with B as its first slice (the owner: "A with B first"),
-deletion vectors applied by compaction and none written ("Apply, write none").
+**Status:** accepted, 25 Nov 2026, as built below (the owner: "Accept and close", after M28's exit review,
+`docs/m28-exit-review.md`). Proposed 24 Nov 2026: M28 is ADR-0121's item A with B as its first slice (the owner: "A
+with B first"), deletion vectors applied by compaction and none written ("Apply, write none").
 
 ## Context
 
@@ -41,7 +42,7 @@ deletion vectors applied by compaction and none written ("Apply, write none").
   deletion vectors (with pyroaring). It writes no deletion vectors, and refuses to upgrade a table past v2 itself.
 - **M27's B1:** a table with any position delete file reads every partition's delete files at every run.
 
-## Decision (proposed)
+## Decision
 
 1. **Slice 1, the rewrite's cost (ADR-0121's B):** a partition's position delete files are read only when a rewrite
    could change something:
@@ -101,3 +102,20 @@ deletion vectors applied by compaction and none written ("Apply, write none").
 - **A client can make, upgrade and write v3 tables here,** and compaction keeps their lineage.
 - **A v3 table's deletion vectors** are applied as its files are compacted.
 - **Not done:** encryption keys, multi-argument transforms, and lineage on branches other than `main`.
+
+## As built (M28)
+
+- **§2:**
+  - a create's `null` members are taken as absent (Iceberg Java sends `"write-order": null`);
+  - `next-row-id` advances to `first-row-id + added-rows`, the same as Java's when the client sends `first-row-id`
+    at `next-row-id`.
+- **§3:**
+  - a v3 table's bin is never joined, its rows then keeping their ids;
+  - an upgraded table's v2 manifests are compacted: their entries inherit, and a rewritten one is given
+    `first_row_id` and `format-version` 3;
+  - the merged file's column orders are one a leaf.
+- **§4:** a deletion vector goes to the one bin holding its file, read within the bin's bound, and is removed only
+  when that bin applied it.
+- **§5 and slice 6:** one check, `tools/iceberg_java_check.sh`, in CI, with Iceberg Java as the v3 writer (PyIceberg
+  0.12 cannot append to a v3 table) and PyIceberg and Java as its readers.
+- **The exit review's Lows** are recorded in `docs/m28-exit-review.md` (B1 to B3).

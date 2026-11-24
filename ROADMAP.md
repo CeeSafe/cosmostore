@@ -5788,3 +5788,14 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Results:** 521 unit tests, the fuzzer, the smokes (`compaction_check.py`'s 109 checks), and
   `iceberg_java_check.sh`'s 20 checks. CI green on 2e75b42, with the Java check.
 - **Next:** the owner's word on ADR-0122 and on closing M28.
+
+### 25 Nov 2026: M28 closed (ADR-0122 accepted)
+
+- **The owner's decision:** "Accept and close". ADR-0122 is accepted, with its As built.
+- **M28 is closed.** The exit review's B1 to B3 are recorded in `docs/m28-exit-review.md`; M27's B1 is closed by
+  slice 1.
+- **Next:** M29, when the owner asks. Candidates on record:
+  - v3's remaining parts: deletion vectors written (merging a file's new deletes), encryption keys, multi-argument
+    transforms, lineage on branches;
+  - M22's B2 and B3 (asks across a leader change, a loop a node);
+  - M21's, M24's to M27's remaining Lows.
