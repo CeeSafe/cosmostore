@@ -1,6 +1,10 @@
 # ADR-0117: M26, after ZSTD written (proposed)
 
-**Status:** proposed, 24 Nov 2026 (the owner: "continue", after M25 was closed the same day).
+**Status:** decided, 24 Nov 2026. The owner chose:
+- B, the writer's Lows ("B: writer's Lows");
+- parquet-java as the second reader ("parquet-java").
+
+Proposed the same day (the owner: "continue", after M25 was closed the same day).
 
 ## Context
 
