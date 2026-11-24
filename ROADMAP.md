@@ -5657,3 +5657,13 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - M27's B1, the rewrite's cost at every run;
   - M22's B2 and B3 (asks across a leader change, a loop a node);
   - M21's, M24's and M25's remaining Lows.
+
+### 24 Nov 2026: M28 proposed (ADR-0121)
+
+- **The candidates:**
+  - **A:** Iceberg v3 tables (row lineage, v3's types and defaults, deletion vectors);
+  - **B:** the rewrite's cost (M27's B1);
+  - **C:** the cluster's Lows (M22's B2 and B3).
+- **The recommendation is A, with B as its first slice;** for A, deletion vectors applied by compaction, none
+  written.
+- **Next:** the owner's choice.
