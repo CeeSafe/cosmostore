@@ -258,3 +258,58 @@ fn icebergCreateTakesNullsAsAbsent() -> Result<void, TestFailure> {
     Check.isTrue(jsonMemberI64(borrow m, "default-spec-id") == Some(0i64), "spec 0")?;
     return Ok();
 }
+
+/// A create commit's body: `assert-create`, and the table made at `location`.
+fn createCommitBody(location: Slice<u8>) -> Vector<u8> {
+    var b = copyBytes(
+        "{\"requirements\":[{\"type\":\"assert-create\"}],\"updates\":[{\"action\":\"assign-uuid\",\"uuid\":\"9a0d6b4e-2c1f-4f4a-9b3c-1d2e3f4a5b6c\"},{\"action\":\"upgrade-format-version\",\"format-version\":2},{\"action\":\"add-schema\",\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}},{\"action\":\"set-current-schema\",\"schema-id\":-1},{\"action\":\"set-location\",\"location\":\"".bytes(),
+    )!;
+    b.extend(location)!;
+    b.extend("\"}]}".bytes())!;
+    return b;
+}
+
+/// Staged creates (ADR-0124): a staged create writes no table, only its id's reservation; the commit that creates the
+/// table must name a location so reserved, for this table, and makes it once.
+@test
+fn icebergStagedCreates() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("iceberg-staged");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket(catalogText(tableWarehouseBucket("cat".bytes())!.view()))!;
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let staged = icebergCreateTable(
+        mut s,
+        "cat".bytes(),
+        "ns".bytes(),
+        "{\"name\":\"t\",\"stage-create\":true,\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+    )!;
+    let answer = parseJson(staged.body.view())!!;
+    Check.isTrue(jsonMember(borrow answer, "metadata-location").isNull(), "nothing written")?;
+    let location = copyBytes(jsonMemberText(jsonMember(borrow answer, "metadata")!, "location")!)!;
+    Check.isTrue(currentTable(borrow s, "cat".bytes(), "ns".bytes(), "t".bytes())!.isNull(), "no table yet")?;
+    // A location no staged create gave: refused.
+    let other = createCommitBody("s3://cat--table-s3/00000000-0000-4000-8000-000000000000".bytes());
+    let refused = icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), other.view())!;
+    Check.equalU64(400, refused.status as u64)?;
+    // The location staged, for another table's name: refused.
+    let body = createCommitBody(location.view());
+    let wrongName = icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "u".bytes(), body.view())!;
+    Check.equalU64(400, wrongName.status as u64)?;
+    // For its own: the table made, at its location.
+    let made = icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), body.view())!;
+    Check.equalU64(200, made.status as u64)?;
+    let rec = currentTable(borrow s, "cat".bytes(), "ns".bytes(), "t".bytes())!!;
+    let m = readMetadata(
+        borrow s,
+        tableWarehouseBucket("cat".bytes())!.view(),
+        jsonMemberText(borrow rec.json, "metadataLocation")!,
+    )!;
+    Check.equalBytes(location.view(), jsonMemberText(borrow m, "location")!)?;
+    Check.isTrue(jsonMemberI64(borrow m, "format-version") == Some(2i64), "version 2")?;
+    Check.equalU64(1, arrayLength(borrow m, "sort-orders") as u64)?;
+    // Its reservation used: the same create again finds the table there, and its requirement refuses it.
+    let again = icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), body.view())!;
+    Check.equalU64(409, again.status as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}

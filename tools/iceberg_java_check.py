@@ -44,6 +44,10 @@ arn = tables.create_table_bucket(name="java-check")["arn"]
 
 
 def java(phase):
+    if os.environ.get("CALL_TRACES") and phase == "calls":
+        trace = subprocess.run(["java", "--enable-native-access=ALL-UNNAMED", "-cp", classpath, "V3Check", endpoint, arn,
+                                "calls"], capture_output=True, text=True, timeout=300)
+        print("\n".join(l for l in trace.stderr.splitlines() if not l.startswith("WARNING"))[:6000])
     run = subprocess.run(["java", "--enable-native-access=ALL-UNNAMED", "-cp", classpath, "V3Check", endpoint, arn,
                           phase], capture_output=True, text=True, timeout=300)
     if run.returncode != 0:
@@ -75,6 +79,27 @@ upgraded, _, _ = java("upgrade")
 check("a v2 table upgraded by Java", (upgraded.get("before"), upgraded.get("format")), ("2", "3"))
 check("its next row id from 0", upgraded.get("next-row-id"), "0")
 check("its first v3 append's rows given ids", (upgraded.get("first-row-id"), upgraded.get("after-append")), ("0", "5"))
+# An engine's CREATE TABLE AS SELECT and CREATE OR REPLACE TABLE AS SELECT (ADR-0124): Iceberg Java's create, replace and
+# create-or-replace transactions.
+ctas, _, _ = java("ctas")
+check("CTAS: the table made with its rows", (ctas.get("ctas-rows"), ctas.get("ctas-snapshots")), ("7", "1"))
+rtas, _, _ = java("rtas")
+check("RTAS: its rows replaced, its schema the new one", (rtas.get("rtas-rows"), rtas.get("rtas-columns")), ("3", "3"))
+check("RTAS: its history kept", rtas.get("rtas-snapshots"), "2")
+check("create-or-replace, both ways: the second's rows", rtas.get("cor-rows"), "2")
+# Each other catalog call Iceberg Java's client makes (ADR-0124 §3).
+calls, _, _ = java("calls")
+# Refused by design, as S3 Tables does (Java's client sees no such endpoint in the catalog's config):
+# - a namespace's properties are its `owner` alone, set at its create;
+# - a table is not registered from a metadata file: two tables would share a warehouse, and one's drop would purge the
+#   other's files.
+refused = {"set-namespace-properties", "remove-namespace-properties", "register-table"}
+for name, result in sorted(calls.items()):
+    if name.startswith("call-"):
+        if name[5:] in refused:
+            check("Java's %s refused" % name[5:], result.startswith("UnsupportedOperationException"), True)
+        else:
+            check("Java's %s" % name[5:], result, "ok")
 before, rows, _ = java("write")
 check("still v3 after its appends", before.get("format"), "3")
 check("its deletion vector committed", before.get("deletes"), "1")
@@ -89,6 +114,13 @@ catalog = load_catalog("cosmo", **{
     "s3.force-virtual-addressing": "false"})
 check("PyIceberg reads the v3 table, its deletion vector applied",
       sorted(catalog.load_table("javans.v3").scan().to_arrow().column("id").to_pylist()), sorted(r[0] for r in rows))
+# PyIceberg's staged create (ADR-0124): its create transaction, rows appended in it, the table made at its commit.
+import pyarrow as pa
+pyschema = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("data", pa.string())])
+with catalog.create_table_transaction("javans.pytx", schema=pyschema) as tx:
+    tx.append(pa.table({"id": [1, 2, 3], "data": ["a", "b", "c"]}, schema=pyschema))
+check("PyIceberg's create transaction: the table made with its rows",
+      sorted(catalog.load_table("javans.pytx").scan().to_arrow().column("id").to_pylist()), [1, 2, 3])
 tables.put_table_maintenance_configuration(tableBucketARN=arn, namespace="javans", name="v3", type="icebergCompaction",
     value={"status": "enabled", "settings": {"icebergCompaction": {"targetFileSizeMB": 1, "strategy": "binpack"}}})
 

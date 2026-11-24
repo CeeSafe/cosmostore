@@ -1081,15 +1081,15 @@ fn icebergCreateTable(
     };
     let name = copyBytes(jsonMemberText(borrow request, "name") ?? "".bytes())?;
     if (!tableNameOk(name.view(), false)) { return badRequest("A table is 1 to 255 of a-z, 0-9 and _."); }
-    match (jsonMember(borrow request, "stage-create")) {
-        Some(v) => {
-            match (v) {
-                Json.Bool(true) => { return badRequest("Staged creates are not supported."); }
-                _ => {}
-            }
-        }
-        null => {}
-    }
+    // A staged create (ADR-0124): the table's metadata answered, written nowhere; its id reserved, for the commit
+    // that creates it (Iceberg Java's create and replace transactions, an engine's CREATE TABLE AS SELECT).
+    let staged = match (jsonMember(borrow request, "stage-create")) {
+        Some(v) => match (v) {
+            Json.Bool(b) => *b,
+            _ => false,
+        },
+        null => false,
+    };
     let hidden = tableWarehouseBucket(bucket)?;
     if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
     let key = catalogKey(CATALOG_TABLES, ns, name.view())?;
@@ -1114,6 +1114,18 @@ fn icebergCreateTable(
             );
         }
     };
+    if (staged) {
+        var reservation = jsonObject();
+        jsonSet(mut reservation, "namespace", jsonString(ns)?)?;
+        jsonSet(mut reservation, "name", jsonString(name.view())?)?;
+        jsonSet(mut reservation, "createdAt", jsonInteger(Clock.unixMillis())?)?;
+        let stagedKey = catalogKey(CATALOG_STAGED, id.view(), "".bytes())?;
+        let _ = writeRecord(store, hidden.view(), stagedKey.view(), borrow reservation, PutCondition.IfAbsent)?;
+        var j = jsonObject();
+        jsonSet(mut j, "metadata", m)?;
+        jsonSet(mut j, "config", jsonObject())?;
+        return tablesJson(borrow j);
+    }
     let location = writeMetadata(store, hidden.view(), id.view(), 0, borrow m)?;
     let now = Clock.unixMillis();
     var rec = jsonObject();
@@ -1133,6 +1145,159 @@ fn icebergCreateTable(
         }
     }
     return loadResult(location.view(), m);
+}
+
+/// Whether a commit's requirements are `assert-create` alone.
+fn createsOnly(requirements: borrow Json?) -> bool {
+    let r = requirements ?? { return false; };
+    return match (r) {
+        Json.Array(items) => items.length == 1 && jsonMemberText(
+            borrow items[0],
+            "type",
+        ) == Some("assert-create".bytes()),
+        _ => false,
+    };
+}
+
+/// A table made by a staged create's commit (ADR-0124): its updates applied to empty metadata, at the location its
+/// staged create reserved, as Iceberg's catalogs build a table from a create transaction's changes.
+fn icebergCommitCreate(
+    store: borrow mut ObjectStore,
+    bucket: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+    request: borrow Json,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucket)?;
+    if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
+    if (!tableNameOk(name, false)) { return badRequest("A table is 1 to 255 of a-z, 0-9 and _."); }
+    let updates = match (jsonMember(request, "updates")) {
+        Some(u) => cloneJson(u)?,
+        null => jsonArray(),
+    };
+    // Its location, the warehouse of the id its staged create reserved for this table.
+    var location: Vector<u8>? = null;
+    match (borrow updates) {
+        Json.Array(items) => {
+            for (u in items.view()) {
+                if (jsonMemberText(u, "action") == Some("set-location".bytes())) {
+                    location = Some(copyBytes(jsonMemberText(u, "location") ?? "".bytes())?);
+                }
+            }
+        }
+        _ => { return badRequest("The commit's updates are not a list."); }
+    }
+    let at = location ?? { return badRequest("A create's commit sets its table's location."); };
+    var prefix = copyBytes("s3://".bytes())?;
+    prefix.extend(hidden.view())?;
+    prefix.push('/')?;
+    if (at.length <= prefix.length || !startsWithBytes(at.view(), prefix.view())) {
+        return badRequest("A table's location is its warehouse.");
+    }
+    let id = copyBytes(at.view()[prefix.length..])?;
+    if (findBytes(id.view(), "/".bytes(), 0).isSome()) { return badRequest("A table's location is its warehouse."); }
+    let stagedKey = catalogKey(CATALOG_STAGED, id.view(), "".bytes())?;
+    let reservation = readRecord(store, hidden.view(), stagedKey.view())? ?? {
+        return badRequest("The table's location is not one a staged create gave it.");
+    };
+    if (jsonMemberText(borrow reservation.json, "namespace") != Some(ns) ||
+        jsonMemberText(borrow reservation.json, "name") != Some(name)) {
+        return badRequest("The table's location was staged for another table.");
+    }
+    let warehouse = warehouseOf(bucket, id.view())?;
+    var m = emptyTableMetadata()?;
+    match (applyUpdates(mut m, borrow updates, warehouse.view())?) {
+        Some(_) => { return badRequest("An update is not valid here, or not one this catalog applies."); }
+        null => {}
+    }
+    if (!completeCreatedMetadata(mut m, warehouse.view())?) {
+        return badRequest("A created table needs its schema, its location and a format version of 2 or 3.");
+    }
+    let written = writeMetadata(store, hidden.view(), id.view(), 0, borrow m)?;
+    let now = Clock.unixMillis();
+    var rec = jsonObject();
+    jsonSet(mut rec, "id", jsonString(id.view())?)?;
+    jsonSet(mut rec, "createdAt", jsonInteger(now)?)?;
+    jsonSet(mut rec, "modifiedAt", jsonInteger(now)?)?;
+    jsonSet(mut rec, "metadataLocation", jsonString(written.view())?)?;
+    let key = catalogKey(CATALOG_TABLES, ns, name)?;
+    match (writeRecord(store, hidden.view(), key.view(), borrow rec, PutCondition.IfAbsent)) {
+        Ok(_) => {}
+        Err(e) => {
+            removeMetadataFile(store, hidden.view(), written.view());
+            return match (e) {
+                TablesError.Conflict => icebergError(409, "AlreadyExistsException", "The table already exists."),
+                _ => Err(e),
+            };
+        }
+    }
+    let _ = store.deleteObject(catalogText(hidden.view()), catalogText(stagedKey.view()));
+    var j = jsonObject();
+    jsonSet(mut j, "metadata-location", jsonString(written.view())?)?;
+    jsonSet(mut j, "metadata", m)?;
+    return tablesJson(borrow j);
+}
+
+/// The metadata a create transaction's updates start from: no schema, spec, order, snapshot or location yet.
+fn emptyTableMetadata() -> Result<Json, AllocError> {
+    var m = jsonObject();
+    jsonSet(mut m, "format-version", jsonInteger(1)?)?;
+    jsonSet(mut m, "table-uuid", jsonString("".bytes())?)?;
+    jsonSet(mut m, "location", jsonString("".bytes())?)?;
+    jsonSet(mut m, "last-sequence-number", jsonInteger(0)?)?;
+    jsonSet(mut m, "last-updated-ms", jsonInteger(Clock.unixMillis())?)?;
+    jsonSet(mut m, "last-column-id", jsonInteger(0)?)?;
+    jsonSet(mut m, "schemas", jsonArray())?;
+    jsonSet(mut m, "current-schema-id", jsonInteger(-1)?)?;
+    jsonSet(mut m, "partition-specs", jsonArray())?;
+    jsonSet(mut m, "default-spec-id", jsonInteger(-1)?)?;
+    jsonSet(mut m, "last-partition-id", jsonInteger(999)?)?;
+    jsonSet(mut m, "sort-orders", jsonArray())?;
+    jsonSet(mut m, "default-sort-order-id", jsonInteger(-1)?)?;
+    jsonSet(mut m, "properties", jsonObject())?;
+    jsonSet(mut m, "current-snapshot-id", jsonInteger(-1)?)?;
+    jsonSet(mut m, "refs", jsonObject())?;
+    jsonSet(mut m, "snapshots", jsonArray())?;
+    jsonSet(mut m, "snapshot-log", jsonArray())?;
+    jsonSet(mut m, "metadata-log", jsonArray())?;
+    return Ok(m);
+}
+
+/// A created table's metadata made whole: version 2 or 3 (2 when its updates set none), its location the warehouse,
+/// a schema current, an unpartitioned spec and the unsorted order when it added none, and a uuid; false when it
+/// cannot be.
+fn completeCreatedMetadata(m: borrow mut Json, warehouse: Slice<u8>) -> Result<bool, AllocError> {
+    let version = jsonMemberI64(m, "format-version") ?? 1;
+    if (version == 1) { jsonSet(m, "format-version", jsonInteger(2)?)?; }
+    if (version > 3) { return Ok(false); }
+    if (jsonMemberText(m, "location") != Some(warehouse)) { return Ok(false); }
+    let current = jsonMemberI64(m, "current-schema-id") ?? -1;
+    if (!hasId(m, "schemas", "schema-id", current)) { return Ok(false); }
+    if (arrayLength(m, "partition-specs") == 0) {
+        var spec = jsonObject();
+        jsonSet(mut spec, "spec-id", jsonInteger(0)?)?;
+        jsonSet(mut spec, "fields", jsonArray())?;
+        appendTo(m, "partition-specs", spec)?;
+        jsonSet(m, "default-spec-id", jsonInteger(0)?)?;
+    }
+    if (!hasId(m, "partition-specs", "spec-id", jsonMemberI64(m, "default-spec-id") ?? -1)) { return Ok(false); }
+    if (arrayLength(m, "sort-orders") == 0) {
+        var order = jsonObject();
+        jsonSet(mut order, "order-id", jsonInteger(0)?)?;
+        jsonSet(mut order, "fields", jsonArray())?;
+        appendTo(m, "sort-orders", order)?;
+        jsonSet(m, "default-sort-order-id", jsonInteger(0)?)?;
+    }
+    if (!hasId(m, "sort-orders", "order-id", jsonMemberI64(m, "default-sort-order-id") ?? -1)) { return Ok(false); }
+    if (jsonMemberText(m, "table-uuid") == Some("".bytes())) {
+        var uuid = Vector<u8>.create();
+        if (!newUuid(mut uuid)?) { return Ok(false); }
+        jsonSet(m, "table-uuid", Json.Text(uuid))?;
+    }
+    if ((jsonMemberI64(m, "format-version") ?? 2) >= 3 && jsonMemberI64(m, "next-row-id").isNull()) {
+        jsonSet(m, "next-row-id", jsonInteger(0)?)?;
+    }
+    return Ok(true);
 }
 
 /// The table's record and current metadata; NotFound if it has none (made through the S3 Tables API, with no
@@ -1173,7 +1338,14 @@ fn icebergCommit(
     let hidden = tableWarehouseBucket(bucket)?;
     var rec = match (currentTable(store, bucket, ns, name)?) {
         Some(r) => r,
-        null => { return noSuchTable(); }
+        null => {
+            // A staged create's commit (ADR-0124): `assert-create` its one requirement, the table made from its
+            // updates.
+            if (createsOnly(jsonMember(borrow request, "requirements"))) {
+                return icebergCommitCreate(store, bucket, ns, name, borrow request);
+            }
+            return noSuchTable();
+        }
     };
     let previous = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
     if (previous.length == 0) { return noSuchTable(); }
@@ -1241,7 +1413,14 @@ fn icebergTable(
     if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
     let rec = match (currentTable(store, bucket, ns, name)?) {
         Some(r) => r,
-        null => { return noSuchTable(); }
+        null => {
+            // A staged create's commit makes the table (ADR-0124): authorized as the create it is.
+            if (isMethod(m, Method.Post)) {
+                checkTables(store, caller, "s3tables:CreateTable", bucket, "".bytes())?;
+                return icebergCommit(store, bucket, ns, name, body);
+            }
+            return noSuchTable();
+        }
     };
     // A commit is UpdateTableMetadataLocation; a load and HEAD GetTableMetadataLocation; a drop DeleteTable.
     let action = if (isMethod(m, Method.Post)) "s3tables:UpdateTableMetadataLocation"

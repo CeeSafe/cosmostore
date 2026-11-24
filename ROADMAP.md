@@ -5809,3 +5809,26 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **C:** the cluster's Lows.
 - **The recommendation is A.**
 - **Next:** the owner's choice.
+
+### 25 Nov 2026: M29 decided, ADR-0124, slices 1 and 2 (staged creates; Java's catalog calls)
+
+- **The owner's choice:** A, engines' catalog calls.
+- **Staged creates (ADR-0124 §1, §2):**
+  - **A staged create** answers with the new table's metadata, written nowhere, and reserves its id
+    (`.s3tables/staged/<id>`).
+  - **A commit whose only requirement is `assert-create`** creates the table:
+    - authorized as `s3tables:CreateTable`;
+    - at a location staged for this table only;
+    - its updates applied to empty metadata, then made whole.
+- **The Java check (47 checks, in CI)** now runs:
+  - Iceberg Java's create transaction (CTAS), replace transaction (RTAS: a wider schema, its rows replaced, its
+    history kept), and create-or-replace both ways;
+  - PyIceberg's create transaction;
+  - 22 more catalog calls of Java's client.
+  - **Refused by design, as S3 Tables does:** setting a namespace's properties (it keeps only its `owner`), and
+    registering a table from a metadata file (two tables would share a warehouse).
+  - **Found:** nothing beyond staged creates. A null-pointer error at first was the check's own (`Map.of` and
+    Java's request builder).
+- **Unit test:** `icebergStagedCreates` (a commit at a location not staged, or staged for another table, refused).
+  522 unit tests.
+- **Next:** the exit review.

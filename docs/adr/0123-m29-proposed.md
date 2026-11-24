@@ -1,6 +1,8 @@
 # ADR-0123: M29, after Iceberg v3 tables (proposed)
 
-**Status:** proposed, 25 Nov 2026 (the owner: "continue", after M28 was closed the same day).
+**Status:** decided, 25 Nov 2026. The owner chose A, engines' catalog calls ("A: engines' calls").
+
+Proposed the same day (the owner: "continue", after M28 was closed the same day).
 
 ## Context
 
