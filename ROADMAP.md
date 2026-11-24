@@ -5488,3 +5488,13 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - Iceberg v3's deletion vectors, and rewriting position delete files (ADR-0115's B);
   - M21's to M25's recorded Lows (ADR-0115's C), among them M23's B3 (`total_uncompressed_size`), which real
     compression now makes matter more.
+
+### 24 Nov 2026: M26 proposed (ADR-0117)
+
+- **The candidates:**
+  - **A:** Iceberg v3's deletes (Puffin deletion vectors, position delete files rewritten, exact removal);
+  - **B:** the writer's Lows (M23's B2 to B6, M24's B1, M25's B1 and B2);
+  - **C:** both, B first.
+- **The recommendation is B:** M23's B2 (statistics' order) and B4 (`.` in column names) can mislead a reader of
+  files from writers other than Iceberg's, and B is small.
+- **Next:** the owner's choice.
