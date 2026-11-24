@@ -5540,3 +5540,15 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - Unsigned integers ordered as signed, put back into the writer for the run, fail it in each codec's file.
   - parquet-java reads a zero min as -0.0 whatever the file says, so the signed zeros are pyarrow's check's to see.
 - **Next:** the exit review.
+
+### 24 Nov 2026: M26's exit review (docs/m26-exit-review.md)
+
+- **The review:** no High or Medium finding.
+- **Fixed:** L1, a file left out of the commit no longer keeps an equality delete.
+- **Recorded:**
+  - B1, a crash between the commit and a 0-row file's deletion leaves an object the sweep removes;
+  - B2, parquet-java's filter does not know NaNs;
+  - B3, the parquet-java check is local.
+- **Results:** 504 unit tests, the writer check (36 files), the parquet-java check (1,343), the fuzzer, and the s3,
+  cluster (209) and maintenance smokes.
+- **Next:** the owner's word on ADR-0118 and on closing M26.
