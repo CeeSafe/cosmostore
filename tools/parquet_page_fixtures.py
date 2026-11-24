@@ -90,6 +90,11 @@ assert flat_rows[4]["s"] is None
 compact_path = "s3://compact--table-s3/c0c0c0c0-1111-4222-8333-444444444444/data/kind=a/%s.parquet"
 compact_position_rows = [{"file_path": compact_path % "a", "pos": 0}, {"file_path": compact_path % "a", "pos": 5},
                          {"file_path": compact_path % "b", "pos": 1}]
+# A second position delete file of that partition (ADR-0120): rows naming c (the live file of another spec, kept,
+# one twice), a file gone from the table (dropped), and a (merged by the run: dropped), out of order.
+rewrite_position_rows = [{"file_path": compact_path % "c", "pos": 2}, {"file_path": compact_path % "gone", "pos": 7},
+                         {"file_path": compact_path % "c", "pos": 0}, {"file_path": compact_path % "a", "pos": 3},
+                         {"file_path": compact_path % "c", "pos": 2}]
 compact_equality_schema = pa.schema([with_id(flat_schema.field("id"), 1)])
 compact_equality_rows = [{"id": flat_rows[2]["id"]}, {"id": flat_rows[7]["id"]}]
 
@@ -285,6 +290,8 @@ fixtures = [
         compression="zstd", data_page_version="2.0"), equality_nodes, equality_rows),
     ("DELETES_COMPACT_POSITION", "the compaction sweep's position deletes", write(position_schema,
         compact_position_rows, compression="snappy"), position_nodes, compact_position_rows),
+    ("DELETES_REWRITE_POSITION", "a second position delete file of the sweep's partition, to be rewritten", write(
+        position_schema, rewrite_position_rows, compression="snappy"), position_nodes, rewrite_position_rows),
     ("DELETES_COMPACT_EQUALITY", "the compaction sweep's equality deletes, on id", write(compact_equality_schema,
         compact_equality_rows, compression="snappy"), [("prim", "id", False, "i64")], compact_equality_rows),
 ]

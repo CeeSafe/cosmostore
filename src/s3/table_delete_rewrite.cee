@@ -1,0 +1,500 @@
+// Position deletes rewritten within compaction's run (ADR-0120): a partition's position delete files read whole, the
+// rows naming a file still live kept, and written as one file sorted by path and position, or none.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+/// The most rows of one partition's position delete files a run rewrites (a delete file's own bound, so the one
+/// written reads again); a partition past it stays as it is.
+const DELETE_REWRITE_MAX_ROWS: usize = 8388608;
+/// The most position-delete rows one run reads to rewrite: the partitions past it wait for the next run.
+const DELETE_REWRITE_RUN_ROWS: i64 = 16777216;
+/// A rewritten file's row groups, at most this many rows each.
+const DELETE_REWRITE_GROUP_ROWS: usize = 1048576;
+
+/// A partition's position delete files to rewrite (ADR-0120 §2), and once put, what replaces them.
+struct DeleteRewrite {
+    partitionKey: Vector<u8>;
+    /// Its position delete files: indexes into the plan's `deletes`.
+    files: Vector<usize>;
+    /// Put and to be committed: the files replaced, and the one written (null when no row was kept).
+    done: bool;
+    output: CompactionOutput?;
+    /// The written file's data sequence number: the largest of the files it replaces (§4).
+    sequence: i64;
+}
+
+/// The partitions whose position delete files a run reads (ADR-0120 §2): every partition with one, not blocked,
+/// within DELETE_REWRITE_MAX_ROWS and, together, DELETE_REWRITE_RUN_ROWS. Whether one is rewritten is decided
+/// once its files are read (`writeDeleteRewrite`).
+fn deleteRewritesOf(
+    deletes: Slice<DeleteFile>,
+    manifests: Slice<AvroFile>,
+    blocked: Slice<Vector<u8>>,
+) -> Result<Vector<DeleteRewrite>, AllocError> {
+    var out = Vector<DeleteRewrite>.create();
+    var rows = Vector<i64>.create();
+    for (x in 0..deletes.length) {
+        if (deletes[x].content != DELETE_CONTENT_POSITION) { continue; }
+        var isBlocked = false;
+        for (b in 0..blocked.length) {
+            if (blocked[b].view() == deletes[x].partitionKey.view()) { isBlocked = true; }
+        }
+        if (isBlocked) { continue; }
+        let stated = match (jsonMember(borrow manifests[deletes[x].manifest].records[deletes[x].entry], "data_file")) {
+            Some(f) => recordInt(f, "record_count", -1),
+            null => -1,
+        };
+        if (stated < 0) { continue; }
+        var at: usize? = null;
+        for (r in 0..out.length) {
+            if (out[r].partitionKey.view() == deletes[x].partitionKey.view()) { at = Some(r); }
+        }
+        match (at) {
+            Some(r) => {
+                out[r].files.push(x)?;
+                rows[r] = rows[r] + stated;
+            }
+            null => {
+                var files = Vector<usize>.create();
+                files.push(x)?;
+                out.push(DeleteRewrite {
+                    partitionKey: copyBytes(deletes[x].partitionKey.view())?,
+                    files: files,
+                    done: false,
+                    output: null,
+                    sequence: 0,
+                })?;
+                rows.push(stated)?;
+            }
+        }
+    }
+    var chosen = Vector<DeleteRewrite>.create();
+    var total: i64 = 0;
+    for (k in 0..out.length) {
+        let n = rows[k];
+        if (n > truncate<i64>(DELETE_REWRITE_MAX_ROWS) || total + n > DELETE_REWRITE_RUN_ROWS) { continue; }
+        total += n;
+        var files = Vector<usize>.create();
+        files.extend(out[k].files.view())?;
+        chosen.push(DeleteRewrite {
+            partitionKey: copyBytes(out[k].partitionKey.view())?,
+            files: files,
+            done: false,
+            output: null,
+            sequence: 0,
+        })?;
+    }
+    return Ok(chosen);
+}
+
+/// The data files live after this run's commit, by path, with their data sequence numbers: every live data entry of
+/// the plan's manifests but the inputs of the bins written (`joined`).
+fn liveDataFiles(plan: borrow CompactionPlan, joined: Slice<usize>) -> Result<HashMap<Vector<u8>, i64>, AllocError> {
+    var removed = HashMap<Vector<u8>, u8>.create();
+    for (j in 0..joined.length) {
+        let bin = borrow plan.bins[joined[j]];
+        for (i in 0..bin.inputs.length) { let _ = removed.put(copyBytes(bin.inputs[i].path.view())?, 1)?; }
+    }
+    var out = HashMap<Vector<u8>, i64>.create();
+    for (i in 0..plan.list.records.length) {
+        if (recordInt(borrow plan.list.records[i], "content", 0) != 0) { continue; }
+        let manifestSequence = recordInt(borrow plan.list.records[i], "sequence_number", 0);
+        for (e in 0..plan.manifests[i].records.length) {
+            let entry = borrow plan.manifests[i].records[e];
+            if (recordInt(entry, "status", 0) == 2) { continue; }
+            let file = jsonMember(entry, "data_file") ?? { continue; };
+            if (recordInt(file, "content", 0) != 0) { continue; }
+            let path = copyBytes(jsonMemberText(file, "file_path") ?? { continue; })?;
+            if (removed.get(borrow path).isSome()) { continue; }
+            let sequence = match (jsonMember(entry, "sequence_number")) {
+                Some(v) => jsonI64(v) ?? manifestSequence,
+                null => manifestSequence,
+            };
+            let _ = out.put(path, sequence)?;
+        }
+    }
+    return Ok(out);
+}
+
+/// A partition's delete files pinned, under the store, and a writer for what replaces them.
+struct DeleteRewriteCopy {
+    readers: Vector<PreparedReader>;
+    sizes: Vector<u64>;
+    sequences: Vector<i64>;
+    writer: ObjectWriter;
+    codec: i64;
+    level: u32;
+}
+
+/// Rewrite `r`'s files pinned as planned; null when one changed since (it waits for the next run).
+fn prepareDeleteRewrite(
+    store: borrow mut ObjectStore,
+    plan: borrow CompactionPlan,
+    r: usize,
+) -> Result<DeleteRewriteCopy?, StoreError> {
+    let bucket = catalogText(plan.hidden.view());
+    var readers = Vector<PreparedReader>.create();
+    var sizes = Vector<u64>.create();
+    var sequences = Vector<i64>.create();
+    for (x in plan.deleteRewrites[r].files.view()) {
+        let d = borrow plan.deletes[x];
+        match (store.headObject(bucket, catalogText(d.key.view()))) {
+            Ok(info) => {
+                if (info.size != d.size || info.generation != d.generation) { return Ok(null); }
+            }
+            Err(_) => { return Ok(null); }
+        }
+        match (store.prepareReaderOf(bucket, catalogText(d.key.view()), null, 0, d.size)) {
+            Ok(p) => { readers.push(p)?; }
+            Err(_) => { return Ok(null); }
+        }
+        sizes.push(d.size)?;
+        sequences.push(d.sequence)?;
+    }
+    return Ok(Some(DeleteRewriteCopy {
+        readers: readers,
+        sizes: sizes,
+        sequences: sequences,
+        writer: store.newWriter()?,
+        codec: plan.pageCodec,
+        level: plan.pageLevel,
+    }));
+}
+
+/// What a partition's rewrite wrote: its file (null when no row was kept), its metrics, its data sequence number.
+struct DeleteRewriteWritten {
+    obj: FinishedObject?;
+    metrics: FileMetrics;
+    sequence: i64;
+}
+
+/// The rows kept, by path: each path's positions, sorted and without duplicates once `finish`ed.
+struct KeptPositions {
+    index: HashMap<Vector<u8>, usize>;
+    paths: Vector<Vector<u8>>;
+    positions: Vector<Vector<i64>>;
+}
+
+/// A partition's delete files read, off the lock, and their kept rows written (ADR-0120 §3, §4); null when the
+/// partition is left as it is: nothing would change (one file, no row dropped), a file is not one rewritten here
+/// (a column besides `file_path` and `pos`), or a file does not read.
+fn writeDeleteRewrite(
+    c: borrow mut DeleteRewriteCopy,
+    live: borrow HashMap<Vector<u8>, i64>,
+) -> Result<DeleteRewriteWritten?, StoreError> {
+    var kept = KeptPositions {
+        index: HashMap<Vector<u8>, usize>.create(),
+        paths: Vector<Vector<u8>>.create(),
+        positions: Vector<Vector<i64>>.create(),
+    };
+    var template: DeleteFooter? = null;
+    var read: usize = 0;
+    var dropped = false;
+    var most: i64 = 0;
+    for (f in 0..c.readers.length) {
+        let bytes = readPrepared(mut c.readers[f])? ?? { return Ok(null); };
+        if (bytes.length as u64 != c.sizes[f]) { return Ok(null); }
+        let footer = deleteFooterOf(bytes.view())? ?? { return Ok(null); };
+        // Only `file_path` and `pos` (the optional `row` column's values are not kept here).
+        if (footer.leaves.length != 2) { return Ok(null); }
+        let deletes = readPositionDeletesWithin(bytes.view(), DELETE_REWRITE_MAX_ROWS - read)? ?? { return Ok(null); };
+        read += deletes.rows;
+        let sequence = c.sequences[f];
+        if (sequence > most) { most = sequence; }
+        for (p in 0..deletes.paths.length) {
+            // Kept when the file it names stays live and the delete applied to it (ADR-0120 §3).
+            let applies = match (live.get(borrow deletes.paths[p])) {
+                Some(s) => *s <= sequence,
+                null => false,
+            };
+            if (!applies) {
+                dropped = true;
+                continue;
+            }
+            let at = match (kept.index.get(borrow deletes.paths[p])) {
+                Some(i) => *i,
+                null => {
+                    let i = kept.paths.length;
+                    kept.paths.push(copyBytes(deletes.paths[p].view())?)?;
+                    kept.positions.push(Vector<i64>.create())?;
+                    let _ = kept.index.put(copyBytes(deletes.paths[p].view())?, i)?;
+                    i
+                }
+            };
+            kept.positions[at].extend(deletes.positions[p].view())?;
+        }
+        if (f == 0) { template = Some(footer); }
+    }
+    if (c.readers.length < 2 && !dropped) { return Ok(null); }
+    let t = template ?? { return Ok(null); };
+    let pathAt = leafOfId(t.leaves.view(), ICEBERG_DELETE_FILE_PATH) ?? { return Ok(null); };
+    let posAt = leafOfId(t.leaves.view(), ICEBERG_DELETE_POS) ?? { return Ok(null); };
+    // Sorted by path, then position, without duplicates (Iceberg's order for a position delete file).
+    var order = Vector<usize>.create();
+    for (p in 0..kept.paths.length) {
+        kept.positions[p].sortBy((a, b) => if (a < b) -1 else if (a > b) 1 else 0);
+        order.push(p)?;
+    }
+    let paths = kept.paths.view();
+    order.sortBy((a, b) => compareBytes(paths[a].view(), paths[b].view()));
+    var rows: i64 = 0;
+    var leastPos: i64 = 0;
+    var mostPos: i64 = 0;
+    var columns = Vector<ColumnValues>.create();
+    columns.push(emptyValues())?;
+    columns.push(emptyValues())?;
+    var groups = Vector<ThriftValue>.create();
+    var written: u64 = 4;
+    var groupRows: usize = 0;
+    if (order.length > 0 && c.writer.write(PARQUET_MAGIC.bytes()).isErr()) { return Ok(null); }
+    for (o in 0..order.length) {
+        let p = order[o];
+        var previous: i64 = -1;
+        for (pos in kept.positions[p].view()) {
+            if (pos == previous) { continue; }
+            previous = pos;
+            if (rows == 0 || pos < leastPos) { leastPos = pos; }
+            if (rows == 0 || pos > mostPos) { mostPos = pos; }
+            rows += 1;
+            let pathLeaf = borrow t.leaves[pathAt];
+            let posLeaf = borrow t.leaves[posAt];
+            columns[pathAt].reps.push(0)?;
+            columns[pathAt].defs.push(truncate<u8>(pathLeaf.maxDef))?;
+            if (!(pushValue(mut columns[pathAt], pathLeaf, kept.paths[p].view())?)) { return Ok(null); }
+            var le = Vector<u8>.create();
+            let bits = truncate<u64>(pos);
+            for (shift in [0u64, 8, 16, 24, 32, 40, 48, 56]) { le.push(truncate<u8>(bits >> shift))?; }
+            columns[posAt].reps.push(0)?;
+            columns[posAt].defs.push(truncate<u8>(posLeaf.maxDef))?;
+            if (!(pushValue(mut columns[posAt], posLeaf, le.view())?)) { return Ok(null); }
+            groupRows += 1;
+            if (groupRows == DELETE_REWRITE_GROUP_ROWS) {
+                if (!(flushDeleteGroup(
+                    mut c.writer,
+                    mut written,
+                    t.leaves.view(),
+                    mut columns,
+                    groupRows,
+                    mut groups,
+                    c.codec,
+                    c.level,
+                )?)) {
+                    return Ok(null);
+                }
+                groupRows = 0;
+            }
+        }
+    }
+    var lower = Vector<Json>.create();
+    var upper = Vector<Json>.create();
+    var counts = Vector<Json>.create();
+    var nulls = Vector<Json>.create();
+    var obj: FinishedObject? = null;
+    if (rows > 0) {
+        if (groupRows > 0 &&
+            !(flushDeleteGroup(
+                mut c.writer,
+                mut written,
+                t.leaves.view(),
+                mut columns,
+                groupRows,
+                mut groups,
+                c.codec,
+                c.level,
+            )?)) {
+            return Ok(null);
+        }
+        let tail = parquetTail(borrow t.meta, groups, rows)? ?? { return Ok(null); };
+        if (c.writer.write(tail.view()).isErr()) { return Ok(null); }
+        obj = match (c.writer.finish()) {
+            Ok(o) => Some(o),
+            Err(_) => { return Ok(null); }
+        };
+        // Full bounds, as Iceberg's writers keep for position deletes: equal `file_path` bounds name one data file.
+        let first = kept.paths[order[0]].view();
+        let last = kept.paths[order[order.length - 1]].view();
+        lower.push(metricPair(ICEBERG_DELETE_FILE_PATH, Json.Text(copyBytes(first)?))?)?;
+        upper.push(metricPair(ICEBERG_DELETE_FILE_PATH, Json.Text(copyBytes(last)?))?)?;
+        lower.push(metricPair(ICEBERG_DELETE_POS, Json.Text(longBytes(leastPos)?))?)?;
+        upper.push(metricPair(ICEBERG_DELETE_POS, Json.Text(longBytes(mostPos)?))?)?;
+        for (id in [ICEBERG_DELETE_FILE_PATH, ICEBERG_DELETE_POS]) {
+            counts.push(metricPair(id, jsonInteger(rows)?)?)?;
+            nulls.push(metricPair(id, jsonInteger(0)?)?)?;
+        }
+    }
+    return Ok(Some(DeleteRewriteWritten {
+        obj: obj,
+        metrics: FileMetrics {
+            rows: rows,
+            valueCounts: counts,
+            nullCounts: nulls,
+            nanCounts: Vector<Json>.create(),
+            sizes: Vector<Json>.create(),
+            lower: lower,
+            upper: upper,
+        },
+        sequence: most,
+    }));
+}
+
+/// A long's Iceberg single-value bytes: 8, little-endian.
+fn longBytes(v: i64) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    let bits = truncate<u64>(v);
+    for (shift in [0u64, 8, 16, 24, 32, 40, 48, 56]) { out.push(truncate<u8>(bits >> shift))?; }
+    return Ok(out);
+}
+
+/// The rows held written as a row group of the rewritten file, and let go.
+fn flushDeleteGroup(
+    writer: borrow mut ObjectWriter,
+    written: borrow mut u64,
+    leaves: Slice<PageLeaf>,
+    columns: borrow mut Vector<ColumnValues>,
+    rows: usize,
+    groups: borrow mut Vector<ThriftValue>,
+    codec: i64,
+    level: u32,
+) -> Result<bool, AllocError> {
+    let encoded = encodeRowGroupAt(*written, leaves, columns.view(), truncate<i64>(rows), codec, level)? ?? {
+        return Ok(false);
+    };
+    if (writer.write(encoded.bytes.view()).isErr()) { return Ok(false); }
+    *written += encoded.bytes.length as u64;
+    groups.push(encoded.group)?;
+    for (k in 0..columns.length) { columns[k] = emptyValues(); }
+    return Ok(true);
+}
+
+/// A rewrite's file put beside the first file it replaces, as `compacted-deletes-<uuid>.parquet`, and the rewrite
+/// marked to be committed; false when it could not be put.
+fn putDeleteRewrite(
+    store: borrow mut ObjectStore,
+    plan: borrow mut CompactionPlan,
+    r: usize,
+    w: borrow DeleteRewriteWritten,
+) -> Result<bool, StoreError> {
+    let first = plan.deleteRewrites[r].files[0];
+    match (w.obj.asBorrow()) {
+        Some(obj) => {
+            let firstKey = copyBytes(plan.deletes[first].key.view())?;
+            let firstPath = copyBytes(plan.deletes[first].path.view())?;
+            let slash = lastSlash(firstKey.view());
+            var key = copyBytes(firstKey.view()[0..slash])?;
+            key.extend("compacted-deletes-".bytes())?;
+            if (!newUuid(mut key)?) { return Ok(false); }
+            key.extend(".parquet".bytes())?;
+            match (store.putFinishedWith(
+                catalogText(plan.hidden.view()),
+                catalogText(key.view()),
+                "application/octet-stream",
+                "".bytes(),
+                "".bytes(),
+                obj,
+                PutCondition.IfAbsent,
+            )) {
+                Ok(_) => {}
+                Err(_) => { return Ok(false); }
+            }
+            let pathSlash = lastSlash(firstPath.view());
+            var path = copyBytes(firstPath.view()[0..pathSlash])?;
+            path.extend(key.view()[slash..])?;
+            plan.deleteRewrites[r].output = Some(CompactionOutput {
+                key: key,
+                path: path,
+                length: obj.size,
+                metrics: Some(cloneMetrics(borrow w.metrics)?),
+            });
+        }
+        null => {}
+    }
+    plan.deleteRewrites[r].sequence = w.sequence;
+    plan.deleteRewrites[r].done = true;
+    return Ok(true);
+}
+
+fn cloneMetrics(m: borrow FileMetrics) -> Result<FileMetrics, AllocError> {
+    var out = FileMetrics {
+        rows: m.rows,
+        valueCounts: Vector<Json>.create(),
+        nullCounts: Vector<Json>.create(),
+        nanCounts: Vector<Json>.create(),
+        sizes: Vector<Json>.create(),
+        lower: Vector<Json>.create(),
+        upper: Vector<Json>.create(),
+    };
+    for (j in m.valueCounts.view()) { out.valueCounts.push(cloneJson(j)?)?; }
+    for (j in m.nullCounts.view()) { out.nullCounts.push(cloneJson(j)?)?; }
+    for (j in m.lower.view()) { out.lower.push(cloneJson(j)?)?; }
+    for (j in m.upper.view()) { out.upper.push(cloneJson(j)?)?; }
+    return Ok(out);
+}
+
+/// Every partition's rewrite, in the run's own steps: pinned under the lock, read and written off it, put under it.
+/// Used by `compactTable` (a single node) and the tests; a cluster's leader puts each in a gated step.
+async fn rewriteDeletesAll(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    plan: borrow mut CompactionPlan,
+    joined: Slice<usize>,
+) -> Result<void, NetError> {
+    if (plan.deleteRewrites.length == 0) { return Ok(); }
+    let live = match (liveDataFiles(plan, joined)) {
+        Ok(l) => l,
+        Err(_) => { return Ok(); }
+    };
+    for (r in 0..plan.deleteRewrites.length) {
+        var prepared: DeleteRewriteCopy? = null;
+        {
+            var guard = match (await store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NetError.Closed); }
+            };
+            let st = guard.data();
+            let p = plan;
+            prepared = match (await Async.blocking(() => prepareDeleteRewrite(st, p, r))) {
+                Ok(c) => c,
+                Err(_) => null,
+            };
+        }
+        var copy = prepared ?? { continue; };
+        let lv = borrow live;
+        let w = match (await Async.blocking(() => writeDeleteRewrite(mut copy, lv))) {
+            Ok(Some(w)) => w,
+            _ => { continue; }
+        };
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let p = plan;
+        let wr = borrow w;
+        let _ = await Async.blocking(() => putDeleteRewrite(st, p, r, wr));
+    }
+    return Ok();
+}
+
+/// Every partition's rewrite in one thread, the store held throughout (the tests' runs, as `compactionWorkload` runs
+/// a compaction's steps).
+fn rewriteDeletesNow(
+    store: borrow mut ObjectStore,
+    plan: borrow mut CompactionPlan,
+    joined: Slice<usize>,
+) -> Result<void, StoreError> {
+    if (plan.deleteRewrites.length == 0) { return Ok(); }
+    let live = liveDataFiles(plan, joined)?;
+    for (r in 0..plan.deleteRewrites.length) {
+        var copy = match (prepareDeleteRewrite(store, plan, r)) {
+            Ok(Some(c)) => c,
+            _ => { continue; }
+        };
+        let w = match (writeDeleteRewrite(mut copy, borrow live)) {
+            Ok(Some(w)) => w,
+            _ => { continue; }
+        };
+        let _ = putDeleteRewrite(store, plan, r, borrow w);
+    }
+    return Ok();
+}

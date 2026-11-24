@@ -5586,3 +5586,24 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - none written when no row is kept.
 - **Slice 1:** CI's check job runs `tools/parquet_writer_check.py` (pyarrow) and `tools/parquet_java_check.sh`
   (Temurin 21, Maven 3.9.9 with its SHA-512 checked, `~/.m2` cached) after the tests (M26's B3).
+
+### 24 Nov 2026: M27 slices 2 and 3, position deletes rewritten (ADR-0120 §2 to §5)
+
+- **`src/s3/table_delete_rewrite.cee`:**
+  - **The plan:** each partition with position delete files, not blocked, within 8 M rows (16 M a run).
+  - **After the bins are written:** the live data files and their sequence numbers.
+  - **Each partition's files** pinned under the lock, read off it, and their rows kept when the file named is live
+    and at or below the delete's number. Left as it is when nothing would change (one file, no row dropped), or a
+    file holds more than `file_path` and `pos`.
+  - **The kept rows** written sorted and once each, in row groups of 1 M rows, with full `file_path` and `pos`
+    bounds, at the largest sequence number of the files replaced; none when no row is kept.
+  - **The put:** under the lock; on a cluster, a gated step of its own.
+- **The commit:** the replaced files DELETED, the new ones ADDED in a delete manifest per spec. The summary has
+  `added-delete-files`, `added-position-delete-files`, `added-position-deletes`, the removed counts, and the totals.
+  A run with only rewrites commits too.
+- **Tests:**
+  - **`positionDeletesRewritten`:** two position delete files become one, naming only the live file of another spec,
+    once each and sorted, at sequence number 2.
+  - **`compactionKeepsDeletesWithAnotherSpec`:** its position delete, naming only the merged files, is now rewritten
+    away; the equality delete stays.
+- **Results:** 505 unit tests, the deletes sweeps among them.

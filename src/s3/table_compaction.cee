@@ -87,6 +87,8 @@ struct CompactionPlan {
     pageCodec: i64;
     pageLevel: u32;
     avroCodec: AvroCodec;
+    /// The partitions whose position delete files the run reads to rewrite (ADR-0120).
+    deleteRewrites: Vector<DeleteRewrite>;
 }
 
 /// A file a run wrote: its key and path, and its length.
@@ -352,6 +354,7 @@ fn planCompaction(
     let pageCodec = pageCodecOf(borrow m);
     let pageLevel = codecLevelOf(borrow m, "write.parquet.compression-level");
     let avroCodec = avroCodecOf(borrow m);
+    let deleteRewrites = deleteRewritesOf(deletes.view(), manifests.view(), blocked.view())?;
     let plan = CompactionPlan {
         bucket: copyBytes(t.bucket.view())?,
         hidden: hidden,
@@ -371,6 +374,7 @@ fn planCompaction(
         pageCodec: pageCodec,
         pageLevel: pageLevel,
         avroCodec: avroCodec,
+        deleteRewrites: deleteRewrites,
     };
     return Ok(Some(CompactionDraft { plan: plan, pending: pending, target: target }));
 }
@@ -1206,6 +1210,12 @@ fn addsNoFile(output: borrow CompactionOutput) -> bool => match (output.metrics.
     null => false,
 };
 
+/// A rewritten delete file's rows (ADR-0120): its metrics'.
+fn outputRowsOf(o: borrow CompactionOutput) -> i64 => match (o.metrics.asBorrow()) {
+    Some(m) => m.rows,
+    null => 0,
+};
+
 /// A written file's rows: a merged file's own (its deletes dropped, ADR-0114 §4), a joined file's its inputs'.
 fn outputRows(output: borrow CompactionOutput, bin: borrow CompactionBin) -> i64 => match (output.metrics.asBorrow()) {
     Some(m) => m.rows,
@@ -1574,6 +1584,12 @@ fn commitCompaction(
 ) -> Result<bool, TablesError> {
     var written = Vector<Vector<u8>>.create();
     for (i in 0..outputs.length) { written.push(copyBytes(outputs[i].key.view())?)?; }
+    for (r in 0..plan.deleteRewrites.length) {
+        match (plan.deleteRewrites[r].output.asBorrow()) {
+            Some(o) => { written.push(copyBytes(o.key.view())?)?; }
+            null => {}
+        }
+    }
     // Everything the run wrote is deleted unless the swap made it the table's, an error's path included (the M16
     // exit review).
     let outcome = commitWritten(store, plan, outputs, bins, nowMs, mut written);
@@ -1661,7 +1677,26 @@ fn commitWritten(
     // The delete files that apply to nothing live any more (ADR-0114 §5), removed: no data file left after this
     // commit, nor one it adds, that Iceberg's rule says each may apply to.
     var removedDeletes = Vector<usize>.create();
+    // The position delete files of each partition rewritten (ADR-0120 §5): each replaced, DELETED.
+    var rewritten = Vector<usize>.create();
+    var addedDeleteFiles: i64 = 0;
+    var addedPositions: i64 = 0;
+    for (r in 0..plan.deleteRewrites.length) {
+        if (!plan.deleteRewrites[r].done) { continue; }
+        for (x in plan.deleteRewrites[r].files.view()) {
+            gone[plan.deletes[x].manifest].push(plan.deletes[x].entry)?;
+            rewritten.push(x)?;
+        }
+        match (plan.deleteRewrites[r].output.asBorrow()) {
+            Some(o) => {
+                addedDeleteFiles += 1;
+                addedPositions = addChecked(addedPositions, outputRowsOf(o)) ?? { return Ok(false); };
+            }
+            null => {}
+        }
+    }
     for (x in 0..plan.deletes.length) {
+        if (holdsIndex(rewritten.view(), x)) { continue; } // rewritten: not removed again
         let d = borrow plan.deletes[x];
         // Only a delete a committed bin applied (the M24 exit review: not one whose partition merely matched no file).
         var applied = false;
@@ -1674,6 +1709,7 @@ fn commitWritten(
             removedDeletes.push(x)?;
         }
     }
+    removedDeletes.extend(rewritten.view())?;
     // A manifest of the joined files per partition spec (the M16 exit review): each written by a manifest of that
     // spec's schema and metadata, an entry per file of the spec.
     var newList = Vector<Json>.create();
@@ -1792,6 +1828,104 @@ fn commitWritten(
             jsonSet(mut addedRecord, "min_sequence_number", jsonInteger(leastSequence)?)?;
         }
         newList.push(addedRecord)?;
+    }
+    // The rewritten position delete files, ADDED in a delete manifest per spec (ADR-0120 §5).
+    var deleteSpecs = Vector<i64>.create();
+    for (r in 0..plan.deleteRewrites.length) {
+        if (!plan.deleteRewrites[r].done || plan.deleteRewrites[r].output.isNull()) { continue; }
+        let first = borrow plan.deletes[plan.deleteRewrites[r].files[0]];
+        let spec = recordInt(borrow plan.list.records[first.manifest], "partition_spec_id", 0);
+        if (!holdsId(deleteSpecs.view(), spec)) { deleteSpecs.push(spec)?; }
+    }
+    for (sp in 0..deleteSpecs.length) {
+        var template: usize? = null;
+        var entries = Vector<Json>.create();
+        var leastSequence: i64 = sequence;
+        var specRows: i64 = 0;
+        for (r in 0..plan.deleteRewrites.length) {
+            let rw = borrow plan.deleteRewrites[r];
+            if (!rw.done) { continue; }
+            let o = rw.output.asBorrow() ?? { continue; };
+            let first = borrow plan.deletes[rw.files[0]];
+            if (recordInt(borrow plan.list.records[first.manifest], "partition_spec_id", 0) != deleteSpecs[sp]) {
+                continue;
+            }
+            if (template.isNull()) { template = Some(first.manifest); }
+            let rows = outputRowsOf(o);
+            specRows = addChecked(specRows, rows) ?? { return Ok(false); };
+            var entry = cloneJson(borrow plan.manifests[first.manifest].records[first.entry])?;
+            var file = cloneJson(jsonMember(borrow entry, "data_file") ?? { return Ok(false); })?;
+            jsonSet(mut file, "file_path", Json.Text(copyBytes(o.path.view())?))?;
+            jsonSet(mut file, "file_size_in_bytes", jsonInteger(truncate<i64>(o.length))?)?;
+            jsonSet(mut file, "record_count", jsonInteger(rows)?)?;
+            match (o.metrics.asBorrow()) {
+                Some(m) => {
+                    setMetric(mut file, "value_counts", m.valueCounts.view())?;
+                    setMetric(mut file, "null_value_counts", m.nullCounts.view())?;
+                    setMetric(mut file, "lower_bounds", m.lower.view())?;
+                    setMetric(mut file, "upper_bounds", m.upper.view())?;
+                }
+                null => {}
+            }
+            for (name in [
+                "column_sizes",
+                "nan_value_counts",
+                "split_offsets",
+                "key_metadata",
+                "sort_order_id",
+                "referenced_data_file",
+            ]) {
+                if (jsonMember(borrow file, name).isSome()) { jsonSet(mut file, name, Json.Null)?; }
+            }
+            jsonSet(mut entry, "data_file", file)?;
+            jsonSet(mut entry, "status", jsonInteger(1)?)?;
+            jsonSet(mut entry, "snapshot_id", jsonInteger(snapshot)?)?;
+            if (v2) {
+                if (rw.sequence < leastSequence) { leastSequence = rw.sequence; }
+                jsonSet(mut entry, "sequence_number", jsonInteger(rw.sequence)?)?;
+                jsonSet(mut entry, "file_sequence_number", Json.Null)?;
+            }
+            entries.push(entry)?;
+        }
+        let t = template ?? { continue; };
+        let added = match (writeAvroIn(
+            plan.manifests[t].metadata.view(),
+            entries.view(),
+            AvroCodec { kind: plan.avroCodec.kind, level: plan.avroCodec.level },
+        )?) {
+            Some(b) => b,
+            null => { return Ok(false); }
+        };
+        var addedKey = copyBytes(dir.view())?;
+        if (!newUuid(mut addedKey)?) { return Ok(false); }
+        addedKey.extend("-m-compaction-deletes.avro".bytes())?;
+        let addedPath = putWarehouseFile(store, plan, scheme.view(), addedKey.view(), added.view(), written)? ?? {
+            return Ok(false);
+        };
+        var record = cloneJson(borrow plan.list.records[t])?;
+        jsonSet(mut record, "manifest_path", Json.Text(addedPath))?;
+        jsonSet(mut record, "manifest_length", jsonInteger(truncate<i64>(added.length))?)?;
+        jsonSet(mut record, "added_snapshot_id", jsonInteger(snapshot)?)?;
+        jsonSet(mut record, "partitions", Json.Null)?;
+        setCount(mut record, ["added_files_count", "added_data_files_count"][..], truncate<i64>(entries.length))?;
+        setCount(
+            mut record,
+            [
+                "existing_files_count",
+                "existing_data_files_count",
+                "deleted_files_count",
+                "deleted_data_files_count",
+                "existing_rows_count",
+                "deleted_rows_count",
+            ][..],
+            0,
+        )?;
+        setCount(mut record, ["added_rows_count"][..], specRows)?;
+        if (v2) {
+            jsonSet(mut record, "sequence_number", jsonInteger(sequence)?)?;
+            jsonSet(mut record, "min_sequence_number", jsonInteger(leastSequence)?)?;
+        }
+        newList.push(record)?;
     }
     // The manifests that held inputs, rewritten; the others as they are.
     for (i in 0..plan.manifests.length) {
@@ -1935,6 +2069,11 @@ fn commitWritten(
             removedEqualities = addChecked(removedEqualities, rows) ?? { return Ok(false); };
         }
     }
+    if (addedDeleteFiles > 0) {
+        summaryCount(mut summary, "added-delete-files", addedDeleteFiles)?;
+        summaryCount(mut summary, "added-position-delete-files", addedDeleteFiles)?;
+        summaryCount(mut summary, "added-position-deletes", addedPositions)?;
+    }
     if (removedDeletes.length > 0) {
         summaryCount(mut summary, "removed-delete-files", truncate<i64>(removedDeletes.length))?;
         summaryCount(mut summary, "removed-position-delete-files", removedPositionFiles)?;
@@ -1948,9 +2087,9 @@ fn commitWritten(
     // The totals less what the commit removed (rows its deletes dropped, the delete files it removed); a total that
     // would go below 0 (a writer's text, not trusted) is left out.
     let lessRecords = removedRows - addedRows;
-    let lessDeleteFiles = truncate<i64>(removedDeletes.length);
+    let lessDeleteFiles = truncate<i64>(removedDeletes.length) - addedDeleteFiles;
     let totals = ["total-records", "total-delete-files", "total-position-deletes", "total-equality-deletes"];
-    let less = [lessRecords, lessDeleteFiles, removedPositions, removedEqualities];
+    let less = [lessRecords, lessDeleteFiles, removedPositions - addedPositions, removedEqualities];
     for (t in 0..totals.length) {
         match (summaryValue(previous, totals[t])) {
             Some(v) => {
@@ -2110,7 +2249,7 @@ async fn compactTable(
         Err(_) => { return Ok(); } // out of memory: the next run
     }
     var plan = draft.plan;
-    if (plan.bins.length == 0) {
+    if (plan.bins.length == 0 && plan.deleteRewrites.length == 0) {
         var guard = match (await store.get().lock()) {
             Ok(g) => g,
             Err(_) => { return Err(NetError.Closed); }
@@ -2145,6 +2284,8 @@ async fn compactTable(
             _ => {}
         }
     }
+    // Each partition's position deletes rewritten, once the bins written are known (ADR-0120).
+    await rewriteDeletesAll(store, mut plan, joined.view())?;
     var guard = match (await store.get().lock()) {
         Ok(g) => g,
         Err(_) => { return Err(NetError.Closed); }
@@ -2240,7 +2381,11 @@ fn finishCompaction(
     nowMs: i64,
     leftover: borrow mut Vector<Vector<u8>>,
 ) -> Result<void, TablesError> {
-    if (outputs.length == 0) {
+    var rewrites = false;
+    for (r in 0..plan.deleteRewrites.length) {
+        if (plan.deleteRewrites[r].done) { rewrites = true; }
+    }
+    if (outputs.length == 0 && !rewrites) {
         return writeJobStatus(store, plan.hidden.view(), plan.id.view(), COMPACTION, "Successful", "", nowMs);
     }
     let hidden = copyBytes(plan.hidden.view())?;

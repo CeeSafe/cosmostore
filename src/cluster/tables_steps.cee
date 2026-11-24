@@ -137,6 +137,53 @@ async fn compactOnShard(
         // it waits (the M22 exit review's finding 2); the run ends after.
         if (!(await stepCommit(shared, slot)?) || outOfMemory) { return Ok(); }
     }
+    // Each partition's position deletes rewritten (ADR-0120): pinned under the store, read and written off it, and
+    // put in a gated step of its own, as a bin is.
+    if (plan.deleteRewrites.length > 0) {
+        let live = match (await Async.blocking(() => liveDataFiles(borrow plan, joined.view()))) {
+            Ok(l) => l,
+            Err(_) => { return Ok(); }
+        };
+        for (r in 0..plan.deleteRewrites.length) {
+            var prepared: DeleteRewriteCopy? = null;
+            {
+                var guard = match (await store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NodeFault.Net); }
+                };
+                let st = guard.data();
+                let p = borrow plan;
+                prepared = match (await Async.blocking(() => prepareDeleteRewrite(st, p, r))) {
+                    Ok(c) => c,
+                    Err(_) => null,
+                };
+            }
+            var copy = prepared ?? { continue; };
+            let lv = borrow live;
+            let w = match (await Async.blocking(() => writeDeleteRewrite(mut copy, lv))) {
+                Ok(Some(w)) => w,
+                _ => { continue; }
+            };
+            if (pauseMs > 0 && !(await frontPause(pauseMs))) { return Err(NodeFault.Net); }
+            var gate = match (await slot.gate.lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let _held = gate.data();
+            if (!(await stepReady(slot, mut term)?)) { return Ok(); }
+            {
+                var guard = match (await store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NodeFault.Net); }
+                };
+                let st = guard.data();
+                let p = borrow mut plan;
+                let wr = borrow w;
+                let _ = await Async.blocking(() => putDeleteRewrite(st, p, r, wr));
+            }
+            if (!(await stepCommit(shared, slot)?)) { return Ok(); }
+        }
+    }
     // The commit, or the job's status when there is nothing to commit: one gated step.
     var leftover = Vector<Vector<u8>>.create();
     var gate = match (await slot.gate.lock()) {
