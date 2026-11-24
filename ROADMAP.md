@@ -5391,3 +5391,10 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - CeeSafe's zstd encoder (ADR 0196 phase 4), so that ZSTD tables stay ZSTD;
   - Iceberg v3's deletion vectors, and rewriting position delete files;
   - M21's to M24's recorded Lows.
+
+### 24 Nov 2026: M25 is ZSTD written (ADR-0115)
+
+- **M25 proposed and chosen:** ADR-0115's item A.
+  - **First:** CeeSafe's zstd encoder (ADR 0196 phase 4), levels 1 to 9, released here by its `docs/release.md`.
+  - **Then:** compaction writes the table's own codec.
+- **Next:** the encoder, in a CeeSafe worktree; the design ADR here.
