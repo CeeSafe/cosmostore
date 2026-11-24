@@ -5498,3 +5498,31 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **The recommendation is B:** M23's B2 (statistics' order) and B4 (`.` in column names) can mislead a reader of
   files from writers other than Iceberg's, and B is small.
 - **Next:** the owner's choice.
+
+### 24 Nov 2026: M26 decided and slices 1 to 4, the writer's Lows (ADR-0117, ADR-0118)
+
+- **The owner's choices:** B, the writer's Lows; parquet-java as the second reader. ADR-0118 proposed with six
+  slices.
+- **Paths (§3, M23's B4):** a leaf carries its path's names, and `path_in_schema` is written from them, so a column
+  named `a.b` is one name.
+- **Dictionaries (§4, M23's B5):** an index width of at least 1.
+- **Statistics (§1, M23's B2):** each column's order comes from its logical or converted type:
+  - unsigned integers as unsigned;
+  - DECIMAL in BYTE_ARRAY or FIXED by value (FIXED's bounds are written now, where they were left out);
+  - strings, binary and FIXED by unsigned bytes;
+  - floats with NaNs left out, a zero minimum as -0.0 and a zero maximum as +0.0;
+  - INT96, INTERVAL, FLOAT16 and types not known here: none.
+- **Sizes (§2, M23's B3):** `total_uncompressed_size` counts each page's header and its dictionary page.
+- **No 0-row file (§5, M24's B1):** a merged file of no rows is left out of the commit, and deleted after it. A
+  joined file is always added, since its rows are its inputs' stated counts.
+- **Tests:**
+  - `statisticsInEachOrder`, on a new pyarrow fixture (ORDERS: unsigned integers past the signed range, decimals of
+    both signs, ±0.0 and NaNs, names with a `.`);
+  - `pathsFromTheSchema`, `sizesCountHeadersAndDictionaries`, `deletedRowsAddNoFile`;
+  - `tableLevelReachesTheFile` (M25's B2): gzip at 1, 6 and 9 from the table's properties writes three files;
+  - `mergeFailureJoins` (M23's B6), async through `compactTable`: an input whose pages do not read is joined.
+  - Each new test was seen to fail with its fix taken out.
+- **The writer check:** ORDERS written in each codec, read the same by pyarrow (NaN-aware, -0.0 apart), and every
+  flat or struct column's min and max checked against its values (36 files).
+- **Results:** 504 unit tests.
+- **Next:** the parquet-java check (slice 5), then the exit review.

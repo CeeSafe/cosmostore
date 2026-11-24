@@ -992,16 +992,7 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
             for (k in 0..these.length) {
                 columns.push(emptyValues())?;
                 stats.push(emptyStats())?;
-                leaves.push(PageLeaf {
-                    path: copyBytes(these[k].path.view())?,
-                    key: copyBytes(these[k].key.view())?,
-                    fieldId: these[k].fieldId,
-                    unit: these[k].unit,
-                    physical: these[k].physical,
-                    typeLength: these[k].typeLength,
-                    maxDef: these[k].maxDef,
-                    maxRep: these[k].maxRep,
-                })?;
+                leaves.push(copyLeaf(borrow these[k])?)?;
             }
             firstMeta = Some(cloneFields(borrow footer.meta)?);
         }
@@ -1084,9 +1075,11 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
                             if (these[k].maxRep != 0) { return Ok(null); }
                             eqLeaves.push(PageLeaf {
                                 path: Vector<u8>.create(),
+                                names: Vector<u8>.create(),
                                 key: Vector<u8>.create(),
                                 fieldId: these[k].fieldId,
                                 unit: these[k].unit,
+                                order: these[k].order,
                                 physical: these[k].physical,
                                 typeLength: these[k].typeLength,
                                 maxDef: these[k].maxDef,
@@ -1204,6 +1197,14 @@ fn chunkCompressedSize(group: borrow ThriftValue, k: usize) -> i64 {
         null => 0,
     };
 }
+
+/// Whether a written file is left out of the commit (ADR-0118 §5, the M24 exit review's B1): a merged file that holds
+/// no rows, every row of its bin deleted. A joined file's rows are its inputs' stated counts, not its own, so it is
+/// always added.
+fn addsNoFile(output: borrow CompactionOutput) -> bool => match (output.metrics.asBorrow()) {
+    Some(m) => m.rows == 0,
+    null => false,
+};
 
 /// A written file's rows: a merged file's own (its deletes dropped, ADR-0114 §4), a joined file's its inputs'.
 fn outputRows(output: borrow CompactionOutput, bin: borrow CompactionBin) -> i64 => match (output.metrics.asBorrow()) {
@@ -1578,6 +1579,18 @@ fn commitCompaction(
         Ok(d) => d,
         Err(_) => false,
     };
+    if (done) {
+        // A bin whose rows were all deleted adds no file (ADR-0118 §5): its output, written before the commit, is
+        // deleted, and handed back for a cluster's next gated step as an error's are.
+        for (o in 0..outputs.length) {
+            if (!addsNoFile(borrow outputs[o])) { continue; }
+            let _ = store.deleteObject(catalogText(plan.hidden.view()), catalogText(outputs[o].key.view()));
+            match (copyBytes(outputs[o].key.view())) {
+                Ok(k) => { let _ = leftover.push(k); }
+                Err(_) => {}
+            }
+        }
+    }
     if (!done) {
         // Each deleted. On a cluster's leader a key written in this same step is not applied yet, so its delete does
         // nothing: it is handed back, for one more gated step to delete (the M22 exit review's finding 1).
@@ -1624,10 +1637,14 @@ fn commitWritten(
     // The table's sequence number at the plan: a file whose bin applied deletes takes it (ADR-0114 §5), so that no
     // delete committed before applies to it.
     let startSequence = sequence - 1;
+    var addedFiles: i64 = 0;
     for (o in 0..outputs.length) {
         let bin = borrow plan.bins[bins[o]];
-        addedBytes += truncate<i64>(outputs[o].length);
-        addedRows += outputRows(borrow outputs[o], bin);
+        if (!addsNoFile(borrow outputs[o])) {
+            addedFiles += 1;
+            addedBytes += truncate<i64>(outputs[o].length);
+            addedRows += outputRows(borrow outputs[o], bin);
+        }
         for (i in 0..bin.inputs.length) {
             gone[bin.inputs[i].manifest].push(bin.inputs[i].entry)?;
             removedBytes += truncate<i64>(bin.inputs[i].size);
@@ -1660,6 +1677,7 @@ fn commitWritten(
     var newList = Vector<Json>.create();
     var specs = Vector<i64>.create();
     for (o in 0..outputs.length) {
+        if (addsNoFile(borrow outputs[o])) { continue; } // no file (ADR-0118 §5)
         let spec = recordInt(borrow plan.list.records[plan.bins[bins[o]].inputs[0].manifest], "partition_spec_id", 0);
         if (!holdsId(specs.view(), spec)) { specs.push(spec)?; }
     }
@@ -1676,6 +1694,7 @@ fn commitWritten(
                 "partition_spec_id",
                 0,
             ) != specs[sp]) { continue; }
+            if (addsNoFile(borrow outputs[o])) { continue; }
             if (specFiles == 0) { template = bin.inputs[0].manifest; }
             specFiles += 1;
             specRows = addChecked(specRows, outputRows(borrow outputs[o], bin)) ?? { return Ok(false); };
@@ -1891,7 +1910,7 @@ fn commitWritten(
     // The snapshot, and the metadata naming it.
     var summary = jsonObject();
     jsonSet(mut summary, "operation", jsonString("replace".bytes())?)?;
-    summaryCount(mut summary, "added-data-files", truncate<i64>(outputs.length))?;
+    summaryCount(mut summary, "added-data-files", addedFiles)?;
     summaryCount(mut summary, "deleted-data-files", inputsCount)?;
     summaryCount(mut summary, "added-records", addedRows)?;
     summaryCount(mut summary, "deleted-records", removedRows)?;
@@ -1941,7 +1960,7 @@ fn commitWritten(
     // A previous total that would overflow (a writer's text, not trusted) is left out (the M16 exit review).
     match (summaryValue(previous, "total-data-files")) {
         Some(v) => {
-            match (addChecked(v, truncate<i64>(outputs.length) - inputsCount)) {
+            match (addChecked(v, addedFiles - inputsCount)) {
                 Some(t) => { summaryCount(mut summary, "total-data-files", t)?; }
                 null => {}
             }

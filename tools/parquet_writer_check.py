@@ -5,6 +5,7 @@ usage: tools/parquet_writer_check.py DIR   (DIR: the package's out/parquet-writt
        pyarrow)
 """
 import io
+import math
 import os
 import re
 import sys
@@ -28,10 +29,34 @@ for name in names:
     suffix = name.rsplit("-", 1)[-1][:-len(".parquet")]
     codec = {"none": "UNCOMPRESSED", "snappy": "SNAPPY", "gzip": "GZIP", "zstd1": "ZSTD", "zstd3": "ZSTD",
              "zstd9": "ZSTD"}.get(suffix)
-    same = got.equals(want) and all(written.metadata.row_group(0).column(c).compression == codec
+    # By each row's repr: NaN is equal to NaN there (not to Arrow's `equals`), and -0.0 differs from 0.0.
+    same = got.schema.equals(want.schema) and repr(got.to_pylist()) == repr(want.to_pylist()) and all(written.metadata.row_group(0).column(c).compression == codec
                                     for c in range(written.metadata.num_columns))
     stats = all(written.metadata.row_group(0).column(c).statistics is not None
                 for c in range(written.metadata.num_columns))
+    # Each flat or struct column's min and max (ADR-0118 §1) against its values: nulls and NaNs left out, a zero
+    # minimum -0.0 and a zero maximum +0.0.
+    flat = got.flatten()
+    for c in range(written.metadata.num_columns):
+        col = written.metadata.row_group(0).column(c)
+        if col.path_in_schema not in flat.column_names or not col.statistics.has_min_max:
+            continue
+        values = [v for v in flat.column(col.path_in_schema).to_pylist()
+                  if v is not None and not (isinstance(v, float) and math.isnan(v))]
+        if isinstance(col.statistics.min, bytes) and values and isinstance(values[0], str):
+            values = [v.encode() for v in values]
+        least, most = min(values), max(values)
+        if isinstance(least, float) and least == 0:
+            least = -0.0
+        if isinstance(most, float) and most == 0:
+            most = 0.0
+        ok = col.statistics.min == least and col.statistics.max == most and (
+            not isinstance(least, float) or math.copysign(1, col.statistics.min) == math.copysign(1, least)) and (
+            not isinstance(most, float) or math.copysign(1, col.statistics.max) == math.copysign(1, most))
+        if not ok:
+            print("FAIL %s: %s's bounds %r..%r, its values' %r..%r" % (name, col.path_in_schema, col.statistics.min,
+                                                                      col.statistics.max, least, most))
+            stats = False
     print("%s %s: %d rows, codec %s, %s" % ("ok  " if same and stats else "FAIL", name, got.num_rows,
           written.metadata.row_group(0).column(0).compression, "the same table" if same else "NOT the same"))
     failed = failed or not same or not stats

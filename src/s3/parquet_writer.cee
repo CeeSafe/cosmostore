@@ -117,20 +117,45 @@ fn writePlainRange(
     return Ok();
 }
 
-/// How two values of `leaf`'s type order; null when their order is not sure here (a FIXED value's, as a decimal's is
-/// signed; a NaN), and the statistics then leave min and max out.
+/// How two big-endian two's-complement integers of any lengths order (a DECIMAL's unscaled value); an empty one is 0.
+fn compareTwosComplement(a: Slice<u8>, b: Slice<u8>) -> i32 {
+    let negA = a.length > 0 && a[0] >= 0x80;
+    let negB = b.length > 0 && b[0] >= 0x80;
+    if (negA != negB) { return if (negA) -1 else 1; }
+    let n = if (a.length > b.length) a.length else b.length;
+    let pad: u8 = if (negA) 0xFF else 0;
+    for (i in 0..n) {
+        let x = if (i < n - a.length) pad else a[i - (n - a.length)];
+        let y = if (i < n - b.length) pad else b[i - (n - b.length)];
+        if (x != y) { return if (x < y) -1 else 1; }
+    }
+    return 0;
+}
+
+/// How two non-NaN values of `leaf`'s type order, by its statistics order (ADR-0118 §1); null when it has none here.
 fn compareValues(leaf: borrow PageLeaf, a: Slice<u8>, b: Slice<u8>) -> i32? {
-    if (leaf.physical == PQ_INT32) {
-        let x = truncate<i32>(a.readLE<u32>(0));
-        let y = truncate<i32>(b.readLE<u32>(0));
-        return Some(if (x < y) -1 else if (x > y) 1 else 0);
+    let order = leaf.order;
+    if (order == PQ_ORDER_SIGNED || order == PQ_ORDER_UNSIGNED) {
+        let unsigned = order == PQ_ORDER_UNSIGNED;
+        if (leaf.physical == PQ_INT32) {
+            let x = a.readLE<u32>(0);
+            let y = b.readLE<u32>(0);
+            if (unsigned) { return Some(if (x < y) -1 else if (x > y) 1 else 0); }
+            let sx = truncate<i32>(x);
+            let sy = truncate<i32>(y);
+            return Some(if (sx < sy) -1 else if (sx > sy) 1 else 0);
+        }
+        if (leaf.physical == PQ_INT64) {
+            let x = a.readLE<u64>(0);
+            let y = b.readLE<u64>(0);
+            if (unsigned) { return Some(if (x < y) -1 else if (x > y) 1 else 0); }
+            let sx = truncate<i64>(x);
+            let sy = truncate<i64>(y);
+            return Some(if (sx < sy) -1 else if (sx > sy) 1 else 0);
+        }
+        return null;
     }
-    if (leaf.physical == PQ_INT64) {
-        let x = truncate<i64>(a.readLE<u64>(0));
-        let y = truncate<i64>(b.readLE<u64>(0));
-        return Some(if (x < y) -1 else if (x > y) 1 else 0);
-    }
-    if (leaf.physical == PQ_FLOAT || leaf.physical == PQ_DOUBLE) {
+    if (order == PQ_ORDER_FLOAT) {
         let x = if (leaf.physical == PQ_FLOAT) f32.fromBits(
             a.readLE<u32>(0),
         ) as f64 else f64.fromBits(a.readLE<u64>(0));
@@ -140,11 +165,14 @@ fn compareValues(leaf: borrow PageLeaf, a: Slice<u8>, b: Slice<u8>) -> i32? {
         if (x != x || y != y) { return null; }
         return Some(if (x < y) -1 else if (x > y) 1 else 0);
     }
-    if (leaf.physical == PQ_BOOLEAN || leaf.physical == PQ_BYTE_ARRAY) { return Some(compareBytes(a, b)); }
+    if (order == PQ_ORDER_DECIMAL) { return Some(compareTwosComplement(a, b)); }
+    if (order == PQ_ORDER_BYTES) { return Some(compareBytes(a, b)); }
     return null;
 }
 
-/// A chunk's statistics: its nulls, and its least and greatest values when their order is sure.
+/// A chunk's statistics: its nulls, and its least and greatest values in its type's order (ADR-0118 §1): NaNs left
+/// out, a zero minimum written as -0.0 and a zero maximum as +0.0, as the format asks; none when its type has no
+/// order here or every value is a NaN.
 fn statisticsOf(leaf: borrow PageLeaf, v: borrow ColumnValues) -> Result<Vector<ThriftField>, AllocError> {
     var nulls: i64 = 0;
     for (d in v.defs.view()) {
@@ -152,22 +180,59 @@ fn statisticsOf(leaf: borrow PageLeaf, v: borrow ColumnValues) -> Result<Vector<
     }
     var out = Vector<ThriftField>.create();
     out.push(tLong(3, nulls))?;
-    if (v.count == 0) { return Ok(out); }
-    var least: usize = 0;
-    var most: usize = 0;
-    for (i in 1..v.count) {
-        let c = compareValues(leaf, valueAt(v, leaf, i), valueAt(v, leaf, least)) ?? { return Ok(out); };
-        if (c < 0) { least = i; }
-        let d = compareValues(leaf, valueAt(v, leaf, i), valueAt(v, leaf, most)) ?? { return Ok(out); };
-        if (d > 0) { most = i; }
+    var least: usize? = null;
+    var most: usize? = null;
+    for (i in 0..v.count) {
+        let x = valueAt(v, leaf, i);
+        if (isNaNValue(leaf.physical, x)) { continue; }
+        match (least) {
+            Some(l) => {
+                let c = compareValues(leaf, x, valueAt(v, leaf, l)) ?? { return Ok(out); };
+                if (c < 0) { least = Some(i); }
+            }
+            null => {
+                if (compareValues(leaf, x, x).isNull()) { return Ok(out); }
+                least = Some(i);
+            }
+        }
+        match (most) {
+            Some(m) => {
+                let c = compareValues(leaf, x, valueAt(v, leaf, m)) ?? { return Ok(out); };
+                if (c > 0) { most = Some(i); }
+            }
+            null => { most = Some(i); }
+        }
     }
-    if (compareValues(leaf, valueAt(v, leaf, 0), valueAt(v, leaf, 0)).isNull()) { return Ok(out); }
-    out.push(tBinary(5, valueAt(v, leaf, most))?)?;
-    out.push(tBinary(6, valueAt(v, leaf, least))?)?;
+    let l = least ?? { return Ok(out); };
+    let m = most ?? { return Ok(out); };
+    var max = copyBytes(valueAt(v, leaf, m))?;
+    var min = copyBytes(valueAt(v, leaf, l))?;
+    if (leaf.order == PQ_ORDER_FLOAT) {
+        // A zero's sign bit is the last byte's top bit (little-endian): cleared in the maximum, set in the minimum.
+        let top = max.length - 1;
+        if (isZeroFloat(leaf, max.view())) { max[top] = max[top] & 0x7F; }
+        if (isZeroFloat(leaf, min.view())) { min[top] = min[top] | 0x80; }
+    }
+    out.push(tBinary(5, max.view())?)?;
+    out.push(tBinary(6, min.view())?)?;
     return Ok(out);
 }
 
+/// Whether `a` is a zero (+0.0 or -0.0) of `leaf`'s FLOAT or DOUBLE.
+fn isZeroFloat(leaf: borrow PageLeaf, a: Slice<u8>) -> bool {
+    if (leaf.physical == PQ_FLOAT) { return (a.readLE<u32>(0) & 0x7FFFFFFF) == 0; }
+    if (leaf.physical == PQ_DOUBLE) { return (a.readLE<u64>(0) & 0x7FFFFFFFFFFFFFFF) == 0; }
+    return false;
+}
+
 // ---- A column chunk ----
+
+/// A dictionary's index width for `count` values: at least 1, as Arrow and parquet-java write it (ADR-0118 §4, the M23
+/// exit review's B5), though a width of 0 holds the one index of a dictionary of one value.
+fn indexWidthOf(count: usize) -> u32 {
+    let w = bitWidthOf(truncate<u32>(count - 1));
+    return if (w == 0) 1 else w;
+}
 
 /// A page's bytes compressed by `codec`; null for a codec not written here.
 fn compressPage(codec: i64, level: u32, page: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
@@ -192,7 +257,8 @@ fn compressPage(codec: i64, level: u32, page: Slice<u8>) -> Result<Vector<u8>?, 
     return Ok(null);
 }
 
-/// A page's header and its (compressed) bytes, appended to `out`.
+/// A page's header and its (compressed) bytes, appended to `out`; its header's and uncompressed body's size, or null
+/// for a codec not written here.
 fn writePage(
     out: borrow mut Vector<u8>,
     codec: i64,
@@ -200,16 +266,19 @@ fn writePage(
     kind: i64,
     page: Slice<u8>,
     detail: ThriftField,
-) -> Result<bool, AllocError> {
-    let compressed = compressPage(codec, level, page)? ?? { return Ok(false); };
+) -> Result<i64?, AllocError> {
+    let compressed = compressPage(codec, level, page)? ?? { return Ok(null); };
     var header = Vector<ThriftField>.create();
     header.push(tInt(1, kind))?;
     header.push(tInt(2, truncate<i64>(page.length)))?;
     header.push(tInt(3, truncate<i64>(compressed.length)))?;
     header.push(detail)?;
+    let before = out.length;
     writeThriftStruct(out, header.view())?;
+    let headerLength = out.length - before;
     out.extend(compressed.view())?;
-    return Ok(true);
+    // The page's size as `total_uncompressed_size` counts it: its header and its uncompressed body (ADR-0118 §2).
+    return Ok(Some(truncate<i64>(headerLength + page.length)));
 }
 
 /// The dictionary of a chunk's values, when it is smaller than PLAIN: its values (PLAIN, in first-seen order) and
@@ -241,7 +310,7 @@ fn dictionaryOf(leaf: borrow PageLeaf, v: borrow ColumnValues) -> Result<ChunkDi
             }
         }
     }
-    let width = bitWidthOf(truncate<u32>(seen.length() - 1));
+    let width = indexWidthOf(seen.length());
     let encoded = values.length + (v.count * width as usize + 7) / 8 + 16;
     if (encoded >= plain) { return Ok(null); }
     return Ok(Some(ChunkDictionary { values: values, count: seen.length(), indexes: indexes }));
@@ -270,29 +339,30 @@ fn writeColumnChunkAt(
     let start = out.length;
     let dictionary = dictionaryOf(leaf, v)?;
     var dictionaryOffset: u64? = null;
+    var dictionarySize: i64 = 0;
     match (borrow dictionary) {
         Some(d) => {
             dictionaryOffset = Some(offset + (out.length - start) as u64);
             var detail = Vector<ThriftField>.create();
             detail.push(tInt(1, truncate<i64>(d.count)))?;
             detail.push(tInt(2, PQ_ENC_PLAIN))?;
-            if (!(writePage(
+            dictionarySize = writePage(
                 out,
                 codec,
                 codecLevel,
                 PQ_PAGE_DICTIONARY,
                 d.values.view(),
                 tStruct(7, detail),
-            )?)) { return Ok(null); }
+            )? ?? { return Ok(null); };
         }
         null => {}
     }
     let dataOffset = offset + (out.length - start) as u64;
     let width = match (borrow dictionary) {
-        Some(d) => bitWidthOf(truncate<u32>(d.count - 1)),
+        Some(d) => indexWidthOf(d.count),
         null => 0,
     };
-    var uncompressedTotal: i64 = 0;
+    var uncompressedTotal: i64 = dictionarySize;
     var level: usize = 0;
     var value: usize = 0;
     while (level < v.defs.length) {
@@ -323,13 +393,14 @@ fn writeColumnChunkAt(
                 PQ_ENC_PLAIN
             },
         };
-        uncompressedTotal += truncate<i64>(page.length);
         var detail = Vector<ThriftField>.create();
         detail.push(tInt(1, truncate<i64>(to - level)))?;
         detail.push(tInt(2, encoding))?;
         detail.push(tInt(3, PQ_ENC_RLE))?;
         detail.push(tInt(4, PQ_ENC_RLE))?;
-        if (!(writePage(out, codec, codecLevel, PQ_PAGE_DATA, page.view(), tStruct(5, detail))?)) { return Ok(null); }
+        uncompressedTotal += writePage(out, codec, codecLevel, PQ_PAGE_DATA, page.view(), tStruct(5, detail))? ?? {
+            return Ok(null);
+        };
         level = to;
         value += present;
     }
@@ -339,17 +410,17 @@ fn writeColumnChunkAt(
     encodings.push(ThriftValue.Int(THRIFT_I32, if (dictionary.isSome()) PQ_ENC_RLE_DICTIONARY else PQ_ENC_PLAIN))?;
     encodings.push(ThriftValue.Int(THRIFT_I32, PQ_ENC_RLE))?;
     if (dictionary.isSome()) { encodings.push(ThriftValue.Int(THRIFT_I32, PQ_ENC_PLAIN))?; }
+    // The path's own names, so a name holding a `.` stays one (ADR-0118 §3, the M23 exit review's B4).
     var path = Vector<ThriftValue>.create();
-    var part = Vector<u8>.create();
-    for (c in leaf.path.view()) {
-        if (c == '.') {
-            path.push(ThriftValue.Binary(part))?;
-            part = Vector<u8>.create();
-        } else {
-            part.push(c)?;
-        }
+    let names = leaf.names.view();
+    var at: usize = 0;
+    while (at + 4 <= names.length) {
+        let n = names.readLE<u32>(at) as usize;
+        if (at + 4 + n > names.length) { return Ok(null); }
+        path.push(ThriftValue.Binary(copyBytes(names[at + 4..at + 4 + n])?))?;
+        at += 4 + n;
     }
-    path.push(ThriftValue.Binary(part))?;
+    if (path.length == 0 || at != names.length) { return Ok(null); }
     let total = truncate<i64>(out.length - start);
     var meta = Vector<ThriftField>.create();
     meta.push(tInt(PQ_META_TYPE, leaf.physical))?;

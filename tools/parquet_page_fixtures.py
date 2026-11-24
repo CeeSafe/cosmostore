@@ -6,7 +6,9 @@ rows here (not from pyarrow's reading).
 
 usage: tools/parquet_page_fixtures.py OUT.cee          (needs pyarrow; the codecs here are none, gzip, snappy and zstd)
 """
+import decimal
 import io
+import math
 import struct
 import sys
 
@@ -91,6 +93,39 @@ compact_position_rows = [{"file_path": compact_path % "a", "pos": 0}, {"file_pat
 compact_equality_schema = pa.schema([with_id(flat_schema.field("id"), 1)])
 compact_equality_rows = [{"id": flat_rows[2]["id"]}, {"id": flat_rows[7]["id"]}]
 
+# Statistics' orders (ADR-0118 §1): unsigned integers past the signed range, decimals of both signs in FIXED, floats
+# with -0.0, +0.0 and NaNs, and names holding a `.` (a column's, a struct's and its field's).
+orders_schema = pa.schema([
+    pa.field("u8", pa.uint8()),
+    pa.field("u32", pa.uint32()),
+    pa.field("u64", pa.uint64()),
+    pa.field("dec", pa.decimal128(9, 2)),
+    pa.field("wide", pa.decimal128(20, 3)),
+    pa.field("f", pa.float32()),
+    pa.field("zeros", pa.float64()),
+    pa.field("a.b", pa.int32()),
+    pa.field("s.t", pa.struct([pa.field("x.y", pa.string())])),
+])
+D = decimal.Decimal
+orders_rows = []
+for i in range(12):
+    orders_rows.append({
+        "u8": None if i == 5 else [3, 200, 7, 255, 0, 1, 128, 127, 9, 250, 2, 4][i],
+        "u32": [1, 3000000000, 5, 4294967295, 2147483648, 7, 0, 2147483647, 9, 11, 3, 4][i],
+        "u64": None if i == 2 else [1, 2 ** 63, 5, 2 ** 64 - 1, 3, 0, 7, 2 ** 63 - 1, 9, 11, 3, 4][i],
+        "dec": [D("1.25"), D("-3.50"), D("1000000.00"), D("-9999999.99"), D("0.00"), D("2.00"), D("-0.01"),
+                D("7.77"), D("3.00"), D("-2.00"), D("5.50"), D("6.60")][i],
+        "wide": None if i % 4 == 1 else D("-12345678901234567.891") if i == 3 else D(i * 1000003) / 1000 - 4,
+        "f": [math.nan, -0.0, 1.5, 0.0, -2.25, math.nan, 3.0, 0.0, -0.0, 1.0, math.nan, 2.0][i],
+        "zeros": [0.0, -0.0, math.nan, 0.0, -0.0, 0.0, -0.0, math.nan, 0.0, 0.0, -0.0, 0.0][i],
+        "a.b": i * 7 - 30,
+        "s.t": None if i == 6 else {"x.y": None if i == 9 else "v%d" % (i * 13 % 7)},
+    })
+orders_nodes = [("prim", "u8", True, "u32"), ("prim", "u32", True, "u32"), ("prim", "u64", True, "u64"),
+                ("prim", "dec", True, "dec4"), ("prim", "wide", True, "dec9"), ("prim", "f", True, "f32"),
+                ("prim", "zeros", True, "f64"), ("prim", "a.b", True, "i32"),
+                ("struct", "s.t", True, [("prim", "x.y", True, "bytes")])]
+
 renamed_nodes = [(n[0], "c_" + n[1], n[2], n[3]) for n in reversed(flat_nodes)]
 nested_nodes = [
     ("prim", "id", False, "i32"),
@@ -166,6 +201,15 @@ def shredded(nodes, rows):
 def value_text(kind, v):
     if kind in ("i32", "i64"):
         return str(v)
+    # Unsigned integers as the reader renders their bits: as signed.
+    if kind == "u32":
+        return str(v - 2 ** 32 if v >= 2 ** 31 else v)
+    if kind == "u64":
+        return str(v - 2 ** 64 if v >= 2 ** 63 else v)
+    # A FIXED decimal's bytes: its unscaled value, big-endian two's complement, in the type's length.
+    if kind in ("dec4", "dec9"):
+        n = int(kind[3:])
+        return int(v * (100 if n == 4 else 1000)).to_bytes(n, "big", signed=True).hex()
     if kind == "f32":
         return struct.pack("<f", v).hex()
     if kind == "f64":
@@ -232,6 +276,9 @@ fixtures = [
     ("FLAT_IDS_RENAMED", "the same columns and ids, in the other order and renamed: v2 pages, PLAIN, none", write(
         renamed_schema, renamed_rows, compression="none", use_dictionary=False, data_page_version="2.0"),
         renamed_nodes, renamed_rows),
+    ("ORDERS", "statistics' orders: unsigned, decimals, floats with zeros and NaNs, names with a `.`: v1, PLAIN", write(
+        orders_schema, orders_rows, compression="none", use_dictionary=False, data_page_version="1.0"), orders_nodes,
+        orders_rows),
     ("DELETES_POSITION", "a position delete file: v1 pages, snappy", write(position_schema, position_rows,
         compression="snappy", data_page_version="1.0"), position_nodes, position_rows),
     ("DELETES_EQUALITY", "an equality delete file on id and s: v2 pages, zstd", write(equality_schema, equality_rows,
@@ -250,7 +297,9 @@ for name, _, data, nodes, rows in fixtures:
             g, w = got[k], want[k]
             if isinstance(w, list) and w and isinstance(w[0], tuple):
                 g = [tuple(x) for x in g]
-            if isinstance(w, float) or isinstance(g, float):
+            if isinstance(w, float) and math.isnan(w):
+                assert isinstance(g, float) and math.isnan(g), (name, k, g, w)
+            elif isinstance(w, float) or isinstance(g, float):
                 assert g is None and w is None or abs(g - w) <= abs(w) * 1e-6, (name, k, g, w)
             else:
                 assert g == w, (name, k, g, w)

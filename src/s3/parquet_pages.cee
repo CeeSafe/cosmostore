@@ -61,6 +61,111 @@ const PQ_UNIT_MILLIS: u8 = 1;
 const PQ_UNIT_MICROS: u8 = 2;
 const PQ_UNIT_NANOS: u8 = 3;
 
+// How a column's statistics order its values (ADR-0118 §1), by its logical or converted type.
+const PQ_ORDER_NONE: u8 = 0;
+const PQ_ORDER_SIGNED: u8 = 1;
+const PQ_ORDER_UNSIGNED: u8 = 2;
+/// A DECIMAL in BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY: big-endian two's complement, by value.
+const PQ_ORDER_DECIMAL: u8 = 3;
+/// Unsigned bytes: strings, binary, BOOLEAN's 0 and 1.
+const PQ_ORDER_BYTES: u8 = 4;
+/// FLOAT and DOUBLE, NaNs left out.
+const PQ_ORDER_FLOAT: u8 = 5;
+
+/// The fields of member `id` of a struct field (a union's chosen member included); null when absent or not a struct.
+fn memberOf<region a>(fields: borrow(a) Vector<ThriftField>, id: i16) -> borrow(a) Vector<ThriftField>? {
+    return match (thriftField(fields, id)) {
+        Some(v) => match (v) {
+            ThriftValue.Struct(f) => Some(f),
+            _ => null,
+        },
+        null => null,
+    };
+}
+
+/// A leaf schema element's statistics order (ADR-0118 §1): from its logical type (field 10), else its converted
+/// type (field 6), else its physical type. PQ_ORDER_NONE for INT96, INTERVAL, FLOAT16 and a type not known here.
+fn orderOf(e: borrow Vector<ThriftField>, physical: i64) -> u8 {
+    let integer = physical == PQ_INT32 || physical == PQ_INT64;
+    let binary = physical == PQ_BYTE_ARRAY || physical == PQ_FIXED;
+    let decimal = if (integer) PQ_ORDER_SIGNED else if (binary) PQ_ORDER_DECIMAL else PQ_ORDER_NONE;
+    match (memberOf(e, 10)) {
+        Some(lt) => {
+            match (memberOf(lt, 10)) {
+                Some(it) => {
+                    if (!integer) { return PQ_ORDER_NONE; }
+                    return match (thriftField(it, 2)) {
+                        Some(v) => match (v) {
+                            ThriftValue.Bool(signed) => if (*signed) PQ_ORDER_SIGNED else PQ_ORDER_UNSIGNED,
+                            _ => PQ_ORDER_NONE,
+                        },
+                        null => PQ_ORDER_NONE,
+                    };
+                }
+                null => {}
+            }
+            if (memberOf(lt, 5).isSome()) { return decimal; }
+            for (id in [1i16, 4, 12, 13, 14]) {
+                if (memberOf(lt, id).isSome()) { return if (binary) PQ_ORDER_BYTES else PQ_ORDER_NONE; }
+            }
+            for (id in [6i16, 7, 8]) {
+                if (memberOf(lt, id).isSome()) { return if (integer) PQ_ORDER_SIGNED else PQ_ORDER_NONE; }
+            }
+            // UNKNOWN (always null) orders as its physical type; any other is not known here.
+            if (memberOf(lt, 11).isNull()) { return PQ_ORDER_NONE; }
+        }
+        null => {
+            match (thriftInt(e, 6)) {
+                Some(c) => {
+                    if (c >= 11 && c <= 14) { return if (integer) PQ_ORDER_UNSIGNED else PQ_ORDER_NONE; }
+                    if (c == 5) { return decimal; }
+                    if (c == 0 || c == 4 || c == 19 || c == 20) {
+                        return if (binary) PQ_ORDER_BYTES else PQ_ORDER_NONE;
+                    }
+                    if ((c >= 6 && c <= 10) || (c >= 15 && c <= 18)) {
+                        return if (integer) PQ_ORDER_SIGNED else PQ_ORDER_NONE;
+                    }
+                    return PQ_ORDER_NONE;
+                }
+                null => {}
+            }
+        }
+    }
+    if (integer) { return PQ_ORDER_SIGNED; }
+    if (physical == PQ_FLOAT || physical == PQ_DOUBLE) { return PQ_ORDER_FLOAT; }
+    if (physical == PQ_BOOLEAN || binary) { return PQ_ORDER_BYTES; }
+    return PQ_ORDER_NONE;
+}
+
+/// `name` appended to a path's names (`PageLeaf.names`): its length (u32, little-endian), then its bytes.
+fn appendName(names: borrow mut Vector<u8>, name: Slice<u8>) -> Result<void, AllocError> {
+    let n = truncate<u32>(name.length);
+    for (shift in [0u32, 8, 16, 24]) { names.push(truncate<u8>(n >> shift))?; }
+    names.extend(name)?;
+    return Ok();
+}
+
+/// One name as a path's names (a test's leaf, or a column at the root).
+fn namesOf(name: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    appendName(mut out, name)?;
+    return Ok(out);
+}
+
+/// A copy of `leaf`.
+fn copyLeaf(leaf: borrow PageLeaf) -> Result<PageLeaf, AllocError> => Ok(PageLeaf {
+    path: copyBytes(leaf.path.view())?,
+    names: copyBytes(leaf.names.view())?,
+    key: copyBytes(leaf.key.view())?,
+    fieldId: leaf.fieldId,
+    unit: leaf.unit,
+    order: leaf.order,
+    physical: leaf.physical,
+    typeLength: leaf.typeLength,
+    maxDef: leaf.maxDef,
+    maxRep: leaf.maxRep,
+});
+
 /// A schema element's time unit: its logical type's TIME (7) or TIMESTAMP (8) unit, or its converted type's
 /// (TIME_MILLIS 7, TIME_MICROS 8, TIMESTAMP_MILLIS 9, TIMESTAMP_MICROS 10).
 fn timeUnitOf(e: borrow Vector<ThriftField>) -> u8 {
@@ -112,6 +217,8 @@ fn timeUnitOf(e: borrow Vector<ThriftField>) -> u8 {
 /// length, and its greatest definition and repetition levels; and `key`, which names it across writers (ADR-0112 §2).
 struct PageLeaf {
     path: Vector<u8>;
+    /// The path's names, each as `appendName` writes it, so a name holding a `.` stays one name (ADR-0118 §3).
+    names: Vector<u8>;
     /// Each element from the root's child down: its repetition, and its Iceberg field id (its name when it has none);
     /// then the leaf's type, length, converted and logical types, scale and precision. Two files' leaves of one key
     /// hold the same values, whatever their writers named a list's or map's groups.
@@ -121,6 +228,8 @@ struct PageLeaf {
     /// A time or timestamp's unit, by its logical or converted type: PQ_UNIT_MILLIS, _MICROS or _NANOS; PQ_UNIT_NONE
     /// for another column (the M24 exit review's M2: Iceberg's timestamps are microseconds, or nanoseconds).
     unit: u8;
+    /// How its statistics order its values: a PQ_ORDER_ (ADR-0118 §1).
+    order: u8;
     physical: i64;
     typeLength: usize;
     maxDef: u32;
@@ -195,7 +304,7 @@ fn schemaLeaves(meta: borrow Vector<ThriftField>) -> Result<Vector<PageLeaf>?, A
     };
     let children = thriftInt(root, 5) ?? 0;
     for (c in 0..children) {
-        if (!(walkSchema(elements, mut at, "".bytes(), "".bytes(), 0, 0, 0, mut out)?)) { return Ok(null); }
+        if (!(walkSchema(elements, mut at, "".bytes(), "".bytes(), "".bytes(), 0, 0, 0, mut out)?)) { return Ok(null); }
         if (c > 100000) { return Ok(null); }
     }
     if (at != elements.length) { return Ok(null); }
@@ -206,6 +315,7 @@ fn walkSchema(
     elements: borrow Vector<ThriftValue>,
     at: borrow mut usize,
     prefix: Slice<u8>,
+    namesPrefix: Slice<u8>,
     keyPrefix: Slice<u8>,
     def: u32,
     rep: u32,
@@ -227,6 +337,8 @@ fn walkSchema(
     var path = copyBytes(prefix)?;
     if (path.length > 0) { path.push('.')?; }
     path.extend(name)?;
+    var names = copyBytes(namesPrefix)?;
+    appendName(mut names, name)?;
     var key = copyBytes(keyPrefix)?;
     key.push(truncate<u8>(repetition) + '0')?;
     match (thriftInt(e, 9)) {
@@ -244,7 +356,9 @@ fn walkSchema(
         Some(children) => {
             if (children < 0 || children > 100000) { return Ok(false); }
             for (c in 0..children) {
-                if (!(walkSchema(elements, at, path.view(), key.view(), d, r, depth + 1, out)?)) { return Ok(false); }
+                if (!(walkSchema(elements, at, path.view(), names.view(), key.view(), d, r, depth + 1, out)?)) {
+                    return Ok(false);
+                }
             }
         }
         null => {
@@ -259,9 +373,11 @@ fn walkSchema(
             }
             out.push(PageLeaf {
                 path: path,
+                names: names,
                 key: key,
                 fieldId: thriftInt(e, 9) ?? -1,
                 unit: timeUnitOf(e),
+                order: orderOf(e, physical),
                 physical: physical,
                 typeLength: checkedTruncate<usize>(length) ?? { return Ok(false); },
                 maxDef: d,

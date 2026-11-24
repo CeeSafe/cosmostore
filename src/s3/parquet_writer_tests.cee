@@ -123,7 +123,177 @@ fn pagesWrittenReadBackTheSame() -> Result<void, TestFailure> {
             codecLevel,
             dir.view(),
         )?;
+        rewriteFixture("ORDERS", PAGES_ORDERS[..], PAGES_ORDERS_EXPECTED[..], codec, codecLevel, dir.view())?;
     }
+    return Ok();
+}
+
+/// A binary field of a struct as hex, "-" when it is absent.
+fn binaryHex(fields: borrow Vector<ThriftField>, id: i16) -> String {
+    var out = String.create();
+    match (thriftField(fields, id)) {
+        Some(v) => {
+            match (v) {
+                ThriftValue.Binary(b) => {
+                    var hex = Vector<u8>.create();
+                    appendHexBytes(mut hex, b.view())!;
+                    out.append(StringView.fromUtf8(hex.view()) ?? "?")!;
+                }
+                _ => { out.append("?")!; }
+            }
+        }
+        null => { out.append("-")!; }
+    }
+    return out;
+}
+
+/// Statistics in each column's own order (ADR-0118 §1, the M23 exit review's B2): unsigned integers past the signed
+/// range, decimals by value, a zero minimum as -0.0 and a zero maximum as +0.0, NaNs left out.
+@test
+fn statisticsInEachOrder() -> Result<void, TestFailure> {
+    let read = readFixture(fixtureBytes(PAGES_ORDERS[..]).view())?;
+    // `max/min` a column, little-endian for numbers, big-endian for decimals.
+    let want = [
+        "ff000000/00000000",
+        "ffffffff/00000000",
+        "ffffffffffffffff/0000000000000000",
+        "05f5e100/c4653601",
+        "000000000000a7c941/ff54ab567314e0f52d",
+        "00004040/000010c0",
+        "0000000000000000/0000000000000080",
+        "2f000000/e2ffffff",
+        "7636/7630",
+    ];
+    Check.equalU64(want.length as u64, read.leaves.length as u64)?;
+    for (c in 0..read.leaves.length) {
+        let stats = statisticsOf(borrow read.leaves[c], borrow read.columns[c])!;
+        var got = binaryHex(borrow stats, 5);
+        got.append("/")!;
+        let least = binaryHex(borrow stats, 6);
+        got.append(least.view())!;
+        Check.equalText(want[c], got.view())?;
+    }
+    // The orders read from the schema.
+    let orders = [
+        PQ_ORDER_UNSIGNED,
+        PQ_ORDER_UNSIGNED,
+        PQ_ORDER_UNSIGNED,
+        PQ_ORDER_DECIMAL,
+        PQ_ORDER_DECIMAL,
+        PQ_ORDER_FLOAT,
+        PQ_ORDER_FLOAT,
+        PQ_ORDER_SIGNED,
+        PQ_ORDER_BYTES,
+    ];
+    for (c in 0..read.leaves.length) { Check.equalU64(orders[c] as u64, read.leaves[c].order as u64)?; }
+    // A column of NaNs only has no bounds.
+    let nanOnly = [0u8, 0, 0xC0, 0x7F];
+    var v = emptyValues();
+    for (i in 0..3) {
+        v.data.extend(nanOnly[..])!;
+        v.defs.push(1)!;
+        v.reps.push(0)!;
+        v.count += 1;
+    }
+    let stats = statisticsOf(borrow read.leaves[5], borrow v)!;
+    Check.equalText("-", binaryHex(borrow stats, 5).view())?;
+    return Ok();
+}
+
+/// The chunks of a written file's first row group.
+fn writtenChunks(written: Slice<u8>) -> Result<Vector<Vector<ThriftField>>, TestFailure> {
+    let n = parquetFooterLength(written[written.length - 8..], written.length as u64) ?? {
+        return Err(TestFailure.create("a footer"));
+    };
+    let start = written.length - 8 - n as usize;
+    let footer = parseParquetFooter(written[start..written.length - 8], written.length as u64)!!;
+    let groups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? { return Err(TestFailure.create("groups")); };
+    let group = match (borrow groups[0]) {
+        ThriftValue.Struct(f) => f,
+        _ => { return Err(TestFailure.create("a row group")); }
+    };
+    let chunks = structItems(group, PQ_GROUP_COLUMNS) ?? { return Err(TestFailure.create("columns")); };
+    var out = Vector<Vector<ThriftField>>.create();
+    for (c in 0..chunks.length) {
+        let chunk = match (borrow chunks[c]) {
+            ThriftValue.Struct(f) => f,
+            _ => { return Err(TestFailure.create("a chunk")); }
+        };
+        let meta = match (thriftField(chunk, PQ_CHUNK_META)) {
+            Some(m) => match (m) {
+                ThriftValue.Struct(f) => f,
+                _ => { return Err(TestFailure.create("its metadata")); }
+            },
+            null => { return Err(TestFailure.create("its metadata")); }
+        };
+        out.push(cloneFields(meta)!)!;
+    }
+    return Ok(out);
+}
+
+/// Paths from the schema's names (ADR-0118 §3, the M23 exit review's B4): a column named `a.b` is one name, and a
+/// struct `s.t`'s field `x.y` two.
+@test
+fn pathsFromTheSchema() -> Result<void, TestFailure> {
+    let read = readFixture(fixtureBytes(PAGES_ORDERS[..]).view())?;
+    let written = writeParquetFile(
+        borrow read.meta,
+        read.leaves.view(),
+        read.columns.view(),
+        read.rows,
+        PQ_CODEC_SNAPPY,
+        0,
+    )! ?? { return Err(TestFailure.create("written")); };
+    let chunks = writtenChunks(written.view())?;
+    let wants = ["a.b", "s.t|x.y"];
+    let at = [7usize, 8];
+    for (k in 0..2) {
+        let path = match (thriftField(borrow chunks[at[k]], 3)) {
+            Some(v) => match (v) {
+                ThriftValue.List(_, _, items) => items,
+                _ => { return Err(TestFailure.create("a path")); }
+            },
+            null => { return Err(TestFailure.create("a path")); }
+        };
+        var got = String.create();
+        for (i in 0..path.length) {
+            if (i > 0) { got.append("|")!; }
+            match (borrow path[i]) {
+                ThriftValue.Binary(b) => { got.append(StringView.fromUtf8(b.view()) ?? "?")!; }
+                _ => { return Err(TestFailure.create("a name")); }
+            }
+        }
+        Check.equalText(wants[k], got.view())?;
+    }
+    return Ok();
+}
+
+/// Sizes as the format defines them (ADR-0118 §2, the M23 exit review's B3): uncompressed, a chunk's
+/// `total_uncompressed_size` is every byte it holds, headers and dictionary page included, so it equals its
+/// compressed size; and a dictionary's index width is at least 1 (§4).
+@test
+fn sizesCountHeadersAndDictionaries() -> Result<void, TestFailure> {
+    let read = readFixture(fixtureBytes(PAGES_FLAT_V1_DICT[..]).view())?;
+    let written = writeParquetFile(
+        borrow read.meta,
+        read.leaves.view(),
+        read.columns.view(),
+        read.rows,
+        PQ_CODEC_UNCOMPRESSED,
+        0,
+    )! ?? { return Err(TestFailure.create("written")); };
+    let chunks = writtenChunks(written.view())?;
+    var dictionaries: usize = 0;
+    for (c in 0..chunks.length) {
+        let uncompressed = thriftInt(borrow chunks[c], 6) ?? -1;
+        let compressed = thriftInt(borrow chunks[c], PQ_META_TOTAL_COMPRESSED) ?? -2;
+        Check.equalI64(compressed, uncompressed)?;
+        if (thriftInt(borrow chunks[c], PQ_META_DICT_OFFSET).isSome()) { dictionaries += 1; }
+    }
+    Check.isTrue(dictionaries > 0, "a chunk with a dictionary")?;
+    Check.equalU64(1, indexWidthOf(1) as u64)?;
+    Check.equalU64(1, indexWidthOf(2) as u64)?;
+    Check.equalU64(2, indexWidthOf(3) as u64)?;
     return Ok();
 }
 
