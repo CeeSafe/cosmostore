@@ -67,10 +67,11 @@ fn fixtureCompactStoreWith(
     bRows: i64,
     withDeletes: bool,
     otherSpec: bool,
-) => fixtureCompactStoreFull(dir, config, a, aRows, b, bRows, withDeletes, otherSpec, false);
+) => fixtureCompactStoreFull(dir, config, a, aRows, b, bRows, withDeletes, otherSpec, 0);
 
-/// `fixtureCompactStoreWith`, with a second position delete file when `secondPositions` (DELETES_REWRITE_POSITION:
-/// rows naming c, a file gone, and a; ADR-0120).
+/// `fixtureCompactStoreWith`, with c and other position deletes by `positions`: 1, a second position delete file
+/// (DELETES_REWRITE_POSITION: rows naming c, a file gone, and a; ADR-0120); 2, the position delete file one naming
+/// only c, its `file_path` bounds stated (ADR-0122 §1). c is live in a's partition (named ORC) unless `otherSpec`.
 fn fixtureCompactStoreFull(
     dir: Slice<u8>,
     config: StoreConfig,
@@ -80,8 +81,10 @@ fn fixtureCompactStoreFull(
     bRows: i64,
     withDeletes: bool,
     otherSpec: bool,
-    secondPositions: bool,
+    positions: i32,
 ) {
+    let secondPositions = positions == 1;
+    let withC = positions != 0;
     var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", config)!;
     s.createBucket(COMPACT_HIDDEN)!;
     let hidden = COMPACT_HIDDEN.bytes();
@@ -98,7 +101,7 @@ fn fixtureCompactStoreFull(
     entries.push(
         compactEntry(borrow fixture.records[0], compactPath("data/kind=a/b.parquet").view(), b.length, bRows),
     )!;
-    if (secondPositions && !otherSpec) {
+    if (withC && !otherSpec) {
         // c, live in a's partition and spec, which compaction does not rewrite: its manifest names it ORC (ADR-0120's
         // tests: the rows naming it are kept).
         let c = fixtureBytes(PAGES_FLAT_IDS[..]);
@@ -129,7 +132,9 @@ fn fixtureCompactStoreFull(
                 else if (k == 1) "data/kind=a/equality-deletes.parquet"
                 else "data/kind=a/position-deletes-2.parquet";
             var bytes = Vector<u8>.create();
-            if (k == 0) {
+            if (k == 0 && positions == 2) {
+                bytes = fixtureBytes(PAGES_DELETES_C_POSITION[..]);
+            } else if (k == 0) {
                 bytes = fixtureBytes(PAGES_DELETES_COMPACT_POSITION[..]);
             } else if (k == 1) {
                 bytes = fixtureBytes(PAGES_DELETES_COMPACT_EQUALITY[..]);
@@ -148,9 +153,20 @@ fn fixtureCompactStoreFull(
                 borrow fixture.records[0],
                 compactPath(name).view(),
                 bytes.length,
-                if (k == 0) 3 else if (k == 1) 2 else 5,
+                if (k == 0 && positions == 2) 1 else if (k == 0) 3 else if (k == 1) 2 else 5,
             );
             var file = cloneJson(jsonMember(borrow entry, "data_file")!)!;
+            if (k == 0 && positions == 2) {
+                // Its `file_path` bounds, equal: the one file it names.
+                for (bounds in ["lower_bounds", "upper_bounds"]) {
+                    var pair = jsonObject();
+                    jsonSet(mut pair, "key", jsonInteger(ICEBERG_DELETE_FILE_PATH)!)!;
+                    jsonSet(mut pair, "value", Json.Text(compactPath("data/kind=a/c.parquet")))!;
+                    var items = Vector<Json>.create();
+                    items.push(pair)!;
+                    jsonSet(mut file, bounds, Json.Array(items))!;
+                }
+            }
             jsonSet(mut file, "content", jsonInteger(if (k == 1) 2 else 1)!)!;
             if (k == 1) {
                 var ids = Vector<Json>.create();
@@ -258,18 +274,23 @@ fn fixtureCompactStoreFull(
 /// A compaction run, step by step as `compactTable` takes them (its locked steps here in one thread): the plan, the
 /// footers, each bin's copy and put, the commit. A step that fails ends the run, as a fault does a real one.
 fn compactionWorkload(dir: Slice<u8>, config: StoreConfig) {
+    let _ = compactionWorkloadCounting(dir, config);
+}
+
+/// `compactionWorkload`, and how many partitions' position delete files it read to rewrite.
+fn compactionWorkloadCounting(dir: Slice<u8>, config: StoreConfig) -> usize {
     var s = match (ObjectStore.open(StringView.fromUtf8(dir) ?? "", config)) {
         Ok(s) => s,
-        Err(_) => { return; }
+        Err(_) => { return 0; }
     };
     let t = compactTableName();
     var draft = match (planCompaction(mut s, borrow t, 50000)) {
         Ok(Some(d)) => d,
-        _ => { return; }
+        _ => { return 0; }
     };
-    if (readFooterLengths(mut draft).isErr()) { return; }
+    if (readFooterLengths(mut draft).isErr()) { return 0; }
     pinFooters(mut s, mut draft);
-    if (finishPlan(mut draft).isErr()) { return; }
+    if (finishPlan(mut draft).isErr()) { return 0; }
     var plan = draft.plan;
     var outputs = Vector<CompactionOutput>.create();
     var joined = Vector<usize>.create();
@@ -286,14 +307,18 @@ fn compactionWorkload(dir: Slice<u8>, config: StoreConfig) {
             Ok(Some(o)) => {
                 var out = o;
                 out.metrics = copy.metrics;
-                if (outputs.push(out).isErr() || joined.push(b).isErr()) { return; }
+                if (outputs.push(out).isErr() || joined.push(b).isErr()) { return 0; }
             }
             _ => {}
         }
     }
-    if (rewriteDeletesNow(mut s, mut plan, joined.view()).isErr()) { return; }
+    let read = match (rewriteDeletesNow(mut s, mut plan, joined.view())) {
+        Ok(n) => n,
+        Err(_) => { return 0; }
+    };
     var leftover = Vector<Vector<u8>>.create();
     let _ = finishCompaction(mut s, mut plan, borrow outputs, joined.view(), 50000, mut leftover);
+    return read;
 }
 
 /// A recovered store's table: its metadata names snapshot 1 (before) or a replace after it, every data file its
@@ -1071,7 +1096,7 @@ fn rewriteStore(dir: Slice<u8>, config: StoreConfig) =>
         23,
         true,
         false,
-        true,
+        1,
     );
 
 /// Compaction that rewrites position deletes, swept for faults and crashes at every I/O point (ADR-0120 §6).
@@ -1143,7 +1168,7 @@ fn crossPartitionRowsLeaveTheRewrite() -> Result<void, TestFailure> {
         23,
         true,
         true,
-        true,
+        1,
     );
     compactionWorkload(dir.bytes(), storeConfig());
     let s = ObjectStore.open(dir.view(), storeConfig())!;
@@ -1156,6 +1181,41 @@ fn crossPartitionRowsLeaveTheRewrite() -> Result<void, TestFailure> {
     }
     Check.isTrue(kept, "the second position delete file as it was")?;
     removeTree(dir.view());
+    return Ok();
+}
+
+/// A partition's position delete files read only when a rewrite could change them (ADR-0122 §1, M27's B1): one file
+/// whose `file_path` bounds name c alone, live in its partition, is not read and stays; two files are read.
+@test
+fn rewriteReadsOnlyWhatCouldChange() -> Result<void, TestFailure> {
+    let one = scratchDirectory("compact-rewrite-one");
+    fixtureCompactStoreFull(
+        one.bytes(),
+        storeConfig(),
+        fixtureBytes(PAGES_FLAT_IDS[..]),
+        23,
+        fixtureBytes(PAGES_FLAT_IDS_RENAMED[..]),
+        23,
+        true,
+        false,
+        2,
+    );
+    Check.equalU64(0, compactionWorkloadCounting(one.bytes(), storeConfig()) as u64)?;
+    {
+        let s = ObjectStore.open(one.view(), storeConfig())!;
+        let c = tableCounts(borrow s)?;
+        let first = compactPath("data/kind=a/position-deletes.parquet");
+        var kept = false;
+        for (p in c.deletePaths.view()) {
+            if (p.view() == first.view()) { kept = true; }
+        }
+        Check.isTrue(kept, "the one file naming c, as it was")?;
+    }
+    removeTree(one.view());
+    let two = scratchDirectory("compact-rewrite-two");
+    rewriteStore(two.bytes(), storeConfig());
+    Check.equalU64(1, compactionWorkloadCounting(two.bytes(), storeConfig()) as u64)?;
+    removeTree(two.view());
     return Ok();
 }
 

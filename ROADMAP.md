@@ -5667,3 +5667,20 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **The recommendation is A, with B as its first slice;** for A, deletion vectors applied by compaction, none
   written.
 - **Next:** the owner's choice.
+
+### 24 Nov 2026: M28 decided, ADR-0122 proposed, slice 1 (the rewrite's cost)
+
+- **The owner's choices:** Iceberg v3 tables, with the rewrite's cost first; deletion vectors applied by compaction,
+  none written.
+- **ADR-0122** (proposed), from the v3 spec:
+  - the catalog creates v3 tables (the `format-version` property), upgrades 2 to 3, and takes a v3 snapshot's
+    `first-row-id` and `added-rows`, advancing `next-row-id`;
+  - compaction writes each row's `_row_id` and `_last_updated_sequence_number` into the merged file, and commits as
+    a v3 writer;
+  - deletion vectors read from Puffin and applied;
+  - M27's rewrite writes no position delete file in a v3 table.
+  - **PyIceberg 0.12** writes v3 snapshots and reads deletion vectors, but writes none. The checks write their own,
+    and Iceberg Java is a slice of its own.
+- **Slice 1 (M27's B1):** a partition whose one position delete file's `file_path` bounds name one file, live in it
+  at or below its sequence number, is not read. `rewriteReadsOnlyWhatCouldChange` counts the reads (0 for that
+  partition, 1 for two files), and fails with the check taken out. 511 unit tests.

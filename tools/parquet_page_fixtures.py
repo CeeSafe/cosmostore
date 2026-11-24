@@ -95,6 +95,8 @@ compact_position_rows = [{"file_path": compact_path % "a", "pos": 0}, {"file_pat
 rewrite_position_rows = [{"file_path": compact_path % "c", "pos": 2}, {"file_path": compact_path % "gone", "pos": 7},
                          {"file_path": compact_path % "c", "pos": 0}, {"file_path": compact_path % "a", "pos": 3},
                          {"file_path": compact_path % "c", "pos": 2}]
+# A position delete file naming only c (ADR-0122 §1: one path, live, so nothing to rewrite).
+c_position_rows = [{"file_path": compact_path % "c", "pos": 1}]
 compact_equality_schema = pa.schema([with_id(flat_schema.field("id"), 1)])
 compact_equality_rows = [{"id": flat_rows[2]["id"]}, {"id": flat_rows[7]["id"]}]
 
@@ -292,6 +294,8 @@ fixtures = [
         compact_position_rows, compression="snappy"), position_nodes, compact_position_rows),
     ("DELETES_REWRITE_POSITION", "a second position delete file of the sweep's partition, to be rewritten", write(
         position_schema, rewrite_position_rows, compression="snappy"), position_nodes, rewrite_position_rows),
+    ("DELETES_C_POSITION", "a position delete file naming only c", write(position_schema, c_position_rows,
+        compression="snappy"), position_nodes, c_position_rows),
     ("DELETES_COMPACT_EQUALITY", "the compaction sweep's equality deletes, on id", write(compact_equality_schema,
         compact_equality_rows, compression="snappy"), [("prim", "id", False, "i64")], compact_equality_rows),
 ]
