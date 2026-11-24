@@ -1,7 +1,8 @@
 # ADR-0120: position deletes rewritten within compaction (M27)
 
-**Status:** proposed, 24 Nov 2026. M27 is ADR-0119's item B with C's CI step first (the owner: "B + CI step"),
-the rewrite made within compaction's run ("In compaction's run").
+**Status:** accepted, 24 Nov 2026, as built below (the owner: "Accept and close", after M27's exit review,
+`docs/m27-exit-review.md`). Proposed the same day: M27 is ADR-0119's item B with C's CI step first (the owner:
+"B + CI step"), the rewrite made within compaction's run ("In compaction's run").
 
 ## Context
 
@@ -19,7 +20,7 @@ the rewrite made within compaction's run ("In compaction's run").
 - **What compaction has:** each position delete file is read whole for a bin (`readPositionDeletesWithin`, bounded
   at 8 M rows), its spec and partition key and sequence number, and the plan's live data files.
 
-## Decision (proposed)
+## Decision
 
 1. **The CI step (slice 1):** CI's check job installs a JDK and Maven 3.9.9 (from archive.apache.org, its SHA-512
    checked) and runs `tools/parquet_java_check.sh` after the tests (M26's B3).
@@ -66,3 +67,15 @@ the rewrite made within compaction's run ("In compaction's run").
 - **A table's position delete files stop accumulating** across compactions, and scan plans read one a partition.
 - **v3's deletion vectors (ADR-0119's A)** can reuse the kept-row rule and exact removal.
 - **Compaction reads every position delete file of a partition it rewrites,** within the bound of §2.
+
+## As built (M27)
+
+- **§2:** a partition is also left as it is when a row names a file of another partition, since readers scope a
+  delete file by partition, or by path when its `file_path` bounds are equal (the exit review's L2).
+- **§5:**
+  - one added delete manifest per source manifest, not per spec, so each entry is written with the Avro schema it
+    was read with (the exit review's M1; compaction's added data manifest likewise);
+  - the summary's sizes count delete files (L3).
+- **§6:** the new file is read in the checks by PyIceberg's scan. parquet-java reads the writer it shares with
+  compaction's data files, in CI.
+- **The exit review's Lows** are recorded in `docs/m27-exit-review.md` (B1 to B3).

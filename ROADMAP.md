@@ -5646,3 +5646,14 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Results:** 510 unit tests, the fuzzer, and the s3, cluster (209) and maintenance smokes, `compaction_check.py`'s
   109 checks on `serve` and through a cluster.
 - **Next:** the owner's word on ADR-0120 and on closing M27.
+
+### 24 Nov 2026: M27 closed (ADR-0120 accepted)
+
+- **The owner's decision:** "Accept and close". ADR-0120 is accepted, with its As built.
+- **M27 is closed.** The exit review's B1 to B3 are recorded in `docs/m27-exit-review.md`. M24's B3 (conservative
+  position-delete removal) is closed by it.
+- **Next:** M28, when the owner asks. Candidates on record:
+  - Iceberg v3 tables (ADR-0119's A): row lineage, deletion vectors;
+  - M27's B1, the rewrite's cost at every run;
+  - M22's B2 and B3 (asks across a leader change, a loop a node);
+  - M21's, M24's and M25's remaining Lows.
