@@ -5799,3 +5799,13 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     transforms, lineage on branches;
   - M22's B2 and B3 (asks across a leader change, a loop a node);
   - M21's, M24's to M27's remaining Lows.
+
+### 25 Nov 2026: M29 proposed (ADR-0123)
+
+- **The candidates:**
+  - **A:** engines' catalog calls (staged creates: Iceberg Java's create and replace transactions, CTAS's and
+    RTAS's way; each other REST call its client makes that is refused today);
+  - **B:** S3 Tables' tags and encryption;
+  - **C:** the cluster's Lows.
+- **The recommendation is A.**
+- **Next:** the owner's choice.
