@@ -5698,3 +5698,32 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **The unreferenced-file sweep** reads v3 metadata; format 4 ends its run.
 - **Tests:** `icebergV3Tables`; the sweep's and the updates' tests moved to format 4 as the one refused. 512 unit
   tests.
+
+### 24 Nov 2026: M28 slice 3, compaction keeps a v3 table's row lineage (ADR-0122 §3)
+
+- **From Iceberg Java's source:**
+  - **Inheritance:** a data file with a null `first_row_id` gets its manifest's, counted in file order over the
+    ADDED and EXISTING entries whose own is null. DELETED entries do not count.
+  - **The V3 list writer** gives each data manifest without a `first_row_id` the next range, sized by its existing
+    and added rows. `added-rows` is the total given.
+- **The plan:** a v3 table is compacted when its list and data manifests carry `first_row_id`, every data manifest
+  has one, and the metadata has `next-row-id`. A file without a first row id is no candidate.
+- **The merge (`src/s3/table_lineage.cee`):**
+  - the merged file's schema has `_row_id` and `_last_updated_sequence_number` last at the root, as optional INT64s
+    with their reserved ids; any an input had are removed from where they were;
+  - each row's values are its file's own where present, else the file's first row id plus its position, and the
+    file's data sequence number;
+  - a row a delete drops takes its lineage with it;
+  - files with and without the columns are grouped together.
+- **The commit, as a v3 writer:**
+  - a rewritten data manifest writes each carried entry's first row id explicitly;
+  - new manifests (rewritten and added) get theirs from the table's `next-row-id`;
+  - an ADDED entry's is null;
+  - the snapshot has `first-row-id` and `added-rows`, and the table's `next-row-id` advances.
+- **M27's rewrite** writes no position delete file in a v3 table: it only removes files when no row is kept.
+- **Test:** `v3CompactionKeepsRowIds`, on the fixture table made v3 (the v3 fields added to its Avro schemas):
+  - a's rows keep 100 on (inherited) and b's 500 on (its own), with and without deletes;
+  - the snapshot's `first-row-id` is 1000, and `next-row-id` advances by the rows.
+- **Results:** 513 unit tests.
+- **Found:** PyIceberg 0.12 makes and reads v3 tables, but cannot append to one (it writes no v3 manifest). Iceberg
+  Java is the v3 writer of the checks.

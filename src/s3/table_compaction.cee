@@ -15,7 +15,7 @@ const COMPACTION_SMALL_PERCENT: u64 = 75;
 /// delete file stays as it is (ADR-0098 §2).
 const COMPACTION_APPLIES_DELETES: bool = true;
 /// The highest table format compacted (ADR-0122): 3 once its row lineage is kept.
-const COMPACTION_MAX_FORMAT: i64 = 2;
+const COMPACTION_MAX_FORMAT: i64 = 3;
 /// The most files one run reads the footers of: a table of more is compacted over several runs.
 const COMPACTION_MAX_CANDIDATES: usize = 10000;
 
@@ -36,6 +36,8 @@ struct CompactionInput {
     partitionKey: Vector<u8>;
     /// Its spec, partition (as JSON) and shape: the files of a bin share them.
     group: Vector<u8>;
+    /// Its first row id (v3, ADR-0122 §3): its entry's, or inherited from its manifest's; -1 when it has none.
+    firstRowId: i64;
 }
 
 /// Files joined into one, and the join's plan.
@@ -170,6 +172,7 @@ struct PendingInput {
     entry: usize;
     sequence: i64;
     partitionKey: Vector<u8>;
+    firstRowId: i64;
     /// Its last 8 bytes, pinned under the lock; then its footer's, once their length is known (0: not joined).
     tail: PreparedReader;
     footerLength: u64;
@@ -282,12 +285,30 @@ fn planCompaction(
             }
         }
     }
+    // A v3 table's lineage (ADR-0122 §3): its list and data manifests must carry `first_row_id`, and each data
+    // manifest one of its own (given by the first v3 snapshot); else the table stays as it is, as a writer that
+    // could not keep its rows' ids would leave it.
+    let lineage = (jsonMemberI64(borrow m, "format-version") ?? 1) >= 3;
+    if (lineage) {
+        if (jsonMemberI64(borrow m, "next-row-id").isNull()) { return Ok(null); }
+        for (i in 0..list.records.length) {
+            if (recordInt(borrow list.records[i], "content", 0) != 0) { continue; }
+            if (jsonMemberI64(borrow list.records[i], "first_row_id").isNull()) { return Ok(null); }
+            for (e in 0..manifests[i].records.length) {
+                let file = jsonMember(borrow manifests[i].records[e], "data_file") ?? { return Ok(null); };
+                if (jsonMember(file, "first_row_id").isNull()) { return Ok(null); }
+            }
+        }
+    }
     // The candidates, by group, in path order: their footers read after, off the lock.
     var pending = Vector<PendingInput>.create();
     let small = target * COMPACTION_SMALL_PERCENT / 100;
     for (i in 0..list.records.length) {
         let manifestRecord = borrow list.records[i];
         if (recordInt(manifestRecord, "content", 0) != 0) { continue; }
+        // Iceberg Java's inheritance: the manifest's first row id, given in file order to each live entry whose own
+        // is null, advanced by its rows.
+        var inherited: i64? = jsonMemberI64(manifestRecord, "first_row_id");
         let spec = recordInt(manifestRecord, "partition_spec_id", 0);
         // A delete file of another spec may apply to any of this spec's partitions.
         var otherSpec = false;
@@ -301,6 +322,17 @@ fn planCompaction(
             let entry = borrow manifests[i].records[e];
             if (recordInt(entry, "status", 0) == 2) { continue; }
             let file = jsonMember(entry, "data_file") ?? { continue; };
+            let firstRowId = match (jsonMemberI64(file, "first_row_id")) {
+                Some(given) => given,
+                null => match (inherited) {
+                    Some(n) => {
+                        inherited = addChecked(n, recordInt(file, "record_count", 0));
+                        n
+                    }
+                    null => -1,
+                },
+            };
+            if (lineage && firstRowId < 0) { continue; }
             if (recordInt(file, "content", 0) != 0) { continue; }
             let format = jsonMemberText(file, "file_format") ?? "".bytes();
             if (!equalsIgnoreCase(format, "PARQUET".bytes())) { continue; }
@@ -348,6 +380,7 @@ fn planCompaction(
                 entry: e,
                 sequence: sequence,
                 partitionKey: partitionKey,
+                firstRowId: firstRowId,
                 tail: tail,
                 footerLength: 0,
                 footer: null,
@@ -409,7 +442,8 @@ fn finishPlan(d: borrow mut CompactionDraft) -> Result<void, TablesError> {
         match (mergeable) {
             Some(leaves) => {
                 group.push('M')?;
-                group.extend(mergeKeyOf(leaves.view())?.view())?;
+                // Without the lineage columns, which some of a v3 table's files hold and others not (ADR-0122 §3).
+                group.extend(mergeKeyOf(dataLeavesOf(leaves.view())?.leaves.view())?.view())?;
             }
             null => {
                 group.push('J')?;
@@ -427,6 +461,7 @@ fn finishPlan(d: borrow mut CompactionDraft) -> Result<void, TablesError> {
             sequence: c.sequence,
             partitionKey: copyBytes(c.partitionKey.view())?,
             group: group,
+            firstRowId: c.firstRowId,
         })?;
     }
     d.plan.bins = binsOf(inputs, d.target, d.plan.deletes.view())?;
@@ -763,6 +798,9 @@ struct BinCopy {
     binDeletes: Vector<BinDelete>;
     inputPaths: Vector<Vector<u8>>;
     inputSequences: Vector<i64>;
+    /// A v3 table's merge (ADR-0122 §3): each row's lineage written, from each input's first row id.
+    lineage: bool;
+    inputFirstRowIds: Vector<i64>;
 }
 
 /// A delete file applied by a merge: its content, its data sequence number, and an equality delete's field ids with
@@ -873,9 +911,13 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
         }
         var inputPaths = Vector<Vector<u8>>.create();
         var inputSequences = Vector<i64>.create();
+        var inputFirstRowIds = Vector<i64>.create();
+        let lineage = plan.formatVersion >= 3;
         for (i in 0..bin.inputs.length) {
             inputPaths.push(copyBytes(bin.inputs[i].path.view())?)?;
             inputSequences.push(bin.inputs[i].sequence)?;
+            if (lineage && bin.inputs[i].firstRowId < 0) { return Ok(null); }
+            inputFirstRowIds.push(bin.inputs[i].firstRowId)?;
         }
         return Ok(Some(BinCopy {
             deleteReaders: deleteReaders,
@@ -889,9 +931,11 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
             merge: true,
             rowGroupBytes: plan.rowGroupBytes,
             metricsPlan: match (schemaLeaves(borrow bin.inputs[0].footer.meta)?) {
-                Some(leaves) => metricsPlanOf(borrow plan.metadata, leaves.view())?,
+                Some(leaves) => metricsPlanOf(borrow plan.metadata, mergedLeavesOf(leaves.view(), lineage)?.view())?,
                 null => { return Ok(null); }
             },
+            lineage: lineage,
+            inputFirstRowIds: inputFirstRowIds,
             metrics: null,
             pageCodec: plan.pageCodec,
             pageLevel: plan.pageLevel,
@@ -925,6 +969,8 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
         binDeletes: Vector<BinDelete>.create(),
         inputPaths: Vector<Vector<u8>>.create(),
         inputSequences: Vector<i64>.create(),
+        lineage: false,
+        inputFirstRowIds: Vector<i64>.create(),
     }));
 }
 
@@ -997,14 +1043,23 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
         let footer = borrow c.footers[i];
         let these = schemaLeaves(borrow footer.meta)? ?? { return Ok(null); };
         if (firstMeta.isNull()) {
-            for (k in 0..these.length) {
+            leaves = mergedLeavesOf(these.view(), c.lineage)?;
+            for (k in 0..leaves.length) {
                 columns.push(emptyValues())?;
                 stats.push(emptyStats())?;
-                leaves.push(copyLeaf(borrow these[k])?)?;
             }
-            firstMeta = Some(cloneFields(borrow footer.meta)?);
+            firstMeta = if (c.lineage) withLineageSchema(borrow footer.meta)? else Some(
+                cloneFields(borrow footer.meta)?,
+            );
+            if (firstMeta.isNull()) { return Ok(null); }
         }
-        let order = leafOrder(leaves.view(), these.view())? ?? { return Ok(null); };
+        // The columns merged by key: with lineage, all but the lineage columns, which are written last.
+        let data = dataLeavesOf(these.view())?;
+        let lineageCount: usize = if (c.lineage) 2 else 0;
+        let merged = leaves.length - lineageCount;
+        let order = if (c.lineage) leafOrder(leaves.view()[0..merged], data.leaves.view())? ?? { return Ok(null); }
+            else leafOrder(leaves.view(), these.view())? ?? { return Ok(null); };
+        if (c.lineage && (i >= c.inputFirstRowIds.length || i >= c.inputSequences.length)) { return Ok(null); }
         let fileGroups = structItems(borrow footer.meta, PQ_FILE_ROW_GROUPS) ?? { return Ok(null); };
         // The rows its position deletes name (by Iceberg's rule, those at or above its sequence number), sorted, and
         // the equality deletes above it.
@@ -1112,14 +1167,37 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
                     }
                 }
             }
-            for (k in 0..groupValues.length) {
+            for (j in 0..order.length) {
+                let k = if (c.lineage) data.at[j] else j;
                 if (dropped == 0) {
                     held += heldBytes(borrow groupValues[k]);
-                    if (!(appendValues(mut columns[order[k]], borrow groupValues[k])?)) { return Ok(null); }
+                    if (!(appendValues(mut columns[order[j]], borrow groupValues[k])?)) { return Ok(null); }
                 } else {
                     let kept = keptRows(borrow these[k], borrow groupValues[k], keep.view())? ?? { return Ok(null); };
                     held += heldBytes(borrow kept);
-                    if (!(appendValues(mut columns[order[k]], borrow kept)?)) { return Ok(null); }
+                    if (!(appendValues(mut columns[order[j]], borrow kept)?)) { return Ok(null); }
+                }
+            }
+            // Each row's lineage (ADR-0122 §3), its deletes' rows dropped with it.
+            if (c.lineage) {
+                let lineageValues = lineageColumns(
+                    these.view(),
+                    borrow groupValues,
+                    count,
+                    fileRow,
+                    c.inputFirstRowIds[i],
+                    c.inputSequences[i],
+                )? ?? { return Ok(null); };
+                for (w in 0..2) {
+                    let at = merged + w;
+                    if (dropped == 0) {
+                        if (!(appendValues(mut columns[at], borrow lineageValues[w])?)) { return Ok(null); }
+                    } else {
+                        let kept = keptRows(borrow leaves[at], borrow lineageValues[w], keep.view())? ?? {
+                            return Ok(null);
+                        };
+                        if (!(appendValues(mut columns[at], borrow kept)?)) { return Ok(null); }
+                    }
                 }
             }
             fileRow += groupRows;
@@ -1783,7 +1861,15 @@ fn commitWritten(
                     }
                 }
             }
-            for (name in ["split_offsets", "key_metadata", "sort_order_id", "equality_ids", "distinct_counts"]) {
+            // An ADDED entry's first row id is null: its manifest's is assigned at the commit (ADR-0122 §3).
+            for (name in [
+                "split_offsets",
+                "key_metadata",
+                "sort_order_id",
+                "equality_ids",
+                "distinct_counts",
+                "first_row_id",
+            ]) {
                 if (jsonMember(borrow file, name).isSome()) { jsonSet(mut file, name, Json.Null)?; }
             }
             jsonSet(mut entry, "data_file", file)?;
@@ -1817,6 +1903,9 @@ fn commitWritten(
             written,
         )? ?? { return Ok(false); };
         var addedRecord = cloneJson(borrow plan.list.records[template])?;
+        if (jsonMember(borrow addedRecord, "first_row_id").isSome()) {
+            jsonSet(mut addedRecord, "first_row_id", Json.Null)?; // assigned below (v3)
+        }
         jsonSet(mut addedRecord, "manifest_path", Json.Text(addedPath))?;
         jsonSet(mut addedRecord, "manifest_length", jsonInteger(truncate<i64>(addedManifest.length))?)?;
         jsonSet(mut addedRecord, "added_snapshot_id", jsonInteger(snapshot)?)?;
@@ -1884,6 +1973,7 @@ fn commitWritten(
                 "key_metadata",
                 "sort_order_id",
                 "referenced_data_file",
+                "first_row_id",
             ]) {
                 if (jsonMember(borrow file, name).isSome()) { jsonSet(mut file, name, Json.Null)?; }
             }
@@ -1913,6 +2003,7 @@ fn commitWritten(
             return Ok(false);
         };
         var record = cloneJson(borrow plan.list.records[t])?;
+        if (jsonMember(borrow record, "first_row_id").isSome()) { jsonSet(mut record, "first_row_id", Json.Null)?; }
         jsonSet(mut record, "manifest_path", Json.Text(addedPath))?;
         jsonSet(mut record, "manifest_length", jsonInteger(truncate<i64>(added.length))?)?;
         jsonSet(mut record, "added_snapshot_id", jsonInteger(snapshot)?)?;
@@ -1944,6 +2035,10 @@ fn commitWritten(
             continue;
         }
         let manifestSequence = recordInt(borrow plan.list.records[i], "sequence_number", 0);
+        // v3 (ADR-0122 §3): each carried data entry's first row id written as it is inherited now, since this new
+        // manifest is given a first row id of its own.
+        let lineageHere = plan.formatVersion >= 3 && recordInt(borrow plan.list.records[i], "content", 0) == 0;
+        var inherited: i64? = jsonMemberI64(borrow plan.list.records[i], "first_row_id");
         var kept = Vector<Json>.create();
         var existing: i64 = 0;
         var existingRows: i64 = 0;
@@ -1955,6 +2050,19 @@ fn commitWritten(
             let status = recordInt(old, "status", 0);
             if (status == 2) { continue; } // deleted before: not carried
             var entry = cloneJson(old)?;
+            if (lineageHere) {
+                var file = cloneJson(jsonMember(borrow entry, "data_file") ?? { return Ok(false); })?;
+                let given = match (jsonMemberI64(borrow file, "first_row_id")) {
+                    Some(g) => g,
+                    null => {
+                        let n = inherited ?? { return Ok(false); };
+                        inherited = addChecked(n, recordInt(borrow file, "record_count", 0));
+                        n
+                    }
+                };
+                jsonSet(mut file, "first_row_id", jsonInteger(given)?)?;
+                jsonSet(mut entry, "data_file", file)?;
+            }
             let rows = match (jsonMember(old, "data_file")) {
                 Some(d) => recordInt(d, "record_count", 0),
                 null => 0,
@@ -2005,6 +2113,7 @@ fn commitWritten(
             written,
         )? ?? { return Ok(false); };
         var record = cloneJson(borrow plan.list.records[i])?;
+        if (lineageHere) { jsonSet(mut record, "first_row_id", Json.Null)?; } // a new manifest: assigned below
         jsonSet(mut record, "manifest_path", Json.Text(path))?;
         jsonSet(mut record, "manifest_length", jsonInteger(truncate<i64>(bytes.length))?)?;
         jsonSet(mut record, "added_snapshot_id", jsonInteger(snapshot)?)?;
@@ -2018,6 +2127,23 @@ fn commitWritten(
             jsonSet(mut record, "min_sequence_number", jsonInteger(least)?)?;
         }
         newList.push(record)?;
+    }
+    // v3's row lineage (ADR-0122 §3), as Iceberg Java's manifest list writer gives it: each data manifest without a
+    // first row id gets the table's next, advanced by its existing and added rows; the snapshot's `first-row-id` is
+    // where it started, and `added-rows` how far it went.
+    let lineageStart = jsonMemberI64(borrow plan.metadata, "next-row-id") ?? 0;
+    var lineageNext = lineageStart;
+    if (plan.formatVersion >= 3) {
+        for (k in 0..newList.length) {
+            if (recordInt(borrow newList[k], "content", 0) != 0) { continue; }
+            if (jsonMemberI64(borrow newList[k], "first_row_id").isSome()) { continue; }
+            jsonSet(mut newList[k], "first_row_id", jsonInteger(lineageNext)?)?;
+            let rows = addChecked(
+                recordInt(borrow newList[k], "existing_rows_count", 0),
+                recordInt(borrow newList[k], "added_rows_count", 0),
+            ) ?? { return Ok(false); };
+            lineageNext = addChecked(lineageNext, rows) ?? { return Ok(false); };
+        }
     }
     // The manifest list, with the list's metadata naming the new snapshot.
     var listMeta = Vector<JsonMember>.create();
@@ -2131,6 +2257,10 @@ fn commitWritten(
     jsonSet(mut snap, "snapshot-id", jsonInteger(snapshot)?)?;
     jsonSet(mut snap, "parent-snapshot-id", jsonInteger(plan.snapshot)?)?;
     if (v2) { jsonSet(mut snap, "sequence-number", jsonInteger(sequence)?)?; }
+    if (plan.formatVersion >= 3) {
+        jsonSet(mut snap, "first-row-id", jsonInteger(lineageStart)?)?;
+        jsonSet(mut snap, "added-rows", jsonInteger(lineageNext - lineageStart)?)?;
+    }
     jsonSet(mut snap, "timestamp-ms", jsonInteger(nowMs)?)?;
     jsonSet(mut snap, "manifest-list", Json.Text(newListPath))?;
     jsonSet(mut snap, "summary", summary)?;
@@ -2142,6 +2272,7 @@ fn commitWritten(
     appendTo(mut m, "snapshots", snap)?;
     jsonSet(mut m, "current-snapshot-id", jsonInteger(snapshot)?)?;
     if (v2) { jsonSet(mut m, "last-sequence-number", jsonInteger(sequence)?)?; }
+    if (plan.formatVersion >= 3) { jsonSet(mut m, "next-row-id", jsonInteger(lineageNext)?)?; }
     var log = jsonObject();
     jsonSet(mut log, "timestamp-ms", jsonInteger(nowMs)?)?;
     jsonSet(mut log, "snapshot-id", jsonInteger(snapshot)?)?;

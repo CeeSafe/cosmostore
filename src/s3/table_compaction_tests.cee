@@ -1219,6 +1219,188 @@ fn rewriteReadsOnlyWhatCouldChange() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// An Avro file's metadata with its schema given v3's `first_row_id` (ADR-0122): in a manifest's data file (field
+/// 142), or, for a manifest list, in each manifest's record (520); and its `format-version` 3.
+fn withFirstRowIdField(metadata: Slice<JsonMember>, list: bool) -> Vector<JsonMember> {
+    var out = Vector<JsonMember>.create();
+    for (k in 0..metadata.length) {
+        let key = metadata[k].key.view();
+        var value = cloneJson(borrow metadata[k].value)!;
+        if (key == "avro.schema".bytes()) {
+            let schemaText = match (borrow value) {
+                Json.Text(t) => copyBytes(t.view())!,
+                _ => Vector<u8>.create(),
+            };
+            var schema = parseJson(schemaText.view())!!;
+            var field = jsonObject();
+            jsonSet(mut field, "name", jsonString("first_row_id".bytes())!)!;
+            var union = Vector<Json>.create();
+            union.push(jsonString("null".bytes())!)!;
+            union.push(jsonString("long".bytes())!)!;
+            jsonSet(mut field, "type", Json.Array(union))!;
+            jsonSet(mut field, "default", Json.Null)!;
+            jsonSet(mut field, "field-id", jsonInteger(if (list) 520 else 142)!)!;
+            if (list) {
+                pushSchemaField(mut schema, field);
+            } else {
+                // The data file record: the type of the entry's `data_file` field.
+                var fields = Vector<Json>.create();
+                for (f in memberItems(borrow schema, "fields")!.view()) {
+                    var copy = cloneJson(f)!;
+                    if (jsonMemberText(f, "name") == Some("data_file".bytes())) {
+                        var record = cloneJson(jsonMember(f, "type")!)!;
+                        pushSchemaField(mut record, cloneJson(borrow field)!);
+                        jsonSet(mut copy, "type", record)!;
+                    }
+                    fields.push(copy)!;
+                }
+                jsonSet(mut schema, "fields", Json.Array(fields))!;
+            }
+            var text = Vector<u8>.create();
+            writeJson(mut text, borrow schema)!;
+            value = Json.Text(text);
+        }
+        if (key == "format-version".bytes()) { value = jsonString("3".bytes())!; }
+        out.push(JsonMember { key: copyBytes(key)!, value: value })!;
+    }
+    return out;
+}
+
+fn pushSchemaField(record: borrow mut Json, field: Json) {
+    var fields = Vector<Json>.create();
+    for (f in memberItems(record, "fields")!.view()) { fields.push(cloneJson(f)!)!; }
+    fields.push(field)!;
+    jsonSet(record, "fields", Json.Array(fields))!;
+}
+
+/// The fixture table made v3 (ADR-0122 §3): its manifests and list rewritten with `first_row_id`, the data manifest's
+/// 100 (a inherits it), b's own 500; the delete manifest's none; the table upgraded, its `next-row-id` 1000.
+fn makeV3(dir: Slice<u8>) {
+    var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
+    let listPath = compactPath("metadata/snap-1.avro");
+    let list = readWarehouseAvro(borrow s, COMPACT_HIDDEN.bytes(), listPath.view())!!;
+    var records = Vector<Json>.create();
+    for (i in 0..list.records.length) {
+        var record = cloneJson(borrow list.records[i])!;
+        let path = copyBytes(jsonMemberText(borrow record, "manifest_path")!)!;
+        let manifest = readWarehouseAvro(borrow s, COMPACT_HIDDEN.bytes(), path.view())!!;
+        let data = recordInt(borrow record, "content", 0) == 0;
+        var entries = Vector<Json>.create();
+        for (e in 0..manifest.records.length) {
+            var entry = cloneJson(borrow manifest.records[e])!;
+            var file = cloneJson(jsonMember(borrow entry, "data_file")!)!;
+            let named = jsonMemberText(borrow file, "file_path")!;
+            let isB = named.length > 9 && named[named.length - 9..] == "b.parquet".bytes();
+            jsonSet(mut file, "first_row_id", if (data && isB) jsonInteger(500)! else Json.Null)!;
+            jsonSet(mut entry, "data_file", file)!;
+            entries.push(entry)!;
+        }
+        let bytes = writeAvro(withFirstRowIdField(manifest.metadata.view(), false).view(), entries.view())!!;
+        let prefix = "s3://compact--table-s3/".bytes();
+        let _ = s.putObject(
+            COMPACT_HIDDEN,
+            StringView.fromUtf8(path.view()[prefix.length..]) ?? "",
+            "",
+            bytes.view(),
+            PutCondition.None,
+        )!;
+        jsonSet(mut record, "manifest_length", jsonInteger(truncate<i64>(bytes.length))!)!;
+        jsonSet(mut record, "first_row_id", if (data) jsonInteger(100)! else Json.Null)!;
+        records.push(record)!;
+    }
+    let listBytes = writeAvro(withFirstRowIdField(list.metadata.view(), true).view(), records.view())!!;
+    let prefix = "s3://compact--table-s3/".bytes();
+    let _ = s.putObject(
+        COMPACT_HIDDEN,
+        StringView.fromUtf8(listPath.view()[prefix.length..]) ?? "",
+        "",
+        listBytes.view(),
+        PutCondition.None,
+    )!;
+    // The table upgraded, its row ids assigned up to 1000.
+    let rec = tableRecord(borrow s, "compact".bytes(), "ns".bytes(), "t".bytes())!;
+    var m = readMetadata(borrow s, COMPACT_HIDDEN.bytes(), jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+    jsonSet(mut m, "format-version", jsonInteger(3)!)!;
+    jsonSet(mut m, "next-row-id", jsonInteger(1000)!)!;
+    let location = writeMetadata(mut s, COMPACT_HIDDEN.bytes(), COMPACT_ID.bytes(), 2, borrow m)!;
+    var updated = cloneJson(borrow rec.json)!;
+    jsonSet(mut updated, "metadataLocation", Json.Text(location))!;
+    let _ = writeRecord(
+        mut s,
+        COMPACT_HIDDEN.bytes(),
+        ".s3tables/tables/ns/t".bytes(),
+        borrow updated,
+        PutCondition.None,
+    )!;
+}
+
+/// Each row's lineage in the merged file, in its rows' order: `_row_id` and `_last_updated_sequence_number`.
+fn lineageOf(bytes: Slice<u8>) -> Result<Vector<i64>, TestFailure> {
+    let read = readFixture(bytes)?;
+    let k = leafOfId(read.leaves.view(), ICEBERG_ROW_ID) ?? { return Err(TestFailure.create("no _row_id")); };
+    let q = leafOfId(read.leaves.view(), ICEBERG_LAST_UPDATED_SEQUENCE) ?? {
+        return Err(TestFailure.create("no _last_updated_sequence_number"));
+    };
+    var out = Vector<i64>.create();
+    for (i in 0..read.columns[k].count) {
+        out.push(truncate<i64>(valueAt(borrow read.columns[k], borrow read.leaves[k], i).readLE<u64>(0)))!;
+        Check.equalI64(1, truncate<i64>(valueAt(borrow read.columns[q], borrow read.leaves[q], i).readLE<u64>(0)))?;
+    }
+    return Ok(out);
+}
+
+/// A v3 table compacted keeps each row's id (ADR-0122 §3): a's rows inherit 100 on, b's are 500 on, written into the
+/// merged file; with deletes, the dropped rows' ids are gone and the others kept. The commit is a v3 writer's: the
+/// snapshot's `first-row-id` is 1000, and the table's `next-row-id` past the rows its new manifests hold.
+@test
+fn v3CompactionKeepsRowIds() -> Result<void, TestFailure> {
+    for (withDeletes in [false, true]) {
+        let dir = scratchDirectory(if (withDeletes) "compact-v3-deletes" else "compact-v3");
+        fixtureCompactStoreWith(
+            dir.bytes(),
+            storeConfig(),
+            fixtureBytes(PAGES_FLAT_IDS[..]),
+            23,
+            fixtureBytes(PAGES_FLAT_IDS_RENAMED[..]),
+            23,
+            withDeletes,
+            false,
+        );
+        makeV3(dir.bytes());
+        compactionWorkload(dir.bytes(), storeConfig());
+        let s = ObjectStore.open(dir.view(), storeConfig())!;
+        let c = tableCounts(borrow s)?;
+        Check.equalU64(1, c.dataFiles as u64)?;
+        let ids = lineageOf(compactedFile(borrow s)?.view())?;
+        var want = Vector<i64>.create();
+        for (f in 0..2) {
+            for (r in 0..23) {
+                // Without deletes every row; with them, a's 0 and 5 and b's 1 by position, ids of rows 2 and 7.
+                let gone = withDeletes && (r == 2 || r == 7 || (f == 0 && (r == 0 || r == 5)) || (f == 1 && r == 1));
+                if (!gone) { want.push(if (f == 0) 100 + truncate<i64>(r) else 500 + truncate<i64>(r))!; }
+            }
+        }
+        Check.equalU64(want.length as u64, ids.length as u64)?;
+        for (i in 0..want.length) { Check.equalI64(want[i], ids[i])?; }
+        let rec = tableRecord(borrow s, "compact".bytes(), "ns".bytes(), "t".bytes())!;
+        let m = readMetadata(borrow s, COMPACT_HIDDEN.bytes(), jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+        let current = jsonMemberI64(borrow m, "current-snapshot-id")!;
+        var first: i64 = -1;
+        var added: i64 = -1;
+        for (snap in memberItems(borrow m, "snapshots")!.view()) {
+            if (jsonMemberI64(snap, "snapshot-id") == Some(current)) {
+                first = jsonMemberI64(snap, "first-row-id") ?? -1;
+                added = jsonMemberI64(snap, "added-rows") ?? -1;
+            }
+        }
+        Check.equalI64(1000, first)?;
+        Check.equalI64(truncate<i64>(want.length), added)?;
+        Check.equalI64(1000 + truncate<i64>(want.length), jsonMemberI64(borrow m, "next-row-id") ?? -1)?;
+        removeTree(dir.view());
+    }
+    return Ok();
+}
+
 /// A table's metadata whose properties are `props` (a JSON object's members), for the codec choice's tests.
 fn metadataWith(props: StringView) -> Json {
     var text = textOf("{\"format-version\": 2, \"properties\": {");

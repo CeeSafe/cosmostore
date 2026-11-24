@@ -1,0 +1,171 @@
+// Iceberg v3's row lineage in a merged file (ADR-0122 §3): each row's `_row_id` and `_last_updated_sequence_number`
+// written as columns, so that a row keeps its id when compaction moves it to a new file.
+import web_core;
+
+/// Iceberg's reserved field ids of the row lineage columns.
+const ICEBERG_ROW_ID: i64 = 2147483540;
+const ICEBERG_LAST_UPDATED_SEQUENCE: i64 = 2147483539;
+
+fn isLineageLeaf(leaf: borrow PageLeaf) -> bool =>
+    leaf.fieldId == ICEBERG_ROW_ID || leaf.fieldId == ICEBERG_LAST_UPDATED_SEQUENCE;
+
+/// A lineage column's leaf, as the merged file's schema writes it: an optional INT64 at the root.
+fn lineageLeaf(id: i64, name: StringView) -> Result<PageLeaf, AllocError> {
+    var key = copyBytes("lineage:".bytes())?;
+    appendDecimal(mut key, truncate<u64>(id))?;
+    return Ok(PageLeaf {
+        path: copyBytes(name.bytes())?,
+        names: namesOf(name.bytes())?,
+        key: key,
+        fieldId: id,
+        unit: PQ_UNIT_NONE,
+        order: PQ_ORDER_SIGNED,
+        physical: PQ_INT64,
+        typeLength: 0,
+        maxDef: 1,
+        maxRep: 0,
+    });
+}
+
+/// A file's leaves without its lineage columns (the ones merged by key), and where each is among its chunks.
+struct DataLeaves {
+    leaves: Vector<PageLeaf>;
+    at: Vector<usize>;
+}
+
+fn dataLeavesOf(these: Slice<PageLeaf>) -> Result<DataLeaves, AllocError> {
+    var out = DataLeaves { leaves: Vector<PageLeaf>.create(), at: Vector<usize>.create() };
+    for (k in 0..these.length) {
+        if (isLineageLeaf(borrow these[k])) { continue; }
+        out.leaves.push(copyLeaf(borrow these[k])?)?;
+        out.at.push(k)?;
+    }
+    return Ok(out);
+}
+
+/// A merged file's leaves: the first input's, and with `lineage`, its lineage columns (any it had) last, as
+/// `withLineageSchema` writes them.
+fn mergedLeavesOf(these: Slice<PageLeaf>, lineage: bool) -> Result<Vector<PageLeaf>, AllocError> {
+    if (!lineage) {
+        var all = Vector<PageLeaf>.create();
+        for (k in 0..these.length) { all.push(copyLeaf(borrow these[k])?)?; }
+        return Ok(all);
+    }
+    var out = dataLeavesOf(these)?.leaves;
+    out.push(lineageLeaf(ICEBERG_ROW_ID, "_row_id")?)?;
+    out.push(lineageLeaf(ICEBERG_LAST_UPDATED_SEQUENCE, "_last_updated_sequence_number")?)?;
+    return Ok(out);
+}
+
+/// A footer's schema with the lineage columns last at the root (optional INT64s with their field ids), any it had
+/// removed; null when one it had is not a leaf at the root.
+fn withLineageSchema(meta: borrow Vector<ThriftField>) -> Result<Vector<ThriftField>?, AllocError> {
+    let elements = structItems(meta, PQ_FILE_SCHEMA) ?? { return Ok(null); };
+    if (elements.length == 0) { return Ok(null); }
+    var kept = Vector<ThriftValue>.create();
+    var removed: i64 = 0;
+    // Each element's depth, by its parents' remaining children.
+    var remaining = Vector<i64>.create();
+    for (j in 0..elements.length) {
+        let e = match (borrow elements[j]) {
+            ThriftValue.Struct(f) => f,
+            _ => { return Ok(null); }
+        };
+        let depth = remaining.length;
+        if (remaining.length > 0) {
+            let last = remaining.length - 1;
+            remaining[last] = remaining[last] - 1;
+        }
+        let children = thriftInt(e, 5) ?? 0;
+        let id = thriftInt(e, 9) ?? -1;
+        let isLineage = id == ICEBERG_ROW_ID || id == ICEBERG_LAST_UPDATED_SEQUENCE;
+        if (isLineage) {
+            if (depth != 1 || children != 0) { return Ok(null); }
+            removed += 1;
+        } else {
+            kept.push(ThriftValue.Struct(cloneFields(e)?))?;
+        }
+        if (children > 0) { remaining.push(children)?; }
+        while (remaining.length > 0 && remaining[remaining.length - 1] == 0) { let _ = remaining.pop(); }
+    }
+    // The root's children: less the ones removed, and the two added.
+    var root = Vector<ThriftField>.create();
+    match (borrow kept[0]) {
+        ThriftValue.Struct(f) => {
+            for (field in f.view()) {
+                if (field.id == 5) {
+                    root.push(tInt(5, (thriftInt(f, 5) ?? 0) - removed + 2))?;
+                } else {
+                    root.push(ThriftField { id: field.id, value: cloneThrift(borrow field.value)? })?;
+                }
+            }
+        }
+        _ => { return Ok(null); }
+    }
+    kept[0] = ThriftValue.Struct(root);
+    for (id in [ICEBERG_ROW_ID, ICEBERG_LAST_UPDATED_SEQUENCE]) {
+        var e = Vector<ThriftField>.create();
+        e.push(tInt(1, PQ_INT64))?;
+        e.push(tInt(3, 1))?; // optional
+        e.push(tBinary(4, if (id == ICEBERG_ROW_ID) "_row_id".bytes() else "_last_updated_sequence_number".bytes())?)?;
+        e.push(tInt(9, id))?;
+        kept.push(ThriftValue.Struct(e))?;
+    }
+    var out = Vector<ThriftField>.create();
+    for (field in meta.view()) {
+        if (field.id == PQ_FILE_SCHEMA) {
+            out.push(ThriftField { id: PQ_FILE_SCHEMA, value: ThriftValue.List(THRIFT_LIST, THRIFT_STRUCT, kept) })?;
+            kept = Vector<ThriftValue>.create();
+        } else {
+            out.push(ThriftField { id: field.id, value: cloneThrift(borrow field.value)? })?;
+        }
+    }
+    return Ok(Some(out));
+}
+
+/// A row group's lineage columns (ADR-0122 §3): each row's `_row_id`, its file's own where it has one, else its
+/// file's first row id plus its position in the file; and its `_last_updated_sequence_number`, its own, else its
+/// file's data sequence number. Null when a file's own column is not one read here.
+fn lineageColumns(
+    these: Slice<PageLeaf>,
+    groupValues: borrow Vector<ColumnValues>,
+    rows: usize,
+    firstRow: i64,
+    firstRowId: i64,
+    sequence: i64,
+) -> Result<Vector<ColumnValues>?, AllocError> {
+    var out = Vector<ColumnValues>.create();
+    let ids = [ICEBERG_ROW_ID, ICEBERG_LAST_UPDATED_SEQUENCE];
+    for (w in 0..2) {
+        var v = emptyValues();
+        let mine = leafOfId(these, ids[w]);
+        var at: usize = 0;
+        for (r in 0..rows) {
+            var given: i64? = null;
+            match (mine) {
+                Some(k) => {
+                    let leaf = borrow these[k];
+                    if (leaf.physical != PQ_INT64 || leaf.maxRep != 0) { return Ok(null); }
+                    let values = borrow groupValues[k];
+                    if (values.defs.length != rows) { return Ok(null); }
+                    if (values.defs[r] as u32 == leaf.maxDef) {
+                        given = Some(truncate<i64>(valueAt(values, leaf, at).readLE<u64>(0)));
+                        at += 1;
+                    }
+                }
+                null => {}
+            }
+            let value = match (given) {
+                Some(g) => g,
+                null => if (w == 0) firstRowId + firstRow + truncate<i64>(r) else sequence,
+            };
+            v.reps.push(0)?;
+            v.defs.push(1)?;
+            let bits = truncate<u64>(value);
+            for (shift in [0u64, 8, 16, 24, 32, 40, 48, 56]) { v.data.push(truncate<u8>(bits >> shift))?; }
+            v.count += 1;
+        }
+        out.push(v)?;
+    }
+    return Ok(Some(out));
+}
