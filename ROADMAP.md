@@ -5621,3 +5621,13 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   file.
 - **Found by the sweep:** the deletes-rewritten-only state (the bins failed, the rewrite committed), now named.
 - **Checked:** a keep rule that drops every row fails both the sweep and `positionDeletesRewritten`.
+
+### 24 Nov 2026: M27 slice 5, the rewrite on real tables (ADR-0120)
+
+- **`tools/compaction_check.py` (109 checks), `posrewrite`:**
+  - **Partition a:** a small file, and a position delete naming only a file gone from the table (as Spark leaves
+    them). After the run, the delete file is gone.
+  - **Partition b:** a large file, which stays as it is, and five position delete files, one of them with a dangling
+    row. After the run they are one file: b's five rows, sorted, the dangling row dropped.
+  - PyIceberg reads the same rows, and the summary counts 1 position delete file added and 6 removed.
+- **CI** (slice 1) ran the readers step: pyarrow's 36 files and parquet-java's 1,343 checks pass.

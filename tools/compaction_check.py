@@ -378,6 +378,46 @@ check_metrics("equality", t, f)
 t.append(pa.table({"id": [9], "part": ["a"]}, schema=pschema))
 check("equality: an append after", ids_of("equality"), [1, 2, 4, 9])
 
+# Position deletes rewritten (ADR-0120): in partition a, a small file and a position delete naming only a file gone
+# from the table (as Spark leaves them); in partition b, a large file (above the target's small share, so not
+# rewritten) and five position delete files, each deleting one of its rows, one with a dangling row too. After the
+# run: a's delete file gone, b's five merged into one of its five rows, sorted, and the same rows read.
+catalog.create_table("ns.posrewrite", schema=ischema, properties={"format-version": "2"}, partition_spec=ispec)
+compaction("posrewrite", "disabled")
+catalog.load_table("ns.posrewrite").append(pa.table({"id": [1, 2], "part": ["a", "a"]}, schema=pschema))
+big = 300000
+# Scattered ids, which compress little, so the file stays above the small share.
+catalog.load_table("ns.posrewrite").append(pa.table(
+    {"id": [1000 + (i * 2654435761) % (1 << 40) for i in range(big)], "part": ["b"] * big}, schema=pschema))
+t = catalog.load_table("ns.posrewrite")
+b_file = [f.file for f in t.scan(row_filter="part == 'b'").plan_files()][0]
+check("posrewrite: b's file above the small share", b_file.file_size_in_bytes > 768 * 1024, True)
+gone = t.location() + "/data/part=a/gone-00000.parquet"
+commit_delete("posrewrite", t, "a", "dangling.parquet", DataFileContent.POSITION_DELETES,
+              pa.table({"file_path": [gone], "pos": [0]}, schema=dschema))
+for k in range(5):
+    paths = [b_file.file_path] + ([gone.replace("part=a", "part=b")] if k == 2 else [])
+    commit_delete("posrewrite", catalog.load_table("ns.posrewrite"), "b", "small-deletes-%d.parquet" % k,
+                  DataFileContent.POSITION_DELETES,
+                  pa.table({"file_path": paths, "pos": [4 - k] + ([9] if k == 2 else [])}, schema=dschema))
+posrewrite_before = ids_of("posrewrite")
+check("posrewrite: six delete files before", len(delete_files("posrewrite")), 6)
+check("posrewrite: b's five rows deleted", len(posrewrite_before), 2 + big - 5)
+compaction("posrewrite", "enabled")
+wait_for("posrewrite: one delete file left", lambda: len(delete_files("posrewrite")) == 1, 4 * day)
+check("posrewrite: the same rows", ids_of("posrewrite"), posrewrite_before)
+left = list(delete_files("posrewrite"))[0]
+check("posrewrite: the one left is b's", "part=b" in left, True)
+bucket, key = left[5:].split("/", 1)
+rows = pq.read_table(io.BytesIO(s3.get_object(Bucket=bucket, Key=key)["Body"].read())).to_pylist()
+check("posrewrite: its rows, sorted, the dangling one dropped",
+      [(r["file_path"], r["pos"]) for r in rows], [(b_file.file_path, p) for p in range(5)])
+check("posrewrite: b's file kept as it was", b_file.file_path in data_files("posrewrite"), True)
+t = catalog.load_table("ns.posrewrite")
+summary = t.current_snapshot().summary
+check("posrewrite: the summary's delete files", (summary.get("added-position-delete-files"),
+                                                 summary.get("removed-position-delete-files")), ("1", "6"))
+
 # A table's own codecs kept (ADR-0116): gzip pages, null manifests (Avro's name, which PyIceberg takes; Java's is
 # `uncompressed`) (not snappy: PyIceberg reads snappy
 # manifests only with its optional python-snappy, which this check's PyIceberg has not; the snappy writer is a unit
@@ -451,7 +491,7 @@ got = next(iter(t.scan().plan_files())).file
 check("modes: no bounds for id (counts)", 1 in (got.lower_bounds or {}), False)
 check("modes: item's lower bound, 4 characters", (got.lower_bounds or {}).get(2), "δέλτ".encode())
 
-for name in ("flat", "snappy", "zstd", "modes", "codecs", "parts", "sorted", "deletes", "equality"):
+for name in ("flat", "snappy", "zstd", "posrewrite", "modes", "codecs", "parts", "sorted", "deletes", "equality"):
     catalog.purge_table("ns." + name)
 catalog.drop_namespace("ns")
 for attempt in range(3):
