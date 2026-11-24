@@ -49,10 +49,10 @@ the second reader ("parquet-java").
      bytes.
    - **parquet-java** (`tools/parquet_java_check.sh`, built with Maven like the SDK matrix's Java check, and run
      locally like `tools/parquet_writer_check.py`):
-     - it reads each file the writer's test leaves, row by row through parquet-avro's reader, and compares the
-       rows with pyarrow's reading of the fixture;
-     - it reads each chunk's statistics through parquet-java's own min and max, and checks them against the
-       column's values in its type's order;
+     - it reads each file the writer's test leaves, and the pyarrow fixture it came from, row by row through
+       parquet-java's example reader (Avro's names cannot hold a `.`), and compares the rows;
+     - it finds each chunk by its path in the fixture's schema, and compares its min and max with the fixture's by
+       parquet-java's comparator for the column's type;
      - it reads a snappy manifest the Avro test leaves, through Avro Java (M25's B1).
    - **New fixtures from pyarrow:** unsigned integers, decimals in both physical types, floats with ±0.0 and NaNs,
      and a column named with a `.`.

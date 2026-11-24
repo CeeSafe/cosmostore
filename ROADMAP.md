@@ -5526,3 +5526,17 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   flat or struct column's min and max checked against its values (36 files).
 - **Results:** 504 unit tests.
 - **Next:** the parquet-java check (slice 5), then the exit review.
+
+### 24 Nov 2026: M26 slice 5, the parquet-java check (ADR-0118 §6)
+
+- **`tools/parquet_java_check.sh`** (local, like the SDK matrix: a JDK and Maven; parquet-java 1.15.2, Avro 1.12.0):
+  - each file the page writer's test leaves, read by parquet-java's example reader beside its pyarrow fixture: the
+    same rows;
+  - each chunk found by its path in the fixture's schema, its null count, and its min and max equal to the
+    fixture's by parquet-java's comparator; uncompressed, its total uncompressed size equal to its bytes;
+  - the Avro test's manifest in each codec (null, deflate, snappy, zstandard), read by Avro Java as the same
+    records (M25's B1).
+- **Results:** 1,343 checks over 36 files and 4 manifests pass.
+  - Unsigned integers ordered as signed, put back into the writer for the run, fail it in each codec's file.
+  - parquet-java reads a zero min as -0.0 whatever the file says, so the signed zeros are pyarrow's check's to see.
+- **Next:** the exit review.
