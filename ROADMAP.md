@@ -5563,3 +5563,14 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     removal (M24's B3);
   - the parquet-java check in CI (M26's B3);
   - M21's, M22's, M24's and M25's remaining Lows.
+
+### 24 Nov 2026: M27 proposed (ADR-0119)
+
+- **Found:** the catalog refuses `upgrade-format-version` to anything but 2, so v3 tables cannot exist here; v3's
+  deletion vectors come after v3 tables.
+- **The candidates:**
+  - **A:** Iceberg v3 tables (row lineage, deletion vectors);
+  - **B:** position deletes rewritten (dangling entries dropped, exact removal, a partition's merged);
+  - **C:** the operational Lows (the parquet-java check in CI, M22's B2 and B3).
+- **The recommendation is B, with C's CI step first.**
+- **Next:** the owner's choice.
