@@ -5727,3 +5727,25 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Results:** 513 unit tests.
 - **Found:** PyIceberg 0.12 makes and reads v3 tables, but cannot append to one (it writes no v3 manifest). Iceberg
   Java is the v3 writer of the checks.
+
+### 25 Nov 2026: M28 slice 4, deletion vectors read and applied (ADR-0122 §4)
+
+- **`src/s3/table_deletion_vectors.cee`:** a `deletion-vector-v1` blob read; then its vector, and each 32-bit roaring
+  bitmap in the portable format (array, bitmap and run containers, both cookies, keys past 0).
+  - **Checked:** the framed length, magic and CRC-32, keys and values ascending, every count against the bytes, and
+    the rows within a delete file's bound.
+- **The plan:** a `puffin` delete entry is a position delete naming its `referenced_data_file`, read at its
+  `content_offset` and `content_size_in_bytes`, both checked against the file.
+- **The merge:** a bin applies it as a position delete of that one file.
+- **The commit:** a deletion vector is removed when the commit removes the file it names, counted as `removed-dvs`.
+  M27's rewrite never takes one.
+- **Fixtures** (`tools/dv_fixtures.py`, pyroaring 1.2.0):
+  - a Puffin file of two blobs, for a and b;
+  - a blob of every container kind and a position past 2^32.
+- **Tests:**
+  - **The reader:** `deletionVectorFormats` and `deletionVectorsInPuffin`; every byte changed and every length cut
+    (`deletionVectorsBroken`, the CRC refusing each change); 3,000 mutated bitmaps without the CRC
+    (`portableBitmapsMutated`).
+  - **`v3CompactionAppliesDeletionVectors`:** a v3 table's two vectors applied, the rows they delete gone, the
+    others keeping their row ids, and both removed. It fails with the removal taken out.
+- **Results:** 518 unit tests.

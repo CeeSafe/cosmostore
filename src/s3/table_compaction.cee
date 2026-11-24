@@ -595,9 +595,25 @@ fn deleteFileOf(
 ) -> Result<DeleteFile?, AllocError> {
     let content = recordInt(d, "content", 0);
     if (content != DELETE_CONTENT_POSITION && content != DELETE_CONTENT_EQUALITY) { return Ok(null); }
-    if (!equalsIgnoreCase(jsonMemberText(d, "file_format") ?? "".bytes(), "PARQUET".bytes())) { return Ok(null); }
+    let format = jsonMemberText(d, "file_format") ?? "".bytes();
     let size = recordInt(d, "file_size_in_bytes", -1);
-    if (size <= 0 || truncate<u64>(size) > DELETE_FILE_MAX_BYTES) { return Ok(null); }
+    // A deletion vector (ADR-0122 §4): a position delete in a Puffin file, one blob of it, naming one data file.
+    var referenced = Vector<u8>.create();
+    var offset: u64 = 0;
+    var length: u64 = truncate<u64>(if (size > 0) size else 0);
+    if (equalsIgnoreCase(format, "PUFFIN".bytes())) {
+        if (content != DELETE_CONTENT_POSITION) { return Ok(null); }
+        referenced = copyBytes(jsonMemberText(d, "referenced_data_file") ?? { return Ok(null); })?;
+        let at = recordInt(d, "content_offset", -1);
+        let n = recordInt(d, "content_size_in_bytes", -1);
+        if (at < 0 || n <= 0 || size <= 0 || at > size || n > size - at) { return Ok(null); }
+        if (truncate<u64>(n) > DELETE_FILE_MAX_BYTES) { return Ok(null); }
+        offset = truncate<u64>(at);
+        length = truncate<u64>(n);
+    } else {
+        if (!equalsIgnoreCase(format, "PARQUET".bytes())) { return Ok(null); }
+        if (size <= 0 || truncate<u64>(size) > DELETE_FILE_MAX_BYTES) { return Ok(null); }
+    }
     // Its rows as its manifest states them, within DELETE_FILE_MAX_ROWS (its decoding checks them again).
     let rows = recordInt(d, "record_count", -1);
     if (rows < 0 || truncate<u64>(rows) > DELETE_FILE_MAX_ROWS as u64) { return Ok(null); }
@@ -633,6 +649,9 @@ fn deleteFileOf(
         partitionKey: copyBytes(partitionKey)?,
         manifest: 0,
         entry: 0,
+        referenced: referenced,
+        offset: offset,
+        length: length,
     }));
 }
 
@@ -807,6 +826,8 @@ struct BinCopy {
 /// their Iceberg types.
 struct BinDelete {
     content: i64;
+    /// A deletion vector's data file (ADR-0122 §4); empty for a Parquet delete file.
+    referenced: Vector<u8>;
     sequence: i64;
     ids: Vector<i64>;
     kinds: Vector<Vector<u8>>;
@@ -895,11 +916,11 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
                 }
                 Err(_) => { return Ok(null); }
             }
-            match (store.prepareReaderOf(bucket, catalogText(d.key.view()), null, 0, d.size)) {
+            match (store.prepareReaderOf(bucket, catalogText(d.key.view()), null, d.offset, d.offset + d.length)) {
                 Ok(r) => { deleteReaders.push(r)?; }
                 Err(_) => { return Ok(null); }
             }
-            deleteSizes.push(d.size)?;
+            deleteSizes.push(d.length)?;
             var kinds = Vector<Vector<u8>>.create();
             for (k in 0..d.equalityIds.length) {
                 let kind = fieldTypeOf(borrow plan.metadata, d.equalityIds[k]) ?? { return Ok(null); };
@@ -907,7 +928,13 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
             }
             var ids = Vector<i64>.create();
             ids.extend(d.equalityIds.view())?;
-            binDeletes.push(BinDelete { content: d.content, sequence: d.sequence, ids: ids, kinds: kinds })?;
+            binDeletes.push(BinDelete {
+                content: d.content,
+                referenced: copyBytes(d.referenced.view())?,
+                sequence: d.sequence,
+                ids: ids,
+                kinds: kinds,
+            })?;
         }
         var inputPaths = Vector<Vector<u8>>.create();
         var inputSequences = Vector<i64>.create();
@@ -1024,7 +1051,13 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
         let bytes = readPrepared(mut c.deleteReaders[x])? ?? { return Ok(null); };
         if (bytes.length as u64 != c.deleteSizes[x]) { return Ok(null); }
         let d = borrow c.binDeletes[x];
-        if (d.content == DELETE_CONTENT_POSITION) {
+        if (d.content == DELETE_CONTENT_POSITION && d.referenced.length > 0) {
+            // A deletion vector: its blob, the positions of the one file it names (ADR-0122 §4).
+            positionSets.push(readDeletionVector(bytes.view(), d.referenced.view(), DELETE_FILE_MAX_ROWS)? ?? {
+                return Ok(null);
+            })?;
+            positionAt.push(x)?;
+        } else if (d.content == DELETE_CONTENT_POSITION) {
             positionSets.push(readPositionDeletes(bytes.view())? ?? { return Ok(null); })?;
             positionAt.push(x)?;
         } else {
@@ -1291,6 +1324,22 @@ fn addsNoFile(output: borrow CompactionOutput) -> bool => match (output.metrics.
     Some(m) => m.rows == 0,
     null => false,
 };
+
+/// Whether this commit removes the data file of `path`: an input of a bin written.
+fn inputRemoved(
+    plan: borrow CompactionPlan,
+    outputs: borrow Vector<CompactionOutput>,
+    bins: Slice<usize>,
+    path: Slice<u8>,
+) -> bool {
+    for (o in 0..outputs.length) {
+        let bin = borrow plan.bins[bins[o]];
+        for (i in 0..bin.inputs.length) {
+            if (bin.inputs[i].path.view() == path) { return true; }
+        }
+    }
+    return false;
+}
 
 /// A rewritten delete file's rows (ADR-0120): its metrics'.
 fn outputRowsOf(o: borrow CompactionOutput) -> i64 => match (o.metrics.asBorrow()) {
@@ -1780,6 +1829,14 @@ fn commitWritten(
     for (x in 0..plan.deletes.length) {
         if (holdsIndex(rewritten.view(), x)) { continue; } // rewritten: not removed again
         let d = borrow plan.deletes[x];
+        // A deletion vector goes with the one file it names (ADR-0122 §4): removed when this commit removes it.
+        if (d.referenced.length > 0) {
+            if (inputRemoved(plan, outputs, bins, d.referenced.view())) {
+                gone[d.manifest].push(d.entry)?;
+                removedDeletes.push(x)?;
+            }
+            continue;
+        }
         // Only a delete a committed bin applied (the M24 exit review: not one whose partition merely matched no file).
         var applied = false;
         for (o in 0..outputs.length) {
@@ -1794,7 +1851,7 @@ fn commitWritten(
     removedDeletes.extend(rewritten.view())?;
     // The sizes count delete files too, as Iceberg's summary does (the M27 exit review's L3): those removed, and the
     // rewritten ones added.
-    for (x in removedDeletes.view()) { removedBytes += truncate<i64>(plan.deletes[x].size); }
+    for (x in removedDeletes.view()) { removedBytes += truncate<i64>(plan.deletes[x].length); }
     for (r in 0..plan.deleteRewrites.length) {
         if (!plan.deleteRewrites[r].done) { continue; }
         match (plan.deleteRewrites[r].output.asBorrow()) {
@@ -2188,6 +2245,7 @@ fn commitWritten(
     summaryCount(mut summary, "deleted-records", removedRows)?;
     // The delete files removed, and their deletes (ADR-0114 §5).
     var removedPositionFiles: i64 = 0;
+    var removedVectors: i64 = 0;
     var removedEqualityFiles: i64 = 0;
     var removedPositions: i64 = 0;
     var removedEqualities: i64 = 0;
@@ -2198,7 +2256,8 @@ fn commitWritten(
             null => 0,
         };
         if (d.content == DELETE_CONTENT_POSITION) {
-            removedPositionFiles += 1;
+            // A deletion vector is counted apart, as Iceberg's summary does (`removed-dvs`).
+            if (d.referenced.length > 0) { removedVectors += 1; } else { removedPositionFiles += 1; }
             removedPositions = addChecked(removedPositions, rows) ?? { return Ok(false); };
         } else {
             removedEqualityFiles += 1;
@@ -2213,6 +2272,7 @@ fn commitWritten(
     if (removedDeletes.length > 0) {
         summaryCount(mut summary, "removed-delete-files", truncate<i64>(removedDeletes.length))?;
         summaryCount(mut summary, "removed-position-delete-files", removedPositionFiles)?;
+        if (removedVectors > 0) { summaryCount(mut summary, "removed-dvs", removedVectors)?; }
         summaryCount(mut summary, "removed-equality-delete-files", removedEqualityFiles)?;
         summaryCount(mut summary, "removed-position-deletes", removedPositions)?;
         summaryCount(mut summary, "removed-equality-deletes", removedEqualities)?;

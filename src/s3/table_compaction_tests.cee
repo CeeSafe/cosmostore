@@ -393,6 +393,13 @@ fn tableCounts(s: borrow ObjectStore) -> Result<TableCounts, TestFailure> {
                 Err(_) => { return Err(TestFailure.create("a data file the table names is not there")); }
             };
             Check.equalU64(truncate<u64>(jsonMemberI64(file, "file_size_in_bytes") ?? -1), info.size)?;
+            // A deletion vector's Puffin file has no Parquet footer to read (ADR-0122 §4).
+            if (jsonMemberText(file, "file_format") == Some("PUFFIN".bytes())) {
+                deletes += 1;
+                deletePaths.push(copyBytes(filePath)!)!;
+                deleteSequences.push(jsonMemberI64(entry, "sequence_number") ?? 0)!;
+                continue;
+            }
             // Its rows read from the Parquet file's own footer, not the manifest's count (the M22 exit review's
             // finding 3): a file of the right size and wrong bytes does not pass.
             let bytes = match (s.getObject(COMPACT_HIDDEN, StringView.fromUtf8(key) ?? "")) {
@@ -1232,14 +1239,7 @@ fn withFirstRowIdField(metadata: Slice<JsonMember>, list: bool) -> Vector<JsonMe
                 _ => Vector<u8>.create(),
             };
             var schema = parseJson(schemaText.view())!!;
-            var field = jsonObject();
-            jsonSet(mut field, "name", jsonString("first_row_id".bytes())!)!;
-            var union = Vector<Json>.create();
-            union.push(jsonString("null".bytes())!)!;
-            union.push(jsonString("long".bytes())!)!;
-            jsonSet(mut field, "type", Json.Array(union))!;
-            jsonSet(mut field, "default", Json.Null)!;
-            jsonSet(mut field, "field-id", jsonInteger(if (list) 520 else 142)!)!;
+            let field = optionalField("first_row_id", "long", if (list) 520 else 142);
             if (list) {
                 pushSchemaField(mut schema, field);
             } else {
@@ -1250,6 +1250,10 @@ fn withFirstRowIdField(metadata: Slice<JsonMember>, list: bool) -> Vector<JsonMe
                     if (jsonMemberText(f, "name") == Some("data_file".bytes())) {
                         var record = cloneJson(jsonMember(f, "type")!)!;
                         pushSchemaField(mut record, cloneJson(borrow field)!);
+                        // A deletion vector's (ADR-0122 §4).
+                        pushSchemaField(mut record, optionalField("referenced_data_file", "string", 143));
+                        pushSchemaField(mut record, optionalField("content_offset", "long", 144));
+                        pushSchemaField(mut record, optionalField("content_size_in_bytes", "long", 145));
                         jsonSet(mut copy, "type", record)!;
                     }
                     fields.push(copy)!;
@@ -1264,6 +1268,19 @@ fn withFirstRowIdField(metadata: Slice<JsonMember>, list: bool) -> Vector<JsonMe
         out.push(JsonMember { key: copyBytes(key)!, value: value })!;
     }
     return out;
+}
+
+/// An optional Avro field of Iceberg's: a union with null, defaulting to null, with its field id.
+fn optionalField(name: StringView, kind: StringView, id: i64) -> Json {
+    var field = jsonObject();
+    jsonSet(mut field, "name", jsonString(name.bytes())!)!;
+    var union = Vector<Json>.create();
+    union.push(jsonString("null".bytes())!)!;
+    union.push(jsonString(kind.bytes())!)!;
+    jsonSet(mut field, "type", Json.Array(union))!;
+    jsonSet(mut field, "default", Json.Null)!;
+    jsonSet(mut field, "field-id", jsonInteger(id)!)!;
+    return field;
 }
 
 fn pushSchemaField(record: borrow mut Json, field: Json) {
@@ -1398,6 +1415,147 @@ fn v3CompactionKeepsRowIds() -> Result<void, TestFailure> {
         Check.equalI64(1000 + truncate<i64>(want.length), jsonMemberI64(borrow m, "next-row-id") ?? -1)?;
         removeTree(dir.view());
     }
+    return Ok();
+}
+
+/// The v3 fixture table given deletion vectors (ADR-0122 §4): DV_PUFFIN put as one Puffin file, and a delete manifest
+/// at sequence number 2 of two entries, a's (positions 0, 3, 5) and b's (1), each its blob's offset and length.
+fn addDeletionVectors(dir: Slice<u8>) {
+    var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
+    let puffin = fixtureBytes(DV_PUFFIN[..]);
+    let puffinKey = compactKey("data/kind=a/dvs.puffin");
+    let _ = s.putObject(
+        COMPACT_HIDDEN,
+        StringView.fromUtf8(puffinKey.view()) ?? "",
+        "",
+        puffin.view(),
+        PutCondition.None,
+    )!;
+    let listPath = compactPath("metadata/snap-1.avro");
+    let list = readWarehouseAvro(borrow s, COMPACT_HIDDEN.bytes(), listPath.view())!!;
+    let dataPath = copyBytes(jsonMemberText(borrow list.records[0], "manifest_path")!)!;
+    let data = readWarehouseAvro(borrow s, COMPACT_HIDDEN.bytes(), dataPath.view())!!;
+    var entries = Vector<Json>.create();
+    for (k in 0..2) {
+        var entry = cloneJson(borrow data.records[k])!;
+        var file = cloneJson(jsonMember(borrow entry, "data_file")!)!;
+        let referenced = copyBytes(jsonMemberText(borrow file, "file_path")!)!;
+        jsonSet(mut file, "content", jsonInteger(1)!)!;
+        jsonSet(mut file, "file_path", Json.Text(compactPath("data/kind=a/dvs.puffin")))!;
+        jsonSet(mut file, "file_format", jsonString("PUFFIN".bytes())!)!;
+        jsonSet(mut file, "file_size_in_bytes", jsonInteger(truncate<i64>(puffin.length))!)!;
+        jsonSet(mut file, "record_count", jsonInteger(if (k == 0) 3 else 1)!)!;
+        jsonSet(mut file, "referenced_data_file", Json.Text(referenced))!;
+        let offset = if (k == 0) DV_PUFFIN_A_OFFSET else DV_PUFFIN_B_OFFSET;
+        let length = if (k == 0) DV_PUFFIN_A_LENGTH else DV_PUFFIN_B_LENGTH;
+        jsonSet(mut file, "content_offset", jsonInteger(truncate<i64>(offset))!)!;
+        jsonSet(mut file, "content_size_in_bytes", jsonInteger(truncate<i64>(length))!)!;
+        jsonSet(mut file, "first_row_id", Json.Null)!;
+        for (metric in [
+            "column_sizes",
+            "value_counts",
+            "null_value_counts",
+            "nan_value_counts",
+            "lower_bounds",
+            "upper_bounds",
+        ]) {
+            jsonSet(mut file, metric, Json.Null)!;
+        }
+        jsonSet(mut entry, "data_file", file)!;
+        jsonSet(mut entry, "sequence_number", jsonInteger(2)!)!;
+        entries.push(entry)!;
+    }
+    let manifest = writeAvro(data.metadata.view(), entries.view())!!;
+    let mKey = compactKey("metadata/dvs-m.avro");
+    let _ = s.putObject(
+        COMPACT_HIDDEN,
+        StringView.fromUtf8(mKey.view()) ?? "",
+        "",
+        manifest.view(),
+        PutCondition.None,
+    )!;
+    var records = Vector<Json>.create();
+    for (i in 0..list.records.length) { records.push(cloneJson(borrow list.records[i])!)!; }
+    var item = cloneJson(borrow list.records[0])!;
+    jsonSet(mut item, "manifest_path", Json.Text(compactPath("metadata/dvs-m.avro")))!;
+    jsonSet(mut item, "manifest_length", jsonInteger(truncate<i64>(manifest.length))!)!;
+    jsonSet(mut item, "content", jsonInteger(1)!)!;
+    jsonSet(mut item, "sequence_number", jsonInteger(2)!)!;
+    jsonSet(mut item, "min_sequence_number", jsonInteger(2)!)!;
+    jsonSet(mut item, "first_row_id", Json.Null)!;
+    jsonSet(mut item, "added_rows_count", jsonInteger(4)!)!;
+    records.push(item)!;
+    let listBytes = writeAvro(list.metadata.view(), records.view())!!;
+    let prefix = "s3://compact--table-s3/".bytes();
+    let _ = s.putObject(
+        COMPACT_HIDDEN,
+        StringView.fromUtf8(listPath.view()[prefix.length..]) ?? "",
+        "",
+        listBytes.view(),
+        PutCondition.None,
+    )!;
+    let rec = tableRecord(borrow s, "compact".bytes(), "ns".bytes(), "t".bytes())!;
+    var m = readMetadata(borrow s, COMPACT_HIDDEN.bytes(), jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+    jsonSet(mut m, "last-sequence-number", jsonInteger(2)!)!;
+    let location = writeMetadata(mut s, COMPACT_HIDDEN.bytes(), COMPACT_ID.bytes(), 3, borrow m)!;
+    var updated = cloneJson(borrow rec.json)!;
+    jsonSet(mut updated, "metadataLocation", Json.Text(location))!;
+    let _ = writeRecord(
+        mut s,
+        COMPACT_HIDDEN.bytes(),
+        ".s3tables/tables/ns/t".bytes(),
+        borrow updated,
+        PutCondition.None,
+    )!;
+}
+
+/// A v3 table's deletion vectors applied by compaction (ADR-0122 §4): a's rows 0, 3 and 5 and b's 1 dropped, the rest
+/// keeping their row ids; both vectors removed with the files they named, counted as `removed-dvs`.
+@test
+fn v3CompactionAppliesDeletionVectors() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("compact-v3-dvs");
+    fixtureCompactStoreWith(
+        dir.bytes(),
+        storeConfig(),
+        fixtureBytes(PAGES_FLAT_IDS[..]),
+        23,
+        fixtureBytes(PAGES_FLAT_IDS_RENAMED[..]),
+        23,
+        false,
+        false,
+    );
+    makeV3(dir.bytes());
+    addDeletionVectors(dir.bytes());
+    {
+        let s = ObjectStore.open(dir.view(), storeConfig())!;
+        Check.equalU64(2, tableCounts(borrow s)?.deleteFiles as u64)?;
+    }
+    compactionWorkload(dir.bytes(), storeConfig());
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    let c = tableCounts(borrow s)?;
+    Check.equalU64(1, c.dataFiles as u64)?;
+    Check.equalU64(0, c.deleteFiles as u64)?;
+    let ids = lineageOf(compactedFile(borrow s)?.view())?;
+    var want = Vector<i64>.create();
+    for (r in 0..23) {
+        if (r != 0 && r != 3 && r != 5) { want.push(100 + truncate<i64>(r))!; }
+    }
+    for (r in 0..23) {
+        if (r != 1) { want.push(500 + truncate<i64>(r))!; }
+    }
+    Check.equalU64(want.length as u64, ids.length as u64)?;
+    for (i in 0..want.length) { Check.equalI64(want[i], ids[i])?; }
+    let rec = tableRecord(borrow s, "compact".bytes(), "ns".bytes(), "t".bytes())!;
+    let m = readMetadata(borrow s, COMPACT_HIDDEN.bytes(), jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+    let current = jsonMemberI64(borrow m, "current-snapshot-id")!;
+    var removed: Slice<u8>? = null;
+    for (snap in memberItems(borrow m, "snapshots")!.view()) {
+        if (jsonMemberI64(snap, "snapshot-id") == Some(current)) {
+            removed = jsonMemberText(jsonMember(snap, "summary")!, "removed-dvs");
+        }
+    }
+    Check.equalBytes("2".bytes(), removed ?? "-".bytes())?;
+    removeTree(dir.view());
     return Ok();
 }
 

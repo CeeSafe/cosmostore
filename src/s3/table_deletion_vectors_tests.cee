@@ -1,0 +1,95 @@
+// Iceberg v3's deletion vectors read (ADR-0122 §4): pyroaring's bitmaps in Iceberg's framing, and blobs broken.
+import web_core;
+
+/// Every container kind (array, bitmap, run) and a position past 2^32: all read, in order, as pyroaring wrote them.
+@test
+fn deletionVectorFormats() -> Result<void, TestFailure> {
+    let blob = fixtureBytes(DV_FORMATS[..]);
+    let read = readDeletionVector(blob.view(), "f".bytes(), DELETE_FILE_MAX_ROWS)! ?? {
+        return Err(TestFailure.create("the blob reads"));
+    };
+    Check.equalU64(DV_FORMATS_CARDINALITY, read.rows as u64)?;
+    let ps = read.positions[0].view();
+    for (k in 1..ps.length) { Check.isTrue(ps[k - 1] < ps[k], "ascending")?; }
+    for (sample in DV_FORMATS_SAMPLES) {
+        var found = false;
+        for (p in ps) {
+            if (p == sample) { found = true; }
+        }
+        Check.isTrue(found, "a sample position")?;
+    }
+    // Bounded by its rows: one fewer than it holds is refused.
+    Check.isTrue(readDeletionVector(blob.view(), "f".bytes(), read.rows - 1)!.isNull(), "past maxRows")?;
+    return Ok();
+}
+
+/// A Puffin file's two blobs, each at its offset and length: a's positions 0, 3, 5 and b's 1.
+@test
+fn deletionVectorsInPuffin() -> Result<void, TestFailure> {
+    let file = fixtureBytes(DV_PUFFIN[..]);
+    let a = file.view()[DV_PUFFIN_A_OFFSET as usize..(DV_PUFFIN_A_OFFSET + DV_PUFFIN_A_LENGTH) as usize];
+    let read = readDeletionVector(a, "a".bytes(), DELETE_FILE_MAX_ROWS)!!;
+    Check.equalU64(3, read.positions[0].length as u64)?;
+    Check.equalI64(0, read.positions[0][0])?;
+    Check.equalI64(3, read.positions[0][1])?;
+    Check.equalI64(5, read.positions[0][2])?;
+    let b = file.view()[DV_PUFFIN_B_OFFSET as usize..(DV_PUFFIN_B_OFFSET + DV_PUFFIN_B_LENGTH) as usize];
+    let readB = readDeletionVector(b, "b".bytes(), DELETE_FILE_MAX_ROWS)!!;
+    Check.equalU64(1, readB.positions[0].length as u64)?;
+    Check.equalI64(1, readB.positions[0][0])?;
+    Check.equalBytes("b".bytes(), readB.paths[0].view())?;
+    return Ok();
+}
+
+/// Each byte of `blob` changed, and each length cut: read as a vector or as none, never a panic. A changed byte
+/// within the framed magic, vector and CRC is refused (the CRC covers it).
+fn breakBlob(blob: Slice<u8>) -> Result<void, TestFailure> {
+    let step: usize = if (blob.length > 1000) 7 else 1;
+    var i: usize = 0;
+    while (i < blob.length) {
+        for (x in [0x01u8, 0x80, 0xFF]) {
+            var broken = copyBytes(blob)!;
+            broken[i] = broken[i] ^ x;
+            let read = readDeletionVector(broken.view(), "f".bytes(), DELETE_FILE_MAX_ROWS)!;
+            if (i >= 4) { Check.isTrue(read.isNull(), "a changed byte refused")?; }
+        }
+        let _ = readDeletionVector(blob[0..i], "f".bytes(), DELETE_FILE_MAX_ROWS)!;
+        i += step;
+    }
+    return Ok();
+}
+
+/// Broken blobs, of both fixtures.
+@test
+fn deletionVectorsBroken() -> Result<void, TestFailure> {
+    let file = fixtureBytes(DV_PUFFIN[..]);
+    breakBlob(file.view()[DV_PUFFIN_A_OFFSET as usize..(DV_PUFFIN_A_OFFSET + DV_PUFFIN_A_LENGTH) as usize])?;
+    let formats = fixtureBytes(DV_FORMATS[..]);
+    breakBlob(formats.view())?;
+    return Ok();
+}
+
+/// The portable bitmap reader alone, without the CRC that guards it: mutated bitmaps never panic (the CRC does not
+/// vouch for a writer's bitmap).
+@test
+fn portableBitmapsMutated() -> Result<void, TestFailure> {
+    let formats = fixtureBytes(DV_FORMATS[..]);
+    // The vector: past the length and magic, before the CRC; its first bitmap after the count and key.
+    let bitmap = copyBytes(formats.view()[20..formats.length - 4])!;
+    var rng: u64 = 88172645463325252;
+    for (n in 0..3000) {
+        var broken = copyBytes(bitmap.view())!;
+        for (m in 0..(n % 4) + 1) {
+            rng = rng ^ (rng << 13);
+            rng = rng ^ (rng >> 7);
+            rng = rng ^ (rng << 17);
+            let at = truncate<usize>(rng % (broken.length as u64));
+            broken[at] = truncate<u8>(rng >> 32);
+            let _ = m;
+        }
+        let cut = truncate<usize>(rng % (broken.length as u64 + 1));
+        var out = Vector<i64>.create();
+        let _ = readPortableBitmap(broken.view()[0..cut], 0, 0, DELETE_FILE_MAX_ROWS, mut out)!;
+    }
+    return Ok();
+}

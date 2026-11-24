@@ -1,0 +1,148 @@
+// Iceberg v3's deletion vectors (ADR-0122 §4): a `deletion-vector-v1` blob of a Puffin file, read into the positions
+// it deletes from the one data file it names. Every length and count is checked before it is used, and the rows are
+// bounded as a position delete file's are.
+import web_core;
+
+const DV_COOKIE_NO_RUNS: u32 = 12346;
+const DV_COOKIE_RUNS: u32 = 12347;
+/// A portable bitmap's containers: one per 2^16 values, so at most 2^16.
+const DV_MAX_CONTAINERS: u32 = 65536;
+
+fn readBe32(b: Slice<u8>, at: usize) -> u32 =>
+    ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | (b[at + 3] as u32);
+
+/// A deletion vector's positions in `path`, from its blob (the bytes at its entry's `content_offset`, of its
+/// `content_size_in_bytes`); null when the blob is not one read here (its length, magic or CRC wrong, a bitmap
+/// malformed, keys out of order) or holds more than `maxRows` positions.
+fn readDeletionVector(blob: Slice<u8>, path: Slice<u8>, maxRows: usize) -> Result<PositionDeletes?, AllocError> {
+    if (blob.length < 12) { return Ok(null); }
+    let framed = readBe32(blob, 0) as usize;
+    if (framed < 4 || framed + 8 != blob.length) { return Ok(null); }
+    let body = blob[4..4 + framed];
+    if (body[0] != 0xD1 || body[1] != 0xD3 || body[2] != 0x39 || body[3] != 0x64) { return Ok(null); }
+    if (Crc32.of(body) != readBe32(blob, 4 + framed)) { return Ok(null); }
+    let v = body[4..];
+    if (v.length < 8) { return Ok(null); }
+    let count = v.readLE<u64>(0);
+    var at: usize = 8;
+    var positions = Vector<i64>.create();
+    var lastKey: i64 = -1;
+    for (n in 0..count) {
+        if (at + 4 > v.length) { return Ok(null); }
+        let key = v.readLE<u32>(at) as i64;
+        at += 4;
+        // Keys ascending, and within Java's signed range (its positions are longs).
+        if (key <= lastKey || key > 2147483647) { return Ok(null); }
+        lastKey = key;
+        at = readPortableBitmap(v, at, truncate<u64>(key) << 32, maxRows, mut positions)? ?? { return Ok(null); };
+        let _ = n;
+    }
+    if (at != v.length) { return Ok(null); }
+    var out = PositionDeletes {
+        paths: Vector<Vector<u8>>.create(),
+        positions: Vector<Vector<i64>>.create(),
+        index: HashMap<Vector<u8>, usize>.create(),
+        rows: positions.length,
+    };
+    out.paths.push(copyBytes(path)?)?;
+    let _ = out.index.put(copyBytes(path)?, 0)?;
+    out.positions.push(positions)?;
+    return Ok(Some(out));
+}
+
+/// A 32-bit roaring bitmap in its portable format at `at` of `data` (RoaringFormatSpec), each value added to `high`
+/// and appended to `out` in ascending order; where it ends, or null when it is malformed or `out` would pass
+/// `maxRows`.
+fn readPortableBitmap(
+    data: Slice<u8>,
+    at: usize,
+    high: u64,
+    maxRows: usize,
+    out: borrow mut Vector<i64>,
+) -> Result<usize?, AllocError> {
+    var p = at;
+    if (p + 4 > data.length) { return Ok(null); }
+    let cookie = data.readLE<u32>(p);
+    p += 4;
+    var size: u32 = 0;
+    var runs: Slice<u8> = data[0..0];
+    var hasRuns = false;
+    if (cookie == DV_COOKIE_NO_RUNS) {
+        if (p + 4 > data.length) { return Ok(null); }
+        size = data.readLE<u32>(p);
+        p += 4;
+    } else if ((cookie & 0xFFFF) == DV_COOKIE_RUNS) {
+        size = (cookie >> 16) + 1;
+        hasRuns = true;
+        let bytes = (size as usize + 7) / 8;
+        if (p + bytes > data.length) { return Ok(null); }
+        runs = data[p..p + bytes];
+        p += bytes;
+    } else {
+        return Ok(null);
+    }
+    if (size > DV_MAX_CONTAINERS) { return Ok(null); }
+    let containers = size as usize;
+    // Each container's key and cardinality less one.
+    if (p + containers * 4 > data.length) { return Ok(null); }
+    let headers = p;
+    p += containers * 4;
+    // The offsets, when written (always without runs; with runs, from 4 containers): skipped, as the containers follow
+    // in order.
+    if (!hasRuns || containers >= 4) {
+        if (p + containers * 4 > data.length) { return Ok(null); }
+        p += containers * 4;
+    }
+    var lastKey: i64 = -1;
+    for (i in 0..containers) {
+        let key = data.readLE<u16>(headers + i * 4) as i64;
+        let cardinality = data.readLE<u16>(headers + i * 4 + 2) as usize + 1;
+        if (key <= lastKey) { return Ok(null); }
+        lastKey = key;
+        let base = high | (truncate<u64>(key) << 16);
+        let isRun = hasRuns && (runs[i / 8] & (1u8 << truncate<u8>(i % 8))) != 0;
+        let before = out.length;
+        if (isRun) {
+            if (p + 2 > data.length) { return Ok(null); }
+            let n = data.readLE<u16>(p) as usize;
+            p += 2;
+            if (p + n * 4 > data.length) { return Ok(null); }
+            var last: i64 = -1;
+            for (r in 0..n) {
+                let start = data.readLE<u16>(p + r * 4) as usize;
+                let length = data.readLE<u16>(p + r * 4 + 2) as usize;
+                if (truncate<i64>(start) <= last || start + length > 65535) { return Ok(null); }
+                if (out.length + length + 1 > maxRows) { return Ok(null); }
+                for (v in start..start + length + 1) { out.push(truncate<i64>(base | truncate<u64>(v)))?; }
+                last = truncate<i64>(start + length);
+            }
+            p += n * 4;
+        } else if (cardinality <= 4096) {
+            if (p + cardinality * 2 > data.length) { return Ok(null); }
+            if (out.length + cardinality > maxRows) { return Ok(null); }
+            var last: i64 = -1;
+            for (k in 0..cardinality) {
+                let v = data.readLE<u16>(p + k * 2) as i64;
+                if (v <= last) { return Ok(null); }
+                last = v;
+                out.push(truncate<i64>(base | truncate<u64>(v)))?;
+            }
+            p += cardinality * 2;
+        } else {
+            if (p + 8192 > data.length) { return Ok(null); }
+            if (out.length + cardinality > maxRows) { return Ok(null); }
+            for (w in 0usize..1024) {
+                let word = data.readLE<u64>(p + w * 8);
+                if (word == 0) { continue; }
+                for (bit in 0u64..64) {
+                    if ((word >> bit) & 1 != 0) { out.push(truncate<i64>(base | ((w as u64) * 64 + bit)))?; }
+                }
+            }
+            p += 8192;
+        }
+        // A container holds as many values as its header says (a run container's is not stated exactly by all
+        // writers' headers, so it is checked only for arrays and bitmaps).
+        if (!isRun && out.length - before != cardinality) { return Ok(null); }
+    }
+    return Ok(Some(p));
+}
