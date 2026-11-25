@@ -6257,3 +6257,13 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Next:** M33, when the owner asks. Candidates on record:
   - ADR-0129's B (hardening: M30's, M31's and M32's recorded Lows), C (Iceberg views and nested namespaces), D
     (table replication) and E (v3's remaining parts).
+
+### 25 Nov 2026: M33 proposed (ADR-0131)
+
+- **The owner:** "continue", after M32 was closed.
+- **ADR-0131 proposes four items:**
+  - **A, hardening** (recommended): M30's, M31's and M32's twenty recorded Lows, each fixed or decided to stay;
+  - **B,** Iceberg views and nested namespaces;
+  - **C,** table replication;
+  - **D,** v3's remaining parts.
+- **Next:** the owner's choice.
