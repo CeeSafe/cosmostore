@@ -6154,3 +6154,15 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     replication);
   - M31's recorded Lows and M30's;
   - v3's remaining parts.
+
+### 25 Nov 2026: M32 proposed (ADR-0129)
+
+- **The owner:** "continue", after M31 was closed.
+- **ADR-0129 proposes five items:**
+  - **A, S3 Tables' remaining small calls** (recommended): logging delivered by the access log writer, metrics, and
+    record expiration answered as AWS answers;
+  - **B,** hardening: M30's and M31's recorded Lows;
+  - **C,** Iceberg views and nested namespaces;
+  - **D,** table replication;
+  - **E,** v3's remaining parts.
+- **Next:** the owner's choice.
