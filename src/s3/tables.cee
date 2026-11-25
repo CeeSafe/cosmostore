@@ -763,6 +763,7 @@ fn createTable(
     bucketName: Slice<u8>,
     ns: Slice<u8>,
     body: Slice<u8>,
+    sealing: borrow WarehouseKeys,
 ) -> Result<TablesAnswer, TablesError> {
     // An Iceberg schema given here becomes the table's first metadata file (ADR-0083 §6).
     let j = tablesObject(body)?;
@@ -797,6 +798,9 @@ fn createTable(
         if (readRecord(store, hidden.view(), nsKey.view())?.isNull()) { return Err(TablesError.NotFound); }
         let key = catalogKey(CATALOG_TABLES, ns, name.view())?;
         if (readRecord(store, hidden.view(), key.view())?.isSome()) { return Err(TablesError.Conflict); }
+        // Its configuration first, at its new id: its metadata is sealed with its encryption (ADR-0126 §4).
+        let configKey = tableConfigKey(id.view())?;
+        writeTablesConfig(store, hidden.view(), configKey.view(), borrow config)?;
         match (borrow request) {
             Some(r) => {
                 let warehouse = warehouseOf(bucketName, id.view())?;
@@ -804,7 +808,7 @@ fn createTable(
                     Some(m) => m,
                     null => { return Err(TablesError.BadRequest); }
                 };
-                let location = writeMetadata(store, hidden.view(), id.view(), 0, borrow m)?;
+                let location = writeMetadataWith(store, hidden.view(), id.view(), 0, borrow m, sealing)?;
                 jsonSet(mut rec, "metadataLocation", Json.Text(location))?;
             }
             null => {}
@@ -815,12 +819,12 @@ fn createTable(
         generation = match (writeRecord(store, hiddenView, keyView, recRef, PutCondition.IfAbsent)) {
             Ok(g) => g,
             Err(e) => {
-                // Another create won the name: its first metadata file is no table's.
+                // Another create won the name: its first metadata file and its configuration are no table's.
                 removeMetadataFile(store, hiddenView, jsonMemberText(recRef, "metadataLocation") ?? "".bytes());
+                let _ = store.deleteObject(catalogText(hiddenView), catalogText(configKey.view()));
                 return Err(e);
             }
         };
-        writeTablesConfig(store, hidden.view(), tableConfigKey(id.view())?.view(), borrow config)?;
     }
     var answer = jsonObject();
     var arn = Vector<u8>.create();
@@ -1191,13 +1195,14 @@ fn routeTablesSync(
     body: Slice<u8>,
     caller: borrow TablesCaller,
     credentials: Slice<Credential>,
+    sealing: borrow WarehouseKeys,
 ) -> Result<TablesAnswer, TablesError> {
     let segs = pathSegments(req.rawPath.view())?;
     let m = req.method;
     if (segs.length == 0) { return Err(TablesError.NotImplemented); }
     let top = segs[0].view();
     // The Iceberg REST catalog (ADR-0083 §5), its calls authorized as S3 Tables' (ADR-0084 §3).
-    if (top == "iceberg".bytes()) { return icebergRoute(store, req, segs.view()[1..], body, caller); }
+    if (top == "iceberg".bytes()) { return icebergRoute(store, req, segs.view()[1..], body, caller, sealing); }
     // Each call is authorized by its table bucket's and its table's policies before it runs (ADR-0084 §2).
     // Tags of a table bucket or table, by its ARN (ADR-0126 §1).
     if (top == "tag".bytes() && segs.length == 2) {
@@ -1329,7 +1334,7 @@ fn routeTablesSync(
         if (segs.length == 3) {
             if (isMethod(m, Method.Put)) {
                 checkTables(store, caller, "s3tables:CreateTable", bucket.view(), "".bytes())?;
-                return createTable(store, req, bucket.view(), ns, body);
+                return createTable(store, req, bucket.view(), ns, body, sealing);
             }
             return Err(TablesError.BadRequest);
         }
@@ -1399,6 +1404,19 @@ fn routeTablesSync(
     return Err(TablesError.NotImplemented);
 }
 
+/// `routeTablesSync` with the server's keys as a worker thread holds them.
+fn routeTablesKeyed(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    body: Slice<u8>,
+    caller: borrow TablesCaller,
+    credentials: Slice<Credential>,
+    tableKeys: borrow TableKeys,
+) -> Result<TablesAnswer, TablesError> {
+    let sealing = tableKeys.keys();
+    return routeTablesSync(store, req, body, caller, credentials, borrow sealing);
+}
+
 /// The S3 Tables API's work under the store, on a worker thread, then a dropped table's objects removed.
 async fn routeTables(
     app: borrow S3App,
@@ -1418,9 +1436,12 @@ async fn routeTables(
     {
         let credentials = app.credentials.get();
         let keys = credentials.view();
+        // The server's master keys, to open and seal an encrypted table's metadata (ADR-0126 §4).
+        let tableKeys = tableKeysOf(app);
+        let tableKeysRef = borrow tableKeys;
         var guard = await lockStore(app)?;
         let store = guard.data();
-        answer = await Async.blocking(() => routeTablesSync(store, req, body, callerRef, keys))?;
+        answer = await Async.blocking(() => routeTablesKeyed(store, req, body, callerRef, keys, tableKeysRef))?;
     }
     if (answer.purgeId.length > 0) {
         let bucket = replace(mut answer.purgeBucket, Vector<u8>.create());

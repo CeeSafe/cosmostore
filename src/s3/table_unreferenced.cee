@@ -261,7 +261,12 @@ struct UnreferencedRun {
 
 /// A run's start for a table, or null when its table bucket's removal is disabled, it has no metadata yet, or it is
 /// gone.
-fn unreferencedRun(store: borrow ObjectStore, t: borrow MaintainedTable) -> Result<UnreferencedRun?, TablesError> {
+fn unreferencedRun(
+    store: borrow ObjectStore,
+    t: borrow MaintainedTable,
+    tableKeys: borrow TableKeys,
+) -> Result<UnreferencedRun?, TablesError> {
+    let sealing = tableKeys.keys();
     let hidden = tableWarehouseBucket(t.bucket.view())?;
     let rec = match (tableRecord(store, t.bucket.view(), t.ns.view(), t.name.view())) {
         Ok(r) => r,
@@ -276,7 +281,7 @@ fn unreferencedRun(store: borrow ObjectStore, t: borrow MaintainedTable) -> Resu
     let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
     if (location.length == 0) { return Ok(null); }
     var failure = Vector<u8>.create();
-    let metadata = match (readMetadata(store, hidden.view(), location.view())) {
+    let metadata = match (readMetadataWith(store, hidden.view(), location.view(), borrow sealing)) {
         Ok(m) => m,
         Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
         Err(_) => {
@@ -300,11 +305,41 @@ fn unreferencedRun(store: borrow ObjectStore, t: borrow MaintainedTable) -> Resu
 
 /// An object's bytes, read under the store; null if it is not there.
 fn warehouseObject(store: borrow ObjectStore, hidden: Slice<u8>, key: Slice<u8>) -> Result<Vector<u8>?, TablesError> {
-    return match (store.getObject(catalogText(hidden), catalogText(key))) {
-        Ok(b) => if (b.length > MANIFEST_MAX_BYTES) Err(TablesError.Internal) else Ok(Some(b)),
-        Err(StoreError.NoSuchKey) => Ok(null),
-        Err(e) => Err(tablesStoreFail(e)),
+    let none = Vector<MasterKey>.create();
+    return warehouseObjectWith(store, hidden, key, borrow WarehouseKeys { sse: none.view(), kms: none.view() });
+}
+
+/// `warehouseObjectWith` with the keys as a worker thread holds them.
+fn warehouseObjectKeyed(
+    store: borrow ObjectStore,
+    hidden: Slice<u8>,
+    key: Slice<u8>,
+    tableKeys: borrow TableKeys,
+) -> Result<Vector<u8>?, TablesError> {
+    let sealing = tableKeys.keys();
+    return warehouseObjectWith(store, hidden, key, borrow sealing);
+}
+
+/// `warehouseObject` opened with the server's keys, when it is sealed (ADR-0126 §4); null when it is not there.
+fn warehouseObjectWith(
+    store: borrow ObjectStore,
+    hidden: Slice<u8>,
+    key: Slice<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<Vector<u8>?, TablesError> {
+    let info = match (store.headObject(catalogText(hidden), catalogText(key))) {
+        Ok(i) => i,
+        Err(StoreError.NoSuchKey) => { return Ok(null); }
+        Err(e) => { return Err(tablesStoreFail(e)); }
     };
+    if (info.size > MANIFEST_MAX_BYTES as u64) { return Err(TablesError.Internal); }
+    let stored = match (store.getObject(catalogText(hidden), catalogText(key))) {
+        Ok(b) => b,
+        Err(StoreError.NoSuchKey) => { return Ok(null); }
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    // Sealed under a key not held here: not read, as a file that is not there is (its run then fails).
+    return Ok(plainOfStored(borrow info, stored, keys)?);
 }
 
 /// A key's forms an engine may write it in or reference it by: percent-decoded, and with `//` made `/` (M10's exit
@@ -487,8 +522,9 @@ async fn removeUnreferenced(
     t: borrow MaintainedTable,
     nowMs: i64,
     dayMs: i64,
+    tableKeys: borrow TableKeys,
 ) -> Result<void, NetError> {
-    var read = match (await readUnreferenced(store, t)?) {
+    var read = match (await readUnreferenced(store, t, tableKeys)?) {
         Some(r) => r,
         null => { return Ok(); }
     };
@@ -522,6 +558,7 @@ fn finishUnreferenced(
 async fn readUnreferenced(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     t: borrow MaintainedTable,
+    tableKeys: borrow TableKeys,
 ) -> Result<UnreferencedRead?, NetError> {
     var started: UnreferencedRun? = null;
     {
@@ -530,7 +567,7 @@ async fn readUnreferenced(
             Err(_) => { return Err(NetError.Closed); }
         };
         let st = guard.data();
-        started = match (await Async.blocking(() => unreferencedRun(st, t))) {
+        started = match (await Async.blocking(() => unreferencedRun(st, t, tableKeys))) {
             Ok(r) => r,
             Err(_) => { return Ok(null); }
         };
@@ -568,7 +605,9 @@ async fn readUnreferenced(
             let st = guard.data();
             let hidden = run.hidden.view();
             let k = key.view();
-            bytes = match (await Async.blocking(() => warehouseObject(st, hidden, k))) {
+            // A sealed manifest opened with the server's keys (ADR-0126 §4); one that does not open fails the run,
+            // with nothing deleted, as a missing one does.
+            bytes = match (await Async.blocking(() => warehouseObjectKeyed(st, hidden, k, tableKeys))) {
                 Ok(b) => b,
                 Err(_) => {
                     unreadable = true;

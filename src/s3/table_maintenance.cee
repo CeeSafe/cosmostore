@@ -15,6 +15,8 @@ const UNREFERENCED_REMOVAL: StringView = "icebergUnreferencedFileRemoval";
 /// The pass's settings (`serve --tables-day-seconds`, for tests): how long a day is, in ms.
 struct TablesMaintainer {
     dayMs: u64;
+    /// The server's keys, to open and seal an encrypted table's files (ADR-0126 §4).
+    keys: TableKeys;
 }
 
 // ---- Configurations ----
@@ -389,6 +391,7 @@ fn manageSnapshots(
     name: Slice<u8>,
     nowMs: i64,
     hourMs: i64,
+    tableKeys: borrow TableKeys,
 ) -> Result<bool, TablesError> {
     let hidden = tableWarehouseBucket(bucketName)?;
     var rec = tableRecord(store, bucketName, ns, name)?;
@@ -401,7 +404,8 @@ fn manageSnapshots(
     if (location.length == 0) { return Ok(false); } // no metadata yet
     let keep = maintenanceSetting(borrow value, SNAPSHOT_MANAGEMENT, "minSnapshotsToKeep") ?? 1;
     let hours = maintenanceSetting(borrow value, SNAPSHOT_MANAGEMENT, "maxSnapshotAgeHours") ?? 120;
-    var m = match (readMetadata(store, hidden.view(), location.view())) {
+    let sealing = tableKeys.keys();
+    var m = match (readMetadataWith(store, hidden.view(), location.view(), borrow sealing)) {
         Ok(m) => m,
         Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
         Err(_) => {
@@ -431,6 +435,7 @@ fn manageSnapshots(
             location.view(),
             mut m,
             previousStamp,
+            borrow sealing,
         )?) {
             Some(_) => {}
             null => { return Ok(false); } // the table changed: next pass
@@ -460,6 +465,8 @@ async fn runMaintenance(
     }
     let dayMs = truncate<i64>(app.tablesDayMs);
     let tr = borrow t;
+    let tableKeys = tableKeysOf(app);
+    let keysRef = borrow tableKeys;
     {
         var guard = await lockStore(app)?;
         let store = guard.data();
@@ -501,18 +508,18 @@ async fn runMaintenance(
         let store = guard.data();
         if (kind == SNAPSHOT_MANAGEMENT.bytes()) {
             let now = Clock.unixMillis();
-            await Async.blocking(() => maintainTable(store, tr, now, dayMs))?;
+            await Async.blocking(() => maintainTable(store, tr, now, dayMs, keysRef))?;
             return Ok(tablesNoContent());
         }
     }
     if (kind == COMPACTION.bytes()) {
-        match (await compactTable(borrow app.store, tr, Clock.unixMillis())) {
+        match (await compactTable(borrow app.store, tr, Clock.unixMillis(), keysRef)) {
             Ok() => {}
             Err(_) => { return Err(TablesError.Internal); }
         }
         return Ok(tablesNoContent());
     }
-    match (await removeUnreferenced(borrow app.store, tr, Clock.unixMillis(), dayMs)) {
+    match (await removeUnreferenced(borrow app.store, tr, Clock.unixMillis(), dayMs, keysRef)) {
         Ok() => {}
         Err(_) => { return Err(TablesError.Internal); }
     }
@@ -576,9 +583,10 @@ fn maintainTable(
     t: borrow MaintainedTable,
     nowMs: i64,
     dayMs: i64,
+    tableKeys: borrow TableKeys,
 ) -> Result<void, TablesError> {
     let hourMs = if (dayMs / 24 > 0) dayMs / 24 else 1;
-    let _ = manageSnapshots(store, t.bucket.view(), t.ns.view(), t.name.view(), nowMs, hourMs)?;
+    let _ = manageSnapshots(store, t.bucket.view(), t.ns.view(), t.name.view(), nowMs, hourMs, tableKeys)?;
     return Ok();
 }
 
@@ -612,12 +620,13 @@ async fn tablesMaintenanceForever(
                 };
                 let st = guard.data();
                 let now = Clock.unixMillis();
-                let _ = await Async.blocking(() => maintainTable(st, t, now, dayMs));
+                let keys = borrow w.keys;
+                let _ = await Async.blocking(() => maintainTable(st, t, now, dayMs, keys));
             }
             // Then its compaction, a bin at a time (ADR-0098 §4), and its unreferenced files, the store held for each
             // read (ADR-0086 §3).
-            await compactTable(store, t, Clock.unixMillis())?;
-            await removeUnreferenced(store, t, Clock.unixMillis(), dayMs)?;
+            await compactTable(store, t, Clock.unixMillis(), borrow w.keys)?;
+            await removeUnreferenced(store, t, Clock.unixMillis(), dayMs, borrow w.keys)?;
         }
     }
     return Err(NetError.Closed);

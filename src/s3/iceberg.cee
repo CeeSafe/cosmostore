@@ -923,14 +923,30 @@ fn holdsId(ids: Slice<i64>, id: i64) -> bool {
 }
 
 fn readMetadata(store: borrow ObjectStore, hidden: Slice<u8>, location: Slice<u8>) -> Result<Json, TablesError> {
+    let none = Vector<MasterKey>.create();
+    return readMetadataWith(store, hidden, location, borrow WarehouseKeys { sse: none.view(), kms: none.view() });
+}
+
+/// `readMetadata` with the server's keys: an encrypted table's metadata file opened (ADR-0126 §4).
+fn readMetadataWith(
+    store: borrow ObjectStore,
+    hidden: Slice<u8>,
+    location: Slice<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<Json, TablesError> {
     let key = match (metadataKey(location, hidden)) {
         Some(k) => k,
         null => { return Err(TablesError.Internal); }
     };
-    let bytes = match (store.getObject(catalogText(hidden), catalogText(key))) {
+    let info = match (store.headObject(catalogText(hidden), catalogText(key))) {
+        Ok(i) => i,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    let stored = match (store.getObject(catalogText(hidden), catalogText(key))) {
         Ok(b) => b,
         Err(e) => { return Err(tablesStoreFail(e)); }
     };
+    let bytes = plainOfStored(borrow info, stored, keys)? ?? { return Err(TablesError.Internal); };
     return match (parseJson(bytes.view())?) {
         Some(j) => Ok(j),
         null => Err(TablesError.Internal),
@@ -956,6 +972,19 @@ fn writeMetadata(
     n: i64,
     m: borrow Json,
 ) -> Result<Vector<u8>, TablesError> {
+    let none = Vector<MasterKey>.create();
+    return writeMetadataWith(store, hidden, tableId, n, m, borrow WarehouseKeys { sse: none.view(), kms: none.view() });
+}
+
+/// `writeMetadata` sealed with the table's encryption, when it has one (ADR-0126 §4), by the server's keys.
+fn writeMetadataWith(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    tableId: Slice<u8>,
+    n: i64,
+    m: borrow Json,
+    keys: borrow WarehouseKeys,
+) -> Result<Vector<u8>, TablesError> {
     var key = copyBytes(tableId)?;
     key.extend("/metadata/".bytes())?;
     var digits = Vector<u8>.create();
@@ -967,14 +996,19 @@ fn writeMetadata(
     key.extend(".metadata.json".bytes())?;
     var body = Vector<u8>.create();
     writeJson(mut body, m)?;
-    match (store.putObject(
+    let encryption = tableEncryption(store, hidden, tableId)?;
+    match (putTableFile(
+        store,
         catalogText(hidden),
         catalogText(key.view()),
         "application/json",
         body.view(),
+        encryption.asBorrow(),
+        keys,
         PutCondition.IfAbsent,
     )) {
-        Ok(_) => {}
+        Ok(true) => {}
+        Ok(false) => { return Err(TablesError.Internal); } // its key is not held here
         Err(e) => { return Err(tablesStoreFail(e)); }
     }
     var location = copyBytes("s3://".bytes())?;
@@ -997,6 +1031,7 @@ fn swapMetadata(
     previous: Slice<u8>,
     m: borrow mut Json,
     previousStamp: i64,
+    sealing: borrow WarehouseKeys,
 ) -> Result<Vector<u8>?, TablesError> {
     // The metadata changed now, unless a snapshot's time already says when.
     if ((jsonMemberI64(m, "last-updated-ms") ?? 0) == previousStamp) {
@@ -1019,7 +1054,7 @@ fn swapMetadata(
         null => {}
     }
     let version = metadataVersion(previous) + 1;
-    let location = writeMetadata(store, hidden, id, if (version > 0) version else 1, m)?;
+    let location = writeMetadataWith(store, hidden, id, if (version > 0) version else 1, m, sealing)?;
     jsonSet(mut rec.json, "metadataLocation", jsonString(location.view())?)?;
     jsonSet(mut rec.json, "modifiedAt", jsonInteger(Clock.unixMillis())?)?;
     match (writeRecord(store, hidden, key, borrow rec.json, PutCondition.IfGeneration(rec.generation))) {
@@ -1078,6 +1113,7 @@ fn icebergCreateTable(
     bucket: Slice<u8>,
     ns: Slice<u8>,
     body: Slice<u8>,
+    sealing: borrow WarehouseKeys,
 ) -> Result<TablesAnswer, TablesError> {
     let request = match (parseJson(body)?) {
         Some(j) => j,
@@ -1131,16 +1167,16 @@ fn icebergCreateTable(
         jsonSet(mut j, "config", jsonObject())?;
         return tablesJson(borrow j);
     }
-    let location = writeMetadata(store, hidden.view(), id.view(), 0, borrow m)?;
     // Its storage class, its bucket's at its create (ADR-0126 §2).
     var config = jsonObject();
     jsonSet(mut config, "storageClass", Json.Text(bucketStorageClass(store, hidden.view())?))?;
-    // Its encryption, its bucket's at its create (ADR-0126 §3).
+    // Its encryption, its bucket's at its create (ADR-0126 §3): written first, as its metadata is sealed with it.
     match (bucketEncryption(store, hidden.view())?) {
         Some(e) => { jsonSet(mut config, "encryption", e)?; }
         null => {}
     }
     writeTablesConfig(store, hidden.view(), tableConfigKey(id.view())?.view(), borrow config)?;
+    let location = writeMetadataWith(store, hidden.view(), id.view(), 0, borrow m, sealing)?;
     let now = Clock.unixMillis();
     var rec = jsonObject();
     jsonSet(mut rec, "id", jsonString(id.view())?)?;
@@ -1181,6 +1217,7 @@ fn icebergCommitCreate(
     ns: Slice<u8>,
     name: Slice<u8>,
     request: borrow Json,
+    sealing: borrow WarehouseKeys,
 ) -> Result<TablesAnswer, TablesError> {
     let hidden = tableWarehouseBucket(bucket)?;
     if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
@@ -1226,15 +1263,15 @@ fn icebergCommitCreate(
     if (!completeCreatedMetadata(mut m, warehouse.view())?) {
         return badRequest("A created table needs its schema, its location and a format version of 2 or 3.");
     }
-    let written = writeMetadata(store, hidden.view(), id.view(), 0, borrow m)?;
     var config = jsonObject();
     jsonSet(mut config, "storageClass", Json.Text(bucketStorageClass(store, hidden.view())?))?;
-    // Its encryption, its bucket's at its create (ADR-0126 §3).
+    // Its encryption, its bucket's at its create (ADR-0126 §3): written first, as its metadata is sealed with it.
     match (bucketEncryption(store, hidden.view())?) {
         Some(e) => { jsonSet(mut config, "encryption", e)?; }
         null => {}
     }
     writeTablesConfig(store, hidden.view(), tableConfigKey(id.view())?.view(), borrow config)?;
+    let written = writeMetadataWith(store, hidden.view(), id.view(), 0, borrow m, sealing)?;
     let now = Clock.unixMillis();
     var rec = jsonObject();
     jsonSet(mut rec, "id", jsonString(id.view())?)?;
@@ -1362,6 +1399,7 @@ fn icebergCommit(
     ns: Slice<u8>,
     name: Slice<u8>,
     body: Slice<u8>,
+    sealing: borrow WarehouseKeys,
 ) -> Result<TablesAnswer, TablesError> {
     let request = match (parseJson(body)?) {
         Some(j) => j,
@@ -1386,7 +1424,7 @@ fn icebergCommit(
     let previous = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
     if (previous.length == 0) { return noSuchTable(); }
     let id = copyBytes(jsonMemberText(borrow rec.json, "id") ?? "".bytes())?;
-    var m = readMetadata(store, hidden.view(), previous.view())?;
+    var m = readMetadataWith(store, hidden.view(), previous.view(), sealing)?;
     let requirements = match (jsonMember(borrow request, "requirements")) {
         Some(r) => cloneJson(r)?,
         null => jsonArray(),
@@ -1425,6 +1463,7 @@ fn icebergCommit(
         previous.view(),
         mut m,
         previousStamp,
+        sealing,
     )?) {
         Some(l) => l,
         null => { return icebergError(409, "CommitFailedException", "The table changed since it was read."); }
@@ -1443,6 +1482,7 @@ fn icebergTable(
     name: Slice<u8>,
     body: Slice<u8>,
     caller: borrow TablesCaller,
+    sealing: borrow WarehouseKeys,
 ) -> Result<TablesAnswer, TablesError> {
     let m = req.method;
     let hidden = tableWarehouseBucket(bucket)?;
@@ -1459,7 +1499,7 @@ fn icebergTable(
                 };
                 if (createsOnly(jsonMember(borrow request, "requirements"))) {
                     checkTables(store, caller, "s3tables:CreateTable", bucket, "".bytes())?;
-                    return icebergCommitCreate(store, bucket, ns, name, borrow request);
+                    return icebergCommitCreate(store, bucket, ns, name, borrow request, sealing);
                 }
             }
             return noSuchTable();
@@ -1470,12 +1510,12 @@ fn icebergTable(
         else if (isMethod(m, Method.Delete)) "s3tables:DeleteTable"
         else "s3tables:GetTableMetadataLocation";
     checkTables(store, caller, action, bucket, jsonMemberText(borrow rec.json, "id") ?? "".bytes())?;
-    if (isMethod(m, Method.Post)) { return icebergCommit(store, bucket, ns, name, body); }
+    if (isMethod(m, Method.Post)) { return icebergCommit(store, bucket, ns, name, body, sealing); }
     if (isMethod(m, Method.Head)) { return Ok(tablesNoContent()); }
     if (isMethod(m, Method.Get)) {
         let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
         if (location.length == 0) { return noSuchTable(); }
-        let metadata = readMetadata(store, hidden.view(), location.view())?;
+        let metadata = readMetadataWith(store, hidden.view(), location.view(), sealing)?;
         return loadResult(location.view(), metadata);
     }
     if (isMethod(m, Method.Delete)) {
@@ -1546,6 +1586,7 @@ fn icebergRoute(
     segs: Slice<Vector<u8>>,
     body: Slice<u8>,
     caller: borrow TablesCaller,
+    sealing: borrow WarehouseKeys,
 ) -> Result<TablesAnswer, TablesError> {
     let m = req.method;
     if (segs.length < 2 || segs[0].view() != "v1".bytes()) { return icebergUnsupported(); }
@@ -1597,10 +1638,10 @@ fn icebergRoute(
         }
         if (isMethod(m, Method.Post)) {
             checkTables(store, caller, "s3tables:CreateTable", b, "".bytes())?;
-            return icebergCreateTable(store, b, ns, body);
+            return icebergCreateTable(store, b, ns, body, sealing);
         }
         return icebergUnsupported();
     }
-    if (rest.length == 4) { return icebergTable(store, req, b, ns, rest[3].view(), body, caller); }
+    if (rest.length == 4) { return icebergTable(store, req, b, ns, rest[3].view(), body, caller, sealing); }
     return icebergUnsupported();
 }

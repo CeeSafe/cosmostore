@@ -1,0 +1,117 @@
+// An encrypted table's files sealed and opened by the catalog and compaction (ADR-0126 §4).
+import web_core;
+
+fn testKey(id: StringView, fill: u8) -> MasterKey {
+    var raw = [0u8; 32];
+    for (i in 0..32) { raw[i] = fill + truncate<u8>(i); }
+    return MasterKey.create(copyBytes(id.bytes())!, raw[..]);
+}
+
+/// A file written sealed (SSE-S3, then SSE-KMS) reads back whole and by ranges across its chunks; its stored bytes
+/// are not its plaintext; without the keys it does not open; in the clear it is as written.
+@test
+fn tableFilesSealedAndOpened() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("sealed-io");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("w--table-s3")!;
+    var sse = Vector<MasterKey>.create();
+    sse.push(testKey("k1", 3))!;
+    var kms = Vector<MasterKey>.create();
+    kms.push(testKey("orders", 90))!;
+    let keys = WarehouseKeys { sse: sse.view(), kms: kms.view() };
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    // Past two 64 KiB chunks, so that ranges cross them.
+    var plain = Vector<u8>.create();
+    for (i in 0u64..150000) { plain.push(truncate<u8>(i * 7 + i / 300))!; }
+    var managed = jsonObject();
+    jsonSet(mut managed, "sseAlgorithm", jsonString("AES256".bytes())!)!;
+    var withKms = jsonObject();
+    jsonSet(mut withKms, "sseAlgorithm", jsonString("aws:kms".bytes())!)!;
+    jsonSet(mut withKms, "kmsKeyArn", jsonString("arn:aws:kms:us-east-1:000000000000:key/orders".bytes())!)!;
+    let names = ["managed", "kms", "clear"];
+    for (k in 0..3) {
+        let encryption: Json? = if (k == 0) Some(cloneJson(borrow managed)!) else if (k == 1) Some(cloneJson(borrow withKms)!) else null;
+        let written = putTableFile(mut s, "w--table-s3", names[k], "application/octet-stream", plain.view(), encryption.asBorrow(), borrow keys, PutCondition.None)!;
+        Check.isTrue(written, "written")?;
+        let info = s.headObject("w--table-s3", names[k])!;
+        Check.equalU64(plain.length as u64, info.size)?;
+        let sealed = metadataFind(info.metadata.view(), SSE_FIELD.bytes()).isSome();
+        Check.isTrue(sealed == (k < 2), "sealed as its table is")?;
+        let stored = s.getObject("w--table-s3", names[k])!;
+        Check.isTrue((stored.view() == plain.view()) == (k == 2), "its stored bytes")?;
+        let whole = readTablePlain(mut s, "w--table-s3", names[k], borrow keys)!!;
+        Check.isTrue(whole.view() == plain.view(), "read back whole")?;
+        for (range in [[0u64, 10], [65530, 65600], [65536, 131072], [100000, 150000], [149990, 200000]]) {
+            var p = preparePlain(mut s, "w--table-s3", names[k], range[0], range[1], borrow keys)!!;
+            let got = readPlainPrepared(mut p)!!;
+            let to = if (range[1] > 150000) 150000 else range[1];
+            Check.isTrue(got.view() == plain.view()[range[0] as usize..to as usize], "a range read back")?;
+        }
+        if (k < 2) {
+            Check.isTrue(readTablePlain(mut s, "w--table-s3", names[k], borrow noKeys)!.isNull(), "no key, no open")?;
+        }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// The metadata location of table `t` of namespace `ns` in table bucket `cat`, and its key in the warehouse.
+fn currentMetadataKey(s: borrow ObjectStore) -> Vector<u8> {
+    let rec = currentTable(s, "cat".bytes(), "ns".bytes(), "t".bytes())!!;
+    let location = jsonMemberText(borrow rec.json, "metadataLocation")!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    return copyBytes(metadataKey(location, hidden.view())!)!;
+}
+
+/// The catalog's own files of a table its bucket's encryption covers (ADR-0126 §4): its metadata files written
+/// sealed under the table's KMS key; read back with the server's keys, and not without them (a commit then fails, the
+/// table as it was).
+@test
+fn encryptedTablesMetadataSealed() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("sealed-catalog");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    var kms = Vector<MasterKey>.create();
+    kms.push(testKey("orders", 90))!;
+    let noSse = Vector<MasterKey>.create();
+    let keys = WarehouseKeys { sse: noSse.view(), kms: kms.view() };
+    let noKeys = WarehouseKeys { sse: noSse.view(), kms: noSse.view() };
+    let config = parseJson(
+        "{\"encryption\":{\"sseAlgorithm\":\"aws:kms\",\"kmsKeyArn\":\"arn:aws:kms:us-east-1:000000000000:key/orders\"}}".bytes(),
+    )!!;
+    writeTablesConfig(mut s, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes(), borrow config)!;
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let made = icebergCreateTable(
+        mut s,
+        "cat".bytes(),
+        "ns".bytes(),
+        "{\"name\":\"t\",\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+        borrow keys,
+    )!;
+    Check.equalU64(200, made.status as u64)?;
+    let first = currentMetadataKey(borrow s);
+    let info = s.headObject(catalogText(hidden.view()), catalogText(first.view()))!;
+    let field = metadataFind(info.metadata.view(), SSE_FIELD.bytes())!;
+    Check.isTrue(isKmsEnvelope(field), "sealed under the table's KMS key")?;
+    let stored = s.getObject(catalogText(hidden.view()), catalogText(first.view()))!;
+    Check.isTrue(parseJson(stored.view())!.isNull(), "its stored bytes are not its JSON")?;
+    let rec = currentTable(borrow s, "cat".bytes(), "ns".bytes(), "t".bytes())!!;
+    let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+    let opened = readMetadataWith(borrow s, hidden.view(), location.view(), borrow keys)!;
+    Check.isTrue(jsonMemberI64(borrow opened, "format-version").isSome(), "opened with the keys")?;
+    Check.isTrue(readMetadataWith(borrow s, hidden.view(), location.view(), borrow noKeys).isErr(), "not without")?;
+    // A commit reads the metadata and writes the next, sealed again; without the keys it fails, nothing changed.
+    let update = "{\"requirements\":[],\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"k\":\"v\"}}]}".bytes();
+    Check.isTrue(icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), update, borrow noKeys).isErr(), "no keys")?;
+    Check.isTrue(currentMetadataKey(borrow s).view() == first.view(), "the table as it was")?;
+    let committed = icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), update, borrow keys)!;
+    Check.equalU64(200, committed.status as u64)?;
+    let second = currentMetadataKey(borrow s);
+    Check.isTrue(second.view() != first.view(), "a new metadata file")?;
+    let next = s.headObject(catalogText(hidden.view()), catalogText(second.view()))!;
+    Check.isTrue(metadataFind(next.metadata.view(), SSE_FIELD.bytes()).isSome(), "sealed too")?;
+    removeTree(dir.view());
+    return Ok();
+}

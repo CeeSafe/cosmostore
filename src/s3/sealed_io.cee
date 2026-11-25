@@ -1,0 +1,303 @@
+// An encrypted table's files read and written by the catalog and compaction (ADR-0126 §4): unsealed as read and sealed
+// as written, with the server's master keys, as S3's GET and PUT do. The store keeps ciphertext and never opens it.
+import web_core;
+
+/// The server's keys, as the catalog and compaction are given them: SSE-S3's master keys and SSE-KMS's keys.
+struct WarehouseKeys<region a> {
+    sse: Slice<a, MasterKey>;
+    kms: Slice<a, MasterKey>;
+}
+
+/// The data key of a stored envelope, with the server's keys: SSE-S3's or SSE-KMS's by its kind. Null for SSE-C (the
+/// catalog holds no customer's key), a key not held, or an envelope that does not open.
+fn storedDataKey(keys: borrow WarehouseKeys, field: Slice<u8>) -> [u8; 32]? {
+    if (isCustomerEnvelope(field)) { return null; }
+    let set = if (isKmsEnvelope(field)) keys.kms else keys.sse;
+    return match (managedDataKey(set, field)) {
+        Ok(k) => Some(k),
+        Err(_) => null,
+    };
+}
+
+/// A reader of a range of an object's plaintext, prepared under the store: its stored bytes pinned, and for a sealed
+/// object how they open (its data key, and the salt of its first part when the range starts inside a multipart
+/// part). Read off the store's lock with `readPlainPrepared`.
+struct PlainReader {
+    reader: PreparedReader;
+    sealed: bool;
+    dataKey: [u8; 32];
+    size: u64;
+    parts: u32;
+    partSizes: Vector<u64>;
+    part: usize;
+    chunk: u64;
+    skip: u64;
+    salt: Vector<u8>;
+    /// The plaintext bytes wanted.
+    length: u64;
+
+    drop {
+        Secret.wipe(mut this.dataKey[0..32]);
+    }
+}
+
+/// `from..to` of an object's plaintext prepared (`to` past its end is its end); null when the object is not there, or
+/// is sealed under a key not held here (or SSE-C).
+fn preparePlain(
+    store: borrow mut ObjectStore,
+    bucket: StringView,
+    key: StringView,
+    from: u64,
+    to: u64,
+    keys: borrow WarehouseKeys,
+) -> Result<PlainReader?, StoreError> {
+    let info = match (store.headObject(bucket, key)) {
+        Ok(i) => i,
+        Err(StoreError.NoSuchKey) => { return Ok(null); }
+        Err(e) => { return Err(e); }
+    };
+    let end = if (to > info.size) info.size else to;
+    let start = if (from > end) end else from;
+    let field = match (metadataFind(info.metadata.view(), SSE_FIELD.bytes())) {
+        Some(f) => copyBytes(f)?,
+        null => {
+            return Ok(Some(PlainReader {
+                reader: store.prepareReaderOf(bucket, key, null, start, end)?,
+                sealed: false,
+                dataKey: [0u8; 32],
+                size: info.size,
+                parts: 0,
+                partSizes: Vector<u64>.create(),
+                part: 0,
+                chunk: 0,
+                skip: 0,
+                salt: Vector<u8>.create(),
+                length: end - start,
+            }));
+        }
+    };
+    let extras = match (decodeExtras(info.extras.view())) {
+        Ok(e) => e,
+        Err(_) => { return Ok(null); }
+    };
+    if (info.parts > 0 && extras.partSizes.length == 0) { return Ok(null); }
+    let dataKey = storedDataKey(keys, field.view()) ?? { return Ok(null); };
+    let r = sseRange(info.size, extras.partSizes.view(), start, end);
+    var salt = Vector<u8>.create();
+    match (r.headerAt) {
+        Some(at) => {
+            var header = store.prepareReaderOf(bucket, key, null, at, at + SSE_PART_HEADER)?;
+            var opened = header.open()?;
+            salt = readRemaining(mut opened)?;
+        }
+        null => {}
+    }
+    var partSizes = Vector<u64>.create();
+    partSizes.extend(extras.partSizes.view())?;
+    return Ok(Some(PlainReader {
+        reader: store.prepareReaderOf(bucket, key, null, r.storedFrom, r.storedTo)?,
+        sealed: true,
+        dataKey: dataKey,
+        size: info.size,
+        parts: info.parts,
+        partSizes: partSizes,
+        part: r.part,
+        chunk: r.chunk,
+        skip: r.skip,
+        salt: salt,
+        length: end - start,
+    }));
+}
+
+/// A prepared range's plaintext, off the store's lock; null when its bytes read short or a chunk does not open.
+fn readPlainPrepared(p: borrow mut PlainReader) -> Result<Vector<u8>?, AllocError> {
+    let stored = readPrepared(mut p.reader)? ?? { return Ok(null); };
+    if (!p.sealed) { return Ok(Some(stored)); }
+    var stream = if (p.parts == 0) SseStream.single(borrow p.dataKey, p.size, p.chunk)
+        else SseStream.multipart(borrow p.dataKey, p.partSizes.view()[p.part..], p.chunk, p.salt.view())?;
+    var s = stream ?? { return Ok(null); };
+    var plain = Vector<u8>.create();
+    if (!s.feed(stored.view(), mut plain)? || !s.isWhole()) { return Ok(null); }
+    let from = p.skip as usize;
+    if (from > plain.length) { return Ok(null); }
+    let wanted = if (p.length as usize > plain.length - from) plain.length - from else p.length as usize;
+    if (from == 0 && wanted == plain.length) { return Ok(Some(plain)); }
+    return Ok(Some(copyBytes(plain.view()[from..from + wanted])?));
+}
+
+/// An object's whole plaintext, under the store: a metadata file or a manifest. Null when it is not there or does
+/// not open.
+fn readTablePlain(
+    store: borrow mut ObjectStore,
+    bucket: StringView,
+    key: StringView,
+    keys: borrow WarehouseKeys,
+) -> Result<Vector<u8>?, StoreError> {
+    var p = preparePlain(store, bucket, key, 0, 18446744073709551615, keys)? ?? { return Ok(null); };
+    return Ok(readPlainPrepared(mut p)?);
+}
+
+/// A writer of a table's file, sealed with its encryption when it has one (ADR-0126 §4): its stored bytes the
+/// sealer's, its size and ETag the plaintext's as S3's PUT gives them, its envelope in its metadata.
+struct SealedWriter {
+    writer: ObjectWriter;
+    sealer: SseSealer?;
+    field: Vector<u8>;
+    md5: Md5;
+    size: u64;
+    sealed: Vector<u8>;
+
+    /// Plaintext written: sealed first when the table is encrypted.
+    fn write(borrow mut this, data: Slice<u8>) -> Result<void, StoreError> {
+        this.md5.update(data);
+        this.size += data.length as u64;
+        match (this.sealer.asBorrowMut()) {
+            Some(s) => {
+                this.sealed.clear();
+                s.feed(data, mut this.sealed)?;
+                if (this.sealed.length > 0) {
+                    return match (this.writer.write(this.sealed.view())) {
+                        Ok() => Ok(),
+                        Err(f) => Err(StoreError.Io(f)),
+                    };
+                }
+                return Ok();
+            }
+            null => {}
+        }
+        return match (this.writer.write(data)) {
+            Ok() => Ok(),
+            Err(f) => Err(StoreError.Io(f)),
+        };
+    }
+
+    /// The file finished: its last chunk sealed, its size and ETag the plaintext's.
+    fn finish(borrow mut this) -> Result<FinishedObject, StoreError> {
+        let digest = this.md5.finish();
+        match (this.sealer.asBorrowMut()) {
+            Some(s) => {
+                this.sealed.clear();
+                s.finish(mut this.sealed)?;
+                if (this.sealed.length > 0) {
+                    match (this.writer.write(this.sealed.view())) {
+                        Ok() => {}
+                        Err(f) => { return Err(StoreError.Io(f)); }
+                    }
+                }
+            }
+            null => {}
+        }
+        var finished = match (this.writer.finish()) {
+            Ok(o) => o,
+            Err(f) => { return Err(StoreError.Io(f)); }
+        };
+        match (this.sealer.asBorrow()) {
+            Some(s) => {
+                finished.size = this.size;
+                finished.md5 = sealedEtag(s, digest);
+            }
+            null => {}
+        }
+        return Ok(finished);
+    }
+
+    /// `metadata` with the file's envelope, when it is sealed.
+    fn metadataWith(borrow this, metadata: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+        var out = copyBytes(metadata)?;
+        if (this.field.length > 0) { metadataAdd(mut out, SSE_FIELD.bytes(), this.field.view())?; }
+        return Ok(out);
+    }}
+
+/// A writer for a file of a table of encryption `encryption` (none: in the clear); null when the key it names is not
+/// held here.
+fn sealedWriter(
+    writer: ObjectWriter,
+    encryption: borrow Json?,
+    keys: borrow WarehouseKeys,
+) -> Result<SealedWriter?, AllocError> {
+    var out = SealedWriter {
+        writer: writer,
+        sealer: null,
+        field: Vector<u8>.create(),
+        md5: Md5.create(),
+        size: 0,
+        sealed: Vector<u8>.create(),
+    };
+    match (encryption) {
+        Some(config) => {
+            let asked = sseOfEncryption(config);
+            let seal = match (newSeal(keys.sse, keys.kms, borrow asked)) {
+                Ok(Some(s)) => s,
+                Ok(null) => { return Ok(Some(out)); }
+                Err(S3Fail.OutOfMemory(oom)) => { return Err(oom); }
+                Err(_) => { return Ok(null); }
+            };
+            out.field.extend(seal.field.view())?;
+            out.sealer = match (sealerOf(borrow seal, 0, null)) {
+                Ok(made) => Some(made),
+                Err(S3Fail.OutOfMemory(oom)) => { return Err(oom); }
+                Err(_) => { return Ok(null); }
+            };
+        }
+        null => {}
+    }
+    return Ok(Some(out));
+}
+
+
+/// `bytes` written whole as a table's file at `key`, sealed with its encryption when it has one: a metadata file or a
+/// manifest. False when the key it names is not held here.
+fn putTableFile(
+    store: borrow mut ObjectStore,
+    bucket: StringView,
+    key: StringView,
+    contentType: StringView,
+    bytes: Slice<u8>,
+    encryption: borrow Json?,
+    keys: borrow WarehouseKeys,
+    condition: PutCondition,
+) -> Result<bool, StoreError> {
+    var w = sealedWriter(store.newWriter()?, encryption, keys)? ?? { return Ok(false); };
+    w.write(bytes)?;
+    let finished = w.finish()?;
+    let metadata = w.metadataWith("".bytes())?;
+    let _ = store.putFinishedWith(bucket, key, contentType, metadata.view(), "".bytes(), borrow finished, condition)?;
+    return Ok(true);
+}
+
+/// The server's key sets, owned (shared with the S3 server as they are reloaded): what a plan or a loop keeps.
+struct TableKeys {
+    sse: Arc<KeySets>;
+    kms: Arc<KeySets>;
+
+    fn keys(borrow this) -> WarehouseKeys =>
+        WarehouseKeys { sse: this.sse.get().view(), kms: this.kms.get().view() };
+
+    fn share(borrow this) -> TableKeys => TableKeys { sse: this.sse.clone(), kms: this.kms.clone() };
+}
+
+fn tableKeysOf(app: borrow S3App) -> TableKeys => TableKeys { sse: app.sseKeys.clone(), kms: app.kmsKeys.clone() };
+
+/// No keys: the tests', and a store opened without a server.
+fn noTableKeys() -> Result<TableKeys, AllocError> =>
+    Ok(TableKeys { sse: sharedKeys(Vector<MasterKey>.create())?, kms: sharedKeys(Vector<MasterKey>.create())? });
+
+/// An object's stored bytes opened whole, from its version's facts (an in-memory read for a caller that holds the
+/// store borrowed only to read): its plaintext; the bytes as they are when it is not sealed; null when it is sealed
+/// under a key not held here, or does not open.
+fn plainOfStored(info: borrow ObjectInfo, stored: Vector<u8>, keys: borrow WarehouseKeys) -> Result<Vector<u8>?, AllocError> {
+    let field = metadataFind(info.metadata.view(), SSE_FIELD.bytes()) ?? { return Ok(Some(stored)); };
+    let extras = match (decodeExtras(info.extras.view())) {
+        Ok(e) => e,
+        Err(_) => { return Ok(null); }
+    };
+    if (info.parts > 0 && extras.partSizes.length == 0) { return Ok(null); }
+    var dataKey = storedDataKey(keys, field) ?? { return Ok(null); };
+    let stream = if (info.parts == 0) SseStream.single(borrow dataKey, info.size, 0)
+        else SseStream.multipart(borrow dataKey, extras.partSizes.view(), 0, "".bytes())?;
+    Secret.wipe(mut dataKey[0..32]);
+    var s = stream ?? { return Ok(null); };
+    var plain = Vector<u8>.create();
+    if (!s.feed(stored.view(), mut plain)? || !s.isWhole() || plain.length as u64 != info.size) { return Ok(null); }
+    return Ok(Some(plain));
+}

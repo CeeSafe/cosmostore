@@ -5926,3 +5926,29 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - the bucket's encryption deleted, its table's kept.
 - **Not yet:** the catalog's own files (slice 3) and compaction (slice 4). Until then an encrypted table's manifests
   are sealed, and its maintenance cannot read them: it fails (Failed), never wrongly.
+
+### 25 Nov 2026: M30 slice 3, the catalog's own files sealed and opened (ADR-0126 §4)
+
+- **`src/s3/sealed_io.cee`:**
+  - `putTableFile` seals a whole file with its table's encryption. Its stored bytes are the sealer's, and its size and
+    ETag are the plaintext's, as S3's PUT gives them.
+  - `readTablePlain` and `plainOfStored` open a whole file, and `preparePlain` and `readPlainPrepared` a range, off
+    the lock: one PUT's or a multipart object's, as GET opens them.
+  - All of them use the server's SSE-S3 and KMS keys (`WarehouseKeys`; `TableKeys` owns them, shared as they are
+    reloaded). An SSE-C file, or one sealed under a key not held here, does not open.
+- **The catalog:**
+  - an encrypted table's metadata files are sealed when written (its creates, commits and snapshot expiry) and
+    opened when read (load, commit, maintenance);
+  - its table config is written before its first metadata file, which is sealed by it;
+  - a commit that cannot open its table's metadata fails, and the table stays as it was.
+- **Compaction's manifests and lists:** opened as read and sealed as written. The unreferenced sweep opens them too:
+  one that does not open fails the run, and nothing is deleted.
+- **The keys:**
+  - come from the S3 app (`routeTables`, `runMaintenance`) and the maintenance loop (`TablesMaintainer.keys`, set
+    when serve loads its key files);
+  - on a cluster, come from each node's `ReplicaContext`.
+- **Tests:** `tableFilesSealedAndOpened` (SSE-S3, KMS and clear: whole and ranges across chunks; no keys, no open) and
+  `encryptedTablesMetadataSealed` (a KMS bucket's table: metadata sealed; a commit without keys refused with the table
+  unchanged, and one with them sealed again).
+- **Not yet (slice 4):** compaction's data files. A sealed input is still skipped, and the files it writes are still
+  in the clear.

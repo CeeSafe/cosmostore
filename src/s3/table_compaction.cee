@@ -95,6 +95,9 @@ struct CompactionPlan {
     deleteRewrites: Vector<DeleteRewrite>;
     /// The metadata of the files the run writes: the table's storage class, when not STANDARD (ADR-0126 §2).
     objectMetadata: Vector<u8>;
+    /// The server's keys, and the table's encryption: its files opened and written sealed (ADR-0126 §4).
+    keys: TableKeys;
+    encryption: Json?;
 }
 
 /// A file a run wrote: its key and path, and its length.
@@ -192,7 +195,9 @@ fn planCompaction(
     store: borrow mut ObjectStore,
     t: borrow MaintainedTable,
     nowMs: i64,
+    tableKeys: borrow TableKeys,
 ) -> Result<CompactionDraft?, TablesError> {
+    let sealing = tableKeys.keys();
     let hidden = tableWarehouseBucket(t.bucket.view())?;
     let rec = match (tableRecord(store, t.bucket.view(), t.ns.view(), t.name.view())) {
         Ok(r) => r,
@@ -206,7 +211,7 @@ fn planCompaction(
     };
     let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
     if (location.length == 0) { return Ok(null); }
-    let m = match (readMetadata(store, hidden.view(), location.view())) {
+    let m = match (readMetadataWith(store, hidden.view(), location.view(), borrow sealing)) {
         Ok(m) => m,
         Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
         Err(_) => {
@@ -236,7 +241,7 @@ fn planCompaction(
         writeJobStatus(store, hidden.view(), id.view(), COMPACTION, "Failed", failed, nowMs)?;
         return Ok(null);
     }
-    let list = match (readWarehouseAvro(store, hidden.view(), listPath.view())?) {
+    let list = match (readWarehouseAvroWith(store, hidden.view(), listPath.view(), borrow sealing)?) {
         Some(f) => f,
         null => {
             writeJobStatus(store, hidden.view(), id.view(), COMPACTION, "Failed", failed, nowMs)?;
@@ -250,7 +255,7 @@ fn planCompaction(
             writeJobStatus(store, hidden.view(), id.view(), COMPACTION, "Failed", failed, nowMs)?;
             return Ok(null);
         }
-        match (readWarehouseAvro(store, hidden.view(), path)?) {
+        match (readWarehouseAvroWith(store, hidden.view(), path, borrow sealing)?) {
             Some(f) => { manifests.push(f)?; }
             null => {
                 writeJobStatus(store, hidden.view(), id.view(), COMPACTION, "Failed", failed, nowMs)?;
@@ -407,6 +412,7 @@ fn planCompaction(
     let deleteRewrites = deleteRewritesOf(deletes.view(), manifests.view(), blocked.view())?;
     var objectMetadata = Vector<u8>.create();
     let storageClass = tableStorageClass(store, hidden.view(), id.view())?;
+    let encryption = tableEncryption(store, hidden.view(), id.view())?;
     if (storageClass.view() != "STANDARD".bytes()) {
         metadataAdd(mut objectMetadata, STORAGE_CLASS_FIELD.bytes(), storageClass.view())?;
     }
@@ -431,6 +437,8 @@ fn planCompaction(
         avroCodec: avroCodec,
         deleteRewrites: deleteRewrites,
         objectMetadata: objectMetadata,
+        keys: tableKeys.share(),
+        encryption: encryption,
     };
     return Ok(Some(CompactionDraft { plan: plan, pending: pending, target: target }));
 }
@@ -555,11 +563,22 @@ fn snapshotListPath(m: borrow Json, id: i64) -> Slice<u8>? {
 
 /// An Avro file of the table's bucket by its path; null when it is elsewhere, missing or not Avro.
 fn readWarehouseAvro(store: borrow ObjectStore, hidden: Slice<u8>, path: Slice<u8>) -> Result<AvroFile?, TablesError> {
+    let none = Vector<MasterKey>.create();
+    return readWarehouseAvroWith(store, hidden, path, borrow WarehouseKeys { sse: none.view(), kms: none.view() });
+}
+
+/// `readWarehouseAvro` of a file opened with the server's keys, when it is sealed (ADR-0126 §4).
+fn readWarehouseAvroWith(
+    store: borrow ObjectStore,
+    hidden: Slice<u8>,
+    path: Slice<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<AvroFile?, TablesError> {
     match (refPlace(path, hidden)) {
         RefPlace.Here => {}
         _ => { return Ok(null); }
     }
-    let bytes = match (warehouseObject(store, hidden, refKey(path))?) {
+    let bytes = match (warehouseObjectWith(store, hidden, refKey(path), keys)?) {
         Some(b) => b,
         null => { return Ok(null); }
     };
@@ -1714,14 +1733,20 @@ fn putWarehouseFile(
     bytes: Slice<u8>,
     written: borrow mut Vector<Vector<u8>>,
 ) -> Result<Vector<u8>?, TablesError> {
-    match (store.putObject(
+    // Sealed with the table's encryption, when it has one (ADR-0126 §4).
+    let sealing = plan.keys.keys();
+    match (putTableFile(
+        store,
         catalogText(plan.hidden.view()),
         catalogText(key),
         "application/octet-stream",
         bytes,
+        plan.encryption.asBorrow(),
+        borrow sealing,
         PutCondition.IfAbsent,
     )) {
-        Ok(_) => {}
+        Ok(true) => {}
+        Ok(false) => { return Err(TablesError.Internal); }
         Err(e) => { return Err(tablesStoreFail(e)); }
     }
     written.push(copyBytes(key)?)?;
@@ -2404,6 +2429,8 @@ fn commitWritten(
     jsonSet(mut m, "refs", refs)?;
     jsonSet(mut m, "last-updated-ms", jsonInteger(nowMs)?)?;
     let key = catalogKey(CATALOG_TABLES, plan.ns.view(), plan.name.view())?;
+    let commitKeys = plan.keys.share();
+    let sealing = commitKeys.keys();
     return match (swapMetadata(
         store,
         plan.hidden.view(),
@@ -2413,6 +2440,7 @@ fn commitWritten(
         plan.location.view(),
         mut m,
         plan.previousStamp,
+        borrow sealing,
     )?) {
         Some(_) => Ok(true),
         null => Ok(false), // another commit swapped first
@@ -2475,8 +2503,9 @@ async fn compactTable(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     t: borrow MaintainedTable,
     nowMs: i64,
+    tableKeys: borrow TableKeys,
 ) -> Result<void, NetError> {
-    var draft = match (await lockedPlan(store, t, nowMs)?) {
+    var draft = match (await lockedPlan(store, t, nowMs, tableKeys)?) {
         Some(d) => d,
         null => { return Ok(); }
     };
@@ -2611,13 +2640,14 @@ async fn lockedPlan(
     store: borrow Arc<AsyncMutex<ObjectStore>>,
     t: borrow MaintainedTable,
     nowMs: i64,
+    tableKeys: borrow TableKeys,
 ) -> Result<CompactionDraft?, NetError> {
     var guard = match (await store.get().lock()) {
         Ok(g) => g,
         Err(_) => { return Err(NetError.Closed); }
     };
     let st = guard.data();
-    return match (await Async.blocking(() => planCompaction(st, t, nowMs))) {
+    return match (await Async.blocking(() => planCompaction(st, t, nowMs, tableKeys))) {
         Ok(p) => Ok(p),
         Err(_) => Ok(null),
     };

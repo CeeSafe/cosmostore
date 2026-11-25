@@ -276,12 +276,15 @@ fn icebergStagedCreates() -> Result<void, TestFailure> {
     let dir = scratchDirectory("iceberg-staged");
     var s = ObjectStore.open(dir.view(), storeConfig())!;
     s.createBucket(catalogText(tableWarehouseBucket("cat".bytes())!.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
     let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
     let staged = icebergCreateTable(
         mut s,
         "cat".bytes(),
         "ns".bytes(),
         "{\"name\":\"t\",\"stage-create\":true,\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+        borrow noKeys,
     )!;
     let answer = parseJson(staged.body.view())!!;
     Check.isTrue(jsonMember(borrow answer, "metadata-location").isNull(), "nothing written")?;
@@ -289,11 +292,11 @@ fn icebergStagedCreates() -> Result<void, TestFailure> {
     Check.isTrue(currentTable(borrow s, "cat".bytes(), "ns".bytes(), "t".bytes())!.isNull(), "no table yet")?;
     // A location no staged create gave: refused.
     let other = parseJson(createCommitBody("s3://cat--table-s3/00000000-0000-4000-8000-000000000000".bytes()).view())!!;
-    let refused = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow other)!;
+    let refused = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow other, borrow noKeys)!;
     Check.equalU64(400, refused.status as u64)?;
     // The location staged, for another table's name: refused.
     let body = parseJson(createCommitBody(location.view()).view())!!;
-    let wrongName = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "u".bytes(), borrow body)!;
+    let wrongName = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "u".bytes(), borrow body, borrow noKeys)!;
     Check.equalU64(400, wrongName.status as u64)?;
     // A commit to a table not there that is not a create: no such table (the M29 exit review's L2).
     let plain = icebergCommit(
@@ -302,6 +305,7 @@ fn icebergStagedCreates() -> Result<void, TestFailure> {
         "ns".bytes(),
         "t".bytes(),
         "{\"requirements\":[],\"updates\":[]}".bytes(),
+        borrow noKeys,
     )!;
     Check.equalU64(404, plain.status as u64)?;
     // The checks a create makes (the review's M2): a schema with an id twice, a spec of a column not there.
@@ -317,11 +321,11 @@ fn icebergStagedCreates() -> Result<void, TestFailure> {
         text.extend(location.view())!;
         text.extend("\"}]}".bytes())!;
         let request = parseJson(text.view())!!;
-        let invalid = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow request)!;
+        let invalid = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow request, borrow noKeys)!;
         Check.equalU64(400, invalid.status as u64)?;
     }
     // For its own: the table made, at its location.
-    let made = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow body)!;
+    let made = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow body, borrow noKeys)!;
     Check.equalU64(200, made.status as u64)?;
     let rec = currentTable(borrow s, "cat".bytes(), "ns".bytes(), "t".bytes())!!;
     let m = readMetadata(
@@ -333,7 +337,7 @@ fn icebergStagedCreates() -> Result<void, TestFailure> {
     Check.isTrue(jsonMemberI64(borrow m, "format-version") == Some(2i64), "version 2")?;
     Check.equalU64(1, arrayLength(borrow m, "sort-orders") as u64)?;
     // Its reservation used: the same create again is refused.
-    let again = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow body)!;
+    let again = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow body, borrow noKeys)!;
     Check.equalU64(400, again.status as u64)?;
     removeTree(dir.view());
     return Ok();
