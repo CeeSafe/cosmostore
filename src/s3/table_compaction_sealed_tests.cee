@@ -1,0 +1,114 @@
+// Compaction of an encrypted table (ADR-0126 §4): its inputs, deletes and manifests opened as read, and everything it
+// writes sealed with the table's key.
+import web_core;
+
+const SEALED_KMS_ARN: StringView = "arn:aws:kms:us-east-1:000000000000:key/orders";
+
+fn sealedTableKeys() -> TableKeys {
+    var kms = Vector<MasterKey>.create();
+    kms.push(testKey("orders", 90))!;
+    return TableKeys { sse: sharedKeys(Vector<MasterKey>.create())!, kms: sharedKeys(kms)! };
+}
+
+/// The fixture table's keys, its files' and its catalog's.
+fn tableFileKeys(s: borrow ObjectStore) -> Vector<Vector<u8>> {
+    let listed = s.listObjects(COMPACT_HIDDEN, COMPACT_ID, "", "".bytes(), false, 1000)!;
+    var out = Vector<Vector<u8>>.create();
+    for (k in 0..listed.keys.length) { out.push(copyBytes(listed.keys[k].view())!)!; }
+    return out;
+}
+
+/// Every file of the fixture table rewritten sealed under the KMS key, and the table's configuration naming it.
+fn sealFixtureTable(dir: StringView, tableKeys: borrow TableKeys) {
+    var s = ObjectStore.open(dir, storeConfig())!;
+    let config = parseJson(
+        "{\"encryption\":{\"sseAlgorithm\":\"aws:kms\",\"kmsKeyArn\":\"arn:aws:kms:us-east-1:000000000000:key/orders\"}}".bytes(),
+    )!!;
+    writeTablesConfig(mut s, COMPACT_HIDDEN.bytes(), tableConfigKey(COMPACT_ID.bytes())!.view(), borrow config)!;
+    let encryption: Json? = Some(cloneJson(jsonMember(borrow config, "encryption")!)!);
+    let keys = tableKeys.keys();
+    for (key in tableFileKeys(borrow s).view()) {
+        let name = StringView.fromUtf8(key.view()) ?? "";
+        let plain = s.getObject(COMPACT_HIDDEN, name)!;
+        if (!putTableFile(
+            mut s,
+            COMPACT_HIDDEN,
+            name,
+            "",
+            plain.view(),
+            encryption.asBorrow(),
+            borrow keys,
+            PutCondition.None,
+        )!) {
+            panic("not sealed");
+        }
+    }
+    s.checkpoint()!;
+}
+
+/// Every file of the table sealed under the KMS key (the files the run wrote too); then each opened, written back in
+/// the clear, for the plain tests' checks. How many files.
+fn checkSealedThenOpen(dir: StringView, tableKeys: borrow TableKeys) -> Result<usize, TestFailure> {
+    var s = ObjectStore.open(dir, storeConfig())!;
+    let keys = tableKeys.keys();
+    let files = tableFileKeys(borrow s);
+    for (key in files.view()) {
+        let name = StringView.fromUtf8(key.view()) ?? "";
+        let info = s.headObject(COMPACT_HIDDEN, name)!;
+        let field = metadataFind(info.metadata.view(), SSE_FIELD.bytes()) ?? {
+            return Err(TestFailure.create("a file of the table in the clear"));
+        };
+        Check.isTrue(isKmsEnvelope(field), "under the table's KMS key")?;
+        let plain = readTablePlain(mut s, COMPACT_HIDDEN, name, borrow keys)!!;
+        let _ = s.putObject(COMPACT_HIDDEN, name, "", plain.view(), PutCondition.None)!;
+    }
+    return Ok(files.length);
+}
+
+/// A sealed table compacted: its position and equality deletes applied in its merge, the merged file and its
+/// manifests sealed; its rows then as the plain table's test has them. Without the key, nothing is compacted.
+@test
+fn encryptedTableCompacted() -> Result<void, TestFailure> {
+    let tableKeys = sealedTableKeys();
+    for (withKeys in [false, true]) {
+        let dir = scratchDirectory(if (withKeys) "compact-sealed" else "compact-sealed-nokey");
+        deletesStore(dir.bytes(), storeConfig());
+        sealFixtureTable(dir.view(), borrow tableKeys);
+        var before: usize = 0;
+        {
+            let s = ObjectStore.open(dir.view(), storeConfig())!;
+            before = tableFileKeys(borrow s).length;
+        }
+        if (withKeys) {
+            let _ = compactionWorkloadKeyed(dir.bytes(), storeConfig(), borrow tableKeys);
+        } else {
+            let _ = compactionWorkloadKeyed(dir.bytes(), storeConfig(), borrow noTableKeys()!);
+        }
+        let after = checkSealedThenOpen(dir.view(), borrow tableKeys)?;
+        let s = ObjectStore.open(dir.view(), storeConfig())!;
+        if (withKeys) {
+            Check.isTrue(after > before, "the run's files written")?;
+            Check.equalU64(1, checkDeletesTable(borrow s)? as u64)?;
+        } else {
+            Check.equalU64(before as u64, after as u64)?;
+            Check.equalU64(2, checkDeletesTable(borrow s)? as u64)?;
+        }
+        removeTree(dir.view());
+    }
+    return Ok();
+}
+
+/// A sealed table's files joined (its fixture's two files, which merge), sealed as they are written.
+@test
+fn encryptedTableJoined() -> Result<void, TestFailure> {
+    let tableKeys = sealedTableKeys();
+    let dir = scratchDirectory("compact-sealed-plain");
+    fixtureCompactStore(dir.bytes(), storeConfig());
+    sealFixtureTable(dir.view(), borrow tableKeys);
+    let _ = compactionWorkloadKeyed(dir.bytes(), storeConfig(), borrow tableKeys);
+    let _ = checkSealedThenOpen(dir.view(), borrow tableKeys)?;
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(1, checkCompacted(borrow s)? as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}

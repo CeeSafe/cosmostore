@@ -31,8 +31,19 @@ fn tableFilesSealedAndOpened() -> Result<void, TestFailure> {
     jsonSet(mut withKms, "kmsKeyArn", jsonString("arn:aws:kms:us-east-1:000000000000:key/orders".bytes())!)!;
     let names = ["managed", "kms", "clear"];
     for (k in 0..3) {
-        let encryption: Json? = if (k == 0) Some(cloneJson(borrow managed)!) else if (k == 1) Some(cloneJson(borrow withKms)!) else null;
-        let written = putTableFile(mut s, "w--table-s3", names[k], "application/octet-stream", plain.view(), encryption.asBorrow(), borrow keys, PutCondition.None)!;
+        let encryption: Json? = if (k == 0) Some(
+            cloneJson(borrow managed)!,
+        ) else if (k == 1) Some(cloneJson(borrow withKms)!) else null;
+        let written = putTableFile(
+            mut s,
+            "w--table-s3",
+            names[k],
+            "application/octet-stream",
+            plain.view(),
+            encryption.asBorrow(),
+            borrow keys,
+            PutCondition.None,
+        )!;
         Check.isTrue(written, "written")?;
         let info = s.headObject("w--table-s3", names[k])!;
         Check.equalU64(plain.length as u64, info.size)?;
@@ -47,6 +58,18 @@ fn tableFilesSealedAndOpened() -> Result<void, TestFailure> {
             let got = readPlainPrepared(mut p)!!;
             let to = if (range[1] > 150000) 150000 else range[1];
             Check.isTrue(got.view() == plain.view()[range[0] as usize..to as usize], "a range read back")?;
+            // Streamed, in pieces smaller than a chunk.
+            var q = preparePlain(mut s, "w--table-s3", names[k], range[0], range[1], borrow keys)!!;
+            var stream = q.open()!!;
+            var streamed = Vector<u8>.create();
+            var buf = Vector<u8>.create();
+            buf.resize(1000, 0)!;
+            while (true) {
+                let n = stream.read(buf.viewMut())!!;
+                if (n == 0) { break; }
+                streamed.extend(buf.view()[0..n])!;
+            }
+            Check.isTrue(streamed.view() == got.view(), "a range streamed")?;
         }
         if (k < 2) {
             Check.isTrue(readTablePlain(mut s, "w--table-s3", names[k], borrow noKeys)!.isNull(), "no key, no open")?;
@@ -103,8 +126,12 @@ fn encryptedTablesMetadataSealed() -> Result<void, TestFailure> {
     Check.isTrue(jsonMemberI64(borrow opened, "format-version").isSome(), "opened with the keys")?;
     Check.isTrue(readMetadataWith(borrow s, hidden.view(), location.view(), borrow noKeys).isErr(), "not without")?;
     // A commit reads the metadata and writes the next, sealed again; without the keys it fails, nothing changed.
-    let update = "{\"requirements\":[],\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"k\":\"v\"}}]}".bytes();
-    Check.isTrue(icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), update, borrow noKeys).isErr(), "no keys")?;
+    let update =
+        "{\"requirements\":[],\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"k\":\"v\"}}]}".bytes();
+    Check.isTrue(
+        icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), update, borrow noKeys).isErr(),
+        "no keys",
+    )?;
     Check.isTrue(currentMetadataKey(borrow s).view() == first.view(), "the table as it was")?;
     let committed = icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), update, borrow keys)!;
     Check.equalU64(200, committed.status as u64)?;

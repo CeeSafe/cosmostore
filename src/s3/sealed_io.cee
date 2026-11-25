@@ -39,6 +39,90 @@ struct PlainReader {
     drop {
         Secret.wipe(mut this.dataKey[0..32]);
     }
+
+    /// The range's plaintext as a stream, a chunk at a time, for a copy too long to hold (a joined bin's row groups).
+    /// Null when the cipher refuses the key.
+    fn open(borrow mut this) -> Result<PlainStream?, StoreError> {
+        let reader = this.reader.open()?;
+        var stream: SseStream? = null;
+        if (this.sealed) {
+            stream = if (this.parts == 0) SseStream.single(borrow this.dataKey, this.size, this.chunk)
+                else SseStream.multipart(
+                    borrow this.dataKey,
+                    this.partSizes.view()[this.part..],
+                    this.chunk,
+                    this.salt.view(),
+                )?;
+            if (stream.isNull()) { return Ok(null); }
+        }
+        var stored = Vector<u8>.create();
+        stored.resize(65536, 0)?;
+        return Ok(Some(PlainStream {
+            reader: reader,
+            stream: stream,
+            stored: stored,
+            plain: Vector<u8>.create(),
+            at: 0,
+            skip: this.skip,
+            left: this.length,
+        }));
+    }
+}
+
+/// A prepared range's plaintext read in pieces (`PlainReader.open`).
+struct PlainStream {
+    reader: ObjectReader;
+    /// Null for a file in the clear, whose stored bytes are its plaintext.
+    stream: SseStream?;
+    stored: Vector<u8>;
+    /// The opened plaintext not yet given, from `at`; the bytes of the first chunk before the range; what is left.
+    plain: Vector<u8>;
+    at: usize;
+    skip: u64;
+    left: u64;
+
+    /// Up to `into.length` bytes of plaintext; 0 at the range's end. Null when a chunk does not open or the stored
+    /// bytes end short of the range.
+    fn read(borrow mut this, into: SliceMut<u8>) -> Result<usize?, StoreError> {
+        if (into.length == 0) { return Ok(Some(0)); }
+        while (true) {
+            if (this.left == 0) { return Ok(Some(0)); }
+            if (this.at < this.plain.length) {
+                var n = this.plain.length - this.at;
+                if (n > into.length) { n = into.length; }
+                if (n as u64 > this.left) { n = truncate<usize>(this.left); }
+                let dest = borrow mut into[0..n];
+                dest.copyFrom(this.plain.view()[this.at..this.at + n]);
+                this.at += n;
+                this.left -= n as u64;
+                return Ok(Some(n));
+            }
+            match (this.stream.asBorrowMut()) {
+                Some(s) => {
+                    let m = this.reader.read(this.stored.viewMut())?;
+                    if (m == 0) { return Ok(null); } // short of the range
+                    this.plain.clear();
+                    this.at = 0;
+                    if (!s.feed(this.stored.view()[0..m], mut this.plain)?) { return Ok(null); }
+                    if (this.skip > 0) {
+                        let dropped =
+                            if (this.skip < this.plain.length as u64) this.skip as usize else this.plain.length;
+                        this.at = dropped;
+                        this.skip -= dropped as u64;
+                    }
+                }
+                null => {
+                    var limit = into.length;
+                    if (limit as u64 > this.left) { limit = truncate<usize>(this.left); }
+                    let n = this.reader.read(borrow mut into[0..limit])?;
+                    if (n == 0) { return Ok(null); }
+                    this.left -= n as u64;
+                    return Ok(Some(n));
+                }
+            }
+        }
+        return Ok(Some(0));
+    }
 }
 
 /// `from..to` of an object's plaintext prepared (`to` past its end is its end); null when the object is not there, or
@@ -120,7 +204,9 @@ fn readPlainPrepared(p: borrow mut PlainReader) -> Result<Vector<u8>?, AllocErro
     if (!s.feed(stored.view(), mut plain)? || !s.isWhole()) { return Ok(null); }
     let from = p.skip as usize;
     if (from > plain.length) { return Ok(null); }
-    let wanted = if (p.length as usize > plain.length - from) plain.length - from else p.length as usize;
+    // All of the range, or nothing: a short read is the caller's to see as a file that changed.
+    if (p.length > (plain.length - from) as u64) { return Ok(null); }
+    let wanted = p.length as usize;
     if (from == 0 && wanted == plain.length) { return Ok(Some(plain)); }
     return Ok(Some(copyBytes(plain.view()[from..from + wanted])?));
 }
@@ -206,7 +292,8 @@ struct SealedWriter {
         var out = copyBytes(metadata)?;
         if (this.field.length > 0) { metadataAdd(mut out, SSE_FIELD.bytes(), this.field.view())?; }
         return Ok(out);
-    }}
+    }
+}
 
 /// A writer for a file of a table of encryption `encryption` (none: in the clear); null when the key it names is not
 /// held here.
@@ -243,7 +330,6 @@ fn sealedWriter(
     }
     return Ok(Some(out));
 }
-
 
 /// `bytes` written whole as a table's file at `key`, sealed with its encryption when it has one: a metadata file or a
 /// manifest. False when the key it names is not held here.
@@ -285,7 +371,11 @@ fn noTableKeys() -> Result<TableKeys, AllocError> =>
 /// An object's stored bytes opened whole, from its version's facts (an in-memory read for a caller that holds the
 /// store borrowed only to read): its plaintext; the bytes as they are when it is not sealed; null when it is sealed
 /// under a key not held here, or does not open.
-fn plainOfStored(info: borrow ObjectInfo, stored: Vector<u8>, keys: borrow WarehouseKeys) -> Result<Vector<u8>?, AllocError> {
+fn plainOfStored(
+    info: borrow ObjectInfo,
+    stored: Vector<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<Vector<u8>?, AllocError> {
     let field = metadataFind(info.metadata.view(), SSE_FIELD.bytes()) ?? { return Ok(Some(stored)); };
     let extras = match (decodeExtras(info.extras.view())) {
         Ok(e) => e,

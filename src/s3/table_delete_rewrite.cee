@@ -176,10 +176,11 @@ struct DeleteRewriteCopy {
     partitionKey: Vector<u8>;
     /// Whether a position delete file may be written: not in a v3 table, which takes none new (ADR-0122 §3).
     writes: bool;
-    readers: Vector<PreparedReader>;
+    readers: Vector<PlainReader>;
     sizes: Vector<u64>;
     sequences: Vector<i64>;
-    writer: ObjectWriter;
+    /// Sealed with the table's encryption, when it has one (ADR-0126 §4).
+    writer: SealedWriter;
     codec: i64;
     level: u32;
 }
@@ -191,7 +192,11 @@ fn prepareDeleteRewrite(
     r: usize,
 ) -> Result<DeleteRewriteCopy?, StoreError> {
     let bucket = catalogText(plan.hidden.view());
-    var readers = Vector<PreparedReader>.create();
+    // Opened with the server's keys when sealed; the rewrite sealed with the table's encryption (ADR-0126 §4).
+    let tableKeys = plan.keys.share();
+    let sealing = tableKeys.keys();
+    let writer = sealedWriter(store.newWriter()?, plan.encryption.asBorrow(), borrow sealing)? ?? { return Ok(null); };
+    var readers = Vector<PlainReader>.create();
     var sizes = Vector<u64>.create();
     var sequences = Vector<i64>.create();
     for (x in plan.deleteRewrites[r].files.view()) {
@@ -202,9 +207,9 @@ fn prepareDeleteRewrite(
             }
             Err(_) => { return Ok(null); }
         }
-        match (store.prepareReaderOf(bucket, catalogText(d.key.view()), null, 0, d.size)) {
-            Ok(p) => { readers.push(p)?; }
-            Err(_) => { return Ok(null); }
+        match (preparePlain(store, bucket, catalogText(d.key.view()), 0, d.size, borrow sealing)) {
+            Ok(Some(p)) => { readers.push(p)?; }
+            _ => { return Ok(null); }
         }
         sizes.push(d.size)?;
         sequences.push(d.sequence)?;
@@ -215,7 +220,7 @@ fn prepareDeleteRewrite(
         readers: readers,
         sizes: sizes,
         sequences: sequences,
-        writer: store.newWriter()?,
+        writer: writer,
         codec: plan.pageCodec,
         level: plan.pageLevel,
     }));
@@ -226,6 +231,8 @@ struct DeleteRewriteWritten {
     obj: FinishedObject?;
     metrics: FileMetrics;
     sequence: i64;
+    /// Its file's envelope when it was sealed: empty in the clear.
+    seal: Vector<u8>;
 }
 
 /// The rows kept, by path: each path's positions, sorted and without duplicates once `finish`ed.
@@ -252,7 +259,7 @@ fn writeDeleteRewrite(
     var dropped = false;
     var most: i64 = 0;
     for (f in 0..c.readers.length) {
-        let bytes = readPrepared(mut c.readers[f])? ?? { return Ok(null); };
+        let bytes = readPlainPrepared(mut c.readers[f])? ?? { return Ok(null); };
         if (bytes.length as u64 != c.sizes[f]) { return Ok(null); }
         let footer = deleteFooterOf(bytes.view())? ?? { return Ok(null); };
         // Only `file_path` and `pos` (the optional `row` column's values are not kept here).
@@ -402,6 +409,7 @@ fn writeDeleteRewrite(
             upper: upper,
         },
         sequence: most,
+        seal: replace(mut c.writer.field, Vector<u8>.create()),
     }));
 }
 
@@ -415,7 +423,7 @@ fn longBytes(v: i64) -> Result<Vector<u8>, AllocError> {
 
 /// The rows held written as a row group of the rewritten file, and let go.
 fn flushDeleteGroup(
-    writer: borrow mut ObjectWriter,
+    writer: borrow mut SealedWriter,
     written: borrow mut u64,
     leaves: Slice<PageLeaf>,
     columns: borrow mut Vector<ColumnValues>,
@@ -452,11 +460,13 @@ fn putDeleteRewrite(
             key.extend("compacted-deletes-".bytes())?;
             if (!newUuid(mut key)?) { return Ok(false); }
             key.extend(".parquet".bytes())?;
+            var metadata = copyBytes(plan.objectMetadata.view())?;
+            if (w.seal.length > 0) { metadataAdd(mut metadata, SSE_FIELD.bytes(), w.seal.view())?; }
             match (store.putFinishedWith(
                 catalogText(plan.hidden.view()),
                 catalogText(key.view()),
                 "application/octet-stream",
-                plan.objectMetadata.view(),
+                metadata.view(),
                 "".bytes(),
                 obj,
                 PutCondition.IfAbsent,

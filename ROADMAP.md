@@ -5952,3 +5952,24 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   unchanged, and one with them sealed again).
 - **Not yet (slice 4):** compaction's data files. A sealed input is still skipped, and the files it writes are still
   in the clear.
+
+### 25 Nov 2026: M30 slice 4, compaction of an encrypted table (ADR-0126 §4, the owner's "Compacted")
+
+- **Its inputs opened as read** (`PlainReader`, pinned under the store and opened off its lock):
+  - each data file's tail, footer, row groups and copied ranges;
+  - its delete files and deletion vectors;
+  - the position delete files a rewrite reads.
+  - A joined bin's copies stream through `PlainStream` a chunk at a time, never held whole.
+  - A sealed file's size is its plaintext's, as its manifest states it. A file sealed under a key not held here (or
+    SSE-C's) is still left as it is.
+- **Its outputs sealed as written** (`SealedWriter`): merged and joined files, and rewritten position deletes. Each has
+  its own data key and envelope, since a nonce is its (part, chunk) and one key across files would repeat them. With
+  slice 3's manifests and lists, everything a run writes is sealed.
+- **Tests:**
+  - `encryptedTableCompacted`: the deletes fixture with every file sealed under the KMS key, compacted (the merge
+    applying both deletes); every file after the run is sealed, and opened, the rows are the plain test's. Without
+    the key, nothing is compacted.
+  - `encryptedTableJoined`: the plain fixture, sealed, compacted.
+  - Both fail when the outputs are written in the clear (mutation-checked).
+- **Also fixed:** slice 3's commit was pushed unformatted. `cee.sh fmt` formats only its scratch copy, so CI's
+  `fmt --check` failed, and this commit formats those files.

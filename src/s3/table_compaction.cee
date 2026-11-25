@@ -2,8 +2,9 @@
 // under a new footer (`parquet.cee`), and committed as one `replace` snapshot through the catalog's conditional write.
 //
 // What is never rewritten: a file in a partition that has a live delete file (or when a delete file's spec is not the
-// data file's), a file sealed with SSE (its stored bytes are not its Parquet bytes), a file of another bucket, a file
-// whose footer this cannot join, and a file whose stored size is not its manifest's. Not knowing is not compacting.
+// data file's), a file sealed under a key not held here (or SSE-C's), a file of another bucket, a file whose footer
+// this cannot join, and a file whose size is not its manifest's. Not knowing is not compacting. A file sealed with the
+// server's keys is opened as it is read, and an encrypted table's files are sealed as written (ADR-0126 §4).
 import web_core;
 import web_transport;
 import web_http;
@@ -113,6 +114,8 @@ struct CompactionOutput {
 struct BinWritten {
     obj: FinishedObject;
     metrics: FileMetrics?;
+    /// Its envelope when it was sealed (ADR-0126 §4), its own data key's: empty in the clear.
+    seal: Vector<u8>;
 }
 
 // ---- The plan ----
@@ -179,9 +182,9 @@ struct PendingInput {
     partitionKey: Vector<u8>;
     firstRowId: i64;
     /// Its last 8 bytes, pinned under the lock; then its footer's, once their length is known (0: not joined).
-    tail: PreparedReader;
+    tail: PlainReader;
     footerLength: u64;
-    footer: PreparedReader?;
+    footer: PlainReader?;
 }
 
 /// A plan made under the store's lock, its candidates' footers not yet read.
@@ -375,15 +378,14 @@ fn planCompaction(
                 Ok(h) => h,
                 Err(_) => { continue; }
             };
+            // A sealed file's size is its plaintext's, as its manifest states it (ADR-0126 §4).
             let fileSize = truncate<u64>(size);
-            if (info.size != fileSize || fileSize < 12 ||
-                metadataFind(info.metadata.view(), SSE_FIELD.bytes()).isSome()) {
-                continue;
-            }
-            // Its last 8 bytes only (the M20 exit review): the footer's length, then the footer, as before.
-            let tail = match (store.prepareReaderOf(bucket, name, null, fileSize - 8, fileSize)) {
-                Ok(r) => r,
-                Err(_) => { continue; }
+            if (info.size != fileSize || fileSize < 12) { continue; }
+            // Its last 8 bytes only (the M20 exit review): the footer's length, then the footer, as before. A sealed
+            // file is opened with the server's keys; one under a key not held here is left as it is.
+            let tail = match (preparePlain(store, bucket, name, fileSize - 8, fileSize, borrow sealing)) {
+                Ok(Some(r)) => r,
+                _ => { continue; }
             };
             let sequence = match (jsonMember(entry, "sequence_number")) {
                 Some(v) => jsonI64(v) ?? manifestSequence,
@@ -451,7 +453,7 @@ fn finishPlan(d: borrow mut CompactionDraft) -> Result<void, TablesError> {
         let c = borrow mut d.pending[i];
         if (c.footerLength == 0) { continue; }
         let bytes = match (c.footer.asBorrowMut()) {
-            Some(r) => readPrepared(r)?,
+            Some(r) => readPlainPrepared(r)?,
             null => null,
         };
         let footerBytes = bytes ?? { continue; };
@@ -499,7 +501,7 @@ fn finishPlan(d: borrow mut CompactionDraft) -> Result<void, TablesError> {
 fn readFooterLengths(d: borrow mut CompactionDraft) -> Result<void, AllocError> {
     for (i in 0..d.pending.length) {
         let c = borrow mut d.pending[i];
-        let tail = readPrepared(mut c.tail)? ?? { continue; };
+        let tail = readPlainPrepared(mut c.tail)? ?? { continue; };
         if (tail.length != 8) { continue; }
         c.footerLength = parquetFooterLength(tail.view(), c.size) ?? 0;
     }
@@ -509,6 +511,8 @@ fn readFooterLengths(d: borrow mut CompactionDraft) -> Result<void, AllocError> 
 /// Each candidate's footer pinned, under the lock, if its version is still the one planned.
 fn pinFooters(store: borrow mut ObjectStore, d: borrow mut CompactionDraft) {
     let hidden = copyBytes(d.plan.hidden.view()).ok() ?? { return; };
+    let tableKeys = d.plan.keys.share();
+    let sealing = tableKeys.keys();
     for (i in 0..d.pending.length) {
         let c = borrow mut d.pending[i];
         if (c.footerLength == 0 || c.footerLength + 8 > c.size) {
@@ -525,7 +529,10 @@ fn pinFooters(store: borrow mut ObjectStore, d: borrow mut CompactionDraft) {
             c.footerLength = 0;
             continue;
         }
-        c.footer = store.prepareReaderOf(bucket, name, null, c.size - 8 - c.footerLength, c.size - 8).ok();
+        c.footer = match (preparePlain(store, bucket, name, c.size - 8 - c.footerLength, c.size - 8, borrow sealing)) {
+            Ok(Some(r)) => Some(r),
+            _ => null,
+        };
         if (c.footer.isNull()) { c.footerLength = 0; }
     }
 }
@@ -663,9 +670,8 @@ fn deleteFileOf(
         Ok(h) => h,
         Err(_) => { return Ok(null); }
     };
-    if (info.size != truncate<u64>(size) || metadataFind(info.metadata.view(), SSE_FIELD.bytes()).isSome()) {
-        return Ok(null);
-    }
+    // A sealed delete file is opened as it is read, its size its plaintext's (ADR-0126 §4).
+    if (info.size != truncate<u64>(size)) { return Ok(null); }
     var ids = Vector<i64>.create();
     match (memberItems(d, "equality_ids")) {
         Some(items) => {
@@ -837,9 +843,10 @@ fn closeBin(
 
 /// A bin's inputs, each copy's range pinned under the store (no I/O), and the writer of its file.
 struct BinCopy {
-    readers: Vector<PreparedReader>;
+    readers: Vector<PlainReader>;
     lengths: Vector<u64>;
-    writer: ObjectWriter;
+    /// Sealed with the table's encryption, when it has one (ADR-0126 §4).
+    writer: SealedWriter;
     /// Each reader a row group of an input, its values rewritten (ADR-0112), rather than a range copied.
     merge: bool;
     rowGroupBytes: u64;
@@ -854,7 +861,7 @@ struct BinCopy {
     pageLevel: u32;
     /// For a merge with deletes (ADR-0114 §4): each applying delete file, whole, and how it applies; each input's path
     /// and data sequence number.
-    deleteReaders: Vector<PreparedReader>;
+    deleteReaders: Vector<PlainReader>;
     deleteSizes: Vector<u64>;
     binDeletes: Vector<BinDelete>;
     inputPaths: Vector<Vector<u8>>;
@@ -908,16 +915,20 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
     for (i in 0..bin.inputs.length) {
         match (store.headObject(bucket, catalogText(bin.inputs[i].key.view()))) {
             Ok(info) => {
-                // The same version as planned, still not sealed: its footer and ranges are the plan's.
-                if (info.size != bin.inputs[i].size || info.generation != bin.inputs[i].generation ||
-                    metadataFind(info.metadata.view(), SSE_FIELD.bytes()).isSome()) {
+                // The same version as planned: its footer and ranges are the plan's.
+                if (info.size != bin.inputs[i].size || info.generation != bin.inputs[i].generation) {
                     return Ok(null);
                 }
             }
             Err(_) => { return Ok(null); }
         }
     }
-    var readers = Vector<PreparedReader>.create();
+    // Each input opened with the server's keys when it is sealed, and the bin's file sealed with the table's
+    // encryption (ADR-0126 §4).
+    let tableKeys = plan.keys.share();
+    let sealing = tableKeys.keys();
+    let writer = sealedWriter(store.newWriter()?, plan.encryption.asBorrow(), borrow sealing)? ?? { return Ok(null); };
+    var readers = Vector<PlainReader>.create();
     var lengths = Vector<u64>.create();
     if (bin.merge) {
         // Each input's row groups, a reader each: their pages are decoded one row group at a time (ADR-0114 §1).
@@ -932,9 +943,9 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
                     _ => { return Ok(null); }
                 };
                 let key = catalogText(bin.inputs[i].key.view());
-                match (store.prepareReaderOf(bucket, key, null, span.start, span.start + span.length)) {
-                    Ok(p) => { readers.push(p)?; }
-                    Err(_) => { return Ok(null); }
+                match (preparePlain(store, bucket, key, span.start, span.start + span.length, borrow sealing)) {
+                    Ok(Some(p)) => { readers.push(p)?; }
+                    _ => { return Ok(null); }
                 }
                 lengths.push(span.length)?;
                 pieces.push(MergePiece { input: i, group: g, start: span.start })?;
@@ -947,7 +958,7 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
             })?;
         }
         // Its deletes, each whole and as planned (ADR-0114 §4): one changed since leaves the bin for the next run.
-        var deleteReaders = Vector<PreparedReader>.create();
+        var deleteReaders = Vector<PlainReader>.create();
         var deleteSizes = Vector<u64>.create();
         var binDeletes = Vector<BinDelete>.create();
         for (x in 0..bin.deletes.length) {
@@ -958,9 +969,16 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
                 }
                 Err(_) => { return Ok(null); }
             }
-            match (store.prepareReaderOf(bucket, catalogText(d.key.view()), null, d.offset, d.offset + d.length)) {
-                Ok(r) => { deleteReaders.push(r)?; }
-                Err(_) => { return Ok(null); }
+            match (preparePlain(
+                store,
+                bucket,
+                catalogText(d.key.view()),
+                d.offset,
+                d.offset + d.length,
+                borrow sealing,
+            )) {
+                Ok(Some(r)) => { deleteReaders.push(r)?; }
+                _ => { return Ok(null); }
             }
             deleteSizes.push(d.length)?;
             var kinds = Vector<Vector<u8>>.create();
@@ -996,7 +1014,7 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
             inputSequences: inputSequences,
             readers: readers,
             lengths: lengths,
-            writer: store.newWriter()?,
+            writer: writer,
             merge: true,
             rowGroupBytes: plan.rowGroupBytes,
             metricsPlan: match (schemaLeaves(borrow bin.inputs[0].footer.meta)?) {
@@ -1015,16 +1033,16 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
     for (c in 0..bin.join.copies.length) {
         let copy = borrow bin.join.copies[c];
         let key = catalogText(bin.inputs[copy.input].key.view());
-        match (store.prepareReaderOf(bucket, key, null, copy.start, copy.start + copy.length)) {
-            Ok(p) => { readers.push(p)?; }
-            Err(_) => { return Ok(null); }
+        match (preparePlain(store, bucket, key, copy.start, copy.start + copy.length, borrow sealing)) {
+            Ok(Some(p)) => { readers.push(p)?; }
+            _ => { return Ok(null); }
         }
         lengths.push(copy.length)?;
     }
     return Ok(Some(BinCopy {
         readers: readers,
         lengths: lengths,
-        writer: store.newWriter()?,
+        writer: writer,
         merge: false,
         rowGroupBytes: plan.rowGroupBytes,
         footers: Vector<ParquetFooter>.create(),
@@ -1033,7 +1051,7 @@ fn prepareBin(store: borrow mut ObjectStore, plan: borrow CompactionPlan, b: usi
         metrics: null,
         pageCodec: plan.pageCodec,
         pageLevel: plan.pageLevel,
-        deleteReaders: Vector<PreparedReader>.create(),
+        deleteReaders: Vector<PlainReader>.create(),
         deleteSizes: Vector<u64>.create(),
         binDeletes: Vector<BinDelete>.create(),
         inputPaths: Vector<Vector<u8>>.create(),
@@ -1051,10 +1069,10 @@ fn copyBin(c: borrow mut BinCopy, tail: Slice<u8>) -> Result<FinishedObject?, St
     var buf = Vector<u8>.create();
     buf.resize(REPLICA_COPY_BYTES, 0)?;
     for (i in 0..c.readers.length) {
-        var reader = c.readers[i].open()?;
+        var reader = c.readers[i].open()? ?? { return Ok(null); };
         var copied: u64 = 0;
         while (true) {
-            let n = reader.read(buf.viewMut())?;
+            let n = reader.read(buf.viewMut())? ?? { return Ok(null); };
             if (n == 0) { break; }
             copied += n as u64;
             if (c.writer.write(buf.view()[0..n]).isErr()) { return Ok(null); }
@@ -1090,7 +1108,7 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
     var equalitySets = Vector<EqualityDeletes>.create();
     var equalityAt = Vector<usize>.create();
     for (x in 0..c.binDeletes.length) {
-        let bytes = readPrepared(mut c.deleteReaders[x])? ?? { return Ok(null); };
+        let bytes = readPlainPrepared(mut c.deleteReaders[x])? ?? { return Ok(null); };
         if (bytes.length as u64 != c.deleteSizes[x]) { return Ok(null); }
         let d = borrow c.binDeletes[x];
         // Each read within what is left of the bin's bound, so that no set is decoded past it (the M28 exit review's
@@ -1175,7 +1193,7 @@ fn mergeBin(c: borrow mut BinCopy) -> Result<FinishedObject?, StoreError> {
             if (piece >= c.pieces.length || c.pieces[piece].input != i || c.pieces[piece].group != g) {
                 return Ok(null);
             }
-            let bytes = readPrepared(mut c.readers[piece])? ?? { return Ok(null); };
+            let bytes = readPlainPrepared(mut c.readers[piece])? ?? { return Ok(null); };
             if (bytes.length as u64 != c.lengths[piece]) { return Ok(null); }
             let base = checkedTruncate<usize>(c.pieces[piece].start) ?? { return Ok(null); };
             piece += 1;
@@ -1479,7 +1497,7 @@ fn setMetric(file: borrow mut Json, name: StringView, items: Slice<Json>) -> Res
 
 /// The values held written as a row group, and let go.
 fn flushGroup(
-    writer: borrow mut ObjectWriter,
+    writer: borrow mut SealedWriter,
     written: borrow mut u64,
     leaves: Slice<PageLeaf>,
     columns: borrow mut Vector<ColumnValues>,
@@ -1511,7 +1529,11 @@ fn putBin(
     plan: borrow CompactionPlan,
     b: usize,
     obj: borrow FinishedObject,
+    seal: Slice<u8>,
 ) -> Result<CompactionOutput?, StoreError> {
+    // The table's storage class, and the file's envelope when it was written sealed (ADR-0126 §2, §4).
+    var metadata = copyBytes(plan.objectMetadata.view())?;
+    if (seal.length > 0) { metadataAdd(mut metadata, SSE_FIELD.bytes(), seal)?; }
     let first = borrow plan.bins[b].inputs[0];
     let slash = lastSlash(first.key.view());
     var key = copyBytes(first.key.view()[0..slash])?;
@@ -1522,7 +1544,7 @@ fn putBin(
         catalogText(plan.hidden.view()),
         catalogText(key.view()),
         "application/octet-stream",
-        plan.objectMetadata.view(),
+        metadata.view(),
         "".bytes(),
         obj,
         PutCondition.IfAbsent,
@@ -2555,7 +2577,8 @@ async fn compactTable(
         };
         let st = guard.data();
         let obj = borrow written.obj;
-        match (await Async.blocking(() => putBin(st, p, b, obj))) {
+        let seal = written.seal.view();
+        match (await Async.blocking(() => putBin(st, p, b, obj, seal))) {
             Ok(Some(o)) => {
                 var out = o;
                 out.metrics = written.metrics;
@@ -2603,7 +2626,8 @@ async fn copiedBin(
             match (await Async.blocking(() => copyBin(mut copy, tail))) {
                 Ok(Some(o)) => {
                     let metrics = copy.metrics;
-                    return Ok(Some(BinWritten { obj: o, metrics: metrics }));
+                    let seal = replace(mut copy.writer.field, Vector<u8>.create());
+                    return Ok(Some(BinWritten { obj: o, metrics: metrics, seal: seal }));
                 }
                 _ => {}
             }
