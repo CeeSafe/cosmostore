@@ -1,5 +1,7 @@
 # M31 exit review: clusters as `serve` (25 Nov 2026)
 
+**M31 closed, 25 Nov 2026** (the owner: "Accept and close"), with ADR-0128 accepted and B1 to B6 recorded below.
+
 **M31's exit (ADR-0127 item A; ADR-0128, with the owner's choices):**
 - a shard's request writes into a bucket it made, so a configured CreateTableBucket is taken in one request on a
   cluster (M30's B1);

@@ -6144,3 +6144,13 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Checks:** 538 unit tests, the cluster smoke (214), the maintenance smoke and the S3 smoke. On the pre-review
   binary, the cluster smoke fails its four new object-lock checks.
 - **Next:** the owner's word on ADR-0128 and on closing M31.
+
+### 25 Nov 2026: M31 closed (ADR-0128 accepted)
+
+- **The owner's decision:** "Accept and close". ADR-0128 is accepted, with its As built.
+- **M31 is closed.** The exit review's B1 to B6 are recorded in `docs/m31-exit-review.md`.
+- **Next:** M32, when the owner asks. Candidates on record:
+  - ADR-0127's B (S3 Tables' remaining small calls), C (Iceberg views and nested namespaces) and D (table
+    replication);
+  - M31's recorded Lows and M30's;
+  - v3's remaining parts.

@@ -1,6 +1,7 @@
 # ADR-0128: Clusters as `serve` (M31)
 
-**Status:** proposed, 25 Nov 2026, with the owner's choices made:
+**Status:** accepted, 25 Nov 2026, as built below (the owner: "Accept and close", after M31's exit review). Proposed the
+same day, with the owner's choices made:
 - a request sees the buckets it made, for its writes ("Bucket existence");
 - asks kept as records beside the queue ("Record + queue");
 - compactions bounded per node, default 2 ("Bounded, default 2").
@@ -30,7 +31,7 @@ M31 is ADR-0127's item A (the owner: "A: clusters as serve").
 - **One loop serves every shard a node leads, in turn** (M22's B3). A long compaction on one shard holds up the
   others' asks and passes. Each shard's writes are not held up.
 
-## Decision (proposed)
+## Decision
 
 1. **Staged buckets** (slice 1):
    - A leader's store keeps the names of the buckets its staged, unapplied entries make (`stagedBuckets`, in memory).
