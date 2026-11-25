@@ -6194,3 +6194,20 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Checks:** 540 unit tests and the S3 smoke.
 - **Not yet (slice 2):** the records. Until then a logged table bucket's warehouse requests are logged in S3's
   format.
+
+### 25 Nov 2026: M32 slice 2, a table bucket's log records (ADR-0130 §2)
+
+- **S3 Tables and Iceberg catalog calls:**
+  - `serveTables` fills the request's facts with the table bucket's warehouse as their bucket, so the access log
+    hook after the answer finds its logging;
+  - its operation is `S3Tables.<Action>`, the action its first authorization noted on the caller (an atomic index
+    into `TABLES_ACTIONS`, and the table id packed in two words);
+  - its table's ARN, its namespace and name from the path or query, its error's name, and who made it.
+- **Warehouse requests:** the S3 path's existing hook, now in S3 Tables' format, with `REST.<METHOD>.OBJECT`, the
+  key, and the table its key's id names. Their namespace and name are `-`, not looked up per request.
+- **The record:** AWS's 25 fields (`tablesLogLine`). Its log objects are under partitioned keys with the table
+  bucket's name as their source.
+- **Tests:** `tableLogRecords` and `tablesCallsAreNoted`. `iceberg_check.py` (on `serve` and through a cluster's
+  node) logs a table bucket: its calls, its creates and a warehouse read are delivered under partitioned keys,
+  25 fields each, a warehouse target is refused, and logging turns off.
+- **Checks:** 542 unit tests, the S3 smoke and the cluster smoke (214).

@@ -56,6 +56,12 @@ fn accessLogLineFormat() -> Result<void, TestFailure> {
             userAgent: copyBytes("aws-cli/2.15 \"x\"".bytes())!,
             host: copyBytes("127.0.0.1:9000".bytes())!,
             authType: ACCESS_AUTH_QUERY,
+            tables: false,
+            operation: Vector<u8>.create(),
+            tableArn: Vector<u8>.create(),
+            nsName: Vector<u8>.create(),
+            tableName: Vector<u8>.create(),
+            errorName: Vector<u8>.create(),
         },
         requester: copyBytes("AKIAEXAMPLE".bytes())!,
         code: Some(S3Code.NoSuchKey),
@@ -168,5 +174,70 @@ fn tableLoggingBodies() -> Result<void, TestFailure> {
             _ => { return Err(TestFailure.create("refused")); }
         }
     }
+    return Ok();
+}
+
+fn tablesFacts(tables: bool, key: StringView, operation: StringView, error: StringView) -> AuditFacts => AuditFacts {
+    access: AccessFacts {
+        bucket: copyBytes("lake--table-s3".bytes())!,
+        key: copyBytes(key.bytes())!,
+        referrer: Vector<u8>.create(),
+        userAgent: copyBytes("aws-cli/2.34".bytes())!,
+        host: copyBytes("127.0.0.1:9000".bytes())!,
+        authType: ACCESS_AUTH_HEADER,
+        tables: tables,
+        operation: copyBytes(operation.bytes())!,
+        tableArn: if (tables) copyBytes(
+            "arn:aws:s3tables:us-east-1:000000000000:bucket/lake/table/c0c0c0c0-1111-4222-8333-444444444444".bytes(),
+        )! else Vector<u8>.create(),
+        nsName: copyBytes((if (tables) "sales" else "").bytes())!,
+        tableName: copyBytes((if (tables) "orders" else "").bytes())!,
+        errorName: copyBytes(error.bytes())!,
+    },
+    requester: copyBytes("AKIAEXAMPLE".bytes())!,
+    code: null,
+    aborted: false,
+};
+
+/// A table bucket's log records (ADR-0130 §2): AWS's 25 fields, for an S3 Tables call and for its warehouse's object
+/// request (its table its key's id's, its namespace and name `-`).
+@test
+fn tableLogRecords() -> Result<void, TestFailure> {
+    let call = tablesFacts(true, "", "S3Tables.GetTable", "NotFoundException");
+    var line = Vector<u8>.create();
+    tablesLogLine(
+        mut line,
+        1549411238000,
+        borrow call.access,
+        borrow call,
+        null,
+        "3E57427F3E".bytes(),
+        "GET".bytes(),
+        "".bytes(),
+        404,
+        7300,
+    )!;
+    Check.equalBytes(
+        "arn:aws:s3tables:us-east-1:000000000000:bucket/lake [06/Feb/2019:00:00:38 +0000] arn:aws:s3tables:us-east-1:000000000000:bucket/lake/table/c0c0c0c0-1111-4222-8333-444444444444 sales orders - - - AKIAEXAMPLE 3E57427F3E S3Tables.GetTable 404 NotFoundException - 7 - \"-\" \"aws-cli/2.34\" SigV4 - AuthHeader 127.0.0.1:9000 - 2019-02-06T00:00:38.000Z us-east-1\n".bytes(),
+        line.view(),
+    )?;
+    let data = tablesFacts(false, "c0c0c0c0-1111-4222-8333-444444444444/data/a.parquet", "", "");
+    var dataLine = Vector<u8>.create();
+    tablesLogLine(
+        mut dataLine,
+        1549411238000,
+        borrow data.access,
+        borrow data,
+        null,
+        "3E57427F3F".bytes(),
+        "GET".bytes(),
+        "".bytes(),
+        200,
+        2000,
+    )!;
+    Check.equalBytes(
+        "arn:aws:s3tables:us-east-1:000000000000:bucket/lake [06/Feb/2019:00:00:38 +0000] arn:aws:s3tables:us-east-1:000000000000:bucket/lake/table/c0c0c0c0-1111-4222-8333-444444444444 - - c0c0c0c0-1111-4222-8333-444444444444/data/a.parquet - - AKIAEXAMPLE 3E57427F3F REST.GET.OBJECT 200 - - 2 - \"-\" \"aws-cli/2.34\" SigV4 - AuthHeader 127.0.0.1:9000 - 2019-02-06T00:00:38.000Z us-east-1\n".bytes(),
+        dataLine.view(),
+    )?;
     return Ok();
 }

@@ -274,6 +274,105 @@ struct AccessFacts {
     host: Vector<u8>;
     /// ACCESS_AUTH_HEADER, ACCESS_AUTH_QUERY, or 0 for an anonymous request.
     authType: u8;
+    /// An S3 Tables or Iceberg catalog call (ADR-0130 §2): its operation (`S3Tables.<Action>`), the table it names
+    /// (its ARN, namespace and name; empty when none), and its error's name. `bucket` is then its table bucket's
+    /// warehouse, whose logging it goes to.
+    tables: bool;
+    operation: Vector<u8>;
+    tableArn: Vector<u8>;
+    nsName: Vector<u8>;
+    tableName: Vector<u8>;
+    errorName: Vector<u8>;
+}
+
+/// A table bucket's ARN, as its log records give it.
+fn appendTableBucketArn(out: borrow mut Vector<u8>, name: Slice<u8>) -> Result<void, AllocError> {
+    out.extend("arn:aws:s3tables:us-east-1:000000000000:bucket/".bytes())?;
+    return out.extend(name);
+}
+
+/// A table bucket's request in its log (ADR-0130 §2), AWS's 25 fields: table bucket ARN, time, table ARN, namespace,
+/// table name, key, object size, remote IP, requester, request ID, operation, status, error code, bytes sent, total
+/// time, turn-around time, referrer, user agent, signature version, cipher suite, authentication type, host header,
+/// TLS version, ISO time, source region. A warehouse request's table is its key's id's; its namespace and name are
+/// not looked up (`-`).
+fn tablesLogLine(
+    out: borrow mut Vector<u8>,
+    millis: i64,
+    access: borrow AccessFacts,
+    audit: borrow AuditFacts,
+    peer: SocketAddress?,
+    requestId: Slice<u8>,
+    method: Slice<u8>,
+    query: Slice<u8>,
+    status: u16,
+    micros: u64,
+) -> Result<void, AllocError> {
+    let hidden = access.bucket.view();
+    let name = hidden[0..hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
+    appendTableBucketArn(out, name)?;
+    out.push(' ')?;
+    appendLogTime(out, millis)?;
+    out.push(' ')?;
+    if (access.tableArn.length > 0) {
+        appendField(out, access.tableArn.view())?;
+    } else {
+        match (if (access.tables) null else tableIdOfKey(access.key.view(), false)) {
+            Some(id) => {
+                appendTableBucketArn(out, name)?;
+                out.extend("/table/".bytes())?;
+                out.extend(id)?;
+            }
+            null => { out.push('-')?; }
+        }
+    }
+    out.push(' ')?;
+    appendField(out, access.nsName.view())?;
+    out.push(' ')?;
+    appendField(out, access.tableName.view())?;
+    out.push(' ')?;
+    appendField(out, access.key.view())?;
+    out.extend(" - ".bytes())?; // object size: not known here
+    appendAddress(out, peer)?;
+    out.push(' ')?;
+    appendField(out, if (audit.requester.view() == "anonymous".bytes()) "".bytes() else audit.requester.view())?;
+    out.push(' ')?;
+    appendField(out, requestId)?;
+    out.push(' ')?;
+    if (access.tables) {
+        appendField(out, access.operation.view())?;
+    } else {
+        appendOperation(out, method, access.key.length > 0, query)?;
+    }
+    out.push(' ')?;
+    appendDecimal(out, status as u64)?;
+    out.push(' ')?;
+    if (access.errorName.length > 0) {
+        appendField(out, access.errorName.view())?;
+    } else {
+        match (audit.code) {
+            Some(c) => { out.extend(s3CodeName(c).bytes())?; }
+            null => { out.push('-')?; }
+        }
+    }
+    out.extend(" - ".bytes())?; // bytes sent: not known here
+    appendDecimal(out, micros / 1000)?;
+    out.extend(" - ".bytes())?;
+    appendQuoted(out, access.referrer.view())?;
+    out.push(' ')?;
+    appendQuoted(out, access.userAgent.view())?;
+    out.push(' ')?;
+    out.extend(match (access.authType) {
+        ACCESS_AUTH_HEADER => "SigV4 - AuthHeader".bytes(),
+        ACCESS_AUTH_QUERY => "SigV4 - QueryString".bytes(),
+        _ => "- - -".bytes(),
+    })?;
+    out.push(' ')?;
+    appendField(out, access.host.view())?;
+    out.extend(" - ".bytes())?; // TLS version
+    appendIso8601(out, millis)?;
+    out.extend(" us-east-1\n".bytes())?;
+    return Ok();
 }
 
 /// A request's line in S3's server access log format: owner, bucket, time, remote IP, requester, request ID,
@@ -371,7 +470,20 @@ async fn queueAccessLine(
         null => { return; }
     };
     var line = Vector<u8>.create();
-    let made = accessLogLine(
+    // A table bucket's warehouse logs in S3 Tables' format, its table bucket the logs' source (ADR-0130 §2, §3).
+    let tableLog = isTableWarehouseShaped(facts.access.bucket.view());
+    let made = if (tableLog) tablesLogLine(
+        mut line,
+        Clock.unixMillis(),
+        borrow facts.access,
+        facts,
+        peer,
+        requestId,
+        method,
+        query,
+        status,
+        micros,
+    ) else accessLogLine(
         mut line,
         Clock.unixMillis(),
         borrow facts.access,
@@ -384,13 +496,15 @@ async fn queueAccessLine(
         status,
         micros,
     );
+    let bucket = facts.access.bucket.view();
+    let source = if (tableLog) bucket[0..bucket.length - TABLE_BUCKET_SUFFIX.bytes().length] else bucket;
     if (made.isErr() || log.lines.trySend(
         AccessLogEntry {
             target: target.bucket,
             prefix: target.prefix,
             line: line,
             requester: target.requester,
-            source: copyBytes(facts.access.bucket.view()).ok() ?? Vector<u8>.create(),
+            source: copyBytes(source).ok() ?? Vector<u8>.create(),
             keys: target.keys,
         },
     ).isErr()) {

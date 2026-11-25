@@ -27,6 +27,89 @@ struct TablesCaller {
     sessionPolicy: BucketPolicy?;
     /// Its key was revoked since its request was authenticated: refused (the M11 second reading's #6).
     revoked: bool;
+    /// What its call was first authorized for (ADR-0130 §2), for the table bucket's log: the action's place in
+    /// TABLES_ACTIONS plus one (0: none), and the table's id as 16 bytes (`tableSet` 1 once it is).
+    action: AtomicU64;
+    tableHi: AtomicU64;
+    tableLo: AtomicU64;
+    tableSet: AtomicU64;
+}
+
+/// The actions a call is authorized for, as its log record names them (`S3Tables.<Action>`).
+const TABLES_ACTIONS: [StringView; 46] = [
+    "s3tables:CreateNamespace", "s3tables:CreateTable", "s3tables:CreateTableBucket", "s3tables:DeleteNamespace",
+    "s3tables:DeleteTable", "s3tables:DeleteTableBucket", "s3tables:DeleteTableBucketEncryption",
+    "s3tables:DeleteTableBucketPolicy", "s3tables:DeleteTablePolicy", "s3tables:GetNamespace", "s3tables:GetTable",
+    "s3tables:GetTableBucket", "s3tables:GetTableBucketEncryption", "s3tables:GetTableBucketLogging",
+    "s3tables:GetTableBucketMaintenanceConfiguration", "s3tables:GetTableBucketPolicy",
+    "s3tables:GetTableBucketStorageClass", "s3tables:GetTableData", "s3tables:GetTableEncryption",
+    "s3tables:GetTableMaintenanceConfiguration", "s3tables:GetTableMaintenanceJobStatus",
+    "s3tables:GetTableMetadataLocation", "s3tables:GetTablePolicy", "s3tables:GetTableStorageClass",
+    "s3tables:ListNamespaces", "s3tables:ListTableBuckets", "s3tables:ListTables", "s3tables:ListTagsForResource",
+    "s3tables:PutTableBucketEncryption", "s3tables:PutTableBucketLogging",
+    "s3tables:PutTableBucketMaintenanceConfiguration", "s3tables:PutTableBucketPolicy",
+    "s3tables:PutTableBucketStorageClass", "s3tables:PutTableData", "s3tables:PutTableMaintenanceConfiguration",
+    "s3tables:PutTablePolicy", "s3tables:RenameTable", "s3tables:TagResource", "s3tables:UntagResource",
+    "s3tables:UpdateTableMetadataLocation", "s3tables:PutTableBucketMetricsConfiguration",
+    "s3tables:GetTableBucketMetricsConfiguration", "s3tables:DeleteTableBucketMetricsConfiguration",
+    "s3tables:PutTableRecordExpirationConfiguration", "s3tables:GetTableRecordExpirationConfiguration",
+    "s3tables:GetTableRecordExpirationJobStatus",
+];
+
+/// A call's first authorization noted on its caller (ADR-0130 §2): its action, and the table it names.
+fn noteTablesCall(caller: borrow TablesCaller, action: StringView, tableId: Slice<u8>) {
+    if (caller.action.load() == 0) {
+        for (i in 0..TABLES_ACTIONS.length) {
+            if (TABLES_ACTIONS[i].bytes() == action.bytes()) {
+                caller.action.store((i + 1) as u64);
+                break;
+            }
+        }
+    }
+    if (caller.tableSet.load() == 0 && uuidShaped(tableId)) {
+        var hex = Vector<u8>.create();
+        for (b in tableId) {
+            if (b != '-' && hex.push(b).isErr()) { return; }
+        }
+        let hi = parseHexU64(hex.view()[0..16]) ?? { return; };
+        let lo = parseHexU64(hex.view()[16..32]) ?? { return; };
+        caller.tableHi.store(hi);
+        caller.tableLo.store(lo);
+        caller.tableSet.store(1);
+    }
+}
+
+/// A hex number of up to 16 digits; null for anything else.
+fn parseHexU64(text: Slice<u8>) -> u64? {
+    if (text.length == 0 || text.length > 16) { return null; }
+    var n: u64 = 0;
+    for (c in text) {
+        let d: u64 = if (c >= '0' && c <= '9') (c - '0') as u64 else if (c >= 'a' && c <= 'f') (c - 'a' + 10) as u64
+            else { return null; };
+        n = (n << 4) | d;
+    }
+    return Some(n);
+}
+
+/// The call's table, as its log record names it: `<table bucket ARN>/table/<id>`; empty when it named none.
+fn notedTableArn(caller: borrow TablesCaller, bucket: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    if (caller.tableSet.load() == 0) { return Ok(out); }
+    appendTableBucketArn(mut out, bucket)?;
+    out.extend("/table/".bytes())?;
+    var hex = Vector<u8>.create();
+    for (word in [caller.tableHi.load(), caller.tableLo.load()]) {
+        for (i in 0u64..16) {
+            let d = truncate<u8>((word >> ((15 - i) * 4)) & 15);
+            hex.push(if (d < 10) '0' + d else 'a' + d - 10)?;
+        }
+    }
+    let h = hex.view();
+    for (part in [h[0..8], h[8..12], h[12..16], h[16..20], h[20..32]]) {
+        if (out[out.length - 1] != '/') { out.push('-')?; }
+        out.extend(part)?;
+    }
+    return Ok(out);
 }
 
 fn clonedPolicy(p: borrow BucketPolicy?) -> Result<BucketPolicy?, AllocError> => match (p) {
@@ -69,6 +152,10 @@ fn tablesCallerOf(
         },
         sessionPolicy: clonedPolicy(who.sessionPolicy.asBorrow())?,
         revoked: revokedRequester(credentials, who),
+        action: AtomicU64.create(0),
+        tableHi: AtomicU64.create(0),
+        tableLo: AtomicU64.create(0),
+        tableSet: AtomicU64.create(0),
     });
 }
 
@@ -207,6 +294,7 @@ fn checkTables(
     bucketName: Slice<u8>,
     tableId: Slice<u8>,
 ) -> Result<void, TablesError> {
+    noteTablesCall(caller, action, tableId);
     if (caller.revoked) { return Err(TablesError.Forbidden); }
     let account = !caller.role && caller.user.length == 0;
     // The policy calls are never refused to the account's keys (ADR-0084 §2); a user or a role needs an Allow.
@@ -278,6 +366,7 @@ fn checkTablesIdentity(
     action: StringView,
     resource: Slice<u8>,
 ) -> Result<void, TablesError> {
+    noteTablesCall(caller, action, "".bytes());
     if (!caller.role && caller.user.length == 0) { return Ok(); }
     return match (identityVerdict(caller, borrow caller.facts, action, resource)) {
         PolicyDecision.Allow => Ok(),

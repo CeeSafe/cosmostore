@@ -236,6 +236,64 @@ for name in ("sealed", "own"):
     tables.delete_table(tableBucketARN=enc_arn, namespace="ns", name=name)
 tables.delete_namespace(tableBucketARN=enc_arn, namespace="ns")
 delete_table_bucket(enc_arn)
+# A table bucket's access logs (ADR-0130 §1, §2): its calls and its warehouse's requests, in S3 Tables' records,
+# delivered into a general purpose bucket under partitioned keys; refused targets; turned off.
+import time
+s3.create_bucket(Bucket="tlog-target")
+log_arn = tables.create_table_bucket(name="log-check")["arn"]
+check("no logging at first", tables.get_table_bucket_logging(tableBucketARN=log_arn)["tableBucketLoggingStatus"], {})
+# A table bucket's warehouse is no target (boto3 itself sends no simple keys, refused below it too).
+for bad in ({"targetBucket": "log-check--table-s3", "targetPrefix": "x/",
+             "targetObjectKeyFormat": {"partitionedPrefix": {"partitionDateSource": "EventTime"}}},):
+    try:
+        tables.put_table_bucket_logging(tableBucketARN=log_arn,
+                                        tableBucketLoggingStatus={"loggingEnabled": bad})
+        check("a logging target refused", "taken", "refused")
+    except ClientError as e:
+        check("a logging target refused", e.response["Error"]["Code"], "BadRequestException")
+tables.put_table_bucket_logging(tableBucketARN=log_arn, tableBucketLoggingStatus={"loggingEnabled": {
+    "targetBucket": "tlog-target", "targetPrefix": "tl/",
+    "targetObjectKeyFormat": {"partitionedPrefix": {"partitionDateSource": "EventTime"}}}})
+got = tables.get_table_bucket_logging(tableBucketARN=log_arn)["tableBucketLoggingStatus"]["loggingEnabled"]
+check("its logging", (got["targetBucket"], got["targetPrefix"], got["targetObjectKeyFormat"]["partitionedPrefix"]
+      ["partitionDateSource"]), ("tlog-target", "tl/", "EventTime"))
+tables.create_namespace(tableBucketARN=log_arn, namespace=["ns"])
+logged = tables.create_table(tableBucketARN=log_arn, namespace="ns", name="t", format="ICEBERG")
+tables.get_table(tableBucketARN=log_arn, namespace="ns", name="t")
+log_key = logged["tableARN"].rsplit("/", 1)[1] + "/data/probe.parquet"
+s3.put_object(Bucket="log-check--table-s3", Key=log_key, Body=b"PAR1")
+s3.get_object(Bucket="log-check--table-s3", Key=log_key)["Body"].read()
+lines = []
+today = time.strftime("%Y/%m/%d", time.gmtime())
+for _ in range(40):
+    time.sleep(0.5)
+    listed = s3.list_objects_v2(Bucket="tlog-target", Prefix="tl/").get("Contents", [])
+    lines = [l for o in listed for l in s3.get_object(Bucket="tlog-target", Key=o["Key"])["Body"].read()
+             .decode().splitlines()]
+    if any(" REST.GET.OBJECT " in l for l in lines) and any(" S3Tables.GetTable " in l for l in lines):
+        break
+check("delivered under partitioned keys", all(o["Key"].startswith("tl/000000000000/us-east-1/log-check/" + today + "/")
+      for o in s3.list_objects_v2(Bucket="tlog-target", Prefix="tl/").get("Contents", [])) and len(lines) > 0, True)
+fields = next((l.split(" ") for l in lines if " S3Tables.GetTable " in l), [])
+check("a call's record: its table bucket, table, namespace and name",
+      (fields[0], fields[3], fields[4], fields[5]) if len(fields) > 5 else None,
+      (log_arn, logged["tableARN"], "ns", "t"))
+check("its fields, AWS's 25 (the time's two tokens)", len(fields), 26)
+read = next((l.split(" ") for l in lines if " REST.GET.OBJECT " in l), [])
+check("a warehouse read's record: its table and key", (read[3], read[6]) if len(read) > 6 else None,
+      (logged["tableARN"], log_key))
+check("the creates logged too", any(" S3Tables.CreateNamespace " in l for l in lines) and
+      any(" S3Tables.CreateTable " in l for l in lines), True)
+tables.put_table_bucket_logging(tableBucketARN=log_arn, tableBucketLoggingStatus={})
+check("logging turned off", tables.get_table_bucket_logging(tableBucketARN=log_arn)["tableBucketLoggingStatus"], {})
+time.sleep(3)  # a batch queued before it was turned off, delivered
+s3.delete_object(Bucket="log-check--table-s3", Key=log_key)
+tables.delete_table(tableBucketARN=log_arn, namespace="ns", name="t")
+tables.delete_namespace(tableBucketARN=log_arn, namespace="ns")
+delete_table_bucket(log_arn)
+for o in s3.list_objects_v2(Bucket="tlog-target").get("Contents", []):
+    s3.delete_object(Bucket="tlog-target", Key=o["Key"])
+s3.delete_bucket(Bucket="tlog-target")
 catalog.rename_table("sales.orders", "sales.orders_v2")
 check("rename_table", catalog.list_tables("sales"), [("sales", "orders_v2")])
 check("rows after the rename", catalog.load_table("sales.orders_v2").scan().to_arrow().num_rows, 4)

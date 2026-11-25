@@ -1447,10 +1447,9 @@ async fn routeTables(
     req: borrow S3Request,
     body: Slice<u8>,
     who: borrow Requester,
+    callerRef: borrow TablesCaller,
 ) -> Result<TablesAnswer, TablesError> {
     var answer = tablesNoContent();
-    let caller = tablesCallerOf(app, req, who, body)?;
-    let callerRef = borrow caller;
     // CosmoStore's own call: one table's maintenance job, now (ADR-0086 §5), as a cluster node asks its shards.
     let segs = pathSegments(req.rawPath.view())?;
     if (segs.length == 5 && segs[0].view() == "tables".bytes() && segs[4].view() == "maintenance-run".bytes() &&
@@ -1532,7 +1531,12 @@ fn icebergErrorOf(e: borrow TablesError) -> Result<TablesAnswer, TablesError> =>
 
 /// A request signed for `s3tables` (ADR-0083 §1): its body read and hashed first, as S3 Tables' clients send no
 /// `x-amz-content-sha256`; keys, their `GetSessionToken` sessions, and roles' sessions (ADR-0088 §2).
-async fn serveTables(app: borrow S3App, req: borrow S3Request, exchange: borrow mut Exchange) -> Result<void, S3Fail> {
+async fn serveTables(
+    app: borrow S3App,
+    req: borrow S3Request,
+    exchange: borrow mut Exchange,
+    facts: borrow mut AuditFacts,
+) -> Result<void, S3Fail> {
     if (!tablesMayRead(req, app.credentials.get().view(), Clock.unixMillis() / 1000)) {
         let refused: Result<TablesAnswer, TablesError> = Err(TablesError.Forbidden);
         return await sendTablesAnswer(req, exchange, refused);
@@ -1558,7 +1562,13 @@ async fn serveTables(app: borrow S3App, req: borrow S3Request, exchange: borrow 
             if (who.key.isNull() || headerOf(req, EXPRESS_TOKEN_FIELD).isSome()) {
                 Err(TablesError.Forbidden)
             } else {
-                await routeTables(app, req, body.view(), borrow who)
+                let caller = tablesCallerOf(app, req, borrow who, body.view())?;
+                let answered = await routeTables(app, req, body.view(), borrow who, borrow caller);
+                // Its table bucket's log record (ADR-0130 §2): what the hook after the answer queues, if it logs.
+                if (app.loggingBuckets.load() > 0) {
+                    tablesLogFacts(app, req, body.view(), borrow auth, borrow caller, borrow answered, facts)?;
+                }
+                answered
             }
         }
         Err(_) => Err(TablesError.Forbidden),
@@ -1813,4 +1823,133 @@ fn onlyMembers(j: borrow Json, allowed: Slice<StringView>) -> bool {
         _ => {}
     }
     return true;
+}
+
+// ---- A table bucket's log record (ADR-0130 §2) ----
+
+/// The table bucket a call names: by its body (CreateTableBucket), an ARN in its path, GetTable's or another call's
+/// query, or the Iceberg catalog's `warehouse` or `prefix`; null for none (ListTableBuckets).
+fn tablesBucketOfRequest(req: borrow S3Request, body: Slice<u8>) -> Result<Vector<u8>?, TablesError> {
+    let segs = pathSegments(req.rawPath.view())?;
+    if (segs.length == 0) { return Ok(null); }
+    let top = segs[0].view();
+    var id = Vector<u8>.create();
+    if (top == "buckets".bytes() && segs.length == 1) {
+        if (!isMethod(req.method, Method.Put)) { return Ok(null); }
+        let j = parseJson(body)? ?? { return Ok(null); };
+        let name = jsonMemberText(borrow j, "name") ?? { return Ok(null); };
+        return Ok(if (tableBucketNameOk(name)) Some(copyBytes(name)?) else null);
+    }
+    if ((top == "buckets".bytes() || top == "namespaces".bytes() || top == "tables".bytes() ||
+        top == "tag".bytes()) && segs.length >= 2) {
+        return Ok(tableBucketOfArn(segs[1].view(), mut id)?);
+    }
+    if (top == "iceberg".bytes() && segs.length >= 3 && segs[1].view() == "v1".bytes()) {
+        if (segs[2].view() == "config".bytes()) {
+            let w = paramOf(req, "warehouse") ?? { return Ok(null); };
+            return Ok(tableBucketOfArn(w, mut id)?);
+        }
+        return Ok(tableBucketOfArn(segs[2].view(), mut id)?);
+    }
+    for (name in ["tableArn", "tableBucketARN"]) {
+        match (paramOf(req, name)) {
+            Some(a) => { return Ok(tableBucketOfArn(a, mut id)?); }
+            null => {}
+        }
+    }
+    return Ok(null);
+}
+
+/// The namespace and table a call names by its path or query, for its log record; empty where it names none.
+fn tablesNamesOf(
+    req: borrow S3Request,
+    ns: borrow mut Vector<u8>,
+    name: borrow mut Vector<u8>,
+) -> Result<void, TablesError> {
+    let segs = pathSegments(req.rawPath.view())?;
+    if (segs.length >= 3 && (segs[0].view() == "tables".bytes() || segs[0].view() == "namespaces".bytes())) {
+        ns.extend(segs[2].view())?;
+        if (segs[0].view() == "tables".bytes() && segs.length >= 4) { name.extend(segs[3].view())?; }
+        return Ok();
+    }
+    if (segs.length >= 1 && segs[0].view() == "iceberg".bytes()) {
+        for (i in 0..segs.length) {
+            if (i + 1 < segs.length && segs[i].view() == "namespaces".bytes() && ns.length == 0) {
+                ns.extend(segs[i + 1].view())?;
+            }
+            if (i + 1 < segs.length && segs[i].view() == "tables".bytes() && name.length == 0) {
+                name.extend(segs[i + 1].view())?;
+            }
+        }
+        return Ok();
+    }
+    match (paramOf(req, "namespace")) {
+        Some(n) => { ns.extend(n)?; }
+        null => {}
+    }
+    match (paramOf(req, "name")) {
+        Some(n) => { name.extend(n)?; }
+        null => {}
+    }
+    return Ok();
+}
+
+/// A call's facts for its table bucket's log record: its bucket the table bucket's warehouse (whose logging it goes
+/// to), its operation the action it was first authorized for, its table, and who made it.
+fn tablesLogFacts(
+    app: borrow S3App,
+    req: borrow S3Request,
+    body: Slice<u8>,
+    auth: borrow Authenticated,
+    caller: borrow TablesCaller,
+    answered: borrow Result<TablesAnswer, TablesError>,
+    facts: borrow mut AuditFacts,
+) -> Result<void, AllocError> {
+    let bucket = match (tablesBucketOfRequest(req, body)) {
+        Ok(Some(b)) => b,
+        Ok(null) => { return Ok(); }
+        Err(TablesError.OutOfMemory(e)) => { return Err(e); }
+        Err(_) => { return Ok(); }
+    };
+    facts.access.bucket.clear();
+    facts.access.bucket.extend(bucket.view())?;
+    facts.access.bucket.extend(TABLE_BUCKET_SUFFIX.bytes())?;
+    facts.access.tables = true;
+    facts.access.operation.clear();
+    let at = caller.action.load();
+    if (at > 0) {
+        facts.access.operation.extend("S3Tables.".bytes())?;
+        facts.access.operation.extend(TABLES_ACTIONS[truncate<usize>(at - 1)].bytes()["s3tables:".length..])?;
+    }
+    facts.access.tableArn = notedTableArn(caller, bucket.view())?;
+    let _ = tablesNamesOf(req, mut facts.access.nsName, mut facts.access.tableName);
+    match (answered) {
+        Err(e) => { facts.access.errorName.extend(tablesErrorName(e).bytes())?; }
+        Ok(_) => {}
+    }
+    match (headerOf(req, "referer")) {
+        Some(v) => { facts.access.referrer.extend(trimBlank(v))?; }
+        null => {}
+    }
+    match (headerOf(req, "user-agent")) {
+        Some(v) => { facts.access.userAgent.extend(trimBlank(v))?; }
+        null => {}
+    }
+    match (headerOf(req, "host")) {
+        Some(v) => { facts.access.host.extend(trimBlank(v))?; }
+        null => {}
+    }
+    facts.access.authType = if (headerOf(req, "authorization").isSome()) ACCESS_AUTH_HEADER else ACCESS_AUTH_QUERY;
+    facts.requester.clear();
+    let credentials = app.credentials.get().view();
+    match (borrow auth.session) {
+        Some(s) => { facts.requester.extend(s.accessKey.view())?; }
+        null => {
+            match (auth.key) {
+                Some(i) => { facts.requester.extend(credentials[i].accessKey.view())?; }
+                null => { facts.requester.extend("anonymous".bytes())?; }
+            }
+        }
+    }
+    return Ok();
 }
