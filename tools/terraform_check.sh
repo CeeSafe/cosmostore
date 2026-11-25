@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Terraform against CosmoStore's IAM (ADR-0108 §6, M21's bar): tools/terraform/main.tf's users, keys, groups,
 # memberships, managed and inline policies, attachments and a role applied, planned with no change, the key used on
-# S3, and destroyed, leaving no IAM record behind; on `serve`, then on a three-node cluster through one node.
+# S3, and destroyed, leaving no IAM record behind; on `serve`, then on a three-node cluster through one node. On
+# `serve`, tools/terraform_tables/main.tf's S3 Tables configuration too (ADR-0126 §5).
 #
 #   tools/terraform_check.sh <cosmostore binary> [port base]
 #
@@ -106,11 +107,44 @@ run() {
     check "$what: no user, group, role or policy left" "$left" "0 0 0 0"
 }
 
+# S3 Tables' configuration (ADR-0126 §5, tools/terraform_tables): a KMS table bucket with tags, and a tagged table
+# taking its encryption, applied, read back through the CLI, planned with no change, and destroyed.
+run_tables() {
+    local what="$1" endpoint="$2" dir="$WORK/tft-$1"
+    mkdir -p "$dir" && cp "$ROOT/tools/terraform_tables/main.tf" "$dir/"
+    (cd "$dir" && "$TF" init -no-color > init.log 2>&1) && pass "$what: tables: terraform init" || { fail "$what: tables: terraform init"; tail -20 "$dir/init.log"; return; }
+    if (cd "$dir" && "$TF" apply -no-color -auto-approve -var "endpoint=$endpoint" > apply.log 2>&1); then
+        pass "$what: tables: terraform apply"
+    else
+        fail "$what: tables: terraform apply"; grep -B2 -A12 "Error" "$dir/apply.log" | head -60
+    fi
+    (cd "$dir" && "$TF" plan -no-color -detailed-exitcode -var "endpoint=$endpoint" > plan.log 2>&1)
+    local planned=$?
+    check "$what: tables: a plan after it changes nothing" "$planned" 0
+    [ "$planned" != 0 ] && grep -E "^  [#~+-]|will be|must be|Error" "$dir/plan.log" | head -40
+    local barn tarn
+    barn=$(cd "$dir" && "$TF" output -raw bucket_arn 2>/dev/null)
+    tarn=$(cd "$dir" && "$TF" output -raw table_arn 2>/dev/null)
+    check "$what: tables: the bucket's encryption" "$(aws --endpoint-url "$endpoint" s3tables get-table-bucket-encryption --table-bucket-arn "$barn" --query '[encryptionConfiguration.sseAlgorithm,encryptionConfiguration.kmsKeyArn]' --output text 2>&1 | tr '\t' ' ')" "aws:kms arn:aws:kms:us-east-1:000000000000:key/orders"
+    check "$what: tables: the bucket's tags" "$(aws --endpoint-url "$endpoint" s3tables list-tags-for-resource --resource-arn "$barn" --query tags.team --output text 2>&1)" data
+    check "$what: tables: the table's encryption, its bucket's" "$(aws --endpoint-url "$endpoint" s3tables get-table-encryption --table-bucket-arn "$barn" --namespace sales --name orders --query encryptionConfiguration.sseAlgorithm --output text 2>&1)" aws:kms
+    check "$what: tables: the table's tags" "$(aws --endpoint-url "$endpoint" s3tables list-tags-for-resource --resource-arn "$tarn" --query tags.stage --output text 2>&1)" raw
+    if (cd "$dir" && "$TF" destroy -no-color -auto-approve -var "endpoint=$endpoint" > destroy.log 2>&1); then
+        pass "$what: tables: terraform destroy"
+    else
+        fail "$what: tables: terraform destroy"; grep -B2 -A12 "Error" "$dir/destroy.log" | head -40
+    fi
+    check "$what: tables: no table bucket left" "$(aws --endpoint-url "$endpoint" s3tables list-table-buckets --query 'length(tableBuckets)' --output text 2>&1)" 0
+}
+
 # ---- serve ----
-"$BIN" serve "$WORK/store" "$BASE" "$WORK/credentials" localhost --maintain-seconds 2 --sts-key-file "$WORK/sts.keys" 2>> "$WORK/serve.log" &
+printf 'orders %s\n' "$(head -c 32 /dev/urandom | base64)" > "$WORK/kms.keys"
+printf 'k1 %s\n' "$(head -c 32 /dev/urandom | base64)" > "$WORK/sse.keys"
+"$BIN" serve "$WORK/store" "$BASE" "$WORK/credentials" localhost --maintain-seconds 2 --sts-key-file "$WORK/sts.keys" --sse-key-file "$WORK/sse.keys" --kms-key-file "$WORK/kms.keys" 2>> "$WORK/serve.log" &
 PIDS[0]=$!
 for i in $(seq 1 50); do aws --endpoint-url "http://127.0.0.1:$BASE" s3api list-buckets > /dev/null 2>&1 && break; pause 0.2; done
 run serve "http://127.0.0.1:$BASE"
+run_tables serve "http://127.0.0.1:$BASE"
 
 # ---- a cluster, through node 1 ----
 head -c 32 /dev/urandom | base64 > "$WORK/cluster.key"

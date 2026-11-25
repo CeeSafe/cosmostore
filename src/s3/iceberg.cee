@@ -953,6 +953,22 @@ fn readMetadataWith(
     };
 }
 
+/// A table's configuration at its create through the catalog, written at its id: its bucket's storage class and
+/// encryption then (ADR-0126 §2, §3).
+fn writeCreatedTableConfig(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    id: Slice<u8>,
+) -> Result<void, TablesError> {
+    var config = jsonObject();
+    jsonSet(mut config, "storageClass", Json.Text(bucketStorageClass(store, hidden)?))?;
+    match (bucketEncryption(store, hidden)?) {
+        Some(e) => { jsonSet(mut config, "encryption", e)?; }
+        null => {}
+    }
+    return writeTablesConfig(store, hidden, tableConfigKey(id)?.view(), borrow config);
+}
+
 /// The version number a metadata file's name begins with (`00003-<uuid>.metadata.json`), or -1.
 fn metadataVersion(location: Slice<u8>) -> i64 {
     var slash = 0usize;
@@ -1155,6 +1171,9 @@ fn icebergCreateTable(
         }
     };
     if (staged) {
+        // Its configuration first, at its reserved id: the files an engine writes before its commit (a CTAS's data
+        // and manifests) are sealed with its encryption as they arrive (ADR-0126 §4).
+        writeCreatedTableConfig(store, hidden.view(), id.view())?;
         // Kept by the table's namespace and name, so that one name holds one at most (the M29 exit review's M1): a
         // later staged create of the name replaces it.
         var reservation = jsonObject();
@@ -1167,15 +1186,8 @@ fn icebergCreateTable(
         jsonSet(mut j, "config", jsonObject())?;
         return tablesJson(borrow j);
     }
-    // Its storage class, its bucket's at its create (ADR-0126 §2).
-    var config = jsonObject();
-    jsonSet(mut config, "storageClass", Json.Text(bucketStorageClass(store, hidden.view())?))?;
-    // Its encryption, its bucket's at its create (ADR-0126 §3): written first, as its metadata is sealed with it.
-    match (bucketEncryption(store, hidden.view())?) {
-        Some(e) => { jsonSet(mut config, "encryption", e)?; }
-        null => {}
-    }
-    writeTablesConfig(store, hidden.view(), tableConfigKey(id.view())?.view(), borrow config)?;
+    // Its configuration, written first, as its metadata is sealed with it.
+    writeCreatedTableConfig(store, hidden.view(), id.view())?;
     let location = writeMetadataWith(store, hidden.view(), id.view(), 0, borrow m, sealing)?;
     let now = Clock.unixMillis();
     var rec = jsonObject();
@@ -1263,14 +1275,12 @@ fn icebergCommitCreate(
     if (!completeCreatedMetadata(mut m, warehouse.view())?) {
         return badRequest("A created table needs its schema, its location and a format version of 2 or 3.");
     }
-    var config = jsonObject();
-    jsonSet(mut config, "storageClass", Json.Text(bucketStorageClass(store, hidden.view())?))?;
-    // Its encryption, its bucket's at its create (ADR-0126 §3): written first, as its metadata is sealed with it.
-    match (bucketEncryption(store, hidden.view())?) {
-        Some(e) => { jsonSet(mut config, "encryption", e)?; }
-        null => {}
+    // Its configuration as its staged create wrote it (the files written before this commit were sealed with it);
+    // made now when it has none.
+    let configKey = tableConfigKey(id.view())?;
+    if (jsonMember(borrow readTablesConfig(store, hidden.view(), configKey.view())?, "storageClass").isNull()) {
+        writeCreatedTableConfig(store, hidden.view(), id.view())?;
     }
-    writeTablesConfig(store, hidden.view(), tableConfigKey(id.view())?.view(), borrow config)?;
     let written = writeMetadataWith(store, hidden.view(), id.view(), 0, borrow m, sealing)?;
     let now = Clock.unixMillis();
     var rec = jsonObject();

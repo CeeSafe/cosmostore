@@ -72,4 +72,82 @@ func tables(ctx context.Context, cfg aws.Config) {
 	must(t.DeleteNamespace(ctx, &s3tables.DeleteNamespaceInput{TableBucketARN: arn, Namespace: aws.String("sales")}))
 	must(t.DeleteTableBucket(ctx, &s3tables.DeleteTableBucketInput{TableBucketARN: arn}))
 	check("DeleteTableBucket", len(must(t.ListTableBuckets(ctx, &s3tables.ListTableBucketsInput{})).TableBuckets), 0)
+	tablesConfig(ctx, t)
+}
+
+// Tags, storage class and encryption (ADR-0126): a table bucket's, set at its create and changed after; a table takes
+// its bucket's storage class and encryption at its own create and keeps them.
+func tablesConfig(ctx context.Context, t *s3tables.Client) {
+	made, err := t.CreateTableBucket(ctx, &s3tables.CreateTableBucketInput{Name: aws.String("sdk-go-config"),
+		Tags:                      map[string]string{"team": "data"},
+		StorageClassConfiguration: &tabletypes.StorageClassConfiguration{StorageClass: tabletypes.StorageClassIntelligentTiering},
+		EncryptionConfiguration:   &tabletypes.EncryptionConfiguration{SseAlgorithm: tabletypes.SSEAlgorithmAes256}})
+	check("CreateTableBucket with tags, a storage class and encryption", codeOf(err), "no error")
+	if err != nil {
+		return
+	}
+	arn := made.Arn
+	tags := func(resource *string) any {
+		got, err := t.ListTagsForResource(ctx, &s3tables.ListTagsForResourceInput{ResourceArn: resource})
+		if err != nil {
+			return codeOf(err)
+		}
+		return got.Tags
+	}
+	bucketClass := func() any {
+		got, err := t.GetTableBucketStorageClass(ctx, &s3tables.GetTableBucketStorageClassInput{TableBucketARN: arn})
+		if err != nil || got.StorageClassConfiguration == nil {
+			return codeOf(err)
+		}
+		return got.StorageClassConfiguration.StorageClass
+	}
+	tableClass := func() any {
+		got, err := t.GetTableStorageClass(ctx, &s3tables.GetTableStorageClassInput{TableBucketARN: arn,
+			Namespace: aws.String("ns"), Name: aws.String("t")})
+		if err != nil || got.StorageClassConfiguration == nil {
+			return codeOf(err)
+		}
+		return got.StorageClassConfiguration.StorageClass
+	}
+	tableSse := func() any {
+		got, err := t.GetTableEncryption(ctx, &s3tables.GetTableEncryptionInput{TableBucketARN: arn,
+			Namespace: aws.String("ns"), Name: aws.String("t")})
+		if err != nil || got.EncryptionConfiguration == nil {
+			return codeOf(err)
+		}
+		return got.EncryptionConfiguration.SseAlgorithm
+	}
+	check("ListTagsForResource: its create's tags", tags(arn), map[string]string{"team": "data"})
+	_, err = t.TagResource(ctx, &s3tables.TagResourceInput{ResourceArn: arn, Tags: map[string]string{"env": "test"}})
+	check("TagResource", codeOf(err), "no error")
+	_, err = t.UntagResource(ctx, &s3tables.UntagResourceInput{ResourceArn: arn, TagKeys: []string{"team"}})
+	check("UntagResource", codeOf(err), "no error")
+	check("ListTagsForResource: one added, one removed", tags(arn), map[string]string{"env": "test"})
+	check("GetTableBucketStorageClass", bucketClass(), tabletypes.StorageClassIntelligentTiering)
+	sse, err := t.GetTableBucketEncryption(ctx, &s3tables.GetTableBucketEncryptionInput{TableBucketARN: arn})
+	if err == nil && sse.EncryptionConfiguration != nil {
+		check("GetTableBucketEncryption", sse.EncryptionConfiguration.SseAlgorithm, tabletypes.SSEAlgorithmAes256)
+	} else {
+		check("GetTableBucketEncryption", codeOf(err), tabletypes.SSEAlgorithmAes256)
+	}
+	must(t.CreateNamespace(ctx, &s3tables.CreateNamespaceInput{TableBucketARN: arn, Namespace: []string{"ns"}}))
+	table := must(t.CreateTable(ctx, &s3tables.CreateTableInput{TableBucketARN: arn, Namespace: aws.String("ns"),
+		Name: aws.String("t"), Format: tabletypes.OpenTableFormatIceberg}))
+	check("GetTableStorageClass: its bucket's", tableClass(), tabletypes.StorageClassIntelligentTiering)
+	check("GetTableEncryption: its bucket's", tableSse(), tabletypes.SSEAlgorithmAes256)
+	check("ListTagsForResource: a table's, none", tags(table.TableARN), map[string]string{})
+	_, err = t.PutTableBucketStorageClass(ctx, &s3tables.PutTableBucketStorageClassInput{TableBucketARN: arn,
+		StorageClassConfiguration: &tabletypes.StorageClassConfiguration{StorageClass: tabletypes.StorageClassStandard}})
+	check("PutTableBucketStorageClass", codeOf(err), "no error")
+	check("GetTableBucketStorageClass: changed", bucketClass(), tabletypes.StorageClassStandard)
+	check("GetTableStorageClass: a table keeps its create's", tableClass(), tabletypes.StorageClassIntelligentTiering)
+	_, err = t.DeleteTableBucketEncryption(ctx, &s3tables.DeleteTableBucketEncryptionInput{TableBucketARN: arn})
+	check("DeleteTableBucketEncryption", codeOf(err), "no error")
+	_, err = t.GetTableBucketEncryption(ctx, &s3tables.GetTableBucketEncryptionInput{TableBucketARN: arn})
+	check("GetTableBucketEncryption: none after", err != nil, true)
+	check("GetTableEncryption: a table keeps its create's", tableSse(), tabletypes.SSEAlgorithmAes256)
+	must(t.DeleteTable(ctx, &s3tables.DeleteTableInput{TableBucketARN: arn, Namespace: aws.String("ns"), Name: aws.String("t")}))
+	must(t.DeleteNamespace(ctx, &s3tables.DeleteNamespaceInput{TableBucketARN: arn, Namespace: aws.String("ns")}))
+	must(t.DeleteTableBucket(ctx, &s3tables.DeleteTableBucketInput{TableBucketARN: arn}))
+	check("DeleteTableBucket: the configured one", len(must(t.ListTableBuckets(ctx, &s3tables.ListTableBucketsInput{})).TableBuckets), 0)
 }

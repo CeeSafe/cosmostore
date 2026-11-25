@@ -32,7 +32,9 @@ import {
   GetTableCommand, UpdateTableMetadataLocationCommand, RenameTableCommand, ListTablesCommand, DeleteTableCommand,
   DeleteNamespaceCommand, DeleteTableBucketCommand, PutTableBucketMaintenanceConfigurationCommand,
   GetTableBucketMaintenanceConfigurationCommand, GetTableMaintenanceConfigurationCommand,
-  GetTableMaintenanceJobStatusCommand,
+  GetTableMaintenanceJobStatusCommand, ListTagsForResourceCommand, TagResourceCommand, UntagResourceCommand,
+  GetTableBucketStorageClassCommand, PutTableBucketStorageClassCommand, GetTableStorageClassCommand,
+  GetTableBucketEncryptionCommand, DeleteTableBucketEncryptionCommand, GetTableEncryptionCommand,
 } from "@aws-sdk/client-s3tables";
 import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -333,6 +335,39 @@ for (const sessions of [true, false]) {
   await t.send(new DeleteNamespaceCommand({ tableBucketARN: arn, namespace: "sales" }));
   await t.send(new DeleteTableBucketCommand({ tableBucketARN: arn }));
   check("DeleteTableBucket", (await t.send(new ListTableBucketsCommand({}))).tableBuckets ?? [], []);
+  // Tags, storage class and encryption (ADR-0126): a table bucket's, set at its create and changed after; a table
+  // takes its bucket's storage class and encryption at its own create and keeps them.
+  const cb = (await t.send(new CreateTableBucketCommand({ name: "sdk-js-config", tags: { team: "data" },
+    storageClassConfiguration: { storageClass: "INTELLIGENT_TIERING" }, encryptionConfiguration: { sseAlgorithm: "AES256" } }))).arn;
+  check("CreateTableBucket with tags, a storage class and encryption", cb, `arn:aws:s3tables:us-east-1:${ACCOUNT}:bucket/sdk-js-config`);
+  const tags = async (resourceArn) => (await t.send(new ListTagsForResourceCommand({ resourceArn }))).tags ?? {};
+  const bucketClass = async () => (await t.send(new GetTableBucketStorageClassCommand({ tableBucketARN: cb }))).storageClassConfiguration?.storageClass;
+  const tableClass = async () => (await t.send(new GetTableStorageClassCommand({ tableBucketARN: cb, namespace: "ns", name: "t" })))
+    .storageClassConfiguration?.storageClass;
+  const tableSse = async () => (await t.send(new GetTableEncryptionCommand({ tableBucketARN: cb, namespace: "ns", name: "t" })))
+    .encryptionConfiguration?.sseAlgorithm;
+  check("ListTagsForResource: its create's tags", await tags(cb), { team: "data" });
+  check("TagResource", await codeOf(t.send(new TagResourceCommand({ resourceArn: cb, tags: { env: "test" } }))), "no error");
+  check("UntagResource", await codeOf(t.send(new UntagResourceCommand({ resourceArn: cb, tagKeys: ["team"] }))), "no error");
+  check("ListTagsForResource: one added, one removed", await tags(cb), { env: "test" });
+  check("GetTableBucketStorageClass", await bucketClass(), "INTELLIGENT_TIERING");
+  check("GetTableBucketEncryption", (await t.send(new GetTableBucketEncryptionCommand({ tableBucketARN: cb }))).encryptionConfiguration?.sseAlgorithm,
+    "AES256");
+  await t.send(new CreateNamespaceCommand({ tableBucketARN: cb, namespace: ["ns"] }));
+  const ct = await t.send(new CreateTableCommand({ tableBucketARN: cb, namespace: "ns", name: "t", format: "ICEBERG" }));
+  check("GetTableStorageClass: its bucket's", await tableClass(), "INTELLIGENT_TIERING");
+  check("GetTableEncryption: its bucket's", await tableSse(), "AES256");
+  check("ListTagsForResource: a table's, none", await tags(ct.tableARN), {});
+  await t.send(new PutTableBucketStorageClassCommand({ tableBucketARN: cb, storageClassConfiguration: { storageClass: "STANDARD" } }));
+  check("PutTableBucketStorageClass", await bucketClass(), "STANDARD");
+  check("GetTableStorageClass: a table keeps its create's", await tableClass(), "INTELLIGENT_TIERING");
+  check("DeleteTableBucketEncryption", await codeOf(t.send(new DeleteTableBucketEncryptionCommand({ tableBucketARN: cb }))), "no error");
+  check("GetTableBucketEncryption: none after", (await codeOf(t.send(new GetTableBucketEncryptionCommand({ tableBucketARN: cb })))) !== "no error", true);
+  check("GetTableEncryption: a table keeps its create's", await tableSse(), "AES256");
+  await t.send(new DeleteTableCommand({ tableBucketARN: cb, namespace: "ns", name: "t" }));
+  await t.send(new DeleteNamespaceCommand({ tableBucketARN: cb, namespace: "ns" }));
+  await t.send(new DeleteTableBucketCommand({ tableBucketARN: cb }));
+  check("DeleteTableBucket: the configured one", (await t.send(new ListTableBucketsCommand({}))).tableBuckets ?? [], []);
 }
 
 // Users (ADR-0088): a user's key reads what its identity policy allows, and nothing else.

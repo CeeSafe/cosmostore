@@ -142,3 +142,39 @@ fn encryptedTablesMetadataSealed() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// A staged create's table has its configuration at its reserved id before its commit (ADR-0126 §4): an engine's files
+/// written to its location then (a CTAS's data and manifests) are sealed with its bucket's encryption, as S3's write
+/// into the warehouse reads it.
+@test
+fn stagedCreatesAreConfiguredAtOnce() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("sealed-staged");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let config = parseJson(
+        "{\"encryption\":{\"sseAlgorithm\":\"aws:kms\",\"kmsKeyArn\":\"arn:aws:kms:us-east-1:000000000000:key/orders\"}}".bytes(),
+    )!!;
+    writeTablesConfig(mut s, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes(), borrow config)!;
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let staged = icebergCreateTable(
+        mut s,
+        "cat".bytes(),
+        "ns".bytes(),
+        "{\"name\":\"t\",\"stage-create\":true,\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+        borrow noKeys,
+    )!;
+    Check.equalU64(200, staged.status as u64)?;
+    let reservation = readRecord(
+        borrow s,
+        hidden.view(),
+        catalogKey(CATALOG_STAGED, "ns".bytes(), "t".bytes())!.view(),
+    )!!;
+    let id = jsonMemberText(borrow reservation.json, "id")!;
+    let e = tableEncryption(borrow s, hidden.view(), id)!!;
+    Check.equalBytes("aws:kms".bytes(), jsonMemberText(borrow e, "sseAlgorithm")!)?;
+    removeTree(dir.view());
+    return Ok();
+}

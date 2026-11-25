@@ -352,14 +352,15 @@ fn bucketEncryptionCall(
     req: borrow S3Request,
     bucket: Slice<u8>,
     body: Slice<u8>,
+    keys: borrow WarehouseKeys,
 ) -> Result<TablesAnswer, TablesError> {
     let hidden = tableWarehouseBucket(bucket)?;
     var config = readTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes())?;
     if (isMethod(req.method, Method.Put)) {
         let j = tablesObject(body)?;
-        let e = encryptionConfigOf(jsonMember(borrow j, "encryptionConfiguration") ?? {
+        let e = heldEncryptionOf(jsonMember(borrow j, "encryptionConfiguration") ?? {
             return Err(TablesError.BadRequest);
-        })? ?? { return Err(TablesError.BadRequest); };
+        }, keys)?;
         jsonSet(mut config, "encryption", e)?;
         writeTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes(), borrow config)?;
         return tablesJson(borrow jsonObject());
@@ -381,9 +382,31 @@ fn bucketEncryptionCall(
 
 /// A create's encryption (ADR-0126 §3): its own `encryptionConfiguration`, else `inherited` (its bucket's); none
 /// when neither is given. Err(BadRequest) for one not taken.
-fn createdEncryptionOf(request: borrow Json, inherited: borrow Json?) -> Result<Json?, TablesError> {
+/// Whether this server can seal with an encryption configuration, as S3's PutBucketEncryption asks (ADR-0126 §3):
+/// AES256 with an SSE-S3 key file; `aws:kms` with the KMS key it names, not one being retired.
+fn encryptionHeld(e: borrow Json, keys: borrow WarehouseKeys) -> bool {
+    if ((jsonMemberText(e, "sseAlgorithm") ?? "".bytes()) != "aws:kms".bytes()) { return keys.sse.length > 0; }
+    let name = kmsKeyNameOf(jsonMemberText(e, "kmsKeyArn") ?? "".bytes()) ?? { return false; };
+    for (k in keys.kms) {
+        if (k.id.view() == name.view() && !k.retiring) { return true; }
+    }
+    return false;
+}
+
+/// An encryption configuration a request gives, when it is valid and this server holds its key.
+fn heldEncryptionOf(j: borrow Json, keys: borrow WarehouseKeys) -> Result<Json, TablesError> {
+    let e = encryptionConfigOf(j)? ?? { return Err(TablesError.BadRequest); };
+    if (!encryptionHeld(borrow e, keys)) { return Err(TablesError.BadRequest); }
+    return Ok(e);
+}
+
+fn createdEncryptionOf(
+    request: borrow Json,
+    inherited: borrow Json?,
+    keys: borrow WarehouseKeys,
+) -> Result<Json?, TablesError> {
     return match (jsonMember(request, "encryptionConfiguration")) {
-        Some(e) => Ok(Some(encryptionConfigOf(e)? ?? { return Err(TablesError.BadRequest); })),
+        Some(e) => Ok(Some(heldEncryptionOf(e, keys)?)),
         null => match (inherited) {
             Some(i) => Ok(Some(cloneJson(i)?)),
             null => Ok(null),

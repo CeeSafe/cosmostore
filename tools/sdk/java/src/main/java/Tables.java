@@ -2,11 +2,14 @@
 // location's compare-and-set on the versionToken.
 import java.net.URI;
 import java.util.List;
+import java.util.Map;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3tables.S3TablesClient;
 import software.amazon.awssdk.services.s3tables.model.OpenTableFormat;
+import software.amazon.awssdk.services.s3tables.model.SSEAlgorithm;
+import software.amazon.awssdk.services.s3tables.model.StorageClass;
 
 class Tables {
     static void run(URI endpoint) {
@@ -48,5 +51,41 @@ class Tables {
         t.deleteNamespace(r -> r.tableBucketARN(arn).namespace("sales"));
         t.deleteTableBucket(r -> r.tableBucketARN(arn));
         Check.check("DeleteTableBucket", t.listTableBuckets(r -> {}).tableBuckets().size(), 0);
+        // Tags, storage class and encryption (ADR-0126): given at create, changed after; a table takes its bucket's
+        // storage class and encryption when it is made and keeps them.
+        String carn = t.createTableBucket(r -> r.name("sdk-java-config").tags(Map.of("team", "data"))
+            .storageClassConfiguration(c -> c.storageClass(StorageClass.INTELLIGENT_TIERING))
+            .encryptionConfiguration(e -> e.sseAlgorithm(SSEAlgorithm.AES256))).arn();
+        Check.check("CreateTableBucket with tags", t.listTagsForResource(r -> r.resourceArn(carn)).tags(), Map.of("team", "data"));
+        t.tagResource(r -> r.resourceArn(carn).tags(Map.of("env", "test")));
+        t.untagResource(r -> r.resourceArn(carn).tagKeys("team"));
+        Check.check("TagResource and UntagResource", t.listTagsForResource(r -> r.resourceArn(carn)).tags(), Map.of("env", "test"));
+        Check.check("GetTableBucketStorageClass",
+            t.getTableBucketStorageClass(r -> r.tableBucketARN(carn)).storageClassConfiguration().storageClassAsString(), "INTELLIGENT_TIERING");
+        Check.check("GetTableBucketEncryption",
+            t.getTableBucketEncryption(r -> r.tableBucketARN(carn)).encryptionConfiguration().sseAlgorithmAsString(), "AES256");
+        t.createNamespace(r -> r.tableBucketARN(carn).namespace("ns"));
+        String carnT = t.createTable(r -> r.tableBucketARN(carn).namespace("ns").name("t").format(OpenTableFormat.ICEBERG)).tableARN();
+        Check.check("GetTableStorageClass: the bucket's",
+            t.getTableStorageClass(r -> r.tableBucketARN(carn).namespace("ns").name("t")).storageClassConfiguration().storageClassAsString(),
+            "INTELLIGENT_TIERING");
+        Check.check("GetTableEncryption: the bucket's",
+            t.getTableEncryption(r -> r.tableBucketARN(carn).namespace("ns").name("t")).encryptionConfiguration().sseAlgorithmAsString(), "AES256");
+        Check.check("a table's tags: none", t.listTagsForResource(r -> r.resourceArn(carnT)).tags(), Map.of());
+        t.putTableBucketStorageClass(r -> r.tableBucketARN(carn).storageClassConfiguration(c -> c.storageClass(StorageClass.STANDARD)));
+        Check.check("PutTableBucketStorageClass",
+            t.getTableBucketStorageClass(r -> r.tableBucketARN(carn)).storageClassConfiguration().storageClassAsString(), "STANDARD");
+        Check.check("a table keeps its storage class",
+            t.getTableStorageClass(r -> r.tableBucketARN(carn).namespace("ns").name("t")).storageClassConfiguration().storageClassAsString(),
+            "INTELLIGENT_TIERING");
+        t.deleteTableBucketEncryption(r -> r.tableBucketARN(carn));
+        Check.check("DeleteTableBucketEncryption",
+            Directory.codeOf(() -> t.getTableBucketEncryption(r -> r.tableBucketARN(carn))).equals("no error"), false);
+        Check.check("a table keeps its encryption",
+            t.getTableEncryption(r -> r.tableBucketARN(carn).namespace("ns").name("t")).encryptionConfiguration().sseAlgorithmAsString(), "AES256");
+        t.deleteTable(r -> r.tableBucketARN(carn).namespace("ns").name("t"));
+        t.deleteNamespace(r -> r.tableBucketARN(carn).namespace("ns"));
+        t.deleteTableBucket(r -> r.tableBucketARN(carn));
+        Check.check("DeleteTableBucket: configured", t.listTableBuckets(r -> {}).tableBuckets().size(), 0);
     }
 }

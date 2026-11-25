@@ -8,6 +8,9 @@ merges the table. After it:
 - the merged file holds each live row with the `_row_id` it had before (its file's first row id plus its position);
 - Iceberg Java reads the same rows, with no delete left;
 - the table is still v3, its snapshot a replace with a first row id, and its next row id advanced.
+With ENCRYPTED=1 the table bucket is sealed under the KMS key `orders` (ADR-0126 §5): every phase then runs on an
+encrypted table, and at the end every file of its warehouse (Java's, PyIceberg's, the catalog's and compaction's) is
+sealed under that key in the store.
 
 usage: tools/iceberg_java_check.py ENDPOINT DAY_SECONDS CLASSPATH   against `serve --tables-day-seconds DAY_SECONDS`,
        with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY set (needs a JDK, pyiceberg, pyarrow and boto3)
@@ -40,7 +43,13 @@ region = "us-east-1"
 cfg = Config(retries={"max_attempts": 1})
 tables = boto3.client("s3tables", endpoint_url=endpoint, region_name=region, config=cfg)
 s3 = boto3.client("s3", endpoint_url=endpoint, region_name=region, config=cfg)
-arn = tables.create_table_bucket(name="java-check")["arn"]
+encrypted = os.environ.get("ENCRYPTED") == "1"
+KMS_KEY = "arn:aws:kms:us-east-1:000000000000:key/orders"
+if encrypted:
+    arn = tables.create_table_bucket(name="java-check", encryptionConfiguration={"sseAlgorithm": "aws:kms",
+                                                                               "kmsKeyArn": KMS_KEY})["arn"]
+else:
+    arn = tables.create_table_bucket(name="java-check")["arn"]
 
 
 def java(phase):
@@ -153,5 +162,25 @@ check("still v3", after.get("format"), "3")
 check("a replace", after.get("operation"), "replace")
 check("its first row id the table's next before", after.get("first-row-id"), str(next_before))
 check("the next row id advanced", int(after["next-row-id"]) > next_before, True)
+if encrypted:
+    # Every file of the warehouse sealed under the table's KMS key: data, deletes, manifests, lists and metadata,
+    # whoever wrote them; and the stored bytes are not the plaintext (a GET opens them).
+    # Each table's files, by its id's prefix (the warehouse's root is the catalog's, not S3's to list).
+    keys = []
+    for t in tables.list_tables(tableBucketARN=arn)["tables"]:
+        token = None
+        while True:
+            page = s3.list_objects_v2(Bucket="java-check--table-s3", Prefix=t["tableARN"].rsplit("/", 1)[1] + "/",
+                                      **({"ContinuationToken": token} if token else {}))
+            keys += [o["Key"] for o in page.get("Contents", [])]
+            token = page.get("NextContinuationToken")
+            if not token:
+                break
+    check("the warehouse has files", len(keys) > 10, True)
+    sealed = [k for k in keys
+              if (lambda h: (h.get("ServerSideEncryption"), h.get("SSEKMSKeyId", "").rsplit("/", 1)[-1]))(
+                  s3.head_object(Bucket="java-check--table-s3", Key=k)) == ("aws:kms", "orders")]
+    check("every file sealed under the table's KMS key", sorted(set(keys) - set(sealed)), [])
+    check("compaction's merged file among them", key in sealed, True)
 sys.stdout.flush()
 os._exit(1 if failed else 0)

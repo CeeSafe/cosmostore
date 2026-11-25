@@ -6000,3 +6000,30 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Accepted with it:** the cluster's limit, in its consequences. On a cluster a table bucket's tags, storage class and
   encryption are set after its create, by their own calls.
 - **Still open in M30:** slice 5 (the checks) and slice 6 (the exit review). Closing M30 stays the owner's.
+
+### 25 Nov 2026: M30 slice 5, the checks (ADR-0126 §5)
+
+- **AWS CLI** (`s3_smoke.sh`, 20 checks): a table bucket created with tags, INTELLIGENT_TIERING and a KMS key:
+  - tags put, removed and listed, and an `aws:` tag refused;
+  - the storage class and encryption read; a KMS key not held refused;
+  - a table's tags by its ARN, and its class and encryption inherited and kept after its bucket's change;
+  - the bucket's encryption deleted and put; a table's tags gone with it.
+- **boto3:** `iceberg_check.py`, as slices 1 and 2 left it, with the cluster's path from the cluster fix.
+- **The SDK matrix (Go 17, JS 16, Java 12, .NET 12 checks):** each SDK's own S3 Tables client creates a configured
+  table bucket, then tags and untags, reads the storage class and encryption, reads a table's inherited and kept
+  settings, and deletes the encryption. Each run ends in all passed with fsck clean.
+- **Terraform** (`terraform_check.sh`, `tools/terraform_tables/`): AWS provider 6.70.0, which has tags (6.21.0) and
+  an optional encryption (6.34.0) but no storage class.
+  - On `serve`: a KMS table bucket with tags, a namespace, and a tagged table that takes its encryption.
+  - Applied, read back through the CLI, planned with no change, and destroyed, leaving no table bucket. 28 checks.
+- **Iceberg Java on a KMS table** (`iceberg_java_check.sh` with `ENCRYPTED=1`, now in CI beside the plain run):
+  - every phase runs on a table sealed under `orders`: Java's create, upgrade, CTAS, RTAS, its 22 calls, its appends
+    and deletion vector, PyIceberg's create transaction, compaction, and the reads by Java and PyIceberg;
+  - then every file of each table's warehouse is sealed under the key. 50 checks.
+- **Found and fixed by the checks:**
+  - **A configured encryption whose key isn't held was taken.** Now PutTableBucketEncryption and the creates refuse
+    it (BadRequestException), as S3's PutBucketEncryption does: AES256 needs the SSE-S3 key file, and `aws:kms` a KMS
+    key this server holds and isn't retiring.
+  - **A staged create's files were not sealed.** A CTAS's or a PyIceberg create transaction's data and manifests are
+    written before the commit makes the table, and the table's configuration was written only at the commit. Now the
+    staged create writes it at the reserved id, and the commit keeps it (`stagedCreatesAreConfiguredAtOnce`).

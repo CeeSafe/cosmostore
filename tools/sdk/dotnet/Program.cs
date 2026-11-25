@@ -502,6 +502,51 @@ foreach (var sessions in new[] { false })
     await t.DeleteNamespaceAsync(new Amazon.S3Tables.Model.DeleteNamespaceRequest { TableBucketARN = arn, Namespace = "sales" });
     await t.DeleteTableBucketAsync(new Amazon.S3Tables.Model.DeleteTableBucketRequest { TableBucketARN = arn });
     Check("DeleteTableBucket", (await t.ListTableBucketsAsync(new Amazon.S3Tables.Model.ListTableBucketsRequest())).TableBuckets?.Count ?? 0, 0);
+    // Tags, storage class and encryption (ADR-0126): given at create, changed after; a table takes its bucket's
+    // storage class and encryption when it is made and keeps them.
+    async Task<string> TagsOf(string resource) => string.Join(",", ((await t.ListTagsForResourceAsync(new Amazon.S3Tables.Model.ListTagsForResourceRequest { ResourceArn = resource })).Tags
+        ?? new Dictionary<string, string>()).OrderBy(p => p.Key).Select(p => p.Key + "=" + p.Value));
+    var carn = (await t.CreateTableBucketAsync(new Amazon.S3Tables.Model.CreateTableBucketRequest
+    {
+        Name = "sdk-dotnet-config", Tags = new Dictionary<string, string> { ["team"] = "data" },
+        StorageClassConfiguration = new Amazon.S3Tables.Model.StorageClassConfiguration { StorageClass = Amazon.S3Tables.StorageClass.INTELLIGENT_TIERING },
+        EncryptionConfiguration = new Amazon.S3Tables.Model.EncryptionConfiguration { SseAlgorithm = Amazon.S3Tables.SSEAlgorithm.AES256 },
+    })).Arn;
+    Check("CreateTableBucket with tags", await TagsOf(carn), "team=data");
+    await t.TagResourceAsync(new Amazon.S3Tables.Model.TagResourceRequest { ResourceArn = carn, Tags = new Dictionary<string, string> { ["env"] = "test" } });
+    await t.UntagResourceAsync(new Amazon.S3Tables.Model.UntagResourceRequest { ResourceArn = carn, TagKeys = new List<string> { "team" } });
+    Check("TagResource and UntagResource", await TagsOf(carn), "env=test");
+    async Task<string> BucketClass() => (await t.GetTableBucketStorageClassAsync(new Amazon.S3Tables.Model.GetTableBucketStorageClassRequest { TableBucketARN = carn }))
+        .StorageClassConfiguration.StorageClass.Value;
+    async Task<string> TableClass() => (await t.GetTableStorageClassAsync(new Amazon.S3Tables.Model.GetTableStorageClassRequest { TableBucketARN = carn, Namespace = "ns", Name = "t" }))
+        .StorageClassConfiguration.StorageClass.Value;
+    async Task<string> TableSse() => (await t.GetTableEncryptionAsync(new Amazon.S3Tables.Model.GetTableEncryptionRequest { TableBucketARN = carn, Namespace = "ns", Name = "t" }))
+        .EncryptionConfiguration.SseAlgorithm.Value;
+    var bucketSse = new Amazon.S3Tables.Model.GetTableBucketEncryptionRequest { TableBucketARN = carn };
+    Check("GetTableBucketStorageClass", await BucketClass(), "INTELLIGENT_TIERING");
+    Check("GetTableBucketEncryption", (await t.GetTableBucketEncryptionAsync(bucketSse)).EncryptionConfiguration.SseAlgorithm.Value, "AES256");
+    await t.CreateNamespaceAsync(new Amazon.S3Tables.Model.CreateNamespaceRequest { TableBucketARN = carn, Namespace = new List<string> { "ns" } });
+    var configured = await t.CreateTableAsync(new Amazon.S3Tables.Model.CreateTableRequest
+    {
+        TableBucketARN = carn, Namespace = "ns", Name = "t", Format = Amazon.S3Tables.OpenTableFormat.ICEBERG,
+    });
+    Check("GetTableStorageClass: the bucket's", await TableClass(), "INTELLIGENT_TIERING");
+    Check("GetTableEncryption: the bucket's", await TableSse(), "AES256");
+    Check("a table's tags: none", await TagsOf(configured.TableARN), "");
+    await t.PutTableBucketStorageClassAsync(new Amazon.S3Tables.Model.PutTableBucketStorageClassRequest
+    {
+        TableBucketARN = carn,
+        StorageClassConfiguration = new Amazon.S3Tables.Model.StorageClassConfiguration { StorageClass = Amazon.S3Tables.StorageClass.STANDARD },
+    });
+    Check("PutTableBucketStorageClass", await BucketClass(), "STANDARD");
+    Check("a table keeps its storage class", await TableClass(), "INTELLIGENT_TIERING");
+    await t.DeleteTableBucketEncryptionAsync(new Amazon.S3Tables.Model.DeleteTableBucketEncryptionRequest { TableBucketARN = carn });
+    Check("DeleteTableBucketEncryption", await CodeOf(() => t.GetTableBucketEncryptionAsync(bucketSse)) != "no error", true);
+    Check("a table keeps its encryption", await TableSse(), "AES256");
+    await t.DeleteTableAsync(new Amazon.S3Tables.Model.DeleteTableRequest { TableBucketARN = carn, Namespace = "ns", Name = "t" });
+    await t.DeleteNamespaceAsync(new Amazon.S3Tables.Model.DeleteNamespaceRequest { TableBucketARN = carn, Namespace = "ns" });
+    await t.DeleteTableBucketAsync(new Amazon.S3Tables.Model.DeleteTableBucketRequest { TableBucketARN = carn });
+    Check("DeleteTableBucket: configured", (await t.ListTableBucketsAsync(new Amazon.S3Tables.Model.ListTableBucketsRequest())).TableBuckets?.Count ?? 0, 0);
 }
 // The IAM API (ADR-0104): a user, its key and policy; the key signs within an upkeep round (10 s here); a role made
 // with a trust policy and assumed; everything deleted, and the key refused after.

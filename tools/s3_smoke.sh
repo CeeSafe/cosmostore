@@ -1573,6 +1573,33 @@ aws s3tables delete-table --table-bucket-arn "$tarn" --namespace sales --name or
 check "delete-table removes its files" "$(aws s3api list-objects-v2 --bucket "$twb" --prefix "$tpre/" --query 'length(Contents || `[]`)' 2>&1)" 0
 aws s3tables delete-namespace --table-bucket-arn "$tarn" --namespace sales > /dev/null 2>&1
 aws s3tables delete-table-bucket --table-bucket-arn "$tarn" > /dev/null 2>&1 && pass "delete-table-bucket" || fail "delete-table-bucket"
+# S3 Tables' tags, storage class and encryption (ADR-0126) through `aws s3tables`: each set, read and removed.
+karn=arn:aws:kms:us-east-1:000000000000:key/orders
+carn=$(aws s3tables create-table-bucket --name smoke-config --tags team=data --storage-class-configuration storageClass=INTELLIGENT_TIERING --encryption-configuration "sseAlgorithm=aws:kms,kmsKeyArn=$karn" --query arn --output text 2>&1)
+check "create-table-bucket with its settings" "$carn" "arn:aws:s3tables:us-east-1:000000000000:bucket/smoke-config"
+check "list-tags-for-resource" "$(aws s3tables list-tags-for-resource --resource-arn "$carn" --query tags.team --output text 2>&1)" data
+aws s3tables tag-resource --resource-arn "$carn" --tags env=test > /dev/null 2>&1 && pass "tag-resource" || fail "tag-resource"
+aws s3tables untag-resource --resource-arn "$carn" --tag-keys team > /dev/null 2>&1 && pass "untag-resource" || fail "untag-resource"
+check "its tags after" "$(aws s3tables list-tags-for-resource --resource-arn "$carn" --output json 2>&1 | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["tags"])')" "{'env': 'test'}"
+check "an aws: tag" "$(code s3tables tag-resource --resource-arn "$carn" --tags aws:x=y)" BadRequestException
+check "get-table-bucket-storage-class" "$(aws s3tables get-table-bucket-storage-class --table-bucket-arn "$carn" --query storageClassConfiguration.storageClass --output text 2>&1)" INTELLIGENT_TIERING
+check "get-table-bucket-encryption" "$(aws s3tables get-table-bucket-encryption --table-bucket-arn "$carn" --query '[encryptionConfiguration.sseAlgorithm,encryptionConfiguration.kmsKeyArn]' --output text 2>&1 | tr '\t' ' ')" "aws:kms $karn"
+check "a KMS key there is not" "$(code s3tables put-table-bucket-encryption --table-bucket-arn "$carn" --encryption-configuration sseAlgorithm=aws:kms,kmsKeyArn=arn:aws:kms:us-east-1:000000000000:key/nobody)" BadRequestException
+aws s3tables create-namespace --table-bucket-arn "$carn" --namespace ns > /dev/null 2>&1
+ctarn=$(aws s3tables create-table --table-bucket-arn "$carn" --namespace ns --name t --format ICEBERG --tags stage=raw --query tableARN --output text 2>&1)
+check "a table's tags, by its ARN" "$(aws s3tables list-tags-for-resource --resource-arn "$ctarn" --query tags.stage --output text 2>&1)" raw
+check "get-table-storage-class: its bucket's" "$(aws s3tables get-table-storage-class --table-bucket-arn "$carn" --namespace ns --name t --query storageClassConfiguration.storageClass --output text 2>&1)" INTELLIGENT_TIERING
+check "get-table-encryption: its bucket's" "$(aws s3tables get-table-encryption --table-bucket-arn "$carn" --namespace ns --name t --query encryptionConfiguration.sseAlgorithm --output text 2>&1)" aws:kms
+aws s3tables put-table-bucket-storage-class --table-bucket-arn "$carn" --storage-class-configuration storageClass=STANDARD > /dev/null 2>&1 && pass "put-table-bucket-storage-class" || fail "put-table-bucket-storage-class"
+check "the table's kept from its create" "$(aws s3tables get-table-storage-class --table-bucket-arn "$carn" --namespace ns --name t --query storageClassConfiguration.storageClass --output text 2>&1)" INTELLIGENT_TIERING
+aws s3tables delete-table-bucket-encryption --table-bucket-arn "$carn" > /dev/null 2>&1 && pass "delete-table-bucket-encryption" || fail "delete-table-bucket-encryption"
+check "none after" "$(code s3tables get-table-bucket-encryption --table-bucket-arn "$carn")" NotFoundException
+check "the table's kept" "$(aws s3tables get-table-encryption --table-bucket-arn "$carn" --namespace ns --name t --query encryptionConfiguration.sseAlgorithm --output text 2>&1)" aws:kms
+aws s3tables put-table-bucket-encryption --table-bucket-arn "$carn" --encryption-configuration sseAlgorithm=AES256 > /dev/null 2>&1 && pass "put-table-bucket-encryption" || fail "put-table-bucket-encryption"
+aws s3tables delete-table --table-bucket-arn "$carn" --namespace ns --name t > /dev/null 2>&1
+check "a table's tags gone with it" "$(code s3tables list-tags-for-resource --resource-arn "$ctarn")" NotFoundException
+aws s3tables delete-namespace --table-bucket-arn "$carn" --namespace ns > /dev/null 2>&1
+aws s3tables delete-table-bucket --table-bucket-arn "$carn" > /dev/null 2>&1 && pass "and the bucket with its settings deleted" || fail "and the bucket with its settings deleted"
 check "gone" "$(aws s3tables list-table-buckets --query 'length(tableBuckets)' 2>&1)" 0
 # The Iceberg REST catalog through PyIceberg (ADR-0083 §5), when ICEBERG_PYTHON names a Python that has it.
 if [ -n "${ICEBERG_PYTHON:-}" ]; then
