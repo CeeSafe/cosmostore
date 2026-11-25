@@ -149,16 +149,21 @@ fn clusterKey(k: usize) -> StringView =>
 
 /// The bucket, then twelve writes: puts of values 100 and on, a delete every fourth. Stops at the first error, as a
 /// power cut would.
-fn clusterWorkload(root: StringView, seed: u64, model: borrow mut ClusterModel) {
+fn clusterWorkload(root: StringView, seed: u64, model: borrow mut ClusterModel) =>
+    clusterWorkloadWith(root, seed, model, false);
+
+/// `clusterWorkload`; with `together`, its first write makes the bucket and puts a value into it, one request's
+/// staged entries (ADR-0128 §1).
+fn clusterWorkloadWith(root: StringView, seed: u64, model: borrow mut ClusterModel, together: bool) {
     var c = match (clusterOpen(root, seed)) {
         Ok(c) => c,
         Err(_) => { return; }
     };
     // An error is a fault the sweep injected: the workload stops there, as a power cut would stop it.
-    let _ = runWorkload(mut c, model);
+    let _ = runWorkload(mut c, model, together);
 }
 
-fn runWorkload(c: borrow mut Cluster, model: borrow mut ClusterModel) -> Result<void, StoreError> {
+fn runWorkload(c: borrow mut Cluster, model: borrow mut ClusterModel, together: bool) -> Result<void, StoreError> {
     for (op in 0usize..13usize) {
         let at = match (awaitLeader(c)?) {
             Some(i) => i,
@@ -171,6 +176,20 @@ fn runWorkload(c: borrow mut Cluster, model: borrow mut ClusterModel) -> Result<
         if (op == 0) {
             model.bucketPending = true;
             c.replicas[at].store.createBucket("bkt")?;
+            if (together) {
+                // A write into the bucket its own request made: taken, though the bucket is not applied yet.
+                model.pendingKey = k;
+                model.pendingValue = value;
+                var data = Vector<u8>.create();
+                data.pushLE(value)?;
+                let _ = c.replicas[at].store.putObject(
+                    "bkt",
+                    clusterKey(k),
+                    "text/plain",
+                    data.view(),
+                    PutCondition.None,
+                )?;
+            }
         } else if (op % 4 == 0) {
             model.pendingKey = k;
             model.pendingValue = 0;
@@ -193,6 +212,7 @@ fn runWorkload(c: borrow mut Cluster, model: borrow mut ClusterModel) -> Result<
         // Acknowledged.
         if (op == 0) {
             model.bucket = true;
+            if (together) { model.values[k] = model.pendingValue; }
         } else {
             model.values[k] = model.pendingValue;
         }
@@ -288,12 +308,15 @@ fn replicasAgreeWithoutFaults() -> Result<void, TestFailure> {
     return Ok();
 }
 
-fn sweepCluster(name: StringView, mode: SweepMode) -> Result<void, TestFailure> {
+fn sweepCluster(name: StringView, mode: SweepMode) -> Result<void, TestFailure> => sweepClusterWith(name, mode, false);
+
+/// `sweepCluster` of `clusterWorkloadWith`.
+fn sweepClusterWith(name: StringView, mode: SweepMode, together: bool) -> Result<void, TestFailure> {
     Faults.elideSyncs(true);
     let root = scratchDirectory(name);
     Faults.countOperations();
     var clean = emptyModel();
-    clusterWorkload(root.view(), 3, mut clean);
+    clusterWorkloadWith(root.view(), 3, mut clean, together);
     Faults.disarm();
     Check.equalU64(13, clean.acked)?;
     let points = Faults.seen();
@@ -303,7 +326,7 @@ fn sweepCluster(name: StringView, mode: SweepMode) -> Result<void, TestFailure> 
         Fs.ensureDirectory(root.view())!;
         armMode(borrow mode, n);
         var model = emptyModel();
-        clusterWorkload(root.view(), 3, mut model);
+        clusterWorkloadWith(root.view(), 3, mut model, together);
         Faults.disarm();
         if (isCrash(borrow mode)) {
             Check.equalU64(0, Faults.violations())?;
@@ -327,6 +350,62 @@ fn replicasFaultsTorn() -> Result<void, TestFailure> => sweepCluster("cluster-to
 
 @test
 fn replicasFaultsCrash() -> Result<void, TestFailure> => sweepCluster("cluster-crash", SweepMode.Crash);
+
+/// A request that makes a bucket and writes into it (ADR-0128 §1): applied on every replica in order, and swept for
+/// faults and crashes at every I/O point.
+@test
+fn stagedBucketsAgreeWithoutFaults() -> Result<void, TestFailure> {
+    let root = scratchDirectory("cluster-staged-clean");
+    var model = emptyModel();
+    clusterWorkloadWith(root.view(), 3, mut model, true);
+    Check.equalU64(13, model.acked)?;
+    checkCluster(root.view(), 3, borrow model)?;
+    removeTree(root.view());
+    return Ok();
+}
+
+@test
+fn stagedBucketsFaultsOnce() -> Result<void, TestFailure> =>
+    sweepClusterWith("cluster-staged-once", SweepMode.Once, true);
+
+@test
+fn stagedBucketsFaultsCrash() -> Result<void, TestFailure> =>
+    sweepClusterWith("cluster-staged-crash", SweepMode.Crash, true);
+
+/// A staged bucket (ADR-0128 §1): not read before it applies, taken by its request's writes, gone with its entries
+/// when they are cut off, and gone at a change of term.
+@test
+fn stagedBucketsAreForWritesOnly() -> Result<void, TestFailure> {
+    let root = scratchDirectory("cluster-staged-edges");
+    var c = clusterOpen(root.view(), 5)!;
+    let at = awaitLeader(mut c)!!;
+    let before = c.replicas[at].beginWrite()!;
+    c.replicas[at].store.createBucket("bkt")!;
+    Check.isFalse(c.replicas[at].store.bucketExists("bkt")!, "not read before it applies")?;
+    var data = Vector<u8>.create();
+    data.pushLE(7u64)!;
+    let _ = c.replicas[at].store.putObject("bkt", "k0", "text/plain", data.view(), PutCondition.None)!;
+    match (c.replicas[at].store.createBucket("bkt")) {
+        Err(StoreError.BucketAlreadyExists) => {}
+        _ => { return Err(TestFailure.create("made twice in one request")); }
+    }
+    // Cut off: the bucket goes with its entries, and a write into it is refused.
+    c.replicas[at].store.truncateEntries(before)!;
+    match (c.replicas[at].store.putObject("bkt", "k1", "text/plain", data.view(), PutCondition.None)) {
+        Err(StoreError.NoSuchBucket) => {}
+        _ => { return Err(TestFailure.create("a write into a bucket cut off")); }
+    }
+    // A change of term ends it too.
+    c.replicas[at].store.createBucket("other")!;
+    c.replicas[at].store.setLeaderTerm(0);
+    match (c.replicas[at].store.putObject("other", "k1", "text/plain", data.view(), PutCondition.None)) {
+        Err(StoreError.NoSuchBucket) => {}
+        Err(StoreError.NotLeader) => {}
+        _ => { return Err(TestFailure.create("a write into a bucket of a term past")); }
+    }
+    removeTree(root.view());
+    return Ok();
+}
 
 /// A follower cut off while the leader writes (overwriting the same keys, so segments empty out), checkpoints and
 /// compacts; then it rejoins, behind the leader's checkpoint, and must catch up from a snapshot. Stops at the first

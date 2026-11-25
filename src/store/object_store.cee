@@ -426,6 +426,12 @@ struct DeleteOutcome {
 }
 
 /// One page of a listing: keys and rolled-up common prefixes, both in byte order.
+/// A bucket made by a leader's staged entry, not yet applied (ADR-0128 §1).
+struct StagedBucket {
+    name: Vector<u8>;
+    lsn: u64;
+}
+
 struct ListPage {
     keys: Vector<Vector<u8>>;
     sizes: Vector<u64>;
@@ -1727,6 +1733,9 @@ struct ObjectStore {
     /// persisted when committed to the journal, and applied only when Raft commits them (`applyEntries`).
     private raft: bool;
     private term: u64;
+    /// The buckets this leader's staged, unapplied entries make, with each one's entry (ADR-0128 §1): a write into one
+    /// is taken, as a request that makes a bucket and writes into it does on `serve`. Reads do not see them.
+    private stagedBuckets: Vector<StagedBucket>;
     /// The terms of the entries recovery found after the checkpoint, unapplied, for the replica's Raft core; and the
     /// Config records among them, as (index, membership bytes).
     private recoveredTerms: Vector<u64>;
@@ -1894,6 +1903,7 @@ struct ObjectStore {
             usedAtMeasure: 0,
             raft: raft,
             term: 0,
+            stagedBuckets: Vector<StagedBucket>.create(),
             recoveredTerms: recoveredTerms,
             recoveredConfigs: recoveredConfigs,
             appliedTerm: startTerm,
@@ -3196,7 +3206,39 @@ struct ObjectStore {
     fn isReplica(borrow this) -> bool => this.raft;
 
     /// The term this replica stages entries in while it leads; 0 while it does not (writes are then NotLeader).
-    fn setLeaderTerm(borrow mut this, term: u64) { this.term = term; }
+    fn setLeaderTerm(borrow mut this, term: u64) {
+        // A change of term ends what this replica staged as leader: whether it commits is no longer its to know.
+        if (term != this.term) { this.stagedBuckets.clear(); }
+        this.term = term;
+    }
+
+    /// Whether a write may go into `bucket`: it is there, or a staged entry of this leader's makes it (ADR-0128 §1).
+    fn bucketForWrite(borrow this, bucket: Slice<u8>) -> Result<bool, StoreError> {
+        if (this.state.hasBucket(bucket)?) { return Ok(true); }
+        for (b in this.stagedBuckets.view()) {
+            if (b.name.view() == bucket) { return Ok(true); }
+        }
+        return Ok(false);
+    }
+
+    /// A bucket made by the entry at `lsn`, staged by this leader: taken for writes until it applies or is cut off.
+    fn noteStagedBucket(borrow mut this, name: Slice<u8>, lsn: u64) -> Result<void, StoreError> {
+        if (this.raft) { this.stagedBuckets.push(StagedBucket { name: copyBytes(name)?, lsn: lsn })?; }
+        return Ok();
+    }
+
+    /// The staged buckets whose entries are past `lsn`'s applied end (`after` false), or cut off after it (true).
+    fn dropStagedBuckets(borrow mut this, lsn: u64, after: bool) {
+        var at: usize = 0;
+        while (at < this.stagedBuckets.length) {
+            let gone = if (after) this.stagedBuckets[at].lsn > lsn else this.stagedBuckets[at].lsn <= lsn;
+            if (gone) {
+                let _ = this.stagedBuckets.remove(at);
+            } else {
+                at += 1;
+            }
+        }
+    }
 
     /// The terms of the unapplied entries recovery found, once: for the replica's Raft core.
     fn takeRecoveredTerms(borrow mut this) -> Vector<u64> => replace(mut this.recoveredTerms, Vector<u64>.create());
@@ -3259,6 +3301,8 @@ struct ObjectStore {
     /// Cuts the entries after `lsn` off, durably: a suffix the leader does not have.
     fn truncateEntries(borrow mut this, lsn: u64) -> Result<void, StoreError> {
         this.checkWritable()?;
+        // The buckets those entries made go with them, before the cut: a write is never taken into one that is gone.
+        this.dropStagedBuckets(lsn, true);
         return Ok(this.journal.truncateAfter(lsn)?);
     }
 
@@ -3291,6 +3335,7 @@ struct ObjectStore {
             )?;
             this.publishedNext = lsn + 1;
             this.appliedTerm = h.term;
+            if (this.stagedBuckets.length > 0) { this.dropStagedBuckets(lsn, false); } // applied: in the state now
             let coded = match (h.kind) {
                 RecordType.Coded => decodeCoded(record[RECORD_HEADER_LEN..metaEnd]),
                 _ => null,
@@ -3340,11 +3385,12 @@ struct ObjectStore {
         let valid = isValidBucketName(name.bytes()) || isTableBucketStoreName(name.bytes()) ||
             isHiddenStoreBucket(name.bytes());
         if (!valid || isDirectoryShaped(name.bytes())) { return Err(StoreError.InvalidBucketName); }
-        if (this.state.hasBucket(name.bytes())?) { return Err(StoreError.BucketAlreadyExists); }
+        if (this.bucketForWrite(name.bytes())?) { return Err(StoreError.BucketAlreadyExists); }
         this.scratch.clear();
         encodeBucketMeta(mut this.scratch, name.bytes(), Clock.unixMillis())?;
         let empty = [0u8; 1];
-        this.commitOne(RecordType.BucketCreate, empty[0..0])?;
+        let lsn = this.commitOne(RecordType.BucketCreate, empty[0..0])?;
+        this.noteStagedBucket(name.bytes(), lsn)?;
         return Ok();
     }
 
@@ -3353,11 +3399,12 @@ struct ObjectStore {
     fn createDirectoryBucket(borrow mut this, name: StringView, zone: Slice<u8>) -> Result<void, StoreError> {
         this.checkWritable()?;
         if (!isDirectoryBucketName(name.bytes(), zone)) { return Err(StoreError.InvalidBucketName); }
-        if (this.state.hasBucket(name.bytes())?) { return Err(StoreError.BucketAlreadyExists); }
+        if (this.bucketForWrite(name.bytes())?) { return Err(StoreError.BucketAlreadyExists); }
         this.scratch.clear();
         encodeDirectoryBucketMeta(mut this.scratch, name.bytes(), Clock.unixMillis(), zone)?;
         let empty = [0u8; 1];
-        this.commitOne(RecordType.BucketCreate, empty[0..0])?;
+        let lsn = this.commitOne(RecordType.BucketCreate, empty[0..0])?;
+        this.noteStagedBucket(name.bytes(), lsn)?;
         return Ok();
     }
 
@@ -3387,10 +3434,6 @@ struct ObjectStore {
     }
 
     fn bucketExists(borrow this, name: StringView) -> Result<bool, StoreError> => this.state.hasBucket(name.bytes());
-
-    /// Whether this is a cluster shard's store, whose writes apply when Raft commits them (ADR-0058): a bucket made
-    /// and a write into it in one request do not see each other.
-    fn isReplicated(borrow this) -> bool => this.raft;
 
     /// When a bucket was made (Unix milliseconds).
     fn bucketCreatedMillis(borrow this, name: StringView) -> Result<i64, StoreError> {
@@ -3677,7 +3720,7 @@ struct ObjectStore {
         this.checkWritable()?;
         ObjectStore.checkKey(key)?;
         if (contentType.length > MAX_CONTENT_TYPE) { return Err(StoreError.InvalidKey); }
-        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        if (!this.bucketForWrite(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         if (obj.size > this.config.maxObjectBytes) { return Err(StoreError.EntityTooLarge); }
         this.admit(obj.size)?;
         this.checkQuota(bucket.bytes(), key.bytes(), obj.size)?;
@@ -4975,7 +5018,7 @@ struct ObjectStore {
         this.checkWritable()?;
         ObjectStore.checkKey(key)?;
         if (contentType.length > MAX_CONTENT_TYPE) { return Err(StoreError.InvalidKey); }
-        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        if (!this.bucketForWrite(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         this.admit(0)?;
         var id = [0u8; 16];
         while (true) {

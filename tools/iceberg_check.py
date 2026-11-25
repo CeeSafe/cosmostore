@@ -132,18 +132,10 @@ catalog.purge_table("sales.staged")
 # S3 Tables' tags and storage class (ADR-0126 §1, §2), through boto3.
 import json
 from botocore.exceptions import ClientError
-try:
-    cfg_arn = tables.create_table_bucket(name="config-check", tags={"team": "data"},
-                                         storageClassConfiguration={"storageClass": "INTELLIGENT_TIERING"})["arn"]
-except ClientError as e:
-    # On a cluster a create's settings are refused before anything is made (a shard's write does not see the bucket
-    # made in its request): made plain, then set by their own calls.
-    check("a configured create refused on a cluster", e.response["Error"]["Code"], "BadRequestException")
-    check("and nothing made", [b["name"] for b in tables.list_table_buckets()["tableBuckets"] if b["name"] == "config-check"], [])
-    cfg_arn = tables.create_table_bucket(name="config-check")["arn"]
-    tables.tag_resource(resourceArn=cfg_arn, tags={"team": "data"})
-    tables.put_table_bucket_storage_class(tableBucketARN=cfg_arn,
-                                          storageClassConfiguration={"storageClass": "INTELLIGENT_TIERING"})
+# Its settings in its create, on `serve` and through a cluster's node alike (ADR-0128 §2: a shard's request writes
+# into the bucket it made).
+cfg_arn = tables.create_table_bucket(name="config-check", tags={"team": "data"},
+                                     storageClassConfiguration={"storageClass": "INTELLIGENT_TIERING"})["arn"]
 check("a table bucket's tags at its create", tables.list_tags_for_resource(resourceArn=cfg_arn)["tags"], {"team": "data"})
 check("its storage class at its create",
       tables.get_table_bucket_storage_class(tableBucketARN=cfg_arn)["storageClassConfiguration"]["storageClass"],
@@ -199,13 +191,7 @@ delete_table_bucket(cfg_arn)
 # S3 Tables' encryption (ADR-0126 §3, §4): a KMS table bucket (the smokes' KMS key `orders`), its tables' default.
 kms_key = "arn:aws:kms:us-east-1:000000000000:key/orders"
 enc_config = {"sseAlgorithm": "aws:kms", "kmsKeyArn": kms_key}
-try:
-    enc_arn = tables.create_table_bucket(name="enc-check", encryptionConfiguration=enc_config)["arn"]
-except ClientError as e:
-    # On a cluster, as the tags above: made plain, its encryption then put.
-    check("an encrypted create refused on a cluster", e.response["Error"]["Code"], "BadRequestException")
-    enc_arn = tables.create_table_bucket(name="enc-check")["arn"]
-    tables.put_table_bucket_encryption(tableBucketARN=enc_arn, encryptionConfiguration=enc_config)
+enc_arn = tables.create_table_bucket(name="enc-check", encryptionConfiguration=enc_config)["arn"]
 got = tables.get_table_bucket_encryption(tableBucketARN=enc_arn)["encryptionConfiguration"]
 check("a table bucket's encryption at its create", (got["sseAlgorithm"], got.get("kmsKeyArn")), ("aws:kms", kms_key))
 tables.create_namespace(tableBucketARN=enc_arn, namespace=["ns"])

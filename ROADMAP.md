@@ -6080,3 +6080,23 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **a maintenance loop per shard,** with a node-wide bound on compactions at once;
   - **the checks:** replica unit tests, a fault and crash sweep, and the cluster and maintenance smokes.
 - **For the owner:** how much of its own writes a request sees; how asks are kept; how many compactions run at once.
+
+### 25 Nov 2026: M31 slice 1, staged buckets (ADR-0128 §1, §2, §5)
+
+- **The store:**
+  - a leader's `stagedBuckets` holds the buckets its staged, unapplied entries make, each with its entry;
+  - `checkPut` (every put) and an upload's create take a staged bucket for writes;
+  - reads see applied state only;
+  - a staged bucket is dropped when its entry applies, when entries after an index are cut off, and at a change of
+    term. A bucket made twice in one request is refused.
+- **CreateTableBucket** takes its tags, storage class and encryption on a cluster in one request, and M30's refusal
+  is gone. `iceberg_check.py` drops its cluster fallbacks.
+- **Clean-up:** M30's `isReplicated()` is gone, since `isReplica()` was already there.
+- **Tests:**
+  - `stagedBucketsAgreeWithoutFaults`: the cluster workload with its first write making the bucket and putting a
+    value in it;
+  - `stagedBucketsFaultsOnce` and `stagedBucketsFaultsCrash`: that workload swept at every I/O point;
+  - `stagedBucketsAreForWritesOnly`: not read before it applies, made once, gone when cut off, and gone at a change
+    of term.
+  - Both the put check and the cut-off are mutation-checked.
+- **Checks:** 536 unit tests, the cluster smoke (209, with configured creates as on `serve`) and the S3 smoke.
