@@ -6127,3 +6127,20 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   copy and put; the other shard's asked run finishes meanwhile. It took 1 s here, and 36 s on the slice-2 binary
   (failed).
 - **Checks:** 537 unit tests, the cluster smoke (209) and the maintenance smoke.
+
+### 25 Nov 2026: M31 slices 4 and 5, the checks and the exit review (`docs/m31-exit-review.md`)
+
+- **The checks (slice 4)** were built with each slice: the replica tests and sweeps, the cluster smoke, and the
+  maintenance smoke's two new phases. All run in CI.
+- **The review:** two independent agents, one on the store, one on asks and loops.
+- **Fixed, each with a test:**
+  - S3's CreateBucket with object lock or an ACL on a cluster: `setBucketConfig` takes a staged bucket, with its
+    staged versioning;
+  - asks cleared by any run of their kind, and removed with their table;
+  - a new leader lists asks once caught up, once per term;
+  - the step-down test strengthened, and the drop on apply tested;
+  - one unreadable ask no longer hides them all.
+- **Recorded:** six Lows (B1 to B6).
+- **Checks:** 538 unit tests, the cluster smoke (214), the maintenance smoke and the S3 smoke. On the pre-review
+  binary, the cluster smoke fails its four new object-lock checks.
+- **Next:** the owner's word on ADR-0128 and on closing M31.

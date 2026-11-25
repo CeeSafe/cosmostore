@@ -44,8 +44,11 @@ async fn tablesMaintenanceShardForever(shared: borrow NodeShared, i: usize) -> R
     let every = if (shared.tablesDayMs / 24 > 0) shared.tablesDayMs / 24 else 1;
     var sincePass: u64 = 0;
     let tick: u64 = if (every < 1000) every else 1000;
-    // Whether this node led the shard at the last tick: when it has just come to lead it, its kept asks are queued.
-    var led = false;
+    // The term this node last queued the shard's kept asks in as its leader (0: none): a term it leads in anew, once
+    // it has applied what its log holds, has them queued (the M31 exit review: a term, not whether it led, so that a
+    // leadership lost and regained within a long run counts; and caught up, so that an ask the last leader committed
+    // is read).
+    var queuedTerm: u64 = 0;
     while (true) {
         if (!(await frontPause(tick))) { return Err(NodeFault.Net); }
         sincePass += tick;
@@ -53,9 +56,12 @@ async fn tablesMaintenanceShardForever(shared: borrow NodeShared, i: usize) -> R
         if (pass) { sincePass = 0; }
         if (slot.failed.load() != 0) { continue; }
         // The asks its last leader kept and did not run, queued (ADR-0128 §3, M22's B2).
-        let leads = await leadsShard(slot)?;
-        if (leads && !led) { await queueKeptAsks(slot)?; }
-        led = leads;
+        let view = await viewOf(slot)?;
+        let leads = view.leads;
+        if (leads && view.term != queuedTerm && view.applied == view.last && view.coreLast == view.last) {
+            await queueKeptAsks(slot)?;
+            queuedTerm = view.term;
+        }
         // The runs asked for, taken from the queue: a shard this node does not lead drops them (its leader's server
         // is asked instead).
         var asked = Vector<AskedRun>.create();

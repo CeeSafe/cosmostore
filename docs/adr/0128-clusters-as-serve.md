@@ -98,3 +98,16 @@ M31 is ADR-0127's item A (the owner: "A: clusters as serve").
 - **A cluster takes the calls `serve` takes in one request,** and keeps its asks through a change of leader.
 - **A request still does not read its own staged writes,** if the first choice is taken: code that needs a value it
   wrote passes it.
+
+## As built (M31's slices and exit review, `docs/m31-exit-review.md`)
+
+- **§1, the writes that take a staged bucket:** `checkPut` (every put), an upload's create, and `setBucketConfig`
+  (the exit review's A1: S3's CreateBucket with an ACL or object lock).
+  - A staged bucket keeps the versioning its request staged, which a lock needs.
+  - Deletes and other setters see applied buckets only.
+- **§3, asks:**
+  - the key is `.s3tables/maintenance/asks/<table id>/<kind>`;
+  - any run of the table's kind clears the ask, in a gated step when one exists. A status write clears it too;
+  - a dropped table's asks go with its maintenance records;
+  - a leader lists kept asks once per term, once caught up.
+- **§4, loops:** `tablesMaintenanceShardForever` per slot. The permit is an atomic count, waited on in 200 ms steps.

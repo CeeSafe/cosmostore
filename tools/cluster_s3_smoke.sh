@@ -106,6 +106,13 @@ printf 'small object two' > two.txt
 check "CreateBucket through node 1" "$(on 1 s3api create-bucket --bucket alpha --query Location --output text 2>&1)" "/alpha"
 check "CreateBucket through node 2" "$(on 2 s3api create-bucket --bucket beta --query Location --output text 2>&1)" "/beta"
 check "CreateBucket again through node 3" "$(code 3 s3api create-bucket --bucket alpha)" "BucketAlreadyOwnedByYou"
+# A bucket made with object lock and an ACL in one request (ADR-0128 §1, the M31 exit review): its configuration
+# written into the bucket its request made.
+check "CreateBucket with object lock through node 2" "$(on 2 s3api create-bucket --bucket locked-c --object-lock-enabled-for-bucket --acl public-read --query Location --output text 2>&1)" "/locked-c"
+check "its lock, through node 3" "$(on 3 s3api get-object-lock-configuration --bucket locked-c --query ObjectLockConfiguration.ObjectLockEnabled --output text 2>&1)" Enabled
+check "its versioning" "$(on 1 s3api get-bucket-versioning --bucket locked-c --query Status --output text 2>&1)" Enabled
+check "its ACL" "$(on 1 s3api get-bucket-acl --bucket locked-c --query 'Grants[?Grantee.URI==`http://acs.amazonaws.com/groups/global/AllUsers`].Permission' --output text 2>&1)" READ
+on 1 s3api delete-bucket --bucket locked-c > /dev/null 2>&1 && pass "and deleted, empty" || fail "and deleted, empty"
 for n in 1 2 3; do
     check "ListBuckets through node $n, merged across shards" "$(on "$n" s3api list-buckets --query 'Buckets[].Name' --output text 2>&1)" "alpha	beta"
 done

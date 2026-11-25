@@ -308,15 +308,62 @@ async fn maintainOnShard(
 ) -> Result<void, NodeFault> {
     let nowMs = Clock.unixMillis();
     let dayMs = truncate<i64>(shared.tablesDayMs);
-    if (kind == SNAPSHOT_MANAGEMENT.bytes()) { return await snapshotsOnShard(shared, at, t, nowMs, dayMs); }
-    if (kind == COMPACTION.bytes()) {
+    if (kind == SNAPSHOT_MANAGEMENT.bytes()) {
+        await snapshotsOnShard(shared, at, t, nowMs, dayMs)?;
+    } else if (kind == COMPACTION.bytes()) {
         // A permit of the node's `--tables-compactions` (ADR-0128 §4): shards compact side by side, a bounded number
         // at once. It is given back on every path, as no drop may take a lock.
         if (!(await compactionPermit(shared)?)) { return Err(NodeFault.Net); }
         let done = await compactOnShard(shared, at, t, nowMs, shared.tablesCopyPauseMs);
         let _ = shared.compactionsRunning.fetchSub(1);
-        return done;
+        done?;
+    } else if (kind == UNREFERENCED_REMOVAL.bytes()) {
+        await removeOnShard(shared, at, t, nowMs, dayMs)?;
+    } else {
+        return Ok();
     }
-    if (kind == UNREFERENCED_REMOVAL.bytes()) { return await removeOnShard(shared, at, t, nowMs, dayMs); }
+    // The run answers its kept ask, whatever it did (ADR-0128 §3, the M31 exit review).
+    return await clearAskOnShard(shared, at, t, kind);
+}
+
+/// A table's kept ask of `kind` deleted, as a gated step, when it has one (looked for off the gate: most runs have
+/// none, and take no step).
+async fn clearAskOnShard(
+    shared: borrow NodeShared,
+    at: usize,
+    t: borrow MaintainedTable,
+    kind: Slice<u8>,
+) -> Result<void, NodeFault> {
+    let slot = borrow shared.slots[at];
+    var key: Vector<u8>? = null;
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        key = match (await Async.blocking(() => keptAskKey(st, t, kind))) {
+            Ok(k) => k,
+            Err(_) => null,
+        };
+    }
+    let k = key ?? { return Ok(); };
+    var term: u64 = 0;
+    var gate = match (await slot.gate.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let _held = gate.data();
+    if (!(await stepReady(slot, mut term)?)) { return Ok(); }
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let kv = k.view();
+        let _ = await Async.blocking(() => clearAsk(st, t, kv));
+    }
+    let _ = await stepCommit(shared, slot)?;
     return Ok();
 }

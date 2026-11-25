@@ -164,8 +164,36 @@ fn recordAsk(store: borrow mut ObjectStore, t: borrow MaintainedTable, kind: Sli
     return Ok();
 }
 
+/// Whether `t` has a kept ask of `kind` (ADR-0128 §3): its record's key, or null (none, or no such table).
+fn keptAskKey(
+    store: borrow ObjectStore,
+    t: borrow MaintainedTable,
+    kind: Slice<u8>,
+) -> Result<Vector<u8>?, TablesError> {
+    let hidden = tableWarehouseBucket(t.bucket.view())?;
+    let rec = match (tableRecord(store, t.bucket.view(), t.ns.view(), t.name.view())) {
+        Ok(r) => r,
+        Err(TablesError.NotFound) => { return Ok(null); }
+        Err(e) => { return Err(e); }
+    };
+    let id = jsonMemberText(borrow rec.json, "id") ?? { return Ok(null); };
+    let key = askKey(id, kind)?;
+    return match (store.headObject(catalogText(hidden.view()), catalogText(key.view()))) {
+        Ok(_) => Ok(Some(key)),
+        Err(StoreError.NoSuchKey) => Ok(null),
+        Err(e) => Err(tablesStoreFail(e)),
+    };
+}
+
+/// `t`'s kept ask of `kind` answered (ADR-0128 §3, the M31 exit review): whatever its run did, it ran (a job disabled,
+/// a table it could not plan, a race it lost all end it, as they end the day's pass).
+fn clearAsk(store: borrow mut ObjectStore, t: borrow MaintainedTable, key: Slice<u8>) -> Result<void, TablesError> {
+    let hidden = tableWarehouseBucket(t.bucket.view())?;
+    return removeCatalogObject(store, hidden.view(), key);
+}
+
 /// The asked runs kept in a store's table buckets (ADR-0128 §3): what a replica that becomes leader queues. An ask
-/// that does not read is passed over.
+/// (or a bucket's asks) that does not read is passed over.
 fn askedRunsOf(store: borrow ObjectStore) -> Result<Vector<AskedRun>, TablesError> {
     var out = Vector<AskedRun>.create();
     let all = match (store.listBucketInfo()) {
@@ -177,12 +205,20 @@ fn askedRunsOf(store: borrow ObjectStore) -> Result<Vector<AskedRun>, TablesErro
         let hidden = all[i].name.view();
         if (!isTableWarehouseShaped(hidden)) { continue; }
         let bucket = hidden[0..hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
-        let keys = catalogKeys(store, hidden, MAINTENANCE_ASKS.bytes(), "".bytes(), 0)?;
+        let keys = match (catalogKeys(store, hidden, MAINTENANCE_ASKS.bytes(), "".bytes(), 0)) {
+            Ok(k) => k,
+            Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
+            Err(_) => { continue; }
+        };
         for (k in 0..keys.length) {
             let rest = keys[k].view()[head..];
             let slash = pieceEnd(rest, 0, '/');
             if (slash >= rest.length) { continue; }
-            let rec = readRecord(store, hidden, keys[k].view())? ?? { continue; };
+            let rec = match (readRecord(store, hidden, keys[k].view())) {
+                Ok(Some(r)) => r,
+                Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
+                _ => { continue; }
+            };
             let ns = jsonMemberText(borrow rec.json, "namespace") ?? { continue; };
             let name = jsonMemberText(borrow rec.json, "name") ?? { continue; };
             out.push(AskedRun {
@@ -342,6 +378,8 @@ fn removeTableMaintenance(
     // bucket from being deleted.
     for (kind in [SNAPSHOT_MANAGEMENT, COMPACTION, UNREFERENCED_REMOVAL]) {
         removeCatalogObject(store, hidden, jobStatusKey(id, kind)?.view())?;
+        // Its kept asks too (ADR-0128 §3, the M31 exit review): they are of this table's id, which no table has again.
+        removeCatalogObject(store, hidden, askKey(id, kind.bytes())?.view())?;
     }
     return removeCatalogObject(store, hidden, unreferencedNotesKey(id)?.view());
 }

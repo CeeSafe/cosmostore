@@ -430,6 +430,9 @@ struct DeleteOutcome {
 struct StagedBucket {
     name: Vector<u8>;
     lsn: u64;
+    /// The versioning its request staged for it (VERSIONING_OFF until one does): a lock its request sets next needs
+    /// it enabled, as S3's CreateBucket with object lock sets both (the M31 exit review).
+    versioning: u8;
 }
 
 struct ListPage {
@@ -3223,7 +3226,9 @@ struct ObjectStore {
 
     /// A bucket made by the entry at `lsn`, staged by this leader: taken for writes until it applies or is cut off.
     fn noteStagedBucket(borrow mut this, name: Slice<u8>, lsn: u64) -> Result<void, StoreError> {
-        if (this.raft) { this.stagedBuckets.push(StagedBucket { name: copyBytes(name)?, lsn: lsn })?; }
+        if (this.raft) {
+            this.stagedBuckets.push(StagedBucket { name: copyBytes(name)?, lsn: lsn, versioning: VERSIONING_OFF })?;
+        }
         return Ok();
     }
 
@@ -4135,10 +4140,15 @@ struct ObjectStore {
     /// A bucket's versioning state; VERSIONING_OFF for a bucket that is not there.
     fn versioningOf(borrow this, bucket: Slice<u8>) -> Result<u8, StoreError> {
         let k = BucketKey { name: copyBytes(bucket)? };
-        return Ok(match (this.state.buckets.get(borrow k)) {
-            Some(b) => b.versioning,
-            null => VERSIONING_OFF,
-        });
+        match (this.state.buckets.get(borrow k)) {
+            Some(b) => { return Ok(b.versioning); }
+            null => {}
+        }
+        // A staged bucket's, as its request staged it (ADR-0128 §1).
+        for (b in this.stagedBuckets.view()) {
+            if (b.name.view() == bucket) { return Ok(b.versioning); }
+        }
+        return Ok(VERSIONING_OFF);
     }
 
     /// The id of a version about to be written to `key` (ADR-0041 §3): a new one when the bucket's versioning is
@@ -6236,7 +6246,9 @@ struct ObjectStore {
     fn setBucketConfig(borrow mut this, bucket: StringView, kind: u8, value: Slice<u8>) -> Result<void, StoreError> {
         this.commitStaged()?;
         this.checkWritable()?;
-        if (!this.state.hasBucket(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
+        // A bucket its request made is configured as it is made (ADR-0128 §1, the M31 exit review: S3's CreateBucket
+        // with an ACL or object lock).
+        if (!this.bucketForWrite(bucket.bytes())?) { return Err(StoreError.NoSuchBucket); }
         if (value.length > 1048576) { return Err(StoreError.MetadataTooLarge); }
         if (kind == BUCKET_CONFIG_VERSIONING && !isVersioningValue(value)) { return Err(StoreError.InvalidKey); }
         if (kind == BUCKET_CONFIG_POLICY && value.length > MAX_STORED_POLICY_BYTES) {
@@ -6278,6 +6290,13 @@ struct ObjectStore {
         encodeBucketConfigMeta(mut this.scratch, bucket.bytes(), kind, value)?;
         let empty = [0u8; 1];
         this.commitOne(RecordType.BucketConfig, empty[0..0])?;
+        if (kind == BUCKET_CONFIG_VERSIONING) {
+            for (i in 0..this.stagedBuckets.length) {
+                if (this.stagedBuckets[i].name.view() == bucket.bytes()) {
+                    this.stagedBuckets[i].versioning = value[0];
+                }
+            }
+        }
         return Ok();
     }
 

@@ -374,6 +374,54 @@ fn stagedBucketsFaultsCrash() -> Result<void, TestFailure> =>
 
 /// A staged bucket (ADR-0128 §1): not read before it applies, taken by its request's writes, gone with its entries
 /// when they are cut off, and gone at a change of term.
+/// Runs one write on the leader and steps the cluster until every replica has applied it.
+fn writeAndApply(c: borrow mut Cluster, at: usize, before: u64) -> Result<void, TestFailure> {
+    let index = c.replicas[at].finishWrite(before)! ?? before;
+    for (round in 0..300) {
+        if (c.replicas[0].isApplied(index) && c.replicas[1].isApplied(index) && c.replicas[2].isApplied(index)) {
+            return Ok();
+        }
+        clusterStep(c)!;
+    }
+    return Err(TestFailure.create("a write did not apply"));
+}
+
+/// A bucket made with its configuration in one request (the M31 exit review: S3's CreateBucket with versioning and
+/// object lock), applied on every replica; then, applied and deleted, it is no longer taken for writes (a staged
+/// bucket is dropped once its entry applies).
+@test
+fn stagedBucketsAreConfiguredAndApplied() -> Result<void, TestFailure> {
+    let root = scratchDirectory("cluster-staged-config");
+    var c = clusterOpen(root.view(), 7)!;
+    let at = awaitLeader(mut c)!!;
+    let before = c.replicas[at].beginWrite()!;
+    c.replicas[at].store.createBucket("locked")!;
+    let enabled = [VERSIONING_ENABLED];
+    c.replicas[at].store.setBucketConfig("locked", BUCKET_CONFIG_VERSIONING, enabled[..])!;
+    c.replicas[at].store.setBucketConfig("locked", BUCKET_CONFIG_OBJECT_LOCK, "E".bytes())!;
+    writeAndApply(mut c, at, before)?;
+    for (i in 0..3) {
+        Check.equalU64(VERSIONING_ENABLED as u64, c.replicas[i].store.versioningState("locked")! as u64)?;
+        Check.isTrue(c.replicas[i].store.bucketConfig("locked", BUCKET_CONFIG_OBJECT_LOCK)!.length > 0, "its lock")?;
+    }
+    // Made and applied, then deleted and applied: a write into it is refused.
+    let made = c.replicas[at].beginWrite()!;
+    c.replicas[at].store.createBucket("brief")!;
+    writeAndApply(mut c, at, made)?;
+    let gone = c.replicas[at].beginWrite()!;
+    c.replicas[at].store.deleteBucket("brief")!;
+    writeAndApply(mut c, at, gone)?;
+    var data = Vector<u8>.create();
+    data.pushLE(1u64)!;
+    let _ = c.replicas[at].beginWrite()!;
+    match (c.replicas[at].store.putObject("brief", "k0", "text/plain", data.view(), PutCondition.None)) {
+        Err(StoreError.NoSuchBucket) => {}
+        _ => { return Err(TestFailure.create("a write into a bucket deleted")); }
+    }
+    removeTree(root.view());
+    return Ok();
+}
+
 @test
 fn stagedBucketsAreForWritesOnly() -> Result<void, TestFailure> {
     let root = scratchDirectory("cluster-staged-edges");
@@ -395,12 +443,12 @@ fn stagedBucketsAreForWritesOnly() -> Result<void, TestFailure> {
         Err(StoreError.NoSuchBucket) => {}
         _ => { return Err(TestFailure.create("a write into a bucket cut off")); }
     }
-    // A change of term ends it too.
+    // A change of term ends it too (a later term, so that the write is refused for the bucket, not for leading).
     c.replicas[at].store.createBucket("other")!;
-    c.replicas[at].store.setLeaderTerm(0);
+    let term = c.replicas[at].replica.core.term;
+    c.replicas[at].store.setLeaderTerm(term + 1);
     match (c.replicas[at].store.putObject("other", "k1", "text/plain", data.view(), PutCondition.None)) {
         Err(StoreError.NoSuchBucket) => {}
-        Err(StoreError.NotLeader) => {}
         _ => { return Err(TestFailure.create("a write into a bucket of a term past")); }
     }
     removeTree(root.view());
