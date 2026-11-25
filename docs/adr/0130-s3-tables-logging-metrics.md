@@ -1,6 +1,11 @@
 # ADR-0130: S3 Tables' logging, metrics and record expiration (M32)
 
-**Status:** proposed, 25 Nov 2026. M32 is ADR-0129's item A (the owner: "A: Tables' small calls").
+**Status:** proposed, 25 Nov 2026, with the owner's choices made:
+- every request logged, as AWS logs it ("All, as AWS");
+- partitioned keys for S3 buckets too ("Yes, S3 too");
+- metrics kept and counted ("Kept and counted").
+
+M32 is ADR-0129's item A (the owner: "A: Tables' small calls").
 
 ## Context
 
