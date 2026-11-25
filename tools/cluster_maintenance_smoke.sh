@@ -121,22 +121,23 @@ DAY=86400 SUFFIX=b
 for n in 1 2 3; do start "$n"; done
 for i in $(seq 1 100); do [ "$(leaders 1)" = 4 ] && break; pause 0.2; done
 check "a fresh cluster, every shard with a leader" "$(leaders 1)" 4
-check "a table of four files there" "$(step 1 make lake t3)" made
-pause 3
-check "no pass runs it" "$(step 2 job lake t3)" "Not_Yet_Run"
-shard=$(shardOf lake--table-s3)
-leader=$(status 1 | awk -v s="$shard" '$1 == s { print $4 }')
-# A table bucket on another shard the same node leads (ADR-0128 §4, M22's B3): its ask is run while the first
-# shard's compaction is held 20 s between its copy and its put.
-near=""
+# Two table buckets on two shards one node leads (ADR-0128 §4, M22's B3): with four shards and three nodes, some
+# node leads two. The second's ask is run while the first's compaction is held 20 s between its copy and its put.
+leader=$(status 1 | awk '$1 != 65535 && $4 != 0 { print $4 }' | sort | uniq -c | awk '$1 >= 2 { print $2; exit }')
+shard=$(status 1 | awk -v l="$leader" '$1 != 65535 && $4 == l { print $1 }' | sed -n 1p)
+other=$(status 1 | awk -v l="$leader" '$1 != 65535 && $4 == l { print $1 }' | sed -n 2p)
+far="" near=""
 for n in $(seq 1 200); do
-    s2=$(shardOf "near$n--table-s3")
-    l2=$(status 1 | awk -v s="$s2" '$1 == s { print $4 }')
-    [ "$s2" != "$shard" ] && [ "$l2" = "$leader" ] && { near="near$n"; break; }
+    [ -z "$far" ] && [ "$(shardOf "far$n--table-s3")" = "$shard" ] && far="far$n"
+    [ -z "$near" ] && [ "$(shardOf "near$n--table-s3")" = "$other" ] && near="near$n"
+    [ -n "$far" ] && [ -n "$near" ] && break
 done
-check "a bucket on another shard of the same leader" "$([ -n "$near" ] && echo yes)" yes
+check "two buckets on two shards of one leader" "$([ -n "$far" ] && [ -n "$near" ] && echo yes)" yes
+check "a table of four files there" "$(step 1 make "$far" t3)" made
+pause 3
+check "no pass runs it" "$(step 2 job "$far" t3)" "Not_Yet_Run"
 check "a table there" "$(step 1 make "$near" t4)" made
-check "its compaction asked" "$(step 2 ask lake t3 icebergCompaction)" 204
+check "its compaction asked" "$(step 2 ask "$far" t3 icebergCompaction)" 204
 pause 3
 asked=$(date +%s)
 check "another shard's ask meanwhile" "$(step 2 ask "$near" t4 icebergSnapshotManagement)" 204
@@ -144,7 +145,7 @@ done=""
 for i in $(seq 1 30); do [ "$(step 2 job "$near" t4 icebergSnapshotManagement)" = Successful ] && { done=yes; break; }; pause 0.5; done
 took=$(( $(date +%s) - asked ))
 check "run while the first shard compacts (took $took s)" "$done" yes
-check "the first shard's run not done yet" "$(step 2 job lake t3)" "Not_Yet_Run"
+check "the first shard's run not done yet" "$(step 2 job "$far" t3)" "Not_Yet_Run"
 kill -9 "${PIDS[$leader]}" 2> /dev/null
 wait "${PIDS[$leader]}" 2> /dev/null
 PIDS[$leader]=""
@@ -156,9 +157,9 @@ for i in $(seq 1 100); do
 done
 check "the shard has a new leader, the old one killed mid-run" "$([ "$now" != "$leader" ] && [ "$now" != 0 ] && echo yes)" yes
 done=""
-for i in $(seq 1 240); do [ "$(step "$up" job lake t3)" = Successful ] && { done=yes; break; }; pause 0.5; done
+for i in $(seq 1 240); do [ "$(step "$up" job "$far" t3)" = Successful ] && { done=yes; break; }; pause 0.5; done
 check "the new leader runs the kept ask" "$done" yes
-check "two files, the same rows" "$(step "$up" files lake t3)" "2 4 0,1,2,3"
+check "two files, the same rows" "$(step "$up" files "$far" t3)" "2 4 0,1,2,3"
 
 if [ "$failed" = 0 ]; then echo "cluster maintenance smoke: all passed"; else echo "cluster maintenance smoke: FAILED"; fi
 exit "$failed"

@@ -6225,3 +6225,11 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - boto3 through `iceberg_check.py`: logging;
   - the SDK matrix: Go and JS 17 checks each, .NET 13, Java 6. Java's pinned SDK has no logging calls.
 - **Checks:** 542 unit tests, the S3 smoke and the cluster smoke (214).
+
+### 25 Nov 2026: the maintenance smoke's two-shard check made deterministic
+
+- **CI failed on 31dc5bd** in the cluster maintenance smoke's check of M31's slice 3, not in M32's code. The check
+  looked for a bucket on another shard led by `lake`'s shard's leader, and on CI's run that leader led only one
+  shard.
+- **Fixed:** both table buckets are picked by a node that leads two shards. With four shards and three nodes, one
+  always does. The check passes locally.
