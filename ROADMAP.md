@@ -6054,3 +6054,18 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - views and nested namespaces;
   - v3's remaining parts (deletion vectors written, encryption keys, multi-argument transforms, lineage on
     branches).
+
+### 25 Nov 2026: M31 proposed (ADR-0127)
+
+- **The owner:** "continue", after M30 was closed.
+- **ADR-0127 proposes four items:**
+  - **A, clusters as `serve`** (recommended): a shard's request seeing its own writes where a call needs it, so a
+    configured CreateTableBucket is taken in one request (M30's B1); maintenance asks kept in replicated state
+    (M22's B2); a loop per shard (M22's B3).
+  - **B,** S3 Tables' remaining small calls: metrics, logging, and record expiration as AWS answers it for a table
+    one makes.
+  - **C,** Iceberg views and nested namespaces.
+  - **D,** table replication.
+- **Found while proposing:** AWS documents record expiration for its own managed tables only (S3 Storage Lens,
+  SageMaker Catalog), not tables one creates, so ADR-0125's B is mostly an answer, not a job.
+- **Next:** the owner's choice.
