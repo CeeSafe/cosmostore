@@ -6296,3 +6296,17 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     request runs only once its shard has applied everything.
 - **Tests:** `tagRules` and `tableConfigurationRecords`.
 - **Checks:** 544 unit tests, the S3 smoke and the cluster smoke (214).
+
+### 26 Nov 2026: M33 slice 2, clusters (ADR-0132, M31's B1–B6)
+
+- **Fixed:**
+  - **B1:** the store's deletes take a staged bucket, as `checkPut` does.
+  - **B2:** the IAM API makes its bucket in the request that first needs it, on a cluster too, and
+    `appliesOnCommit` is gone.
+  - **B3:** compaction permits are a ticket semaphore (`CompactionPermits`), run in the order taken and at most
+    `--tables-compactions` at once.
+  - **B5:** the staged workload is swept for sticky and torn faults too.
+  - **B6:** `compactionPermitsAreFair`, and the maintenance smoke's refusal of `--tables-compactions` 0 and 65.
+- **Kept:** B4, the two-shard check's margin. Its choice of shards is deterministic, and it takes 1 to 2 s against
+  a hold of 20 s.
+- **Checks:** 547 unit tests, the cluster smoke (214), the maintenance smoke and the S3 smoke.

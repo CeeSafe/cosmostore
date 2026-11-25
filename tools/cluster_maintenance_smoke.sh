@@ -63,6 +63,13 @@ shardOf() { python3 -c 'import hashlib,sys; d=hashlib.sha256(bytes.fromhex("00c1
 step() { local n="$1"; shift; "$PY" -I "$ROOT/tools/cluster_maintenance_check.py" "$1" "http://127.0.0.1:$((BASE + 10 + n))" "${@:2}" 2>&1 | tail -1; }
 leaders() { status "$1" | awk '$1 != 65535 && $4 != 0' | wc -l | tr -d ' '; }
 
+# `--tables-compactions` takes 1 to 64 (ADR-0132, M31's B6): a node given another does not start.
+for bad in 0 65; do
+    mkdir -p "$WORK/bad$bad"
+    "$BIN" node "$WORK/bad$bad" --init --cluster-file "$WORK/cluster.conf" --node 1 --listen $((BASE + 30)) \
+        --credentials "$WORK/credentials" --tables-compactions "$bad" > /dev/null 2>&1
+    check "--tables-compactions $bad refused" "$?" 2
+done
 for n in 1 2 3; do start "$n"; done
 for i in $(seq 1 100); do [ "$(leaders 1)" = 4 ] && break; pause 0.2; done
 check "every shard has a leader" "$(leaders 1)" 4

@@ -288,15 +288,28 @@ async fn removeOnShard(
     return Ok();
 }
 
-/// A compaction's permit (ADR-0128 §4): waited for while the node runs `tablesCompactions` of them; false when the
-/// node is stopping.
+/// A node's compactions at once (ADR-0128 §4), fair (ADR-0132, M31's B3): each takes the next ticket, and runs once
+/// the tickets before it are within `limit` of those released, so they run in the order they asked.
+struct CompactionPermits {
+    limit: u64;
+    issued: AtomicU64;
+    released: AtomicU64;
+
+    fn take(borrow this) -> u64 => this.issued.fetchAdd(1);
+
+    fn mayRun(borrow this, ticket: u64) -> bool => ticket < this.released.load() + this.limit;
+
+    fn release(borrow this) { let _ = this.released.fetchAdd(1); }
+}
+
+/// A compaction's permit, waited for in its turn; false when the node is stopping (its ticket then never runs, and
+/// the node's others with it).
 async fn compactionPermit(shared: borrow NodeShared) -> Result<bool, NodeFault> {
-    while (true) {
-        if (shared.compactionsRunning.fetchAdd(1) < shared.tablesCompactions) { return Ok(true); }
-        let _ = shared.compactionsRunning.fetchSub(1);
+    let ticket = shared.compactions.take();
+    while (!shared.compactions.mayRun(ticket)) {
         if (!(await frontPause(200))) { return Ok(false); }
     }
-    return Ok(false);
+    return Ok(true);
 }
 
 /// One job of a table on the shard this replica leads, by its kind.
@@ -315,7 +328,7 @@ async fn maintainOnShard(
         // at once. It is given back on every path, as no drop may take a lock.
         if (!(await compactionPermit(shared)?)) { return Err(NodeFault.Net); }
         let done = await compactOnShard(shared, at, t, nowMs, shared.tablesCopyPauseMs);
-        let _ = shared.compactionsRunning.fetchSub(1);
+        shared.compactions.release();
         done?;
     } else if (kind == UNREFERENCED_REMOVAL.bytes()) {
         await removeOnShard(shared, at, t, nowMs, dayMs)?;
