@@ -5,6 +5,7 @@
 # - A write to the table bucket's shard goes through while its compaction waits mid-run.
 # - The run completes, past the front's timeout, and the table reads the same rows from fewer files.
 # - The shard's leader killed mid-run: the table reads the same rows, and a new leader compacts it.
+# - An asked run kept through a change of leader, on a cluster whose day's pass does not come (ADR-0128 §3).
 #
 #   ICEBERG_PYTHON=<python with pyiceberg[pyarrow] and boto3> tools/cluster_maintenance_smoke.sh   ports 19600 and up
 #   COSMOSTORE=<binary> COSMO_PORT_BASE=29600 ICEBERG_PYTHON=… tools/cluster_maintenance_smoke.sh
@@ -51,10 +52,10 @@ node 2 peer=127.0.0.1:$((BASE + 2)) domain=b
 node 3 peer=127.0.0.1:$((BASE + 3)) domain=c
 EOF
 start() {
-    mkdir -p "$WORK/d$1"
-    "$BIN" node "$WORK/d$1" --init --cluster-file "$WORK/cluster.conf" --node "$1" --listen $((BASE + 10 + $1)) \
-        --credentials "$WORK/credentials" --domain localhost --tables-day-seconds 24 --tables-copy-pause-ms 20000 \
-        >> "$WORK/log$1" 2>&1 &
+    mkdir -p "$WORK/d$1${SUFFIX:-}"
+    "$BIN" node "$WORK/d$1${SUFFIX:-}" --init --cluster-file "$WORK/cluster.conf" --node "$1" --listen $((BASE + 10 + $1)) \
+        --credentials "$WORK/credentials" --domain localhost --tables-day-seconds "${DAY:-24}" \
+        --tables-copy-pause-ms 20000 >> "$WORK/log$1" 2>&1 &
     PIDS[$1]=$!
 }
 status() { "$BIN" cluster-status --cluster-file "$WORK/cluster.conf" --node "$1" 2> /dev/null | tail -n +2 | grep -v "^#"; }
@@ -110,6 +111,37 @@ other=$(( up % 3 + 1 ))
 check "maintenance-run asked through node $up, answered at once" "$(step "$up" ask lake t1 icebergSnapshotManagement)" 204
 check "and through node $other" "$(step "$other" ask lake t1 icebergUnreferencedFileRemoval)" 204
 check "a kind not done refused" "$(step "$up" ask lake t1 sorting)" 400
+
+# An ask kept through a change of leader (ADR-0128 §3, M22's B2): a fresh cluster whose day is a day, so no pass
+# comes while it runs. An asked compaction, its leader killed mid-run: only the ask its store keeps can make the new
+# leader run it.
+for p in 1 2 3; do [ -n "${PIDS[$p]:-}" ] && kill "${PIDS[$p]}" 2> /dev/null; done
+wait 2> /dev/null
+DAY=86400 SUFFIX=b
+for n in 1 2 3; do start "$n"; done
+for i in $(seq 1 100); do [ "$(leaders 1)" = 4 ] && break; pause 0.2; done
+check "a fresh cluster, every shard with a leader" "$(leaders 1)" 4
+check "a table of four files there" "$(step 1 make lake t3)" made
+pause 3
+check "no pass runs it" "$(step 2 job lake t3)" "Not_Yet_Run"
+check "its compaction asked" "$(step 2 ask lake t3 icebergCompaction)" 204
+pause 4
+shard=$(shardOf lake--table-s3)
+leader=$(status 1 | awk -v s="$shard" '$1 == s { print $4 }')
+kill -9 "${PIDS[$leader]}" 2> /dev/null
+wait "${PIDS[$leader]}" 2> /dev/null
+PIDS[$leader]=""
+up=$(( leader % 3 + 1 ))
+for i in $(seq 1 100); do
+    now=$(status "$up" | awk -v s="$shard" '$1 == s { print $4 }')
+    [ -n "$now" ] && [ "$now" != 0 ] && [ "$now" != "$leader" ] && break
+    pause 0.2
+done
+check "the shard has a new leader, the old one killed mid-run" "$([ "$now" != "$leader" ] && [ "$now" != 0 ] && echo yes)" yes
+done=""
+for i in $(seq 1 240); do [ "$(step "$up" job lake t3)" = Successful ] && { done=yes; break; }; pause 0.5; done
+check "the new leader runs the kept ask" "$done" yes
+check "two files, the same rows" "$(step "$up" files lake t3)" "2 4 0,1,2,3"
 
 if [ "$failed" = 0 ]; then echo "cluster maintenance smoke: all passed"; else echo "cluster maintenance smoke: FAILED"; fi
 exit "$failed"

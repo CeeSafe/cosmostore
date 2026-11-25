@@ -8,6 +8,9 @@ import web_server;
 const MAINTENANCE_BUCKET_KEY: StringView = ".s3tables/maintenance/bucket";
 const MAINTENANCE_TABLES: StringView = ".s3tables/maintenance/tables/";
 const MAINTENANCE_STATUS: StringView = ".s3tables/maintenance/status/";
+/// A cluster's asked runs (ADR-0128 §3): `<prefix><table id>/<kind>`, holding the table's namespace and name, until
+/// the run writes its job's status.
+const MAINTENANCE_ASKS: StringView = ".s3tables/maintenance/asks/";
 const SNAPSHOT_MANAGEMENT: StringView = "icebergSnapshotManagement";
 const COMPACTION: StringView = "icebergCompaction";
 const UNREFERENCED_REMOVAL: StringView = "icebergUnreferencedFileRemoval";
@@ -147,6 +150,50 @@ fn tableMaintenanceKey(id: Slice<u8>) -> Result<Vector<u8>, AllocError> =>
 fn jobStatusKey(id: Slice<u8>, kind: StringView) -> Result<Vector<u8>, AllocError> =>
     catalogKey(MAINTENANCE_STATUS, id, kind.bytes());
 
+fn askKey(id: Slice<u8>, kind: Slice<u8>) -> Result<Vector<u8>, AllocError> => catalogKey(MAINTENANCE_ASKS, id, kind);
+
+/// An asked run kept in the shard's replicated state (ADR-0128 §3), so that a new leader runs it: `t`'s `kind`.
+fn recordAsk(store: borrow mut ObjectStore, t: borrow MaintainedTable, kind: Slice<u8>) -> Result<void, TablesError> {
+    let hidden = tableWarehouseBucket(t.bucket.view())?;
+    let rec = tableRecord(store, t.bucket.view(), t.ns.view(), t.name.view())?;
+    let id = copyBytes(jsonMemberText(borrow rec.json, "id") ?? { return Err(TablesError.Internal); })?;
+    var ask = jsonObject();
+    jsonSet(mut ask, "namespace", jsonString(t.ns.view())?)?;
+    jsonSet(mut ask, "name", jsonString(t.name.view())?)?;
+    let _ = writeRecord(store, hidden.view(), askKey(id.view(), kind)?.view(), borrow ask, PutCondition.None)?;
+    return Ok();
+}
+
+/// The asked runs kept in a store's table buckets (ADR-0128 §3): what a replica that becomes leader queues. An ask
+/// that does not read is passed over.
+fn askedRunsOf(store: borrow ObjectStore) -> Result<Vector<AskedRun>, TablesError> {
+    var out = Vector<AskedRun>.create();
+    let all = match (store.listBucketInfo()) {
+        Ok(a) => a,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    let head = MAINTENANCE_ASKS.bytes().length;
+    for (i in 0..all.length) {
+        let hidden = all[i].name.view();
+        if (!isTableWarehouseShaped(hidden)) { continue; }
+        let bucket = hidden[0..hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
+        let keys = catalogKeys(store, hidden, MAINTENANCE_ASKS.bytes(), "".bytes(), 0)?;
+        for (k in 0..keys.length) {
+            let rest = keys[k].view()[head..];
+            let slash = pieceEnd(rest, 0, '/');
+            if (slash >= rest.length) { continue; }
+            let rec = readRecord(store, hidden, keys[k].view())? ?? { continue; };
+            let ns = jsonMemberText(borrow rec.json, "namespace") ?? { continue; };
+            let name = jsonMemberText(borrow rec.json, "name") ?? { continue; };
+            out.push(AskedRun {
+                table: MaintainedTable { bucket: copyBytes(bucket)?, ns: copyBytes(ns)?, name: copyBytes(name)? },
+                kind: copyBytes(rest[slash + 1..])?,
+            })?;
+        }
+    }
+    return Ok(out);
+}
+
 /// PutTableBucketMaintenanceConfiguration and PutTableMaintenanceConfiguration: one type's value into the document at
 /// `key`.
 fn putMaintenance(
@@ -228,6 +275,13 @@ fn writeJobStatus(
     jsonSet(mut entry, "lastRunTimestamp", jsonInteger(nowMs)?)?;
     if (failure.length > 0) { jsonSet(mut entry, "failureMessage", jsonString(failure.bytes())?)?; }
     let _ = writeRecord(store, hidden, key.view(), borrow entry, PutCondition.None)?;
+    // The run answers its ask, if one was kept (ADR-0128 §3): with this status, in the same step.
+    let ask = askKey(id, kind.bytes())?;
+    match (store.deleteObject(catalogText(hidden), catalogText(ask.view()))) {
+        Ok(_) => {}
+        Err(StoreError.NoSuchKey) => {}
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    }
     return Ok();
 }
 
@@ -473,9 +527,15 @@ async fn runMaintenance(
         await Async.blocking(() => maintenanceRunAllowed(store, caller, tr))?;
     }
     // On a cluster, queued for the shard's leader's run and answered at once (ADR-0110 §5); asked again while it
-    // waits, the same.
+    // waits, the same. It is kept in the shard's replicated state too, so that a new leader runs it (ADR-0128 §3).
     match (borrow app.askedRuns) {
         Some(q) => {
+            {
+                var guard = await lockStore(app)?;
+                let store = guard.data();
+                let k = kind;
+                await Async.blocking(() => recordAsk(store, tr, k))?;
+            }
             var queue = match (await q.get().lock()) {
                 Ok(g) => g,
                 Err(_) => { return Err(TablesError.Internal); }

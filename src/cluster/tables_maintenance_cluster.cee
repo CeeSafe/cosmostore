@@ -2,6 +2,39 @@
 // tables from its store and runs each one's jobs as the leader's gated steps (`tables_steps.cee`), not as requests to
 // its own front; the runs a client asked for (`maintenance-run`) within a second.
 
+/// The asks kept in a shard's store (ADR-0128 §3), queued for its new leader's loop, each once.
+async fn queueKeptAsks(slot: borrow ShardSlot) -> Result<void, NodeFault> {
+    var kept = Vector<AskedRun>.create();
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        kept = match (await Async.blocking(() => askedRunsOf(st))) {
+            Ok(k) => k,
+            Err(_) => { return Ok(); } // read again by the next leader; the day's pass runs every job
+        };
+    }
+    var queue = match (await slot.asked.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let runs = queue.data();
+    while (kept.length > 0) {
+        let k = kept.remove(0);
+        var there = false;
+        for (r in runs.view()) {
+            if (r.kind.view() == k.kind.view() && r.table.bucket.view() == k.table.bucket.view() &&
+                r.table.ns.view() == k.table.ns.view() && r.table.name.view() == k.table.name.view()) {
+                there = true;
+            }
+        }
+        if (!there && runs.push(k).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
+    return Ok();
+}
+
 /// Every hour of a day, for each shard this node leads, each table's jobs, run as the leader's gated steps
 /// (ADR-0110 §5); and, within a second, the runs its S3 servers were asked for. A shard it does not lead is its
 /// leader's to maintain.
@@ -9,6 +42,11 @@ async fn tablesMaintenanceClusterForever(shared: borrow NodeShared) -> Result<vo
     let every = if (shared.tablesDayMs / 24 > 0) shared.tablesDayMs / 24 else 1;
     var sincePass: u64 = 0;
     let tick: u64 = if (every < 1000) every else 1000;
+    // Whether this node led each shard at the last tick: a shard it has just come to lead has its kept asks queued.
+    var led = Vector<bool>.create();
+    for (i in 0..shared.slots.length) {
+        if (led.push(false).isErr()) { return Err(NodeFault.OutOfMemory); }
+    }
     while (true) {
         if (!(await frontPause(tick))) { return Err(NodeFault.Net); }
         sincePass += tick;
@@ -17,6 +55,11 @@ async fn tablesMaintenanceClusterForever(shared: borrow NodeShared) -> Result<vo
         for (i in 0..shared.slots.length) {
             let slot = borrow shared.slots[i];
             if (slot.shard == GROUP0_SHARD || slot.failed.load() != 0) { continue; }
+            // A shard this node has come to lead: the asks its last leader kept and did not run, queued (ADR-0128
+            // §3, M22's B2).
+            let leads = await leadsShard(slot)?;
+            if (leads && !led[i]) { await queueKeptAsks(slot)?; }
+            led[i] = leads;
             // The runs asked for, taken from the queue: a shard this node does not lead drops them (its leader's
             // server is asked instead).
             var asked = Vector<AskedRun>.create();
@@ -31,7 +74,7 @@ async fn tablesMaintenanceClusterForever(shared: borrow NodeShared) -> Result<vo
                 }
             }
             if (!pass && asked.length == 0) { continue; }
-            if (!(await leadsShard(slot)?)) { continue; }
+            if (!leads) { continue; }
             for (k in 0..asked.length) {
                 await maintainOnShard(shared, i, borrow asked[k].table, asked[k].kind.view())?;
                 // An ask made while it ran is answered by this run, not run again (ADR-0110 §5, the M22 exit

@@ -6100,3 +6100,18 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     of term.
   - Both the put check and the cut-off are mutation-checked.
 - **Checks:** 536 unit tests, the cluster smoke (209, with configured creates as on `serve`) and the S3 smoke.
+
+### 25 Nov 2026: M31 slice 2, maintenance asks kept (ADR-0128 §3, M22's B2)
+
+- **On a cluster, `maintenance-run`** also writes its ask as a record,
+  `.s3tables/maintenance/asks/<table id>/<kind>` (holding the namespace and name), in the request that is
+  answered 204.
+- **`writeJobStatus` deletes the ask** in the same step, so a run answers its ask and the record doesn't outlive it.
+- **A node that comes to lead a shard** queues the asks that shard's store keeps, each once (`queueKeptAsks`). That
+  happens at its first tick after starting, too.
+- **Tests:**
+  - `askedRunsAreKeptUntilRun`;
+  - the maintenance smoke's new phase: a fresh cluster with a day of 86,400 s, so no pass comes. An asked compaction
+    has its leader killed mid-run, and the new leader runs it. On the slice-1 binary this phase fails ("the new leader
+    runs the kept ask", the table left at four files); on this one it passes.
+- **Checks:** 537 unit tests, the S3 smoke, the cluster smoke (209) and the maintenance smoke.
