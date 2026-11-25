@@ -1,7 +1,7 @@
 # ADR-0124: engines' catalog calls (M29)
 
-**Status:** proposed, 25 Nov 2026, built in slices 1 and 2 below. M29 is ADR-0123's item A (the owner: "A:
-engines' calls").
+**Status:** accepted, 25 Nov 2026, as built below (the owner: "Accept and close", after M29's exit review,
+`docs/m29-exit-review.md`). M29 is ADR-0123's item A (the owner: "A: engines' calls").
 
 ## Context
 
@@ -62,6 +62,19 @@ engines' calls").
   - a staged create writes no table;
   - a create commit at a location no staged create gave, or staged for another table, is refused;
   - the right one makes the table once.
+
+## As built, after the exit review
+
+- **§1:** a reservation is kept by namespace and name (`.s3tables/staged/<namespace>/<name>`), holding the id: one a
+  name, replaced by a later staged create of it, removed by the table's drop.
+- **§2:**
+  - a create commit is checked as a create: every schema a struct of ids once each, each spec's and order's sources
+    the current schema's columns, and no `format-version` property stored;
+  - a POST to a table not there goes straight to the create, from the request it was authorized for;
+  - a commit to a table not there that is not a create is 404.
+- **Compaction** reads only files under its own table's id (the review's M3, an old gap a create commit made easier
+  to reach).
+- **The exit review's Lows** are recorded in `docs/m29-exit-review.md` (B1 to B3).
 
 ## Consequences
 

@@ -5848,3 +5848,14 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Results:** 523 unit tests, the fuzzer, the smokes (PyIceberg's create transaction through a cluster's node), and
   the Java check's 47.
 - **Next:** the owner's word on ADR-0124 and on closing M29.
+
+### 25 Nov 2026: M29 closed (ADR-0124 accepted)
+
+- **The owner's decision:** "Accept and close". ADR-0124 is accepted, with its As built.
+- **M29 is closed.** The exit review's B1 to B3 are recorded in `docs/m29-exit-review.md`.
+- **Next:** M30, when the owner asks. Candidates on record:
+  - S3 Tables' tags and encryption (ADR-0123's B);
+  - the cluster's Lows (ADR-0123's C, M22's B2 and B3);
+  - views and nested namespaces;
+  - v3's remaining parts (deletion vectors written, encryption keys, multi-argument transforms, lineage on
+    branches).
