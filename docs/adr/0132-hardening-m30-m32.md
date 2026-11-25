@@ -1,6 +1,10 @@
 # ADR-0132: Hardening, M30's to M32's recorded Lows (M33)
 
-**Status:** proposed, 25 Nov 2026. M33 is ADR-0131's item A (the owner: "A: hardening").
+**Status:** proposed, 25 Nov 2026, with the owner's choices made:
+- tag keys differing only in case refused ("Refused");
+- `aws:ResourceTag` kept refused in identity policies ("Keep refused").
+
+M33 is ADR-0131's item A (the owner: "A: hardening").
 
 ## Context
 
