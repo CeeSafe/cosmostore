@@ -6267,3 +6267,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **C,** table replication;
   - **D,** v3's remaining parts.
 - **Next:** the owner's choice.
+
+### 25 Nov 2026: M33 decided, ADR-0132 proposed (hardening)
+
+- **The owner:** "A: hardening".
+- **ADR-0132 decides each of the twenty Lows:**
+  - **fixed with a test:** thirteen;
+  - **kept, each with its reason:** five;
+  - **for the owner:** two, tag keys differing only in case and `aws:ResourceTag` in identity policies.
+- **Slices:** tags and configuration; clusters; logging; the exit review.

@@ -1,6 +1,8 @@
 # ADR-0131: M33, after S3 Tables' logging and metrics (proposed)
 
-**Status:** proposed, 25 Nov 2026, after M32 was closed the same day (the owner: "continue").
+**Status:** decided, 25 Nov 2026. The owner chose A, hardening ("A: hardening").
+
+Proposed the same day, after M32 was closed (the owner: "continue").
 
 ## Context
 
