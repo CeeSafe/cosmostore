@@ -1150,6 +1150,18 @@ done
 check "the log object is delivered" "$(ls logs.got | wc -l | tr -d ' ' | awk '{ print ($1 >= 1) ? "yes" : "no" }')" yes
 check "it has the PUT's line" "$(cat logs.got/* | grep -c '^cosmostore smoke \[.*REST.PUT.OBJECT logged.txt "PUT /smoke/logged.txt HTTP/1.1" 200 ')" 1
 check "and the missing key's, with its error" "$(cat logs.got/* | grep -c 'REST.GET.OBJECT not-here .* 404 NoSuchKey ')" 1
+# Partitioned keys (ADR-0130 §3), as the CLI sends them (the date source a child element): kept and answered, and its
+# logs delivered under `<prefix><account>/<region>/<bucket>/YYYY/MM/DD/`.
+aws s3api put-bucket-logging --bucket smoke --bucket-logging-status '{"LoggingEnabled":{"TargetBucket":"smokelogs","TargetPrefix":"parted/","TargetObjectKeyFormat":{"PartitionedPrefix":{"PartitionDateSource":"DeliveryTime"}}}}' > /dev/null 2>&1 && pass "put-bucket-logging with PartitionedPrefix" || fail "put-bucket-logging with PartitionedPrefix"
+check "its date source answered" "$(aws s3api get-bucket-logging --bucket smoke --query LoggingEnabled.TargetObjectKeyFormat.PartitionedPrefix.PartitionDateSource --output text 2>&1)" DeliveryTime
+aws s3api head-bucket --bucket smoke > /dev/null 2>&1
+parted=""
+for i in $(seq 1 30); do
+    parted=$(aws s3api list-objects-v2 --bucket smokelogs --prefix "parted/000000000000/us-east-1/smoke/$(date -u +%Y/%m/%d)/" --query 'length(Contents || `[]`)' --output text 2>&1)
+    [ "$parted" != 0 ] && break
+    sleep 0.5
+done
+check "delivered under a partitioned key" "$([ "$parted" != 0 ] && echo yes)" yes
 aws s3api put-bucket-logging --bucket smoke --bucket-logging-status '{}' > /dev/null 2>&1
 check "logging off" "$(aws s3api get-bucket-logging --bucket smoke --output text 2>&1)" ""
 

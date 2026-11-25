@@ -637,6 +637,18 @@ fn tablesAllowedOnBucket(
 
 // ---- Metrics (ADR-0130 §4) ----
 
+/// The table buckets counted at most (ADR-0130 §4).
+const TABLES_COUNTED: usize = 4096;
+
+/// Whether a request is DeleteTableBucket (`DELETE /buckets/{arn}`).
+fn deletesTableBucket(req: borrow S3Request) -> bool {
+    let segs = match (pathSegments(req.rawPath.view())) {
+        Ok(s) => s,
+        Err(_) => { return false; }
+    };
+    return segs.length == 2 && segs[0].view() == "buckets".bytes();
+}
+
 /// One table bucket's requests since the server started: all, and those answered 4xx and 5xx.
 struct TablesCount {
     bucket: Vector<u8>;
@@ -716,6 +728,9 @@ async fn countTablesRequest(
         Ok(a) => a.status,
         Err(e) => tablesErrorStatus(e),
     };
+    // A table bucket that is not there is not counted (the M32 exit review's M1: a name in a request is anyone's to
+    // make up), nor past TABLES_COUNTED buckets.
+    if (status == 404) { return; }
     var guard = match (await app.tablesCounts.lock()) {
         Ok(g) => g,
         Err(_) => { return; }
@@ -725,7 +740,14 @@ async fn countTablesRequest(
     for (i in 0..counts.length) {
         if (counts[i].bucket.view() == bucket.view()) { at = i; }
     }
+    // Its delete ends its counts: one made again with its name starts from none.
+    let deleted = isMethod(req.method, Method.Delete) && status < 300 && deletesTableBucket(req);
+    if (deleted) {
+        if (at < counts.length) { let _ = counts.swapRemove(at); }
+        return;
+    }
     if (at == counts.length) {
+        if (counts.length >= TABLES_COUNTED) { return; }
         let made = counts.push(TablesCount { bucket: bucket, requests: 0, clientErrors: 0, serverErrors: 0 });
         if (made.isErr()) { return; }
     }

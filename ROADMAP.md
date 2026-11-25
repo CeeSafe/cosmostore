@@ -6233,3 +6233,18 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   shard.
 - **Fixed:** both table buckets are picked by a node that leads two shards. With four shards and three nodes, one
   always does. The check passes locally.
+
+### 25 Nov 2026: M32 slice 5, the exit review (`docs/m32-exit-review.md`)
+
+- **The review:** one independent agent.
+- **Fixed:**
+  - the High: S3's `PartitionedPrefix` parsed and answered as the SDKs write it, with the date source a child
+    element. The binary before the fix answered the CLI's DeliveryTime as `None`. The smoke check ADR-0130 promised
+    is added;
+  - the Medium: a table bucket's counts bounded, with no 404s, at most 4,096 buckets, and ended by the bucket's
+    delete;
+  - four Lows: simple keys batched across sources again, the audit requester filled, a facts failure never failing
+    a call, and Iceberg names taken by position.
+- **Recorded:** six Lows.
+- **Checks:** 542 unit tests, the S3 smoke and the cluster smoke (214).
+- **Next:** the owner's word on ADR-0130 and on closing M32.

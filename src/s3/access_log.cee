@@ -60,17 +60,15 @@ fn parseLogging(xml: Slice<u8>) -> Result<LoggingTarget?, S3Fail> {
     };
     if (findBytes(enabled, "<TargetGrants".bytes(), 0).isSome()) { return Err(S3Fail.Code(S3Code.NotImplemented)); }
     var keys = LOG_KEYS_SIMPLE;
-    match (findBytes(enabled, "<PartitionedPrefix".bytes(), 0)) {
-        Some(from) => {
-            // `<PartitionedPrefix PartitionDateSource="EventTime|DeliveryTime"/>`, EventTime when it names none.
-            let end = findBytes(enabled, ">".bytes(), from) ?? { return Err(S3Fail.Code(S3Code.MalformedXML)); };
-            let tag = enabled[from..end];
-            keys = if (findBytes(tag, "DeliveryTime".bytes(), 0).isSome()) LOG_KEYS_DELIVERY_TIME
-                else if (findBytes(tag, "PartitionDateSource".bytes(), 0).isNull() ||
-                    findBytes(tag, "EventTime".bytes(), 0).isSome()) LOG_KEYS_EVENT_TIME
-                else { return Err(S3Fail.Code(S3Code.MalformedXML)); };
-        }
-        null => {}
+    if (findBytes(enabled, "<PartitionedPrefix".bytes(), 0).isSome()) {
+        // `<PartitionedPrefix><PartitionDateSource>EventTime|DeliveryTime</PartitionDateSource></PartitionedPrefix>`,
+        // as the SDKs send it (the M32 exit review's H1); EventTime when it names none.
+        var source = Vector<u8>.create();
+        let named = rawElement(enabled, "PartitionDateSource", mut source)?;
+        let text = trimBlank(source.view());
+        keys = if (!named || text == "EventTime".bytes()) LOG_KEYS_EVENT_TIME
+            else if (text == "DeliveryTime".bytes()) LOG_KEYS_DELIVERY_TIME
+            else { return Err(S3Fail.Code(S3Code.MalformedXML)); };
     }
     var bucket = Vector<u8>.create();
     var prefix = Vector<u8>.create();
@@ -100,9 +98,9 @@ fn loggingXml(target: borrow (LoggingTarget?), out: borrow mut Vector<u8>) -> Re
             appendXmlEscaped(out, t.prefix.view())?;
             out.extend("</TargetPrefix>".bytes())?;
             if (t.keys != LOG_KEYS_SIMPLE) {
-                out.extend("<TargetObjectKeyFormat><PartitionedPrefix PartitionDateSource=\"".bytes())?;
+                out.extend("<TargetObjectKeyFormat><PartitionedPrefix><PartitionDateSource>".bytes())?;
                 out.extend((if (t.keys == LOG_KEYS_DELIVERY_TIME) "DeliveryTime" else "EventTime").bytes())?;
-                out.extend("\"/></TargetObjectKeyFormat>".bytes())?;
+                out.extend("</PartitionDateSource></PartitionedPrefix></TargetObjectKeyFormat>".bytes())?;
             }
             out.extend("</LoggingEnabled>".bytes())?;
         }
@@ -603,8 +601,10 @@ fn gatherLines(w: borrow AccessLogWriter, batches: borrow mut Vector<AccessLogBa
         var at = batches.length;
         for (i in 0..batches.length) {
             if (batches[i].target.view() == e.target.view() && batches[i].prefix.view() == e.prefix.view() &&
-                batches[i].requester.view() == e.requester.view() && batches[i].source.view() == e.source.view() &&
-                batches[i].keys == e.keys) {
+                batches[i].requester.view() == e.requester.view() && batches[i].keys == e.keys &&
+                (e.keys == LOG_KEYS_SIMPLE || batches[i].source.view() == e.source.view())) {
+                // Simple keys name no source: several buckets' lines share an object, as before (the M32 exit
+                // review's L4).
                 at = i;
             }
         }
