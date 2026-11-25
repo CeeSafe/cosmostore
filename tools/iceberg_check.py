@@ -18,6 +18,18 @@ endpoint = sys.argv[1]
 failed = False
 
 
+def delete_table_bucket(bucket_arn):
+    """DeleteTableBucket, once more on ConflictException: on a cluster a bucket's leftover records (its tables' objects,
+    its configuration) are deleted with the request's own writes, so the first answers that it is not empty yet."""
+    from botocore.exceptions import ClientError
+    try:
+        tables.delete_table_bucket(tableBucketARN=bucket_arn)
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConflictException":
+            raise
+        tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
 def check(name, got, want):
     global failed
     if got == want:
@@ -120,8 +132,18 @@ catalog.purge_table("sales.staged")
 # S3 Tables' tags and storage class (ADR-0126 §1, §2), through boto3.
 import json
 from botocore.exceptions import ClientError
-cfg_arn = tables.create_table_bucket(name="config-check", tags={"team": "data"},
-                                     storageClassConfiguration={"storageClass": "INTELLIGENT_TIERING"})["arn"]
+try:
+    cfg_arn = tables.create_table_bucket(name="config-check", tags={"team": "data"},
+                                         storageClassConfiguration={"storageClass": "INTELLIGENT_TIERING"})["arn"]
+except ClientError as e:
+    # On a cluster a create's settings are refused before anything is made (a shard's write does not see the bucket
+    # made in its request): made plain, then set by their own calls.
+    check("a configured create refused on a cluster", e.response["Error"]["Code"], "BadRequestException")
+    check("and nothing made", [b["name"] for b in tables.list_table_buckets()["tableBuckets"] if b["name"] == "config-check"], [])
+    cfg_arn = tables.create_table_bucket(name="config-check")["arn"]
+    tables.tag_resource(resourceArn=cfg_arn, tags={"team": "data"})
+    tables.put_table_bucket_storage_class(tableBucketARN=cfg_arn,
+                                          storageClassConfiguration={"storageClass": "INTELLIGENT_TIERING"})
 check("a table bucket's tags at its create", tables.list_tags_for_resource(resourceArn=cfg_arn)["tags"], {"team": "data"})
 check("its storage class at its create",
       tables.get_table_bucket_storage_class(tableBucketARN=cfg_arn)["storageClassConfiguration"]["storageClass"],
@@ -173,11 +195,17 @@ check("allowed again once untagged", True, True)
 tables.delete_table_policy(tableBucketARN=cfg_arn, namespace="ns", name="inherits")
 tables.delete_table(tableBucketARN=cfg_arn, namespace="ns", name="inherits")
 tables.delete_namespace(tableBucketARN=cfg_arn, namespace="ns")
-tables.delete_table_bucket(tableBucketARN=cfg_arn)
+delete_table_bucket(cfg_arn)
 # S3 Tables' encryption (ADR-0126 §3, §4): a KMS table bucket (the smokes' KMS key `orders`), its tables' default.
 kms_key = "arn:aws:kms:us-east-1:000000000000:key/orders"
-enc_arn = tables.create_table_bucket(name="enc-check", encryptionConfiguration={"sseAlgorithm": "aws:kms",
-                                     "kmsKeyArn": kms_key})["arn"]
+enc_config = {"sseAlgorithm": "aws:kms", "kmsKeyArn": kms_key}
+try:
+    enc_arn = tables.create_table_bucket(name="enc-check", encryptionConfiguration=enc_config)["arn"]
+except ClientError as e:
+    # On a cluster, as the tags above: made plain, its encryption then put.
+    check("an encrypted create refused on a cluster", e.response["Error"]["Code"], "BadRequestException")
+    enc_arn = tables.create_table_bucket(name="enc-check")["arn"]
+    tables.put_table_bucket_encryption(tableBucketARN=enc_arn, encryptionConfiguration=enc_config)
 got = tables.get_table_bucket_encryption(tableBucketARN=enc_arn)["encryptionConfiguration"]
 check("a table bucket's encryption at its create", (got["sseAlgorithm"], got.get("kmsKeyArn")), ("aws:kms", kms_key))
 tables.create_namespace(tableBucketARN=enc_arn, namespace=["ns"])
@@ -212,7 +240,7 @@ check("its table's kept from its create", tables.get_table_encryption(tableBucke
 for name in ("sealed", "own"):
     tables.delete_table(tableBucketARN=enc_arn, namespace="ns", name=name)
 tables.delete_namespace(tableBucketARN=enc_arn, namespace="ns")
-tables.delete_table_bucket(tableBucketARN=enc_arn)
+delete_table_bucket(enc_arn)
 catalog.rename_table("sales.orders", "sales.orders_v2")
 check("rename_table", catalog.list_tables("sales"), [("sales", "orders_v2")])
 check("rows after the rename", catalog.load_table("sales.orders_v2").scan().to_arrow().num_rows, 4)
@@ -223,6 +251,6 @@ try:
 except NoSuchTableError:
     check("purge_table", "NoSuchTableError", "NoSuchTableError")
 catalog.drop_namespace("sales")
-tables.delete_table_bucket(tableBucketARN=arn)
+delete_table_bucket(arn)
 check("cleaned up", "iceberg-check" in [b["name"] for b in tables.list_table_buckets()["tableBuckets"]], False)
 sys.exit(1 if failed else 0)

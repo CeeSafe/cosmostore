@@ -5973,3 +5973,23 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - Both fail when the outputs are written in the clear (mutation-checked).
 - **Also fixed:** slice 3's commit was pushed unformatted. `cee.sh fmt` formats only its scratch copy, so CI's
   `fmt --check` failed, and this commit formats those files.
+
+### 25 Nov 2026: M30's cluster fixes (CI red since slice 1)
+
+- **What broke:** CI's cluster smoke has failed since fc6f993 (slice 1), and I didn't notice because I didn't wait
+  for those runs to finish. CreateTableBucket wrote the bucket's config record straight after making the bucket.
+  - On a cluster shard a write applies only when Raft commits it, so the record's write found no bucket (ADR-0058,
+    as `ensureBucket` notes). Every create through a node answered NotFound, though it made the bucket.
+  - So PyIceberg, maintenance and compaction all failed in the cluster smoke.
+- **The fixes:**
+  - A create that sets nothing writes no record; an absent one reads as the defaults.
+  - A create that sets tags, a storage class or an encryption is refused on a cluster (BadRequestException) before
+    anything is made. Its client sets them with TagResource, PutTableBucketStorageClass or
+    PutTableBucketEncryption once the bucket exists. `ObjectStore.isReplicated()` says which store it is. Doing it
+    in one request would need the store to stage a bucket and a write into it together, a durability change.
+  - TagResource and UntagResource (`/tag/{arn}`) were not routed on a cluster, so they went to shard 0 and answered
+    NotFound. They now go to the shard of the bucket their ARN names.
+  - `iceberg_check.py`: on a cluster it checks the refusal and then sets the settings by their calls. It retries
+    DeleteTableBucket once on ConflictException, the cluster's documented answer while a bucket's leftovers are
+    deleted with the request.
+- **Checks:** the cluster smoke (209 passed, PyIceberg's 47 through node 2), the S3 smoke and the tests all pass.

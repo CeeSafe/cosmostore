@@ -89,3 +89,8 @@ encryption, tags").
 - **Tools that set S3 Tables' encryption, tags or storage class are taken,** and a KMS table's files are all sealed
   with its key, compaction's included.
 - **The catalog and compaction hold keys:** each read of an encrypted table's metadata unwraps its data key.
+- **On a cluster, a table bucket's settings come after its create** (found by CI in slice 1): a shard's write does not
+  see a bucket made in the same request (ADR-0058). So a create that sets tags, a storage class or an encryption is
+  refused before anything is made, and its client sets them with their own calls. A table's create is not
+  affected, since its bucket already exists. Taking them in one request would need the store to stage a bucket and a
+  write into it together: for the owner, at M30's exit review.
