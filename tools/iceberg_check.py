@@ -110,6 +110,13 @@ try:
     check("a rename into a namespace not there", "renamed", "NoSuchNamespaceError")
 except NoSuchNamespaceError:
     check("a rename into a namespace not there", "NoSuchNamespaceError", "NoSuchNamespaceError")
+# A staged create (ADR-0124): PyIceberg's create transaction, its rows appended in it, the table made at its commit
+# (on `serve` and through a cluster's node).
+with catalog.create_table_transaction("sales.staged", schema=schema) as tx:
+    tx.append(pa.table({"id": [7, 8], "item": ["fig", "kiwi"]}, schema=schema))
+check("create_table_transaction: the table made with its rows",
+      sorted(catalog.load_table("sales.staged").scan().to_arrow().column("id").to_pylist()), [7, 8])
+catalog.purge_table("sales.staged")
 catalog.rename_table("sales.orders", "sales.orders_v2")
 check("rename_table", catalog.list_tables("sales"), [("sales", "orders_v2")])
 check("rows after the rename", catalog.load_table("sales.orders_v2").scan().to_arrow().num_rows, 4)

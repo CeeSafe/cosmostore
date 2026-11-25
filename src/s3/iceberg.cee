@@ -438,6 +438,22 @@ fn presentMember<region a>(j: borrow(a) Json, key: StringView) -> borrow(a) Json
     };
 }
 
+/// A schema's column ids, when it is a struct whose every field has an id above 0, once only (the REST spec has the
+/// client assign them); null otherwise.
+fn schemaColumns(schema: borrow Json) -> Result<Vector<i64>?, AllocError> {
+    if (jsonMemberText(schema, "type") != Some("struct".bytes())) { return Ok(null); }
+    var columns = Vector<i64>.create();
+    if (!collectFieldIds(schema, mut columns)?) { return Ok(null); }
+    if (columns.length == 0) { return Ok(null); }
+    var sorted = Vector<i64>.create();
+    sorted.extend(columns.view())?;
+    sorted.sortBy((a, b) => if (a < b) -1 else if (a > b) 1 else 0);
+    for (i in 1..sorted.length) {
+        if (sorted[i - 1] == sorted[i]) { return Ok(null); }
+    }
+    return Ok(Some(columns));
+}
+
 /// A new table's first metadata from a CreateTableRequest: its schema as schema 0, its spec as spec 0, its order, its
 /// properties, and the warehouse as its location; format version 2, or 3 when its `format-version` property asks
 /// (ADR-0122 §2; the property itself not stored, as Iceberg's catalogs do). Null if the schema, spec or order is not
@@ -448,20 +464,8 @@ fn newTableMetadata(request: borrow Json, location: Slice<u8>) -> Result<Json?, 
         Some(s) => cloneJson(s)?,
         null => { return Ok(null); }
     };
-    if (jsonMemberText(borrow schema, "type") != Some("struct".bytes())) { return Ok(null); }
     jsonSet(mut schema, "schema-id", jsonInteger(0)?)?;
-    // Every column id given, above 0 and once only (the REST spec has the client assign them).
-    var columns = Vector<i64>.create();
-    if (!collectFieldIds(borrow schema, mut columns)?) { return Ok(null); }
-    if (columns.length == 0) { return Ok(null); }
-    {
-        var sorted = Vector<i64>.create();
-        sorted.extend(columns.view())?;
-        sorted.sortBy((a, b) => if (a < b) -1 else if (a > b) 1 else 0);
-        for (i in 1..sorted.length) {
-            if (sorted[i - 1] == sorted[i]) { return Ok(null); }
-        }
-    }
+    let columns = schemaColumns(borrow schema)? ?? { return Ok(null); };
     let lastColumn = highestFieldId(borrow schema);
     var spec = match (presentMember(request, "partition-spec")) {
         Some(s) => cloneJson(s)?,
@@ -1115,12 +1119,13 @@ fn icebergCreateTable(
         }
     };
     if (staged) {
+        // Kept by the table's namespace and name, so that one name holds one at most (the M29 exit review's M1): a
+        // later staged create of the name replaces it.
         var reservation = jsonObject();
-        jsonSet(mut reservation, "namespace", jsonString(ns)?)?;
-        jsonSet(mut reservation, "name", jsonString(name.view())?)?;
+        jsonSet(mut reservation, "id", jsonString(id.view())?)?;
         jsonSet(mut reservation, "createdAt", jsonInteger(Clock.unixMillis())?)?;
-        let stagedKey = catalogKey(CATALOG_STAGED, id.view(), "".bytes())?;
-        let _ = writeRecord(store, hidden.view(), stagedKey.view(), borrow reservation, PutCondition.IfAbsent)?;
+        let stagedKey = catalogKey(CATALOG_STAGED, ns, name.view())?;
+        let _ = writeRecord(store, hidden.view(), stagedKey.view(), borrow reservation, PutCondition.None)?;
         var j = jsonObject();
         jsonSet(mut j, "metadata", m)?;
         jsonSet(mut j, "config", jsonObject())?;
@@ -1196,13 +1201,12 @@ fn icebergCommitCreate(
     }
     let id = copyBytes(at.view()[prefix.length..])?;
     if (findBytes(id.view(), "/".bytes(), 0).isSome()) { return badRequest("A table's location is its warehouse."); }
-    let stagedKey = catalogKey(CATALOG_STAGED, id.view(), "".bytes())?;
+    let stagedKey = catalogKey(CATALOG_STAGED, ns, name)?;
     let reservation = readRecord(store, hidden.view(), stagedKey.view())? ?? {
         return badRequest("The table's location is not one a staged create gave it.");
     };
-    if (jsonMemberText(borrow reservation.json, "namespace") != Some(ns) ||
-        jsonMemberText(borrow reservation.json, "name") != Some(name)) {
-        return badRequest("The table's location was staged for another table.");
+    if (jsonMemberText(borrow reservation.json, "id") != Some(id.view())) {
+        return badRequest("The table's location is not the one its staged create gave it.");
     }
     let warehouse = warehouseOf(bucket, id.view())?;
     var m = emptyTableMetadata()?;
@@ -1273,6 +1277,28 @@ fn completeCreatedMetadata(m: borrow mut Json, warehouse: Slice<u8>) -> Result<b
     if (jsonMemberText(m, "location") != Some(warehouse)) { return Ok(false); }
     let current = jsonMemberI64(m, "current-schema-id") ?? -1;
     if (!hasId(m, "schemas", "schema-id", current)) { return Ok(false); }
+    // The checks a create makes (the M29 exit review's M2): every schema a struct of ids once each, and each spec's
+    // and order's sources the current schema's columns.
+    var columns = Vector<i64>.create();
+    for (schema in (memberItems(m, "schemas") ?? { return Ok(false); }).view()) {
+        let ids = schemaColumns(schema)? ?? { return Ok(false); };
+        if (jsonMemberI64(schema, "schema-id") == Some(current)) { columns = ids; }
+    }
+    for (spec in (memberItems(m, "partition-specs") ?? { return Ok(false); }).view()) {
+        if (!sourcesKnown(spec, columns.view())) { return Ok(false); }
+    }
+    for (order in (memberItems(m, "sort-orders") ?? { return Ok(false); }).view()) {
+        if (!sourcesKnown(order, columns.view())) { return Ok(false); }
+    }
+    // Its properties not the create's own `format-version`, which a create does not store (the review's L4).
+    match (jsonMember(m, "properties")) {
+        Some(_) => {
+            var props = cloneJson(jsonMember(m, "properties") ?? { return Ok(false); })?;
+            jsonRemove(mut props, "format-version".bytes());
+            jsonSet(m, "properties", props)?;
+        }
+        null => {}
+    }
     if (arrayLength(m, "partition-specs") == 0) {
         var spec = jsonObject();
         jsonSet(mut spec, "spec-id", jsonInteger(0)?)?;
@@ -1338,14 +1364,7 @@ fn icebergCommit(
     let hidden = tableWarehouseBucket(bucket)?;
     var rec = match (currentTable(store, bucket, ns, name)?) {
         Some(r) => r,
-        null => {
-            // A staged create's commit (ADR-0124): `assert-create` its one requirement, the table made from its
-            // updates.
-            if (createsOnly(jsonMember(borrow request, "requirements"))) {
-                return icebergCommitCreate(store, bucket, ns, name, borrow request);
-            }
-            return noSuchTable();
-        }
+        null => { return noSuchTable(); } // a create's commit is `icebergTable`'s, authorized as a create
     };
     let previous = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
     if (previous.length == 0) { return noSuchTable(); }
@@ -1414,10 +1433,17 @@ fn icebergTable(
     let rec = match (currentTable(store, bucket, ns, name)?) {
         Some(r) => r,
         null => {
-            // A staged create's commit makes the table (ADR-0124): authorized as the create it is.
+            // A staged create's commit makes the table (ADR-0124), authorized as the create it is; any other call to a
+            // table not there is answered as such, before any authorization (the M29 exit review's L1, L2).
             if (isMethod(m, Method.Post)) {
-                checkTables(store, caller, "s3tables:CreateTable", bucket, "".bytes())?;
-                return icebergCommit(store, bucket, ns, name, body);
+                let request = match (parseJson(body)?) {
+                    Some(j) => j,
+                    null => { return badRequest("The body is not JSON."); }
+                };
+                if (createsOnly(jsonMember(borrow request, "requirements"))) {
+                    checkTables(store, caller, "s3tables:CreateTable", bucket, "".bytes())?;
+                    return icebergCommitCreate(store, bucket, ns, name, borrow request);
+                }
             }
             return noSuchTable();
         }

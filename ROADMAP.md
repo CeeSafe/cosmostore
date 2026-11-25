@@ -5832,3 +5832,19 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Unit test:** `icebergStagedCreates` (a commit at a location not staged, or staged for another table, refused).
   522 unit tests.
 - **Next:** the exit review.
+
+### 25 Nov 2026: M29's exit review (docs/m29-exit-review.md)
+
+- **The review:** no High finding.
+- **Fixed:**
+  - **M1:** reservations kept by namespace and name, one a name;
+  - **M2:** a create commit checked as a create (schemas' ids, specs' and orders' sources);
+  - **M3:** compaction reads only its own table's files (`compactionReadsOnlyItsOwnFiles`). This was an old gap, now
+    open to a CreateTable-only caller;
+  - **L1 to L3:** the create path from the request authorized for it; 404 for a non-create commit to a table not
+    there; a drop removes its name's reservation.
+- **Recorded:** B1, an uncommitted staged create's leftovers; B2, a client's table-uuid; B3, the sweep reads what a
+  table's metadata names.
+- **Results:** 523 unit tests, the fuzzer, the smokes (PyIceberg's create transaction through a cluster's node), and
+  the Java check's 47.
+- **Next:** the owner's word on ADR-0124 and on closing M29.

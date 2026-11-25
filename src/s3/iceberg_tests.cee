@@ -288,15 +288,40 @@ fn icebergStagedCreates() -> Result<void, TestFailure> {
     let location = copyBytes(jsonMemberText(jsonMember(borrow answer, "metadata")!, "location")!)!;
     Check.isTrue(currentTable(borrow s, "cat".bytes(), "ns".bytes(), "t".bytes())!.isNull(), "no table yet")?;
     // A location no staged create gave: refused.
-    let other = createCommitBody("s3://cat--table-s3/00000000-0000-4000-8000-000000000000".bytes());
-    let refused = icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), other.view())!;
+    let other = parseJson(createCommitBody("s3://cat--table-s3/00000000-0000-4000-8000-000000000000".bytes()).view())!!;
+    let refused = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow other)!;
     Check.equalU64(400, refused.status as u64)?;
     // The location staged, for another table's name: refused.
-    let body = createCommitBody(location.view());
-    let wrongName = icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "u".bytes(), body.view())!;
+    let body = parseJson(createCommitBody(location.view()).view())!!;
+    let wrongName = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "u".bytes(), borrow body)!;
     Check.equalU64(400, wrongName.status as u64)?;
+    // A commit to a table not there that is not a create: no such table (the M29 exit review's L2).
+    let plain = icebergCommit(
+        mut s,
+        "cat".bytes(),
+        "ns".bytes(),
+        "t".bytes(),
+        "{\"requirements\":[],\"updates\":[]}".bytes(),
+    )!;
+    Check.equalU64(404, plain.status as u64)?;
+    // The checks a create makes (the review's M2): a schema with an id twice, a spec of a column not there.
+    for (bad in [
+        "{\"action\":\"add-schema\",\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"},{\"id\":1,\"name\":\"b\",\"required\":true,\"type\":\"long\"}]}},{\"action\":\"set-current-schema\",\"schema-id\":-1}",
+        "{\"action\":\"add-schema\",\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}},{\"action\":\"set-current-schema\",\"schema-id\":-1},{\"action\":\"add-spec\",\"spec\":{\"spec-id\":0,\"fields\":[{\"source-id\":9,\"field-id\":1000,\"name\":\"x\",\"transform\":\"identity\"}]}},{\"action\":\"set-default-spec\",\"spec-id\":-1}",
+    ]) {
+        var text = copyBytes(
+            "{\"requirements\":[{\"type\":\"assert-create\"}],\"updates\":[{\"action\":\"upgrade-format-version\",\"format-version\":2},".bytes(),
+        )!;
+        text.extend(bad.bytes())!;
+        text.extend(",{\"action\":\"set-location\",\"location\":\"".bytes())!;
+        text.extend(location.view())!;
+        text.extend("\"}]}".bytes())!;
+        let request = parseJson(text.view())!!;
+        let invalid = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow request)!;
+        Check.equalU64(400, invalid.status as u64)?;
+    }
     // For its own: the table made, at its location.
-    let made = icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), body.view())!;
+    let made = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow body)!;
     Check.equalU64(200, made.status as u64)?;
     let rec = currentTable(borrow s, "cat".bytes(), "ns".bytes(), "t".bytes())!!;
     let m = readMetadata(
@@ -307,9 +332,9 @@ fn icebergStagedCreates() -> Result<void, TestFailure> {
     Check.equalBytes(location.view(), jsonMemberText(borrow m, "location")!)?;
     Check.isTrue(jsonMemberI64(borrow m, "format-version") == Some(2i64), "version 2")?;
     Check.equalU64(1, arrayLength(borrow m, "sort-orders") as u64)?;
-    // Its reservation used: the same create again finds the table there, and its requirement refuses it.
-    let again = icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), body.view())!;
-    Check.equalU64(409, again.status as u64)?;
+    // Its reservation used: the same create again is refused.
+    let again = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), borrow body)!;
+    Check.equalU64(400, again.status as u64)?;
     removeTree(dir.view());
     return Ok();
 }

@@ -229,6 +229,11 @@ fn planCompaction(
         null => { return Ok(null); } // a v1 snapshot of inline manifests: not compacted here
     };
     let failed = "The table's manifests could not be read; nothing was compacted.";
+    // Its manifest list and manifests this table's own (the M29 exit review's M3).
+    if (!inTable(listPath.view(), hidden.view(), id.view())) {
+        writeJobStatus(store, hidden.view(), id.view(), COMPACTION, "Failed", failed, nowMs)?;
+        return Ok(null);
+    }
     let list = match (readWarehouseAvro(store, hidden.view(), listPath.view())?) {
         Some(f) => f,
         null => {
@@ -239,6 +244,10 @@ fn planCompaction(
     var manifests = Vector<AvroFile>.create();
     for (i in 0..list.records.length) {
         let path = jsonMemberText(borrow list.records[i], "manifest_path") ?? "".bytes();
+        if (!inTable(path, hidden.view(), id.view())) {
+            writeJobStatus(store, hidden.view(), id.view(), COMPACTION, "Failed", failed, nowMs)?;
+            return Ok(null);
+        }
         match (readWarehouseAvro(store, hidden.view(), path)?) {
             Some(f) => { manifests.push(f)?; }
             null => {
@@ -267,7 +276,13 @@ fn planCompaction(
             };
             if (!holdsId(deleteSpecs.view(), spec)) { deleteSpecs.push(spec)?; }
             let read = match (file) {
-                Some(d) => if (COMPACTION_APPLIES_DELETES) deleteFileOf(store, hidden.view(), d, k.view())? else null,
+                Some(d) => if (COMPACTION_APPLIES_DELETES) deleteFileOf(
+                    store,
+                    hidden.view(),
+                    id.view(),
+                    d,
+                    k.view(),
+                )? else null,
                 null => null,
             };
             match (read) {
@@ -337,10 +352,8 @@ fn planCompaction(
             let size = recordInt(file, "file_size_in_bytes", -1);
             if (size <= 0 || truncate<u64>(size) >= small) { continue; }
             let path = jsonMemberText(file, "file_path") ?? { continue; };
-            match (refPlace(path, hidden.view())) {
-                RefPlace.Here => {}
-                _ => { continue; }
-            }
+            // This table's own files only (the M29 exit review's M3).
+            if (!inTable(path, hidden.view(), id.view())) { continue; }
             let partitionKey = partitionKeyOf(spec, jsonMember(file, "partition"))?;
             var inBlocked = false;
             for (d in 0..blocked.length) {
@@ -588,6 +601,7 @@ fn partitionKeyOf(spec: i64, partition: borrow Json?) -> Result<Vector<u8>, Allo
 fn deleteFileOf(
     store: borrow ObjectStore,
     hidden: Slice<u8>,
+    tableId: Slice<u8>,
     d: borrow Json,
     partitionKey: Slice<u8>,
 ) -> Result<DeleteFile?, AllocError> {
@@ -616,10 +630,7 @@ fn deleteFileOf(
     let rows = recordInt(d, "record_count", -1);
     if (rows < 0 || truncate<u64>(rows) > DELETE_FILE_MAX_ROWS as u64) { return Ok(null); }
     let path = jsonMemberText(d, "file_path") ?? { return Ok(null); };
-    match (refPlace(path, hidden)) {
-        RefPlace.Here => {}
-        _ => { return Ok(null); }
-    }
+    if (!inTable(path, hidden, tableId)) { return Ok(null); }
     let key = refKey(path);
     let info = match (store.headObject(catalogText(hidden), catalogText(key))) {
         Ok(h) => h,

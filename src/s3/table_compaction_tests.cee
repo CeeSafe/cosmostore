@@ -1637,6 +1637,62 @@ async fn v3MergeFailureDoesNotJoin() -> Result<void, TestFailure> {
     return await Async.blocking(() => checkV3NotJoined(d));
 }
 
+/// A table's metadata naming another table's files is not read by its compaction (the M29 exit review's M3): its
+/// snapshot's manifest list copied under another table's id, the run refuses it, and the table stays as it is.
+@test
+fn compactionReadsOnlyItsOwnFiles() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("compact-other-table");
+    fixtureCompactStoreOf(
+        dir.bytes(),
+        storeConfig(),
+        fixtureBytes(PAGES_FLAT_IDS[..]),
+        23,
+        fixtureBytes(PAGES_FLAT_IDS_RENAMED[..]),
+        23,
+    );
+    {
+        var s = ObjectStore.open(dir.view(), storeConfig())!;
+        let listKey = compactKey("metadata/snap-1.avro");
+        let list = s.getObject(COMPACT_HIDDEN, StringView.fromUtf8(listKey.view()) ?? "")!;
+        let elsewhere = "d1d1d1d1-0000-4000-8000-000000000000/metadata/snap-1.avro";
+        let _ = s.putObject(COMPACT_HIDDEN, elsewhere, "", list.view(), PutCondition.None)!;
+        let rec = tableRecord(borrow s, "compact".bytes(), "ns".bytes(), "t".bytes())!;
+        var m = readMetadata(borrow s, COMPACT_HIDDEN.bytes(), jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+        var snaps = Vector<Json>.create();
+        for (snap in memberItems(borrow m, "snapshots")!.view()) {
+            var copy = cloneJson(snap)!;
+            var path = copyBytes("s3://compact--table-s3/".bytes())!;
+            path.extend(elsewhere.bytes())!;
+            jsonSet(mut copy, "manifest-list", Json.Text(path))!;
+            snaps.push(copy)!;
+        }
+        jsonSet(mut m, "snapshots", Json.Array(snaps))!;
+        let location = writeMetadata(mut s, COMPACT_HIDDEN.bytes(), COMPACT_ID.bytes(), 1, borrow m)!;
+        var updated = cloneJson(borrow rec.json)!;
+        jsonSet(mut updated, "metadataLocation", Json.Text(location))!;
+        let _ = writeRecord(
+            mut s,
+            COMPACT_HIDDEN.bytes(),
+            ".s3tables/tables/ns/t".bytes(),
+            borrow updated,
+            PutCondition.None,
+        )!;
+    }
+    compactionWorkload(dir.bytes(), storeConfig());
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    let rec = tableRecord(borrow s, "compact".bytes(), "ns".bytes(), "t".bytes())!;
+    let m = readMetadata(borrow s, COMPACT_HIDDEN.bytes(), jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+    Check.equalU64(1, arrayLength(borrow m, "snapshots") as u64)?;
+    let status = maintenanceDocument(
+        borrow s,
+        COMPACT_HIDDEN.bytes(),
+        jobStatusKey(COMPACT_ID.bytes(), COMPACTION)!.view(),
+    )!;
+    Check.equalBytes("Failed".bytes(), jsonMemberText(borrow status, "status")!)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
 /// A table's metadata whose properties are `props` (a JSON object's members), for the codec choice's tests.
 fn metadataWith(props: StringView) -> Json {
     var text = textOf("{\"format-version\": 2, \"properties\": {");
