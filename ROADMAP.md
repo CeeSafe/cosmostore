@@ -6115,3 +6115,15 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     has its leader killed mid-run, and the new leader runs it. On the slice-1 binary this phase fails ("the new leader
     runs the kept ask", the table left at four files); on this one it passes.
 - **Checks:** 537 unit tests, the S3 smoke, the cluster smoke (209) and the maintenance smoke.
+
+### 25 Nov 2026: M31 slice 3, a maintenance loop per shard (ADR-0128 §4, M22's B3)
+
+- **`tablesMaintenanceShardForever`:** one task per shard slot (group 0's excepted), each with its own timer, asks,
+  pass and leadership. It replaces the node-wide loop.
+- **`--tables-compactions <n>`** (1 to 64, default 2): a node-wide count of compactions at once. Each compaction
+  takes a permit (`compactionPermit`, an atomic count waited on in 200 ms steps) and gives it back on every path.
+  Snapshot management and unreferenced removal take none.
+- **The maintenance smoke's check:** two shards led by the same node. One shard's compaction is held 20 s between
+  copy and put; the other shard's asked run finishes meanwhile. It took 1 s here, and 36 s on the slice-2 binary
+  (failed).
+- **Checks:** 537 unit tests, the cluster smoke (209) and the maintenance smoke.

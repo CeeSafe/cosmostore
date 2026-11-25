@@ -1,6 +1,6 @@
-// Table maintenance on a cluster (ADR-0086 §5, ADR-0110): every hour of a day, each shard this node leads lists its
-// tables from its store and runs each one's jobs as the leader's gated steps (`tables_steps.cee`), not as requests to
-// its own front; the runs a client asked for (`maintenance-run`) within a second.
+// Table maintenance on a cluster (ADR-0086 §5, ADR-0110, ADR-0128): every hour of a day, each shard this node leads
+// lists its tables from its store and runs each one's jobs as the leader's gated steps (`tables_steps.cee`), not as
+// requests to its own front; the runs a client asked for (`maintenance-run`) within a second. A loop per shard.
 
 /// The asks kept in a shard's store (ADR-0128 §3), queued for its new leader's loop, each once.
 async fn queueKeptAsks(slot: borrow ShardSlot) -> Result<void, NodeFault> {
@@ -35,87 +35,82 @@ async fn queueKeptAsks(slot: borrow ShardSlot) -> Result<void, NodeFault> {
     return Ok();
 }
 
-/// Every hour of a day, for each shard this node leads, each table's jobs, run as the leader's gated steps
-/// (ADR-0110 §5); and, within a second, the runs its S3 servers were asked for. A shard it does not lead is its
-/// leader's to maintain.
-async fn tablesMaintenanceClusterForever(shared: borrow NodeShared) -> Result<void, NodeFault> {
+/// One shard's table maintenance on this node (ADR-0128 §4, M22's B3): every hour of a day while this node leads it,
+/// each table's jobs, run as the leader's gated steps (ADR-0110 §5); and, within a second, the runs its S3 servers
+/// were asked for. Each shard has its own loop, so one shard's long compaction holds up no other's asks or passes.
+async fn tablesMaintenanceShardForever(shared: borrow NodeShared, i: usize) -> Result<void, NodeFault> {
+    let slot = borrow shared.slots[i];
+    if (slot.shard == GROUP0_SHARD) { return Ok(); }
     let every = if (shared.tablesDayMs / 24 > 0) shared.tablesDayMs / 24 else 1;
     var sincePass: u64 = 0;
     let tick: u64 = if (every < 1000) every else 1000;
-    // Whether this node led each shard at the last tick: a shard it has just come to lead has its kept asks queued.
-    var led = Vector<bool>.create();
-    for (i in 0..shared.slots.length) {
-        if (led.push(false).isErr()) { return Err(NodeFault.OutOfMemory); }
-    }
+    // Whether this node led the shard at the last tick: when it has just come to lead it, its kept asks are queued.
+    var led = false;
     while (true) {
         if (!(await frontPause(tick))) { return Err(NodeFault.Net); }
         sincePass += tick;
         let pass = sincePass >= every;
         if (pass) { sincePass = 0; }
-        for (i in 0..shared.slots.length) {
-            let slot = borrow shared.slots[i];
-            if (slot.shard == GROUP0_SHARD || slot.failed.load() != 0) { continue; }
-            // A shard this node has come to lead: the asks its last leader kept and did not run, queued (ADR-0128
-            // §3, M22's B2).
-            let leads = await leadsShard(slot)?;
-            if (leads && !led[i]) { await queueKeptAsks(slot)?; }
-            led[i] = leads;
-            // The runs asked for, taken from the queue: a shard this node does not lead drops them (its leader's
-            // server is asked instead).
-            var asked = Vector<AskedRun>.create();
-            {
-                var queue = match (await slot.asked.get().lock()) {
-                    Ok(g) => g,
-                    Err(_) => { return Err(NodeFault.Net); }
-                };
-                let runs = queue.data();
-                while (runs.length > 0) {
-                    if (asked.push(runs.remove(0)).isErr()) { return Err(NodeFault.OutOfMemory); }
+        if (slot.failed.load() != 0) { continue; }
+        // The asks its last leader kept and did not run, queued (ADR-0128 §3, M22's B2).
+        let leads = await leadsShard(slot)?;
+        if (leads && !led) { await queueKeptAsks(slot)?; }
+        led = leads;
+        // The runs asked for, taken from the queue: a shard this node does not lead drops them (its leader's server
+        // is asked instead).
+        var asked = Vector<AskedRun>.create();
+        {
+            var queue = match (await slot.asked.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let runs = queue.data();
+            while (runs.length > 0) {
+                if (asked.push(runs.remove(0)).isErr()) { return Err(NodeFault.OutOfMemory); }
+            }
+        }
+        if (!pass && asked.length == 0) { continue; }
+        if (!leads) { continue; }
+        for (k in 0..asked.length) {
+            await maintainOnShard(shared, i, borrow asked[k].table, asked[k].kind.view())?;
+            // An ask made while it ran is answered by this run, not run again (ADR-0110 §5, the M22 exit review's
+            // finding 4).
+            var queue = match (await slot.asked.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let runs = queue.data();
+            var at: usize = 0;
+            while (at < runs.length) {
+                let r = borrow runs[at];
+                let same = r.kind.view() == asked[k].kind.view() &&
+                    r.table.bucket.view() == asked[k].table.bucket.view() &&
+                    r.table.ns.view() == asked[k].table.ns.view() &&
+                    r.table.name.view() == asked[k].table.name.view();
+                if (same) {
+                    let _ = runs.remove(at);
+                } else {
+                    at += 1;
                 }
             }
-            if (!pass && asked.length == 0) { continue; }
-            if (!leads) { continue; }
-            for (k in 0..asked.length) {
-                await maintainOnShard(shared, i, borrow asked[k].table, asked[k].kind.view())?;
-                // An ask made while it ran is answered by this run, not run again (ADR-0110 §5, the M22 exit
-                // review's finding 4).
-                var queue = match (await slot.asked.get().lock()) {
-                    Ok(g) => g,
-                    Err(_) => { return Err(NodeFault.Net); }
-                };
-                let runs = queue.data();
-                var at: usize = 0;
-                while (at < runs.length) {
-                    let r = borrow runs[at];
-                    let same = r.kind.view() == asked[k].kind.view() &&
-                        r.table.bucket.view() == asked[k].table.bucket.view() &&
-                        r.table.ns.view() == asked[k].table.ns.view() &&
-                        r.table.name.view() == asked[k].table.name.view();
-                    if (same) {
-                        let _ = runs.remove(at);
-                    } else {
-                        at += 1;
-                    }
-                }
-            }
-            if (!pass) { continue; }
-            var tables = Vector<MaintainedTable>.create();
-            {
-                var guard = match (await slot.store.get().lock()) {
-                    Ok(g) => g,
-                    Err(_) => { return Err(NodeFault.Net); }
-                };
-                let st = guard.data();
-                tables = match (await Async.blocking(() => maintainedTables(st))) {
-                    Ok(t) => t,
-                    Err(_) => { continue; }
-                };
-            }
-            for (k in 0..tables.length) {
-                // Compaction between them, as `serve` runs it (ADR-0098 §4).
-                for (kind in [SNAPSHOT_MANAGEMENT, COMPACTION, UNREFERENCED_REMOVAL]) {
-                    await maintainOnShard(shared, i, borrow tables[k], kind.bytes())?;
-                }
+        }
+        if (!pass) { continue; }
+        var tables = Vector<MaintainedTable>.create();
+        {
+            var guard = match (await slot.store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let st = guard.data();
+            tables = match (await Async.blocking(() => maintainedTables(st))) {
+                Ok(t) => t,
+                Err(_) => { continue; }
+            };
+        }
+        for (k in 0..tables.length) {
+            // Compaction between them, as `serve` runs it (ADR-0098 §4).
+            for (kind in [SNAPSHOT_MANAGEMENT, COMPACTION, UNREFERENCED_REMOVAL]) {
+                await maintainOnShard(shared, i, borrow tables[k], kind.bytes())?;
             }
         }
     }

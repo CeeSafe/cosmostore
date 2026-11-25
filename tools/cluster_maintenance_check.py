@@ -59,7 +59,8 @@ if what == "make":
     print("made")
 elif what == "job":
     status = tables.get_table_maintenance_job_status(tableBucketARN=arn, namespace="ns", name=sys.argv[4])
-    print(status["status"]["icebergCompaction"].get("status", ""))
+    kind = sys.argv[5] if len(sys.argv) > 5 else "icebergCompaction"
+    print(status["status"][kind].get("status", ""))
 elif what == "files":
     t = catalog.load_table("ns." + sys.argv[4])
     files = list(t.scan().plan_files())

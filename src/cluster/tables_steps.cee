@@ -288,6 +288,17 @@ async fn removeOnShard(
     return Ok();
 }
 
+/// A compaction's permit (ADR-0128 §4): waited for while the node runs `tablesCompactions` of them; false when the
+/// node is stopping.
+async fn compactionPermit(shared: borrow NodeShared) -> Result<bool, NodeFault> {
+    while (true) {
+        if (shared.compactionsRunning.fetchAdd(1) < shared.tablesCompactions) { return Ok(true); }
+        let _ = shared.compactionsRunning.fetchSub(1);
+        if (!(await frontPause(200))) { return Ok(false); }
+    }
+    return Ok(false);
+}
+
 /// One job of a table on the shard this replica leads, by its kind.
 async fn maintainOnShard(
     shared: borrow NodeShared,
@@ -298,7 +309,14 @@ async fn maintainOnShard(
     let nowMs = Clock.unixMillis();
     let dayMs = truncate<i64>(shared.tablesDayMs);
     if (kind == SNAPSHOT_MANAGEMENT.bytes()) { return await snapshotsOnShard(shared, at, t, nowMs, dayMs); }
-    if (kind == COMPACTION.bytes()) { return await compactOnShard(shared, at, t, nowMs, shared.tablesCopyPauseMs); }
+    if (kind == COMPACTION.bytes()) {
+        // A permit of the node's `--tables-compactions` (ADR-0128 §4): shards compact side by side, a bounded number
+        // at once. It is given back on every path, as no drop may take a lock.
+        if (!(await compactionPermit(shared)?)) { return Err(NodeFault.Net); }
+        let done = await compactOnShard(shared, at, t, nowMs, shared.tablesCopyPauseMs);
+        let _ = shared.compactionsRunning.fetchSub(1);
+        return done;
+    }
     if (kind == UNREFERENCED_REMOVAL.bytes()) { return await removeOnShard(shared, at, t, nowMs, dayMs); }
     return Ok();
 }

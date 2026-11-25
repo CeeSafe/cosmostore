@@ -86,6 +86,9 @@ struct NodeShared {
     tablesDayMs: u64;
     /// `--tables-copy-pause-ms`, a test option (ADR-0110 §7).
     tablesCopyPauseMs: u64;
+    /// `--tables-compactions` (ADR-0128 §4): how many compactions this node's shards run at once, and how many run.
+    tablesCompactions: u64;
+    compactionsRunning: AtomicU64;
     /// Scrub (ADR-0063): how often a pass starts, and what passes found: versions checked, damage found, records
     /// repaired from a replica, extents fetched (a damaged one removed comes back this way, as a missing one does).
     scrubEveryMs: u64;
@@ -369,6 +372,8 @@ fn openNode(
         inventoryDayMs: sts.inventoryDayMs,
         tablesDayMs: sts.tablesDayMs,
         tablesCopyPauseMs: sts.tablesCopyPauseMs,
+        tablesCompactions: sts.tablesCompactions,
+        compactionsRunning: AtomicU64.create(0),
         requests: AtomicU64.create(0),
         scrubEveryMs: scrubEveryMs,
         codeAfterMs: codeAfterMs,
@@ -1562,7 +1567,11 @@ async fn runNode(
         s.spawn(async () => await deliverClusterForever(node));
         s.spawn(async () => await accessLogClusterForever(node));
         s.spawn(async () => await inventoryClusterForever(node));
-        s.spawn(async () => await tablesMaintenanceClusterForever(node));
+        // Table maintenance, a loop per shard (ADR-0128 §4, M22's B3): one shard's long compaction holds up no other's.
+        for (i in 0..node.slots.length) {
+            let at = i;
+            s.spawn(async move () => await tablesMaintenanceShardForever(node, at));
+        }
         s.spawn(async () => await codeForever(node));
         for (i in 0..peers) {
             let at = i;
@@ -1739,6 +1748,7 @@ fn nodeCommand() -> i32 {
         lifecycleEveryMs: (args.lifecycleSeconds ?? 3600) * 1000,
         tablesDayMs: (args.tablesDaySeconds ?? 86400) * 1000,
         tablesCopyPauseMs: args.tablesCopyPauseMs ?? 0,
+        tablesCompactions: args.tablesCompactions ?? 2,
         restoreHourMs: (args.restoreHourSeconds ?? 3600) * 1000,
         zoneId: Vector<u8>.create(),
     };
@@ -2147,6 +2157,8 @@ struct ClusterArguments {
     tablesDaySeconds: u64?;
     /// A test option (ADR-0110 §7): a wait between a compaction bin's copy and its put, 1 to 600000 ms.
     tablesCopyPauseMs: u64?;
+    /// How many compactions the node's shards run at once (ADR-0128 §4), 1 to 64; 2 by default.
+    tablesCompactions: u64?;
     /// `--restore-hour-seconds` (ADR-0102 §6): an hour of a restore's times, and a day of its `Days`.
     restoreHourSeconds: u64?;
     /// How often lifecycle rules run on each shard's leader, 1 to 86400 seconds (tests; an hour by default).
@@ -2180,6 +2192,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
     var inventoryDaySeconds: u64? = null;
     var tablesDaySeconds: u64? = null;
     var tablesCopyPauseMs: u64? = null;
+    var tablesCompactions: u64? = null;
     var restoreHourSeconds: u64? = null;
     var lifecycleSeconds: u64? = null;
     var init = false;
@@ -2253,6 +2266,10 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
             tablesDaySeconds = value.parseInt<u64>();
             let n = tablesDaySeconds ?? 0;
             if (n < 1 || n > 86400) { return null; }
+        } else if (option == "--tables-compactions") {
+            tablesCompactions = value.parseInt<u64>();
+            let n = tablesCompactions ?? 0;
+            if (n < 1 || n > 64) { return null; }
         } else if (option == "--tables-copy-pause-ms") {
             tablesCopyPauseMs = value.parseInt<u64>();
             let n = tablesCopyPauseMs ?? 0;
@@ -2295,6 +2312,7 @@ fn clusterArguments(from: usize) -> ClusterArguments? {
                 inventoryDaySeconds: inventoryDaySeconds,
                 tablesDaySeconds: tablesDaySeconds,
                 tablesCopyPauseMs: tablesCopyPauseMs,
+                tablesCompactions: tablesCompactions,
                 restoreHourSeconds: restoreHourSeconds,
                 lifecycleSeconds: lifecycleSeconds,
                 init: init,
