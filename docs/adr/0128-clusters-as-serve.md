@@ -1,6 +1,11 @@
 # ADR-0128: Clusters as `serve` (M31)
 
-**Status:** proposed, 25 Nov 2026. M31 is ADR-0127's item A (the owner: "A: clusters as serve").
+**Status:** proposed, 25 Nov 2026, with the owner's choices made:
+- a request sees the buckets it made, for its writes ("Bucket existence");
+- asks kept as records beside the queue ("Record + queue");
+- compactions bounded per node, default 2 ("Bounded, default 2").
+
+M31 is ADR-0127's item A (the owner: "A: clusters as serve").
 
 ## Context
 
