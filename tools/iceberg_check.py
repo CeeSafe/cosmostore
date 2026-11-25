@@ -174,6 +174,45 @@ tables.delete_table_policy(tableBucketARN=cfg_arn, namespace="ns", name="inherit
 tables.delete_table(tableBucketARN=cfg_arn, namespace="ns", name="inherits")
 tables.delete_namespace(tableBucketARN=cfg_arn, namespace="ns")
 tables.delete_table_bucket(tableBucketARN=cfg_arn)
+# S3 Tables' encryption (ADR-0126 §3, §4): a KMS table bucket (the smokes' KMS key `orders`), its tables' default.
+kms_key = "arn:aws:kms:us-east-1:000000000000:key/orders"
+enc_arn = tables.create_table_bucket(name="enc-check", encryptionConfiguration={"sseAlgorithm": "aws:kms",
+                                     "kmsKeyArn": kms_key})["arn"]
+got = tables.get_table_bucket_encryption(tableBucketARN=enc_arn)["encryptionConfiguration"]
+check("a table bucket's encryption at its create", (got["sseAlgorithm"], got.get("kmsKeyArn")), ("aws:kms", kms_key))
+tables.create_namespace(tableBucketARN=enc_arn, namespace=["ns"])
+kms_table = tables.create_table(tableBucketARN=enc_arn, namespace="ns", name="sealed", format="ICEBERG")
+got = tables.get_table_encryption(tableBucketARN=enc_arn, namespace="ns", name="sealed")["encryptionConfiguration"]
+check("a table's encryption: its bucket's", got["sseAlgorithm"], "aws:kms")
+own = tables.create_table(tableBucketARN=enc_arn, namespace="ns", name="own", format="ICEBERG",
+                          encryptionConfiguration={"sseAlgorithm": "AES256"})
+check("a table's own encryption", tables.get_table_encryption(tableBucketARN=enc_arn, namespace="ns", name="own")
+      ["encryptionConfiguration"]["sseAlgorithm"], "AES256")
+enc_warehouse = "enc-check--table-s3"
+sealed_key = kms_table["tableARN"].rsplit("/", 1)[1] + "/data/probe.parquet"
+s3.put_object(Bucket=enc_warehouse, Key=sealed_key, Body=b"PAR1")
+head = s3.head_object(Bucket=enc_warehouse, Key=sealed_key)
+check("a write into its warehouse sealed with its key",
+      (head.get("ServerSideEncryption"), head.get("SSEKMSKeyId", "").rsplit("/", 1)[-1]), ("aws:kms", "orders"))
+check("and read back", s3.get_object(Bucket=enc_warehouse, Key=sealed_key)["Body"].read(), b"PAR1")
+try:
+    s3.put_object(Bucket=enc_warehouse, Key=sealed_key, Body=b"PAR1", ServerSideEncryption="AES256")
+    check("a write asking for another encryption refused", "taken", "refused")
+except ClientError as e:
+    check("a write asking for another encryption refused", e.response["Error"]["Code"], "InvalidArgument")
+s3.delete_object(Bucket=enc_warehouse, Key=sealed_key)
+tables.delete_table_bucket_encryption(tableBucketARN=enc_arn)
+try:
+    tables.get_table_bucket_encryption(tableBucketARN=enc_arn)
+    check("the bucket's encryption deleted", "there", "gone")
+except ClientError:
+    check("the bucket's encryption deleted", "gone", "gone")
+check("its table's kept from its create", tables.get_table_encryption(tableBucketARN=enc_arn, namespace="ns",
+      name="sealed")["encryptionConfiguration"]["sseAlgorithm"], "aws:kms")
+for name in ("sealed", "own"):
+    tables.delete_table(tableBucketARN=enc_arn, namespace="ns", name=name)
+tables.delete_namespace(tableBucketARN=enc_arn, namespace="ns")
+tables.delete_table_bucket(tableBucketARN=enc_arn)
 catalog.rename_table("sales.orders", "sales.orders_v2")
 check("rename_table", catalog.list_tables("sales"), [("sales", "orders_v2")])
 check("rows after the rename", catalog.load_table("sales.orders_v2").scan().to_arrow().num_rows, 4)

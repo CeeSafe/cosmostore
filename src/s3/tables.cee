@@ -451,11 +451,15 @@ fn createTableBucket(
     req: borrow S3Request,
     body: Slice<u8>,
 ) -> Result<TablesAnswer, TablesError> {
-    let j = tablesBody(body, ["encryptionConfiguration"][..])?;
+    let j = tablesObject(body)?;
     let name = copyBytes(jsonMemberText(borrow j, "name") ?? "".bytes())?;
     if (!tableBucketNameOk(name.view())) { return Err(TablesError.BadRequest); }
-    // Its tags and storage class (ADR-0126 §1, §2), checked before it is made.
-    let config = createdConfigOf(borrow j, "STANDARD".bytes())?;
+    // Its tags, storage class and encryption (ADR-0126 §1 to §3), checked before it is made.
+    var config = createdConfigOf(borrow j, "STANDARD".bytes())?;
+    match (createdEncryptionOf(borrow j, null)?) {
+        Some(e) => { jsonSet(mut config, "encryption", e)?; }
+        null => {}
+    }
     let hidden = tableWarehouseBucket(name.view())?;
     match (store.createBucket(catalogText(hidden.view()))) {
         Ok() => {}
@@ -761,15 +765,19 @@ fn createTable(
     body: Slice<u8>,
 ) -> Result<TablesAnswer, TablesError> {
     // An Iceberg schema given here becomes the table's first metadata file (ADR-0083 §6).
-    let j = tablesBody(body, ["encryptionConfiguration"][..])?;
+    let j = tablesObject(body)?;
     let name = copyBytes(jsonMemberText(borrow j, "name") ?? "".bytes())?;
     if (!tableNameOk(name.view(), false)) { return Err(TablesError.BadRequest); }
     if (jsonMemberText(borrow j, "format") != Some("ICEBERG".bytes())) { return Err(TablesError.BadRequest); }
-    // Its tags and storage class (ADR-0126 §1, §2): the bucket's class when it gives none.
-    let config = createdConfigOf(
-        borrow j,
-        bucketStorageClass(store, tableWarehouseBucket(bucketName)?.view())?.view(),
-    )?;
+    // Its tags, storage class and encryption (ADR-0126 §1 to §3): the bucket's class and encryption when it gives
+    // none; its encryption never changed after.
+    let warehouseBucket = tableWarehouseBucket(bucketName)?;
+    var config = createdConfigOf(borrow j, bucketStorageClass(store, warehouseBucket.view())?.view())?;
+    let inherited = bucketEncryption(store, warehouseBucket.view())?;
+    match (createdEncryptionOf(borrow j, inherited.asBorrow())?) {
+        Some(e) => { jsonSet(mut config, "encryption", e)?; }
+        null => {}
+    }
     let hidden = tableWarehouseBucket(bucketName)?;
     var id = Vector<u8>.create();
     if (!newUuid(mut id)?) { return Err(TablesError.Internal); }
@@ -1254,6 +1262,15 @@ fn routeTablesSync(
             }
             return Err(TablesError.BadRequest);
         }
+        // Its encryption (ADR-0126 §3).
+        if (segs.length == 3 && segs[2].view() == "encryption".bytes()) {
+            let _ = tableBucketRecord(store, bucket.view())?;
+            let action = if (isMethod(m, Method.Put)) "s3tables:PutTableBucketEncryption"
+                else if (isMethod(m, Method.Delete)) "s3tables:DeleteTableBucketEncryption"
+                else "s3tables:GetTableBucketEncryption";
+            checkTables(store, caller, action, bucket.view(), "".bytes())?;
+            return bucketEncryptionCall(store, req, bucket.view(), body);
+        }
         // Its storage class (ADR-0126 §2).
         if (segs.length == 3 && segs[2].view() == "storage-class".bytes()) {
             let _ = tableBucketRecord(store, bucket.view())?;
@@ -1364,6 +1381,12 @@ fn routeTablesSync(
             checkTables(store, caller, policyActionOf(m, false), bucket.view(), id.view())?;
             let key = tablePolicyKey(id.view())?;
             return tablesPolicyCall(store, m, bucket.view(), key.view(), body, credentials);
+        }
+        if (segs.length == 5 && what == "encryption".bytes() && isMethod(m, Method.Get)) {
+            checkTables(store, caller, "s3tables:GetTableEncryption", bucket.view(), id.view())?;
+            let hidden = tableWarehouseBucket(bucket.view())?;
+            let e = tableEncryption(store, hidden.view(), id.view())?;
+            return encryptionAnswer(e.asBorrow());
         }
         if (segs.length == 5 && what == "storage-class".bytes() && isMethod(m, Method.Get)) {
             checkTables(store, caller, "s3tables:GetTableStorageClass", bucket.view(), id.view())?;

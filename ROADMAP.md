@@ -5906,3 +5906,23 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Results:** 524 unit tests.
 - **Not yet:** encryption (slices 2 to 4). POST and copy into a warehouse take no table class (engines write by PUT
   and multipart); manifests are written STANDARD.
+
+### 25 Nov 2026: M30 slice 2, the encryption configuration and S3's writes sealed by it (ADR-0126 §3, §4)
+
+- **Calls:** `Put`/`Get`/`DeleteTableBucketEncryption` and `GetTableEncryption`, and the creates'
+  `encryptionConfiguration`:
+  - `AES256`, or `aws:kms` with a key ARN or id;
+  - a table's set at its create, its own or its bucket's then, never changed after (a bucket's later change or
+    delete does not reach it).
+- **S3's writes into a table's warehouse** (PUT, multipart, POST, copy):
+  - sealed with the table's encryption when they ask for none;
+  - refused (InvalidArgument) when they ask for another, the owner's choice.
+  - A table with none takes the bucket's S3 default as before.
+- **Checks:** `iceberg_check.py` runs:
+  - a KMS table bucket, and its table's encryption inherited;
+  - a table's own AES256;
+  - a write into the warehouse sealed with the `orders` key and read back;
+  - a write asking AES256 refused;
+  - the bucket's encryption deleted, its table's kept.
+- **Not yet:** the catalog's own files (slice 3) and compaction (slice 4). Until then an encrypted table's manifests
+  are sealed, and its maintenance cannot read them: it fails (Failed), never wrongly.

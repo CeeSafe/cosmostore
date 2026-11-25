@@ -265,3 +265,155 @@ async fn withTableStorageClass(
     metadataAdd(mut out, STORAGE_CLASS_FIELD.bytes(), storageClass.view())?;
     return Ok(out);
 }
+
+// ---- Encryption (ADR-0126 §3, §4) ----
+
+/// An `encryptionConfiguration` as S3 Tables takes it: `AES256`, or `aws:kms` with a `kmsKeyArn` naming a KMS key
+/// (its ARN or id); kept as `{sseAlgorithm, kmsKeyArn}`. Null when it is not one taken.
+fn encryptionConfigOf(j: borrow Json) -> Result<Json?, AllocError> {
+    let algorithm = jsonMemberText(j, "sseAlgorithm") ?? { return Ok(null); };
+    var out = jsonObject();
+    if (algorithm == "AES256".bytes()) {
+        if (jsonMember(j, "kmsKeyArn").isSome()) { return Ok(null); }
+        jsonSet(mut out, "sseAlgorithm", jsonString("AES256".bytes())?)?;
+        return Ok(Some(out));
+    }
+    if (algorithm != "aws:kms".bytes()) { return Ok(null); }
+    let key = jsonMemberText(j, "kmsKeyArn") ?? { return Ok(null); };
+    if (kmsKeyNameOf(key).isNull()) { return Ok(null); }
+    jsonSet(mut out, "sseAlgorithm", jsonString("aws:kms".bytes())?)?;
+    jsonSet(mut out, "kmsKeyArn", jsonString(key)?)?;
+    return Ok(Some(out));
+}
+
+/// What a kept encryption seals with: SSE-S3, or SSE-KMS by its key.
+fn sseOfEncryption(e: borrow Json) -> SseRequest {
+    if (jsonMemberText(e, "sseAlgorithm") == Some("aws:kms".bytes())) {
+        return match (kmsKeyNameOf(jsonMemberText(e, "kmsKeyArn") ?? "".bytes())) {
+            Some(n) => SseRequest.Kms(n),
+            null => SseRequest.Managed,
+        };
+    }
+    return SseRequest.Managed;
+}
+
+/// A table bucket's encryption, null when it has none.
+fn bucketEncryption(store: borrow ObjectStore, hidden: Slice<u8>) -> Result<Json?, TablesError> {
+    let config = readTablesConfig(store, hidden, TABLE_BUCKET_CONFIG_KEY.bytes())?;
+    return match (jsonMember(borrow config, "encryption")) {
+        Some(e) => Ok(Some(cloneJson(e)?)),
+        null => Ok(null),
+    };
+}
+
+/// A table's encryption, as its create set it (its own, or its bucket's then); null when it has none.
+fn tableEncryption(store: borrow ObjectStore, hidden: Slice<u8>, id: Slice<u8>) -> Result<Json?, TablesError> {
+    let config = readTablesConfig(store, hidden, tableConfigKey(id)?.view())?;
+    return match (jsonMember(borrow config, "encryption")) {
+        Some(e) => Ok(Some(cloneJson(e)?)),
+        null => Ok(null),
+    };
+}
+
+fn encryptionAnswer(e: borrow Json?) -> Result<TablesAnswer, TablesError> {
+    var answer = jsonObject();
+    jsonSet(
+        mut answer,
+        "encryptionConfiguration",
+        match (e) {
+            Some(x) => cloneJson(x)?,
+            null => {
+                var managed = jsonObject();
+                jsonSet(mut managed, "sseAlgorithm", jsonString("AES256".bytes())?)?;
+                managed
+            }
+        },
+    )?;
+    return tablesJson(borrow answer);
+}
+
+/// PutTableBucketEncryption, GetTableBucketEncryption and DeleteTableBucketEncryption (ADR-0126 §3): the bucket's
+/// encryption, its tables' default at their create.
+fn bucketEncryptionCall(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucket: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucket)?;
+    var config = readTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes())?;
+    if (isMethod(req.method, Method.Put)) {
+        let j = tablesObject(body)?;
+        let e = encryptionConfigOf(jsonMember(borrow j, "encryptionConfiguration") ?? {
+            return Err(TablesError.BadRequest);
+        })? ?? { return Err(TablesError.BadRequest); };
+        jsonSet(mut config, "encryption", e)?;
+        writeTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes(), borrow config)?;
+        return tablesJson(borrow jsonObject());
+    }
+    if (isMethod(req.method, Method.Get)) {
+        let kept: Json? = match (jsonMember(borrow config, "encryption")) {
+            Some(e) => Some(cloneJson(e)?),
+            null => { return Err(TablesError.NotFound); }
+        };
+        return encryptionAnswer(kept.asBorrow());
+    }
+    if (isMethod(req.method, Method.Delete)) {
+        jsonRemove(mut config, "encryption".bytes());
+        writeTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes(), borrow config)?;
+        return Ok(tablesNoContent());
+    }
+    return Err(TablesError.BadRequest);
+}
+
+/// A create's encryption (ADR-0126 §3): its own `encryptionConfiguration`, else `inherited` (its bucket's); none
+/// when neither is given. Err(BadRequest) for one not taken.
+fn createdEncryptionOf(request: borrow Json, inherited: borrow Json?) -> Result<Json?, TablesError> {
+    return match (jsonMember(request, "encryptionConfiguration")) {
+        Some(e) => Ok(Some(encryptionConfigOf(e)? ?? { return Err(TablesError.BadRequest); })),
+        null => match (inherited) {
+            Some(i) => Ok(Some(cloneJson(i)?)),
+            null => Ok(null),
+        },
+    };
+}
+
+/// The encryption a write into a table's warehouse is sealed with (ADR-0126 §4): its table's, when it has one and
+/// the write asks for none; null when the table has none (the bucket's default applies, as S3's). A write that asks
+/// for another than its table's is refused, as S3 Tables refuses.
+async fn tableWriteSse(
+    app: borrow S3App,
+    bucket: Slice<u8>,
+    key: Slice<u8>,
+    asked: borrow SseRequest,
+) -> Result<SseRequest?, S3Fail> {
+    if (!isTableWarehouseShaped(bucket)) { return Ok(null); }
+    let id = copyBytes(tableIdOfKey(key, false) ?? { return Ok(null); })?;
+    var found: Json? = null;
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let idView = id.view();
+        found = match (await Async.blocking(() => tableEncryption(store, bucket, idView))) {
+            Ok(e) => e,
+            Err(TablesError.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
+            Err(_) => null,
+        };
+    }
+    let e = found ?? { return Ok(null); };
+    let table = sseOfEncryption(borrow e);
+    let same = match (asked) {
+        SseRequest.None => true,
+        SseRequest.Managed => match (table) {
+            SseRequest.Managed => true,
+            _ => false,
+        },
+        SseRequest.Kms(n) => match (borrow table) {
+            SseRequest.Kms(t) => n.view() == t.view() || n.view().length == 0,
+            _ => false,
+        },
+        SseRequest.Customer(_) => false,
+    };
+    if (!same) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
+    return Ok(Some(table));
+}
