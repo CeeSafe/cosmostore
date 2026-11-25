@@ -87,5 +87,27 @@ class Tables {
         t.deleteNamespace(r -> r.tableBucketARN(carn).namespace("ns"));
         t.deleteTableBucket(r -> r.tableBucketARN(carn));
         Check.check("DeleteTableBucket: configured", t.listTableBuckets(r -> {}).tableBuckets().size(), 0);
+        // Metrics and record expiration (ADR-0130): a table bucket's metrics configuration put, read and deleted; record
+        // expiration is not offered. The SDK's 2.57.11 has no PutTableBucketLogging or GetTableBucketLogging, so the
+        // logging configuration is checked by the .NET SDK.
+        String larn = t.createTableBucket(r -> r.name("sdk-java-logged")).arn();
+        Check.check("GetTableBucketMetricsConfiguration: none",
+            Directory.codeOf(() -> t.getTableBucketMetricsConfiguration(r -> r.tableBucketARN(larn))), "NotFoundException");
+        t.putTableBucketMetricsConfiguration(r -> r.tableBucketARN(larn));
+        var mc = t.getTableBucketMetricsConfiguration(r -> r.tableBucketARN(larn));
+        Check.check("PutTableBucketMetricsConfiguration", mc.tableBucketARN() + " " + !mc.id().isEmpty(), larn + " true");
+        t.deleteTableBucketMetricsConfiguration(r -> r.tableBucketARN(larn));
+        Check.check("DeleteTableBucketMetricsConfiguration",
+            Directory.codeOf(() -> t.getTableBucketMetricsConfiguration(r -> r.tableBucketARN(larn))), "NotFoundException");
+        t.createNamespace(r -> r.tableBucketARN(larn).namespace("ns"));
+        String larnT = t.createTable(r -> r.tableBucketARN(larn).namespace("ns").name("t").format(OpenTableFormat.ICEBERG)).tableARN();
+        Check.check("GetTableRecordExpirationConfiguration: not offered",
+            Directory.codeOf(() -> t.getTableRecordExpirationConfiguration(r -> r.tableArn(larnT))), "MethodNotAllowedException");
+        Check.check("GetTableRecordExpirationJobStatus: not offered",
+            Directory.codeOf(() -> t.getTableRecordExpirationJobStatus(r -> r.tableArn(larnT))), "MethodNotAllowedException");
+        t.deleteTable(r -> r.tableBucketARN(larn).namespace("ns").name("t"));
+        t.deleteNamespace(r -> r.tableBucketARN(larn).namespace("ns"));
+        t.deleteTableBucket(r -> r.tableBucketARN(larn));
+        Check.check("DeleteTableBucket: with metrics", t.listTableBuckets(r -> {}).tableBuckets().size(), 0);
     }
 }

@@ -26,6 +26,8 @@ enum TablesError {
     NotFound,
     Conflict,
     NotImplemented,
+    /// A call S3 Tables does not take for this resource (record expiration on a table one makes, ADR-0130 §5).
+    MethodNotAllowed,
     Internal,
     @from OutOfMemory(AllocError),
     @from Failed(S3Fail),
@@ -37,6 +39,7 @@ fn tablesErrorStatus(e: borrow TablesError) -> u16 => match (e) {
     TablesError.NotFound => 404,
     TablesError.Conflict => 409,
     TablesError.NotImplemented => 501,
+    TablesError.MethodNotAllowed => 405,
     _ => 500,
 };
 
@@ -46,6 +49,7 @@ fn tablesErrorName(e: borrow TablesError) -> StringView => match (e) {
     TablesError.NotFound => "NotFoundException",
     TablesError.Conflict => "ConflictException",
     TablesError.NotImplemented => "NotImplemented",
+    TablesError.MethodNotAllowed => "MethodNotAllowedException",
     _ => "InternalServerErrorException",
 };
 
@@ -55,6 +59,7 @@ fn tablesErrorMessage(e: borrow TablesError) -> StringView => match (e) {
     TablesError.NotFound => "The specified resource was not found.",
     TablesError.Conflict => "The request conflicts with the resource's current state.",
     TablesError.NotImplemented => "This part of S3 Tables is not implemented.",
+    TablesError.MethodNotAllowed => "Record expiration is for AWS managed tables, not tables one makes.",
     _ => "An internal error occurred.",
 };
 
@@ -1233,6 +1238,11 @@ fn routeTablesSync(
         checkTables(store, caller, action, bucket.view(), id.view())?;
         return tablesTagCall(store, req, bucket.view(), id.view(), body);
     }
+    // Record expiration (ADR-0130 §5): AWS's for its managed tables, which CosmoStore has none of.
+    if ((top == "table-record-expiration".bytes() || top == "table-record-expiration-job-status".bytes()) &&
+        segs.length == 1) {
+        return Err(TablesError.MethodNotAllowed);
+    }
     if (top == "get-table".bytes() && segs.length == 1) {
         if (!isMethod(m, Method.Get)) { return Err(TablesError.BadRequest); }
         return getTable(store, req, caller);
@@ -1294,6 +1304,15 @@ fn routeTablesSync(
                 else "s3tables:GetTableBucketEncryption";
             checkTables(store, caller, action, bucket.view(), "".bytes())?;
             return bucketEncryptionCall(store, req, bucket.view(), body, sealing);
+        }
+        // Its metrics configuration (ADR-0130 §4).
+        if (segs.length == 3 && segs[2].view() == "metrics".bytes()) {
+            let _ = tableBucketRecord(store, bucket.view())?;
+            let action = if (isMethod(m, Method.Put)) "s3tables:PutTableBucketMetricsConfiguration"
+                else if (isMethod(m, Method.Delete)) "s3tables:DeleteTableBucketMetricsConfiguration"
+                else "s3tables:GetTableBucketMetricsConfiguration";
+            checkTables(store, caller, action, bucket.view(), "".bytes())?;
+            return bucketMetricsCall(store, req, bucket.view());
         }
         // Its logging (ADR-0130 §1): a Put is taken before the store's work, in `routeTables`.
         if (segs.length == 3 && segs[2].view() == "logging".bytes()) {
@@ -1564,6 +1583,8 @@ async fn serveTables(
             } else {
                 let caller = tablesCallerOf(app, req, borrow who, body.view())?;
                 let answered = await routeTables(app, req, body.view(), borrow who, borrow caller);
+                // Its table bucket's request counts (ADR-0130 §4).
+                await countTablesRequest(app, req, body.view(), borrow answered);
                 // Its table bucket's log record (ADR-0130 §2): what the hook after the answer queues, if it logs.
                 if (app.loggingBuckets.load() > 0) {
                     tablesLogFacts(app, req, body.view(), borrow auth, borrow caller, borrow answered, facts)?;

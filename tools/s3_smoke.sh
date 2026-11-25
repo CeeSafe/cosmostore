@@ -1603,6 +1603,17 @@ aws s3tables delete-table-bucket-encryption --table-bucket-arn "$carn" > /dev/nu
 check "none after" "$(code s3tables get-table-bucket-encryption --table-bucket-arn "$carn")" NotFoundException
 check "the table's kept" "$(aws s3tables get-table-encryption --table-bucket-arn "$carn" --namespace ns --name t --query encryptionConfiguration.sseAlgorithm --output text 2>&1)" aws:kms
 aws s3tables put-table-bucket-encryption --table-bucket-arn "$carn" --encryption-configuration sseAlgorithm=AES256 > /dev/null 2>&1 && pass "put-table-bucket-encryption" || fail "put-table-bucket-encryption"
+# Metrics and record expiration (ADR-0130 §4, §5): metrics kept, an id answered, the bucket's requests counted in the
+# stats endpoint; record expiration is AWS's for its managed tables.
+check "no metrics configuration at first" "$(code s3tables get-table-bucket-metrics-configuration --table-bucket-arn "$carn")" NotFoundException
+aws s3tables put-table-bucket-metrics-configuration --table-bucket-arn "$carn" > /dev/null 2>&1 && pass "put-table-bucket-metrics-configuration" || fail "put-table-bucket-metrics-configuration"
+check "get-table-bucket-metrics-configuration" "$(aws s3tables get-table-bucket-metrics-configuration --table-bucket-arn "$carn" --query tableBucketARN --output text 2>&1)" "$carn"
+check "its requests counted in the stats" "$(curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" "$AWS_ENDPOINT_URL/_cosmostore/stats" | python3 -I -c 'import json,sys; t=[b for b in json.load(sys.stdin)["tableBuckets"] if b["name"]=="smoke-config"]; print(len(t) == 1 and t[0]["requests"] > 5 and t[0]["clientErrors"] >= 1)')" True
+aws s3tables delete-table-bucket-metrics-configuration --table-bucket-arn "$carn" > /dev/null 2>&1 && pass "delete-table-bucket-metrics-configuration" || fail "delete-table-bucket-metrics-configuration"
+check "and not counted in the stats" "$(curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" "$AWS_ENDPOINT_URL/_cosmostore/stats" | python3 -I -c 'import json,sys; print([b["name"] for b in json.load(sys.stdin)["tableBuckets"]])')" "[]"
+check "record expiration: AWS's managed tables only" "$(code s3tables get-table-record-expiration-configuration --table-arn "$ctarn")" MethodNotAllowedException
+check "nor put" "$(code s3tables put-table-record-expiration-configuration --table-arn "$ctarn" --value 'status=enabled,settings={days=30}')" MethodNotAllowedException
+check "nor its job's status" "$(code s3tables get-table-record-expiration-job-status --table-arn "$ctarn")" MethodNotAllowedException
 aws s3tables delete-table --table-bucket-arn "$carn" --namespace ns --name t > /dev/null 2>&1
 check "a table's tags gone with it" "$(code s3tables list-tags-for-resource --resource-arn "$ctarn")" NotFoundException
 aws s3tables delete-namespace --table-bucket-arn "$carn" --namespace ns > /dev/null 2>&1

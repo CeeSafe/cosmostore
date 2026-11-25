@@ -93,3 +93,20 @@ M32 is ADR-0129's item A (the owner: "A: Tables' small calls").
 
 - **S3 Tables' API is done but for replication and migrations.**
 - **A table bucket's requests can be audited** where its owner reads logs.
+
+## As built (slices 1 to 4)
+
+- **§1:** the configuration is kept as the table bucket's warehouse's logging, in the store's bucket configuration
+  (logging value version 3), so its warehouse's requests reach the access log hook as any bucket's do.
+- **§2:**
+  - a call's operation is the action its first authorization noted on its caller;
+  - a warehouse request's namespace and table name are `-`, not looked up per request;
+  - bytes sent and object size are `-`, as in S3's lines here.
+- **§4, the counts:** CosmoStore has no `/metrics` endpoint; this ADR assumed one wrongly.
+  - The counts are in the stats endpoint (`GET /_cosmostore/stats`): `tableBuckets`, with each table bucket's
+    requests, client errors and server errors, for those whose metrics configuration is on.
+  - They are counted in memory, per server, since it started.
+- **§6:**
+  - the AWS CLI 2.34 has no logging commands (2.40 added them), so boto3 checks logging;
+  - the Java SDK pinned in the matrix (2.57.11) has no logging calls, so Java checks metrics and record expiration
+    only. Go, JS and .NET check all three.

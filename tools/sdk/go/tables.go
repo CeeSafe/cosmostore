@@ -73,6 +73,7 @@ func tables(ctx context.Context, cfg aws.Config) {
 	must(t.DeleteTableBucket(ctx, &s3tables.DeleteTableBucketInput{TableBucketARN: arn}))
 	check("DeleteTableBucket", len(must(t.ListTableBuckets(ctx, &s3tables.ListTableBucketsInput{})).TableBuckets), 0)
 	tablesConfig(ctx, t)
+	tablesLogging(ctx, t, s)
 }
 
 // Tags, storage class and encryption (ADR-0126): a table bucket's, set at its create and changed after; a table takes
@@ -150,4 +151,89 @@ func tablesConfig(ctx context.Context, t *s3tables.Client) {
 	must(t.DeleteNamespace(ctx, &s3tables.DeleteNamespaceInput{TableBucketARN: arn, Namespace: aws.String("ns")}))
 	must(t.DeleteTableBucket(ctx, &s3tables.DeleteTableBucketInput{TableBucketARN: arn}))
 	check("DeleteTableBucket: the configured one", len(must(t.ListTableBuckets(ctx, &s3tables.ListTableBucketsInput{})).TableBuckets), 0)
+}
+
+// Logging, metrics and record expiration (ADR-0130): a table bucket's access log configuration put, read back and
+// turned off, never into its own warehouse; its metrics configuration put, read and deleted; record expiration is
+// not offered, so its calls answer MethodNotAllowedException.
+func tablesLogging(ctx context.Context, t *s3tables.Client, s *s3.Client) {
+	const logs = "sdk-go-tlogs"
+	must(s.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(logs)}))
+	made, err := t.CreateTableBucket(ctx, &s3tables.CreateTableBucketInput{Name: aws.String("sdk-go-logged")})
+	check("CreateTableBucket: one to log", codeOf(err), "no error")
+	if err != nil {
+		return
+	}
+	arn := made.Arn
+	logging := func() *tabletypes.LoggingEnabled {
+		got := must(t.GetTableBucketLogging(ctx, &s3tables.GetTableBucketLoggingInput{TableBucketARN: arn}))
+		if got.TableBucketLoggingStatus == nil {
+			return nil
+		}
+		return got.TableBucketLoggingStatus.LoggingEnabled
+	}
+	putLogging := func(target string) error {
+		_, err := t.PutTableBucketLogging(ctx, &s3tables.PutTableBucketLoggingInput{TableBucketARN: arn,
+			TableBucketLoggingStatus: &tabletypes.TableBucketLoggingStatus{LoggingEnabled: &tabletypes.LoggingEnabled{
+				TargetBucket: aws.String(target), TargetPrefix: aws.String("tl/"),
+				TargetObjectKeyFormat: &tabletypes.TargetObjectKeyFormat{PartitionedPrefix: &tabletypes.PartitionedPrefix{
+					PartitionDateSource: tabletypes.PartitionDateSourceEventTime}}}}})
+		return err
+	}
+	check("GetTableBucketLogging: none at first", logging() == nil, true)
+	check("PutTableBucketLogging", codeOf(putLogging(logs)), "no error")
+	on := logging()
+	if on != nil {
+		source := tabletypes.PartitionDateSource("")
+		if on.TargetObjectKeyFormat != nil && on.TargetObjectKeyFormat.PartitionedPrefix != nil {
+			source = on.TargetObjectKeyFormat.PartitionedPrefix.PartitionDateSource
+		}
+		check("GetTableBucketLogging: as put", []any{aws.ToString(on.TargetBucket), aws.ToString(on.TargetPrefix), source},
+			[]any{logs, "tl/", tabletypes.PartitionDateSourceEventTime})
+	} else {
+		check("GetTableBucketLogging: as put", "no loggingEnabled", logs)
+	}
+	check("PutTableBucketLogging: into its own warehouse", codeOf(putLogging("sdk-go-logged--table-s3")), "BadRequestException")
+	_, err = t.PutTableBucketLogging(ctx, &s3tables.PutTableBucketLoggingInput{TableBucketARN: arn,
+		TableBucketLoggingStatus: &tabletypes.TableBucketLoggingStatus{}})
+	check("PutTableBucketLogging: turned off", codeOf(err), "no error")
+	check("GetTableBucketLogging: none after", logging() == nil, true)
+	metrics := func() (*s3tables.GetTableBucketMetricsConfigurationOutput, error) {
+		return t.GetTableBucketMetricsConfiguration(ctx, &s3tables.GetTableBucketMetricsConfigurationInput{TableBucketARN: arn})
+	}
+	_, err = metrics()
+	check("GetTableBucketMetricsConfiguration: none at first", codeOf(err), "NotFoundException")
+	_, err = t.PutTableBucketMetricsConfiguration(ctx, &s3tables.PutTableBucketMetricsConfigurationInput{TableBucketARN: arn})
+	check("PutTableBucketMetricsConfiguration", codeOf(err), "no error")
+	mc, err := metrics()
+	if err == nil {
+		check("GetTableBucketMetricsConfiguration", []any{aws.ToString(mc.TableBucketARN), aws.ToString(mc.Id) != ""},
+			[]any{aws.ToString(arn), true})
+	} else {
+		check("GetTableBucketMetricsConfiguration", codeOf(err), "no error")
+	}
+	_, err = t.DeleteTableBucketMetricsConfiguration(ctx, &s3tables.DeleteTableBucketMetricsConfigurationInput{TableBucketARN: arn})
+	check("DeleteTableBucketMetricsConfiguration", codeOf(err), "no error")
+	_, err = metrics()
+	check("GetTableBucketMetricsConfiguration: none after", codeOf(err), "NotFoundException")
+	must(t.CreateNamespace(ctx, &s3tables.CreateNamespaceInput{TableBucketARN: arn, Namespace: []string{"ns"}}))
+	table := must(t.CreateTable(ctx, &s3tables.CreateTableInput{TableBucketARN: arn, Namespace: aws.String("ns"),
+		Name: aws.String("t"), Format: tabletypes.OpenTableFormatIceberg}))
+	_, err = t.GetTableRecordExpirationConfiguration(ctx, &s3tables.GetTableRecordExpirationConfigurationInput{TableArn: table.TableARN})
+	check("GetTableRecordExpirationConfiguration: not offered", codeOf(err), "MethodNotAllowedException")
+	_, err = t.GetTableRecordExpirationJobStatus(ctx, &s3tables.GetTableRecordExpirationJobStatusInput{TableArn: table.TableARN})
+	check("GetTableRecordExpirationJobStatus: not offered", codeOf(err), "MethodNotAllowedException")
+	must(t.DeleteTable(ctx, &s3tables.DeleteTableInput{TableBucketARN: arn, Namespace: aws.String("ns"), Name: aws.String("t")}))
+	must(t.DeleteNamespace(ctx, &s3tables.DeleteNamespaceInput{TableBucketARN: arn, Namespace: aws.String("ns")}))
+	must(t.DeleteTableBucket(ctx, &s3tables.DeleteTableBucketInput{TableBucketARN: arn}))
+	check("DeleteTableBucket: the logged one", len(must(t.ListTableBuckets(ctx, &s3tables.ListTableBucketsInput{})).TableBuckets), 0)
+	// The logs bucket may hold delivered logs under any prefix.
+	pages := s3.NewListObjectsV2Paginator(s, &s3.ListObjectsV2Input{Bucket: aws.String(logs)})
+	for pages.HasMorePages() {
+		for _, o := range must(pages.NextPage(ctx)).Contents {
+			must(s.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(logs), Key: o.Key}))
+		}
+	}
+	_, err = s.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(logs)})
+	check("DeleteBucket: the logs bucket", codeOf(err), "no error")
 }

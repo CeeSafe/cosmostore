@@ -547,6 +547,58 @@ foreach (var sessions in new[] { false })
     await t.DeleteNamespaceAsync(new Amazon.S3Tables.Model.DeleteNamespaceRequest { TableBucketARN = carn, Namespace = "ns" });
     await t.DeleteTableBucketAsync(new Amazon.S3Tables.Model.DeleteTableBucketRequest { TableBucketARN = carn });
     Check("DeleteTableBucket: configured", (await t.ListTableBucketsAsync(new Amazon.S3Tables.Model.ListTableBucketsRequest())).TableBuckets?.Count ?? 0, 0);
+    // Logging, metrics and record expiration (ADR-0130): a table bucket's logging configuration put, read and cleared,
+    // never to its own warehouse; its metrics configuration put, read and deleted; record expiration is not offered.
+    await s3.PutBucketAsync("sdk-dotnet-tlogs");
+    var larn = (await t.CreateTableBucketAsync(new Amazon.S3Tables.Model.CreateTableBucketRequest { Name = "sdk-dotnet-logged" })).Arn;
+    async Task<Amazon.S3Tables.Model.LoggingEnabled> LoggingOf() => (await t.GetTableBucketLoggingAsync(new Amazon.S3Tables.Model.GetTableBucketLoggingRequest { TableBucketARN = larn }))
+        .TableBucketLoggingStatus?.LoggingEnabled;
+    Task<string> PutLogging(Amazon.S3Tables.Model.LoggingEnabled enabled) => CodeOf(() => t.PutTableBucketLoggingAsync(new Amazon.S3Tables.Model.PutTableBucketLoggingRequest
+    {
+        TableBucketARN = larn, TableBucketLoggingStatus = new Amazon.S3Tables.Model.TableBucketLoggingStatus { LoggingEnabled = enabled },
+    }));
+    Check("GetTableBucketLogging: none", await LoggingOf() == null, true);
+    Check("PutTableBucketLogging", await PutLogging(new Amazon.S3Tables.Model.LoggingEnabled
+    {
+        TargetBucket = "sdk-dotnet-tlogs", TargetPrefix = "tl/",
+        TargetObjectKeyFormat = new Amazon.S3Tables.Model.TargetObjectKeyFormat
+        {
+            PartitionedPrefix = new Amazon.S3Tables.Model.PartitionedPrefix { PartitionDateSource = Amazon.S3Tables.PartitionDateSource.EventTime },
+        },
+    }), "no error");
+    var logging = await LoggingOf();
+    Check("GetTableBucketLogging", logging?.TargetBucket + " " + logging?.TargetPrefix + " " + logging?.TargetObjectKeyFormat?.PartitionedPrefix?.PartitionDateSource?.Value,
+        "sdk-dotnet-tlogs tl/ EventTime");
+    Check("PutTableBucketLogging: to its own warehouse", await PutLogging(new Amazon.S3Tables.Model.LoggingEnabled
+    {
+        TargetBucket = "sdk-dotnet-logged--table-s3", TargetPrefix = "tl/",
+    }), "BadRequestException");
+    Check("PutTableBucketLogging: cleared", await PutLogging(null), "no error");
+    Check("GetTableBucketLogging: cleared", await LoggingOf() == null, true);
+    var metricsOf = new Amazon.S3Tables.Model.GetTableBucketMetricsConfigurationRequest { TableBucketARN = larn };
+    Check("GetTableBucketMetricsConfiguration: none", await CodeOf(() => t.GetTableBucketMetricsConfigurationAsync(metricsOf)), "NotFoundException");
+    await t.PutTableBucketMetricsConfigurationAsync(new Amazon.S3Tables.Model.PutTableBucketMetricsConfigurationRequest { TableBucketARN = larn });
+    var metrics = await t.GetTableBucketMetricsConfigurationAsync(metricsOf);
+    Check("PutTableBucketMetricsConfiguration", metrics.TableBucketARN + " " + !string.IsNullOrEmpty(metrics.Id), larn + " True");
+    await t.DeleteTableBucketMetricsConfigurationAsync(new Amazon.S3Tables.Model.DeleteTableBucketMetricsConfigurationRequest { TableBucketARN = larn });
+    Check("DeleteTableBucketMetricsConfiguration", await CodeOf(() => t.GetTableBucketMetricsConfigurationAsync(metricsOf)), "NotFoundException");
+    await t.CreateNamespaceAsync(new Amazon.S3Tables.Model.CreateNamespaceRequest { TableBucketARN = larn, Namespace = new List<string> { "ns" } });
+    var expiring = (await t.CreateTableAsync(new Amazon.S3Tables.Model.CreateTableRequest
+    {
+        TableBucketARN = larn, Namespace = "ns", Name = "t", Format = Amazon.S3Tables.OpenTableFormat.ICEBERG,
+    })).TableARN;
+    Check("GetTableRecordExpirationConfiguration: not offered", await CodeOf(() => t.GetTableRecordExpirationConfigurationAsync(
+        new Amazon.S3Tables.Model.GetTableRecordExpirationConfigurationRequest { TableArn = expiring })), "MethodNotAllowedException");
+    Check("GetTableRecordExpirationJobStatus: not offered", await CodeOf(() => t.GetTableRecordExpirationJobStatusAsync(
+        new Amazon.S3Tables.Model.GetTableRecordExpirationJobStatusRequest { TableArn = expiring })), "MethodNotAllowedException");
+    await t.DeleteTableAsync(new Amazon.S3Tables.Model.DeleteTableRequest { TableBucketARN = larn, Namespace = "ns", Name = "t" });
+    await t.DeleteNamespaceAsync(new Amazon.S3Tables.Model.DeleteNamespaceRequest { TableBucketARN = larn, Namespace = "ns" });
+    await t.DeleteTableBucketAsync(new Amazon.S3Tables.Model.DeleteTableBucketRequest { TableBucketARN = larn });
+    Check("DeleteTableBucket: logged", (await t.ListTableBucketsAsync(new Amazon.S3Tables.Model.ListTableBucketsRequest())).TableBuckets?.Count ?? 0, 0);
+    // Logs may have been delivered to the target bucket; it is emptied before it is deleted.
+    foreach (var o in (await s3.ListObjectsV2Async(new ListObjectsV2Request { BucketName = "sdk-dotnet-tlogs" })).S3Objects ?? new List<S3Object>())
+        await s3.DeleteObjectAsync("sdk-dotnet-tlogs", o.Key);
+    Check("DeleteBucket: the logs' target", await CodeOf(() => s3.DeleteBucketAsync("sdk-dotnet-tlogs")), "no error");
 }
 // The IAM API (ADR-0104): a user, its key and policy; the key signs within an upkeep round (10 s here); a role made
 // with a trust policy and assumed; everything deleted, and the key refused after.

@@ -634,3 +634,148 @@ fn tablesAllowedOnBucket(
     let _ = tableBucketRecord(store, bucket)?;
     return checkTables(store, caller, action, bucket, "".bytes());
 }
+
+// ---- Metrics (ADR-0130 §4) ----
+
+/// One table bucket's requests since the server started: all, and those answered 4xx and 5xx.
+struct TablesCount {
+    bucket: Vector<u8>;
+    requests: u64;
+    clientErrors: u64;
+    serverErrors: u64;
+}
+
+/// Put, Get and DeleteTableBucketMetricsConfiguration: kept in the table bucket's configuration record, with an id
+/// given at its Put; Get answers its table bucket's ARN and that id, NotFoundException when it is off.
+fn bucketMetricsCall(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucket: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucket)?;
+    var config = readTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes())?;
+    if (isMethod(req.method, Method.Put)) {
+        if (jsonMember(borrow config, "metrics").isNull()) {
+            var id = Vector<u8>.create();
+            if (!newUuid(mut id)?) { return Err(TablesError.Internal); }
+            var metrics = jsonObject();
+            jsonSet(mut metrics, "id", Json.Text(id))?;
+            jsonSet(mut config, "metrics", metrics)?;
+            writeTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes(), borrow config)?;
+        }
+        return Ok(tablesAnswer(200, Vector<u8>.create()));
+    }
+    if (isMethod(req.method, Method.Delete)) {
+        if (jsonMember(borrow config, "metrics").isSome()) {
+            jsonRemove(mut config, "metrics".bytes());
+            writeTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes(), borrow config)?;
+        }
+        return Ok(tablesNoContent());
+    }
+    if (!isMethod(req.method, Method.Get)) { return Err(TablesError.BadRequest); }
+    let metrics = jsonMember(borrow config, "metrics") ?? { return Err(TablesError.NotFound); };
+    var arn = Vector<u8>.create();
+    tableBucketArn(req, bucket, mut arn)?;
+    var answer = jsonObject();
+    jsonSet(mut answer, "tableBucketARN", Json.Text(arn))?;
+    jsonSet(mut answer, "id", jsonString(jsonMemberText(metrics, "id") ?? "".bytes())?)?;
+    return tablesJson(borrow answer);
+}
+
+/// Whether a table bucket's metrics are on (ADR-0130 §4).
+fn tablesMetricsOn(store: borrow ObjectStore, bucket: Slice<u8>) -> bool {
+    let hidden = match (tableWarehouseBucket(bucket)) {
+        Ok(h) => h,
+        Err(_) => { return false; }
+    };
+    return match (readTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes())) {
+        Ok(c) => jsonMember(borrow c, "metrics").isSome(),
+        Err(_) => false,
+    };
+}
+
+/// For each counted table bucket, whether its metrics are on (its configuration read under the store).
+fn metricsOnOf(store: borrow ObjectStore, counts: Slice<TablesCount>) -> Result<Vector<bool>, AllocError> {
+    var on = Vector<bool>.create();
+    for (c in counts) { on.push(tablesMetricsOn(store, c.bucket.view()))?; }
+    return Ok(on);
+}
+
+/// A table bucket's request counted (ADR-0130 §4), by its answer's status: a request naming none is not.
+async fn countTablesRequest(
+    app: borrow S3App,
+    req: borrow S3Request,
+    body: Slice<u8>,
+    answered: borrow Result<TablesAnswer, TablesError>,
+) {
+    let bucket = match (tablesBucketOfRequest(req, body)) {
+        Ok(Some(b)) => b,
+        _ => { return; }
+    };
+    let status: u16 = match (answered) {
+        Ok(a) => a.status,
+        Err(e) => tablesErrorStatus(e),
+    };
+    var guard = match (await app.tablesCounts.lock()) {
+        Ok(g) => g,
+        Err(_) => { return; }
+    };
+    let counts = guard.data();
+    var at = counts.length;
+    for (i in 0..counts.length) {
+        if (counts[i].bucket.view() == bucket.view()) { at = i; }
+    }
+    if (at == counts.length) {
+        let made = counts.push(TablesCount { bucket: bucket, requests: 0, clientErrors: 0, serverErrors: 0 });
+        if (made.isErr()) { return; }
+    }
+    counts[at].requests += 1;
+    if (status >= 400 && status < 500) { counts[at].clientErrors += 1; }
+    if (status >= 500) { counts[at].serverErrors += 1; }
+}
+
+/// The stats endpoint's `tableBuckets` (ADR-0130 §4): the counts of the table buckets whose metrics are on, as a
+/// JSON field (with its trailing comma).
+async fn tablesCountsField(app: borrow S3App) -> Result<Vector<u8>, S3Fail> {
+    var counts = Vector<TablesCount>.create();
+    {
+        var guard = match (await app.tablesCounts.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(S3Fail.Code(S3Code.ServiceUnavailable)); }
+        };
+        for (c in guard.data().view()) {
+            counts.push(TablesCount {
+                bucket: copyBytes(c.bucket.view())?,
+                requests: c.requests,
+                clientErrors: c.clientErrors,
+                serverErrors: c.serverErrors,
+            })?;
+        }
+    }
+    var on = Vector<bool>.create();
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let cs = counts.view();
+        on = await Async.blocking(() => metricsOnOf(store, cs))?;
+    }
+    var out = Vector<u8>.create();
+    out.extend("\"tableBuckets\": [".bytes())?;
+    var first = true;
+    for (i in 0..counts.length) {
+        if (!on[i]) { continue; }
+        if (!first) { out.extend(", ".bytes())?; }
+        first = false;
+        out.extend("{\"name\": \"".bytes())?;
+        out.extend(counts[i].bucket.view())?;
+        out.extend("\", \"requests\": ".bytes())?;
+        appendDecimal(mut out, counts[i].requests)?;
+        out.extend(", \"clientErrors\": ".bytes())?;
+        appendDecimal(mut out, counts[i].clientErrors)?;
+        out.extend(", \"serverErrors\": ".bytes())?;
+        appendDecimal(mut out, counts[i].serverErrors)?;
+        out.push('}')?;
+    }
+    out.extend("],\n  ".bytes())?;
+    return Ok(out);
+}

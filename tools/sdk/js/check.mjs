@@ -35,6 +35,9 @@ import {
   GetTableMaintenanceJobStatusCommand, ListTagsForResourceCommand, TagResourceCommand, UntagResourceCommand,
   GetTableBucketStorageClassCommand, PutTableBucketStorageClassCommand, GetTableStorageClassCommand,
   GetTableBucketEncryptionCommand, DeleteTableBucketEncryptionCommand, GetTableEncryptionCommand,
+  GetTableBucketLoggingCommand, PutTableBucketLoggingCommand, GetTableBucketMetricsConfigurationCommand,
+  PutTableBucketMetricsConfigurationCommand, DeleteTableBucketMetricsConfigurationCommand,
+  GetTableRecordExpirationConfigurationCommand, GetTableRecordExpirationJobStatusCommand,
 } from "@aws-sdk/client-s3tables";
 import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -368,6 +371,49 @@ for (const sessions of [true, false]) {
   await t.send(new DeleteNamespaceCommand({ tableBucketARN: cb, namespace: "ns" }));
   await t.send(new DeleteTableBucketCommand({ tableBucketARN: cb }));
   check("DeleteTableBucket: the configured one", (await t.send(new ListTableBucketsCommand({}))).tableBuckets ?? [], []);
+  // Logging, metrics and record expiration (ADR-0130): a table bucket's access log configuration put, read back and
+  // turned off, never into its own warehouse; its metrics configuration put, read and deleted; record expiration is
+  // not offered, so its calls answer MethodNotAllowedException.
+  const logs = "sdk-js-tlogs";
+  await s.send(new CreateBucketCommand({ Bucket: logs }));
+  const lb = (await t.send(new CreateTableBucketCommand({ name: "sdk-js-logged" }))).arn;
+  check("CreateTableBucket: one to log", lb, `arn:aws:s3tables:us-east-1:${ACCOUNT}:bucket/sdk-js-logged`);
+  const logging = async () => (await t.send(new GetTableBucketLoggingCommand({ tableBucketARN: lb }))).tableBucketLoggingStatus?.loggingEnabled;
+  const putLogging = (targetBucket) => t.send(new PutTableBucketLoggingCommand({ tableBucketARN: lb, tableBucketLoggingStatus: {
+    loggingEnabled: { targetBucket, targetPrefix: "tl/", targetObjectKeyFormat: { partitionedPrefix: { partitionDateSource: "EventTime" } } } } }));
+  check("GetTableBucketLogging: none at first", await logging(), undefined);
+  check("PutTableBucketLogging", await codeOf(putLogging(logs)), "no error");
+  const on = await logging();
+  check("GetTableBucketLogging: as put", [on?.targetBucket, on?.targetPrefix, on?.targetObjectKeyFormat?.partitionedPrefix?.partitionDateSource],
+    [logs, "tl/", "EventTime"]);
+  check("PutTableBucketLogging: into its own warehouse", await codeOf(putLogging("sdk-js-logged--table-s3")), "BadRequestException");
+  check("PutTableBucketLogging: turned off", await codeOf(t.send(new PutTableBucketLoggingCommand({ tableBucketARN: lb,
+    tableBucketLoggingStatus: {} }))), "no error");
+  check("GetTableBucketLogging: none after", await logging(), undefined);
+  const metrics = () => t.send(new GetTableBucketMetricsConfigurationCommand({ tableBucketARN: lb }));
+  check("GetTableBucketMetricsConfiguration: none at first", await codeOf(metrics()), "NotFoundException");
+  check("PutTableBucketMetricsConfiguration", await codeOf(t.send(new PutTableBucketMetricsConfigurationCommand({ tableBucketARN: lb }))),
+    "no error");
+  const mc = await metrics();
+  check("GetTableBucketMetricsConfiguration", [mc.tableBucketARN, !!mc.id], [lb, true]);
+  check("DeleteTableBucketMetricsConfiguration",
+    await codeOf(t.send(new DeleteTableBucketMetricsConfigurationCommand({ tableBucketARN: lb }))), "no error");
+  check("GetTableBucketMetricsConfiguration: none after", await codeOf(metrics()), "NotFoundException");
+  await t.send(new CreateNamespaceCommand({ tableBucketARN: lb, namespace: ["ns"] }));
+  const lt = await t.send(new CreateTableCommand({ tableBucketARN: lb, namespace: "ns", name: "t", format: "ICEBERG" }));
+  check("GetTableRecordExpirationConfiguration: not offered",
+    await codeOf(t.send(new GetTableRecordExpirationConfigurationCommand({ tableArn: lt.tableARN }))), "MethodNotAllowedException");
+  check("GetTableRecordExpirationJobStatus: not offered",
+    await codeOf(t.send(new GetTableRecordExpirationJobStatusCommand({ tableArn: lt.tableARN }))), "MethodNotAllowedException");
+  await t.send(new DeleteTableCommand({ tableBucketARN: lb, namespace: "ns", name: "t" }));
+  await t.send(new DeleteNamespaceCommand({ tableBucketARN: lb, namespace: "ns" }));
+  await t.send(new DeleteTableBucketCommand({ tableBucketARN: lb }));
+  check("DeleteTableBucket: the logged one", (await t.send(new ListTableBucketsCommand({}))).tableBuckets ?? [], []);
+  // The logs bucket may hold delivered logs under any prefix.
+  for await (const page of paginateListObjectsV2({ client: s }, { Bucket: logs })) {
+    for (const o of page.Contents ?? []) await s.send(new DeleteObjectCommand({ Bucket: logs, Key: o.Key }));
+  }
+  check("DeleteBucket: the logs bucket", await codeOf(s.send(new DeleteBucketCommand({ Bucket: logs }))), "no error");
 }
 
 // Users (ADR-0088): a user's key reads what its identity policy allows, and nothing else.

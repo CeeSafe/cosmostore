@@ -6211,3 +6211,17 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   node) logs a table bucket: its calls, its creates and a warehouse read are delivered under partitioned keys,
   25 fields each, a warehouse target is refused, and logging turns off.
 - **Checks:** 542 unit tests, the S3 smoke and the cluster smoke (214).
+
+### 25 Nov 2026: M32 slices 3 and 4, metrics, record expiration and the checks (ADR-0130 §4 to §6)
+
+- **Metrics:**
+  - Put/Get/DeleteTableBucketMetricsConfiguration, kept in the table bucket's configuration record with an id given
+    at its Put; Get answers NotFoundException when it is off;
+  - each table bucket's requests counted in memory, and shown by the stats endpoint's `tableBuckets` while its
+    metrics are on. ADR-0130 named a `/metrics` endpoint CosmoStore does not have; its As built says so.
+- **Record expiration:** its three calls answer MethodNotAllowedException (405), a new `TablesError`.
+- **The checks:**
+  - the CLI (33 checks in the smoke's S3 Tables block): metrics, the stats' counts, and record expiration;
+  - boto3 through `iceberg_check.py`: logging;
+  - the SDK matrix: Go and JS 17 checks each, .NET 13, Java 6. Java's pinned SDK has no logging calls.
+- **Checks:** 542 unit tests, the S3 smoke and the cluster smoke (214).
