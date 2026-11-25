@@ -6069,3 +6069,14 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Found while proposing:** AWS documents record expiration for its own managed tables only (S3 Storage Lens,
   SageMaker Catalog), not tables one creates, so ADR-0125's B is mostly an answer, not a job.
 - **Next:** the owner's choice.
+
+### 25 Nov 2026: M31 decided, ADR-0128 proposed (clusters as `serve`)
+
+- **The owner:** "A: clusters as serve".
+- **ADR-0128 proposes:**
+  - **staged buckets:** a bucket made by a staged, unapplied entry, taken by writes, so a configured
+    CreateTableBucket works in one request on a cluster;
+  - **maintenance asks** kept as replicated records, which a new leader reads;
+  - **a maintenance loop per shard,** with a node-wide bound on compactions at once;
+  - **the checks:** replica unit tests, a fault and crash sweep, and the cluster and maintenance smokes.
+- **For the owner:** how much of its own writes a request sees; how asks are kept; how many compactions run at once.

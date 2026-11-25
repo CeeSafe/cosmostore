@@ -1,6 +1,8 @@
 # ADR-0127: M31, after S3 Tables' configuration (proposed)
 
-**Status:** proposed, 25 Nov 2026, after M30 was closed the same day (the owner: "continue").
+**Status:** decided, 25 Nov 2026. The owner chose A, clusters as `serve` ("A: clusters as serve").
+
+Proposed the same day, after M30 was closed (the owner: "continue").
 
 ## Context
 
