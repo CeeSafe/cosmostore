@@ -451,14 +451,17 @@ fn createTableBucket(
     req: borrow S3Request,
     body: Slice<u8>,
 ) -> Result<TablesAnswer, TablesError> {
-    let j = tablesBody(body, ["encryptionConfiguration", "storageClassConfiguration", "tags"][..])?;
+    let j = tablesBody(body, ["encryptionConfiguration"][..])?;
     let name = copyBytes(jsonMemberText(borrow j, "name") ?? "".bytes())?;
     if (!tableBucketNameOk(name.view())) { return Err(TablesError.BadRequest); }
+    // Its tags and storage class (ADR-0126 §1, §2), checked before it is made.
+    let config = createdConfigOf(borrow j, "STANDARD".bytes())?;
     let hidden = tableWarehouseBucket(name.view())?;
     match (store.createBucket(catalogText(hidden.view()))) {
         Ok() => {}
         Err(e) => { return Err(tablesStoreFail(e)); }
     }
+    writeTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes(), borrow config)?;
     var answer = jsonObject();
     var arn = Vector<u8>.create();
     tableBucketArn(req, name.view(), mut arn)?;
@@ -758,10 +761,15 @@ fn createTable(
     body: Slice<u8>,
 ) -> Result<TablesAnswer, TablesError> {
     // An Iceberg schema given here becomes the table's first metadata file (ADR-0083 §6).
-    let j = tablesBody(body, ["encryptionConfiguration", "storageClassConfiguration", "tags"][..])?;
+    let j = tablesBody(body, ["encryptionConfiguration"][..])?;
     let name = copyBytes(jsonMemberText(borrow j, "name") ?? "".bytes())?;
     if (!tableNameOk(name.view(), false)) { return Err(TablesError.BadRequest); }
     if (jsonMemberText(borrow j, "format") != Some("ICEBERG".bytes())) { return Err(TablesError.BadRequest); }
+    // Its tags and storage class (ADR-0126 §1, §2): the bucket's class when it gives none.
+    let config = createdConfigOf(
+        borrow j,
+        bucketStorageClass(store, tableWarehouseBucket(bucketName)?.view())?.view(),
+    )?;
     let hidden = tableWarehouseBucket(bucketName)?;
     var id = Vector<u8>.create();
     if (!newUuid(mut id)?) { return Err(TablesError.Internal); }
@@ -804,6 +812,7 @@ fn createTable(
                 return Err(e);
             }
         };
+        writeTablesConfig(store, hidden.view(), tableConfigKey(id.view())?.view(), borrow config)?;
     }
     var answer = jsonObject();
     var arn = Vector<u8>.create();
@@ -1021,6 +1030,9 @@ fn deleteTable(
         // again (the M29 exit review's L3).
         let stagedKey = catalogKey(CATALOG_STAGED, ns, name)?;
         let _ = store.deleteObject(bucket, catalogText(stagedKey.view()));
+        // Its tags and storage class (ADR-0126).
+        let configKey = tableConfigKey(id.view())?;
+        let _ = store.deleteObject(bucket, catalogText(configKey.view()));
     }
     // Its objects go after the answer's work, a page at a time (`purgeWarehouse`).
     var answer = tablesNoContent();
@@ -1179,6 +1191,16 @@ fn routeTablesSync(
     // The Iceberg REST catalog (ADR-0083 §5), its calls authorized as S3 Tables' (ADR-0084 §3).
     if (top == "iceberg".bytes()) { return icebergRoute(store, req, segs.view()[1..], body, caller); }
     // Each call is authorized by its table bucket's and its table's policies before it runs (ADR-0084 §2).
+    // Tags of a table bucket or table, by its ARN (ADR-0126 §1).
+    if (top == "tag".bytes() && segs.length == 2) {
+        var id = Vector<u8>.create();
+        let bucket = tableBucketOfArn(segs[1].view(), mut id)? ?? { return Err(TablesError.BadRequest); };
+        let action = if (isMethod(m, Method.Get)) "s3tables:ListTagsForResource"
+            else if (isMethod(m, Method.Post)) "s3tables:TagResource"
+            else "s3tables:UntagResource";
+        checkTables(store, caller, action, bucket.view(), id.view())?;
+        return tablesTagCall(store, req, bucket.view(), id.view(), body);
+    }
     if (top == "get-table".bytes() && segs.length == 1) {
         if (!isMethod(m, Method.Get)) { return Err(TablesError.BadRequest); }
         return getTable(store, req, caller);
@@ -1231,6 +1253,14 @@ fn routeTablesSync(
                 return putMaintenance(store, hidden.view(), MAINTENANCE_BUCKET_KEY.bytes(), kind, body);
             }
             return Err(TablesError.BadRequest);
+        }
+        // Its storage class (ADR-0126 §2).
+        if (segs.length == 3 && segs[2].view() == "storage-class".bytes()) {
+            let _ = tableBucketRecord(store, bucket.view())?;
+            let action = if (isMethod(m, Method.Put)) "s3tables:PutTableBucketStorageClass"
+                else "s3tables:GetTableBucketStorageClass";
+            checkTables(store, caller, action, bucket.view(), "".bytes())?;
+            return bucketStorageClassCall(store, req, bucket.view(), body);
         }
         // Its encryption, replication and the rest: not done (ADR-0083 §6).
         if (segs.length > 2) { return Err(TablesError.NotImplemented); }
@@ -1335,7 +1365,12 @@ fn routeTablesSync(
             let key = tablePolicyKey(id.view())?;
             return tablesPolicyCall(store, m, bucket.view(), key.view(), body, credentials);
         }
-        // A table's encryption, maintenance and the rest: not done (ADR-0083 §6).
+        if (segs.length == 5 && what == "storage-class".bytes() && isMethod(m, Method.Get)) {
+            checkTables(store, caller, "s3tables:GetTableStorageClass", bucket.view(), id.view())?;
+            let hidden = tableWarehouseBucket(bucket.view())?;
+            return storageClassAnswer(tableStorageClass(store, hidden.view(), id.view())?.view());
+        }
+        // A table's encryption, replication and the rest: not done (ADR-0083 §6).
         return Err(TablesError.NotImplemented);
     }
     return Err(TablesError.NotImplemented);

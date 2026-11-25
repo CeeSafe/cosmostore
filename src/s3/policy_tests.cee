@@ -56,6 +56,8 @@ fn plainFacts() -> PolicyFacts => PolicyFacts {
     sseKmsKeyId: null,
     sseCustomerAlgorithm: null,
     noClient: false,
+    tagKeys: Vector<Vector<u8>>.create(),
+    tagValues: Vector<Vector<u8>>.create(),
 };
 
 fn decisionName(d: PolicyDecision) -> StringView => match (d) {
@@ -683,5 +685,31 @@ fn directoryBucketPolicies() -> Result<void, TestFailure> {
         ) == "MalformedPolicy",
         "not a bucket's ARN",
     )?;
+    return Ok();
+}
+
+/// `aws:ResourceTag/<key>` (ADR-0126 §1): taken in S3 Tables' policies, whose calls give their resource's tags, and
+/// decided by them (its key without case); refused in S3's, whose calls give none, so a Deny on it cannot fail open.
+@test
+fn resourceTagConditions() -> Result<void, TestFailure> {
+    let json =
+        "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:GetTable\",\"Resource\":\"arn:aws:s3tables:us-east-1:000000000000:bucket/b/table/*\",\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/Stage\":\"locked\"}}}]}";
+    let none = Vector<Credential>.create();
+    let s3json =
+        "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::b/*\",\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/Stage\":\"locked\"}}}]}";
+    match (parseBucketPolicy(s3json.bytes(), "b".bytes(), none.view(), false)) {
+        Err(S3Fail.Code(S3Code.NotImplemented)) => {}
+        _ => { return Err(TestFailure.create("refused in an S3 bucket policy")); }
+    }
+    let policy = parseTablesPolicy(json.bytes(), "b".bytes(), none.view(), false)!;
+    var tags = jsonObject();
+    jsonSet(mut tags, "stage", Json.Text(copyBytes("locked".bytes())!))!;
+    let tagged = factsWithTags(borrow plainFacts(), Some(borrow tags))!;
+    let untagged = factsWithTags(borrow plainFacts(), null)!;
+    let resource = "b/table/t1".bytes();
+    let denied = decidePolicyFor(borrow policy, null, null, "s3tables:GetTable", resource, borrow tagged);
+    Check.equalText("deny", decisionName(denied))?;
+    let neither = decidePolicyFor(borrow policy, null, null, "s3tables:GetTable", resource, borrow untagged);
+    Check.equalText("neither", decisionName(neither))?;
     return Ok();
 }

@@ -68,11 +68,16 @@ fn tablesCallerOf(app: borrow S3App, req: borrow S3Request, who: borrow Requeste
 /// What the caller's identity policies say of `action` on `resource` (`s3tables:<bucket>[/table/<id>]`): a role's
 /// session Allow only when its role's and its session's policies both allow, else Deny; a user's its policy's say;
 /// Neither for an account's key.
-fn identityVerdict(caller: borrow TablesCaller, action: StringView, resource: Slice<u8>) -> PolicyDecision {
+fn identityVerdict(
+    caller: borrow TablesCaller,
+    facts: borrow PolicyFacts,
+    action: StringView,
+    resource: Slice<u8>,
+) -> PolicyDecision {
     if (caller.role) {
         match (borrow caller.rolePolicy) {
             Some(p) => {
-                match (decidePolicy(p, null, action, resource, borrow caller.facts)) {
+                match (decidePolicy(p, null, action, resource, facts)) {
                     PolicyDecision.Allow => {}
                     _ => { return PolicyDecision.Deny; }
                 }
@@ -81,7 +86,7 @@ fn identityVerdict(caller: borrow TablesCaller, action: StringView, resource: Sl
         }
         match (borrow caller.sessionPolicy) {
             Some(p) => {
-                match (decidePolicy(p, null, action, resource, borrow caller.facts)) {
+                match (decidePolicy(p, null, action, resource, facts)) {
                     PolicyDecision.Allow => {}
                     _ => { return PolicyDecision.Deny; }
                 }
@@ -91,7 +96,7 @@ fn identityVerdict(caller: borrow TablesCaller, action: StringView, resource: Sl
         return PolicyDecision.Allow;
     }
     return match (borrow caller.userPolicy) {
-        Some(p) => decidePolicy(p, null, action, resource, borrow caller.facts),
+        Some(p) => decidePolicy(p, null, action, resource, facts),
         null => if (caller.user.length > 0) PolicyDecision.Deny else PolicyDecision.Neither,
     };
 }
@@ -137,6 +142,7 @@ fn policyVerdict(
     key: Slice<u8>,
     bucketName: Slice<u8>,
     caller: borrow TablesCaller,
+    facts: borrow PolicyFacts,
     action: StringView,
     resource: Slice<u8>,
 ) -> Result<PolicyDecision, TablesError> {
@@ -152,7 +158,7 @@ fn policyVerdict(
     };
     let who: Slice<u8>? = if (caller.principal.length > 0) Some(caller.principal.view()) else null;
     let user: Slice<u8>? = if (caller.user.length > 0) Some(caller.user.view()) else null;
-    return Ok(decidePolicyFor(borrow policy, who, user, action, resource, borrow caller.facts));
+    return Ok(decidePolicyFor(borrow policy, who, user, action, resource, facts));
 }
 
 /// ForbiddenException unless the caller may do `action` on table bucket `bucketName`, or on its table `tableId` when
@@ -173,15 +179,19 @@ fn checkTables(
         resource.extend("/table/".bytes())?;
         resource.extend(tableId)?;
     }
+    // The resource's tags, for `aws:ResourceTag` (ADR-0126 §1): a table's own, or its bucket's.
+    let hidden = tableWarehouseBucket(bucketName)?;
+    let configKey = if (tableId.length > 0) tableConfigKey(tableId)? else copyBytes(TABLE_BUCKET_CONFIG_KEY.bytes())?;
+    let config = readTablesConfig(store, hidden.view(), configKey.view())?;
+    let facts = factsWithTags(borrow caller.facts, jsonMember(borrow config, "tags"))?;
     // The identity policies first (ADR-0088 §2), on `s3tables:<bucket>[/table/<id>]`.
     var named = copyBytes("s3tables:".bytes())?;
     named.extend(resource.view())?;
-    let identity = identityVerdict(caller, action, named.view());
+    let identity = identityVerdict(caller, borrow facts, action, named.view());
     match (identity) {
         PolicyDecision.Deny => { return Err(TablesError.Forbidden); }
         _ => {}
     }
-    let hidden = tableWarehouseBucket(bucketName)?;
     var resourceAllows = false;
     match (policyVerdict(
         store,
@@ -189,6 +199,7 @@ fn checkTables(
         TABLE_BUCKET_POLICY_KEY.bytes(),
         bucketName,
         caller,
+        borrow facts,
         action,
         resource.view(),
     )?) {
@@ -198,7 +209,16 @@ fn checkTables(
     }
     if (tableId.length > 0) {
         let key = tablePolicyKey(tableId)?;
-        match (policyVerdict(store, hidden.view(), key.view(), bucketName, caller, action, resource.view())?) {
+        match (policyVerdict(
+            store,
+            hidden.view(),
+            key.view(),
+            bucketName,
+            caller,
+            borrow facts,
+            action,
+            resource.view(),
+        )?) {
             PolicyDecision.Deny => { return Err(TablesError.Forbidden); }
             PolicyDecision.Allow => { resourceAllows = true; }
             PolicyDecision.Neither => {}
@@ -222,7 +242,7 @@ fn checkTablesIdentity(
     resource: Slice<u8>,
 ) -> Result<void, TablesError> {
     if (!caller.role && caller.user.length == 0) { return Ok(); }
-    return match (identityVerdict(caller, action, resource)) {
+    return match (identityVerdict(caller, borrow caller.facts, action, resource)) {
         PolicyDecision.Allow => Ok(),
         _ => Err(TablesError.Forbidden),
     };

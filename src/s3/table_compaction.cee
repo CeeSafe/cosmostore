@@ -93,6 +93,8 @@ struct CompactionPlan {
     avroCodec: AvroCodec;
     /// The partitions whose position delete files the run reads to rewrite (ADR-0120).
     deleteRewrites: Vector<DeleteRewrite>;
+    /// The metadata of the files the run writes: the table's storage class, when not STANDARD (ADR-0126 §2).
+    objectMetadata: Vector<u8>;
 }
 
 /// A file a run wrote: its key and path, and its length.
@@ -403,6 +405,11 @@ fn planCompaction(
     let pageLevel = codecLevelOf(borrow m, "write.parquet.compression-level");
     let avroCodec = avroCodecOf(borrow m);
     let deleteRewrites = deleteRewritesOf(deletes.view(), manifests.view(), blocked.view())?;
+    var objectMetadata = Vector<u8>.create();
+    let storageClass = tableStorageClass(store, hidden.view(), id.view())?;
+    if (storageClass.view() != "STANDARD".bytes()) {
+        metadataAdd(mut objectMetadata, STORAGE_CLASS_FIELD.bytes(), storageClass.view())?;
+    }
     let plan = CompactionPlan {
         bucket: copyBytes(t.bucket.view())?,
         hidden: hidden,
@@ -423,6 +430,7 @@ fn planCompaction(
         pageLevel: pageLevel,
         avroCodec: avroCodec,
         deleteRewrites: deleteRewrites,
+        objectMetadata: objectMetadata,
     };
     return Ok(Some(CompactionDraft { plan: plan, pending: pending, target: target }));
 }
@@ -1495,7 +1503,7 @@ fn putBin(
         catalogText(plan.hidden.view()),
         catalogText(key.view()),
         "application/octet-stream",
-        "".bytes(),
+        plan.objectMetadata.view(),
         "".bytes(),
         obj,
         PutCondition.IfAbsent,

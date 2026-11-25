@@ -1,0 +1,267 @@
+// S3 Tables' configuration of table buckets and tables (ADR-0126): tags and storage class, kept as catalog records.
+// A table bucket's are `.s3tables/bucket-config`; a table's, by its id as its policy is, `.s3tables/table-config/<id>`.
+import web_core;
+import web_http;
+import web_server;
+
+const TABLE_BUCKET_CONFIG_KEY: StringView = ".s3tables/bucket-config";
+const TABLE_CONFIGS: StringView = ".s3tables/table-config/";
+/// S3's limits on a resource's tags.
+const TABLES_MAX_TAGS: usize = 50;
+const TABLES_MAX_TAG_KEY: usize = 128;
+const TABLES_MAX_TAG_VALUE: usize = 256;
+
+fn tableConfigKey(id: Slice<u8>) -> Result<Vector<u8>, AllocError> => catalogKey(TABLE_CONFIGS, id, "".bytes());
+
+/// A resource's configuration record, `{}` when it has none.
+fn readTablesConfig(store: borrow ObjectStore, hidden: Slice<u8>, key: Slice<u8>) -> Result<Json, TablesError> {
+    return match (readRecord(store, hidden, key)?) {
+        Some(r) => Ok(r.json),
+        null => Ok(jsonObject()),
+    };
+}
+
+fn writeTablesConfig(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    key: Slice<u8>,
+    config: borrow Json,
+) -> Result<void, TablesError> {
+    let _ = writeRecord(store, hidden, key, config, PutCondition.None)?;
+    return Ok();
+}
+
+/// A `tags` map as S3 Tables takes it: strings to strings, 50 at most, keys 1 to 128 characters and values to 256,
+/// none of AWS's own (`aws:`); null otherwise.
+fn tablesTagsOf(j: borrow Json) -> Result<Vector<JsonMember>?, AllocError> {
+    var out = Vector<JsonMember>.create();
+    match (j) {
+        Json.Object(ms) => {
+            if (ms.length > TABLES_MAX_TAGS) { return Ok(null); }
+            for (k in 0..ms.length) {
+                let key = ms[k].key.view();
+                if (key.length == 0 || key.length > TABLES_MAX_TAG_KEY || startsWithBytes(key, "aws:".bytes())) {
+                    return Ok(null);
+                }
+                match (borrow ms[k].value) {
+                    Json.Text(t) => {
+                        if (t.length > TABLES_MAX_TAG_VALUE) { return Ok(null); }
+                    }
+                    _ => { return Ok(null); }
+                }
+                out.push(JsonMember { key: copyBytes(key)?, value: cloneJson(borrow ms[k].value)? })?;
+            }
+        }
+        _ => { return Ok(null); }
+    }
+    return Ok(Some(out));
+}
+
+/// A configuration's tags with `more` added over them; null when they would pass the limit.
+fn mergedTags(config: borrow Json, more: Slice<JsonMember>) -> Result<Json?, AllocError> {
+    var tags = match (jsonMember(config, "tags")) {
+        Some(t) => cloneJson(t)?,
+        null => jsonObject(),
+    };
+    for (m in more) { jsonSet(mut tags, StringView.fromUtf8(m.key.view()) ?? "", cloneJson(borrow m.value)?)?; }
+    let count = match (borrow tags) {
+        Json.Object(ms) => ms.length,
+        _ => 0,
+    };
+    if (count > TABLES_MAX_TAGS) { return Ok(null); }
+    return Ok(Some(tags));
+}
+
+/// A storage class S3 Tables takes: STANDARD or INTELLIGENT_TIERING.
+fn tablesStorageClassOk(name: Slice<u8>) -> bool =>
+    name == "STANDARD".bytes() || name == "INTELLIGENT_TIERING".bytes();
+
+/// A `storageClassConfiguration`'s class; null when it is not one taken.
+fn storageClassConfigOf(j: borrow Json) -> Result<Vector<u8>?, AllocError> {
+    let name = jsonMemberText(j, "storageClass") ?? { return Ok(null); };
+    if (!tablesStorageClassOk(name)) { return Ok(null); }
+    return Ok(Some(copyBytes(name)?));
+}
+
+/// A create's `tags` and `storageClassConfiguration`, as a configuration record; `inherited` the class when it gives
+/// none (a table its bucket's). Err(BadRequest) for ones not taken.
+fn createdConfigOf(request: borrow Json, inherited: Slice<u8>) -> Result<Json, TablesError> {
+    var config = jsonObject();
+    match (jsonMember(request, "tags")) {
+        Some(t) => {
+            let tags = tablesTagsOf(t)? ?? { return Err(TablesError.BadRequest); };
+            jsonSet(mut config, "tags", Json.Object(tags))?;
+        }
+        null => {}
+    }
+    var storageClass = copyBytes(inherited)?;
+    match (jsonMember(request, "storageClassConfiguration")) {
+        Some(s) => { storageClass = storageClassConfigOf(s)? ?? { return Err(TablesError.BadRequest); }; }
+        null => {}
+    }
+    jsonSet(mut config, "storageClass", Json.Text(storageClass))?;
+    return Ok(config);
+}
+
+/// A table bucket's storage class: its configuration's, STANDARD when it set none.
+fn bucketStorageClass(store: borrow ObjectStore, hidden: Slice<u8>) -> Result<Vector<u8>, TablesError> {
+    let config = readTablesConfig(store, hidden, TABLE_BUCKET_CONFIG_KEY.bytes())?;
+    return Ok(copyBytes(jsonMemberText(borrow config, "storageClass") ?? "STANDARD".bytes())?);
+}
+
+/// A table's storage class: its own, else its bucket's.
+fn tableStorageClass(store: borrow ObjectStore, hidden: Slice<u8>, id: Slice<u8>) -> Result<Vector<u8>, TablesError> {
+    let config = readTablesConfig(store, hidden, tableConfigKey(id)?.view())?;
+    return match (jsonMemberText(borrow config, "storageClass")) {
+        Some(c) => Ok(copyBytes(c)?),
+        null => bucketStorageClass(store, hidden),
+    };
+}
+
+/// Whether a table of the bucket has the id: its record, among the bucket's tables.
+fn tableIdExists(store: borrow ObjectStore, hidden: Slice<u8>, id: Slice<u8>) -> Result<bool, TablesError> {
+    var after = Vector<u8>.create();
+    while (true) {
+        let keys = catalogKeys(store, hidden, CATALOG_TABLES.bytes(), after.view(), 1000)?;
+        if (keys.length == 0) { return Ok(false); }
+        for (k in keys.view()) {
+            match (readRecord(store, hidden, k.view())?) {
+                Some(r) => {
+                    if (jsonMemberText(borrow r.json, "id") == Some(id)) { return Ok(true); }
+                }
+                null => {}
+            }
+        }
+        after = copyBytes(keys[keys.length - 1].view())?;
+    }
+    return Ok(false);
+}
+
+/// The configuration record of a tag call's resource: a table bucket's, or a table's by its id; NotFound when it is
+/// not there.
+fn taggedKeyOf(store: borrow ObjectStore, bucket: Slice<u8>, id: Slice<u8>) -> Result<Vector<u8>, TablesError> {
+    let _ = tableBucketRecord(store, bucket)?;
+    if (id.length == 0) { return Ok(copyBytes(TABLE_BUCKET_CONFIG_KEY.bytes())?); }
+    let hidden = tableWarehouseBucket(bucket)?;
+    if (!tableIdExists(store, hidden.view(), id)?) { return Err(TablesError.NotFound); }
+    return Ok(tableConfigKey(id)?);
+}
+
+/// TagResource, UntagResource and ListTagsForResource (ADR-0126 §1).
+fn tablesTagCall(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucket: Slice<u8>,
+    id: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucket)?;
+    let key = taggedKeyOf(store, bucket, id)?;
+    var config = readTablesConfig(store, hidden.view(), key.view())?;
+    if (isMethod(req.method, Method.Get)) {
+        var answer = jsonObject();
+        jsonSet(
+            mut answer,
+            "tags",
+            match (jsonMember(borrow config, "tags")) {
+                Some(t) => cloneJson(t)?,
+                null => jsonObject(),
+            },
+        )?;
+        return tablesJson(borrow answer);
+    }
+    if (isMethod(req.method, Method.Post)) {
+        let j = tablesObject(body)?;
+        let more = tablesTagsOf(jsonMember(borrow j, "tags") ?? { return Err(TablesError.BadRequest); })? ?? {
+            return Err(TablesError.BadRequest);
+        };
+        let tags = mergedTags(borrow config, more.view())? ?? { return Err(TablesError.BadRequest); };
+        jsonSet(mut config, "tags", tags)?;
+        writeTablesConfig(store, hidden.view(), key.view(), borrow config)?;
+        return tablesJson(borrow jsonObject());
+    }
+    if (isMethod(req.method, Method.Delete)) {
+        var tags = match (jsonMember(borrow config, "tags")) {
+            Some(t) => cloneJson(t)?,
+            null => jsonObject(),
+        };
+        for (k in paramValues(req, "tagKeys")?.view()) { jsonRemove(mut tags, k.view()); }
+        jsonSet(mut config, "tags", tags)?;
+        writeTablesConfig(store, hidden.view(), key.view(), borrow config)?;
+        return Ok(tablesNoContent());
+    }
+    return Err(TablesError.BadRequest);
+}
+
+/// PutTableBucketStorageClass and GetTableBucketStorageClass (ADR-0126 §2).
+fn bucketStorageClassCall(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    bucket: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let hidden = tableWarehouseBucket(bucket)?;
+    if (isMethod(req.method, Method.Put)) {
+        let j = tablesObject(body)?;
+        let c = storageClassConfigOf(jsonMember(borrow j, "storageClassConfiguration") ?? {
+            return Err(TablesError.BadRequest);
+        })? ?? { return Err(TablesError.BadRequest); };
+        var config = readTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes())?;
+        jsonSet(mut config, "storageClass", Json.Text(c))?;
+        writeTablesConfig(store, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes(), borrow config)?;
+        return tablesJson(borrow jsonObject());
+    }
+    if (isMethod(req.method, Method.Get)) {
+        return storageClassAnswer(bucketStorageClass(store, hidden.view())?.view());
+    }
+    return Err(TablesError.BadRequest);
+}
+
+fn storageClassAnswer(storageClass: Slice<u8>) -> Result<TablesAnswer, TablesError> {
+    var inner = jsonObject();
+    jsonSet(mut inner, "storageClass", jsonString(storageClass)?)?;
+    var answer = jsonObject();
+    jsonSet(mut answer, "storageClassConfiguration", inner)?;
+    return tablesJson(borrow answer);
+}
+
+/// The values of a query parameter given more than once (`tagKeys=a&tagKeys=b`), or once with commas.
+fn paramValues(req: borrow S3Request, name: StringView) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    for (p in req.query.view()) {
+        if (p.name.view() != name.bytes()) { continue; }
+        let text = StringView.fromUtf8(p.value.view()) ?? { continue; };
+        for (part in text.split(",")) {
+            if (part.bytes().length > 0) { out.push(copyBytes(part.bytes())?)?; }
+        }
+    }
+    return Ok(out);
+}
+
+/// A write into a table's warehouse that asks for no storage class takes its table's (ADR-0126 §2): its metadata with
+/// the class recorded, when that is not STANDARD.
+async fn withTableStorageClass(
+    app: borrow S3App,
+    req: borrow S3Request,
+    metadata: Vector<u8>,
+) -> Result<Vector<u8>, S3Fail> {
+    let hidden = req.bucket.bytes();
+    if (!isTableWarehouseShaped(hidden) || headerOf(req, STORAGE_CLASS_FIELD).isSome()) { return Ok(metadata); }
+    let id = copyBytes(tableIdOfKey(req.key.bytes(), false) ?? { return Ok(metadata); })?;
+    var stored: Vector<u8>? = null;
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let idView = id.view();
+        stored = match (await Async.blocking(() => tableStorageClass(store, hidden, idView))) {
+            Ok(c) => Some(c),
+            Err(TablesError.OutOfMemory(e)) => { return Err(S3Fail.OutOfMemory(e)); }
+            Err(_) => null,
+        };
+    }
+    let storageClass = stored ?? { return Ok(metadata); };
+    if (storageClass.view() == "STANDARD".bytes()) { return Ok(metadata); }
+    var out = metadata;
+    metadataAdd(mut out, STORAGE_CLASS_FIELD.bytes(), storageClass.view())?;
+    return Ok(out);
+}

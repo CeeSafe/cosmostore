@@ -1,6 +1,8 @@
 # ADR-0126: S3 Tables' encryption, tags and storage class (M30)
 
-**Status:** proposed, 25 Nov 2026. M30 is ADR-0125's item A (the owner: "A: encryption, tags").
+**Status:** proposed, 25 Nov 2026, with the owner's choices made: encrypted tables compacted ("Compacted"), and a
+write asking for another encryption than its table's refused ("Refused"). M30 is ADR-0125's item A (the owner: "A:
+encryption, tags").
 
 ## Context
 

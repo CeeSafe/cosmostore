@@ -5880,3 +5880,29 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Found:** sealing is the S3 layer's, and the catalog and compaction read the store directly, so an encrypted
   table needs them to unseal and seal.
 - **Next:** the owner's choices (encrypted tables compacted; a write asking for another encryption refused).
+
+### 25 Nov 2026: M30 slice 1, S3 Tables' tags and storage class (ADR-0126 §1, §2)
+
+- **The owner's choices:** encrypted tables compacted, unsealing and sealing; a write asking for another encryption
+  than its table's refused.
+- **Tags:** `TagResource`, `UntagResource` and `ListTagsForResource` on table buckets and tables (a table by its
+  ARN's id), and the creates' `tags`.
+  - Kept as catalog records: the bucket's `.s3tables/bucket-config`, a table's `.s3tables/table-config/<id>`,
+    removed with the table.
+  - Within S3's limits: 50, keys to 128, values to 256, no `aws:`.
+- **`aws:ResourceTag/<key>`** in S3 Tables' policies: decided by the resource's tags (a table's, or its bucket's),
+  its key without case. **Refused in S3's policies,** whose calls give no tags, so that a Deny on a tag cannot fail
+  open (`resourceTagConditions`).
+- **Storage class:**
+  - `Put`/`GetTableBucketStorageClass` and `GetTableStorageClass`;
+  - a table takes its bucket's at its create (S3 Tables' and Iceberg's creates), or its own;
+  - a PUT or multipart upload into its warehouse that names no class takes it, and so do compaction's merged and
+    rewritten delete files.
+- **Checks:** `iceberg_check.py` (on `serve` and through a cluster's node) runs:
+  - tags at create, tag and untag;
+  - each storage class call and its inheritance;
+  - a warehouse PUT's class;
+  - a table policy denying by `aws:ResourceTag` until the tag is removed.
+- **Results:** 524 unit tests.
+- **Not yet:** encryption (slices 2 to 4). POST and copy into a warehouse take no table class (engines write by PUT
+  and multipart); manifests are written STANDARD.

@@ -117,6 +117,63 @@ with catalog.create_table_transaction("sales.staged", schema=schema) as tx:
 check("create_table_transaction: the table made with its rows",
       sorted(catalog.load_table("sales.staged").scan().to_arrow().column("id").to_pylist()), [7, 8])
 catalog.purge_table("sales.staged")
+# S3 Tables' tags and storage class (ADR-0126 §1, §2), through boto3.
+import json
+from botocore.exceptions import ClientError
+cfg_arn = tables.create_table_bucket(name="config-check", tags={"team": "data"},
+                                     storageClassConfiguration={"storageClass": "INTELLIGENT_TIERING"})["arn"]
+check("a table bucket's tags at its create", tables.list_tags_for_resource(resourceArn=cfg_arn)["tags"], {"team": "data"})
+check("its storage class at its create",
+      tables.get_table_bucket_storage_class(tableBucketARN=cfg_arn)["storageClassConfiguration"]["storageClass"],
+      "INTELLIGENT_TIERING")
+tables.tag_resource(resourceArn=cfg_arn, tags={"env": "test"})
+tables.untag_resource(resourceArn=cfg_arn, tagKeys=["team"])
+check("tags added and removed", tables.list_tags_for_resource(resourceArn=cfg_arn)["tags"], {"env": "test"})
+tables.create_namespace(tableBucketARN=cfg_arn, namespace=["ns"])
+made = tables.create_table(tableBucketARN=cfg_arn, namespace="ns", name="inherits", format="ICEBERG",
+                           tags={"owner": "ana"})
+check("a table's storage class: its bucket's",
+      tables.get_table_storage_class(tableBucketARN=cfg_arn, namespace="ns", name="inherits")
+      ["storageClassConfiguration"]["storageClass"], "INTELLIGENT_TIERING")
+check("a table's tags, by its ARN", tables.list_tags_for_resource(resourceArn=made["tableARN"])["tags"], {"owner": "ana"})
+# A write into the table's warehouse that names no class takes the table's.
+s3 = boto3.client("s3", endpoint_url=endpoint, region_name=region, config=Config(retries={"max_attempts": 1}))
+warehouse = tables.get_table_bucket(tableBucketARN=cfg_arn)["name"] + "--table-s3"
+data_key = made["tableARN"].rsplit("/", 1)[1] + "/data/probe.parquet"
+s3.put_object(Bucket=warehouse, Key=data_key, Body=b"PAR1")
+check("a write into its warehouse takes its class", s3.head_object(Bucket=warehouse, Key=data_key).get("StorageClass"),
+      "INTELLIGENT_TIERING")
+s3.delete_object(Bucket=warehouse, Key=data_key)
+tables.put_table_bucket_storage_class(tableBucketARN=cfg_arn, storageClassConfiguration={"storageClass": "STANDARD"})
+check("the bucket's class put", tables.get_table_bucket_storage_class(tableBucketARN=cfg_arn)
+      ["storageClassConfiguration"]["storageClass"], "STANDARD")
+check("the table's kept from its create", tables.get_table_storage_class(tableBucketARN=cfg_arn, namespace="ns",
+      name="inherits")["storageClassConfiguration"]["storageClass"], "INTELLIGENT_TIERING")
+try:
+    tables.tag_resource(resourceArn=cfg_arn, tags={"aws:x": "y"})
+    check("an aws: tag refused", "taken", "refused")
+except ClientError:
+    check("an aws: tag refused", "refused", "refused")
+# A table policy denying by the table's tag (aws:ResourceTag).
+deny = {"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": "*",
+        "Action": "s3tables:GetTableMetadataLocation", "Resource": made["tableARN"],
+        "Condition": {"StringEquals": {"aws:ResourceTag/stage": "locked"}}}]}
+tables.put_table_policy(tableBucketARN=cfg_arn, namespace="ns", name="inherits", resourcePolicy=json.dumps(deny))
+tables.get_table_metadata_location(tableBucketARN=cfg_arn, namespace="ns", name="inherits")
+check("not denied while the tag is not there", True, True)
+tables.tag_resource(resourceArn=made["tableARN"], tags={"stage": "locked"})
+try:
+    tables.get_table_metadata_location(tableBucketARN=cfg_arn, namespace="ns", name="inherits")
+    check("denied by its tag", "allowed", "denied")
+except ClientError as e:
+    check("denied by its tag", e.response["Error"]["Code"], "ForbiddenException")
+tables.untag_resource(resourceArn=made["tableARN"], tagKeys=["stage"])
+tables.get_table_metadata_location(tableBucketARN=cfg_arn, namespace="ns", name="inherits")
+check("allowed again once untagged", True, True)
+tables.delete_table_policy(tableBucketARN=cfg_arn, namespace="ns", name="inherits")
+tables.delete_table(tableBucketARN=cfg_arn, namespace="ns", name="inherits")
+tables.delete_namespace(tableBucketARN=cfg_arn, namespace="ns")
+tables.delete_table_bucket(tableBucketARN=cfg_arn)
 catalog.rename_table("sales.orders", "sales.orders_v2")
 check("rename_table", catalog.list_tables("sales"), [("sales", "orders_v2")])
 check("rows after the rename", catalog.load_table("sales.orders_v2").scan().to_arrow().num_rows, 4)

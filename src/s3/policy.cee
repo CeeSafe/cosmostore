@@ -18,6 +18,8 @@ enum PolicyKey {
     SseAlgorithm,
     SseKmsKeyId,
     SseCustomerAlgorithm,
+    /// `aws:ResourceTag/<key>` (ADR-0126 §1): the tag of the resource the call is on, its key the test's `tagKey`.
+    ResourceTag,
 }
 
 /// A condition operator, without its `Not`: `PolicyTest.negated` says whether it had one.
@@ -49,6 +51,8 @@ struct PolicyTest {
     /// fails, and when the request does not have the key.
     negated: bool;
     key: PolicyKey;
+    /// For `aws:ResourceTag/<key>`: the tag's key, in lower case (condition keys are matched without case).
+    tagKey: Vector<u8>;
     /// String values (lower case for the `IgnoreCase` operators, `true` or `false` for `Bool` and `Null`).
     values: Vector<Vector<u8>>;
     ranges: Vector<IpRange>;
@@ -106,6 +110,7 @@ fn clonePolicy(p: borrow BucketPolicy) -> Result<BucketPolicy, AllocError> {
                 op: test.op,
                 negated: test.negated,
                 key: test.key,
+                tagKey: copyBytes(test.tagKey.view())?,
                 values: cloneVectors(borrow test.values)?,
                 ranges: ranges,
                 numbers: numbers,
@@ -465,6 +470,7 @@ fn policyOpOf(name: Slice<u8>) -> PolicyTest? {
         op: op,
         negated: i == 1 || i == 3 || i == 5 || i == 8 || i == 10,
         key: PolicyKey.Referer,
+        tagKey: Vector<u8>.create(),
         values: Vector<Vector<u8>>.create(),
         ranges: Vector<IpRange>.create(),
         numbers: Vector<u64>.create(),
@@ -510,12 +516,17 @@ fn opFitsKey(op: PolicyOp, key: PolicyKey) -> bool => match (op) {
     _ => match (key) {
         PolicyKey.Referer | PolicyKey.UserAgent | PolicyKey.Prefix | PolicyKey.Delimiter => true,
         PolicyKey.SseAlgorithm | PolicyKey.SseKmsKeyId | PolicyKey.SseCustomerAlgorithm => true,
+        PolicyKey.ResourceTag => true,
         _ => false,
     },
 };
 
 /// `Condition`: operators, each with keys and their values (ADR-0043 §3).
-fn parseCondition<region a>(r: borrow mut JsonReader<a>, tests: borrow mut Vector<PolicyTest>) -> Result<void, S3Fail> {
+fn parseCondition<region a>(
+    r: borrow mut JsonReader<a>,
+    tests: borrow mut Vector<PolicyTest>,
+    tables: bool,
+) -> Result<void, S3Fail> {
     if (!r.take('{')) { return Err(malformedPolicy()); }
     if (r.take('}')) { return Ok(); }
     var name = Vector<u8>.create();
@@ -532,7 +543,20 @@ fn parseCondition<region a>(r: borrow mut JsonReader<a>, tests: borrow mut Vecto
         while (true) {
             if (!r.string(mut name)?) { return Err(malformedPolicy()); }
             if (!r.take(':')) { return Err(malformedPolicy()); }
-            let key = match (policyKeyOf(name.view())) {
+            // `aws:ResourceTag/<key>`, its key kept (ADR-0126 §1): in S3 Tables' policies only, whose calls give their
+            // resource's tags. S3's calls give none, and a Deny on a tag would never hold there, so it stays refused.
+            var tagKey = Vector<u8>.create();
+            let tagPrefix = "aws:resourcetag/".bytes();
+            var isTag = tables && name.length > tagPrefix.length;
+            if (isTag) {
+                for (i in 0..tagPrefix.length) {
+                    if (lowerAscii(name[i]) != tagPrefix[i]) { isTag = false; }
+                }
+            }
+            if (isTag) {
+                for (c in name.view()[tagPrefix.length..]) { tagKey.push(lowerAscii(c))?; }
+            }
+            let key = if (isTag) PolicyKey.ResourceTag else match (policyKeyOf(name.view())) {
                 Some(k) => k,
                 null => { return Err(notImplemented()); }
             };
@@ -543,6 +567,7 @@ fn parseCondition<region a>(r: borrow mut JsonReader<a>, tests: borrow mut Vecto
                 op: template.op,
                 negated: template.negated,
                 key: key,
+                tagKey: tagKey,
                 values: Vector<Vector<u8>>.create(),
                 ranges: Vector<IpRange>.create(),
                 numbers: Vector<u64>.create(),
@@ -679,7 +704,7 @@ fn parseStatement<region a>(
                 st.resources.push(pattern)?;
             }
         } else {
-            parseCondition(r, mut st.tests)?;
+            parseCondition(r, mut st.tests, tables)?;
         }
         if (r.take(',')) { continue; }
         if (r.take('}')) { break; }
@@ -1218,6 +1243,10 @@ struct PolicyFacts {
     /// A write the server makes for a configuration (ADR-0094 §2): it has no client, so a condition on a client's
     /// facts holds for it in no way, and its statement neither allows nor denies (the M14 exit review's B1).
     noClient: bool;
+    /// The tags of the resource the call is on (ADR-0126 §1), keys in lower case: S3 Tables' table bucket's or
+    /// table's.
+    tagKeys: Vector<Vector<u8>>;
+    tagValues: Vector<Vector<u8>>;
 }
 
 fn ownedOf(v: Slice<u8>?) -> Result<Vector<u8>?, AllocError> => match (v) {
@@ -1244,6 +1273,8 @@ fn policyFacts(
         sseKmsKeyId: ownedOf(headerOf(req, "x-amz-server-side-encryption-aws-kms-key-id"))?,
         sseCustomerAlgorithm: ownedOf(headerOf(req, "x-amz-server-side-encryption-customer-algorithm"))?,
         noClient: false,
+        tagKeys: Vector<Vector<u8>>.create(),
+        tagValues: Vector<Vector<u8>>.create(),
     };
     if (listing) {
         facts.prefix = copyBytes(paramOf(req, "prefix") ?? "".bytes())?;
@@ -1252,6 +1283,52 @@ fn policyFacts(
     }
     return Ok(facts);
 }
+
+/// A copy of `facts` with the resource's tags (ADR-0126 §1): `tags` a JSON object of strings, its keys in lower case.
+fn factsWithTags(facts: borrow PolicyFacts, tags: borrow Json?) -> Result<PolicyFacts, AllocError> {
+    var out = PolicyFacts {
+        secure: facts.secure,
+        peer: facts.peer,
+        referer: ownedOf(optionalView(facts.referer.asBorrow()))?,
+        userAgent: ownedOf(optionalView(facts.userAgent.asBorrow()))?,
+        prefix: ownedOf(optionalView(facts.prefix.asBorrow()))?,
+        delimiter: ownedOf(optionalView(facts.delimiter.asBorrow()))?,
+        maxKeys: ownedOf(optionalView(facts.maxKeys.asBorrow()))?,
+        sseAlgorithm: ownedOf(optionalView(facts.sseAlgorithm.asBorrow()))?,
+        sseKmsKeyId: ownedOf(optionalView(facts.sseKmsKeyId.asBorrow()))?,
+        sseCustomerAlgorithm: ownedOf(optionalView(facts.sseCustomerAlgorithm.asBorrow()))?,
+        noClient: facts.noClient,
+        tagKeys: Vector<Vector<u8>>.create(),
+        tagValues: Vector<Vector<u8>>.create(),
+    };
+    match (tags) {
+        Some(t) => {
+            match (t) {
+                Json.Object(ms) => {
+                    for (k in 0..ms.length) {
+                        match (borrow ms[k].value) {
+                            Json.Text(v) => {
+                                var lower = Vector<u8>.create();
+                                for (c in ms[k].key.view()) { lower.push(lowerAscii(c))?; }
+                                out.tagKeys.push(lower)?;
+                                out.tagValues.push(copyBytes(v.view())?)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    return Ok(out);
+}
+
+fn optionalView<region a>(v: borrow(a) Vector<u8>?) -> Slice<a, u8>? => match (v) {
+    Some(x) => Some(x.view()),
+    null => null,
+};
 
 /// The text of a string key, when the request has it.
 fn factText(facts: borrow PolicyFacts, key: PolicyKey) -> Slice<u8>? => match (key) {
@@ -1289,7 +1366,21 @@ fn factText(facts: borrow PolicyFacts, key: PolicyKey) -> Slice<u8>? => match (k
     },
     PolicyKey.SecureTransport => if (facts.secure) Some("true".bytes()) else Some("false".bytes()),
     PolicyKey.SourceIp => null,
+    PolicyKey.ResourceTag => null,
 };
+
+/// The text a test's key has in the request: a resource tag's by its key, else `factText`'s.
+fn testText<region a>(facts: borrow(a) PolicyFacts, t: borrow PolicyTest) -> Slice<a, u8>? {
+    match (t.key) {
+        PolicyKey.ResourceTag => {
+            for (i in 0..facts.tagKeys.length) {
+                if (facts.tagKeys[i].view() == t.tagKey.view()) { return Some(facts.tagValues[i].view()); }
+            }
+            return null;
+        }
+        _ => { return factText(facts, t.key); }
+    }
+}
 
 /// Whether the request has the key at all.
 fn factPresent(facts: borrow PolicyFacts, key: PolicyKey) -> bool => match (key) {
@@ -1308,7 +1399,10 @@ fn testHolds(t: borrow PolicyTest, facts: borrow PolicyFacts) -> bool {
             _ => { return false; }
         }
     }
-    let present = factPresent(facts, t.key);
+    let present = match (t.key) {
+        PolicyKey.ResourceTag => testText(facts, t).isSome(),
+        _ => factPresent(facts, t.key),
+    };
     match (t.op) {
         PolicyOp.Null => {
             for (i in 0..t.values.length) {
@@ -1334,7 +1428,7 @@ fn testHolds(t: borrow PolicyTest, facts: borrow PolicyFacts) -> bool {
         }
         PolicyOp.NumericEquals | PolicyOp.NumericLessThan | PolicyOp.NumericLessThanEquals | PolicyOp.NumericGreaterThan | PolicyOp.NumericGreaterThanEquals => {
             // A value that is not a number matches no number.
-            match (parseDecimal(factText(facts, t.key) ?? "".bytes())) {
+            match (parseDecimal(testText(facts, t) ?? "".bytes())) {
                 Some(n) => {
                     for (i in 0..t.numbers.length) {
                         let v = t.numbers[i];
@@ -1352,7 +1446,7 @@ fn testHolds(t: borrow PolicyTest, facts: borrow PolicyFacts) -> bool {
             }
         }
         _ => {
-            let text = factText(facts, t.key) ?? "".bytes();
+            let text = testText(facts, t) ?? "".bytes();
             for (i in 0..t.values.length) {
                 let v = t.values[i].view();
                 let hit = match (t.op) {
