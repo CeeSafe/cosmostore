@@ -53,12 +53,23 @@ fn sealFixtureTableAs(dir: StringView, tableKeys: borrow TableKeys, configured: 
 
 /// Every file of the table sealed under the KMS key (the files the run wrote too); then each opened, written back in
 /// the clear, for the plain tests' checks. How many files.
-fn checkSealedThenOpen(dir: StringView, tableKeys: borrow TableKeys) -> Result<usize, TestFailure> {
+fn checkSealedThenOpen(dir: StringView, tableKeys: borrow TableKeys) -> Result<usize, TestFailure> =>
+    checkSealedThenOpenAs(dir, tableKeys, false);
+
+/// `checkSealedThenOpen`; with `metadataClear`, the metadata files may be in the clear (`openMetadataFiles`).
+fn checkSealedThenOpenAs(
+    dir: StringView,
+    tableKeys: borrow TableKeys,
+    metadataClear: bool,
+) -> Result<usize, TestFailure> {
     var s = ObjectStore.open(dir, storeConfig())!;
     let keys = tableKeys.keys();
     let files = tableFileKeys(borrow s);
+    let suffix = ".metadata.json".bytes();
     for (key in files.view()) {
         let name = StringView.fromUtf8(key.view()) ?? "";
+        let isMetadata = key.length >= suffix.length && key.view()[key.length - suffix.length..] == suffix;
+        if (metadataClear && isMetadata) { continue; }
         let info = s.headObject(COMPACT_HIDDEN, name)!;
         let field = metadataFind(info.metadata.view(), SSE_FIELD.bytes()) ?? {
             return Err(TestFailure.create("a file of the table in the clear"));
@@ -68,6 +79,20 @@ fn checkSealedThenOpen(dir: StringView, tableKeys: borrow TableKeys) -> Result<u
         let _ = s.putObject(COMPACT_HIDDEN, name, "", plain.view(), PutCondition.None)!;
     }
     return Ok(files.length);
+}
+
+/// The fixture table's metadata files written back in the clear, its other files left sealed.
+fn openMetadataFiles(dir: StringView, tableKeys: borrow TableKeys) {
+    var s = ObjectStore.open(dir, storeConfig())!;
+    let keys = tableKeys.keys();
+    for (key in tableFileKeys(borrow s).view()) {
+        let suffix = ".metadata.json".bytes();
+        if (key.length < suffix.length || key.view()[key.length - suffix.length..] != suffix) { continue; }
+        let name = StringView.fromUtf8(key.view()) ?? "";
+        let plain = readTablePlain(mut s, COMPACT_HIDDEN, name, borrow keys)!!;
+        let _ = s.putObject(COMPACT_HIDDEN, name, "application/json", plain.view(), PutCondition.None)!;
+    }
+    s.checkpoint()!;
 }
 
 /// A sealed table compacted: its position and equality deletes applied in its merge, the merged file and its
@@ -87,9 +112,12 @@ fn encryptedTableCompacted() -> Result<void, TestFailure> {
         if (withKeys) {
             let _ = compactionWorkloadKeyed(dir.bytes(), storeConfig(), borrow tableKeys);
         } else {
+            // Its metadata in the clear and its manifests sealed, so that the run reaches them (the M33 exit review's
+            // M1).
+            openMetadataFiles(dir.view(), borrow tableKeys);
             let _ = compactionWorkloadKeyed(dir.bytes(), storeConfig(), borrow noTableKeys()!);
         }
-        let after = checkSealedThenOpen(dir.view(), borrow tableKeys)?;
+        let after = checkSealedThenOpenAs(dir.view(), borrow tableKeys, !withKeys)?;
         let s = ObjectStore.open(dir.view(), storeConfig())!;
         if (withKeys) {
             Check.isTrue(after > before, "the run's files written")?;
@@ -97,6 +125,13 @@ fn encryptedTableCompacted() -> Result<void, TestFailure> {
         } else {
             Check.equalU64(before as u64, after as u64)?;
             Check.equalU64(2, checkDeletesTable(borrow s)? as u64)?;
+            // Its manifests do not open without the key: the job is Failed, not silent (the M33 exit review's M1).
+            let status = maintenanceDocument(
+                borrow s,
+                COMPACT_HIDDEN.bytes(),
+                jobStatusKey(COMPACT_ID.bytes(), COMPACTION)!.view(),
+            )!;
+            Check.equalBytes("Failed".bytes(), jsonMemberText(borrow status, "status") ?? "".bytes())?;
         }
         removeTree(dir.view());
     }

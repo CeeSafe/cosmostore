@@ -6328,3 +6328,18 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - `iceberg_check.py` (56 on `serve`, and through a cluster's node): a refused call and a record expiration call in
     the table bucket's logs;
   - 547 unit tests, the cluster smoke (214), the S3 smoke and the Java matrix.
+
+### 26 Nov 2026: M33 slice 4, the exit review (`docs/m33-exit-review.md`)
+
+- **The review:** one independent agent, judging each of the twenty Lows closed or not.
+- **Fixed:**
+  - the Medium: M30 B9's fix had silenced compaction for manifests that do not open. Their job is Failed again,
+    tested with plain metadata over sealed manifests and mutation-checked;
+  - three Lows: a staged create's replacement order, a rename keeping its configuration's name, and the IAM change's
+    leftovers;
+  - the missing tests.
+- **Recorded:** five Lows (B1 to B5).
+- **The twenty:** fourteen closed, six kept with their reasons.
+- **Checks:** 547 unit tests, the cluster smoke (214), the maintenance smoke and the S3 smoke. Slice 3's perf gate
+  failed once on noise and passed on its rerun.
+- **Next:** the owner's word on ADR-0132 and on closing M33.
