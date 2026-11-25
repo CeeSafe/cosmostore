@@ -87,10 +87,28 @@ class Tables {
         t.deleteNamespace(r -> r.tableBucketARN(carn).namespace("ns"));
         t.deleteTableBucket(r -> r.tableBucketARN(carn));
         Check.check("DeleteTableBucket: configured", t.listTableBuckets(r -> {}).tableBuckets().size(), 0);
-        // Metrics and record expiration (ADR-0130): a table bucket's metrics configuration put, read and deleted; record
-        // expiration is not offered. The SDK's 2.57.11 has no PutTableBucketLogging or GetTableBucketLogging, so the
-        // logging configuration is checked by the .NET SDK.
+        // Logging, metrics and record expiration (ADR-0130): a table bucket's logging and metrics configurations put,
+        // read and removed; record expiration is not offered. The SDK has the logging calls since 2.58.0 (ADR-0132,
+        // M32's B6).
         String larn = t.createTableBucket(r -> r.name("sdk-java-logged")).arn();
+        s.createBucket(r -> r.bucket("sdk-java-tlogs"));
+        Check.check("GetTableBucketLogging: none",
+            t.getTableBucketLogging(r -> r.tableBucketARN(larn)).tableBucketLoggingStatus().loggingEnabled() == null, true);
+        t.putTableBucketLogging(r -> r.tableBucketARN(larn).tableBucketLoggingStatus(st -> st.loggingEnabled(le -> le
+            .targetBucket("sdk-java-tlogs").targetPrefix("tl/")
+            .targetObjectKeyFormat(f -> f.partitionedPrefix(pp -> pp.partitionDateSource("EventTime"))))));
+        var le = t.getTableBucketLogging(r -> r.tableBucketARN(larn)).tableBucketLoggingStatus().loggingEnabled();
+        Check.check("PutTableBucketLogging",
+            le.targetBucket() + " " + le.targetPrefix() + " " + le.targetObjectKeyFormat().partitionedPrefix().partitionDateSourceAsString(),
+            "sdk-java-tlogs tl/ EventTime");
+        Check.check("PutTableBucketLogging: to its own warehouse",
+            Directory.codeOf(() -> t.putTableBucketLogging(r -> r.tableBucketARN(larn).tableBucketLoggingStatus(st -> st
+                .loggingEnabled(l2 -> l2.targetBucket("sdk-java-logged--table-s3").targetPrefix("x/")
+                    .targetObjectKeyFormat(f -> f.partitionedPrefix(pp -> pp.partitionDateSource("EventTime"))))))),
+            "BadRequestException");
+        t.putTableBucketLogging(r -> r.tableBucketARN(larn).tableBucketLoggingStatus(st -> {}));
+        Check.check("PutTableBucketLogging: cleared",
+            t.getTableBucketLogging(r -> r.tableBucketARN(larn)).tableBucketLoggingStatus().loggingEnabled() == null, true);
         Check.check("GetTableBucketMetricsConfiguration: none",
             Directory.codeOf(() -> t.getTableBucketMetricsConfiguration(r -> r.tableBucketARN(larn))), "NotFoundException");
         t.putTableBucketMetricsConfiguration(r -> r.tableBucketARN(larn));
@@ -109,5 +127,9 @@ class Tables {
         t.deleteNamespace(r -> r.tableBucketARN(larn).namespace("ns"));
         t.deleteTableBucket(r -> r.tableBucketARN(larn));
         Check.check("DeleteTableBucket: with metrics", t.listTableBuckets(r -> {}).tableBuckets().size(), 0);
+        for (var o : s.listObjectsV2(r -> r.bucket("sdk-java-tlogs")).contents()) {
+            s.deleteObject(r -> r.bucket("sdk-java-tlogs").key(o.key()));
+        }
+        s.deleteBucket(r -> r.bucket("sdk-java-tlogs"));
     }
 }

@@ -6310,3 +6310,21 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Kept:** B4, the two-shard check's margin. Its choice of shards is deterministic, and it takes 1 to 2 s against
   a hold of 20 s.
 - **Checks:** 547 unit tests, the cluster smoke (214), the maintenance smoke and the S3 smoke.
+
+### 26 Nov 2026: M33 slice 3, logging (ADR-0132, M32's B1–B6)
+
+- **Fixed:**
+  - **B1:** record expiration's calls are routed on a cluster by their `tableArn`, so their record and count are
+    their table bucket's.
+  - **B2:** a request refused before its caller is known is logged when it names a table bucket that logs: 403
+    ForbiddenException, with its requester and operation `-`.
+  - **B6:** the Java SDK's pin moves from 2.57.11 to 2.58.0 (11 Nov 2026), its first with the logging calls, and the
+    Java matrix checks logging too. All its checks pass.
+- **Kept, with their reasons in ADR-0132:**
+  - B3, a warehouse record's namespace and name;
+  - B4, the per-request cost on a cluster;
+  - B5, downgrades.
+- **Checks:**
+  - `iceberg_check.py` (56 on `serve`, and through a cluster's node): a refused call and a record expiration call in
+    the table bucket's logs;
+  - 547 unit tests, the cluster smoke (214), the S3 smoke and the Java matrix.

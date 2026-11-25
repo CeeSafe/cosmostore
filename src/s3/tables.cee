@@ -1570,6 +1570,8 @@ async fn serveTables(
 ) -> Result<void, S3Fail> {
     if (!tablesMayRead(req, app.credentials.get().view(), Clock.unixMillis() / 1000)) {
         let refused: Result<TablesAnswer, TablesError> = Err(TablesError.Forbidden);
+        // Logged when it names a table bucket that logs (ADR-0132, M32's B2), its requester and operation `-`.
+        if (app.loggingBuckets.load() > 0) { let _ = tablesRefusalFacts(req, "".bytes(), facts); }
         return await sendTablesAnswer(req, exchange, refused);
     }
     let unsigned = Authenticated { payload: PayloadMode.Unsigned, signer: null, key: null, session: null };
@@ -1591,6 +1593,7 @@ async fn serveTables(
             };
             // A role's session is decided by its policies (ADR-0088 §2), as a user is.
             if (who.key.isNull() || headerOf(req, EXPRESS_TOKEN_FIELD).isSome()) {
+                if (app.loggingBuckets.load() > 0) { let _ = tablesRefusalFacts(req, body.view(), facts); }
                 Err(TablesError.Forbidden)
             } else {
                 let caller = tablesCallerOf(app, req, borrow who, body.view())?;
@@ -1606,7 +1609,10 @@ async fn serveTables(
                 answered
             }
         }
-        Err(_) => Err(TablesError.Forbidden),
+        Err(_) => {
+            if (app.loggingBuckets.load() > 0) { let _ = tablesRefusalFacts(req, body.view(), facts); }
+            Err(TablesError.Forbidden)
+        }
     };
     return await sendTablesAnswer(req, exchange, answer);
 }
@@ -1983,6 +1989,38 @@ fn tablesLogFacts(
                 null => { facts.requester.extend("anonymous".bytes())?; }
             }
         }
+    }
+    return Ok();
+}
+
+/// A request refused before its caller is known (no key, a signature that does not check, an Express token): its
+/// table bucket's log record, its requester and operation `-` (ADR-0132, M32's B2), as AWS logs a refused request.
+fn tablesRefusalFacts(
+    req: borrow S3Request,
+    body: Slice<u8>,
+    facts: borrow mut AuditFacts,
+) -> Result<void, AllocError> {
+    let bucket = match (tablesBucketOfRequest(req, body)) {
+        Ok(Some(b)) => b,
+        Ok(null) => { return Ok(); }
+        Err(TablesError.OutOfMemory(e)) => { return Err(e); }
+        Err(_) => { return Ok(); }
+    };
+    facts.access.bucket.clear();
+    facts.access.bucket.extend(bucket.view())?;
+    facts.access.bucket.extend(TABLE_BUCKET_SUFFIX.bytes())?;
+    facts.access.tables = true;
+    facts.access.operation.clear();
+    facts.access.errorName.clear();
+    facts.access.errorName.extend("ForbiddenException".bytes())?;
+    let _ = tablesNamesOf(req, mut facts.access.nsName, mut facts.access.tableName);
+    match (headerOf(req, "user-agent")) {
+        Some(v) => { facts.access.userAgent.extend(trimBlank(v))?; }
+        null => {}
+    }
+    match (headerOf(req, "host")) {
+        Some(v) => { facts.access.host.extend(trimBlank(v))?; }
+        null => {}
     }
     return Ok();
 }

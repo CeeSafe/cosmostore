@@ -263,6 +263,18 @@ tables.get_table(tableBucketARN=log_arn, namespace="ns", name="t")
 log_key = logged["tableARN"].rsplit("/", 1)[1] + "/data/probe.parquet"
 s3.put_object(Bucket="log-check--table-s3", Key=log_key, Body=b"PAR1")
 s3.get_object(Bucket="log-check--table-s3", Key=log_key)["Body"].read()
+# A call refused before its caller is known (a wrong secret), and a record expiration call (routed by its table on a
+# cluster): both in the table bucket's logs (ADR-0132, M32's B1, B2).
+bad = boto3.client("s3tables", endpoint_url=endpoint, region_name=region, aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+                   aws_secret_access_key="wrong", config=Config(retries={"max_attempts": 1}))
+try:
+    bad.get_table_bucket(tableBucketARN=log_arn)
+except ClientError:
+    pass
+try:
+    tables.get_table_record_expiration_configuration(tableArn=logged["tableARN"])
+except ClientError:
+    pass
 lines = []
 today = time.strftime("%Y/%m/%d", time.gmtime())
 for _ in range(40):
@@ -270,7 +282,8 @@ for _ in range(40):
     listed = s3.list_objects_v2(Bucket="tlog-target", Prefix="tl/").get("Contents", [])
     lines = [l for o in listed for l in s3.get_object(Bucket="tlog-target", Key=o["Key"])["Body"].read()
              .decode().splitlines()]
-    if any(" REST.GET.OBJECT " in l for l in lines) and any(" S3Tables.GetTable " in l for l in lines):
+    if (any(" REST.GET.OBJECT " in l for l in lines) and any(" S3Tables.GetTable " in l for l in lines) and
+            any(" 403 ForbiddenException " in l for l in lines) and any(" 405 MethodNotAllowedException " in l for l in lines)):
         break
 check("delivered under partitioned keys", all(o["Key"].startswith("tl/000000000000/us-east-1/log-check/" + today + "/")
       for o in s3.list_objects_v2(Bucket="tlog-target", Prefix="tl/").get("Contents", [])) and len(lines) > 0, True)
@@ -282,6 +295,11 @@ check("its fields, AWS's 25 (the time's two tokens)", len(fields), 26)
 read = next((l.split(" ") for l in lines if " REST.GET.OBJECT " in l), [])
 check("a warehouse read's record: its table and key", (read[3], read[6]) if len(read) > 6 else None,
       (logged["tableARN"], log_key))
+check("a refused call logged, its requester and operation -",
+      any((l.split(" ")[9], l.split(" ")[11], l.split(" ")[12]) == ("-", "-", "403")
+          for l in lines if " 403 ForbiddenException " in l), True)
+check("a record expiration call logged with its table bucket's", any(" 405 MethodNotAllowedException " in l for l in lines),
+      True)
 check("the creates logged too", any(" S3Tables.CreateNamespace " in l for l in lines) and
       any(" S3Tables.CreateTable " in l for l in lines), True)
 tables.put_table_bucket_logging(tableBucketARN=log_arn, tableBucketLoggingStatus={})
