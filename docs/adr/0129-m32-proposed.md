@@ -1,6 +1,8 @@
 # ADR-0129: M32, after clusters as `serve` (proposed)
 
-**Status:** proposed, 25 Nov 2026, after M31 was closed the same day (the owner: "continue").
+**Status:** decided, 25 Nov 2026. The owner chose A, S3 Tables' remaining small calls ("A: Tables' small calls").
+
+Proposed the same day, after M31 was closed (the owner: "continue").
 
 ## Context
 

@@ -6166,3 +6166,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **D,** table replication;
   - **E,** v3's remaining parts.
 - **Next:** the owner's choice.
+
+### 25 Nov 2026: M32 decided, ADR-0130 proposed (S3 Tables' logging, metrics and record expiration)
+
+- **The owner:** "A: Tables' small calls".
+- **ADR-0130 proposes:**
+  - table bucket logging in AWS's 25-field record format and partitioned keys, delivered by the access log writer;
+  - metrics kept and counted;
+  - record expiration answering MethodNotAllowedException.
+- **For the owner:** which requests are logged; partitioned keys for S3 buckets too; metrics counted or only kept.
