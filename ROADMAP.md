@@ -6175,3 +6175,22 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - metrics kept and counted;
   - record expiration answering MethodNotAllowedException.
 - **For the owner:** which requests are logged; partitioned keys for S3 buckets too; metrics counted or only kept.
+
+### 25 Nov 2026: M32 slice 1, the logging configuration and partitioned keys (ADR-0130 §1, §3)
+
+- **The stored logging value, version 3:** carries the key format (simple, or partitioned by event or delivery time).
+  Versions 1 and 2 still read.
+- **S3's PutBucketLogging takes `<PartitionedPrefix PartitionDateSource="EventTime|DeliveryTime"/>`** (no longer
+  NotImplemented), and GetBucketLogging answers it.
+- **The access log queue carries each line's source bucket and key format.** A partitioned batch's object is
+  `<prefix>000000000000/us-east-1/<source>/YYYY/MM/DD/YYYY-MM-DD-hh-mm-ss-<random>`, dated by its first line or by its
+  delivery, on `serve` and through a cluster's delivery.
+- **S3 Tables' PutTableBucketLogging and GetTableBucketLogging:**
+  - the configuration is kept as the table bucket's warehouse's logging, with who put it;
+  - partitioned keys only (EventTime by default);
+  - a general purpose target the caller may `s3:PutObject` into, without SSE-KMS default encryption or object lock;
+  - `{}` turns it off, and Get answers `{"tableBucketLoggingStatus": {}}` when it is off.
+- **Tests:** `partitionedLogKeys` and `tableLoggingBodies`.
+- **Checks:** 540 unit tests and the S3 smoke.
+- **Not yet (slice 2):** the records. Until then a logged table bucket's warehouse requests are logged in S3's
+  format.

@@ -85,3 +85,88 @@ fn accessLogLineFormat() -> Result<void, TestFailure> {
     Check.isTrue(startsWithBytes(key.view(), "web/2019-02-06-00-00-38-".bytes()) && key.length == 24 + 16, "key")?;
     return Ok();
 }
+
+/// Partitioned log keys (ADR-0130 §3): S3's `PartitionedPrefix` taken and answered; the configuration kept with its
+/// format; a batch's key `<prefix><account>/<region>/<source>/YYYY/MM/DD/YYYY-MM-DD-hh-mm-ss-<random>`, dated by its
+/// first line or by its delivery.
+@test
+fn partitionedLogKeys() -> Result<void, TestFailure> {
+    let xml =
+        "<BucketLoggingStatus><LoggingEnabled><TargetBucket>logs</TargetBucket><TargetPrefix>in/</TargetPrefix><TargetObjectKeyFormat><PartitionedPrefix PartitionDateSource=\"DeliveryTime\"/></TargetObjectKeyFormat></LoggingEnabled></BucketLoggingStatus>";
+    let t = parseLogging(xml.bytes())!!;
+    Check.equalU64(LOG_KEYS_DELIVERY_TIME as u64, t.keys as u64)?;
+    var answered = Vector<u8>.create();
+    loggingXml(borrow Some(cloneTarget(borrow t)), mut answered)!;
+    Check.isTrue(findBytes(answered.view(), "PartitionDateSource=\"DeliveryTime\"".bytes(), 0).isSome(), "answered")?;
+    let plain = parseLogging(
+        "<BucketLoggingStatus><LoggingEnabled><TargetBucket>logs</TargetBucket><TargetObjectKeyFormat><PartitionedPrefix/></TargetObjectKeyFormat></LoggingEnabled></BucketLoggingStatus>".bytes(),
+    )!!;
+    Check.equalU64(LOG_KEYS_EVENT_TIME as u64, plain.keys as u64)?;
+    // Kept (version 3), with an empty requester or one.
+    for (who in ["", "user AIDA1"]) {
+        var kept = cloneTarget(borrow t);
+        kept.requester = copyBytes(who.bytes())!;
+        var blob = Vector<u8>.create();
+        encodeLogging(borrow kept, mut blob)!;
+        Check.equalU64(3, blob[0] as u64)?;
+        let back = decodeLogging(blob.view())!;
+        Check.equalBytes(who.bytes(), back.requester.view())?;
+        Check.equalU64(LOG_KEYS_DELIVERY_TIME as u64, back.keys as u64)?;
+    }
+    // The keys: 2019-02-06 00:00:38 for the first line, 2019-03-01 12:00:00 at delivery.
+    for (keys in [LOG_KEYS_EVENT_TIME, LOG_KEYS_DELIVERY_TIME]) {
+        let batch = AccessLogBatch {
+            target: copyBytes("logs".bytes())!,
+            prefix: copyBytes("in/".bytes())!,
+            bytes: Vector<u8>.create(),
+            since: 1549411238000,
+            requester: Vector<u8>.create(),
+            source: copyBytes("lake".bytes())!,
+            keys: keys,
+        };
+        var key = Vector<u8>.create();
+        batchKey(borrow batch, 1551441600000, mut key)!;
+        let want = if (keys == LOG_KEYS_EVENT_TIME) "in/000000000000/us-east-1/lake/2019/02/06/2019-02-06-00-00-38-"
+            else "in/000000000000/us-east-1/lake/2019/03/01/2019-03-01-12-00-00-";
+        Check.isTrue(startsWithBytes(key.view(), want.bytes()), "a partitioned key")?;
+        Check.equalU64((want.length + 16) as u64, key.length as u64)?;
+    }
+    return Ok();
+}
+
+fn cloneTarget(t: borrow LoggingTarget) -> LoggingTarget => LoggingTarget {
+    bucket: copyBytes(t.bucket.view())!,
+    prefix: copyBytes(t.prefix.view())!,
+    requester: copyBytes(t.requester.view())!,
+    keys: t.keys,
+};
+
+/// PutTableBucketLogging's body (ADR-0130 §1): partitioned only (EventTime by default), a general purpose target;
+/// `{}` turns it off.
+@test
+fn tableLoggingBodies() -> Result<void, TestFailure> {
+    let on = tableLoggingTargetOf(
+        "{\"tableBucketLoggingStatus\":{\"loggingEnabled\":{\"targetBucket\":\"logs\",\"targetPrefix\":\"t/\"}}}".bytes(),
+    )!!;
+    Check.equalU64(LOG_KEYS_EVENT_TIME as u64, on.keys as u64)?;
+    Check.equalBytes("t/".bytes(), on.prefix.view())?;
+    let delivery = tableLoggingTargetOf(
+        "{\"tableBucketLoggingStatus\":{\"loggingEnabled\":{\"targetBucket\":\"logs\",\"targetObjectKeyFormat\":{\"partitionedPrefix\":{\"partitionDateSource\":\"DeliveryTime\"}}}}}".bytes(),
+    )!!;
+    Check.equalU64(LOG_KEYS_DELIVERY_TIME as u64, delivery.keys as u64)?;
+    Check.isTrue(tableLoggingTargetOf("{\"tableBucketLoggingStatus\":{}}".bytes())!.isNull(), "off")?;
+    for (body in [
+        "{}",
+        "{\"tableBucketLoggingStatus\":{\"loggingEnabled\":{\"targetBucket\":\"logs\",\"targetObjectKeyFormat\":{\"simplePrefix\":{}}}}}",
+        "{\"tableBucketLoggingStatus\":{\"loggingEnabled\":{\"targetBucket\":\"lake--table-s3\"}}}",
+        "{\"tableBucketLoggingStatus\":{\"loggingEnabled\":{\"targetBucket\":\"d--usw2-az1--x-s3\"}}}",
+        "{\"tableBucketLoggingStatus\":{\"loggingEnabled\":{\"targetBucket\":\"\"}}}",
+        "{\"tableBucketLoggingStatus\":{\"loggingEnabled\":{\"targetBucket\":\"logs\",\"targetObjectKeyFormat\":{\"partitionedPrefix\":{\"partitionDateSource\":\"Never\"}}}}}",
+    ]) {
+        match (tableLoggingTargetOf(body.bytes())) {
+            Err(TablesError.BadRequest) => {}
+            _ => { return Err(TestFailure.create("refused")); }
+        }
+    }
+    return Ok();
+}

@@ -459,3 +459,178 @@ async fn tableWriteSse(
     if (!same) { return Err(S3Fail.Code(S3Code.InvalidArgument)); }
     return Ok(Some(table));
 }
+
+// ---- Logging (ADR-0130 §1) ----
+
+/// A table bucket's logging as GetTableBucketLogging answers it: `{"tableBucketLoggingStatus": {}}` when off.
+fn tableLoggingAnswer(stored: Slice<u8>) -> Result<TablesAnswer, TablesError> {
+    var status = jsonObject();
+    match (decodeLogging(stored)) {
+        Some(t) => {
+            var partitioned = jsonObject();
+            let source = if (t.keys == LOG_KEYS_DELIVERY_TIME) "DeliveryTime" else "EventTime";
+            jsonSet(mut partitioned, "partitionDateSource", jsonString(source.bytes())?)?;
+            var format = jsonObject();
+            jsonSet(mut format, "partitionedPrefix", partitioned)?;
+            var enabled = jsonObject();
+            jsonSet(mut enabled, "targetBucket", jsonString(t.bucket.view())?)?;
+            jsonSet(mut enabled, "targetPrefix", jsonString(t.prefix.view())?)?;
+            jsonSet(mut enabled, "targetObjectKeyFormat", format)?;
+            jsonSet(mut status, "loggingEnabled", enabled)?;
+        }
+        null => {}
+    }
+    var answer = jsonObject();
+    jsonSet(mut answer, "tableBucketLoggingStatus", status)?;
+    return tablesJson(borrow answer);
+}
+
+/// GetTableBucketLogging, under the store.
+fn getTableBucketLogging(
+    store: borrow ObjectStore,
+    caller: borrow TablesCaller,
+    bucket: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    let _ = tableBucketRecord(store, bucket)?;
+    checkTables(store, caller, "s3tables:GetTableBucketLogging", bucket, "".bytes())?;
+    let hidden = tableWarehouseBucket(bucket)?;
+    let stored = match (store.bucketConfig(catalogText(hidden.view()), BUCKET_CONFIG_LOGGING)) {
+        Ok(s) => s,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    return tableLoggingAnswer(stored.view());
+}
+
+/// A PutTableBucketLogging body's target: null to turn logging off. Its key format must be partitioned, as S3 Tables
+/// takes no other (EventTime when it names no date source).
+fn tableLoggingTargetOf(body: Slice<u8>) -> Result<LoggingTarget?, TablesError> {
+    let j = tablesObject(body)?;
+    let status = jsonMember(borrow j, "tableBucketLoggingStatus") ?? { return Err(TablesError.BadRequest); };
+    let enabled = jsonMember(status, "loggingEnabled") ?? { return Ok(null); };
+    let bucket = jsonMemberText(enabled, "targetBucket") ?? { return Err(TablesError.BadRequest); };
+    let prefix = match (jsonMember(enabled, "targetPrefix")) {
+        Some(Json.Text(p)) => copyBytes(p.view())?,
+        Some(_) => { return Err(TablesError.BadRequest); }
+        null => Vector<u8>.create(),
+    };
+    var keys = LOG_KEYS_EVENT_TIME;
+    match (jsonMember(enabled, "targetObjectKeyFormat")) {
+        Some(f) => {
+            if (jsonMember(f, "simplePrefix").isSome()) { return Err(TablesError.BadRequest); }
+            match (jsonMember(f, "partitionedPrefix")) {
+                Some(p) => {
+                    match (jsonMemberText(p, "partitionDateSource")) {
+                        Some(s) => {
+                            if (s == "DeliveryTime".bytes()) {
+                                keys = LOG_KEYS_DELIVERY_TIME;
+                            } else if (s != "EventTime".bytes()) {
+                                return Err(TablesError.BadRequest);
+                            }
+                        }
+                        null => {}
+                    }
+                }
+                null => { return Err(TablesError.BadRequest); }
+            }
+        }
+        null => {}
+    }
+    if (bucket.length == 0 || bucket.length > 63 || prefix.length > 1024) { return Err(TablesError.BadRequest); }
+    // A general purpose bucket: not a table bucket's warehouse, a hidden one or a directory bucket.
+    if (isHiddenBucketName(bucket) || isTableWarehouseShaped(bucket) || isDirectoryShaped(bucket)) {
+        return Err(TablesError.BadRequest);
+    }
+    return Ok(
+        Some(LoggingTarget { bucket: copyBytes(bucket)?, prefix: prefix, requester: Vector<u8>.create(), keys: keys }),
+    );
+}
+
+/// The checks of a target that need its bucket (ADR-0130 §1): there (on `serve`; a cluster's other shard's is not
+/// seen here, as S3's logging takes it), without SSE-KMS default encryption or object lock.
+fn tableLoggingTargetFits(store: borrow ObjectStore, target: Slice<u8>, cluster: bool) -> Result<bool, TablesError> {
+    let name = catalogText(target);
+    let there = match (store.bucketExists(name)) {
+        Ok(t) => t,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    if (!there) { return Ok(cluster); }
+    let encryption = match (store.bucketConfig(name, BUCKET_CONFIG_ENCRYPTION)) {
+        Ok(e) => e,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    if (startsWithBytes(encryption.view(), "aws:kms".bytes())) { return Ok(false); }
+    let lock = match (store.bucketConfig(name, BUCKET_CONFIG_OBJECT_LOCK)) {
+        Ok(l) => l,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    return Ok(lock.length == 0);
+}
+
+/// PutTableBucketLogging (ADR-0130 §1): its target checked, and kept as its warehouse's logging configuration, with
+/// who put it (ADR-0094); `{}` turns it off.
+async fn putTableBucketLogging(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    caller: borrow TablesCaller,
+    bucket: Slice<u8>,
+    body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> {
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        await Async.blocking(() => tablesAllowedOnBucket(store, caller, "s3tables:PutTableBucketLogging", bucket))?;
+    }
+    var stored = Vector<u8>.create();
+    match (tableLoggingTargetOf(body)?) {
+        Some(parsed) => {
+            var t = parsed;
+            // The caller's logs go only where it may write (as S3's PutBucketLogging, the M11 exit review's A1).
+            match (await authorizeDestination(app, req, who, "s3:PutObject", t.bucket.view(), t.prefix.view())) {
+                Ok() => {}
+                Err(S3Fail.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
+                Err(_) => { return Err(TablesError.Forbidden); }
+            }
+            var fits = false;
+            {
+                var guard = await lockStore(app)?;
+                let store = guard.data();
+                let target = t.bucket.view();
+                let cluster = app.cluster;
+                fits = await Async.blocking(() => tableLoggingTargetFits(store, target, cluster))?;
+            }
+            if (!fits) { return Err(TablesError.BadRequest); }
+            t.requester = requesterText(app, who)?;
+            encodeLogging(borrow t, mut stored)?;
+        }
+        null => {}
+    }
+    let hidden = tableWarehouseBucket(bucket)?;
+    {
+        var guard = await lockStore(app)?;
+        let store = guard.data();
+        let h = catalogText(hidden.view());
+        let value = stored.view();
+        match (await Async.blocking(() => store.setBucketConfig(h, BUCKET_CONFIG_LOGGING, value))) {
+            Ok() => {}
+            Err(e) => { return Err(tablesStoreFail(e)); }
+        }
+    }
+    match (await recountLogging(app)) {
+        Ok() => {}
+        Err(S3Fail.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
+        Err(_) => { return Err(TablesError.Internal); }
+    }
+    return tablesJson(borrow jsonObject());
+}
+
+/// The table bucket is there and the caller may do `action` on it (its policy and identity's, ADR-0084).
+fn tablesAllowedOnBucket(
+    store: borrow ObjectStore,
+    caller: borrow TablesCaller,
+    action: StringView,
+    bucket: Slice<u8>,
+) -> Result<void, TablesError> {
+    let _ = tableBucketRecord(store, bucket)?;
+    return checkTables(store, caller, action, bucket, "".bytes());
+}
