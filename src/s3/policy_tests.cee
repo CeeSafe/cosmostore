@@ -58,6 +58,9 @@ fn plainFacts() -> PolicyFacts => PolicyFacts {
     noClient: false,
     tagKeys: Vector<Vector<u8>>.create(),
     tagValues: Vector<Vector<u8>>.create(),
+    requestTagKeys: Vector<Vector<u8>>.create(),
+    requestTagValues: Vector<Vector<u8>>.create(),
+    requestTagged: false,
 };
 
 fn decisionName(d: PolicyDecision) -> StringView => match (d) {
@@ -711,5 +714,123 @@ fn resourceTagConditions() -> Result<void, TestFailure> {
     Check.equalText("deny", decisionName(denied))?;
     let neither = decidePolicyFor(borrow policy, null, null, "s3tables:GetTable", resource, borrow untagged);
     Check.equalText("neither", decisionName(neither))?;
+    return Ok();
+}
+
+/// A tables policy of one Deny of TagResource on table bucket `b` under `condition`.
+fn tagDeny(condition: StringView) -> BucketPolicy {
+    var json = copyBytes(
+        "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:TagResource\",\"Resource\":\"arn:aws:s3tables:us-east-1:000000000000:bucket/b\",\"Condition\":".bytes(),
+    )!;
+    json.extend(condition.bytes())!;
+    json.extend("}]}".bytes())!;
+    let none = Vector<Credential>.create();
+    return parseTablesPolicy(json.view(), "b".bytes(), none.view(), false)!;
+}
+
+/// Facts of a call that sets `keys` with `values` (an empty `values`: UntagResource's keys), or names none.
+fn requestTagFacts(keys: Slice<StringView>, values: Slice<StringView>, tagged: bool) -> PolicyFacts {
+    var f = plainFacts();
+    f.requestTagged = tagged;
+    for (k in keys) { f.requestTagKeys.push(copyBytes(k.bytes())!)!; }
+    for (v in values) { f.requestTagValues.push(copyBytes(v.bytes())!)!; }
+    return f;
+}
+
+fn tagDecision(p: borrow BucketPolicy, facts: borrow PolicyFacts) -> PolicyDecision =>
+    decidePolicyFor(p, null, null, "s3tables:TagResource", "b".bytes(), facts);
+
+/// `aws:RequestTag/<key>` and `aws:TagKeys` (ADR-0126 §1, the M30 exit review): a Deny on the tags a call sets or
+/// names, as IAM decides them. `aws:TagKeys` with `ForAllValues:` (every key; none named, it holds) or
+/// `ForAnyValue:` (one key), `Not…` on each key; without a set operator, or a set operator elsewhere, refused; neither
+/// is taken in an S3 policy.
+@test
+fn requestTagConditions() -> Result<void, TestFailure> {
+    let stage = ["stage"];
+    let locked = ["locked"];
+    let open = ["open"];
+    let setsLocked = requestTagFacts(stage[..], locked[..], true);
+    let setsOpen = requestTagFacts(stage[..], open[..], true);
+    let empty = Vector<StringView>.create();
+    let noKeys = empty.view();
+    let noCall = requestTagFacts(noKeys, noKeys, false);
+    // RequestTag: its key without case; a call that sets none does not match.
+    let onStage = tagDeny("{\"StringEquals\":{\"aws:RequestTag/Stage\":\"locked\"}}");
+    Check.equalText("deny", decisionName(tagDecision(borrow onStage, borrow setsLocked)))?;
+    Check.equalText("neither", decisionName(tagDecision(borrow onStage, borrow setsOpen)))?;
+    Check.equalText("neither", decisionName(tagDecision(borrow onStage, borrow noCall)))?;
+    // ForAnyValue: one key is enough; UntagResource's keys count.
+    let anyStage = tagDeny("{\"ForAnyValue:StringEquals\":{\"aws:TagKeys\":[\"stage\",\"owner\"]}}");
+    let two = ["team", "stage"];
+    let twoValues = ["a", "b"];
+    Check.equalText(
+        "deny",
+        decisionName(tagDecision(borrow anyStage, borrow requestTagFacts(two[..], twoValues[..], true))),
+    )?;
+    Check.equalText(
+        "deny",
+        decisionName(tagDecision(borrow anyStage, borrow requestTagFacts(stage[..], noKeys, true))),
+    )?;
+    let team = ["team"];
+    Check.equalText(
+        "neither",
+        decisionName(tagDecision(borrow anyStage, borrow requestTagFacts(team[..], open[..], true))),
+    )?;
+    Check.equalText("neither", decisionName(tagDecision(borrow anyStage, borrow noCall)))?;
+    // ForAllValues with Not: a Deny of any key outside the list; a call naming only listed keys passes, and one
+    // naming none holds the test (IAM's empty set), so it is denied.
+    let onlyListed = tagDeny("{\"ForAllValues:StringNotEquals\":{\"aws:TagKeys\":[\"stage\",\"owner\"]}}");
+    // Every key outside the list: denied; one inside: not every key is outside, so not denied.
+    Check.equalText(
+        "deny",
+        decisionName(tagDecision(borrow onlyListed, borrow requestTagFacts(team[..], open[..], true))),
+    )?;
+    Check.equalText(
+        "neither",
+        decisionName(tagDecision(borrow onlyListed, borrow requestTagFacts(two[..], twoValues[..], true))),
+    )?;
+    Check.equalText("deny", decisionName(tagDecision(borrow onlyListed, borrow noCall)))?;
+    // ForAnyValue with Not: a Deny when any key is outside the list.
+    let anyOutside = tagDeny("{\"ForAnyValue:StringNotEquals\":{\"aws:TagKeys\":[\"stage\",\"owner\"]}}");
+    Check.equalText(
+        "deny",
+        decisionName(tagDecision(borrow anyOutside, borrow requestTagFacts(two[..], twoValues[..], true))),
+    )?;
+    Check.equalText("neither", decisionName(tagDecision(borrow anyOutside, borrow setsLocked)))?;
+    // Null on aws:TagKeys: whether the call names tags.
+    let named = tagDeny("{\"Null\":{\"aws:TagKeys\":\"false\"}}");
+    Check.equalText("deny", decisionName(tagDecision(borrow named, borrow setsOpen)))?;
+    Check.equalText("neither", decisionName(tagDecision(borrow named, borrow noCall)))?;
+    // Refused: aws:TagKeys without a set operator, a set operator on another key, and both in an S3 policy.
+    let none = Vector<Credential>.create();
+    for (condition in [
+        "{\"StringEquals\":{\"aws:TagKeys\":\"stage\"}}",
+        "{\"ForAnyValue:StringEquals\":{\"aws:RequestTag/stage\":\"locked\"}}",
+        "{\"ForAllValues:StringEquals\":{\"aws:UserAgent\":\"x\"}}",
+    ]) {
+        var json = copyBytes(
+            "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:TagResource\",\"Resource\":\"arn:aws:s3tables:us-east-1:000000000000:bucket/b\",\"Condition\":".bytes(),
+        )!;
+        json.extend(condition.bytes())!;
+        json.extend("}]}".bytes())!;
+        match (parseTablesPolicy(json.view(), "b".bytes(), none.view(), false)) {
+            Err(S3Fail.Code(S3Code.NotImplemented)) => {}
+            _ => { return Err(TestFailure.create("refused")); }
+        }
+    }
+    for (condition in [
+        "{\"StringEquals\":{\"aws:RequestTag/stage\":\"locked\"}}",
+        "{\"ForAnyValue:StringEquals\":{\"aws:TagKeys\":\"stage\"}}",
+    ]) {
+        var json = copyBytes(
+            "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:PutObject\",\"Resource\":\"arn:aws:s3:::b/*\",\"Condition\":".bytes(),
+        )!;
+        json.extend(condition.bytes())!;
+        json.extend("}]}".bytes())!;
+        match (parseBucketPolicy(json.view(), "b".bytes(), none.view(), false)) {
+            Err(S3Fail.Code(S3Code.NotImplemented)) => {}
+            _ => { return Err(TestFailure.create("refused in an S3 policy")); }
+        }
+    }
     return Ok();
 }

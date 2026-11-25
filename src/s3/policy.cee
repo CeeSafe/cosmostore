@@ -20,6 +20,11 @@ enum PolicyKey {
     SseCustomerAlgorithm,
     /// `aws:ResourceTag/<key>` (ADR-0126 §1): the tag of the resource the call is on, its key the test's `tagKey`.
     ResourceTag,
+    /// `aws:RequestTag/<key>`: a tag the call sets (TagResource, a create's `tags`), its key the test's `tagKey`.
+    RequestTag,
+    /// `aws:TagKeys`: the tag keys the call names (TagResource's and a create's, UntagResource's `tagKeys`), a set:
+    /// tested with `ForAllValues:` or `ForAnyValue:` only.
+    TagKeys,
 }
 
 /// A condition operator, without its `Not`: `PolicyTest.negated` says whether it had one.
@@ -51,8 +56,12 @@ struct PolicyTest {
     /// fails, and when the request does not have the key.
     negated: bool;
     key: PolicyKey;
-    /// For `aws:ResourceTag/<key>`: the tag's key, in lower case (condition keys are matched without case).
+    /// For `aws:ResourceTag/<key>` and `aws:RequestTag/<key>`: the tag's key, in lower case (condition keys are matched
+    /// without case).
     tagKey: Vector<u8>;
+    /// A set operator on a key of several values (`aws:TagKeys`): 0 none, 1 `ForAllValues:` (every value matches; an
+    /// empty set does), 2 `ForAnyValue:` (one does; an empty set does not). `negated` applies to each value.
+    set: u8;
     /// String values (lower case for the `IgnoreCase` operators, `true` or `false` for `Bool` and `Null`).
     values: Vector<Vector<u8>>;
     ranges: Vector<IpRange>;
@@ -111,6 +120,7 @@ fn clonePolicy(p: borrow BucketPolicy) -> Result<BucketPolicy, AllocError> {
                 negated: test.negated,
                 key: test.key,
                 tagKey: copyBytes(test.tagKey.view())?,
+                set: test.set,
                 values: cloneVectors(borrow test.values)?,
                 ranges: ranges,
                 numbers: numbers,
@@ -471,6 +481,7 @@ fn policyOpOf(name: Slice<u8>) -> PolicyTest? {
         negated: i == 1 || i == 3 || i == 5 || i == 8 || i == 10,
         key: PolicyKey.Referer,
         tagKey: Vector<u8>.create(),
+        set: 0,
         values: Vector<Vector<u8>>.create(),
         ranges: Vector<IpRange>.create(),
         numbers: Vector<u64>.create(),
@@ -516,7 +527,7 @@ fn opFitsKey(op: PolicyOp, key: PolicyKey) -> bool => match (op) {
     _ => match (key) {
         PolicyKey.Referer | PolicyKey.UserAgent | PolicyKey.Prefix | PolicyKey.Delimiter => true,
         PolicyKey.SseAlgorithm | PolicyKey.SseKmsKeyId | PolicyKey.SseCustomerAlgorithm => true,
-        PolicyKey.ResourceTag => true,
+        PolicyKey.ResourceTag | PolicyKey.RequestTag | PolicyKey.TagKeys => true,
         _ => false,
     },
 };
@@ -533,9 +544,19 @@ fn parseCondition<region a>(
     while (true) {
         if (!r.string(mut name)?) { return Err(malformedPolicy()); }
         if (!r.take(':')) { return Err(malformedPolicy()); }
-        // `...IfExists`, `ForAllValues:`, `ForAnyValue:` and the operators of other types (dates, ARNs, binary)
-        // are valid in S3 and not evaluated here: refused, never ignored.
-        let template = match (policyOpOf(name.view())) {
+        // `...IfExists` and the operators of other types (dates, ARNs, binary) are valid in S3 and not evaluated
+        // here: refused, never ignored. `ForAllValues:` and `ForAnyValue:` are taken in S3 Tables' policies, on
+        // `aws:TagKeys` only (ADR-0126 §1).
+        var set: u8 = 0;
+        var skip: usize = 0;
+        if (tables && startsWithIgnoreCase(name.view(), "forallvalues:".bytes())) {
+            set = 1;
+            skip = 13;
+        } else if (tables && startsWithIgnoreCase(name.view(), "foranyvalue:".bytes())) {
+            set = 2;
+            skip = 12;
+        }
+        let template = match (policyOpOf(name.view()[skip..])) {
             Some(t) => t,
             null => { return Err(notImplemented()); }
         };
@@ -545,22 +566,39 @@ fn parseCondition<region a>(
             if (!r.take(':')) { return Err(malformedPolicy()); }
             // `aws:ResourceTag/<key>`, its key kept (ADR-0126 §1): in S3 Tables' policies only, whose calls give their
             // resource's tags. S3's calls give none, and a Deny on a tag would never hold there, so it stays refused.
+            // `aws:RequestTag/<key>` and `aws:TagKeys` likewise: the tags a call of S3 Tables sets or names.
             var tagKey = Vector<u8>.create();
-            let tagPrefix = "aws:resourcetag/".bytes();
-            var isTag = tables && name.length > tagPrefix.length;
-            if (isTag) {
-                for (i in 0..tagPrefix.length) {
-                    if (lowerAscii(name[i]) != tagPrefix[i]) { isTag = false; }
+            var tagged: PolicyKey? = null;
+            if (tables) {
+                if (startsWithIgnoreCase(name.view(), "aws:resourcetag/".bytes()) && name.length > 16) {
+                    tagged = Some(PolicyKey.ResourceTag);
+                    for (c in name.view()[16..]) { tagKey.push(lowerAscii(c))?; }
+                } else if (startsWithIgnoreCase(name.view(), "aws:requesttag/".bytes()) && name.length > 15) {
+                    tagged = Some(PolicyKey.RequestTag);
+                    for (c in name.view()[15..]) { tagKey.push(lowerAscii(c))?; }
+                } else if (equalsIgnoreCase(name.view(), "aws:tagkeys".bytes())) {
+                    tagged = Some(PolicyKey.TagKeys);
                 }
             }
-            if (isTag) {
-                for (c in name.view()[tagPrefix.length..]) { tagKey.push(lowerAscii(c))?; }
-            }
-            let key = if (isTag) PolicyKey.ResourceTag else match (policyKeyOf(name.view())) {
+            let key = match (tagged) {
                 Some(k) => k,
-                null => { return Err(notImplemented()); }
+                null => match (policyKeyOf(name.view())) {
+                    Some(k) => k,
+                    null => { return Err(notImplemented()); }
+                },
             };
             if (!opFitsKey(template.op, key)) { return Err(notImplemented()); }
+            // A set operator on `aws:TagKeys` alone, and `aws:TagKeys` with one (or `Null`): a multi-valued key under
+            // a single-valued operator is ambiguous, so refused.
+            let onSet = match (key) {
+                PolicyKey.TagKeys => true,
+                _ => false,
+            };
+            let isNull = match (template.op) {
+                PolicyOp.Null => true,
+                _ => false,
+            };
+            if ((set != 0) != (onSet && !isNull)) { return Err(notImplemented()); }
             var raw = Vector<Vector<u8>>.create();
             policyScalars(r, mut raw)?;
             var test = PolicyTest {
@@ -568,6 +606,7 @@ fn parseCondition<region a>(
                 negated: template.negated,
                 key: key,
                 tagKey: tagKey,
+                set: set,
                 values: Vector<Vector<u8>>.create(),
                 ranges: Vector<IpRange>.create(),
                 numbers: Vector<u64>.create(),
@@ -1247,6 +1286,11 @@ struct PolicyFacts {
     /// table's.
     tagKeys: Vector<Vector<u8>>;
     tagValues: Vector<Vector<u8>>;
+    /// The tags the call sets or names (ADR-0126 §1): their keys as given and values (none for UntagResource's keys);
+    /// `requestTagged` when it names any set at all, so that `aws:TagKeys` is present.
+    requestTagKeys: Vector<Vector<u8>>;
+    requestTagValues: Vector<Vector<u8>>;
+    requestTagged: bool;
 }
 
 fn ownedOf(v: Slice<u8>?) -> Result<Vector<u8>?, AllocError> => match (v) {
@@ -1275,6 +1319,9 @@ fn policyFacts(
         noClient: false,
         tagKeys: Vector<Vector<u8>>.create(),
         tagValues: Vector<Vector<u8>>.create(),
+        requestTagKeys: Vector<Vector<u8>>.create(),
+        requestTagValues: Vector<Vector<u8>>.create(),
+        requestTagged: false,
     };
     if (listing) {
         facts.prefix = copyBytes(paramOf(req, "prefix") ?? "".bytes())?;
@@ -1300,6 +1347,9 @@ fn factsWithTags(facts: borrow PolicyFacts, tags: borrow Json?) -> Result<Policy
         noClient: facts.noClient,
         tagKeys: Vector<Vector<u8>>.create(),
         tagValues: Vector<Vector<u8>>.create(),
+        requestTagKeys: copyAll(facts.requestTagKeys.view())?,
+        requestTagValues: copyAll(facts.requestTagValues.view())?,
+        requestTagged: facts.requestTagged,
     };
     match (tags) {
         Some(t) => {
@@ -1366,7 +1416,7 @@ fn factText(facts: borrow PolicyFacts, key: PolicyKey) -> Slice<u8>? => match (k
     },
     PolicyKey.SecureTransport => if (facts.secure) Some("true".bytes()) else Some("false".bytes()),
     PolicyKey.SourceIp => null,
-    PolicyKey.ResourceTag => null,
+    PolicyKey.ResourceTag | PolicyKey.RequestTag | PolicyKey.TagKeys => null,
 };
 
 /// The text a test's key has in the request: a resource tag's by its key, else `factText`'s.
@@ -1375,6 +1425,14 @@ fn testText<region a>(facts: borrow(a) PolicyFacts, t: borrow PolicyTest) -> Sli
         PolicyKey.ResourceTag => {
             for (i in 0..facts.tagKeys.length) {
                 if (facts.tagKeys[i].view() == t.tagKey.view()) { return Some(facts.tagValues[i].view()); }
+            }
+            return null;
+        }
+        PolicyKey.RequestTag => {
+            for (i in 0..facts.requestTagValues.length) {
+                if (equalsIgnoreCase(facts.requestTagKeys[i].view(), t.tagKey.view())) {
+                    return Some(facts.requestTagValues[i].view());
+                }
             }
             return null;
         }
@@ -1400,7 +1458,8 @@ fn testHolds(t: borrow PolicyTest, facts: borrow PolicyFacts) -> bool {
         }
     }
     let present = match (t.key) {
-        PolicyKey.ResourceTag => testText(facts, t).isSome(),
+        PolicyKey.ResourceTag | PolicyKey.RequestTag => testText(facts, t).isSome(),
+        PolicyKey.TagKeys => facts.requestTagged,
         _ => factPresent(facts, t.key),
     };
     match (t.op) {
@@ -1412,6 +1471,16 @@ fn testHolds(t: borrow PolicyTest, facts: borrow PolicyFacts) -> bool {
             return false;
         }
         _ => {}
+    }
+    // A set operator (`aws:TagKeys`): each of the call's keys tested as one value, `Not…` on each; `ForAllValues`
+    // holds when every one matches (none named: it holds), `ForAnyValue` when one does.
+    if (t.set != 0) {
+        for (k in 0..facts.requestTagKeys.length) {
+            let hit = textMatches(t, facts.requestTagKeys[k].view()) != t.negated;
+            if (t.set == 1 && !hit) { return false; }
+            if (t.set == 2 && hit) { return true; }
+        }
+        return t.set == 1;
     }
     if (!present) { return t.negated; }
     var matched = false;
@@ -1445,20 +1514,38 @@ fn testHolds(t: borrow PolicyTest, facts: borrow PolicyFacts) -> bool {
                 null => {}
             }
         }
-        _ => {
-            let text = testText(facts, t) ?? "".bytes();
-            for (i in 0..t.values.length) {
-                let v = t.values[i].view();
-                let hit = match (t.op) {
-                    PolicyOp.StringEqualsIgnoreCase | PolicyOp.Bool => equalsIgnoreCase(text, v),
-                    PolicyOp.StringLike => wildMatch(v, text, false),
-                    _ => text == v,
-                };
-                if (hit) { matched = true; }
-            }
-        }
+        _ => { matched = textMatches(t, testText(facts, t) ?? "".bytes()); }
     }
     return matched != t.negated;
+}
+
+/// Whether a string test's values match `text`, any of them, without its `Not`.
+fn textMatches(t: borrow PolicyTest, text: Slice<u8>) -> bool {
+    for (i in 0..t.values.length) {
+        let v = t.values[i].view();
+        let hit = match (t.op) {
+            PolicyOp.StringEqualsIgnoreCase | PolicyOp.Bool => equalsIgnoreCase(text, v),
+            PolicyOp.StringLike => wildMatch(v, text, false),
+            _ => text == v,
+        };
+        if (hit) { return true; }
+    }
+    return false;
+}
+
+/// Whether `text` begins with `prefix` (lower case), without regard to case.
+fn startsWithIgnoreCase(text: Slice<u8>, prefix: Slice<u8>) -> bool {
+    if (text.length < prefix.length) { return false; }
+    for (i in 0..prefix.length) {
+        if (lowerAscii(text[i]) != prefix[i]) { return false; }
+    }
+    return true;
+}
+
+fn copyAll(items: Slice<Vector<u8>>) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    for (i in 0..items.length) { out.push(copyBytes(items[i].view())?)?; }
+    return Ok(out);
 }
 
 enum PolicyDecision {

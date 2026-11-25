@@ -212,6 +212,15 @@ tables.create_namespace(tableBucketARN=enc_arn, namespace=["ns"])
 kms_table = tables.create_table(tableBucketARN=enc_arn, namespace="ns", name="sealed", format="ICEBERG")
 got = tables.get_table_encryption(tableBucketARN=enc_arn, namespace="ns", name="sealed")["encryptionConfiguration"]
 check("a table's encryption: its bucket's", got["sseAlgorithm"], "aws:kms")
+# A table made with its schema: its first metadata file, written in its create's request, sealed with the key (the
+# M30 exit review: on a cluster the create's configuration is not read back in its own request).
+tables.create_table(tableBucketARN=enc_arn, namespace="ns", name="schemed", format="ICEBERG",
+                    metadata={"iceberg": {"schema": {"fields": [{"name": "a", "type": "long", "required": True}]}}})
+first = tables.get_table_metadata_location(tableBucketARN=enc_arn, namespace="ns", name="schemed")["metadataLocation"]
+head = s3.head_object(Bucket="enc-check--table-s3", Key=first.split("/", 3)[3])
+check("its first metadata file sealed with the key",
+      (head.get("ServerSideEncryption"), head.get("SSEKMSKeyId", "").rsplit("/", 1)[-1]), ("aws:kms", "orders"))
+tables.delete_table(tableBucketARN=enc_arn, namespace="ns", name="schemed")
 own = tables.create_table(tableBucketARN=enc_arn, namespace="ns", name="own", format="ICEBERG",
                           encryptionConfiguration={"sseAlgorithm": "AES256"})
 check("a table's own encryption", tables.get_table_encryption(tableBucketARN=enc_arn, namespace="ns", name="own")

@@ -954,19 +954,28 @@ fn readMetadataWith(
 }
 
 /// A table's configuration at its create through the catalog, written at its id: its bucket's storage class and
-/// encryption then (ADR-0126 §2, §3).
+/// encryption then (ADR-0126 §2, §3). Its encryption, which the create's first metadata file is sealed with: given
+/// to it, not read back, as a cluster shard's write is not seen in its own request (ADR-0058).
 fn writeCreatedTableConfig(
     store: borrow mut ObjectStore,
     hidden: Slice<u8>,
     id: Slice<u8>,
-) -> Result<void, TablesError> {
+    keys: borrow WarehouseKeys,
+) -> Result<Json?, TablesError> {
     var config = jsonObject();
     jsonSet(mut config, "storageClass", Json.Text(bucketStorageClass(store, hidden)?))?;
-    match (bucketEncryption(store, hidden)?) {
-        Some(e) => { jsonSet(mut config, "encryption", e)?; }
+    let encryption = bucketEncryption(store, hidden)?;
+    match (encryption.asBorrow()) {
+        Some(e) => {
+            // A key this server no longer seals with (retired since the bucket's was set): refused, as each of
+            // the table's writes would be.
+            if (!encryptionHeld(e, keys)) { return Err(TablesError.BadRequest); }
+            jsonSet(mut config, "encryption", cloneJson(e)?)?;
+        }
         null => {}
     }
-    return writeTablesConfig(store, hidden, tableConfigKey(id)?.view(), borrow config);
+    writeTablesConfig(store, hidden, tableConfigKey(id)?.view(), borrow config)?;
+    return Ok(encryption);
 }
 
 /// The version number a metadata file's name begins with (`00003-<uuid>.metadata.json`), or -1.
@@ -1001,6 +1010,21 @@ fn writeMetadataWith(
     m: borrow Json,
     keys: borrow WarehouseKeys,
 ) -> Result<Vector<u8>, TablesError> {
+    let encryption = tableEncryption(store, hidden, tableId)?;
+    return writeMetadataSealedBy(store, hidden, tableId, n, m, keys, encryption.asBorrow());
+}
+
+/// `writeMetadataWith` sealed with `encryption`, the table's as its caller has it: a create's, given rather than read
+/// back (`writeCreatedTableConfig`).
+fn writeMetadataSealedBy(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    tableId: Slice<u8>,
+    n: i64,
+    m: borrow Json,
+    keys: borrow WarehouseKeys,
+    encryption: borrow Json?,
+) -> Result<Vector<u8>, TablesError> {
     var key = copyBytes(tableId)?;
     key.extend("/metadata/".bytes())?;
     var digits = Vector<u8>.create();
@@ -1012,14 +1036,13 @@ fn writeMetadataWith(
     key.extend(".metadata.json".bytes())?;
     var body = Vector<u8>.create();
     writeJson(mut body, m)?;
-    let encryption = tableEncryption(store, hidden, tableId)?;
     match (putTableFile(
         store,
         catalogText(hidden),
         catalogText(key.view()),
         "application/json",
         body.view(),
-        encryption.asBorrow(),
+        encryption,
         keys,
         PutCondition.IfAbsent,
     )) {
@@ -1173,7 +1196,7 @@ fn icebergCreateTable(
     if (staged) {
         // Its configuration first, at its reserved id: the files an engine writes before its commit (a CTAS's data
         // and manifests) are sealed with its encryption as they arrive (ADR-0126 §4).
-        writeCreatedTableConfig(store, hidden.view(), id.view())?;
+        let _ = writeCreatedTableConfig(store, hidden.view(), id.view(), sealing)?;
         // Kept by the table's namespace and name, so that one name holds one at most (the M29 exit review's M1): a
         // later staged create of the name replaces it.
         var reservation = jsonObject();
@@ -1186,9 +1209,9 @@ fn icebergCreateTable(
         jsonSet(mut j, "config", jsonObject())?;
         return tablesJson(borrow j);
     }
-    // Its configuration, written first, as its metadata is sealed with it.
-    writeCreatedTableConfig(store, hidden.view(), id.view())?;
-    let location = writeMetadataWith(store, hidden.view(), id.view(), 0, borrow m, sealing)?;
+    // Its configuration, written first; its metadata sealed with its encryption.
+    let encryption = writeCreatedTableConfig(store, hidden.view(), id.view(), sealing)?;
+    let location = writeMetadataSealedBy(store, hidden.view(), id.view(), 0, borrow m, sealing, encryption.asBorrow())?;
     let now = Clock.unixMillis();
     var rec = jsonObject();
     jsonSet(mut rec, "id", jsonString(id.view())?)?;
@@ -1198,8 +1221,9 @@ fn icebergCreateTable(
     match (writeRecord(store, hidden.view(), key.view(), borrow rec, PutCondition.IfAbsent)) {
         Ok(_) => {}
         Err(e) => {
-            // Another create won the name: this one's file is no table's.
+            // Another create won the name: this one's file and configuration are no table's.
             removeMetadataFile(store, hidden.view(), location.view());
+            let _ = store.deleteObject(catalogText(hidden.view()), catalogText(tableConfigKey(id.view())?.view()));
             return match (e) {
                 TablesError.Conflict => icebergError(409, "AlreadyExistsException", "The table already exists."),
                 _ => Err(e),
@@ -1278,10 +1302,17 @@ fn icebergCommitCreate(
     // Its configuration as its staged create wrote it (the files written before this commit were sealed with it);
     // made now when it has none.
     let configKey = tableConfigKey(id.view())?;
-    if (jsonMember(borrow readTablesConfig(store, hidden.view(), configKey.view())?, "storageClass").isNull()) {
-        writeCreatedTableConfig(store, hidden.view(), id.view())?;
+    let staged = readTablesConfig(store, hidden.view(), configKey.view())?;
+    var encryption: Json? = null;
+    if (jsonMember(borrow staged, "storageClass").isNull()) {
+        encryption = writeCreatedTableConfig(store, hidden.view(), id.view(), sealing)?;
+    } else {
+        match (jsonMember(borrow staged, "encryption")) {
+            Some(e) => { encryption = Some(cloneJson(e)?); }
+            null => {}
+        }
     }
-    let written = writeMetadataWith(store, hidden.view(), id.view(), 0, borrow m, sealing)?;
+    let written = writeMetadataSealedBy(store, hidden.view(), id.view(), 0, borrow m, sealing, encryption.asBorrow())?;
     let now = Clock.unixMillis();
     var rec = jsonObject();
     jsonSet(mut rec, "id", jsonString(id.view())?)?;

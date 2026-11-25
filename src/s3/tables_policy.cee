@@ -41,12 +41,19 @@ fn rolePolicyCopy(roles: Slice<StsRole>, r: usize) -> Result<BucketPolicy?, Allo
 }
 
 /// A requester as S3 Tables decides it: its key, and its user's or role's identity policies (ADR-0088 §2).
-fn tablesCallerOf(app: borrow S3App, req: borrow S3Request, who: borrow Requester) -> Result<TablesCaller, AllocError> {
+fn tablesCallerOf(
+    app: borrow S3App,
+    req: borrow S3Request,
+    who: borrow Requester,
+    body: Slice<u8>,
+) -> Result<TablesCaller, AllocError> {
     let credentials = app.credentials.get().view();
     let user = if (who.role.isNull()) userOfRequester(credentials, who) else null;
+    var facts = policyFacts(req, false, app.secure, who.peer)?;
+    requestTagsInto(mut facts, req, body)?;
     return Ok(TablesCaller {
         principal: principalOf(app, who)?,
-        facts: policyFacts(req, false, app.secure, who.peer)?,
+        facts: facts,
         user: match (user) {
             Some(u) => copyBytes(u.userKey.view())?,
             null => Vector<u8>.create(),
@@ -63,6 +70,36 @@ fn tablesCallerOf(app: borrow S3App, req: borrow S3Request, who: borrow Requeste
         sessionPolicy: clonedPolicy(who.sessionPolicy.asBorrow())?,
         revoked: revokedRequester(credentials, who),
     });
+}
+
+/// The tags an S3 Tables call sets or names, for `aws:RequestTag/<key>` and `aws:TagKeys` (ADR-0126 §1): a body's
+/// `tags` (TagResource, CreateTableBucket, CreateTable), or UntagResource's `tagKeys`. The Iceberg catalog's calls set
+/// none.
+fn requestTagsInto(facts: borrow mut PolicyFacts, req: borrow S3Request, body: Slice<u8>) -> Result<void, AllocError> {
+    if (icebergPath(req)) { return Ok(); }
+    if (startsWithBytes(req.rawPath.view(), "/tag/".bytes()) && isMethod(req.method, Method.Delete)) {
+        facts.requestTagged = true;
+        for (k in paramValues(req, "tagKeys")?.view()) { facts.requestTagKeys.push(copyBytes(k.view())?)?; }
+        return Ok();
+    }
+    if (body.length == 0) { return Ok(); }
+    let j = parseJson(body)? ?? { return Ok(); };
+    match (jsonMember(borrow j, "tags")) {
+        Some(Json.Object(ms)) => {
+            facts.requestTagged = true;
+            for (m in ms.view()) {
+                match (borrow m.value) {
+                    Json.Text(v) => {
+                        facts.requestTagKeys.push(copyBytes(m.key.view())?)?;
+                        facts.requestTagValues.push(copyBytes(v.view())?)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    return Ok();
 }
 
 /// What the caller's identity policies say of `action` on `resource` (`s3tables:<bucket>[/table/<id>]`): a role's
@@ -344,7 +381,7 @@ async fn tableDataAllowed(
 ) -> Result<bool, S3Fail> {
     if (!isTableWarehouseShaped(hidden)) { return Ok(true); }
     let name = hidden[0..hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
-    let caller = tablesCallerOf(app, req, who)?;
+    let caller = tablesCallerOf(app, req, who, "".bytes())?;
     let callerRef = borrow caller;
     var guard = await lockStore(app)?;
     let store = guard.data();

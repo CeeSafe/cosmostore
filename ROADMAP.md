@@ -6027,3 +6027,17 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **A staged create's files were not sealed.** A CTAS's or a PyIceberg create transaction's data and manifests are
     written before the commit makes the table, and the table's configuration was written only at the commit. Now the
     staged create writes it at the reserved id, and the commit keeps it (`stagedCreatesAreConfiguredAtOnce`).
+
+### 25 Nov 2026: M30 slice 6, the exit review (`docs/m30-exit-review.md`)
+
+- **The review:** two independent agents, one on encryption and sealed I/O, one on tags, policies, the API and
+  clusters.
+- **Fixed, each with a check or test:**
+  - two Highs: a cluster create's first metadata file written in the clear; a write taken in the clear when its
+    table's configuration could not be read;
+  - three Mediums: a plain table's client-sealed files merged in the clear; no multipart-sealed test;
+    `aws:RequestTag` and `aws:TagKeys` (with `ForAllValues:`/`ForAnyValue:`) built;
+  - three Lows.
+- **Recorded:** nine Lows, and the accepted cluster limit.
+- **Checks:** 532 unit tests, the cluster smoke (209), the S3 smoke and CI.
+- **Next:** the owner's decision on closing M30.

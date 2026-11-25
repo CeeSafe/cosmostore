@@ -19,12 +19,17 @@ fn tableFileKeys(s: borrow ObjectStore) -> Vector<Vector<u8>> {
 }
 
 /// Every file of the fixture table rewritten sealed under the KMS key, and the table's configuration naming it.
-fn sealFixtureTable(dir: StringView, tableKeys: borrow TableKeys) {
+fn sealFixtureTable(dir: StringView, tableKeys: borrow TableKeys) => sealFixtureTableAs(dir, tableKeys, true);
+
+/// `sealFixtureTable`; with `configured` false, its files sealed as a client asked, its table with no encryption.
+fn sealFixtureTableAs(dir: StringView, tableKeys: borrow TableKeys, configured: bool) {
     var s = ObjectStore.open(dir, storeConfig())!;
     let config = parseJson(
         "{\"encryption\":{\"sseAlgorithm\":\"aws:kms\",\"kmsKeyArn\":\"arn:aws:kms:us-east-1:000000000000:key/orders\"}}".bytes(),
     )!!;
-    writeTablesConfig(mut s, COMPACT_HIDDEN.bytes(), tableConfigKey(COMPACT_ID.bytes())!.view(), borrow config)!;
+    if (configured) {
+        writeTablesConfig(mut s, COMPACT_HIDDEN.bytes(), tableConfigKey(COMPACT_ID.bytes())!.view(), borrow config)!;
+    }
     let encryption: Json? = Some(cloneJson(jsonMember(borrow config, "encryption")!)!);
     let keys = tableKeys.keys();
     for (key in tableFileKeys(borrow s).view()) {
@@ -109,6 +114,27 @@ fn encryptedTableJoined() -> Result<void, TestFailure> {
     let _ = checkSealedThenOpen(dir.view(), borrow tableKeys)?;
     let s = ObjectStore.open(dir.view(), storeConfig())!;
     Check.equalU64(1, checkCompacted(borrow s)? as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// A table with no encryption whose files a client sealed (the M30 exit review): left as they are, as before M30, as
+/// their merge would be written in the clear.
+@test
+fn clientSealedFilesOfAPlainTableAreLeft() -> Result<void, TestFailure> {
+    let tableKeys = sealedTableKeys();
+    let dir = scratchDirectory("compact-client-sealed");
+    deletesStore(dir.bytes(), storeConfig());
+    sealFixtureTableAs(dir.view(), borrow tableKeys, false);
+    var before: usize = 0;
+    {
+        let s = ObjectStore.open(dir.view(), storeConfig())!;
+        before = tableFileKeys(borrow s).length;
+    }
+    let _ = compactionWorkloadKeyed(dir.bytes(), storeConfig(), borrow tableKeys);
+    Check.equalU64(before as u64, checkSealedThenOpen(dir.view(), borrow tableKeys)? as u64)?;
+    let s = ObjectStore.open(dir.view(), storeConfig())!;
+    Check.equalU64(2, checkDeletesTable(borrow s)? as u64)?;
     removeTree(dir.view());
     return Ok();
 }

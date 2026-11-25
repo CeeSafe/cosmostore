@@ -153,6 +153,9 @@ fn stagedCreatesAreConfiguredAtOnce() -> Result<void, TestFailure> {
     let hidden = tableWarehouseBucket("cat".bytes())!;
     s.createBucket(catalogText(hidden.view()))!;
     let none = Vector<MasterKey>.create();
+    var kms = Vector<MasterKey>.create();
+    kms.push(testKey("orders", 90))!;
+    let keys = WarehouseKeys { sse: none.view(), kms: kms.view() };
     let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
     let config = parseJson(
         "{\"encryption\":{\"sseAlgorithm\":\"aws:kms\",\"kmsKeyArn\":\"arn:aws:kms:us-east-1:000000000000:key/orders\"}}".bytes(),
@@ -164,7 +167,7 @@ fn stagedCreatesAreConfiguredAtOnce() -> Result<void, TestFailure> {
         "cat".bytes(),
         "ns".bytes(),
         "{\"name\":\"t\",\"stage-create\":true,\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
-        borrow noKeys,
+        borrow keys,
     )!;
     Check.equalU64(200, staged.status as u64)?;
     let reservation = readRecord(
@@ -175,6 +178,96 @@ fn stagedCreatesAreConfiguredAtOnce() -> Result<void, TestFailure> {
     let id = jsonMemberText(borrow reservation.json, "id")!;
     let e = tableEncryption(borrow s, hidden.view(), id)!!;
     Check.equalBytes("aws:kms".bytes(), jsonMemberText(borrow e, "sseAlgorithm")!)?;
+    // Without the key (retired since its bucket's was set), a create is refused, as each write would be.
+    let refused = icebergCreateTable(
+        mut s,
+        "cat".bytes(),
+        "ns".bytes(),
+        "{\"name\":\"u\",\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+        borrow noKeys,
+    );
+    Check.isTrue(refused.isErr(), "a key not held, refused")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// A multipart object sealed as S3's UploadPart seals one (ADR-0046 §2: each part under its salt's key, the salt
+/// first), read back through `preparePlain` (the M30 exit review): whole, by ranges within a part and across parts
+/// and chunks, and streamed; its ranges starting after a part's header take that header's salt.
+@test
+fn multipartSealedFilesOpenByRanges() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("sealed-multipart");
+    var config = storeConfig();
+    config.minPartBytes = 1;
+    var s = ObjectStore.open(dir.view(), config)!;
+    s.createBucket("w--table-s3")!;
+    var sse = Vector<MasterKey>.create();
+    sse.push(testKey("k1", 3))!;
+    let none = Vector<MasterKey>.create();
+    let keys = WarehouseKeys { sse: sse.view(), kms: none.view() };
+    let seal = match (newSeal(keys.sse, keys.kms, borrow SseRequest.Managed)) {
+        Ok(Some(n)) => n,
+        _ => { return Err(TestFailure.create("no seal")); }
+    };
+    var metadata = Vector<u8>.create();
+    metadataAdd(mut metadata, SSE_FIELD.bytes(), seal.field.view())!;
+    let sizes = [70000u64, 100, 131077];
+    var plain = Vector<u8>.create();
+    for (i in 0u64..(70000 + 100 + 131077)) { plain.push(truncate<u8>(i * 13 + i / 777))!; }
+    let id = s.createUploadWith(
+        "w--table-s3",
+        "mp",
+        "",
+        metadata.view(),
+        ChecksumAlgorithm.None,
+        ChecksumType.FullObject,
+    )!;
+    var chosen = Vector<PartChoice>.create();
+    var at: usize = 0;
+    for (p in 0..3) {
+        var salt = [0u8; 16];
+        for (k in 0..16) { salt[k] = truncate<u8>(p * 16 + k + 7); }
+        var sealer = SseSealer.createPart(borrow seal.dataKey, salt, sizes[p])!!;
+        let end = at + sizes[p] as usize;
+        var stored = Vector<u8>.create();
+        sealer.feed(plain.view()[at..end], mut stored)!;
+        sealer.finish(mut stored)!;
+        var writer = s.newPartWriter()!;
+        writer.write(stored.view())!;
+        var part = writer.finish()!;
+        part.size = sizes[p];
+        part.md5 = Md5.of(plain.view()[at..end]);
+        let md5 = s.putPart("w--table-s3", "mp", id, truncate<u32>(p + 1), borrow part)!;
+        chosen.push(PartChoice { number: truncate<u32>(p + 1), md5: md5, checksum: [0u8; 32], checksumLength: 0 })!;
+        at = end;
+    }
+    let _ = s.completeUpload("w--table-s3", "mp", id, chosen.view())!;
+    let info = s.headObject("w--table-s3", "mp")!;
+    Check.equalU64(3, info.parts as u64)?;
+    Check.equalU64(plain.length as u64, info.size)?;
+    let whole = readTablePlain(mut s, "w--table-s3", "mp", borrow keys)!!;
+    Check.isTrue(whole.view() == plain.view(), "read back whole")?;
+    // Within the first part; its end into the second; the second whole; after the third's header, mid-chunk; across
+    // the third's chunks; its end.
+    for (range in [
+        [5u64, 70], [69990, 70050], [70000, 70100], [70200, 70300], [70100 + 65530, 70100 + 65600],
+        [70100 + 131000, 70100 + 131077],
+    ]) {
+        var p = preparePlain(mut s, "w--table-s3", "mp", range[0], range[1], borrow keys)!!;
+        let got = readPlainPrepared(mut p)!!;
+        Check.isTrue(got.view() == plain.view()[range[0] as usize..range[1] as usize], "a range read back")?;
+        var q = preparePlain(mut s, "w--table-s3", "mp", range[0], range[1], borrow keys)!!;
+        var stream = q.open()!!;
+        var streamed = Vector<u8>.create();
+        var buf = Vector<u8>.create();
+        buf.resize(777, 0)!;
+        while (true) {
+            let n = stream.read(buf.viewMut())!!;
+            if (n == 0) { break; }
+            streamed.extend(buf.view()[0..n])!;
+        }
+        Check.isTrue(streamed.view() == got.view(), "a range streamed")?;
+    }
     removeTree(dir.view());
     return Ok();
 }

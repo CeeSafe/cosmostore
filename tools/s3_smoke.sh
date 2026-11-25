@@ -1582,6 +1582,13 @@ aws s3tables tag-resource --resource-arn "$carn" --tags env=test > /dev/null 2>&
 aws s3tables untag-resource --resource-arn "$carn" --tag-keys team > /dev/null 2>&1 && pass "untag-resource" || fail "untag-resource"
 check "its tags after" "$(aws s3tables list-tags-for-resource --resource-arn "$carn" --output json 2>&1 | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["tags"])')" "{'env': 'test'}"
 check "an aws: tag" "$(code s3tables tag-resource --resource-arn "$carn" --tags aws:x=y)" BadRequestException
+# aws:TagKeys and aws:RequestTag in its policy (ADR-0126 §1): a Deny of tagging with the key `frozen`, or setting `env`
+# to `prod`; other tags are taken.
+aws s3tables put-table-bucket-policy --table-bucket-arn "$carn" --resource-policy "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:TagResource\",\"Resource\":\"$carn\",\"Condition\":{\"ForAnyValue:StringEquals\":{\"aws:TagKeys\":\"frozen\"}}},{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:TagResource\",\"Resource\":\"$carn\",\"Condition\":{\"StringEquals\":{\"aws:RequestTag/env\":\"prod\"}}}]}" > /dev/null 2>&1 && pass "a policy on the tags a call sets" || fail "a policy on the tags a call sets"
+check "aws:TagKeys denies its key" "$(code s3tables tag-resource --resource-arn "$carn" --tags frozen=1)" ForbiddenException
+check "aws:RequestTag denies its value" "$(code s3tables tag-resource --resource-arn "$carn" --tags env=prod)" ForbiddenException
+aws s3tables tag-resource --resource-arn "$carn" --tags env=test > /dev/null 2>&1 && pass "and takes the others" || fail "and takes the others"
+aws s3tables delete-table-bucket-policy --table-bucket-arn "$carn" > /dev/null 2>&1
 check "get-table-bucket-storage-class" "$(aws s3tables get-table-bucket-storage-class --table-bucket-arn "$carn" --query storageClassConfiguration.storageClass --output text 2>&1)" INTELLIGENT_TIERING
 check "get-table-bucket-encryption" "$(aws s3tables get-table-bucket-encryption --table-bucket-arn "$carn" --query '[encryptionConfiguration.sseAlgorithm,encryptionConfiguration.kmsKeyArn]' --output text 2>&1 | tr '\t' ' ')" "aws:kms $karn"
 check "a KMS key there is not" "$(code s3tables put-table-bucket-encryption --table-bucket-arn "$carn" --encryption-configuration sseAlgorithm=aws:kms,kmsKeyArn=arn:aws:kms:us-east-1:000000000000:key/nobody)" BadRequestException

@@ -208,6 +208,10 @@ fn planCompaction(
         Err(e) => { return Err(e); }
     };
     let id = copyBytes(jsonMemberText(borrow rec.json, "id") ?? "".bytes())?;
+    // The table's encryption (ADR-0126 §4). Without one, a file a client sealed is left as it is, as before M30: its
+    // merge would be written in the clear (the M30 exit review).
+    let encryption = tableEncryption(store, hidden.view(), id.view())?;
+    let opensSealed = encryption.isSome();
     let target = match (compactionTarget(store, hidden.view(), id.view(), nowMs)?) {
         Some(b) => b,
         null => { return Ok(null); }
@@ -292,6 +296,7 @@ fn planCompaction(
                     id.view(),
                     d,
                     k.view(),
+                    opensSealed,
                 )? else null,
                 null => null,
             };
@@ -381,6 +386,7 @@ fn planCompaction(
             // A sealed file's size is its plaintext's, as its manifest states it (ADR-0126 §4).
             let fileSize = truncate<u64>(size);
             if (info.size != fileSize || fileSize < 12) { continue; }
+            if (!opensSealed && metadataFind(info.metadata.view(), SSE_FIELD.bytes()).isSome()) { continue; }
             // Its last 8 bytes only (the M20 exit review): the footer's length, then the footer, as before. A sealed
             // file is opened with the server's keys; one under a key not held here is left as it is.
             let tail = match (preparePlain(store, bucket, name, fileSize - 8, fileSize, borrow sealing)) {
@@ -414,7 +420,6 @@ fn planCompaction(
     let deleteRewrites = deleteRewritesOf(deletes.view(), manifests.view(), blocked.view())?;
     var objectMetadata = Vector<u8>.create();
     let storageClass = tableStorageClass(store, hidden.view(), id.view())?;
-    let encryption = tableEncryption(store, hidden.view(), id.view())?;
     if (storageClass.view() != "STANDARD".bytes()) {
         metadataAdd(mut objectMetadata, STORAGE_CLASS_FIELD.bytes(), storageClass.view())?;
     }
@@ -638,6 +643,7 @@ fn deleteFileOf(
     tableId: Slice<u8>,
     d: borrow Json,
     partitionKey: Slice<u8>,
+    opensSealed: bool,
 ) -> Result<DeleteFile?, AllocError> {
     let content = recordInt(d, "content", 0);
     if (content != DELETE_CONTENT_POSITION && content != DELETE_CONTENT_EQUALITY) { return Ok(null); }
@@ -670,8 +676,10 @@ fn deleteFileOf(
         Ok(h) => h,
         Err(_) => { return Ok(null); }
     };
-    // A sealed delete file is opened as it is read, its size its plaintext's (ADR-0126 §4).
+    // A sealed delete file is opened as it is read, its size its plaintext's (ADR-0126 §4); in a table without
+    // encryption it is left as it is, as its data files are.
     if (info.size != truncate<u64>(size)) { return Ok(null); }
+    if (!opensSealed && metadataFind(info.metadata.view(), SSE_FIELD.bytes()).isSome()) { return Ok(null); }
     var ids = Vector<i64>.create();
     match (memberItems(d, "equality_ids")) {
         Some(items) => {
