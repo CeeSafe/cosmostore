@@ -1,8 +1,10 @@
 # ADR-0126: S3 Tables' encryption, tags and storage class (M30)
 
-**Status:** proposed, 25 Nov 2026, with the owner's choices made: encrypted tables compacted ("Compacted"), and a
-write asking for another encryption than its table's refused ("Refused"). M30 is ADR-0125's item A (the owner: "A:
-encryption, tags").
+**Status:** accepted, 25 Nov 2026 (the owner: "I accept ADR-0126"), after slices 1 to 4 and the cluster fix, with
+the cluster's limit in its consequences. Proposed the same day with the owner's choices made: encrypted tables
+compacted ("Compacted"), and a write asking for another encryption than its table's refused ("Refused"). M30 is
+ADR-0125's item A (the owner: "A: encryption, tags"). M30 stays open for slices 5 (the checks) and 6 (the exit
+review).
 
 ## Context
 
@@ -34,7 +36,7 @@ encryption, tags").
   - **Every file of a table is sealed with its key:** its data, deletes, manifests and metadata files.
   - **Maintenance (compaction, expiry)** works on encrypted tables, with the key's permissions.
 
-## Decision (proposed)
+## Decision
 
 1. **Tags** (slice 1):
    - kept per table bucket and table, as the creates' `tags` and the three calls set them, within S3's limits (50 a

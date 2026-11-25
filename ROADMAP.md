@@ -5993,3 +5993,10 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     DeleteTableBucket once on ConflictException, the cluster's documented answer while a bucket's leftovers are
     deleted with the request.
 - **Checks:** the cluster smoke (209 passed, PyIceberg's 47 through node 2), the S3 smoke and the tests all pass.
+
+### 25 Nov 2026: ADR-0126 accepted
+
+- The owner: "I accept ADR-0126", after slices 1 to 4 and the cluster fix (843c65b, CI green).
+- **Accepted with it:** the cluster's limit, in its consequences. On a cluster a table bucket's tags, storage class and
+  encryption are set after its create, by their own calls.
+- **Still open in M30:** slice 5 (the checks) and slice 6 (the exit review). Closing M30 stays the owner's.
