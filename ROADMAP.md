@@ -5859,3 +5859,15 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - views and nested namespaces;
   - v3's remaining parts (deletion vectors written, encryption keys, multi-argument transforms, lineage on
     branches).
+
+### 25 Nov 2026: M30 proposed (ADR-0125)
+
+- **The S3 Tables calls not done** (botocore 1.44.9 lists 58): encryption, tags, storage class, metrics, logging,
+  record expiration, replication, migrations.
+- **The candidates:**
+  - **A:** S3 Tables' configuration (encryption sealing a table's files, tags with policy conditions, storage class);
+  - **B:** record expiration;
+  - **C:** table replication;
+  - **D:** the cluster's Lows.
+- **The recommendation is A.**
+- **Next:** the owner's choice.
