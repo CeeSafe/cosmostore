@@ -1,6 +1,8 @@
 # ADR-0125: M30, after engines' catalog calls (proposed)
 
-**Status:** proposed, 25 Nov 2026 (the owner: "continue", after M29 was closed the same day).
+**Status:** decided, 25 Nov 2026. The owner chose A, S3 Tables' configuration ("A: encryption, tags").
+
+Proposed the same day (the owner: "continue", after M29 was closed the same day).
 
 ## Context
 

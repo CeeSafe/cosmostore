@@ -5871,3 +5871,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **D:** the cluster's Lows.
 - **The recommendation is A.**
 - **Next:** the owner's choice.
+
+### 25 Nov 2026: M30 decided, ADR-0126 proposed (S3 Tables' encryption, tags and storage class)
+
+- **The owner's choice:** A.
+- **ADR-0126** (proposed), six slices: tags and storage class; the encryption configuration and S3's writes sealed
+  by it; the catalog's own files sealed; compaction of encrypted tables; the checks; the exit review.
+- **Found:** sealing is the S3 layer's, and the catalog and compaction read the store directly, so an encrypted
+  table needs them to unseal and seal.
+- **Next:** the owner's choices (encrypted tables compacted; a write asking for another encryption refused).
