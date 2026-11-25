@@ -807,32 +807,44 @@ fn createTable(
         if (readRecord(store, hidden.view(), nsKey.view())?.isNull()) { return Err(TablesError.NotFound); }
         let key = catalogKey(CATALOG_TABLES, ns, name.view())?;
         if (readRecord(store, hidden.view(), key.view())?.isSome()) { return Err(TablesError.Conflict); }
-        // Its configuration first, at its new id: its metadata is sealed with its encryption (ADR-0126 §4).
+        // Its metadata made before anything is written, so that a request refused leaves nothing (ADR-0132, M30's
+        // B2); then its configuration, at its new id, with its name (M30's B7), and its metadata sealed with its
+        // encryption (ADR-0126 §4).
+        let warehouse = warehouseOf(bucketName, id.view())?;
+        let made: Json? = match (borrow request) {
+            Some(r) => match (newTableMetadata(r, warehouse.view())?) {
+                Some(m) => Some(m),
+                null => { return Err(TablesError.BadRequest); }
+            },
+            null => null,
+        };
+        jsonSet(mut config, "namespace", jsonString(ns)?)?;
+        jsonSet(mut config, "name", jsonString(name.view())?)?;
         let configKey = tableConfigKey(id.view())?;
         writeTablesConfig(store, hidden.view(), configKey.view(), borrow config)?;
-        match (borrow request) {
-            Some(r) => {
-                let warehouse = warehouseOf(bucketName, id.view())?;
-                let m = match (newTableMetadata(r, warehouse.view())?) {
-                    Some(m) => m,
-                    null => { return Err(TablesError.BadRequest); }
-                };
+        match (made.asBorrow()) {
+            Some(m) => {
                 // Sealed with the encryption just given to its configuration, not read back (a shard's write is not
                 // seen in its own request, ADR-0058).
                 let encryption: Json? = match (jsonMember(borrow config, "encryption")) {
                     Some(e) => Some(cloneJson(e)?),
                     null => null,
                 };
-                let location =
-                    writeMetadataSealedBy(
-                        store,
-                        hidden.view(),
-                        id.view(),
-                        0,
-                        borrow m,
-                        sealing,
-                        encryption.asBorrow(),
-                    )?;
+                let location = match (writeMetadataSealedBy(
+                    store,
+                    hidden.view(),
+                    id.view(),
+                    0,
+                    m,
+                    sealing,
+                    encryption.asBorrow(),
+                )) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let _ = store.deleteObject(catalogText(hidden.view()), catalogText(configKey.view()));
+                        return Err(e);
+                    }
+                };
                 jsonSet(mut rec, "metadataLocation", Json.Text(location))?;
             }
             null => {}

@@ -6276,3 +6276,23 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **kept, each with its reason:** five;
   - **for the owner:** two, tag keys differing only in case and `aws:ResourceTag` in identity policies.
 - **Slices:** tags and configuration; clusters; logging; the exit review.
+
+### 26 Nov 2026: M33 slice 1, tags and configuration (ADR-0132, M30's B2–B9)
+
+- **Fixed:**
+  - **B2:** createTable makes its metadata before writing anything, and removes its configuration record if its
+    metadata write fails; so does the Iceberg create. A staged create that replaces another of its name removes
+    the earlier id's record.
+  - **B3** (the owner's "Refused"): tag keys the same but for case are refused, within a request and against a
+    resource's tags. The same key is replaced.
+  - **B4:** tag lengths are counted in characters, and only AWS's characters are taken.
+  - **B5:** a table with no configuration record (made before M30) is STANDARD.
+  - **B7:** a table's configuration keeps its namespace and name, and the tag calls' lookup checks the table record
+    there before scanning.
+  - **B9:** a manifest sealed under a key not held is reported as unreadable, not missing.
+- **Kept:**
+  - **B6:** `aws:ResourceTag` stays refused in identity policies (the owner's "Keep refused").
+  - **B8:** configuration writes are not a race. On `serve` they are one request under the lock, and on a cluster a
+    request runs only once its shard has applied everything.
+- **Tests:** `tagRules` and `tableConfigurationRecords`.
+- **Checks:** 544 unit tests, the S3 smoke and the cluster smoke (214).

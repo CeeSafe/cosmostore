@@ -960,9 +960,14 @@ fn writeCreatedTableConfig(
     store: borrow mut ObjectStore,
     hidden: Slice<u8>,
     id: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
     keys: borrow WarehouseKeys,
 ) -> Result<Json?, TablesError> {
     var config = jsonObject();
+    // Its name, so that its id is found by it (ADR-0132, M30's B7).
+    jsonSet(mut config, "namespace", jsonString(ns)?)?;
+    jsonSet(mut config, "name", jsonString(name)?)?;
     jsonSet(mut config, "storageClass", Json.Text(bucketStorageClass(store, hidden)?))?;
     let encryption = bucketEncryption(store, hidden)?;
     match (encryption.asBorrow()) {
@@ -1196,13 +1201,30 @@ fn icebergCreateTable(
     if (staged) {
         // Its configuration first, at its reserved id: the files an engine writes before its commit (a CTAS's data
         // and manifests) are sealed with its encryption as they arrive (ADR-0126 §4).
-        let _ = writeCreatedTableConfig(store, hidden.view(), id.view(), sealing)?;
+        let _ = writeCreatedTableConfig(store, hidden.view(), id.view(), ns, name.view(), sealing)?;
         // Kept by the table's namespace and name, so that one name holds one at most (the M29 exit review's M1): a
-        // later staged create of the name replaces it.
+        // later staged create of the name replaces it, and the configuration of the one it replaces goes (ADR-0132,
+        // M30's B2).
         var reservation = jsonObject();
         jsonSet(mut reservation, "id", jsonString(id.view())?)?;
         jsonSet(mut reservation, "createdAt", jsonInteger(Clock.unixMillis())?)?;
         let stagedKey = catalogKey(CATALOG_STAGED, ns, name.view())?;
+        match (readRecord(store, hidden.view(), stagedKey.view())?) {
+            Some(earlier) => {
+                match (jsonMemberText(borrow earlier.json, "id")) {
+                    Some(old) => {
+                        if (old != id.view()) {
+                            let _ = store.deleteObject(
+                                catalogText(hidden.view()),
+                                catalogText(tableConfigKey(old)?.view()),
+                            );
+                        }
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
         let _ = writeRecord(store, hidden.view(), stagedKey.view(), borrow reservation, PutCondition.None)?;
         var j = jsonObject();
         jsonSet(mut j, "metadata", m)?;
@@ -1210,8 +1232,23 @@ fn icebergCreateTable(
         return tablesJson(borrow j);
     }
     // Its configuration, written first; its metadata sealed with its encryption.
-    let encryption = writeCreatedTableConfig(store, hidden.view(), id.view(), sealing)?;
-    let location = writeMetadataSealedBy(store, hidden.view(), id.view(), 0, borrow m, sealing, encryption.asBorrow())?;
+    let encryption = writeCreatedTableConfig(store, hidden.view(), id.view(), ns, name.view(), sealing)?;
+    let location = match (writeMetadataSealedBy(
+        store,
+        hidden.view(),
+        id.view(),
+        0,
+        borrow m,
+        sealing,
+        encryption.asBorrow(),
+    )) {
+        Ok(l) => l,
+        Err(e) => {
+            // No table: its configuration is no table's either (ADR-0132, M30's B2).
+            let _ = store.deleteObject(catalogText(hidden.view()), catalogText(tableConfigKey(id.view())?.view()));
+            return Err(e);
+        }
+    };
     let now = Clock.unixMillis();
     var rec = jsonObject();
     jsonSet(mut rec, "id", jsonString(id.view())?)?;
@@ -1305,7 +1342,7 @@ fn icebergCommitCreate(
     let staged = readTablesConfig(store, hidden.view(), configKey.view())?;
     var encryption: Json? = null;
     if (jsonMember(borrow staged, "storageClass").isNull()) {
-        encryption = writeCreatedTableConfig(store, hidden.view(), id.view(), sealing)?;
+        encryption = writeCreatedTableConfig(store, hidden.view(), id.view(), ns, name, sealing)?;
     } else {
         match (jsonMember(borrow staged, "encryption")) {
             Some(e) => { encryption = Some(cloneJson(e)?); }

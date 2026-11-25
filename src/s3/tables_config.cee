@@ -40,12 +40,19 @@ fn tablesTagsOf(j: borrow Json) -> Result<Vector<JsonMember>?, AllocError> {
             if (ms.length > TABLES_MAX_TAGS) { return Ok(null); }
             for (k in 0..ms.length) {
                 let key = ms[k].key.view();
-                if (key.length == 0 || key.length > TABLES_MAX_TAG_KEY || startsWithBytes(key, "aws:".bytes())) {
+                // Lengths in characters and AWS's characters (ADR-0132, M30's B4); no two keys the same but for case
+                // (M30's B3, the owner's "Refused").
+                let chars = tagCharacters(key) ?? { return Ok(null); };
+                if (chars == 0 || chars > TABLES_MAX_TAG_KEY || startsWithBytes(key, "aws:".bytes())) {
                     return Ok(null);
+                }
+                for (other in 0..k) {
+                    if (equalsIgnoreCase(ms[other].key.view(), key)) { return Ok(null); }
                 }
                 match (borrow ms[k].value) {
                     Json.Text(t) => {
-                        if (t.length > TABLES_MAX_TAG_VALUE) { return Ok(null); }
+                        let n = tagCharacters(t.view()) ?? { return Ok(null); };
+                        if (n > TABLES_MAX_TAG_VALUE) { return Ok(null); }
                     }
                     _ => { return Ok(null); }
                 }
@@ -58,11 +65,40 @@ fn tablesTagsOf(j: borrow Json) -> Result<Vector<JsonMember>?, AllocError> {
 }
 
 /// A configuration's tags with `more` added over them; null when they would pass the limit.
+/// A tag key's or value's length in characters (UTF-8 code points), when each is one AWS takes: a letter or digit
+/// (any non-ASCII character is taken as one), a space, or one of `+ - = . _ : / @`; null otherwise.
+fn tagCharacters(text: Slice<u8>) -> usize? {
+    if (StringView.fromUtf8(text).isNull()) { return null; }
+    var n: usize = 0;
+    for (b in text) {
+        if ((b & 0xC0) == 0x80) { continue; } // a continuation byte
+        n += 1;
+        if (b >= 0x80) { continue; }
+        let ok = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == ' ' || b == '+' ||
+            b == '-' || b == '=' || b == '.' || b == '_' || b == ':' || b == '/' || b == '@';
+        if (!ok) { return null; }
+    }
+    return Some(n);
+}
+
 fn mergedTags(config: borrow Json, more: Slice<JsonMember>) -> Result<Json?, AllocError> {
     var tags = match (jsonMember(config, "tags")) {
         Some(t) => cloneJson(t)?,
         null => jsonObject(),
     };
+    // A key the resource has but for case is refused (ADR-0132, M30's B3); the same key is replaced.
+    match (borrow tags) {
+        Json.Object(ms) => {
+            for (m in more) {
+                for (have in ms.view()) {
+                    if (have.key.view() != m.key.view() && equalsIgnoreCase(have.key.view(), m.key.view())) {
+                        return Ok(null);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
     for (m in more) { jsonSet(mut tags, StringView.fromUtf8(m.key.view()) ?? "", cloneJson(borrow m.value)?)?; }
     let count = match (borrow tags) {
         Json.Object(ms) => ms.length,
@@ -125,14 +161,30 @@ fn bucketStorageClass(store: borrow ObjectStore, hidden: Slice<u8>) -> Result<Ve
 /// A table's storage class: its own, else its bucket's.
 fn tableStorageClass(store: borrow ObjectStore, hidden: Slice<u8>, id: Slice<u8>) -> Result<Vector<u8>, TablesError> {
     let config = readTablesConfig(store, hidden, tableConfigKey(id)?.view())?;
+    // A table with no configuration was made before M30, when STANDARD was the only class (ADR-0132, M30's B5).
     return match (jsonMemberText(borrow config, "storageClass")) {
         Some(c) => Ok(copyBytes(c)?),
-        null => bucketStorageClass(store, hidden),
+        null => Ok(copyBytes("STANDARD".bytes())?),
     };
 }
 
 /// Whether a table of the bucket has the id: its record, among the bucket's tables.
 fn tableIdExists(store: borrow ObjectStore, hidden: Slice<u8>, id: Slice<u8>) -> Result<bool, TablesError> {
+    // By the name its configuration keeps (ADR-0132, M30's B7): the table record there, if it has this id. A table
+    // made before M30, or renamed since, is found by the scan.
+    let config = readTablesConfig(store, hidden, tableConfigKey(id)?.view())?;
+    match (jsonMemberText(borrow config, "namespace")) {
+        Some(ns) => {
+            let name = jsonMemberText(borrow config, "name") ?? "".bytes();
+            match (readRecord(store, hidden, catalogKey(CATALOG_TABLES, ns, name)?.view())?) {
+                Some(r) => {
+                    if (jsonMemberText(borrow r.json, "id") == Some(id)) { return Ok(true); }
+                }
+                null => {}
+            }
+        }
+        null => {}
+    }
     var after = Vector<u8>.create();
     while (true) {
         let keys = catalogKeys(store, hidden, CATALOG_TABLES.bytes(), after.view(), 1000)?;

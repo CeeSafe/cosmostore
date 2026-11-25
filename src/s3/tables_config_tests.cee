@@ -1,0 +1,91 @@
+// S3 Tables' configuration (ADR-0126), hardened (ADR-0132, M30's B2 to B7).
+import web_core;
+
+fn tablesTagsOfText(text: StringView) -> Vector<JsonMember>? => tablesTagsOf(borrow parseJson(text.bytes())!!)!;
+
+/// Tags as AWS takes them (M30's B3, B4): lengths in characters, AWS's characters only, and no two keys the same but
+/// for case, within a request or against a resource's.
+@test
+fn tagRules() -> Result<void, TestFailure> {
+    // 128 two-byte characters is 128 characters, 256 bytes: taken; 129 is not.
+    var key = Vector<u8>.create();
+    for (i in 0..128) { key.extend("é".bytes())!; }
+    var body = copyBytes("{\"".bytes())!;
+    body.extend(key.view())!;
+    body.extend("\":\"v\"}".bytes())!;
+    Check.isTrue(tablesTagsOf(borrow parseJson(body.view())!!)!.isSome(), "128 characters")?;
+    key.extend("é".bytes())!;
+    var longer = copyBytes("{\"".bytes())!;
+    longer.extend(key.view())!;
+    longer.extend("\":\"v\"}".bytes())!;
+    Check.isTrue(tablesTagsOf(borrow parseJson(longer.view())!!)!.isNull(), "129 characters")?;
+    Check.isTrue(tablesTagsOfText("{\"team\":\"a b+c-d=e.f_g:h/i@j\"}").isSome(), "AWS's characters")?;
+    Check.isTrue(tablesTagsOfText("{\"team\":\"a#b\"}").isNull(), "a character AWS does not take")?;
+    Check.isTrue(tablesTagsOfText("{\"Stage\":\"a\",\"stage\":\"b\"}").isNull(), "two keys the same but for case")?;
+    // Against a resource's: the same key replaced, one the same but for case refused.
+    let config = parseJson("{\"tags\":{\"Stage\":\"raw\"}}".bytes())!!;
+    let same = tablesTagsOfText("{\"Stage\":\"clean\"}")!;
+    let merged = mergedTags(borrow config, same.view())!!;
+    Check.equalBytes("clean".bytes(), jsonMemberText(borrow merged, "Stage")!)?;
+    let cased = tablesTagsOfText("{\"stage\":\"clean\"}")!;
+    Check.isTrue(mergedTags(borrow config, cased.view())!.isNull(), "a key the resource has but for case")?;
+    return Ok();
+}
+
+/// A table's configuration record (M30's B5, B7, B2): a table without one is STANDARD whatever its bucket's class;
+/// a table's id found by the name its record keeps; a staged id, with a record but no table, is no table; a staged
+/// create replaced by another of its name takes its record with it.
+@test
+fn tableConfigurationRecords() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("tables-config-records");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    let bucketConfig = parseJson("{\"storageClass\":\"INTELLIGENT_TIERING\"}".bytes())!!;
+    writeTablesConfig(mut s, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes(), borrow bucketConfig)!;
+    let old = "a0a0a0a0-1111-4222-8333-444444444444";
+    var rec = jsonObject();
+    jsonSet(mut rec, "id", jsonString(old.bytes())!)!;
+    let _ = writeRecord(
+        mut s,
+        hidden.view(),
+        catalogKey(CATALOG_TABLES, "ns".bytes(), "old".bytes())!.view(),
+        borrow rec,
+        PutCondition.None,
+    )!;
+    Check.equalBytes("STANDARD".bytes(), tableStorageClass(borrow s, hidden.view(), old.bytes())!.view())?;
+    Check.isTrue(tableIdExists(borrow s, hidden.view(), old.bytes())!, "found by the scan")?;
+    // A table made through the catalog: found by its record's name.
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let schema =
+        "\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}";
+    var made = copyBytes("{\"name\":\"t\",".bytes())!;
+    made.extend(schema.bytes())!;
+    made.push('}')!;
+    Check.equalU64(
+        200,
+        icebergCreateTable(mut s, "cat".bytes(), "ns".bytes(), made.view(), borrow noKeys)!.status as u64,
+    )?;
+    let t = currentTable(borrow s, "cat".bytes(), "ns".bytes(), "t".bytes())!!;
+    let id = copyBytes(jsonMemberText(borrow t.json, "id")!)!;
+    let config = readTablesConfig(borrow s, hidden.view(), tableConfigKey(id.view())!.view())!;
+    Check.equalBytes("t".bytes(), jsonMemberText(borrow config, "name")!)?;
+    Check.isTrue(tableIdExists(borrow s, hidden.view(), id.view())!, "found by its name")?;
+    // Two staged creates of one name: the first's record goes; the second's id has a record and no table.
+    var staged = copyBytes("{\"name\":\"s\",\"stage-create\":true,".bytes())!;
+    staged.extend(schema.bytes())!;
+    staged.push('}')!;
+    let _ = icebergCreateTable(mut s, "cat".bytes(), "ns".bytes(), staged.view(), borrow noKeys)!;
+    let stagedKey = catalogKey(CATALOG_STAGED, "ns".bytes(), "s".bytes())!;
+    let first = copyBytes(jsonMemberText(borrow readRecord(borrow s, hidden.view(), stagedKey.view())!!.json, "id")!)!;
+    let _ = icebergCreateTable(mut s, "cat".bytes(), "ns".bytes(), staged.view(), borrow noKeys)!;
+    let second = copyBytes(jsonMemberText(borrow readRecord(borrow s, hidden.view(), stagedKey.view())!!.json, "id")!)!;
+    Check.isTrue(first.view() != second.view(), "a new id")?;
+    let firstConfig = readTablesConfig(borrow s, hidden.view(), tableConfigKey(first.view())!.view())!;
+    Check.isTrue(jsonMember(borrow firstConfig, "name").isNull(), "the replaced one's record gone")?;
+    Check.isFalse(tableIdExists(borrow s, hidden.view(), second.view())!, "a staged id is no table")?;
+    removeTree(dir.view());
+    return Ok();
+}
