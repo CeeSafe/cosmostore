@@ -6248,3 +6248,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Recorded:** six Lows.
 - **Checks:** 542 unit tests, the S3 smoke and the cluster smoke (214).
 - **Next:** the owner's word on ADR-0130 and on closing M32.
+
+### 25 Nov 2026: M32 closed (ADR-0130 accepted)
+
+- **The owner's decision:** "Accept and close". ADR-0130 is accepted, with its As built.
+- **M32 is closed.** The exit review's B1 to B6 are recorded in `docs/m32-exit-review.md`.
+- **S3 Tables' API is done but for replication and migrations.**
+- **Next:** M33, when the owner asks. Candidates on record:
+  - ADR-0129's B (hardening: M30's, M31's and M32's recorded Lows), C (Iceberg views and nested namespaces), D
+    (table replication) and E (v3's remaining parts).

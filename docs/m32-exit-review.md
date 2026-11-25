@@ -1,5 +1,7 @@
 # M32 exit review: S3 Tables' logging, metrics and record expiration (25 Nov 2026)
 
+**M32 closed, 25 Nov 2026** (the owner: "Accept and close"), with ADR-0130 accepted and B1 to B6 recorded below.
+
 **M32's exit (ADR-0129 item A; ADR-0130, with the owner's choices):**
 - a table bucket's access logs: its calls and its warehouse's requests, in AWS's 25-field records, delivered under
   partitioned keys;

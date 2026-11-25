@@ -1,6 +1,7 @@
 # ADR-0130: S3 Tables' logging, metrics and record expiration (M32)
 
-**Status:** proposed, 25 Nov 2026, with the owner's choices made:
+**Status:** accepted, 25 Nov 2026, as built below (the owner: "Accept and close", after M32's exit review). Proposed the
+same day, with the owner's choices made:
 - every request logged, as AWS logs it ("All, as AWS");
 - partitioned keys for S3 buckets too ("Yes, S3 too");
 - metrics kept and counted ("Kept and counted").
@@ -45,7 +46,7 @@ M32 is ADR-0129's item A (the owner: "A: Tables' small calls").
   - CosmoStore's metrics are its `/metrics` endpoint (Prometheus).
 - **Record expiration:** AWS's three calls are for its managed tables, and list MethodNotAllowedException.
 
-## Decision (proposed)
+## Decision
 
 1. **The logging configuration** (slice 1):
    - `PutTableBucketLogging` and `GetTableBucketLogging`, kept in the table bucket's configuration record (ADR-0126);
