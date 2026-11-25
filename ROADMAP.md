@@ -6041,3 +6041,16 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Recorded:** nine Lows, and the accepted cluster limit.
 - **Checks:** 532 unit tests, the cluster smoke (209), the S3 smoke and CI.
 - **Next:** the owner's decision on closing M30.
+
+### 25 Nov 2026: M30 closed
+
+- **The owner's decision:** "Close M30". ADR-0126 had been accepted before it (the owner: "I accept ADR-0126").
+- **M30 is closed as built.** The exit review's B1 to B9 are recorded in `docs/m30-exit-review.md`. Among them is
+  the cluster limit: a table bucket's settings are set after its create.
+- **Next:** M31, when the owner asks. Candidates on record:
+  - ADR-0125's other items: B, record expiration; C, table replication; D, the cluster's Lows (M22's B2 and B3);
+  - configured CreateTableBucket on a cluster (M30's B1), a store change with its fault sweep;
+  - M30's recorded Lows (B2 to B9);
+  - views and nested namespaces;
+  - v3's remaining parts (deletion vectors written, encryption keys, multi-argument transforms, lineage on
+    branches).

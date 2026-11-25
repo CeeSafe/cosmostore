@@ -1,5 +1,7 @@
 # M30 exit review: S3 Tables' encryption, tags and storage class (25 Nov 2026)
 
+**M30 closed, 25 Nov 2026** (the owner: "Close M30"), as built, with B1 to B9 recorded below.
+
 **M30's exit (ADR-0125 item A; ADR-0126):**
 - tags, storage class and encryption on table buckets and tables, through S3 Tables' calls and their creates;
 - every file of an encrypted table sealed with its key: S3's writes, the catalog's metadata, and compaction's reads
