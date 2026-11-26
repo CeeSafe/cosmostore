@@ -6452,3 +6452,15 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **B,** table replication;
   - **C,** v3's remaining parts.
 - **Next:** the owner's choice.
+
+### 26 Nov 2026: M35 decided, ADR-0136 proposed (M34's recorded items)
+
+- **The owner:** "A.".
+- **Read again, B2 does not race:** a catalog call runs whole under the store's one hold on `serve`, and behind its
+  shard's gate on a cluster, so its checks and writes are not interleaved.
+- **ADR-0136 proposes:**
+  - full list pages in S3 Tables' ListNamespaces and ListTables (B4);
+  - view metadata as Iceberg Java's builder makes it, with the review's missing tests (B1);
+  - orphan files swept (B3);
+  - B2 kept with the hold made explicit, or closed by name reservations as well.
+- **For the owner:** B2's choice; how far B3's sweep reaches (every orphaned id, tables' too, recommended).

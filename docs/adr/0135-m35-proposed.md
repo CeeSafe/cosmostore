@@ -1,6 +1,8 @@
 # ADR-0135: M35, after Iceberg views (proposed)
 
-**Status:** proposed, 26 Nov 2026, after M34 was closed (the owner: "continue").
+**Status:** decided, 26 Nov 2026. The owner chose A, M34's recorded items ("A."); its design is ADR-0136.
+
+Proposed the same day, after M34 was closed (the owner: "continue").
 
 ## Context
 
