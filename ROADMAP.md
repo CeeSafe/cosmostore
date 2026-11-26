@@ -6491,3 +6491,19 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   2 versions, the 4th current.
 - **Checks:** 556 unit tests (`snapshotsFaultsCrash` timed out at 60 s under `--jobs`, as it can when the machine is
   loaded, and passed alone), the Java check plain and on a KMS table, and the S3 smoke.
+
+### 26 Nov 2026: M35 slice 3, a table bucket's orphaned files swept (ADR-0136 §3, M34's B3)
+
+- **The sweep** (`src/s3/table_orphans.cee`), per table bucket, when its unreferenced-file removal is enabled:
+  - a top-level id of the warehouse that no table, view or staged create's record names, nor a live table's pin, is
+    noted when first found and all its objects deleted once it has stayed so for `unreferencedDays +
+    nonCurrentDays`: a create that crashed before its record, or a drop's purge cut short, for tables and views alike;
+  - a view's metadata files other than its current one, on the same terms; a view whose current file cannot be placed
+    loses none;
+  - notes in `.s3tables/maintenance/orphans`; at most 10,000 objects deleted a pass, the rest on the next.
+- **Where it runs:** on `serve`, after each pass's tables, the store held for one table bucket at a time; on a
+  cluster, after each shard's tables, each table bucket's sweep one gated step (ADR-0110 §4).
+- **Test:** `orphansSwept` (disabled: nothing; noted, kept at 12 days, deleted at 13; a table's files, a view's
+  current file, a pinned id and a staged create's id kept). Mutation-checked: the pin, staged and current-file guards.
+- **Checks:** 557 unit tests, the S3 smoke, the cluster smoke, the cluster S3 smoke (214) and the cluster
+  maintenance smoke.

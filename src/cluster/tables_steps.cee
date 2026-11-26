@@ -288,6 +288,45 @@ async fn removeOnShard(
     return Ok();
 }
 
+/// Orphaned files on the shard this replica leads (ADR-0136 §3): its table buckets listed off the gate; each one's
+/// sweep a gated step.
+async fn orphansOnShard(shared: borrow NodeShared, at: usize) -> Result<void, NodeFault> {
+    let slot = borrow shared.slots[at];
+    let dayMs = truncate<i64>(shared.tablesDayMs);
+    var warehouses = Vector<Vector<u8>>.create();
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        warehouses = match (await Async.blocking(() => tableWarehouses(st))) {
+            Ok(w) => w,
+            Err(_) => { return Ok(); }
+        };
+    }
+    for (i in 0..warehouses.length) {
+        var term: u64 = 0;
+        var gate = match (await slot.gate.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let _held = gate.data();
+        if (!(await stepReady(slot, mut term)?)) { return Ok(); }
+        {
+            var guard = match (await slot.store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let st = guard.data();
+            let hidden = warehouses[i].view();
+            let _ = await Async.blocking(() => sweepOrphans(st, hidden, Clock.unixMillis(), dayMs));
+        }
+        let _ = await stepCommit(shared, slot)?;
+    }
+    return Ok();
+}
+
 /// A node's compactions at once (ADR-0128 §4), fair (ADR-0132, M31's B3): each takes the next ticket, and runs once
 /// the tickets before it are within `limit` of those released, so they run in the order they asked.
 struct CompactionPermits {

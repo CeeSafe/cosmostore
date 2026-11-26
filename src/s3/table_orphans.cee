@@ -1,0 +1,276 @@
+// Orphaned files of a table bucket (ADR-0136 §3, M34's B3): what the unreferenced-file removal of each table
+// (`table_unreferenced.cee`) cannot reach.
+// - An id in the warehouse that no table, view or staged create names: a create that crashed after its first
+//   metadata file and before its record, or a drop whose purge was cut short.
+// - A view's metadata files other than its current one: a view's metadata has no log of earlier files, so nothing
+//   references them once a commit replaces them.
+// Each is noted when first found and deleted once it has stayed so for `unreferencedDays + nonCurrentDays`, when its
+// table bucket has unreferenced-file removal enabled, as unreferenced files are. An id that a live table's pin names
+// (its files referenced by that table, `shared/`) is kept. Not knowing a view's current file deletes none of its.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+/// The notes of what was found orphaned: an id, or a view's metadata file's key, with when it was first found.
+const MAINTENANCE_ORPHANS: StringView = ".s3tables/maintenance/orphans";
+/// Objects one sweep of a table bucket deletes at most, the store held; the rest go on the next pass.
+const ORPHAN_DELETES_MAX: usize = 10000;
+
+/// The hidden buckets of this store's table buckets.
+fn tableWarehouses(store: borrow ObjectStore) -> Result<Vector<Vector<u8>>, TablesError> {
+    var out = Vector<Vector<u8>>.create();
+    let all = match (store.listBucketInfo()) {
+        Ok(a) => a,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    for (i in 0..all.length) {
+        if (isTableWarehouseShaped(all[i].name.view())) { out.push(copyBytes(all[i].name.view())?)?; }
+    }
+    return Ok(out);
+}
+
+/// Whether `keys`, sorted, holds `key`.
+fn holdsSorted(keys: borrow Vector<Vector<u8>>, key: Slice<u8>) -> bool => !sortedHolds(keys, key);
+
+/// The ids each record under `head` names (`id`), into `out`.
+fn idsOfRecords(
+    store: borrow ObjectStore,
+    hidden: Slice<u8>,
+    head: StringView,
+    out: borrow mut Vector<Vector<u8>>,
+) -> Result<void, TablesError> {
+    let keys = catalogKeys(store, hidden, head.bytes(), "".bytes(), 0)?;
+    for (i in 0..keys.length) {
+        match (readRecord(store, hidden, keys[i].view())?) {
+            Some(r) => {
+                match (jsonMemberText(borrow r.json, "id")) {
+                    Some(id) => { out.push(copyBytes(id)?)?; }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+    }
+    return Ok();
+}
+
+/// The ids a live table's pin names: their files are referenced by that table (`shared/<of>/<by>`, ADR-0086 §3).
+fn pinnedIds(
+    store: borrow ObjectStore,
+    hidden: Slice<u8>,
+    out: borrow mut Vector<Vector<u8>>,
+) -> Result<void, TablesError> {
+    let bucket = hidden[0..hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
+    let head = MAINTENANCE_SHARED.bytes().length;
+    let pins = catalogKeys(store, hidden, MAINTENANCE_SHARED.bytes(), "".bytes(), 0)?;
+    for (i in 0..pins.length) {
+        let rest = pins[i].view()[head..];
+        let slash = pieceEnd(rest, 0, '/');
+        if (slash >= rest.length) { continue; }
+        let of = rest[0..slash];
+        let by = rest[slash + 1..];
+        let pin = match (readRecord(store, hidden, pins[i].view())?) {
+            Some(p) => p,
+            null => { continue; }
+        };
+        let ns = jsonMemberText(borrow pin.json, "namespace") ?? "".bytes();
+        let name = jsonMemberText(borrow pin.json, "name") ?? "".bytes();
+        let live = match (tableRecord(store, bucket, ns, name)) {
+            Ok(rec) => jsonMemberText(borrow rec.json, "id") == Some(by),
+            Err(TablesError.NotFound) => false,
+            Err(e) => { return Err(e); }
+        };
+        if (live) { out.push(copyBytes(of)?)?; }
+    }
+    return Ok();
+}
+
+/// The top-level ids of the warehouse: its prefixes of a UUID's form (never the catalog's `.s3tables/`).
+fn warehouseIds(store: borrow ObjectStore, hidden: Slice<u8>) -> Result<Vector<Vector<u8>>, TablesError> {
+    var out = Vector<Vector<u8>>.create();
+    var marker = Vector<u8>.create();
+    var markerIsPrefix = false;
+    while (true) {
+        let page = match (store.listObjects(catalogText(hidden), "", "/", marker.view(), markerIsPrefix, 1000)) {
+            Ok(p) => p,
+            Err(e) => { return Err(tablesStoreFail(e)); }
+        };
+        for (i in 0..page.commonPrefixes.length) {
+            let p = page.commonPrefixes[i].view();
+            if (p.length > 1 && uuidShaped(p[0..p.length - 1])) { out.push(copyBytes(p[0..p.length - 1])?)?; }
+        }
+        if (!page.truncated || page.nextMarker.length == 0) { break; }
+        marker = copyBytes(page.nextMarker.view())?;
+        markerIsPrefix = page.nextMarkerIsPrefix;
+    }
+    return Ok(out);
+}
+
+/// A view's current metadata file's key in the warehouse, from its record's `s3://<hidden>/<key>`; null when it is
+/// not there, or not in this warehouse under the view's id.
+fn viewCurrentKey(rec: borrow Json, hidden: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
+    let id = jsonMemberText(rec, "id") ?? { return Ok(null); };
+    let location = jsonMemberText(rec, "metadataLocation") ?? { return Ok(null); };
+    var head = copyBytes("s3://".bytes())?;
+    head.extend(hidden)?;
+    head.push('/')?;
+    if (!startsWithBytes(location, head.view())) { return Ok(null); }
+    let key = location[head.length..];
+    if (!uuidShaped(id) || key.length <= id.length || key[0..id.length] != id || key[id.length] != '/') {
+        return Ok(null);
+    }
+    return Ok(Some(copyBytes(key)?));
+}
+
+/// What a sweep found and did: its notes kept, and how many objects it may still delete.
+struct OrphanSweep {
+    hidden: Vector<u8>;
+    notes: Json;
+    kept: Vector<JsonMember>;
+    budget: usize;
+    nowMs: i64;
+    /// `unreferencedDays + nonCurrentDays`, in milliseconds.
+    ageMs: i64;
+    deleted: usize;
+}
+
+/// Whether `note` (an id, or an object's key) is old enough to delete; if not, or if `remaining` says its deletion
+/// is not done, its note is kept.
+fn orphanDue(sweep: borrow mut OrphanSweep, note: Slice<u8>) -> Result<bool, AllocError> {
+    let first = jsonMemberI64(borrow sweep.notes, textOfRef(note)) ?? sweep.nowMs;
+    if (sweep.nowMs - first >= sweep.ageMs) { return Ok(true); }
+    sweep.kept.push(JsonMember { key: copyBytes(note)?, value: jsonInteger(first)? })?;
+    return Ok(false);
+}
+
+/// Deletes `keys`, as far as the sweep's budget lets it; whether all of them went.
+fn deleteOrphans(
+    store: borrow mut ObjectStore,
+    sweep: borrow mut OrphanSweep,
+    keys: Slice<Vector<u8>>,
+) -> Result<bool, TablesError> {
+    let n = if (keys.length > sweep.budget) sweep.budget else keys.length;
+    var at: usize = 0;
+    while (at < n) {
+        let end = if (n - at > 1000) at + 1000 else n;
+        match (store.deleteObjects(catalogText(sweep.hidden.view()), keys[at..end])) {
+            Ok(_) => {}
+            Err(e) => { return Err(tablesStoreFail(e)); }
+        }
+        at = end;
+    }
+    sweep.budget -= n;
+    sweep.deleted += n;
+    return Ok(n == keys.length);
+}
+
+/// One table bucket's orphans swept, under the store (on a cluster, one gated step): nothing when its unreferenced
+/// file removal is disabled. The number of objects deleted.
+fn sweepOrphans(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    nowMs: i64,
+    dayMs: i64,
+) -> Result<usize, TablesError> {
+    let document = maintenanceDocument(store, hidden, MAINTENANCE_BUCKET_KEY.bytes())?;
+    let value = maintenanceValue(borrow document, UNREFERENCED_REMOVAL)?;
+    if (!maintenanceEnabled(borrow value)) { return Ok(0); }
+    let days = (maintenanceSetting(borrow value, UNREFERENCED_REMOVAL, "unreferencedDays") ?? 3) +
+        (maintenanceSetting(borrow value, UNREFERENCED_REMOVAL, "nonCurrentDays") ?? 10);
+    // What records name: tables (in any namespace), views, staged creates, and what live tables' pins name.
+    var live = Vector<Vector<u8>>.create();
+    idsOfRecords(store, hidden, CATALOG_TABLES, mut live)?;
+    idsOfRecords(store, hidden, CATALOG_VIEWS, mut live)?;
+    idsOfRecords(store, hidden, CATALOG_STAGED, mut live)?;
+    pinnedIds(store, hidden, mut live)?;
+    sortKeys(mut live);
+    var sweep = OrphanSweep {
+        hidden: copyBytes(hidden)?,
+        notes: maintenanceDocument(store, hidden, MAINTENANCE_ORPHANS.bytes())?,
+        kept: Vector<JsonMember>.create(),
+        budget: ORPHAN_DELETES_MAX,
+        nowMs: nowMs,
+        ageMs: days * dayMs,
+        deleted: 0,
+    };
+    // Ids no record names: all their objects, once due.
+    let ids = warehouseIds(store, hidden)?;
+    for (i in 0..ids.length) {
+        let id = ids[i].view();
+        if (holdsSorted(borrow live, id)) { continue; }
+        if (!orphanDue(mut sweep, id)?) { continue; }
+        var prefix = copyBytes(id)?;
+        prefix.push('/')?;
+        let objects = catalogKeys(store, hidden, prefix.view(), "".bytes(), 0)?;
+        if (!deleteOrphans(store, mut sweep, objects.view())?) {
+            // Not all of it this pass: still due on the next.
+            let first = jsonMemberI64(borrow sweep.notes, textOfRef(id)) ?? nowMs;
+            sweep.kept.push(JsonMember { key: copyBytes(id)?, value: jsonInteger(first)? })?;
+        }
+    }
+    // Each view's metadata files other than its current one.
+    let views = catalogKeys(store, hidden, CATALOG_VIEWS.bytes(), "".bytes(), 0)?;
+    for (i in 0..views.length) {
+        let rec = match (readRecord(store, hidden, views[i].view())?) {
+            Some(r) => r,
+            null => { continue; }
+        };
+        let current = viewCurrentKey(borrow rec.json, hidden)? ?? { continue; };
+        let id = jsonMemberText(borrow rec.json, "id") ?? { continue; };
+        var prefix = copyBytes(id)?;
+        prefix.push('/')?;
+        let objects = catalogKeys(store, hidden, prefix.view(), "".bytes(), 0)?;
+        var due = Vector<Vector<u8>>.create();
+        for (k in 0..objects.length) {
+            let key = objects[k].view();
+            if (key == current.view()) { continue; }
+            if (orphanDue(mut sweep, key)?) { due.push(copyBytes(key)?)?; }
+        }
+        if (!deleteOrphans(store, mut sweep, due.view())?) {
+            // What the budget left: noted as due, for the next pass.
+            for (k in 0..due.length) {
+                let gone = store.headObject(catalogText(hidden), catalogText(due[k].view())).isErr();
+                if (!gone) {
+                    let first = jsonMemberI64(borrow sweep.notes, textOfRef(due[k].view())) ?? nowMs;
+                    sweep.kept.push(JsonMember { key: copyBytes(due[k].view())?, value: jsonInteger(first)? })?;
+                }
+            }
+        }
+    }
+    let deleted = sweep.deleted;
+    if (sweep.kept.length == 0) {
+        removeCatalogObject(store, hidden, MAINTENANCE_ORPHANS.bytes())?;
+    } else {
+        let kept = replace(mut sweep.kept, Vector<JsonMember>.create());
+        let notes = Json.Object(kept);
+        let _ = writeRecord(store, hidden, MAINTENANCE_ORPHANS.bytes(), borrow notes, PutCondition.None)?;
+    }
+    return Ok(deleted);
+}
+
+/// Each table bucket's orphans on `serve` (ADR-0136 §3), the store held for one table bucket at a time.
+async fn sweepAllOrphans(store: borrow Arc<AsyncMutex<ObjectStore>>, dayMs: i64) -> Result<void, NetError> {
+    var warehouses = Vector<Vector<u8>>.create();
+    {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        warehouses = match (await Async.blocking(() => tableWarehouses(st))) {
+            Ok(w) => w,
+            Err(_) => { return Ok(); }
+        };
+    }
+    for (i in 0..warehouses.length) {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let hidden = warehouses[i].view();
+        let _ = await Async.blocking(() => sweepOrphans(st, hidden, Clock.unixMillis(), dayMs));
+    }
+    return Ok();
+}

@@ -1,0 +1,131 @@
+// Orphaned files of a table bucket (ADR-0136 §3).
+import web_core;
+import web_http;
+
+const ORPHAN_ID: StringView = "0f0f0f0f-0000-4000-8000-000000000001";
+const PINNED_ID: StringView = "0f0f0f0f-0000-4000-8000-000000000002";
+const STAGED_ID: StringView = "0f0f0f0f-0000-4000-8000-000000000003";
+
+fn putIn(s: borrow mut ObjectStore, hidden: Slice<u8>, key: StringView) {
+    let _ = s.putObject(catalogText(hidden), key, "application/octet-stream", "x".bytes(), PutCondition.None)!;
+}
+
+fn objectThere(s: borrow ObjectStore, hidden: Slice<u8>, key: Slice<u8>) -> bool =>
+    s.headObject(catalogText(hidden), catalogText(key)).isOk();
+
+fn underId(s: borrow ObjectStore, hidden: Slice<u8>, id: Slice<u8>) -> usize {
+    var prefix = copyBytes(id)!;
+    prefix.push('/')!;
+    return catalogKeys(s, hidden, prefix.view(), "".bytes(), 0)!.length;
+}
+
+/// A table bucket's orphans (M34's B3, ADR-0136 §3): an id no record names, and a view's earlier metadata files, noted
+/// when first found and deleted once `unreferencedDays + nonCurrentDays` old; a table's files, a view's current one, and
+/// an id a live table's pin or a staged create names, kept; nothing when the removal is disabled.
+@test
+fn orphansSwept() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("orphans");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let caller = tablesCaller("AKIAORPHANS");
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let made = icebergCreateTable(
+        mut s,
+        "cat".bytes(),
+        "ns".bytes(),
+        "{\"name\":\"t\",\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+        borrow noKeys,
+    )!;
+    Check.equalU64(200, made.status as u64)?;
+    let table = currentTable(borrow s, "cat".bytes(), "ns".bytes(), "t".bytes())!!;
+    let tableId = copyBytes(jsonMemberText(borrow table.json, "id")!)!;
+    // A view, replaced once: two metadata files, the first no longer current.
+    let views = viewSegments(["views"][..]);
+    let one = viewSegments(["views", "v"][..]);
+    Check.equalU64(
+        200,
+        icebergViews(
+            mut s,
+            Method.Post,
+            "cat".bytes(),
+            "ns".bytes(),
+            views.view(),
+            VIEW_BODY.bytes(),
+            borrow caller,
+            borrow noKeys,
+        )!.status as u64,
+    )?;
+    let props = "{\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"k\":\"1\"}}]}";
+    Check.equalU64(
+        200,
+        icebergViews(
+            mut s,
+            Method.Post,
+            "cat".bytes(),
+            "ns".bytes(),
+            one.view(),
+            props.bytes(),
+            borrow caller,
+            borrow noKeys,
+        )!.status as u64,
+    )?;
+    let view = readRecord(borrow s, hidden.view(), viewKey("ns".bytes(), "v".bytes())!.view())!!;
+    let viewId = copyBytes(jsonMemberText(borrow view.json, "id")!)!;
+    let current = viewCurrentKey(borrow view.json, hidden.view())!!;
+    Check.equalU64(2, underId(borrow s, hidden.view(), viewId.view()) as u64)?;
+    // An orphaned id (a create that crashed after its file), and one a live table's pin names.
+    putIn(mut s, hidden.view(), "0f0f0f0f-0000-4000-8000-000000000001/metadata/00000-a.metadata.json");
+    putIn(mut s, hidden.view(), "0f0f0f0f-0000-4000-8000-000000000001/data/a.parquet");
+    putIn(mut s, hidden.view(), "0f0f0f0f-0000-4000-8000-000000000002/data/b.parquet");
+    var pin = jsonObject();
+    jsonSet(mut pin, "namespace", jsonString("ns".bytes())!)!;
+    jsonSet(mut pin, "name", jsonString("t".bytes())!)!;
+    let pinKey = sharedKey(PINNED_ID.bytes(), tableId.view())!;
+    let _ = writeRecord(mut s, hidden.view(), pinKey.view(), borrow pin, PutCondition.None)!;
+    // A staged create's id, its engine's file written before its commit.
+    putIn(mut s, hidden.view(), "0f0f0f0f-0000-4000-8000-000000000003/data/c.parquet");
+    var staged = jsonObject();
+    jsonSet(mut staged, "id", jsonString(STAGED_ID.bytes())!)!;
+    let stagedKey = catalogKey(CATALOG_STAGED, "ns".bytes(), "s".bytes())!;
+    let _ = writeRecord(mut s, hidden.view(), stagedKey.view(), borrow staged, PutCondition.None)!;
+    let tableFiles = underId(borrow s, hidden.view(), tableId.view());
+    let day: i64 = 86400000;
+    let t0: i64 = 1000 * day;
+    // Disabled: nothing noted or deleted.
+    let off = parseJson("{\"icebergUnreferencedFileRemoval\":{\"status\":\"disabled\"}}".bytes())!!;
+    let _ = writeRecord(mut s, hidden.view(), MAINTENANCE_BUCKET_KEY.bytes(), borrow off, PutCondition.None)!;
+    Check.equalU64(0, sweepOrphans(mut s, hidden.view(), t0 + 100 * day, day)! as u64)?;
+    Check.isTrue(readRecord(borrow s, hidden.view(), MAINTENANCE_ORPHANS.bytes())!.isNull(), "nothing noted")?;
+    removeCatalogObject(mut s, hidden.view(), MAINTENANCE_BUCKET_KEY.bytes())!;
+    // Enabled (the default): first noted, nothing deleted; 12 days on, still nothing; at 13 days, the orphans go.
+    Check.equalU64(0, sweepOrphans(mut s, hidden.view(), t0, day)! as u64)?;
+    Check.isTrue(readRecord(borrow s, hidden.view(), MAINTENANCE_ORPHANS.bytes())!.isSome(), "noted")?;
+    Check.equalU64(0, sweepOrphans(mut s, hidden.view(), t0 + 12 * day, day)! as u64)?;
+    Check.equalU64(3, sweepOrphans(mut s, hidden.view(), t0 + 13 * day, day)! as u64)?;
+    Check.equalU64(0, underId(borrow s, hidden.view(), ORPHAN_ID.bytes()) as u64)?;
+    Check.equalU64(1, underId(borrow s, hidden.view(), PINNED_ID.bytes()) as u64)?;
+    Check.equalU64(1, underId(borrow s, hidden.view(), STAGED_ID.bytes()) as u64)?;
+    Check.equalU64(tableFiles as u64, underId(borrow s, hidden.view(), tableId.view()) as u64)?;
+    Check.equalU64(1, underId(borrow s, hidden.view(), viewId.view()) as u64)?;
+    Check.isTrue(objectThere(borrow s, hidden.view(), current.view()), "the view's current file kept")?;
+    Check.isTrue(readRecord(borrow s, hidden.view(), MAINTENANCE_ORPHANS.bytes())!.isNull(), "no notes left")?;
+    // The view still loads.
+    Check.equalU64(
+        200,
+        icebergViews(
+            mut s,
+            Method.Get,
+            "cat".bytes(),
+            "ns".bytes(),
+            one.view(),
+            "".bytes(),
+            borrow caller,
+            borrow noKeys,
+        )!.status as u64,
+    )?;
+    removeTree(dir.view());
+    return Ok();
+}
