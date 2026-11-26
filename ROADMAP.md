@@ -6551,3 +6551,17 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **B,** M35's recorded B1 to B5;
   - **C,** v3's remaining parts.
 - **Next:** the owner's choice.
+
+### 26 Nov 2026: M36 decided, ADR-0138 proposed (table replication)
+
+- **The owner:** "A.", and B1 first.
+- **ADR-0138 proposes:**
+  - slice 0, M35's B1: the orphan sweep's reads off the store's hold;
+  - the six configuration calls, with version tokens, authorized as AWS lists;
+  - replicas: tables of their own in the destination, read-only, marked as AWS marks them, every file copied and
+    rewritten to its own paths, sealed with the destination's encryption; `DisassociateTableReplication`;
+  - the copy asked in the source's commit, done by a loop per node or shard, its record last; across shards as S3
+    replicas go; `GetTableReplicationStatus`;
+  - the checks by the CLI, boto3, PyIceberg and Iceberg Java, on `serve` and across a cluster's shards.
+- **For the owner:** a replica as a copy or a reference; destinations here only or elsewhere too; a table's
+  configuration replacing its bucket's or adding to it.

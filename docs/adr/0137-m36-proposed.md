@@ -1,6 +1,9 @@
 # ADR-0137: M36, after M34's recorded items (proposed)
 
-**Status:** proposed, 26 Nov 2026, after M35 was closed (the owner: "continue").
+**Status:** decided, 26 Nov 2026. The owner chose A, table replication ("A."), with M35's B1 first ("Yes, B1
+first"); its design is ADR-0138.
+
+Proposed the same day, after M35 was closed (the owner: "continue").
 
 ## Context
 
