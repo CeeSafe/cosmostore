@@ -201,7 +201,20 @@ fn tableBucketReplicationCall(
         checkTables(store, caller, "s3tables:GetTableBucketMaintenanceConfiguration", bucket.view(), "".bytes())?;
         checkReplicationDestinations(store, caller, destinations.view(), cluster)?;
     }
-    return replicationConfigCall(store, req, hidden.view(), REPLICATION_BUCKET_KEY.bytes(), config);
+    let answer = replicationConfigCall(store, req, hidden.view(), REPLICATION_BUCKET_KEY.bytes(), config)?;
+    // Each of its tables copied now (ADR-0138 §3), not at its next commit: a replica and a table with its own
+    // configuration left out.
+    if (isMethod(m, Method.Put)) {
+        let keys = catalogKeys(store, hidden.view(), CATALOG_TABLES.bytes(), "".bytes(), 0)?;
+        for (i in 0..keys.length) {
+            let rec = readRecord(store, hidden.view(), keys[i].view())? ?? { continue; };
+            if (jsonMember(borrow rec.json, "replicaOf").isSome()) { continue; }
+            let id = jsonMemberText(borrow rec.json, "id") ?? { continue; };
+            if (readRecord(store, hidden.view(), tableReplicationKey(id)?.view())?.isSome()) { continue; }
+            writeReplicationAsk(store, hidden.view(), id)?;
+        }
+    }
+    return Ok(answer);
 }
 
 /// PutTableReplication, GetTableReplication and DeleteTableReplication (`/table-replication?tableArn=`, ADR-0138
@@ -235,7 +248,10 @@ fn tableReplicationCall(
         checkReplicationDestinations(store, caller, destinations.view(), cluster)?;
     }
     let key = tableReplicationKey(id.view())?;
-    return replicationConfigCall(store, req, hidden.view(), key.view(), config);
+    let answer = replicationConfigCall(store, req, hidden.view(), key.view(), config)?;
+    // The table copied now (ADR-0138 §3).
+    if (isMethod(m, Method.Put)) { writeReplicationAsk(store, hidden.view(), id.view())?; }
+    return Ok(answer);
 }
 
 /// The replication configuration a table follows (ADR-0138 §1): its own, else its bucket's; null when neither.

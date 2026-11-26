@@ -6720,3 +6720,22 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   shard 2 and its replica's on shard 1 of 8; 568 unit tests; the S3 smoke.
 - **Not yet:** a file over 64 MiB on a cluster (its parts); Iceberg Java's read of a v3 table's replica with deletion
   vectors.
+
+### 26 Nov 2026: M36 slice 4, the checks (ADR-0138 §6)
+
+- **Iceberg Java** (`iceberg_java_check.py`, plain and on a KMS table bucket): its v3 table with a deletion vector
+  replicated to another table bucket (`completed`), and the replica read by Iceberg Java with the source's rows, its
+  deletion vector kept, still v3.
+- **A configuration's Put asks for its tables now** (a table bucket's: each table, but a replica or one with its own
+  configuration; a table's: itself), not at their next commit. The asks are written whatever the configuration reads
+  in that step (a cluster's step does not read its own write).
+- **A copy writes no replica once its replication is removed:** at its start (before the destination's namespace and
+  configuration) and before its metadata and record, it reads the source's configuration again, on `serve` and on a
+  cluster (`replicationStillNames`), and fails with that reason. Found by the Java check: a copy the source's own
+  compaction asked for, under way when the configuration and the replica were deleted, made the replica again. Its
+  cleanup still allows for a copy that had just finished.
+- **Tests:** `replicaNotMadeOnceRemoved`; `replicationConfigurations` checks the Put's ask.
+- **Earlier slices' checks, for the record:** PyIceberg on `serve` (77) and through a cluster's node (77, across
+  shards 2 and 1), the S3 smoke's CLI checks, and the unit tests above.
+- **Checks:** 569 unit tests, the Java check (60 plain, 63 on a KMS table bucket), the S3 smoke and the cluster S3
+  smoke (214).

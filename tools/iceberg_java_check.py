@@ -52,13 +52,13 @@ else:
     arn = tables.create_table_bucket(name="java-check")["arn"]
 
 
-def java(phase):
+def java(phase, bucket=None):
     if os.environ.get("CALL_TRACES") and phase == "calls":
         trace = subprocess.run(["java", "--enable-native-access=ALL-UNNAMED", "-cp", classpath, "V3Check", endpoint, arn,
                                 "calls"], capture_output=True, text=True, timeout=300)
         print("\n".join(l for l in trace.stderr.splitlines() if not l.startswith("WARNING"))[:6000])
-    run = subprocess.run(["java", "--enable-native-access=ALL-UNNAMED", "-cp", classpath, "V3Check", endpoint, arn,
-                          phase], capture_output=True, text=True, timeout=300)
+    run = subprocess.run(["java", "--enable-native-access=ALL-UNNAMED", "-cp", classpath, "V3Check", endpoint,
+                          bucket or arn, phase], capture_output=True, text=True, timeout=300)
     if run.returncode != 0:
         print(run.stdout[-3000:])
         print(run.stderr[-3000:])
@@ -127,6 +127,59 @@ check("its deletion vector committed", before.get("deletes"), "1")
 check("28 live rows of 30", len(rows), 28)
 next_before = int(before["next-row-id"])
 check("its rows given ids", next_before >= 30, True)
+# Table replication (ADR-0138 §6): the v3 table with its deletion vector replicated, its replica read by Iceberg Java
+# with the same rows (its Puffin footer's data file, and its manifests' paths, the replica's own).
+if encrypted:
+    replica_arn = tables.create_table_bucket(name="java-replica", encryptionConfiguration={"sseAlgorithm": "aws:kms",
+                                                                                           "kmsKeyArn": KMS_KEY})["arn"]
+else:
+    replica_arn = tables.create_table_bucket(name="java-replica")["arn"]
+tables.put_table_bucket_replication(tableBucketARN=arn, configuration={
+    "role": "arn:aws:iam::000000000000:role/replicator",
+    "rules": [{"destinations": [{"destinationTableBucketARN": replica_arn}]}]})
+source_arn = tables.get_table(tableBucketARN=arn, namespace="javans", name="v3")["tableARN"]
+# Asked by the configuration's next commit, or by the next maintenance pass: a property set asks now.
+tables_status = None
+for _ in range(90):
+    tables_status = tables.get_table_replication_status(tableArn=source_arn)["destinations"][0]
+    if tables_status["replicationStatus"] == "completed":
+        break
+    time.sleep(1)
+check("the v3 table replicated", (tables_status["replicationStatus"], tables_status.get("failureMessage")),
+      ("completed", None))
+replicated, _, replica_ids = java("read", replica_arn)
+check("Iceberg Java reads its replica: the same rows", sorted(replica_ids), sorted(r[0] for r in rows))
+check("its replica keeps the deletion vector", replicated.get("deletes"), "1")
+check("and is v3", replicated.get("format"), "3")
+tables.delete_table_bucket_replication(tableBucketARN=arn, versionToken=tables.get_table_bucket_replication(
+    tableBucketARN=arn)["versionToken"])
+# A copy under way when its replication was removed (the source's own compaction asks for one) writes no replica;
+# one that had just finished may have made it again, so the replica goes until it stays gone.
+from botocore.exceptions import ClientError
+for _ in range(20):
+    try:
+        tables.delete_table(tableBucketARN=replica_arn, namespace="javans", name="v3")
+    except ClientError:
+        pass
+    try:
+        tables.delete_namespace(tableBucketARN=replica_arn, namespace="javans")
+        break
+    except ClientError:
+        time.sleep(1)
+for _ in range(20):
+    try:
+        tables.delete_table_bucket(tableBucketARN=replica_arn)
+        break
+    except ClientError:
+        try:
+            tables.delete_table(tableBucketARN=replica_arn, namespace="javans", name="v3")
+        except ClientError:
+            pass
+        try:
+            tables.delete_namespace(tableBucketARN=replica_arn, namespace="javans")
+        except ClientError:
+            pass
+        time.sleep(1)
 
 catalog = load_catalog("cosmo", **{
     "type": "rest", "uri": endpoint + "/iceberg", "warehouse": arn, "rest.sigv4-enabled": "true",

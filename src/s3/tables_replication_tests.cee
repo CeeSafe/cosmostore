@@ -93,6 +93,11 @@ fn replicationConfigurations() -> Result<void, TestFailure> {
     Check.equalU64(200, replicationRequest(mut s, Method.Put, bucketPath, byBucket[..], body.view()))?;
     Check.equalU64(200, replicationRequest(mut s, Method.Get, bucketPath, byBucket[..], "".bytes()))?;
     let token = bucketReplicationToken(mut s);
+    // Its table copied now, not at its next commit (ADR-0138 §3).
+    Check.isTrue(
+        readRecord(borrow s, hidden.view(), replicationAskKey(tableId.view())!.view())!.isSome(),
+        "asked at the Put",
+    )?;
     let rules = replicationOf(borrow s, hidden.view(), tableId.view())!!;
     Check.equalBytes(role.bytes(), jsonMemberText(borrow rules, "role")!)?;
     // A stale token: Conflict, for a Put and a Delete; a Delete without one: BadRequest.
@@ -130,6 +135,16 @@ fn replicaSourceStore(dir: Slice<u8>) -> Result<void, TestFailure> {
     deletesStore(dir, storeConfig());
     var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
     s.createBucket("dst--table-s3")!;
+    let config = parseJson(
+        "{\"configuration\":{\"role\":\"arn:aws:iam::000000000000:role/r\",\"rules\":[{\"destinations\":[{\"destinationTableBucketARN\":\"arn:aws:s3tables:us-east-1:000000000000:bucket/dst\"}]}]}}".bytes(),
+    )!!;
+    let _ = writeRecord(
+        mut s,
+        "compact--table-s3".bytes(),
+        REPLICATION_BUCKET_KEY.bytes(),
+        borrow config,
+        PutCondition.None,
+    )!;
     return Ok();
 }
 
@@ -411,6 +426,46 @@ async fn replicationAskedAndAnswered() -> Result<void, TestFailure> {
         await replicateAsked(borrow shared, borrow keys)!;
     }
     await Async.blocking(() => checkAskedReplica(d.bytes()))?;
+    await Async.blocking(() => removeTree(d));
+    return Ok();
+}
+
+/// The source's replication removed: no replica made, and the copy's status says why (ADR-0138 §3).
+fn removedReplicationStore(dir: Slice<u8>) -> Result<void, TestFailure> {
+    replicaSourceStore(dir)?;
+    var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
+    removeCatalogObject(mut s, "compact--table-s3".bytes(), REPLICATION_BUCKET_KEY.bytes())!;
+    return Ok();
+}
+
+fn checkNoReplica(dir: Slice<u8>) -> Result<void, TestFailure> {
+    let s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
+    let key = catalogKey(CATALOG_TABLES, "ns".bytes(), "t".bytes())!;
+    Check.isTrue(readRecord(borrow s, "dst--table-s3".bytes(), key.view())!.isNull(), "no replica")?;
+    let status = readRecord(
+        borrow s,
+        "compact--table-s3".bytes(),
+        replicationStatusKey(COMPACT_ID.bytes(), "dst".bytes())!.view(),
+    )!!;
+    Check.equalBytes("failed".bytes(), jsonMemberText(borrow status.json, "status")!)?;
+    Check.isTrue(findBytes(jsonMemberText(borrow status.json, "failure")!, "removed".bytes(), 0).isSome(), "why")?;
+    return Ok();
+}
+
+/// A copy whose table's replication was removed while it ran (here, before it): it writes no replica (ADR-0138 §3).
+@test
+async fn replicaNotMadeOnceRemoved() -> Result<void, TestFailure> {
+    let base = await Async.blocking(() => scratchDirectory("replica-removed"));
+    let d = base.view();
+    await Async.blocking(() => removedReplicationStore(d.bytes()))?;
+    let store = await Async.blocking(() => ObjectStore.open(d, storeConfig()))!;
+    {
+        let locked = AsyncMutex<ObjectStore>.create(store)!;
+        let shared = Arc<AsyncMutex<ObjectStore>>.create(locked)!;
+        let keys = await Async.blocking(() => noTableKeys())!;
+        await copyReplica(borrow shared, "compact".bytes(), COMPACT_ID.bytes(), "dst".bytes(), borrow keys)!;
+    }
+    await Async.blocking(() => checkNoReplica(d.bytes()))?;
     await Async.blocking(() => removeTree(d));
     return Ok();
 }

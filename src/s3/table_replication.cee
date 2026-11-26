@@ -31,6 +31,12 @@ fn replicationStatusKey(id: Slice<u8>, destination: Slice<u8>) -> Result<Vector<
 /// A replicated table's ask for a copy, before its record changes (ADR-0138 §3); nothing for one not replicated.
 fn askReplication(store: borrow mut ObjectStore, hidden: Slice<u8>, id: Slice<u8>) -> Result<void, TablesError> {
     if (replicationOf(store, hidden, id)?.isNull()) { return Ok(); }
+    return writeReplicationAsk(store, hidden, id);
+}
+
+/// A table's ask written, whatever its configuration reads now (a configuration's Put asks for its tables in its own
+/// step, where it does not read its own write, ADR-0058). An ask whose table has no configuration copies nothing.
+fn writeReplicationAsk(store: borrow mut ObjectStore, hidden: Slice<u8>, id: Slice<u8>) -> Result<void, TablesError> {
     var ask = jsonObject();
     jsonSet(mut ask, "at", jsonInteger(Clock.unixMillis())?)?;
     let _ = writeRecord(store, hidden, replicationAskKey(id)?.view(), borrow ask, PutCondition.None)?;
@@ -141,6 +147,11 @@ fn replicaCopyStart(
 ) -> Result<ReplicaCopy?, TablesError> {
     var c = replicaSourceRead(store, srcBucket, srcId, dstBucket, keys)? ?? { return Ok(null); };
     if (c.failure.length > 0) { return Ok(Some(c)); }
+    // Nothing made at the destination once its replication is removed (ADR-0138 §3).
+    if (!replicationStillNames(store, borrow c)?) {
+        failCopy(mut c, "The table's replication to this destination was removed.")?;
+        return Ok(Some(c));
+    }
     let d = replicaDestinationStart(
         store,
         dstBucket,
@@ -856,6 +867,17 @@ fn noteRewritten(
     return Ok();
 }
 
+/// Whether the source's configuration still names the copy's destination: a copy whose replication was removed while
+/// it ran writes no replica (ADR-0138 §3).
+fn replicationStillNames(store: borrow ObjectStore, c: borrow ReplicaCopy) -> Result<bool, TablesError> {
+    let config = replicationOf(store, c.srcHidden.view(), c.srcId.view())? ?? { return Ok(false); };
+    let destinations = replicationDestinations(borrow config)?;
+    for (d in 0..destinations.length) {
+        if (destinations[d].view() == c.dstBucket.view()) { return Ok(true); }
+    }
+    return Ok(false);
+}
+
 /// The copy's last step, under the store: the replica's metadata and record when nothing failed, then the
 /// destination's status.
 fn endReplicaCopy(
@@ -864,6 +886,9 @@ fn endReplicaCopy(
     keys: borrow WarehouseKeys,
 ) -> Result<void, TablesError> {
     var replicaLocation = Vector<u8>.create();
+    if (c.failure.length == 0 && !replicationStillNames(store, c)?) {
+        failCopy(c, "The table's replication to this destination was removed.")?;
+    }
     if (c.failure.length == 0) {
         match (finishReplicaCopy(store, c, keys)) {
             Ok(Some(l)) => { replicaLocation = l; }
