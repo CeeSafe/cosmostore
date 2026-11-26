@@ -6758,3 +6758,14 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Recorded:** B1 to B7, first a cluster's files over 64 MiB.
 - **Checks:** 570 unit tests, the S3 smoke, the cluster S3 smoke (214), the Java check (60, and 63 on KMS).
 - **Waiting:** ADR-0138's acceptance and M36's close, the owner's.
+
+### 26 Nov 2026: M36 closed
+
+- **The owner:** "Yes, I accept ADR-0138 and close M36". ADR-0138 is accepted, and M36's B1 to B7 are recorded in
+  `docs/m36-exit-review.md`.
+- **S3 Tables' API is served here in full** but for migrations.
+- **Next:** M37, when the owner asks. The candidates on record:
+  - M36's B1: a cluster's replica files over 64 MiB, sent in parts;
+  - M36's other recorded items (an index of tables by id, the narrow races, the role's check);
+  - Iceberg v3's remaining parts (ADR-0137's C);
+  - S3 Tables' migrations.

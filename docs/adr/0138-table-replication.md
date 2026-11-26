@@ -1,6 +1,7 @@
 # ADR-0138: S3 Tables' table replication (M36)
 
-**Status:** proposed, 26 Nov 2026, with the owner's choices made:
+**Status:** accepted, 26 Nov 2026 (the owner: "Yes, I accept ADR-0138 and close M36"). Proposed the same day, with
+the owner's choices made:
 - a replica is a copy ("A copy");
 - destinations are on this server only ("This server only");
 - a table's configuration replaces its bucket's ("Table's replaces").

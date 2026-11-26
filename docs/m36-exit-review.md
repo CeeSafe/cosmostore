@@ -1,5 +1,8 @@
 # M36 exit review: table replication (26 Nov 2026)
 
+**M36 closed, 26 Nov 2026** (the owner: "Yes, I accept ADR-0138 and close M36"), with ADR-0138 accepted and B1 to B7
+recorded below.
+
 **M36's exit (ADR-0137 item A, with M35's B1 first; ADR-0138, with the owner's choices):** S3 Tables' eight
 replication calls, replicas that read as their sources after each commit through the CLI, boto3, PyIceberg and Iceberg
 Java, on `serve` and on a cluster; and the orphan sweep's reads off the store's hold.
