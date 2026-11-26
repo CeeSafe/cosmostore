@@ -6360,3 +6360,14 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Next:** M34, when the owner asks. Candidates on record:
   - ADR-0131's B (Iceberg views and nested namespaces), C (table replication) and D (v3's remaining parts);
   - M33's recorded Lows.
+
+### 26 Nov 2026: M34 proposed (ADR-0133)
+
+- **The owner:** "continue", after M33 was closed.
+- **ADR-0133 proposes four items:**
+  - **A, Iceberg views and nested namespaces** (recommended), checked by Iceberg Java and PyIceberg 0.12, which both
+    have the view calls;
+  - **B,** table replication;
+  - **C,** v3's remaining parts;
+  - **D,** M33's recorded Lows.
+- **Next:** the owner's choice.
