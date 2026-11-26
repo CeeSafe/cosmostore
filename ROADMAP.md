@@ -6565,3 +6565,9 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - the checks by the CLI, boto3, PyIceberg and Iceberg Java, on `serve` and across a cluster's shards.
 - **For the owner:** a replica as a copy or a reference; destinations here only or elsewhere too; a table's
   configuration replacing its bucket's or adding to it.
+
+### 26 Nov 2026: ADR-0138, the owner's choices
+
+- **A replica:** "A copy": its own warehouse, every file copied and rewritten.
+- **Destinations:** "This server only": a table bucket here, on `serve` or across a cluster's shards.
+- **Precedence:** "Table's replaces": a table's own configuration replaces its bucket's.

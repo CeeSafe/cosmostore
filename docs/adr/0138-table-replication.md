@@ -1,6 +1,9 @@
 # ADR-0138: S3 Tables' table replication (M36)
 
-**Status:** proposed, 26 Nov 2026.
+**Status:** proposed, 26 Nov 2026, with the owner's choices made:
+- a replica is a copy ("A copy");
+- destinations are on this server only ("This server only");
+- a table's configuration replaces its bucket's ("Table's replaces").
 
 M36 is ADR-0137's item A, with M35's B1 first (the owner: "A.", then "Yes, B1 first").
 
@@ -48,13 +51,13 @@ M36 is ADR-0137's item A, with M35's B1 first (the owner: "A.", then "Yes, B1 fi
      version token per write. A Put whose token is not the current one, and a Delete whose token is not, are
      Conflict.
    - A destination is a table bucket of this server, not the source's own. A destination elsewhere is
-     NotImplemented, per the owner's choice below.
+     NotImplemented, as the owner chose below.
    - `role` is kept and given back. It must be a role ARN this server knows (the roles file, ADR-0075, or the IAM API's, ADR-0104), but copies run
      as the server, as the outbox's do.
    - **Authorization** is the caller's, as AWS lists it: the call's own action, plus the permissions on the source and
      on every destination. The actions are named in the log records (ADR-0130).
-   - **Which configuration a table follows:** per the owner's choice below.
-2. **The replica** (slices 1 and 2), per the owner's choice below; recommended:
+   - **Which configuration a table follows:** its own when it has one, else its bucket's, as the owner chose below.
+2. **The replica** (slices 1 and 2), a copy, as the owner chose below:
    - **A table of its own:** in the destination, at the source's namespace (made if it is not there) and name, with
      its own id and warehouse, its record marked as a replica of the source's ARN.
    - **Its files:** the source's, copied, and each rewritten where it names a path: metadata, manifest lists,
