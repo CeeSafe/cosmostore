@@ -6541,3 +6541,13 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - table replication (ADR-0133's B, ADR-0135's B);
   - Iceberg v3's remaining parts (their C);
   - M35's recorded B1 to B5, the first the sweep's reads under the hold.
+
+### 26 Nov 2026: M36 proposed (ADR-0137)
+
+- **The owner:** "continue", after M35 was closed.
+- **ADR-0137 proposes three items:**
+  - **A, table replication, with M35's B1 first** (recommended): the orphan sweep's reads moved off the store's hold,
+    then S3 Tables' eight replication calls;
+  - **B,** M35's recorded B1 to B5;
+  - **C,** v3's remaining parts.
+- **Next:** the owner's choice.
