@@ -1626,6 +1626,22 @@ check "and not counted in the stats" "$(curl -s --aws-sigv4 "aws:amz:us-east-1:s
 check "record expiration: AWS's managed tables only" "$(code s3tables get-table-record-expiration-configuration --table-arn "$ctarn")" MethodNotAllowedException
 check "nor put" "$(code s3tables put-table-record-expiration-configuration --table-arn "$ctarn" --value 'status=enabled,settings={days=30}')" MethodNotAllowedException
 check "nor its job's status" "$(code s3tables get-table-record-expiration-job-status --table-arn "$ctarn")" MethodNotAllowedException
+# Table replication's configurations (ADR-0138 §1): a table bucket's and a table's, with their version tokens.
+rarn=$(aws s3tables create-table-bucket --name smoke-replica --query arn --output text 2>&1)
+rconf="{\"role\":\"arn:aws:iam::000000000000:role/replicator\",\"rules\":[{\"destinations\":[{\"destinationTableBucketARN\":\"$rarn\"}]}]}"
+check "no replication at first" "$(code s3tables get-table-bucket-replication --table-bucket-arn "$carn")" NotFoundException
+rtoken=$(aws s3tables put-table-bucket-replication --table-bucket-arn "$carn" --configuration "$rconf" --query versionToken --output text 2>&1)
+check "put-table-bucket-replication" "$(aws s3tables get-table-bucket-replication --table-bucket-arn "$carn" --query 'configuration.rules[0].destinations[0].destinationTableBucketARN' --output text 2>&1)" "$rarn"
+check "its version token" "$(aws s3tables get-table-bucket-replication --table-bucket-arn "$carn" --query versionToken --output text 2>&1)" "$rtoken"
+check "a stale token refused" "$(code s3tables put-table-bucket-replication --table-bucket-arn "$carn" --configuration "$rconf" --version-token 1)" ConflictException
+check "to itself refused" "$(code s3tables put-table-bucket-replication --table-bucket-arn "$carn" --configuration "{\"role\":\"arn:aws:iam::000000000000:role/r\",\"rules\":[{\"destinations\":[{\"destinationTableBucketARN\":\"$carn\"}]}]}")" BadRequestException
+aws s3tables put-table-replication --table-arn "$ctarn" --configuration "$rconf" > /dev/null 2>&1 && pass "put-table-replication" || fail "put-table-replication"
+check "get-table-replication" "$(aws s3tables get-table-replication --table-arn "$ctarn" --query configuration.role --output text 2>&1)" "arn:aws:iam::000000000000:role/replicator"
+ttoken=$(aws s3tables get-table-replication --table-arn "$ctarn" --query versionToken --output text 2>&1)
+aws s3tables delete-table-replication --table-arn "$ctarn" --version-token "$ttoken" > /dev/null 2>&1 && pass "delete-table-replication" || fail "delete-table-replication"
+aws s3tables delete-table-bucket-replication --table-bucket-arn "$carn" --version-token "$rtoken" > /dev/null 2>&1 && pass "delete-table-bucket-replication" || fail "delete-table-bucket-replication"
+check "none after" "$(code s3tables get-table-bucket-replication --table-bucket-arn "$carn")" NotFoundException
+aws s3tables delete-table-bucket --table-bucket-arn "$rarn" > /dev/null 2>&1
 aws s3tables delete-table --table-bucket-arn "$carn" --namespace ns --name t > /dev/null 2>&1
 check "a table's tags gone with it" "$(code s3tables list-tags-for-resource --resource-arn "$ctarn")" NotFoundException
 aws s3tables delete-namespace --table-bucket-arn "$carn" --namespace ns > /dev/null 2>&1

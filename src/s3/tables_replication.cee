@@ -1,0 +1,254 @@
+// S3 Tables' table replication (ADR-0138): a table bucket's or a table's replication configuration, and (later
+// slices) its replicas, their copies and their status.
+// - A configuration is a catalog record of the source's warehouse: `.s3tables/replication/bucket` for its table
+//   bucket, `.s3tables/replication/tables/<id>` for one table. Its versionToken is the record's generation, as a
+//   table's is, so a Put or Delete given one is a conditional write.
+// - A destination is a table bucket of this server, not the source's own (the owner's "This server only").
+// - A table's own configuration replaces its bucket's (the owner's "Table's replaces").
+import web_core;
+import web_http;
+
+const REPLICATION_BUCKET_KEY: StringView = ".s3tables/replication/bucket";
+const REPLICATION_TABLES: StringView = ".s3tables/replication/tables/";
+/// The service a replica is managed by, as GetTable and ListTables name it (`managedByService`).
+const REPLICATION_SERVICE: StringView = "replication.s3tables.amazonaws.com";
+/// Destinations one configuration names at most.
+const REPLICATION_DESTINATIONS_MAX: usize = 50;
+
+fn tableReplicationKey(id: Slice<u8>) -> Result<Vector<u8>, AllocError> =>
+    catalogKey(REPLICATION_TABLES, id, "".bytes());
+
+/// Whether `role` is an IAM role's ARN: `arn:aws:iam::<account>:role/<name>`.
+fn roleArnShaped(role: Slice<u8>) -> bool {
+    let head = "arn:aws:iam::".bytes();
+    if (!startsWithBytes(role, head)) { return false; }
+    let marker = findBytes(role, ":role/".bytes(), head.length) ?? { return false; };
+    return marker > head.length && role.length > marker + ":role/".bytes().length;
+}
+
+/// A replication configuration a Put gives (`{role, rules: [{destinations: [{destinationTableBucketARN}]}]}`), as
+/// kept, and the table buckets it names, each once; BadRequest when it is not one, or names the source's own.
+fn replicationConfigOf(
+    body: Slice<u8>,
+    source: Slice<u8>,
+    destinations: borrow mut Vector<Vector<u8>>,
+) -> Result<Json, TablesError> {
+    let j = tablesObject(body)?;
+    let c = jsonMember(borrow j, "configuration") ?? { return Err(TablesError.BadRequest); };
+    let role = jsonMemberText(c, "role") ?? { return Err(TablesError.BadRequest); };
+    if (!roleArnShaped(role)) { return Err(TablesError.BadRequest); }
+    let rules = match (jsonMember(c, "rules")) {
+        Some(Json.Array(items)) => items,
+        _ => { return Err(TablesError.BadRequest); }
+    };
+    if (rules.length == 0) { return Err(TablesError.BadRequest); }
+    var keptRules = jsonArray();
+    for (r in 0..rules.length) {
+        let dests = match (jsonMember(borrow rules[r], "destinations")) {
+            Some(Json.Array(items)) => items,
+            _ => { return Err(TablesError.BadRequest); }
+        };
+        if (dests.length == 0) { return Err(TablesError.BadRequest); }
+        var keptDests = jsonArray();
+        for (d in 0..dests.length) {
+            let arn = jsonMemberText(borrow dests[d], "destinationTableBucketARN") ?? {
+                return Err(TablesError.BadRequest);
+            };
+            var id = Vector<u8>.create();
+            let bucket = tableBucketOfArn(arn, mut id)? ?? { return Err(TablesError.BadRequest); };
+            if (id.length > 0 || bucket.view() == source) { return Err(TablesError.BadRequest); }
+            var known = false;
+            for (k in 0..destinations.length) {
+                if (destinations[k].view() == bucket.view()) { known = true; }
+            }
+            if (!known) { destinations.push(bucket)?; }
+            var kept = jsonObject();
+            jsonSet(mut kept, "destinationTableBucketARN", jsonString(arn)?)?;
+            jsonPush(mut keptDests, kept)?;
+        }
+        var rule = jsonObject();
+        jsonSet(mut rule, "destinations", keptDests)?;
+        jsonPush(mut keptRules, rule)?;
+    }
+    if (destinations.length > REPLICATION_DESTINATIONS_MAX) { return Err(TablesError.BadRequest); }
+    var config = jsonObject();
+    jsonSet(mut config, "role", jsonString(role)?)?;
+    jsonSet(mut config, "rules", keptRules)?;
+    return Ok(config);
+}
+
+/// The caller may make the replicas in each destination it names (ADR-0138 §1, as AWS lists): CreateNamespace,
+/// CreateTable and PutTableBucketMaintenanceConfiguration there. A destination this store does not hold is another
+/// shard's on a cluster, and its policy is checked by its copies (as S3's logging target is, ADR-0130 §1); on `serve`
+/// it is NotFound.
+fn checkReplicationDestinations(
+    store: borrow ObjectStore,
+    caller: borrow TablesCaller,
+    destinations: Slice<Vector<u8>>,
+    cluster: bool,
+) -> Result<void, TablesError> {
+    for (i in 0..destinations.length) {
+        let name = destinations[i].view();
+        let hidden = tableWarehouseBucket(name)?;
+        let there = match (store.bucketExists(catalogText(hidden.view()))) {
+            Ok(t) => t,
+            Err(e) => { return Err(tablesStoreFail(e)); }
+        };
+        if (!there) {
+            if (cluster) { continue; }
+            return Err(TablesError.NotFound);
+        }
+        for (action in [
+            "s3tables:CreateNamespace",
+            "s3tables:CreateTable",
+            "s3tables:PutTableBucketMaintenanceConfiguration",
+        ]) {
+            checkTables(store, caller, action, name, "".bytes())?;
+        }
+    }
+    return Ok();
+}
+
+/// A table's record's key, from its id; NotFound when no table of the bucket has it.
+fn tableKeyOfId(store: borrow ObjectStore, hidden: Slice<u8>, id: Slice<u8>) -> Result<Vector<u8>, TablesError> {
+    let keys = catalogKeys(store, hidden, CATALOG_TABLES.bytes(), "".bytes(), 0)?;
+    for (i in 0..keys.length) {
+        match (readRecord(store, hidden, keys[i].view())?) {
+            Some(r) => {
+                if (jsonMemberText(borrow r.json, "id") == Some(id)) { return Ok(copyBytes(keys[i].view())?); }
+            }
+            null => {}
+        }
+    }
+    return Err(TablesError.NotFound);
+}
+
+/// Get, Put or Delete of a replication configuration kept at `key` of `hidden` (ADR-0138 §1), its caller authorized
+/// already. A Put's or Delete's `versionToken`, when it gives one (a Delete must), is the record's generation.
+fn replicationConfigCall(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    hidden: Slice<u8>,
+    key: Slice<u8>,
+    config: Json?,
+) -> Result<TablesAnswer, TablesError> {
+    let held = readRecord(store, hidden, key)?;
+    let token = paramOf(req, "versionToken");
+    if (isMethod(req.method, Method.Get)) {
+        let rec = held ?? { return Err(TablesError.NotFound); };
+        var answer = jsonObject();
+        jsonSet(mut answer, "versionToken", Json.Text(versionTokenOf(rec.generation)?))?;
+        jsonSet(mut answer, "configuration", cloneJson(jsonMember(borrow rec.json, "configuration") ?? {
+            return Err(TablesError.Internal);
+        })?)?;
+        return tablesJson(borrow answer);
+    }
+    // A token given must be the one there.
+    var condition = PutCondition.None;
+    match (token) {
+        Some(t) => {
+            let rec = held.asBorrow() ?? { return Err(TablesError.Conflict); };
+            if (t != versionTokenOf(rec.generation)?.view()) { return Err(TablesError.Conflict); }
+            condition = PutCondition.IfGeneration(rec.generation);
+        }
+        null => {}
+    }
+    if (isMethod(req.method, Method.Put)) {
+        var rec = jsonObject();
+        jsonSet(mut rec, "configuration", config ?? { return Err(TablesError.BadRequest); })?;
+        jsonSet(mut rec, "updatedAt", jsonInteger(Clock.unixMillis())?)?;
+        let generation = writeRecord(store, hidden, key, borrow rec, condition)?;
+        var answer = jsonObject();
+        jsonSet(mut answer, "versionToken", Json.Text(versionTokenOf(generation)?))?;
+        jsonSet(mut answer, "status", jsonString("Successful".bytes())?)?;
+        return tablesJson(borrow answer);
+    }
+    if (isMethod(req.method, Method.Delete)) {
+        if (token.isNull()) { return Err(TablesError.BadRequest); }
+        if (held.isNull()) { return Err(TablesError.NotFound); }
+        removeCatalogObject(store, hidden, key)?;
+        return Ok(tablesNoContent());
+    }
+    return Err(TablesError.BadRequest);
+}
+
+/// PutTableBucketReplication, GetTableBucketReplication and DeleteTableBucketReplication
+/// (`/table-bucket-replication?tableBucketARN=`, ADR-0138 §1).
+fn tableBucketReplicationCall(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    body: Slice<u8>,
+    caller: borrow TablesCaller,
+    cluster: bool,
+) -> Result<TablesAnswer, TablesError> {
+    var none = Vector<u8>.create();
+    let arn = paramOf(req, "tableBucketARN") ?? { return Err(TablesError.BadRequest); };
+    let bucket = tableBucketOfArn(arn, mut none)? ?? { return Err(TablesError.BadRequest); };
+    if (none.length > 0) { return Err(TablesError.BadRequest); }
+    let _ = tableBucketRecord(store, bucket.view())?;
+    let hidden = tableWarehouseBucket(bucket.view())?;
+    let m = req.method;
+    let action = if (isMethod(m, Method.Put)) "s3tables:PutTableBucketReplication"
+        else if (isMethod(m, Method.Delete)) "s3tables:DeleteTableBucketReplication"
+        else "s3tables:GetTableBucketReplication";
+    checkTables(store, caller, action, bucket.view(), "".bytes())?;
+    var config: Json? = null;
+    if (isMethod(m, Method.Put)) {
+        var destinations = Vector<Vector<u8>>.create();
+        config = Some(replicationConfigOf(body, bucket.view(), mut destinations)?);
+        // As AWS lists: the source's tables listed and its maintenance read, the destinations' made.
+        checkTables(store, caller, "s3tables:ListTables", bucket.view(), "".bytes())?;
+        checkTables(store, caller, "s3tables:GetTableBucketMaintenanceConfiguration", bucket.view(), "".bytes())?;
+        checkReplicationDestinations(store, caller, destinations.view(), cluster)?;
+    }
+    return replicationConfigCall(store, req, hidden.view(), REPLICATION_BUCKET_KEY.bytes(), config);
+}
+
+/// PutTableReplication, GetTableReplication and DeleteTableReplication (`/table-replication?tableArn=`, ADR-0138
+/// §1): one table's, which replaces its bucket's for it.
+fn tableReplicationCall(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    body: Slice<u8>,
+    caller: borrow TablesCaller,
+    cluster: bool,
+) -> Result<TablesAnswer, TablesError> {
+    var id = Vector<u8>.create();
+    let arn = paramOf(req, "tableArn") ?? { return Err(TablesError.BadRequest); };
+    let bucket = tableBucketOfArn(arn, mut id)? ?? { return Err(TablesError.BadRequest); };
+    if (id.length == 0) { return Err(TablesError.BadRequest); }
+    let _ = tableBucketRecord(store, bucket.view())?;
+    let hidden = tableWarehouseBucket(bucket.view())?;
+    let m = req.method;
+    let action = if (isMethod(m, Method.Put)) "s3tables:PutTableReplication"
+        else if (isMethod(m, Method.Delete)) "s3tables:DeleteTableReplication"
+        else "s3tables:GetTableReplication";
+    // Authorized before the table's existence is told.
+    checkTables(store, caller, action, bucket.view(), id.view())?;
+    let _ = tableKeyOfId(store, hidden.view(), id.view())?;
+    var config: Json? = null;
+    if (isMethod(m, Method.Put)) {
+        var destinations = Vector<Vector<u8>>.create();
+        config = Some(replicationConfigOf(body, bucket.view(), mut destinations)?);
+        checkTables(store, caller, "s3tables:GetTable", bucket.view(), id.view())?;
+        checkTables(store, caller, "s3tables:GetTableMaintenanceConfiguration", bucket.view(), id.view())?;
+        checkReplicationDestinations(store, caller, destinations.view(), cluster)?;
+    }
+    let key = tableReplicationKey(id.view())?;
+    return replicationConfigCall(store, req, hidden.view(), key.view(), config);
+}
+
+/// The replication configuration a table follows (ADR-0138 §1): its own, else its bucket's; null when neither.
+fn replicationOf(store: borrow ObjectStore, hidden: Slice<u8>, id: Slice<u8>) -> Result<Json?, TablesError> {
+    match (readRecord(store, hidden, tableReplicationKey(id)?.view())?) {
+        Some(r) => { return Ok(Some(cloneJson(jsonMember(borrow r.json, "configuration") ?? { return Ok(null); })?)); }
+        null => {}
+    }
+    return match (readRecord(store, hidden, REPLICATION_BUCKET_KEY.bytes())?) {
+        Some(r) => match (jsonMember(borrow r.json, "configuration")) {
+            Some(c) => Ok(Some(cloneJson(c)?)),
+            null => Ok(null),
+        },
+        null => Ok(null),
+    };
+}

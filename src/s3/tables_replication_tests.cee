@@ -1,0 +1,125 @@
+// Table replication's configurations (ADR-0138 §1).
+import web_core;
+import web_http;
+
+const SOURCE_ARN: StringView = "arn:aws:s3tables:us-east-1:000000000000:bucket/cat";
+const DEST_ARN: StringView = "arn:aws:s3tables:us-east-1:000000000000:bucket/dst";
+
+fn replicationBody(destination: StringView, role: StringView) -> Vector<u8> {
+    var b = copyBytes("{\"configuration\":{\"role\":\"".bytes())!;
+    b.extend(role.bytes())!;
+    b.extend("\",\"rules\":[{\"destinations\":[{\"destinationTableBucketARN\":\"".bytes())!;
+    b.extend(destination.bytes())!;
+    b.extend("\"}]}]}}".bytes())!;
+    return b;
+}
+
+/// A replication call: its status, or the error's.
+fn replicationRequest(
+    s: borrow mut ObjectStore,
+    method: Method,
+    path: StringView,
+    params: Slice<StringView>,
+    body: Slice<u8>,
+) -> u64 {
+    var req = tablesPathRequest(path);
+    req.method = method;
+    var i: usize = 0;
+    while (i + 1 < params.length) {
+        req.query.push(policyParam(params[i], params[i + 1]))!;
+        i += 2;
+    }
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let creds = Vector<Credential>.create();
+    let caller = tablesCaller("AKIAREPLICATION");
+    return match (routeTablesSync(s, borrow req, body, borrow caller, creds.view(), borrow noKeys)) {
+        Ok(a) => a.status as u64,
+        Err(TablesError.BadRequest) => 400,
+        Err(TablesError.Forbidden) => 403,
+        Err(TablesError.NotFound) => 404,
+        Err(TablesError.Conflict) => 409,
+        Err(_) => 500,
+    };
+}
+
+/// The answer's `versionToken` of a GET of a table bucket's replication.
+fn bucketReplicationToken(s: borrow mut ObjectStore) -> Vector<u8> {
+    var req = tablesPathRequest("/table-bucket-replication");
+    req.query.push(policyParam("tableBucketARN", SOURCE_ARN))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let creds = Vector<Credential>.create();
+    let caller = tablesCaller("AKIAREPLICATION");
+    let a = routeTablesSync(s, borrow req, "".bytes(), borrow caller, creds.view(), borrow noKeys)!;
+    return copyBytes(jsonMemberText(borrow parseJson(a.body.view())!!, "versionToken")!)!;
+}
+
+/// A table bucket's and a table's replication configurations (ADR-0138 §1): put, read, replaced only with the token
+/// there, deleted only with it; a destination that is the source, or not there, or a role that is not one, refused;
+/// a table's own replacing its bucket's.
+@test
+fn replicationConfigurations() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("replication-config");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    s.createBucket(catalogText(tableWarehouseBucket("dst".bytes())!.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let _ = icebergCreateTable(
+        mut s,
+        "cat".bytes(),
+        "ns".bytes(),
+        "{\"name\":\"t\",\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+        borrow noKeys,
+    )!;
+    let table = currentTable(borrow s, "cat".bytes(), "ns".bytes(), "t".bytes())!!;
+    let tableId = copyBytes(jsonMemberText(borrow table.json, "id")!)!;
+    let role = "arn:aws:iam::000000000000:role/replicator";
+    let bucketPath = "/table-bucket-replication";
+    let byBucket = ["tableBucketARN", SOURCE_ARN];
+    // Refused: no role, the source itself, a destination not there.
+    let noRole = replicationBody(DEST_ARN, "replicator");
+    Check.equalU64(400, replicationRequest(mut s, Method.Put, bucketPath, byBucket[..], noRole.view()))?;
+    let itself = replicationBody(SOURCE_ARN, role);
+    Check.equalU64(400, replicationRequest(mut s, Method.Put, bucketPath, byBucket[..], itself.view()))?;
+    let gone = replicationBody("arn:aws:s3tables:us-east-1:000000000000:bucket/nowhere", role);
+    Check.equalU64(404, replicationRequest(mut s, Method.Put, bucketPath, byBucket[..], gone.view()))?;
+    Check.equalU64(404, replicationRequest(mut s, Method.Get, bucketPath, byBucket[..], "".bytes()))?;
+    // Put and read back.
+    let body = replicationBody(DEST_ARN, role);
+    Check.equalU64(200, replicationRequest(mut s, Method.Put, bucketPath, byBucket[..], body.view()))?;
+    Check.equalU64(200, replicationRequest(mut s, Method.Get, bucketPath, byBucket[..], "".bytes()))?;
+    let token = bucketReplicationToken(mut s);
+    let rules = replicationOf(borrow s, hidden.view(), tableId.view())!!;
+    Check.equalBytes(role.bytes(), jsonMemberText(borrow rules, "role")!)?;
+    // A stale token: Conflict, for a Put and a Delete; a Delete without one: BadRequest.
+    let stale = ["tableBucketARN", SOURCE_ARN, "versionToken", "1"];
+    Check.equalU64(409, replicationRequest(mut s, Method.Put, bucketPath, stale[..], body.view()))?;
+    Check.equalU64(409, replicationRequest(mut s, Method.Delete, bucketPath, stale[..], "".bytes()))?;
+    Check.equalU64(400, replicationRequest(mut s, Method.Delete, bucketPath, byBucket[..], "".bytes()))?;
+    // The table's own, which replaces its bucket's for it.
+    var tableArn = copyBytes(SOURCE_ARN.bytes())!;
+    tableArn.extend("/table/".bytes())!;
+    tableArn.extend(tableId.view())!;
+    let byTable = ["tableArn", StringView.fromUtf8(tableArn.view()) ?? ""];
+    let other = "arn:aws:iam::000000000000:role/other";
+    let tableBody = replicationBody(DEST_ARN, other);
+    Check.equalU64(200, replicationRequest(mut s, Method.Put, "/table-replication", byTable[..], tableBody.view()))?;
+    let followed = replicationOf(borrow s, hidden.view(), tableId.view())!!;
+    Check.equalBytes(other.bytes(), jsonMemberText(borrow followed, "role")!)?;
+    // A table no record has: NotFound.
+    let noTable = [
+        "tableArn",
+        "arn:aws:s3tables:us-east-1:000000000000:bucket/cat/table/00000000-0000-4000-8000-000000000000",
+    ];
+    Check.equalU64(404, replicationRequest(mut s, Method.Get, "/table-replication", noTable[..], "".bytes()))?;
+    // The bucket's deleted with its token.
+    let current = ["tableBucketARN", SOURCE_ARN, "versionToken", StringView.fromUtf8(token.view()) ?? ""];
+    Check.equalU64(204, replicationRequest(mut s, Method.Delete, bucketPath, current[..], "".bytes()))?;
+    Check.equalU64(404, replicationRequest(mut s, Method.Get, bucketPath, byBucket[..], "".bytes()))?;
+    removeTree(dir.view());
+    return Ok();
+}

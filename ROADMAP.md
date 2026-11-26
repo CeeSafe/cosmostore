@@ -6592,3 +6592,24 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Checks:** 561 unit tests (`snapshotsFaultsCrash` and `snapshotsFaultsOnce` timed out at 60 s with the machine at a
   load average of 40 to 60, and passed alone), the S3 smoke, the cluster maintenance smoke and the cluster S3 smoke
   (214).
+
+### 26 Nov 2026: M36 slice 1, replication's configurations (ADR-0138 §1)
+
+- **The six calls** (`src/s3/tables_replication.cee`): `Put`, `Get` and `DeleteTableBucketReplication`
+  (`/table-bucket-replication?tableBucketARN=`) and `Put`, `Get` and `DeleteTableReplication`
+  (`/table-replication?tableArn=`).
+  - A configuration is `{role, rules: [{destinations: [{destinationTableBucketARN}]}]}`: a role ARN's shape, at
+    least one rule and destination, at most 50 table buckets, none the source's own.
+  - It is kept as a catalog record (`.s3tables/replication/bucket`, `.s3tables/replication/tables/<id>`), its
+    `versionToken` the record's generation: a Put given one, and a Delete (which must), write conditionally on it,
+    Conflict when it is not current. A Put answers its new token and `status` `Successful`.
+  - A table's own configuration replaces its bucket's (`replicationOf`), and goes with the table when it is dropped.
+- **Authorization, as AWS lists it:** the call's own action; for a Put, the source's `ListTables` and
+  `GetTableBucketMaintenanceConfiguration` (a table's: `GetTable` and `GetTableMaintenanceConfiguration`), and each
+  destination's `CreateNamespace`, `CreateTable` and `PutTableBucketMaintenanceConfiguration`. A destination this store
+  does not hold is NotFound on `serve`; on a cluster it is another shard's, and its policy is its copies' to check (as
+  a logging target's, ADR-0130 §1). The eight actions are named in the log records.
+- **On a cluster** the calls go to their table bucket's shard by the ARN in their query.
+- **Tests:** `replicationConfigurations` (tokens, Conflict, a destination that is the source or not there, a role
+  that is not one, a table's replacing its bucket's); the S3 smoke's CLI checks.
+- **Checks:** 562 unit tests, the S3 smoke and the cluster S3 smoke (214).
