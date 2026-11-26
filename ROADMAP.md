@@ -6613,3 +6613,27 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Tests:** `replicationConfigurations` (tokens, Conflict, a destination that is the source or not there, a role
   that is not one, a table's replacing its bucket's); the S3 smoke's CLI checks.
 - **Checks:** 562 unit tests, the S3 smoke and the cluster S3 smoke (214).
+
+### 26 Nov 2026: M36 slice 2's plan (the copy), from a survey of what exists
+
+- **Paths:** every path a replica's files name starts with its source's warehouse, `s3://<src>--table-s3/<srcId>/`,
+  so the rewrite is that prefix swapped for the replica's:
+  - the metadata JSON: every string (its location, metadata log, manifest lists, statistics files, `write.*.path`);
+  - manifest lists and manifests (Avro, decoded to JSON and written back with their own header, as compaction does
+    with `readAvro` and `writeAvroIn`): `manifest_path`, `data_file.file_path` and `referenced_data_file` only,
+    never a column's bounds;
+  - position delete files (Parquet): their `file_path` column. No writer takes (path, pos) rows yet. One is built on
+    `writeParquetFile` with the input's own footer as its schema, as `writeDeleteRewrite` does;
+  - deletion vectors (Puffin): the blobs name no path, but the footer's JSON has `referenced-data-file`. Nothing
+    reads or writes a Puffin footer yet: one is written (`PFA1`, the footer JSON, its length, its flags; a compressed
+    footer is refused, and the copy fails with its reason).
+  - Data files and statistics files are copied as they are.
+- **Size:** `warehouseObjectWith` reads a whole file into memory, at most 256 MB. Data files can be larger, so they
+  are copied a part at a time, opened with the source's encryption and sealed with the destination's, as S3's own
+  replication streams a version (ADR-0077 §3).
+- **The ask:** written beside the table record's write in `swapMetadata` (iceberg.cee, which covers commits,
+  compaction and snapshot management), `icebergCommitCreate`, the creates, and `updateTableMetadataLocation`.
+- **The loop:** one more per-table job after unreferenced removal on `serve`, and one more kind on a cluster's shard
+  loop.
+- **The replica's marks:** `tableView` gives `managedByService` and `managedTableInformation` for a record marked
+  as a replica.
