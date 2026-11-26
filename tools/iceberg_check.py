@@ -329,6 +329,56 @@ except TableAlreadyExistsError:
     check("a table at a view's name refused", "refused", "refused")
 catalog.drop_view("sales.recent")
 check("drop_view", catalog.view_exists("sales.recent"), False)
+# M34's B2 kept (ADR-0136 §4): a catalog call runs whole under the store's hold (on a cluster, its shard's gate), so
+# its checks and its writes are not interleaved with another call's. Raced from two clients at once, a view and a
+# table at one name leave exactly one, and a child namespace made as its parent is dropped is never left without it.
+import threading
+racers = [load_catalog("cosmo", **catalog.properties) for _ in range(2)]
+
+
+def race(first, second):
+    barrier = threading.Barrier(2)
+
+    def run(f, c):
+        barrier.wait()
+        try:
+            f(c)
+        except Exception:
+            pass
+
+    threads = [threading.Thread(target=run, args=(f, c)) for f, c in ((first, racers[0]), (second, racers[1]))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+ROUNDS = 20
+both_or_none = 0
+for i in range(ROUNDS):
+    name = "sales.race%d" % i
+    race(lambda c: c.create_view(name, schema=schema, view_version=version),
+         lambda c: c.create_table(name, schema=schema))
+    made = int(catalog.view_exists(name)) + int(catalog.table_exists(name))
+    if made != 1:
+        both_or_none += 1
+    if catalog.view_exists(name):
+        catalog.drop_view(name)
+    if catalog.table_exists(name):
+        catalog.purge_table(name)
+check("a view and a table raced at one name: exactly one made, %d times" % ROUNDS, both_or_none, 0)
+orphaned = 0
+for i in range(ROUNDS):
+    parent, child = ("race%d" % i,), ("race%d" % i, "kid")
+    catalog.create_namespace(parent)
+    race(lambda c: c.drop_namespace(parent), lambda c: c.create_namespace(child))
+    if catalog.namespace_exists(child) and not catalog.namespace_exists(parent):
+        orphaned += 1
+    if catalog.namespace_exists(child):
+        catalog.drop_namespace(child)
+    if catalog.namespace_exists(parent):
+        catalog.drop_namespace(parent)
+check("a child namespace raced with its parent's drop: never left without it, %d times" % ROUNDS, orphaned, 0)
 catalog.create_namespace(("deep",))
 catalog.create_namespace(("deep", "er"))
 check("a nested namespace, listed under its parent", catalog.list_namespaces(("deep",)), [("deep", "er")])

@@ -6507,3 +6507,13 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   current file, a pinned id and a staged create's id kept). Mutation-checked: the pin, staged and current-file guards.
 - **Checks:** 557 unit tests, the S3 smoke, the cluster smoke, the cluster S3 smoke (214) and the cluster
   maintenance smoke.
+
+### 26 Nov 2026: M35 slice 4, B2 kept with the hold made explicit (ADR-0136 §4)
+
+- **The hold named where it is taken** (`src/s3/tables.cee`, the catalog's route): the catalog's checks before its
+  writes rely on the whole call running under one hold of the store, and on a cluster behind its shard's gate; a
+  narrower hold needs reservations across names first.
+- **The check** (`iceberg_check.py`, on `serve` and through a cluster's node): from two clients at once, 20 times
+  each, a view and a table made at one name leave exactly one, and a child namespace made as its parent is dropped is
+  never left without it.
+- **Checks:** PyIceberg (68) in the S3 smoke and through node 2 of the cluster S3 smoke (214).
