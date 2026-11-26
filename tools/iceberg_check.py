@@ -408,4 +408,59 @@ except NoSuchTableError:
 catalog.drop_namespace("sales")
 delete_table_bucket(arn)
 check("cleaned up", "iceberg-check" in [b["name"] for b in tables.list_table_buckets()["tableBuckets"]], False)
+# Table replication (ADR-0138): a table bucket replicated to another, its table's appends and deletes read from the
+# replica, which is read-only until it is disassociated. Not yet on a cluster (`--no-replication`, M36 slice 3).
+if "--no-replication" in sys.argv:
+    sys.exit(1 if failed else 0)
+src_arn = tables.create_table_bucket(name="repl-source")["arn"]
+dst_arn = tables.create_table_bucket(name="repl-replica")["arn"]
+tables.put_table_bucket_replication(tableBucketARN=src_arn, configuration={
+    "role": "arn:aws:iam::000000000000:role/replicator",
+    "rules": [{"destinations": [{"destinationTableBucketARN": dst_arn}]}]})
+src_cat = load_catalog("src", **dict(catalog.properties, warehouse=src_arn))
+dst_cat = load_catalog("dst", **dict(catalog.properties, warehouse=dst_arn))
+src_cat.create_namespace("rs")
+source = src_cat.create_table("rs.t", schema=schema)
+source_arn = tables.get_table(tableBucketARN=src_arn, namespace="rs", name="t")["tableARN"]
+source.append(pa.table({"id": [1, 2, 3], "item": ["a", "b", "c"]}, schema=schema))
+
+
+def replicated(location):
+    """The replica's status once it is completed of the source's current metadata, waited for up to 30 s."""
+    for _ in range(60):
+        d = tables.get_table_replication_status(tableArn=source_arn)["destinations"][0]
+        if d["replicationStatus"] == "completed" and \
+                tables.get_table(tableBucketARN=src_arn, namespace="rs", name="t")["metadataLocation"] == location:
+            return d
+        time.sleep(0.5)
+    return tables.get_table_replication_status(tableArn=source_arn)["destinations"][0]
+
+
+status = replicated(source.metadata_location)
+check("replication: completed", status["replicationStatus"], "completed")
+check("its replica's rows", sorted(dst_cat.load_table("rs.t").scan().to_arrow().column("id").to_pylist()), [1, 2, 3])
+replica = tables.get_table(tableBucketARN=dst_arn, namespace="rs", name="t")
+check("the replica managed by replication", replica.get("managedByService"), "replication.s3tables.amazonaws.com")
+check("its source named", replica["managedTableInformation"]["replicationInformation"]["sourceTableARN"], source_arn)
+check("its warehouse its own", dst_cat.load_table("rs.t").location().startswith(replica["warehouseLocation"]), True)
+source = src_cat.load_table("rs.t")
+source.delete("id == 2")
+source = src_cat.load_table("rs.t")
+replicated(source.metadata_location)
+check("a delete replicated", sorted(dst_cat.load_table("rs.t").scan().to_arrow().column("id").to_pylist()), [1, 3])
+try:
+    dst_cat.load_table("rs.t").append(pa.table({"id": [9], "item": ["z"]}, schema=schema))
+    check("an append to the replica refused", "appended", "refused")
+except Exception:
+    check("an append to the replica refused", "refused", "refused")
+tables.disassociate_table_replication(tableArn=replica["tableARN"])
+check("disassociated", tables.get_table(tableBucketARN=dst_arn, namespace="rs", name="t").get("managedByService"), None)
+dst_cat.load_table("rs.t").append(pa.table({"id": [9], "item": ["z"]}, schema=schema))
+check("then written", sorted(dst_cat.load_table("rs.t").scan().to_arrow().column("id").to_pylist()), [1, 3, 9])
+tables.delete_table_bucket_replication(tableBucketARN=src_arn,
+                                       versionToken=tables.get_table_bucket_replication(tableBucketARN=src_arn)["versionToken"])
+for c, a in ((src_cat, src_arn), (dst_cat, dst_arn)):
+    c.purge_table("rs.t")
+    c.drop_namespace("rs")
+    delete_table_bucket(a)
 sys.exit(1 if failed else 0)

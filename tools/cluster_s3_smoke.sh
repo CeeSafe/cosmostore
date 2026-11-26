@@ -453,7 +453,7 @@ check "its files gone with it" "$(on 2 s3api list-objects-v2 --bucket "$cwb" --p
 on 2 s3tables delete-namespace --table-bucket-arn "$tba" --namespace sales > /dev/null 2>&1
 # PyIceberg through node 2, its catalog and its files on the table bucket's shard.
 if [ -n "${ICEBERG_PYTHON:-}" ]; then
-    if "$ICEBERG_PYTHON" "$OLDPWD/tools/iceberg_check.py" "http://127.0.0.1:$((BASE + 12))" > iceberg.out 2>&1; then
+    if "$ICEBERG_PYTHON" "$OLDPWD/tools/iceberg_check.py" "http://127.0.0.1:$((BASE + 12))" --no-replication > iceberg.out 2>&1; then
         pass "PyIceberg through node 2: $(grep -c '^ok' iceberg.out) checks"
     else
         fail "PyIceberg through node 2"; cat iceberg.out

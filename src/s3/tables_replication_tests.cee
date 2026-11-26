@@ -321,6 +321,52 @@ fn checkAskedReplica(dir: Slice<u8>) -> Result<void, TestFailure> {
         },
         "a commit to the replica refused",
     )?;
+    // S3's writes into its warehouse: refused (reads are not).
+    let caller = tablesCaller("AKIAREPLICATION");
+    let replicaRec = readRecord(
+        borrow s,
+        "dst--table-s3".bytes(),
+        catalogKey(CATALOG_TABLES, "ns".bytes(), "t".bytes())!.view(),
+    )!!;
+    let replicaId = copyBytes(jsonMemberText(borrow replicaRec.json, "id")!)!;
+    Check.isTrue(
+        match (tableDataCheck(borrow s, borrow caller, "s3tables:PutTableData", "dst".bytes(), replicaId.view())) {
+            Err(TablesError.Forbidden) => true,
+            _ => false,
+        },
+        "a write into the replica's warehouse refused",
+    )?;
+    Check.isTrue(
+        tableDataCheck(borrow s, borrow caller, "s3tables:GetTableData", "dst".bytes(), replicaId.view()).isOk(),
+        "a read",
+    )?;
+    // Reconciled: nothing asked while the status is of the source's metadata; asked once it is not (a commit whose ask
+    // was lost).
+    let t = compactTableName();
+    reconcileReplication(mut s, borrow t)!;
+    let askKey = replicationAskKey(COMPACT_ID.bytes())!;
+    Check.isTrue(readRecord(borrow s, "compact--table-s3".bytes(), askKey.view())!.isNull(), "nothing to ask")?;
+    var src = readRecord(
+        borrow s,
+        "compact--table-s3".bytes(),
+        catalogKey(CATALOG_TABLES, "ns".bytes(), "t".bytes())!.view(),
+    )!!;
+    jsonSet(
+        mut src.json,
+        "metadataLocation",
+        jsonString(
+            "s3://compact--table-s3/c0c0c0c0-1111-4222-8333-444444444444/metadata/99999-x.metadata.json".bytes(),
+        )!,
+    )!;
+    let _ = writeRecord(
+        mut s,
+        "compact--table-s3".bytes(),
+        catalogKey(CATALOG_TABLES, "ns".bytes(), "t".bytes())!.view(),
+        borrow src.json,
+        PutCondition.None,
+    )!;
+    reconcileReplication(mut s, borrow t)!;
+    Check.isTrue(readRecord(borrow s, "compact--table-s3".bytes(), askKey.view())!.isSome(), "asked again")?;
     // Disassociated: a table of its own, once.
     let replicaArn = copyBytes(jsonMemberText(borrow got, "tableARN")!)!;
     let byArn = ["tableArn", StringView.fromUtf8(replicaArn.view()) ?? ""];
@@ -336,6 +382,10 @@ fn checkAskedReplica(dir: Slice<u8>) -> Result<void, TestFailure> {
     )?;
     let committed = icebergCommit(mut s, "dst".bytes(), "ns".bytes(), "t".bytes(), update, borrow noKeys)!;
     Check.equalU64(200, committed.status as u64)?;
+    Check.isTrue(
+        tableDataCheck(borrow s, borrow caller, "s3tables:PutTableData", "dst".bytes(), replicaId.view()).isOk(),
+        "then written",
+    )?;
     return Ok();
 }
 

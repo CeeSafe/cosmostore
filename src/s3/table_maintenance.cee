@@ -713,20 +713,32 @@ async fn tablesMaintenanceForever(
         }
         for (i in 0..tables.length) {
             let t = borrow tables[i];
+            // A replica's snapshots and files are its source's (ADR-0138 §2): no snapshot management or compaction.
+            var replica = false;
             {
                 var guard = match (await store.get().lock()) {
                     Ok(g) => g,
                     Err(_) => { return Err(NetError.Closed); }
                 };
                 let st = guard.data();
-                let now = Clock.unixMillis();
-                let keys = borrow w.keys;
-                let _ = await Async.blocking(() => maintainTable(st, t, now, dayMs, keys));
+                replica = (await Async.blocking(() => isReplicaTable(st, t))).ok() ?? false;
+                if (!replica) {
+                    let now = Clock.unixMillis();
+                    let keys = borrow w.keys;
+                    let _ = await Async.blocking(() => maintainTable(st, t, now, dayMs, keys));
+                }
             }
             // Then its compaction, a bin at a time (ADR-0098 §4), and its unreferenced files, the store held for each
             // read (ADR-0086 §3).
-            await compactTable(store, t, Clock.unixMillis(), borrow w.keys)?;
+            if (!replica) { await compactTable(store, t, Clock.unixMillis(), borrow w.keys)?; }
             await removeUnreferenced(store, t, Clock.unixMillis(), dayMs, borrow w.keys)?;
+            // And a replicated table's copy asked for again when one was lost (ADR-0138 §3).
+            var guard = match (await store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NetError.Closed); }
+            };
+            let st = guard.data();
+            let _ = await Async.blocking(() => reconcileReplication(st, t));
         }
         // Then each table bucket's orphaned files (ADR-0136 §3), the store held for one table bucket at a time.
         await sweepAllOrphans(store, dayMs)?;

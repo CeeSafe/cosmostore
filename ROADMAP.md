@@ -6682,3 +6682,18 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   `replicationAskedAndAnswered` (the loop's pass, the status, the marks, a commit refused and then, disassociated,
   taken; mutation-checked).
 - **Checks:** 568 unit tests, the S3 smoke, the cluster S3 smoke (214) and the Java check.
+
+### 26 Nov 2026: M36 slice 2, part 3: a replica read-only to S3, a lost ask made again, and PyIceberg's checks
+
+- **S3's writes into a replica's warehouse** are refused (`tableDataCheck`, beside the write's policy check): a
+  replica's table configuration is marked `replica` when its copy makes it, and the mark goes with its
+  disassociation. Reads are not refused.
+- **A replica's own maintenance:** no snapshot management or compaction (its snapshots and files are its source's);
+  its unreferenced-file removal runs, so a source's expired files go from it too.
+- **Reconciled:** each maintenance pass on `serve` asks again for a replicated table whose destinations' statuses
+  are not of its current metadata, when no ask waits: an ask lost to a crash before its commit is made again.
+- **PyIceberg** (`iceberg_check.py`, 77 on `serve`): a table bucket replicated, its table's append and its delete
+  read from the replica through its own catalog, `managedByService` and the source's ARN, the replica's warehouse its
+  own, an append to the replica refused, `disassociate_table_replication` (boto3), then an append taken. A cluster's
+  run passes `--no-replication` until slice 3.
+- **Checks:** 568 unit tests, the S3 smoke (PyIceberg 77) and the cluster S3 smoke (214).

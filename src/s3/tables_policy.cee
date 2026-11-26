@@ -486,6 +486,24 @@ fn tableIdOfKey(key: Slice<u8>, prefix: bool) -> Slice<u8>? {
     return Some(key[0..TABLE_ID_LENGTH]);
 }
 
+/// `checkTables` of a warehouse call, and a write into a replica's warehouse refused: it moves only by its
+/// replication (ADR-0138 §2).
+fn tableDataCheck(
+    store: borrow ObjectStore,
+    caller: borrow TablesCaller,
+    action: StringView,
+    name: Slice<u8>,
+    id: Slice<u8>,
+) -> Result<void, TablesError> {
+    checkTables(store, caller, action, name, id)?;
+    if (action.bytes() == "s3tables:PutTableData".bytes() && id.length > 0) {
+        let hidden = tableWarehouseBucket(name)?;
+        let config = readTablesConfig(store, hidden.view(), tableConfigKey(id)?.view())?;
+        if (jsonMember(borrow config, "replica").isSome()) { return Err(TablesError.Forbidden); }
+    }
+    return Ok();
+}
+
 /// Whether `who` may do `action` (`s3tables:GetTableData` or `PutTableData`) on table `id` of the hidden bucket
 /// `hidden`, by its table bucket's and table's policies.
 async fn tableDataAllowed(
@@ -502,7 +520,7 @@ async fn tableDataAllowed(
     let callerRef = borrow caller;
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return match (await Async.blocking(() => checkTables(store, callerRef, action, name, id))) {
+    return match (await Async.blocking(() => tableDataCheck(store, callerRef, action, name, id))) {
         Ok() => Ok(true),
         Err(TablesError.Forbidden) => Ok(false),
         Err(TablesError.OutOfMemory(e)) => Err(S3Fail.OutOfMemory(e)),

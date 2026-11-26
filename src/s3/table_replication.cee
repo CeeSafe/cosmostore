@@ -215,7 +215,11 @@ fn replicaCopyStart(
     let configKey = tableConfigKey(c.dstId.view())?;
     if (readRecord(store, dstHidden.view(), configKey.view())?.isNull()) {
         match (writeCreatedTableConfig(store, dstHidden.view(), c.dstId.view(), c.ns.view(), c.name.view(), keys)) {
-            Ok(e) => { c.dstEncryption = e; }
+            Ok(e) => {
+                c.dstEncryption = e;
+                // Marked as a replica, so that S3's writes into its warehouse are refused (ADR-0138 §2).
+                markReplicaConfig(store, dstHidden.view(), c.dstId.view(), true)?;
+            }
             Err(TablesError.BadRequest) => {
                 failCopy(mut c, "The destination's encryption names a key this server does not hold.")?;
                 return Ok(Some(c));
@@ -988,4 +992,42 @@ async fn tablesReplicationForever(
         await replicateAsked(store, borrow w.keys)?;
     }
     return Err(NetError.Closed);
+}
+
+/// Whether a maintained table is a replica: its own maintenance's commits are its replication's (ADR-0138 §2).
+fn isReplicaTable(store: borrow ObjectStore, t: borrow MaintainedTable) -> Result<bool, TablesError> {
+    return match (tableRecord(store, t.bucket.view(), t.ns.view(), t.name.view())) {
+        Ok(rec) => Ok(jsonMember(borrow rec.json, "replicaOf").isSome()),
+        Err(TablesError.NotFound) => Ok(false),
+        Err(e) => Err(e),
+    };
+}
+
+/// A replicated table asked for again when a destination's status is not of its current metadata and no ask waits
+/// (ADR-0138 §3): an ask lost to a crash between it and its commit is made again by the next maintenance pass.
+fn reconcileReplication(store: borrow mut ObjectStore, t: borrow MaintainedTable) -> Result<void, TablesError> {
+    let hidden = tableWarehouseBucket(t.bucket.view())?;
+    let rec = match (tableRecord(store, t.bucket.view(), t.ns.view(), t.name.view())) {
+        Ok(r) => r,
+        Err(TablesError.NotFound) => { return Ok(); }
+        Err(e) => { return Err(e); }
+    };
+    if (jsonMember(borrow rec.json, "replicaOf").isSome()) { return Ok(); }
+    let id = jsonMemberText(borrow rec.json, "id") ?? { return Ok(); };
+    let current = jsonMemberText(borrow rec.json, "metadataLocation") ?? { return Ok(); };
+    let config = replicationOf(store, hidden.view(), id)? ?? { return Ok(); };
+    if (readRecord(store, hidden.view(), replicationAskKey(id)?.view())?.isSome()) { return Ok(); }
+    let destinations = replicationDestinations(borrow config)?;
+    for (d in 0..destinations.length) {
+        let behind = match (readRecord(
+            store,
+            hidden.view(),
+            replicationStatusKey(id, destinations[d].view())?.view(),
+        )?) {
+            Some(s) => jsonMemberText(borrow s.json, "sourceLocation") != Some(current),
+            null => true,
+        };
+        if (behind) { return askReplication(store, hidden.view(), id); }
+    }
+    return Ok();
 }
