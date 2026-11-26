@@ -6517,3 +6517,18 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   each, a view and a table made at one name leave exactly one, and a child namespace made as its parent is dropped is
   never left without it.
 - **Checks:** PyIceberg (68) in the S3 smoke and through node 2 of the cluster S3 smoke (214).
+
+### 26 Nov 2026: M35 slice 5, the exit review (`docs/m35-exit-review.md`)
+
+- **The review:** an independent agent, reading only, asked to verify or refute B2's claim on its own. It found no
+  High, and no way the sweep deletes a file a live table or view needs.
+- **Fixed, each with a test, mutation-checked:**
+  - Medium: a staged create's commit did not look for a view made at its name since its stage;
+  - Medium: a table's `write.*.path` could name another id of the warehouse. The catalog refuses it, and the sweep
+    deletes no id until every table with metadata has had its own unreferenced run succeed;
+  - Medium, in part: past its budget, or held, the sweep lists no id's objects;
+  - Lows: the hold's comment; a key not deleted keeps its note; expiry keeps as Java's builder keeps.
+- **Recorded:** B1 to B5 (the sweep's reads under the hold, a swept id's catalog records, notes on a cluster, slice
+  2's leniencies, other missing tests).
+- **Checks:** 559 unit tests, the S3 smoke, the Java check and the cluster S3 smoke (214).
+- **Waiting:** ADR-0136's acceptance and M35's close, the owner's.

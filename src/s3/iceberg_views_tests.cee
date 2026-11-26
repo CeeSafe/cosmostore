@@ -606,3 +606,78 @@ fn viewsInAnEncryptedTableBucket() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// A staged create's commit refused once a view was made at its name after its stage (the M35 exit review's M1): the
+/// stage's check was an earlier call's, so the commit makes it again.
+@test
+fn stagedCommitAfterAViewAtItsName() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("staged-view");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket(catalogText(tableWarehouseBucket("cat".bytes())!.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let staged = icebergCreateTable(
+        mut s,
+        "cat".bytes(),
+        "ns".bytes(),
+        "{\"name\":\"v\",\"stage-create\":true,\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+        borrow noKeys,
+    )!;
+    let answer = parseJson(staged.body.view())!!;
+    let location = copyBytes(jsonMemberText(jsonMember(borrow answer, "metadata")!, "location")!)!;
+    Check.equalU64(200, viewCall(mut s, Method.Post, ["views"][..], VIEW_BODY, borrow noKeys).status as u64)?;
+    let body = parseJson(createCommitBody(location.view()).view())!!;
+    let refused = icebergCommitCreate(mut s, "cat".bytes(), "ns".bytes(), "v".bytes(), borrow body, borrow noKeys)!;
+    Check.equalU64(409, refused.status as u64)?;
+    Check.isTrue(currentTable(borrow s, "cat".bytes(), "ns".bytes(), "v".bytes())!.isNull(), "no table at the name")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// A table's `write.*.path` in its warehouse stays under its own id (the M35 exit review's M2): one under another id
+/// is refused, at the create and by a commit; one elsewhere is the engine's.
+@test
+fn writePathsStayUnderTheirId() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("write-paths");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket(catalogText(tableWarehouseBucket("cat".bytes())!.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let schema =
+        "\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}";
+    var inside = copyBytes("{\"name\":\"t\",".bytes())!;
+    inside.extend(schema.bytes())!;
+    inside.extend(
+        ",\"properties\":{\"write.data.path\":\"s3://cat--table-s3/0f0f0f0f-0000-4000-8000-000000000009/data\"}}".bytes(),
+    )!;
+    let refused = icebergCreateTable(mut s, "cat".bytes(), "ns".bytes(), inside.view(), borrow noKeys);
+    Check.isTrue(
+        match (refused) {
+            Ok(a) => a.status == 400,
+            Err(TablesError.BadRequest) => true,
+            _ => false,
+        },
+        "a write path under another id refused at the create",
+    )?;
+    var elsewhere = copyBytes("{\"name\":\"t\",".bytes())!;
+    elsewhere.extend(schema.bytes())!;
+    elsewhere.extend(",\"properties\":{\"write.data.path\":\"s3://elsewhere/data\"}}".bytes())!;
+    Check.equalU64(
+        200,
+        icebergCreateTable(mut s, "cat".bytes(), "ns".bytes(), elsewhere.view(), borrow noKeys)!.status as u64,
+    )?;
+    let moved =
+        "{\"requirements\":[],\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"write.metadata.path\":\"s3://cat--table-s3/0f0f0f0f-0000-4000-8000-000000000009\"}}]}";
+    Check.isTrue(
+        match (icebergCommit(mut s, "cat".bytes(), "ns".bytes(), "t".bytes(), moved.bytes(), borrow noKeys)) {
+            Ok(a) => a.status == 400,
+            Err(TablesError.BadRequest) => true,
+            _ => false,
+        },
+        "and by a commit",
+    )?;
+    removeTree(dir.view());
+    return Ok();
+}

@@ -6,7 +6,8 @@
 //   references them once a commit replaces them.
 // Each is noted when first found and deleted once it has stayed so for `unreferencedDays + nonCurrentDays`, when its
 // table bucket has unreferenced-file removal enabled, as unreferenced files are. An id that a live table's pin names
-// (its files referenced by that table, `shared/`) is kept. Not knowing a view's current file deletes none of its.
+// (its files referenced by that table, `shared/`) is kept, and no id is deleted until every table with metadata has
+// had its own run succeed, so that its pins are written. Not knowing a view's current file deletes none of its.
 import web_core;
 import web_transport;
 import web_http;
@@ -151,18 +152,47 @@ fn deleteOrphans(
     keys: Slice<Vector<u8>>,
 ) -> Result<bool, TablesError> {
     let n = if (keys.length > sweep.budget) sweep.budget else keys.length;
+    var failed = false;
     var at: usize = 0;
     while (at < n) {
         let end = if (n - at > 1000) at + 1000 else n;
         match (store.deleteObjects(catalogText(sweep.hidden.view()), keys[at..end])) {
-            Ok(_) => {}
+            Ok(done) => {
+                // A key not deleted keeps its note, still due (the M35 exit review's L2).
+                for (k in 0..done.length) {
+                    if (!done[k]) { failed = true; }
+                }
+            }
             Err(e) => { return Err(tablesStoreFail(e)); }
         }
         at = end;
     }
     sweep.budget -= n;
     sweep.deleted += n;
-    return Ok(n == keys.length);
+    return Ok(n == keys.length && !failed);
+}
+
+/// Whether every table with metadata has had its unreferenced-file run succeed (its status `Successful`): a run
+/// pins each id whose files its table references (`shared/`), so only then are its references all known. A table
+/// whose run failed, or has not run, holds the deletion of ids (the M35 exit review's M2: a table's metadata written
+/// by its engine, its `write.*.path` under another id).
+fn tablesReferencesKnown(store: borrow ObjectStore, hidden: Slice<u8>) -> Result<bool, TablesError> {
+    let keys = catalogKeys(store, hidden, CATALOG_TABLES.bytes(), "".bytes(), 0)?;
+    for (i in 0..keys.length) {
+        let rec = match (readRecord(store, hidden, keys[i].view())?) {
+            Some(r) => r,
+            null => { continue; }
+        };
+        if ((jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes()).length == 0) { continue; }
+        let id = jsonMemberText(borrow rec.json, "id") ?? { return Ok(false); };
+        let status = readRecord(
+            store,
+            hidden,
+            jobStatusKey(id, UNREFERENCED_REMOVAL)?.view(),
+        )? ?? { return Ok(false); };
+        if (jsonMemberText(borrow status.json, "status") != Some("Successful".bytes())) { return Ok(false); }
+    }
+    return Ok(true);
 }
 
 /// One table bucket's orphans swept, under the store (on a cluster, one gated step): nothing when its unreferenced
@@ -194,12 +224,19 @@ fn sweepOrphans(
         ageMs: days * dayMs,
         deleted: 0,
     };
-    // Ids no record names: all their objects, once due.
+    // Ids no record names: all their objects, once due, and once every table's references are known. Held, or past
+    // the budget, they stay noted as due, and are not listed (the M35 exit review's M3).
+    let known = tablesReferencesKnown(store, hidden)?;
     let ids = warehouseIds(store, hidden)?;
     for (i in 0..ids.length) {
         let id = ids[i].view();
         if (holdsSorted(borrow live, id)) { continue; }
         if (!orphanDue(mut sweep, id)?) { continue; }
+        if (!known || sweep.budget == 0) {
+            let first = jsonMemberI64(borrow sweep.notes, textOfRef(id)) ?? nowMs;
+            sweep.kept.push(JsonMember { key: copyBytes(id)?, value: jsonInteger(first)? })?;
+            continue;
+        }
         var prefix = copyBytes(id)?;
         prefix.push('/')?;
         let objects = catalogKeys(store, hidden, prefix.view(), "".bytes(), 0)?;

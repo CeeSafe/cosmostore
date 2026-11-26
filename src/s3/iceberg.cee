@@ -1102,6 +1102,32 @@ fn writeMetadataWith(
 
 /// `writeMetadataWith` sealed with `encryption`, the table's as its caller has it: a create's, given rather than read
 /// back (`writeCreatedTableConfig`).
+/// The properties that name where an engine writes a table's files (Iceberg's `write.*.path`).
+const WRITE_PATH_PROPERTIES: [StringView; 4] = [
+    "write.data.path",
+    "write.metadata.path",
+    "write.object-storage.path",
+    "write.folder-storage.path",
+];
+
+/// Whether each `write.*.path` property of `m` that names this warehouse names it under `id` (the M35 exit review's
+/// M2): files written under an id no record names would be the orphan sweep's (ADR-0136 §3). A path elsewhere is the
+/// engine's to write, and not swept here.
+fn writePathsInside(m: borrow Json, hidden: Slice<u8>, id: Slice<u8>) -> bool {
+    let props = jsonMember(m, "properties") ?? { return true; };
+    for (p in WRITE_PATH_PROPERTIES) {
+        let path = jsonMemberText(props, p) ?? { continue; };
+        let scheme = findBytes(path, "://".bytes(), 0) ?? { continue; };
+        let rest = path[scheme + 3..];
+        let slash = pieceEnd(rest, 0, '/');
+        if (rest[0..slash] != hidden) { continue; }
+        let key = if (slash < rest.length) rest[slash + 1..] else "".bytes();
+        if (key.length < id.length || key[0..id.length] != id) { return false; }
+        if (key.length > id.length && key[id.length] != '/') { return false; }
+    }
+    return true;
+}
+
 fn writeMetadataSealedBy(
     store: borrow mut ObjectStore,
     hidden: Slice<u8>,
@@ -1111,6 +1137,7 @@ fn writeMetadataSealedBy(
     keys: borrow WarehouseKeys,
     encryption: borrow Json?,
 ) -> Result<Vector<u8>, TablesError> {
+    if (!writePathsInside(m, hidden, tableId)) { return Err(TablesError.BadRequest); }
     var key = copyBytes(tableId)?;
     key.extend("/metadata/".bytes())?;
     var digits = Vector<u8>.create();
@@ -1398,6 +1425,10 @@ fn icebergCommitCreate(
     }
     let id = copyBytes(at.view()[prefix.length..])?;
     if (findBytes(id.view(), "/".bytes(), 0).isSome()) { return badRequest("A table's location is its warehouse."); }
+    // Nor a view made at its name since its stage (the M35 exit review's M1): the stage's check was another call's.
+    if (viewExists(store, hidden.view(), ns, name)?) {
+        return icebergError(409, "AlreadyExistsException", "The table already exists.");
+    }
     let stagedKey = catalogKey(CATALOG_STAGED, ns, name)?;
     let reservation = readRecord(store, hidden.view(), stagedKey.view())? ?? {
         return badRequest("The table's location is not one a staged create gave it.");
