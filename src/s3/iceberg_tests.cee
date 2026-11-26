@@ -349,3 +349,69 @@ fn icebergStagedCreates() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// Nested namespaces (ADR-0134 §1): made under their parent, up to 8 levels of names S3 Tables takes; a table made in
+/// one; a namespace with children not dropped; the S3 Tables API's names are one level.
+@test
+fn nestedNamespaces() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("iceberg-nested");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket(catalogText(tableWarehouseBucket("cat".bytes())!.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    Check.equalU64(
+        200,
+        icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"a\"]}".bytes())!.status as u64,
+    )?;
+    Check.equalU64(
+        200,
+        icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"a\",\"b\"]}".bytes())!.status as u64,
+    )?;
+    Check.equalU64(
+        404,
+        icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"x\",\"y\"]}".bytes())!.status as u64,
+    )?;
+    Check.equalU64(
+        400,
+        icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"a\",\"B\"]}".bytes())!.status as u64,
+    )?;
+    Check.equalU64(
+        400,
+        icebergCreateNamespace(
+            mut s,
+            "cat".bytes(),
+            "{\"namespace\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\"]}".bytes(),
+        )!.status as u64,
+    )?;
+    let nestedName = [0x61u8, 0x1F, 0x62]; // a, 0x1F, b
+    let nested = nestedName[..];
+    Check.isTrue(namespaceExists(borrow s, tableWarehouseBucket("cat".bytes())!.view(), nested)!, "a.b there")?;
+    let made = icebergCreateTable(
+        mut s,
+        "cat".bytes(),
+        nested,
+        "{\"name\":\"t\",\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+        borrow noKeys,
+    )!;
+    Check.equalU64(200, made.status as u64)?;
+    Check.isTrue(currentTable(borrow s, "cat".bytes(), nested, "t".bytes())!.isSome(), "its table")?;
+    // Its levels, as the REST spec names them.
+    let levels = namespaceJson(nested)!;
+    match (levels) {
+        Json.Array(items) => {
+            Check.equalU64(2, items.length as u64)?;
+            Check.equalBytes("b".bytes(), match (borrow items[1]) {
+                Json.Text(t) => t.view(),
+                _ => "".bytes(),
+            })?;
+        }
+        _ => { return Err(TestFailure.create("an array")); }
+    }
+    // A, with a child, is not dropped.
+    match (deleteNamespace(mut s, "cat".bytes(), "a".bytes())) {
+        Err(TablesError.Conflict) => {}
+        _ => { return Err(TestFailure.create("a namespace with a child dropped")); }
+    }
+    removeTree(dir.view());
+    return Ok();
+}

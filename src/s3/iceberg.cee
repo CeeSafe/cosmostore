@@ -87,7 +87,66 @@ fn icebergConfig(
 
 // ---- Namespaces ----
 
-fn namespaceJson(name: Slice<u8>) -> Result<Json, AllocError> => namespaceArray(name);
+/// A namespace as the REST spec names it: its levels (ADR-0134 §1), kept joined by 0x1F.
+fn namespaceJson(name: Slice<u8>) -> Result<Json, AllocError> {
+    var a = jsonArray();
+    var at: usize = 0;
+    while (at <= name.length) {
+        let end = pieceEnd(name, at, 0x1F);
+        jsonPush(mut a, Json.Text(copyBytes(name[at..end])?))?;
+        at = end + 1;
+    }
+    return Ok(a);
+}
+
+/// The deepest a namespace nests (ADR-0134 §1, the owner's "Up to 8 levels").
+const NAMESPACE_LEVELS: usize = 8;
+
+/// A namespace's levels, each a name S3 Tables takes, 1 to NAMESPACE_LEVELS of them, joined by 0x1F; null otherwise.
+fn levelsOk(name: Slice<u8>) -> bool {
+    var levels: usize = 0;
+    var at: usize = 0;
+    while (at <= name.length) {
+        let end = pieceEnd(name, at, 0x1F);
+        if (!tableNameOk(name[at..end], true)) { return false; }
+        levels += 1;
+        at = end + 1;
+    }
+    return levels <= NAMESPACE_LEVELS;
+}
+
+/// A request's `namespace` (an array of levels), joined by 0x1F; null when it is not one this takes.
+fn nestedNamespaceOf(j: borrow Json) -> Result<Vector<u8>?, AllocError> {
+    let items = match (jsonMember(j, "namespace")) {
+        Some(Json.Array(items)) => items,
+        _ => { return Ok(null); }
+    };
+    if (items.length == 0 || items.length > NAMESPACE_LEVELS) { return Ok(null); }
+    var out = Vector<u8>.create();
+    for (i in 0..items.length) {
+        match (borrow items[i]) {
+            Json.Text(t) => {
+                if (!tableNameOk(t.view(), true)) { return Ok(null); }
+                if (i > 0) { out.push(0x1F)?; }
+                out.extend(t.view())?;
+            }
+            _ => { return Ok(null); }
+        }
+    }
+    return Ok(Some(out));
+}
+
+/// A namespace's parent: its levels but its last; empty for a first level.
+fn parentOf(ns: Slice<u8>) -> Slice<u8> {
+    var last: usize? = null;
+    for (i in 0..ns.length) {
+        if (ns[i] == 0x1F) { last = Some(i); }
+    }
+    return match (last) {
+        Some(i) => ns[0..i],
+        null => ns[0..0],
+    };
+}
 
 fn icebergListNamespaces(
     store: borrow ObjectStore,
@@ -96,12 +155,27 @@ fn icebergListNamespaces(
 ) -> Result<TablesAnswer, TablesError> {
     let hidden = tableWarehouseBucket(bucket)?;
     var list = jsonArray();
-    // One level only: a parent has no children.
-    if (paramOf(req, "parent").isNull()) {
-        let keys = catalogKeys(store, hidden.view(), CATALOG_NAMESPACES.bytes(), "".bytes(), 0)?;
-        for (i in 0..keys.length) {
-            jsonPush(mut list, namespaceJson(keys[i].view()[CATALOG_NAMESPACES.bytes().length..])?)?;
+    // A parent's children, one level down (ADR-0134 §1); the first level without one.
+    var parent = Vector<u8>.create();
+    match (paramOf(req, "parent")) {
+        Some(p) => {
+            let _ = percentDecodeInto(mut parent, p, true)?;
+            if (!levelsOk(parent.view()) || !namespaceExists(store, hidden.view(), parent.view())?) {
+                return noSuchNamespace();
+            }
         }
+        null => {}
+    }
+    var prefix = copyBytes(CATALOG_NAMESPACES.bytes())?;
+    if (parent.length > 0) {
+        prefix.extend(parent.view())?;
+        prefix.push(0x1F)?;
+    }
+    let keys = catalogKeys(store, hidden.view(), prefix.view(), "".bytes(), 0)?;
+    for (i in 0..keys.length) {
+        let below = keys[i].view()[prefix.length..];
+        if (findBytes(below, [0x1Fu8][..], 0).isSome()) { continue; } // a grandchild
+        jsonPush(mut list, namespaceJson(keys[i].view()[CATALOG_NAMESPACES.bytes().length..])?)?;
     }
     var j = jsonObject();
     jsonSet(mut j, "namespaces", list)?;
@@ -122,11 +196,14 @@ fn icebergCreateNamespace(
         Some(j) => j,
         null => { return badRequest("The body is not JSON."); }
     };
-    let ns = match (singleNamespace(borrow j)) {
-        Ok(n) => n,
-        Err(_) => { return badRequest("A namespace is one level here."); }
+    // 1 to 8 levels, each of 1 to 255 of a-z, 0-9 and _, its parent there (ADR-0134 §1).
+    let ns = nestedNamespaceOf(borrow j)? ?? {
+        return badRequest("A namespace is 1 to 8 levels, each 1 to 255 of a-z, 0-9 and _.");
     };
-    if (!tableNameOk(ns.view(), true)) { return badRequest("A namespace is 1 to 255 of a-z, 0-9 and _."); }
+    let parent = parentOf(ns.view());
+    if (parent.length > 0 && !namespaceExists(store, tableWarehouseBucket(bucket)?.view(), parent)?) {
+        return noSuchNamespace();
+    }
     // Only `owner`, as S3 Tables keeps.
     match (jsonMember(borrow j, "properties")) {
         Some(p) => {
@@ -207,7 +284,11 @@ fn icebergNamespace(
     if (isMethod(m, Method.Delete)) {
         return match (deleteNamespace(store, bucket, ns)) {
             Ok(a) => Ok(a),
-            Err(TablesError.Conflict) => icebergError(409, "NamespaceNotEmptyException", "The namespace has tables."),
+            Err(TablesError.Conflict) => icebergError(
+                409,
+                "NamespaceNotEmptyException",
+                "The namespace has tables, views or namespaces.",
+            ),
             Err(e) => Err(e),
         };
     }
@@ -1482,9 +1563,9 @@ fn icebergCommit(
     // An identifier given names this table (the path's).
     match (jsonMember(borrow request, "identifier")) {
         Some(ident) => {
-            let same = match (singleNamespace(ident)) {
-                Ok(n) => n.view() == ns && jsonMemberText(ident, "name") == Some(name),
-                Err(_) => false,
+            let same = match (nestedNamespaceOf(ident)?) {
+                Some(n) => n.view() == ns && jsonMemberText(ident, "name") == Some(name),
+                null => false,
             };
             if (!same) { return badRequest("The commit's identifier is not the table of its path."); }
         }
@@ -1623,10 +1704,7 @@ fn icebergRename(
             Some(i) => i,
             null => { return badRequest("A rename names its source and destination."); }
         };
-        let ns = match (singleNamespace(ident)) {
-            Ok(n) => n,
-            Err(_) => { return badRequest("A namespace is one level here."); }
-        };
+        let ns = nestedNamespaceOf(ident)? ?? { return badRequest("A namespace is 1 to 8 levels here."); };
         from.push(ns)?;
         from.push(copyBytes(jsonMemberText(ident, "name") ?? "".bytes())?)?;
     }
@@ -1696,9 +1774,9 @@ fn icebergRoute(
         }
         return icebergUnsupported();
     }
-    // A multi-level namespace (its parts joined by 0x1F) is not one here.
+    // A namespace of up to 8 levels, its parts joined by 0x1F (ADR-0134 §1).
     let ns = rest[1].view();
-    if (findBytes(ns, [0x1Fu8][..], 0).isSome()) { return noSuchNamespace(); }
+    if (!levelsOk(ns)) { return noSuchNamespace(); }
     if (rest.length == 2) {
         let action = if (isMethod(m, Method.Delete)) "s3tables:DeleteNamespace" else "s3tables:GetNamespace";
         checkTables(store, caller, action, b, "".bytes())?;

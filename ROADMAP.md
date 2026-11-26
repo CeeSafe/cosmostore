@@ -6381,3 +6381,17 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - the view calls (create, load, exists, list, commit, rename, drop), authorized;
   - the checks by Iceberg Java and PyIceberg.
 - **For the owner:** views' actions; namespaces' depth; S3 Tables' API and nested namespaces.
+
+### 26 Nov 2026: M34 slice 1, nested namespaces (ADR-0134 §1)
+
+- **The Iceberg catalog's namespaces** are 1 to 8 levels (the owner's "Up to 8 levels"), each a name S3 Tables
+  takes, kept with their levels joined by 0x1F.
+  - A level's parent must exist (NoSuchNamespace).
+  - ListNamespaces takes `parent` and answers one level down.
+  - Answers name every level.
+  - Commits and renames take nested identifiers.
+- **A namespace with children is not dropped,** through either API (NamespaceNotEmpty, Conflict).
+- **S3 Tables' API stays one level** (the owner's "One level, as AWS"): its ListNamespaces and ListTables leave out
+  nested namespaces and their tables.
+- **Tests:** `nestedNamespaces`.
+- **Checks:** 548 unit tests, the S3 smoke and the cluster smoke (214).
