@@ -114,6 +114,8 @@ views, _, _ = java("views")
 check("Java's view made, its SQL read back", views.get("view-sql"), "select_id_from_javans.v3")
 check("Java's view replaced: a second version, current", (views.get("view-versions"), views.get("view-current")),
       ("2", "2"))
+check("Java's view keeps one schema", views.get("view-schemas"), "1")
+check("Java's view expires versions past its history size: 2 kept, the 4th current", views.get("view-kept"), "2_4")
 check("Java's views listed", views.get("views-listed"), "1")
 check("Java's view renamed", views.get("view-renamed"), "true")
 check("Java's view dropped", views.get("view-dropped"), "true")

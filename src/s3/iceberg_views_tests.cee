@@ -282,6 +282,86 @@ fn nestedNamespacesAtTheEdges() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// S3 Tables' ListNamespaces of one page: its namespaces' names, and its token or none.
+fn namespacesPage(
+    s: borrow mut ObjectStore,
+    max: StringView,
+    token: Slice<u8>,
+) -> Result<Json, TestFailure> {
+    var req = tablesPathRequest("/namespaces/arn%3Aaws%3As3tables%3Aus-east-1%3A000000000000%3Abucket%2Fcat");
+    req.query.push(policyParam("maxNamespaces", max))!;
+    if (token.length > 0) { req.query.push(policyParam("continuationToken", StringView.fromUtf8(token) ?? ""))!; }
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let creds = Vector<Credential>.create();
+    let caller = tablesCaller("AKIAPAGES");
+    return match (routeTablesSync(s, borrow req, "".bytes(), borrow caller, creds.view(), borrow noKeys)) {
+        Ok(a) => Ok(parseJson(a.body.view())!!),
+        Err(_) => Err(TestFailure.create("ListNamespaces failed")),
+    };
+}
+
+/// The first namespace's name in a page, and how many it has.
+fn pageNames(page: borrow Json, out: borrow mut Vector<u8>) -> usize {
+    match (jsonMember(page, "namespaces")) {
+        Some(Json.Array(items)) => {
+            for (i in 0..items.length) {
+                match (jsonMember(borrow items[i], "namespace")) {
+                    Some(Json.Array(levels)) => {
+                        match (borrow levels[0]) {
+                            Json.Text(t) => {
+                                out.extend(t.view())!;
+                                out.push(',')!;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return items.length;
+        }
+        _ => { return 0; }
+    }
+}
+
+/// S3 Tables' ListNamespaces pages are full, or the last, past the nested namespaces they skip (M34's B4,
+/// ADR-0136 §1).
+@test
+fn namespacePagesSkipNested() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("namespace-pages");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"a\"]}".bytes())!;
+    for (child in ["b1", "b2", "b3"]) {
+        var body = copyBytes("{\"namespace\":[\"a\",\"".bytes())!;
+        body.extend(child.bytes())!;
+        body.extend("\"]}".bytes())!;
+        let _ = icebergCreateNamespace(mut s, "cat".bytes(), body.view())!;
+    }
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"z\"]}".bytes())!;
+    // One page of two: both, and no token.
+    let whole = namespacesPage(mut s, "2", "".bytes())?;
+    var names = Vector<u8>.create();
+    Check.equalU64(2, pageNames(borrow whole, mut names) as u64)?;
+    Check.equalBytes("a,z,".bytes(), names.view())?;
+    Check.isTrue(jsonMember(borrow whole, "continuationToken").isNull(), "no token on the last page")?;
+    // Pages of one: a, then z, then no token.
+    let first = namespacesPage(mut s, "1", "".bytes())?;
+    var one = Vector<u8>.create();
+    Check.equalU64(1, pageNames(borrow first, mut one) as u64)?;
+    Check.equalBytes("a,".bytes(), one.view())?;
+    let token = copyBytes(jsonMemberText(borrow first, "continuationToken")!)!;
+    let second = namespacesPage(mut s, "1", token.view())?;
+    var two = Vector<u8>.create();
+    Check.equalU64(1, pageNames(borrow second, mut two) as u64)?;
+    Check.equalBytes("z,".bytes(), two.view())?;
+    Check.isTrue(jsonMember(borrow second, "continuationToken").isNull(), "z's page is the last")?;
+    removeTree(dir.view());
+    return Ok();
+}
+
 /// A view commit's edges (the M34 exit review's L2, L3): no updates write no file, the current version made current
 /// again logs nothing, and its location stays its warehouse.
 @test
@@ -347,6 +427,182 @@ fn viewCommitEdges() -> Result<void, TestFailure> {
             borrow noKeys,
         )!.status as u64,
     )?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// One view call on `cat`'s namespace `ns`, as `AKIABUILDER`.
+fn viewCall(
+    s: borrow mut ObjectStore,
+    m: Method,
+    names: Slice<StringView>,
+    body: StringView,
+    keys: borrow WarehouseKeys,
+) -> TablesAnswer {
+    let caller = tablesCaller("AKIABUILDER");
+    let segs = viewSegments(names);
+    return icebergViews(s, m, "cat".bytes(), "ns".bytes(), segs.view(), body.bytes(), borrow caller, keys)!;
+}
+
+/// A commit to view `v`: its metadata, or its status when it is not 200.
+fn viewCommit(s: borrow mut ObjectStore, body: StringView, keys: borrow WarehouseKeys) -> Result<Json, u64> {
+    let a = viewCall(s, Method.Post, ["views", "v"][..], body, keys);
+    if (a.status != 200) { return Err(a.status as u64); }
+    let j = parseJson(a.body.view())!!;
+    return Ok(cloneJson(jsonMember(borrow j, "metadata")!)!);
+}
+
+fn viewStatus(s: borrow mut ObjectStore, body: StringView, keys: borrow WarehouseKeys) -> u64 => match (viewCommit(
+    s,
+    body,
+    keys,
+)) {
+    Ok(_) => 200,
+    Err(status) => status,
+};
+
+/// A view's commits as Iceberg Java's `ViewMetadata.Builder` makes them (M34's B1, ADR-0136 §2): an equal schema and
+/// an equal version reused, the log at the version's time, old versions expired past `version.history.num-entries`
+/// and the log cut at the first one kept after them, a version without a summary refused.
+@test
+fn viewMetadataAsJavaBuilds() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("view-builder");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let made = viewCall(mut s, Method.Post, ["views"][..], VIEW_BODY, borrow noKeys);
+    Check.equalU64(200, made.status as u64)?;
+    let created = parseJson(made.body.view())!!;
+    let log0 = jsonMember(jsonMember(borrow created, "metadata")!, "version-log")!;
+    match (log0) {
+        Json.Array(es) => { Check.isTrue(jsonMemberI64(borrow es[0], "timestamp-ms") == Some(1000), "at its time")?; }
+        _ => { return Err(TestFailure.create("no version log")); }
+    }
+    // The same schema again, and a new version on it: one schema, two versions, logged at the version's time.
+    let replace =
+        "{\"updates\":[{\"action\":\"add-schema\",\"schema\":{\"type\":\"struct\",\"schema-id\":-1,\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}},{\"action\":\"add-view-version\",\"view-version\":{\"version-id\":-1,\"schema-id\":-1,\"timestamp-ms\":2000,\"summary\":{},\"default-namespace\":[\"ns\"],\"representations\":[{\"type\":\"sql\",\"sql\":\"select a from t where a > 1\",\"dialect\":\"spark\"}]}},{\"action\":\"set-current-view-version\",\"view-version-id\":-1}]}";
+    let second = match (viewCommit(mut s, replace, borrow noKeys)) {
+        Ok(m) => m,
+        Err(status) => { return Err(TestFailure.create("the replace was refused")); }
+    };
+    Check.equalU64(1, arrayLength(borrow second, "schemas") as u64)?;
+    Check.equalU64(2, arrayLength(borrow second, "versions") as u64)?;
+    Check.isTrue(jsonMemberI64(borrow second, "current-version-id") == Some(2), "version 2 current")?;
+    Check.isTrue(versionTime(borrow second, 2, 0) == 2000, "its time kept")?;
+    match (jsonMember(borrow second, "version-log")!) {
+        Json.Array(es) => {
+            Check.isTrue(jsonMemberI64(borrow es[es.length - 1], "timestamp-ms") == Some(2000), "logged at it")?;
+        }
+        _ => { return Err(TestFailure.create("no version log")); }
+    }
+    // The same version again, at another time: reused, nothing new current.
+    let again =
+        "{\"updates\":[{\"action\":\"add-view-version\",\"view-version\":{\"version-id\":-1,\"schema-id\":0,\"timestamp-ms\":3000,\"summary\":{},\"default-namespace\":[\"ns\"],\"representations\":[{\"type\":\"sql\",\"sql\":\"select a from t where a > 1\",\"dialect\":\"spark\"}]}},{\"action\":\"set-current-view-version\",\"view-version-id\":-1}]}";
+    let third = match (viewCommit(mut s, again, borrow noKeys)) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("the same version was refused")); }
+    };
+    Check.equalU64(2, arrayLength(borrow third, "versions") as u64)?;
+    Check.equalU64(2, arrayLength(borrow third, "version-log") as u64)?;
+    // A history of 2: a third version expires the first, and the log keeps 2 and 3.
+    let two = "{\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"version.history.num-entries\":\"2\"}}]}";
+    Check.equalU64(200, viewStatus(mut s, two, borrow noKeys))?;
+    let next =
+        "{\"updates\":[{\"action\":\"add-view-version\",\"view-version\":{\"version-id\":-1,\"schema-id\":0,\"timestamp-ms\":4000,\"summary\":{\"engine-name\":\"spark\"},\"default-namespace\":[\"ns\"],\"representations\":[{\"type\":\"sql\",\"sql\":\"select 3\",\"dialect\":\"spark\"}]}},{\"action\":\"set-current-view-version\",\"view-version-id\":-1}]}";
+    let fourth = match (viewCommit(mut s, next, borrow noKeys)) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("version 3 was refused")); }
+    };
+    Check.equalU64(2, arrayLength(borrow fourth, "versions") as u64)?;
+    Check.isTrue(!holdsMember(borrow fourth, "versions", "version-id", 1), "version 1 expired")?;
+    Check.isTrue(holdsMember(borrow fourth, "versions", "version-id", 3), "version 3 kept")?;
+    Check.equalU64(2, arrayLength(borrow fourth, "version-log") as u64)?;
+    Check.isTrue(!holdsMember(borrow fourth, "version-log", "version-id", 1), "its log entry gone")?;
+    // A history that is not a positive integer, and a version without a summary: refused.
+    let zero = "{\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"version.history.num-entries\":\"0\"}}]}";
+    Check.equalU64(400, viewStatus(mut s, zero, borrow noKeys))?;
+    let bare =
+        "{\"updates\":[{\"action\":\"add-view-version\",\"view-version\":{\"version-id\":-1,\"schema-id\":0,\"timestamp-ms\":5000,\"default-namespace\":[\"ns\"],\"representations\":[{\"type\":\"sql\",\"sql\":\"select 4\",\"dialect\":\"spark\"}]}}]}";
+    Check.equalU64(400, viewStatus(mut s, bare, borrow noKeys))?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// Each view update on its own, and a commit that lost a race (the M34 exit review's missing tests): `assign-uuid`
+/// of another uuid refused, `remove-properties` removing, `add-schema` of -1 given the next id, a commit made on a
+/// record another commit replaced refused with CommitFailed.
+@test
+fn viewUpdatesEachAlone() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("view-updates");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    Check.equalU64(200, viewCall(mut s, Method.Post, ["views"][..], VIEW_BODY, borrow noKeys).status as u64)?;
+    let other = "{\"updates\":[{\"action\":\"assign-uuid\",\"uuid\":\"00000000-0000-4000-8000-000000000000\"}]}";
+    Check.equalU64(400, viewStatus(mut s, other, borrow noKeys))?;
+    let removal = "{\"updates\":[{\"action\":\"remove-properties\",\"removals\":[\"comment\"]}]}";
+    let removed = match (viewCommit(mut s, removal, borrow noKeys)) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("remove-properties was refused")); }
+    };
+    Check.isTrue(jsonMemberText(jsonMember(borrow removed, "properties")!, "comment").isNull(), "comment removed")?;
+    let schema =
+        "{\"updates\":[{\"action\":\"add-schema\",\"schema\":{\"type\":\"struct\",\"schema-id\":-1,\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"},{\"id\":2,\"name\":\"b\",\"required\":false,\"type\":\"string\"}]}}]}";
+    let added = match (viewCommit(mut s, schema, borrow noKeys)) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("add-schema was refused")); }
+    };
+    Check.isTrue(holdsMember(borrow added, "schemas", "schema-id", 1), "the next schema id")?;
+    // A commit on the record as it was before another commit: CommitFailed, nothing written over the other.
+    let key = viewKey("ns".bytes(), "v".bytes())!;
+    let stale = readRecord(borrow s, hidden.view(), key.view())!!;
+    let props = "{\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"k\":\"1\"}}]}";
+    Check.equalU64(200, viewStatus(mut s, props, borrow noKeys))?;
+    let lost = commitView(mut s, hidden.view(), key.view(), stale, props.bytes(), borrow noKeys)!;
+    Check.equalU64(409, lost.status as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// A view in a table bucket whose encryption is KMS (the M34 exit review's missing test): its metadata files sealed
+/// under the key, made, replaced and loaded with the server's keys, and not loaded without them.
+@test
+fn viewsInAnEncryptedTableBucket() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("view-sealed");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    var kms = Vector<MasterKey>.create();
+    kms.push(testKey("orders", 90))!;
+    let none = Vector<MasterKey>.create();
+    let keys = WarehouseKeys { sse: none.view(), kms: kms.view() };
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let config = parseJson(
+        "{\"encryption\":{\"sseAlgorithm\":\"aws:kms\",\"kmsKeyArn\":\"arn:aws:kms:us-east-1:000000000000:key/orders\"}}".bytes(),
+    )!!;
+    writeTablesConfig(mut s, hidden.view(), TABLE_BUCKET_CONFIG_KEY.bytes(), borrow config)!;
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    Check.equalU64(200, viewCall(mut s, Method.Post, ["views"][..], VIEW_BODY, borrow keys).status as u64)?;
+    let key = viewKey("ns".bytes(), "v".bytes())!;
+    let rec = readRecord(borrow s, hidden.view(), key.view())!!;
+    let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+    Check.isTrue(readMetadataWith(borrow s, hidden.view(), location.view(), borrow noKeys).isErr(), "sealed")?;
+    let replace =
+        "{\"updates\":[{\"action\":\"add-view-version\",\"view-version\":{\"version-id\":-1,\"schema-id\":0,\"timestamp-ms\":2000,\"summary\":{},\"default-namespace\":[\"ns\"],\"representations\":[{\"type\":\"sql\",\"sql\":\"select 2\",\"dialect\":\"spark\"}]}},{\"action\":\"set-current-view-version\",\"view-version-id\":-1}]}";
+    Check.equalU64(200, viewStatus(mut s, replace, borrow keys))?;
+    let next = readRecord(borrow s, hidden.view(), key.view())!!;
+    let nextLocation = copyBytes(jsonMemberText(borrow next.json, "metadataLocation")!)!;
+    Check.isTrue(nextLocation.view() != location.view(), "a new metadata file")?;
+    let opened = readMetadataWith(borrow s, hidden.view(), nextLocation.view(), borrow keys)!;
+    Check.isTrue(jsonMemberI64(borrow opened, "current-version-id") == Some(2), "replaced, opened with the keys")?;
+    Check.isTrue(readMetadataWith(borrow s, hidden.view(), nextLocation.view(), borrow noKeys).isErr(), "sealed")?;
+    Check.equalU64(200, viewCall(mut s, Method.Get, ["views", "v"][..], "", borrow keys).status as u64)?;
     removeTree(dir.view());
     return Ok();
 }

@@ -52,11 +52,23 @@ fn jsonTexts(j: borrow Json) -> bool => match (j) {
     _ => false,
 };
 
-/// A view version as the spec has it: its id and its schema's, a timestamp, its SQL representations (one or more,
-/// each with its SQL and its dialect, the dialects distinct), and its default namespace.
+/// A view version as the spec has it: its id and its schema's, a timestamp, its summary (an object of strings, as
+/// Iceberg Java reads it), its SQL representations (one or more, each with its SQL and its dialect, the dialects
+/// distinct), and its default namespace.
 fn viewVersionOk(v: borrow Json) -> bool {
     if (jsonMemberI64(v, "version-id").isNull() || jsonMemberI64(v, "schema-id").isNull()) { return false; }
     if (jsonMemberI64(v, "timestamp-ms").isNull()) { return false; }
+    match (jsonMember(v, "summary")) {
+        Some(Json.Object(ms)) => {
+            for (i in 0..ms.length) {
+                match (borrow ms[i].value) {
+                    Json.Text(_) => {}
+                    _ => { return false; }
+                }
+            }
+        }
+        _ => { return false; }
+    }
     match (jsonMember(v, "default-namespace")) {
         Some(ns) => {
             if (!jsonTexts(ns)) { return false; }
@@ -112,6 +124,198 @@ fn holdsMember(m: borrow Json, list: StringView, idKey: StringView, id: i64) -> 
     return false;
 }
 
+/// Whether two JSON values are the same: an object's members in any order, an array's in its, a number as written.
+fn jsonSame(a: borrow Json, b: borrow Json) -> bool {
+    match (a) {
+        Json.Null => {
+            return match (b) {
+                Json.Null => true,
+                _ => false,
+            };
+        }
+        Json.Bool(x) => {
+            return match (b) {
+                Json.Bool(y) => x == y,
+                _ => false,
+            };
+        }
+        Json.Number(x) => {
+            return match (b) {
+                Json.Number(y) => x.view() == y.view(),
+                _ => false,
+            };
+        }
+        Json.Text(x) => {
+            return match (b) {
+                Json.Text(y) => x.view() == y.view(),
+                _ => false,
+            };
+        }
+        Json.Array(xs) => {
+            match (b) {
+                Json.Array(ys) => {
+                    if (xs.length != ys.length) { return false; }
+                    for (i in 0..xs.length) {
+                        if (!jsonSame(borrow xs[i], borrow ys[i])) { return false; }
+                    }
+                    return true;
+                }
+                _ => { return false; }
+            }
+        }
+        Json.Object(xs) => {
+            match (b) {
+                Json.Object(ys) => {
+                    if (xs.length != ys.length) { return false; }
+                    for (i in 0..xs.length) {
+                        var found = false;
+                        for (k in 0..ys.length) {
+                            if (ys[k].key.view() == xs[i].key.view()) {
+                                if (!jsonSame(borrow xs[i].value, borrow ys[k].value)) { return false; }
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) { return false; }
+                    }
+                    return true;
+                }
+                _ => { return false; }
+            }
+        }
+    }
+}
+
+/// Whether a member is the same in both: absent from both, or the same value. With `emptyIsAbsent`, an empty array
+/// is as absent.
+fn memberSame(a: borrow Json, b: borrow Json, key: StringView, emptyIsAbsent: bool) -> bool {
+    let x = jsonMember(a, key);
+    let y = jsonMember(b, key);
+    let xAbsent = x.isNull() || (emptyIsAbsent && arrayLength(a, key) == 0);
+    let yAbsent = y.isNull() || (emptyIsAbsent && arrayLength(b, key) == 0);
+    if (xAbsent || yAbsent) { return xAbsent && yAbsent; }
+    return jsonSame(x!, y!);
+}
+
+/// The id of a schema `m` holds that is the same as `s` (its fields and identifier fields), as Iceberg Java's
+/// `Schema.sameSchema`; null if none is.
+fn sameSchemaIn(m: borrow Json, s: borrow Json) -> i64? {
+    match (jsonMember(m, "schemas")) {
+        Some(Json.Array(items)) => {
+            for (i in 0..items.length) {
+                let held = borrow items[i];
+                if (memberSame(held, s, "fields", false) && memberSame(held, s, "identifier-field-ids", true)) {
+                    return jsonMemberI64(held, "schema-id");
+                }
+            }
+        }
+        _ => {}
+    }
+    return null;
+}
+
+/// The id of a version `m` holds that is the same as `v` (all but its id and time), as Iceberg Java's
+/// `ViewMetadata.Builder.sameViewVersion`; null if none is.
+fn sameVersionIn(m: borrow Json, v: borrow Json) -> i64? {
+    match (jsonMember(m, "versions")) {
+        Some(Json.Array(items)) => {
+            for (i in 0..items.length) {
+                let held = borrow items[i];
+                if (memberSame(held, v, "summary", false) && memberSame(held, v, "representations", false) &&
+                    memberSame(held, v, "default-catalog", false) && memberSame(held, v, "default-namespace", false) &&
+                    jsonMemberI64(held, "schema-id") == jsonMemberI64(v, "schema-id")) {
+                    return jsonMemberI64(held, "version-id");
+                }
+            }
+        }
+        _ => {}
+    }
+    return null;
+}
+
+/// A version's `timestamp-ms` in `m`; `fallback` if it has none.
+fn versionTime(m: borrow Json, vid: i64, fallback: i64) -> i64 {
+    match (jsonMember(m, "versions")) {
+        Some(Json.Array(items)) => {
+            for (i in 0..items.length) {
+                if (jsonMemberI64(borrow items[i], "version-id") == Some(vid)) {
+                    return jsonMemberI64(borrow items[i], "timestamp-ms") ?? fallback;
+                }
+            }
+        }
+        _ => {}
+    }
+    return fallback;
+}
+
+/// The versions a view keeps, `version.history.num-entries` (10 when absent) as Iceberg Java's builder reads it; null
+/// when it is not a positive integer.
+fn historySize(m: borrow Json) -> usize? {
+    let props = jsonMember(m, "properties") ?? { return Some(10); };
+    let text = jsonMemberText(props, "version.history.num-entries") ?? { return Some(10); };
+    let n = parseDecimal(text) ?? { return null; };
+    if (n == 0 || n > 2147483647) { return null; }
+    return checkedTruncate<usize>(n);
+}
+
+/// Old versions expired as Iceberg Java's `ViewMetadata.Builder` expires them (B1 of M34's exit review, ADR-0136
+/// §2): past the history size, the highest ids kept and the current one always, never one this commit added; the
+/// version log keeps its entries from the last one of a version no longer kept. False when the history size is not
+/// valid.
+fn expireViewVersions(m: borrow mut Json, added: Slice<i64>) -> Result<bool, AllocError> {
+    let size = historySize(m) ?? { return Ok(false); };
+    let current = jsonMemberI64(m, "current-version-id") ?? -1;
+    var must: usize = 1;
+    for (i in 0..added.length) {
+        if (added[i] != current) { must += 1; }
+    }
+    let keep = if (must > size) must else size;
+    var ids = Vector<i64>.create();
+    match (jsonMember(m, "versions")) {
+        Some(Json.Array(items)) => {
+            for (i in 0..items.length) { ids.push(jsonMemberI64(borrow items[i], "version-id") ?? -1)?; }
+        }
+        _ => {}
+    }
+    if (ids.length <= keep) { return Ok(true); }
+    ids.sortBy((a, b) => if (a > b) -1 else if (a < b) 1 else 0);
+    var kept = Vector<i64>.create();
+    kept.push(current)?;
+    for (i in 0..ids.length) {
+        if (kept.length >= keep) { break; }
+        if (ids[i] != current) { kept.push(ids[i])?; }
+    }
+    let keptView = kept.view();
+    match (jsonMemberMut(m, "versions")) {
+        Some(Json.Array(items)) => {
+            items.retain((v) => keptHolds(keptView, jsonMemberI64(v, "version-id") ?? -1));
+        }
+        _ => {}
+    }
+    var log = jsonArray();
+    match (jsonMember(m, "version-log")) {
+        Some(Json.Array(entries)) => {
+            for (i in 0..entries.length) {
+                if (keptHolds(keptView, jsonMemberI64(borrow entries[i], "version-id") ?? -1)) {
+                    jsonPush(mut log, cloneJson(borrow entries[i])?)?;
+                } else {
+                    log = jsonArray();
+                }
+            }
+        }
+        _ => {}
+    }
+    jsonSet(m, "version-log", log)?;
+    return Ok(true);
+}
+
+fn keptHolds(kept: Slice<i64>, id: i64) -> bool {
+    for (i in 0..kept.length) {
+        if (kept[i] == id) { return true; }
+    }
+    return false;
+}
+
 /// A created view's metadata (`CreateViewRequest`: its schema, its version and its properties), at `location`; null
 /// when the request is not one a view is made from.
 fn newViewMetadata(request: borrow Json, location: Slice<u8>, now: i64) -> Result<Json?, AllocError> {
@@ -129,6 +333,7 @@ fn newViewMetadata(request: borrow Json, location: Slice<u8>, now: i64) -> Resul
     jsonSet(mut v, "schema-id", jsonInteger(0)?)?;
     if (jsonMemberI64(version, "timestamp-ms").isNull()) { jsonSet(mut v, "timestamp-ms", jsonInteger(now)?)?; }
     if (!viewVersionOk(borrow v)) { return Ok(null); }
+    let at = jsonMemberI64(borrow v, "timestamp-ms") ?? now;
     var uuid = Vector<u8>.create();
     if (!newUuid(mut uuid)?) { return Ok(null); }
     var m = jsonObject();
@@ -139,8 +344,9 @@ fn newViewMetadata(request: borrow Json, location: Slice<u8>, now: i64) -> Resul
     var versions = jsonArray();
     jsonPush(mut versions, v)?;
     jsonSet(mut m, "versions", versions)?;
+    // The log's entry at the version's time, as Iceberg Java's builder stamps it (ADR-0136 §2).
     var entry = jsonObject();
-    jsonSet(mut entry, "timestamp-ms", jsonInteger(now)?)?;
+    jsonSet(mut entry, "timestamp-ms", jsonInteger(at)?)?;
     jsonSet(mut entry, "version-id", jsonInteger(vid)?)?;
     var log = jsonArray();
     jsonPush(mut log, entry)?;
@@ -189,6 +395,7 @@ fn applyViewUpdates(m: borrow mut Json, updates: borrow Json?, now: i64) -> Resu
     };
     var lastSchema: i64 = -1;
     var lastVersion: i64 = -1;
+    var added = Vector<i64>.create();
     for (i in 0..us.length) {
         let u = borrow us[i];
         let action = jsonMemberText(u, "action") ?? { return Ok(false); };
@@ -199,10 +406,17 @@ fn applyViewUpdates(m: borrow mut Json, updates: borrow Json?, now: i64) -> Resu
         } else if (action == "add-schema".bytes()) {
             let schema = jsonMember(u, "schema") ?? { return Ok(false); };
             if (!viewSchemaOk(schema)?) { return Ok(false); }
-            var sid = jsonMemberI64(schema, "schema-id") ?? -1;
-            if (sid < 0 || holdsMember(m, "schemas", "schema-id", sid)) {
-                sid = highestOf(m, "schemas", "schema-id") + 1;
+            // A schema the view holds already is reused, its id the last added (ADR-0136 §2, as Java's builder).
+            match (sameSchemaIn(m, schema)) {
+                Some(held) => {
+                    lastSchema = held;
+                    continue;
+                }
+                null => {}
             }
+            var sid = jsonMemberI64(schema, "schema-id") ?? -1;
+            let top = highestOf(m, "schemas", "schema-id");
+            if (sid <= top) { sid = top + 1; }
             var s = cloneJson(schema)?;
             jsonSet(mut s, "schema-id", jsonInteger(sid)?)?;
             appendTo(m, "schemas", s)?;
@@ -255,14 +469,23 @@ fn applyViewUpdates(m: borrow mut Json, updates: borrow Json?, now: i64) -> Resu
             if (sid == -1) { sid = lastSchema; }
             if (sid < 0 || !holdsMember(m, "schemas", "schema-id", sid)) { return Ok(false); }
             jsonSet(mut v, "schema-id", jsonInteger(sid)?)?;
-            var vid = jsonMemberI64(version, "version-id") ?? -1;
-            if (vid < 1 || holdsMember(m, "versions", "version-id", vid)) {
-                vid = highestOf(m, "versions", "version-id") + 1;
-            }
-            jsonSet(mut v, "version-id", jsonInteger(vid)?)?;
             if (jsonMemberI64(version, "timestamp-ms").isNull()) { jsonSet(mut v, "timestamp-ms", jsonInteger(now)?)?; }
+            var vid = jsonMemberI64(version, "version-id") ?? -1;
+            let top = highestOf(m, "versions", "version-id");
+            if (vid <= top) { vid = top + 1; }
+            if (vid < 1) { vid = 1; }
+            jsonSet(mut v, "version-id", jsonInteger(vid)?)?;
             if (!viewVersionOk(borrow v)) { return Ok(false); }
+            // A version the view holds already (all but its id and time) is reused (ADR-0136 §2, as Java's builder).
+            match (sameVersionIn(m, borrow v)) {
+                Some(held) => {
+                    lastVersion = held;
+                    continue;
+                }
+                null => {}
+            }
             appendTo(m, "versions", v)?;
+            added.push(vid)?;
             lastVersion = vid;
         } else if (action == "set-current-view-version".bytes()) {
             var vid = jsonMemberI64(u, "view-version-id") ?? { return Ok(false); };
@@ -272,14 +495,14 @@ fn applyViewUpdates(m: borrow mut Json, updates: borrow Json?, now: i64) -> Resu
             if (jsonMemberI64(m, "current-version-id") == Some(vid)) { continue; }
             jsonSet(m, "current-version-id", jsonInteger(vid)?)?;
             var entry = jsonObject();
-            jsonSet(mut entry, "timestamp-ms", jsonInteger(now)?)?;
+            jsonSet(mut entry, "timestamp-ms", jsonInteger(versionTime(m, vid, now))?)?;
             jsonSet(mut entry, "version-id", jsonInteger(vid)?)?;
             appendTo(m, "version-log", entry)?;
         } else {
             return Ok(false);
         }
     }
-    return Ok(true);
+    return expireViewVersions(m, added.view());
 }
 
 // ---- The calls ----

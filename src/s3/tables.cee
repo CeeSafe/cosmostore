@@ -633,27 +633,42 @@ fn listNamespaces(
     let hidden = tableWarehouseBucket(bucketName)?;
     let bucketRec = tableBucketRecord(store, bucketName)?;
     let base = catalogKey(CATALOG_NAMESPACES, prefix, "".bytes())?;
-    let start = if (after.length > 0) catalogKey(
+    var from = if (after.length > 0) catalogKey(
         CATALOG_NAMESPACES,
         after.view(),
         "".bytes(),
     )? else Vector<u8>.create();
-    let keys = catalogKeys(store, hidden.view(), base.view(), start.view(), max + 1)?;
     var list = jsonArray();
-    let shown = if (keys.length > max) max else keys.length;
+    var shown: usize = 0;
+    var last = Vector<u8>.create();
+    var more = false;
     let head = CATALOG_NAMESPACES.bytes().length;
-    for (i in 0..shown) {
-        let ns = keys[i].view()[head..];
-        // One level, as AWS's (ADR-0134 §1, the owner's choice): a nested namespace is the Iceberg catalog's.
-        if (findBytes(ns, [0x1Fu8][..], 0).isSome()) { continue; }
-        match (readRecord(store, hidden.view(), keys[i].view())?) {
-            Some(r) => { jsonPush(mut list, namespaceView(req, ns, borrow bucketRec.json, borrow r.json)?)?; }
-            null => {}
+    // A page is full, or the last (ADR-0136 §1): the keys are read on past the ones it skips.
+    while (!more) {
+        let keys = catalogKeys(store, hidden.view(), base.view(), from.view(), max + 1)?;
+        for (i in 0..keys.length) {
+            let ns = keys[i].view()[head..];
+            // One level, as AWS's (ADR-0134 §1, the owner's choice): a nested namespace is the Iceberg catalog's.
+            if (findBytes(ns, [0x1Fu8][..], 0).isSome()) { continue; }
+            if (shown == max) {
+                more = true;
+                break;
+            }
+            match (readRecord(store, hidden.view(), keys[i].view())?) {
+                Some(r) => {
+                    jsonPush(mut list, namespaceView(req, ns, borrow bucketRec.json, borrow r.json)?)?;
+                    shown += 1;
+                    last = copyBytes(ns)?;
+                }
+                null => {}
+            }
         }
+        if (keys.length <= max) { break; }
+        from = copyBytes(keys[keys.length - 1].view())?;
     }
     var answer = jsonObject();
     jsonSet(mut answer, "namespaces", list)?;
-    if (shown < keys.length) { setToken(mut answer, keys[shown - 1].view()[head..])?; }
+    if (more) { setToken(mut answer, last.view())?; }
     return tablesJson(borrow answer);
 }
 

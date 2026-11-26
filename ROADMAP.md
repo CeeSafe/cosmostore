@@ -6471,3 +6471,23 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   a table at one name, and a namespace against its parent's drop, on `serve` and a cluster.
 - **B3:** "Every orphaned id": the sweep removes any warehouse id that no table, view or staged create names, and a
   view's earlier metadata files.
+
+### 26 Nov 2026: M35 slices 1 and 2, full list pages and view metadata as Iceberg Java builds it (ADR-0136 §1, §2)
+
+- **Slice 1 (M34's B4):** S3 Tables' ListNamespaces reads on past the nested namespaces it skips, so a page is full
+  or the last; its token is the last shown namespace. ListTables already read on. Test: `namespacePagesSkipNested`
+  (it fails on the old code).
+- **Slice 2 (M34's B1), as Iceberg Java's `ViewMetadata.Builder`:**
+  - an `add-schema` equal to a held schema (fields and identifier fields) reuses its id, and an `add-view-version`
+    equal to a held version (all but its id and time) reuses it; a new id is above every held one;
+  - versions past `version.history.num-entries` (10 when absent; not a positive integer is 400) are expired, the
+    current one and this commit's always kept, and the version log cut after the last entry of an expired version;
+  - the log's entries take the version's `timestamp-ms`, at create and on commits;
+  - a version's `summary` must be an object of strings.
+- **The review's missing tests:** `viewMetadataAsJavaBuilds` (reuse and expiry mutation-checked), `viewUpdatesEachAlone`
+  (`assign-uuid` of another uuid, `remove-properties`, `add-schema` of -1, a commit on a replaced record's
+  CommitFailed) and `viewsInAnEncryptedTableBucket`.
+- **Iceberg Java (`V3Check` phase `views`):** its view keeps one schema across replaces, and with a history of 2 keeps
+  2 versions, the 4th current.
+- **Checks:** 556 unit tests (`snapshotsFaultsCrash` timed out at 60 s under `--jobs`, as it can when the machine is
+  loaded, and passed alone), the Java check plain and on a KMS table, and the S3 smoke.

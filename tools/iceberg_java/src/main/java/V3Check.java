@@ -171,6 +171,17 @@ public class V3Check {
             view = c.loadView(v);
             System.out.println("view-versions " + view.history().size());
             System.out.println("view-current " + view.currentVersion().versionId());
+            // As Java's builder keeps them (ADR-0136 §2): one schema, and versions past the history size expired.
+            System.out.println("view-schemas " + view.schemas().size());
+            view.updateProperties().set("version.history.num-entries", "2").commit();
+            for (int i = 2; i <= 3; i++) {
+                c.buildView(v).withSchema(SCHEMA).withDefaultNamespace(Namespace.of("javans"))
+                    .withQuery("spark", "select id from javans.v3 where id > " + i).replace();
+            }
+            view = c.loadView(v);
+            int kept = 0;
+            for (var ignored : view.versions()) { kept++; }
+            System.out.println("view-kept " + kept + "_" + view.currentVersion().versionId());
             System.out.println("views-listed " + c.listViews(Namespace.of("javans")).size());
             TableIdentifier moved = TableIdentifier.of(Namespace.of("javans"), "jview2");
             c.renameView(v, moved);
