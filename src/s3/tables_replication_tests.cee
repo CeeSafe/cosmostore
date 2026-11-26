@@ -104,7 +104,7 @@ fn replicationConfigurations() -> Result<void, TestFailure> {
     let stale = ["tableBucketARN", SOURCE_ARN, "versionToken", "1"];
     Check.equalU64(409, replicationRequest(mut s, Method.Put, bucketPath, stale[..], body.view()))?;
     Check.equalU64(409, replicationRequest(mut s, Method.Delete, bucketPath, stale[..], "".bytes()))?;
-    Check.equalU64(400, replicationRequest(mut s, Method.Delete, bucketPath, byBucket[..], "".bytes()))?;
+    // A table bucket's Delete may leave out its token, a table's may not (as AWS's model); a token for none: NotFound.
     // The table's own, which replaces its bucket's for it.
     var tableArn = copyBytes(SOURCE_ARN.bytes())!;
     tableArn.extend("/table/".bytes())!;
@@ -115,6 +115,7 @@ fn replicationConfigurations() -> Result<void, TestFailure> {
     Check.equalU64(200, replicationRequest(mut s, Method.Put, "/table-replication", byTable[..], tableBody.view()))?;
     let followed = replicationOf(borrow s, hidden.view(), tableId.view())!!;
     Check.equalBytes(other.bytes(), jsonMemberText(borrow followed, "role")!)?;
+    Check.equalU64(400, replicationRequest(mut s, Method.Delete, "/table-replication", byTable[..], "".bytes()))?;
     // A table no record has: NotFound.
     let noTable = [
         "tableArn",
@@ -125,6 +126,28 @@ fn replicationConfigurations() -> Result<void, TestFailure> {
     let current = ["tableBucketARN", SOURCE_ARN, "versionToken", StringView.fromUtf8(token.view()) ?? ""];
     Check.equalU64(204, replicationRequest(mut s, Method.Delete, bucketPath, current[..], "".bytes()))?;
     Check.equalU64(404, replicationRequest(mut s, Method.Get, bucketPath, byBucket[..], "".bytes()))?;
+    Check.equalU64(404, replicationRequest(mut s, Method.Delete, bucketPath, current[..], "".bytes()))?;
+    Check.equalU64(200, replicationRequest(mut s, Method.Put, bucketPath, byBucket[..], body.view()))?;
+    Check.equalU64(204, replicationRequest(mut s, Method.Delete, bucketPath, byBucket[..], "".bytes()))?;
+    // Two rules, or six destinations: refused, as AWS's model.
+    let twoRules =
+        "{\"configuration\":{\"role\":\"arn:aws:iam::000000000000:role/r\",\"rules\":[{\"destinations\":[{\"destinationTableBucketARN\":\"arn:aws:s3tables:us-east-1:000000000000:bucket/dst\"}]},{\"destinations\":[{\"destinationTableBucketARN\":\"arn:aws:s3tables:us-east-1:000000000000:bucket/dst\"}]}]}}";
+    Check.equalU64(400, replicationRequest(mut s, Method.Put, bucketPath, byBucket[..], twoRules.bytes()))?;
+    // On a cluster, a destination another shard holds: the account's keys only (the M36 exit review's M4).
+    var account = tablesCaller("AKIAACCOUNT");
+    account.cluster = true;
+    let elsewhere = [copyBytes("elsewhere".bytes())!];
+    Check.isTrue(checkReplicationDestinations(borrow s, borrow account, elsewhere[..], true).isOk(), "the account's")?;
+    var user = tablesCaller("AKIAUSER");
+    user.cluster = true;
+    user.user = copyBytes("ana 1".bytes())!;
+    Check.isTrue(
+        match (checkReplicationDestinations(borrow s, borrow user, elsewhere[..], true)) {
+            Err(TablesError.Forbidden) => true,
+            _ => false,
+        },
+        "a user's refused",
+    )?;
     removeTree(dir.view());
     return Ok();
 }
@@ -466,6 +489,105 @@ async fn replicaNotMadeOnceRemoved() -> Result<void, TestFailure> {
         await copyReplica(borrow shared, "compact".bytes(), COMPACT_ID.bytes(), "dst".bytes(), borrow keys)!;
     }
     await Async.blocking(() => checkNoReplica(d.bytes()))?;
+    await Async.blocking(() => removeTree(d));
+    return Ok();
+}
+
+/// The source renamed: its next copy makes a replica at its new name with an id of its own, not the first replica's
+/// (the M36 exit review's H1); a replica renamed: refused; a finish of an earlier version than the replica's: refused
+/// (its M3).
+fn renamedSourceStore(dir: Slice<u8>) -> Result<void, TestFailure> {
+    var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
+    let byName = catalogKey(CATALOG_TABLES, "ns".bytes(), "t".bytes())!;
+    let first = readRecord(borrow s, "dst--table-s3".bytes(), byName.view())!!;
+    let firstId = copyBytes(jsonMemberText(borrow first.json, "id")!)!;
+    // The replica's rename: refused.
+    Check.isTrue(
+        match (renameTableIn(
+            mut s,
+            "dst".bytes(),
+            "ns".bytes(),
+            "t".bytes(),
+            "{\"newName\":\"moved\"}".bytes(),
+            false,
+        )) {
+            Err(TablesError.Forbidden) => true,
+            _ => false,
+        },
+        "a replica's rename refused",
+    )?;
+    // An earlier version than the replica's: refused.
+    let m = readMetadataWith(
+        borrow s,
+        "dst--table-s3".bytes(),
+        jsonMemberText(borrow first.json, "metadataLocation")!,
+        borrow WarehouseKeys { sse: Vector<MasterKey>.create().view(), kms: Vector<MasterKey>.create().view() },
+    )!;
+    var failure = Vector<u8>.create();
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let earlier = replicaDestinationFinish(
+        mut s,
+        "dst".bytes(),
+        "compact".bytes(),
+        COMPACT_ID.bytes(),
+        "ns".bytes(),
+        "t".bytes(),
+        firstId.view(),
+        -5,
+        borrow m,
+        borrow noKeys,
+        mut failure,
+    )!;
+    Check.isTrue(
+        earlier.isNull() && findBytes(failure.view(), "later version".bytes(), 0).isSome(),
+        "an earlier version refused",
+    )?;
+    // The source renamed.
+    Check.isTrue(
+        renameTableIn(mut s, "compact".bytes(), "ns".bytes(), "t".bytes(), "{\"newName\":\"u\"}".bytes(), false).isOk(),
+        "the source renamed",
+    )?;
+    return Ok();
+}
+
+fn checkRenamedSource(dir: Slice<u8>) -> Result<void, TestFailure> {
+    let s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
+    let first = readRecord(
+        borrow s,
+        "dst--table-s3".bytes(),
+        catalogKey(CATALOG_TABLES, "ns".bytes(), "t".bytes())!.view(),
+    )!!;
+    let second = readRecord(
+        borrow s,
+        "dst--table-s3".bytes(),
+        catalogKey(CATALOG_TABLES, "ns".bytes(), "u".bytes())!.view(),
+    )! ?? {
+        return Err(TestFailure.create("no replica at the new name"));
+    };
+    Check.isTrue(
+        jsonMemberText(borrow first.json, "id") != jsonMemberText(borrow second.json, "id"),
+        "an id of its own",
+    )?;
+    return Ok();
+}
+
+@test
+async fn replicaIdsNotShared() -> Result<void, TestFailure> {
+    let base = await Async.blocking(() => scratchDirectory("replica-ids"));
+    let d = base.view();
+    await Async.blocking(() => replicaSourceStore(d.bytes()))?;
+    for (round in 0..2) {
+        let store = await Async.blocking(() => ObjectStore.open(d, storeConfig()))!;
+        {
+            let locked = AsyncMutex<ObjectStore>.create(store)!;
+            let shared = Arc<AsyncMutex<ObjectStore>>.create(locked)!;
+            let keys = await Async.blocking(() => noTableKeys())!;
+            await copyReplica(borrow shared, "compact".bytes(), COMPACT_ID.bytes(), "dst".bytes(), borrow keys)!;
+        }
+        if (round == 0) { await Async.blocking(() => renamedSourceStore(d.bytes()))?; }
+    }
+    await Async.blocking(() => checkRenamedSource(d.bytes()))?;
     await Async.blocking(() => removeTree(d));
     return Ok();
 }

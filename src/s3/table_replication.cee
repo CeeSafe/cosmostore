@@ -128,6 +128,9 @@ struct ReplicaCopy {
     failure: Vector<u8>;
     /// The replica's id an earlier copy kept, from the source's status.
     given: Vector<u8>;
+    /// Each file the copy wrote or found there, by its key in the replica's warehouse: still there at the finish
+    /// (the M36 exit review's M2).
+    replicaKeys: Vector<Vector<u8>>;
 }
 
 fn failCopy(c: borrow mut ReplicaCopy, why: StringView) -> Result<void, AllocError> {
@@ -190,6 +193,8 @@ fn replicaSourceRead(
         Err(e) => { return Err(e); }
     };
     let rec = readRecord(store, srcHidden.view(), key.view())? ?? { return Ok(null); };
+    // A replica is not copied on (the M36 exit review's L6).
+    if (jsonMember(borrow rec.json, "replicaOf").isSome()) { return Ok(null); }
     let rest = key.view()[CATALOG_TABLES.bytes().length..];
     let slash = pieceEnd(rest, 0, '/');
     let srcLocation = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
@@ -210,6 +215,7 @@ fn replicaSourceRead(
         swap: pathSwapOf("".bytes(), "".bytes(), "".bytes(), "".bytes())?,
         failure: Vector<u8>.create(),
         given: Vector<u8>.create(),
+        replicaKeys: Vector<Vector<u8>>.create(),
     };
     if (c.srcLocation.length == 0) {
         failCopy(mut c, "The table has no metadata yet.")?;
@@ -310,7 +316,12 @@ fn replicaDestinationStart(
             }
         }
     }
-    if (id.length == 0 && uuidShaped(given)) { id.extend(given)?; }
+    // An earlier copy's id only while it is still this replica's (the M36 exit review's H1): its configuration names
+    // this namespace and name (a dropped table's goes with it, so an id whose purge may still run is not taken), and
+    // no other table's record holds it.
+    if (id.length == 0 && uuidShaped(given) && replicaIdFree(store, dstHidden.view(), given, ns, name)?) {
+        id.extend(given)?;
+    }
     if (id.length == 0) {
         if (!newUuid(mut id)?) { return Err(TablesError.Internal); }
     }
@@ -366,6 +377,13 @@ struct ReplicaFile {
 
 /// The key in the replica's warehouse of a source path, when the copy can place it; else its failure set.
 fn replicaKeyOf(c: borrow mut ReplicaCopy, path: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
+    let key = replicaKeyPlaced(c, path)? ?? { return Ok(null); };
+    c.replicaKeys.push(copyBytes(key.view())?)?;
+    return Ok(Some(key));
+}
+
+/// `replicaKeyOf`'s key, not noted.
+fn replicaKeyPlaced(c: borrow mut ReplicaCopy, path: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
     if (!inTable(path, c.srcHidden.view(), c.srcId.view())) {
         failCopy(c, "A file the table names is outside its warehouse.")?;
         return Ok(null);
@@ -378,6 +396,19 @@ fn replicaKeyOf(c: borrow mut ReplicaCopy, path: Slice<u8>) -> Result<Vector<u8>
 }
 
 /// The manifest lists of the source's snapshots, and its statistics files, from its metadata.
+/// Whether a snapshot names its manifests itself (format 1's `manifests`), which a copy does not take yet.
+fn embeddedManifests(m: borrow Json) -> bool {
+    match (jsonMember(m, "snapshots")) {
+        Some(Json.Array(snaps)) => {
+            for (i in 0..snaps.length) {
+                if (jsonMember(borrow snaps[i], "manifest-list").isNull()) { return true; }
+            }
+        }
+        _ => {}
+    }
+    return false;
+}
+
 fn replicaTopFiles(
     m: borrow Json,
     lists: borrow mut Vector<Vector<u8>>,
@@ -771,7 +802,15 @@ fn replicaDestinationFinish(
                 failure.extend("The destination has a table at its name that is not its replica.".bytes())?;
                 return Ok(null);
             }
+            // Never back to an earlier version of its source (the M36 exit review's M3): a copy that a deposed
+            // leader finished late.
+            if ((jsonMemberI64(borrow r.json, "sourceVersion") ?? -1) > version) {
+                removeMetadataFile(store, dstHidden.view(), location.view());
+                failure.extend("The replica is of a later version of its source already.".bytes())?;
+                return Ok(null);
+            }
             var next = cloneJson(borrow r.json)?;
+            jsonSet(mut next, "sourceVersion", jsonInteger(version)?)?;
             jsonSet(mut next, "metadataLocation", jsonString(location.view())?)?;
             jsonSet(mut next, "modifiedAt", jsonInteger(now)?)?;
             match (writeRecord(
@@ -800,6 +839,7 @@ fn replicaDestinationFinish(
             jsonSet(mut of, "bucket", jsonString(srcBucket)?)?;
             jsonSet(mut of, "id", jsonString(srcId)?)?;
             jsonSet(mut rec, "replicaOf", of)?;
+            jsonSet(mut rec, "sourceVersion", jsonInteger(version)?)?;
             match (writeRecord(store, dstHidden.view(), dstKey.view(), borrow rec, PutCondition.IfAbsent)) {
                 Ok(_) => {}
                 Err(TablesError.Conflict) => {
@@ -889,6 +929,16 @@ fn endReplicaCopy(
     if (c.failure.length == 0 && !replicationStillNames(store, c)?) {
         failCopy(c, "The table's replication to this destination was removed.")?;
     }
+    // Every file it names still there, under this hold (the M36 exit review's M2): one the copy found there, left by
+    // a copy that failed, may have been deleted since as unreferenced. Its next pass copies it again.
+    if (c.failure.length == 0) {
+        for (i in 0..c.replicaKeys.length) {
+            if (store.headObject(catalogText(c.dstHidden.view()), catalogText(c.replicaKeys[i].view())).isErr()) {
+                failCopy(c, "A file of the replica went while it was copied.")?;
+                break;
+            }
+        }
+    }
     if (c.failure.length == 0) {
         match (finishReplicaCopy(store, c, keys)) {
             Ok(Some(l)) => { replicaLocation = l; }
@@ -940,6 +990,10 @@ async fn copyReplica(
     var lists = Vector<Vector<u8>>.create();
     var files = Vector<ReplicaFile>.create();
     var manifests = Vector<Vector<u8>>.create();
+    // A format 1 snapshot naming its manifests itself is not copied (the M36 exit review's L4).
+    if (c.failure.length == 0 && embeddedManifests(borrow c.metadata)) {
+        let _ = failCopy(mut c, "A snapshot names its manifests itself (format 1), which is not copied yet.");
+    }
     if (c.failure.length == 0 && replicaTopFiles(borrow c.metadata, mut lists, mut files).isErr()) { return Ok(); }
     // Each manifest list's manifests, and each manifest's files: one file read at each hold of the store.
     for (l in 0..lists.length) {
@@ -1195,10 +1249,36 @@ fn reconcileReplication(store: borrow mut ObjectStore, t: borrow MaintainedTable
             hidden.view(),
             replicationStatusKey(id, destinations[d].view())?.view(),
         )?) {
-            Some(s) => jsonMemberText(borrow s.json, "sourceLocation") != Some(current),
+            // Behind, or failed (the M36 exit review's M1): a failed copy is tried again each pass, not only at the
+            // source's next commit.
+            Some(s) => jsonMemberText(borrow s.json, "sourceLocation") != Some(current) ||
+                jsonMemberText(borrow s.json, "status") != Some("completed".bytes()),
             null => true,
         };
         if (behind) { return askReplication(store, hidden.view(), id); }
     }
     return Ok();
+}
+
+/// Whether a replica's id an earlier copy kept is still free for this replica: its configuration there names `ns` and
+/// `name`, and no table record holds the id (the M36 exit review's H1).
+fn replicaIdFree(
+    store: borrow ObjectStore,
+    hidden: Slice<u8>,
+    id: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+) -> Result<bool, TablesError> {
+    let config = readRecord(store, hidden, tableConfigKey(id)?.view())? ?? { return Ok(false); };
+    if (jsonMemberText(
+        borrow config.json,
+        "namespace",
+    ) != Some(ns) || jsonMemberText(borrow config.json, "name") != Some(name)) {
+        return Ok(false);
+    }
+    return match (tableKeyOfId(store, hidden, id)) {
+        Ok(_) => Ok(false),
+        Err(TablesError.NotFound) => Ok(true),
+        Err(e) => Err(e),
+    };
 }

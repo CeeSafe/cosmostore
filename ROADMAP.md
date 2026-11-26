@@ -6739,3 +6739,22 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   shards 2 and 1), the S3 smoke's CLI checks, and the unit tests above.
 - **Checks:** 569 unit tests, the Java check (60 plain, 63 on a KMS table bucket), the S3 smoke and the cluster S3
   smoke (214).
+
+### 26 Nov 2026: M36 slice 5, the exit review (`docs/m36-exit-review.md`)
+
+- **The review:** an independent agent, reading only. Nothing deletes or corrupts a source table; one High, four
+  Mediums.
+- **Fixed, with tests (mutation-checked where they guard data):**
+  - High: a copy could reuse a replica id another table at the destination held (after a rename, or a dropped
+    replica's purge). An earlier copy's id is now reused only while its configuration names this replica and no record
+    holds it, and a replica's rename is refused;
+  - Medium: a failed copy is tried again each maintenance pass;
+  - Medium: every file a copy names is checked still there before its finish;
+  - Medium: a replica keeps its source's version, and is never moved back;
+  - Medium: on a cluster, another shard's destination is the account's keys' to name only;
+  - Lows: AWS's token rule for a bucket's Delete and its limits (one rule, five destinations); an unswappable delete
+    bound dropped; format 1's embedded manifests refused; a replica is not a source; a dropped source's ask and
+    statuses removed.
+- **Recorded:** B1 to B7, first a cluster's files over 64 MiB.
+- **Checks:** 570 unit tests, the S3 smoke, the cluster S3 smoke (214), the Java check (60, and 63 on KMS).
+- **Waiting:** ADR-0138's acceptance and M36's close, the owner's.

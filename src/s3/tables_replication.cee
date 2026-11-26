@@ -13,7 +13,7 @@ const REPLICATION_TABLES: StringView = ".s3tables/replication/tables/";
 /// The service a replica is managed by, as GetTable and ListTables name it (`managedByService`).
 const REPLICATION_SERVICE: StringView = "replication.s3tables.amazonaws.com";
 /// Destinations one configuration names at most.
-const REPLICATION_DESTINATIONS_MAX: usize = 50;
+const REPLICATION_DESTINATIONS_MAX: usize = 5;
 
 fn tableReplicationKey(id: Slice<u8>) -> Result<Vector<u8>, AllocError> =>
     catalogKey(REPLICATION_TABLES, id, "".bytes());
@@ -41,14 +41,15 @@ fn replicationConfigOf(
         Some(Json.Array(items)) => items,
         _ => { return Err(TablesError.BadRequest); }
     };
-    if (rules.length == 0) { return Err(TablesError.BadRequest); }
+    // One rule, of one to five destinations, as AWS's model has it (the M36 exit review's L2).
+    if (rules.length != 1) { return Err(TablesError.BadRequest); }
     var keptRules = jsonArray();
     for (r in 0..rules.length) {
         let dests = match (jsonMember(borrow rules[r], "destinations")) {
             Some(Json.Array(items)) => items,
             _ => { return Err(TablesError.BadRequest); }
         };
-        if (dests.length == 0) { return Err(TablesError.BadRequest); }
+        if (dests.length == 0 || dests.length > REPLICATION_DESTINATIONS_MAX) { return Err(TablesError.BadRequest); }
         var keptDests = jsonArray();
         for (d in 0..dests.length) {
             let arn = jsonMemberText(borrow dests[d], "destinationTableBucketARN") ?? {
@@ -95,7 +96,10 @@ fn checkReplicationDestinations(
             Err(e) => { return Err(tablesStoreFail(e)); }
         };
         if (!there) {
-            if (cluster) { continue; }
+            // Another shard's: its policies are not read here, so only the account's keys name it (the M36 exit
+            // review's M4); a user or a role's session is refused.
+            if (cluster && caller.user.length == 0 && !caller.role) { continue; }
+            if (cluster) { return Err(TablesError.Forbidden); }
             return Err(TablesError.NotFound);
         }
         for (action in [
@@ -131,6 +135,7 @@ fn replicationConfigCall(
     hidden: Slice<u8>,
     key: Slice<u8>,
     config: Json?,
+    deleteNeedsToken: bool,
 ) -> Result<TablesAnswer, TablesError> {
     let held = readRecord(store, hidden, key)?;
     let token = paramOf(req, "versionToken");
@@ -143,7 +148,8 @@ fn replicationConfigCall(
         })?)?;
         return tablesJson(borrow answer);
     }
-    // A token given must be the one there.
+    // A token given must be the one there; none there to give it for: NotFound for a Delete, as AWS's model has it.
+    if (token.isSome() && held.isNull() && isMethod(req.method, Method.Delete)) { return Err(TablesError.NotFound); }
     var condition = PutCondition.None;
     match (token) {
         Some(t) => {
@@ -164,7 +170,8 @@ fn replicationConfigCall(
         return tablesJson(borrow answer);
     }
     if (isMethod(req.method, Method.Delete)) {
-        if (token.isNull()) { return Err(TablesError.BadRequest); }
+        // A table's Delete must give its token; a table bucket's may (the M36 exit review's L1, as AWS's model).
+        if (deleteNeedsToken && token.isNull()) { return Err(TablesError.BadRequest); }
         if (held.isNull()) { return Err(TablesError.NotFound); }
         removeCatalogObject(store, hidden, key)?;
         return Ok(tablesNoContent());
@@ -201,7 +208,7 @@ fn tableBucketReplicationCall(
         checkTables(store, caller, "s3tables:GetTableBucketMaintenanceConfiguration", bucket.view(), "".bytes())?;
         checkReplicationDestinations(store, caller, destinations.view(), cluster)?;
     }
-    let answer = replicationConfigCall(store, req, hidden.view(), REPLICATION_BUCKET_KEY.bytes(), config)?;
+    let answer = replicationConfigCall(store, req, hidden.view(), REPLICATION_BUCKET_KEY.bytes(), config, false)?;
     // Each of its tables copied now (ADR-0138 §3), not at its next commit: a replica and a table with its own
     // configuration left out.
     if (isMethod(m, Method.Put)) {
@@ -238,7 +245,12 @@ fn tableReplicationCall(
         else "s3tables:GetTableReplication";
     // Authorized before the table's existence is told.
     checkTables(store, caller, action, bucket.view(), id.view())?;
-    let _ = tableKeyOfId(store, hidden.view(), id.view())?;
+    let tableKey = tableKeyOfId(store, hidden.view(), id.view())?;
+    // A replica is not a source (the M36 exit review's L6).
+    if (isMethod(m, Method.Put)) {
+        let rec = readRecord(store, hidden.view(), tableKey.view())? ?? { return Err(TablesError.NotFound); };
+        if (jsonMember(borrow rec.json, "replicaOf").isSome()) { return Err(TablesError.BadRequest); }
+    }
     var config: Json? = null;
     if (isMethod(m, Method.Put)) {
         var destinations = Vector<Vector<u8>>.create();
@@ -248,7 +260,7 @@ fn tableReplicationCall(
         checkReplicationDestinations(store, caller, destinations.view(), cluster)?;
     }
     let key = tableReplicationKey(id.view())?;
-    let answer = replicationConfigCall(store, req, hidden.view(), key.view(), config)?;
+    let answer = replicationConfigCall(store, req, hidden.view(), key.view(), config, true)?;
     // The table copied now (ADR-0138 §3).
     if (isMethod(m, Method.Put)) { writeReplicationAsk(store, hidden.view(), id.view())?; }
     return Ok(answer);
