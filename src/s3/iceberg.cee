@@ -1185,6 +1185,8 @@ fn swapMetadata(
     previousStamp: i64,
     sealing: borrow WarehouseKeys,
 ) -> Result<Vector<u8>?, TablesError> {
+    // A replica moves only by its replication (ADR-0138 §2): no commit, compaction or snapshot management of its own.
+    if (jsonMember(borrow rec.json, "replicaOf").isSome()) { return Err(TablesError.Forbidden); }
     // The metadata changed now, unless a snapshot's time already says when.
     if ((jsonMemberI64(m, "last-updated-ms") ?? 0) == previousStamp) {
         let now = Clock.unixMillis();
@@ -1209,6 +1211,8 @@ fn swapMetadata(
     let location = writeMetadataWith(store, hidden, id, if (version > 0) version else 1, m, sealing)?;
     jsonSet(mut rec.json, "metadataLocation", jsonString(location.view())?)?;
     jsonSet(mut rec.json, "modifiedAt", jsonInteger(Clock.unixMillis())?)?;
+    // A replicated table's copy asked for first (ADR-0138 §3).
+    askReplication(store, hidden, id)?;
     match (writeRecord(store, hidden, key, borrow rec.json, PutCondition.IfGeneration(rec.generation))) {
         Ok(g) => { rec.generation = g; }
         Err(TablesError.Conflict) => {
@@ -1360,6 +1364,7 @@ fn icebergCreateTable(
     jsonSet(mut rec, "createdAt", jsonInteger(now)?)?;
     jsonSet(mut rec, "modifiedAt", jsonInteger(now)?)?;
     jsonSet(mut rec, "metadataLocation", jsonString(location.view())?)?;
+    askReplication(store, hidden.view(), id.view())?;
     match (writeRecord(store, hidden.view(), key.view(), borrow rec, PutCondition.IfAbsent)) {
         Ok(_) => {}
         Err(e) => {
@@ -1466,6 +1471,7 @@ fn icebergCommitCreate(
     jsonSet(mut rec, "modifiedAt", jsonInteger(now)?)?;
     jsonSet(mut rec, "metadataLocation", jsonString(written.view())?)?;
     let key = catalogKey(CATALOG_TABLES, ns, name)?;
+    askReplication(store, hidden.view(), id.view())?;
     match (writeRecord(store, hidden.view(), key.view(), borrow rec, PutCondition.IfAbsent)) {
         Ok(_) => {}
         Err(e) => {

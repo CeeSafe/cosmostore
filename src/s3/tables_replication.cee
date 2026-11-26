@@ -252,3 +252,106 @@ fn replicationOf(store: borrow ObjectStore, hidden: Slice<u8>, id: Slice<u8>) ->
         null => Ok(null),
     };
 }
+
+/// The table a call's `tableArn` names: its bucket, its id and its record's key, the caller authorized for `action`
+/// first.
+fn replicatedTableOf(
+    store: borrow ObjectStore,
+    req: borrow S3Request,
+    caller: borrow TablesCaller,
+    action: StringView,
+    bucket: borrow mut Vector<u8>,
+    id: borrow mut Vector<u8>,
+) -> Result<Vector<u8>, TablesError> {
+    let arn = paramOf(req, "tableArn") ?? { return Err(TablesError.BadRequest); };
+    *bucket = tableBucketOfArn(arn, id)? ?? { return Err(TablesError.BadRequest); };
+    if (id.length == 0) { return Err(TablesError.BadRequest); }
+    let _ = tableBucketRecord(store, bucket.view())?;
+    checkTables(store, caller, action, bucket.view(), id.view())?;
+    let hidden = tableWarehouseBucket(bucket.view())?;
+    return tableKeyOfId(store, hidden.view(), id.view());
+}
+
+/// GetTableReplicationStatus (`/replication-status?tableArn=`, ADR-0138 §5): each destination of the table's
+/// configuration, `completed` when its replica is of the source's current metadata, `failed` when its last copy of it
+/// failed, else `pending`.
+fn tableReplicationStatusCall(
+    store: borrow ObjectStore,
+    req: borrow S3Request,
+    caller: borrow TablesCaller,
+) -> Result<TablesAnswer, TablesError> {
+    var bucket = Vector<u8>.create();
+    var id = Vector<u8>.create();
+    let key = replicatedTableOf(store, req, caller, "s3tables:GetTableReplicationStatus", mut bucket, mut id)?;
+    let hidden = tableWarehouseBucket(bucket.view())?;
+    let rec = readRecord(store, hidden.view(), key.view())? ?? { return Err(TablesError.NotFound); };
+    let current = jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes();
+    let config = replicationOf(store, hidden.view(), id.view())? ?? { return Err(TablesError.NotFound); };
+    var list = jsonArray();
+    let destinations = replicationDestinations(borrow config)?;
+    for (d in 0..destinations.length) {
+        var entry = jsonObject();
+        var arn = Vector<u8>.create();
+        tableBucketArn(req, destinations[d].view(), mut arn)?;
+        jsonSet(mut entry, "destinationTableBucketArn", Json.Text(arn))?;
+        var state = "pending";
+        match (readRecord(store, hidden.view(), replicationStatusKey(id.view(), destinations[d].view())?.view())?) {
+            Some(s) => {
+                let of = jsonMemberText(borrow s.json, "sourceLocation") ?? "".bytes();
+                let kept = jsonMemberText(borrow s.json, "status") ?? "".bytes();
+                if (of == current && kept == "completed".bytes()) { state = "completed"; }
+                if (of == current && kept == "failed".bytes()) { state = "failed"; }
+                match (jsonMemberText(borrow s.json, "replicaId")) {
+                    Some(r) => {
+                        var replica = Vector<u8>.create();
+                        tableArn(req, destinations[d].view(), r, mut replica)?;
+                        jsonSet(mut entry, "destinationTableArn", Json.Text(replica))?;
+                    }
+                    null => {}
+                }
+                match (jsonMemberText(borrow s.json, "replicaLocation")) {
+                    Some(l) => {
+                        var last = jsonObject();
+                        jsonSet(mut last, "metadataLocation", jsonString(l)?)?;
+                        jsonSet(mut last, "timestamp", isoText(jsonMemberI64(borrow s.json, "completedAt") ?? 0)?)?;
+                        jsonSet(mut entry, "lastSuccessfulReplicatedUpdate", last)?;
+                    }
+                    null => {}
+                }
+                match (jsonMemberText(borrow s.json, "failure")) {
+                    Some(f) => { if (state == "failed") { jsonSet(mut entry, "failureMessage", jsonString(f)?)?; } }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        jsonSet(mut entry, "replicationStatus", jsonString(state.bytes())?)?;
+        jsonPush(mut list, entry)?;
+    }
+    var answer = jsonObject();
+    var source = Vector<u8>.create();
+    tableArn(req, bucket.view(), id.view(), mut source)?;
+    jsonSet(mut answer, "sourceTableArn", Json.Text(source))?;
+    jsonSet(mut answer, "destinations", list)?;
+    return tablesJson(borrow answer);
+}
+
+/// DisassociateTableReplication (`PUT /table-replication/disassociate?tableArn=`, ADR-0138 §2): a replica made a table
+/// of its own, for good; a table that is not a replica refused. Its source's next copy to it then fails.
+fn disassociateReplicaCall(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    caller: borrow TablesCaller,
+) -> Result<TablesAnswer, TablesError> {
+    var bucket = Vector<u8>.create();
+    var id = Vector<u8>.create();
+    let key = replicatedTableOf(store, req, caller, "s3tables:DisassociateTableReplication", mut bucket, mut id)?;
+    let hidden = tableWarehouseBucket(bucket.view())?;
+    let rec = readRecord(store, hidden.view(), key.view())? ?? { return Err(TablesError.NotFound); };
+    if (jsonMember(borrow rec.json, "replicaOf").isNull()) { return Err(TablesError.BadRequest); }
+    var next = cloneJson(borrow rec.json)?;
+    jsonRemove(mut next, "replicaOf".bytes());
+    jsonSet(mut next, "modifiedAt", jsonInteger(Clock.unixMillis())?)?;
+    let _ = writeRecord(store, hidden.view(), key.view(), borrow next, PutCondition.IfGeneration(rec.generation))?;
+    return tablesJson(borrow jsonObject());
+}

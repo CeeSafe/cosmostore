@@ -775,6 +775,27 @@ fn tableView(
     jsonSet(mut j, "tableARN", Json.Text(arn))?;
     jsonSet(mut j, "type", jsonString("customer".bytes())?)?;
     jsonSet(mut j, "tableBucketId", jsonString(jsonMemberText(bucketRec, "id") ?? "".bytes())?)?;
+    // A replica, managed by replication (ADR-0138 §2): its source's ARN in GetTable's answer.
+    match (jsonMember(borrow rec.json, "replicaOf")) {
+        Some(of) => {
+            jsonSet(mut j, "managedByService", jsonString(REPLICATION_SERVICE.bytes())?)?;
+            if (full) {
+                var source = Vector<u8>.create();
+                tableArn(
+                    req,
+                    jsonMemberText(of, "bucket") ?? "".bytes(),
+                    jsonMemberText(of, "id") ?? "".bytes(),
+                    mut source,
+                )?;
+                var information = jsonObject();
+                jsonSet(mut information, "sourceTableARN", Json.Text(source))?;
+                var managed = jsonObject();
+                jsonSet(mut managed, "replicationInformation", information)?;
+                jsonSet(mut j, "managedTableInformation", managed)?;
+            }
+        }
+        null => {}
+    }
     if (full) {
         jsonSet(mut j, "createdBy", jsonString(TABLES_ACCOUNT.bytes())?)?;
         jsonSet(mut j, "modifiedBy", jsonString(TABLES_ACCOUNT.bytes())?)?;
@@ -883,6 +904,7 @@ fn createTable(
         let hiddenView = hidden.view();
         let keyView = key.view();
         let recRef = borrow rec;
+        askReplication(store, hiddenView, id.view())?;
         generation = match (writeRecord(store, hiddenView, keyView, recRef, PutCondition.IfAbsent)) {
             Ok(g) => g,
             Err(e) => {
@@ -1262,6 +1284,9 @@ fn updateTableMetadataLocation(
         let keyView = key.view();
         let recRef = borrow rec.json;
         let current = rec.generation;
+        // A replica moves only by its replication (ADR-0138 §2).
+        if (jsonMember(recRef, "replicaOf").isSome()) { return Err(TablesError.Forbidden); }
+        askReplication(store, hiddenView, jsonMemberText(recRef, "id") ?? "".bytes())?;
         generation = (writeRecord(store, hiddenView, keyView, recRef, PutCondition.IfGeneration(current)))?;
     }
     var answer = jsonObject();
@@ -1331,6 +1356,13 @@ fn routeTablesSync(
     }
     if (top == "table-replication".bytes() && segs.length == 1) {
         return tableReplicationCall(store, req, body, caller, caller.cluster);
+    }
+    if (top == "table-replication".bytes() && segs.length == 2 && segs[1].view() == "disassociate".bytes() &&
+        isMethod(m, Method.Put)) {
+        return disassociateReplicaCall(store, req, caller);
+    }
+    if (top == "replication-status".bytes() && segs.length == 1 && isMethod(m, Method.Get)) {
+        return tableReplicationStatusCall(store, req, caller);
     }
     if (top == "get-table".bytes() && segs.length == 1) {
         if (!isMethod(m, Method.Get)) { return Err(TablesError.BadRequest); }

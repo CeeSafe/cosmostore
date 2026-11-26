@@ -57,7 +57,7 @@ fn bucketReplicationToken(s: borrow mut ObjectStore) -> Vector<u8> {
 
 /// A table bucket's and a table's replication configurations (ADR-0138 §1): put, read, replaced only with the token
 /// there, deleted only with it; a destination that is the source, or not there, or a role that is not one, refused;
-/// a table's own replacing its bucket's.
+/// a table's mine replacing its bucket's.
 @test
 fn replicationConfigurations() -> Result<void, TestFailure> {
     let dir = scratchDirectory("replication-config");
@@ -121,5 +121,239 @@ fn replicationConfigurations() -> Result<void, TestFailure> {
     Check.equalU64(204, replicationRequest(mut s, Method.Delete, bucketPath, current[..], "".bytes()))?;
     Check.equalU64(404, replicationRequest(mut s, Method.Get, bucketPath, byBucket[..], "".bytes()))?;
     removeTree(dir.view());
+    return Ok();
+}
+
+/// The compaction fixture's table (`compact`'s `ns.t`: two data files, a position delete file, an equality delete
+/// file), and an empty table bucket `dst`.
+fn replicaSourceStore(dir: Slice<u8>) -> Result<void, TestFailure> {
+    deletesStore(dir, storeConfig());
+    var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
+    s.createBucket("dst--table-s3")!;
+    return Ok();
+}
+
+/// The replica's text has none of its source's warehouse, and all of its mine.
+fn noSourcePath(bytes: Slice<u8>, what: StringView) -> Result<void, TestFailure> {
+    if (findBytes(bytes, "compact--table-s3".bytes(), 0).isSome()) { return Err(TestFailure.create(what)); }
+    return Ok();
+}
+
+/// `dst`'s replica of `compact`'s `ns.t` (ADR-0138 §2): marked as its replica; its metadata, manifest lists and
+/// manifests naming only its mine warehouse; each file they name there; its position delete file read with its own
+/// paths; the source's status `completed`.
+fn checkReplica(dir: Slice<u8>) -> Result<void, TestFailure> {
+    let s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let dst = "dst--table-s3".bytes();
+    let rec = readRecord(borrow s, dst, catalogKey(CATALOG_TABLES, "ns".bytes(), "t".bytes())!.view())! ?? {
+        return Err(TestFailure.create("no replica"));
+    };
+    Check.isTrue(replicaOfSource(borrow rec.json, "compact".bytes(), COMPACT_ID.bytes()), "marked as the replica")?;
+    let id = copyBytes(jsonMemberText(borrow rec.json, "id")!)!;
+    var mine = copyBytes("s3://dst--table-s3/".bytes())!;
+    mine.extend(id.view())!;
+    mine.push('/')!;
+    let location = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation")!)!;
+    Check.isTrue(startsWithBytes(location.view(), mine.view()), "its metadata in its warehouse")?;
+    let m = readMetadataWith(borrow s, dst, location.view(), borrow noKeys)!;
+    var text = Vector<u8>.create();
+    writeJson(mut text, borrow m)!;
+    noSourcePath(text.view(), "the metadata names the source")?;
+    var files: u64 = 0;
+    var deletes: u64 = 0;
+    for (snap in memberItems(borrow m, "snapshots")!.view()) {
+        let listPath = jsonMemberText(snap, "manifest-list")!;
+        let list = readWarehouseAvroWith(borrow s, dst, listPath, borrow noKeys)! ?? {
+            return Err(TestFailure.create("a manifest list not there"));
+        };
+        for (entry in list.records.view()) {
+            var lt = Vector<u8>.create();
+            writeJson(mut lt, entry)!;
+            noSourcePath(lt.view(), "a manifest list names the source")?;
+            let manifest = readWarehouseAvroWith(
+                borrow s,
+                dst,
+                jsonMemberText(entry, "manifest_path")!,
+                borrow noKeys,
+            )! ?? {
+                return Err(TestFailure.create("a manifest not there"));
+            };
+            for (record in manifest.records.view()) {
+                var mt = Vector<u8>.create();
+                writeJson(mut mt, record)!;
+                noSourcePath(mt.view(), "a manifest names the source")?;
+                let f = jsonMember(record, "data_file")!;
+                let path = jsonMemberText(f, "file_path")!;
+                Check.isTrue(startsWithBytes(path, mine.view()), "a file in its warehouse")?;
+                let key = refKey(path);
+                let info = s.headObject("dst--table-s3", catalogText(key))!;
+                Check.isTrue(jsonMemberI64(f, "file_size_in_bytes") == Some(truncate<i64>(info.size)), "its size")?;
+                files += 1;
+                if (jsonMemberI64(f, "content") == Some(1)) {
+                    let bytes = s.getObject("dst--table-s3", catalogText(key))!;
+                    let d = readPositionDeletes(bytes.view())!!;
+                    for (p in d.paths.view()) {
+                        Check.isTrue(startsWithBytes(p.view(), mine.view()), "a delete naming its own data file")?;
+                    }
+                    deletes += 1;
+                }
+            }
+        }
+    }
+    Check.isTrue(files >= 4, "its data and delete files")?;
+    Check.equalU64(1, deletes)?;
+    let status = readRecord(
+        borrow s,
+        "compact--table-s3".bytes(),
+        replicationStatusKey(COMPACT_ID.bytes(), "dst".bytes())!.view(),
+    )!!;
+    Check.equalBytes("completed".bytes(), jsonMemberText(borrow status.json, "status")!)?;
+    Check.equalBytes(location.view(), jsonMemberText(borrow status.json, "replicaLocation")!)?;
+    return Ok();
+}
+
+/// A table copied to its replica (ADR-0138 §2, §3) through the async copy as `serve` runs it, then copied again: the
+/// second copy finds every file there and moves the replica to a new metadata file of the same content.
+@test
+async fn replicaCopied() -> Result<void, TestFailure> {
+    let base = await Async.blocking(() => scratchDirectory("replica-copy"));
+    let d = base.view();
+    await Async.blocking(() => replicaSourceStore(d.bytes()))?;
+    let store = await Async.blocking(() => ObjectStore.open(d, storeConfig()))!;
+    {
+        let locked = AsyncMutex<ObjectStore>.create(store)!;
+        let shared = Arc<AsyncMutex<ObjectStore>>.create(locked)!;
+        let keys = await Async.blocking(() => noTableKeys())!;
+        await copyReplica(borrow shared, "compact".bytes(), COMPACT_ID.bytes(), "dst".bytes(), borrow keys)!;
+        await copyReplica(borrow shared, "compact".bytes(), COMPACT_ID.bytes(), "dst".bytes(), borrow keys)!;
+    }
+    await Async.blocking(() => checkReplica(d.bytes()))?;
+    await Async.blocking(() => removeTree(d));
+    return Ok();
+}
+
+/// A tables call by path and query, its answer or error.
+fn tablesCall(
+    s: borrow mut ObjectStore,
+    method: Method,
+    path: StringView,
+    params: Slice<StringView>,
+) -> Result<TablesAnswer, TablesError> {
+    var req = tablesPathRequest(path);
+    req.method = method;
+    var i: usize = 0;
+    while (i + 1 < params.length) {
+        req.query.push(policyParam(params[i], params[i + 1]))!;
+        i += 2;
+    }
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let creds = Vector<Credential>.create();
+    let caller = tablesCaller("AKIAREPLICATION");
+    return routeTablesSync(s, borrow req, "".bytes(), borrow caller, creds.view(), borrow noKeys);
+}
+
+/// The source's table bucket replicated to `dst`, and its table's copy asked for, as a commit asks.
+fn askedReplicaStore(dir: Slice<u8>) -> Result<void, TestFailure> {
+    replicaSourceStore(dir)?;
+    var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
+    let config = parseJson(
+        "{\"configuration\":{\"role\":\"arn:aws:iam::000000000000:role/r\",\"rules\":[{\"destinations\":[{\"destinationTableBucketARN\":\"arn:aws:s3tables:us-east-1:000000000000:bucket/dst\"}]}]}}".bytes(),
+    )!!;
+    let _ = writeRecord(
+        mut s,
+        "compact--table-s3".bytes(),
+        REPLICATION_BUCKET_KEY.bytes(),
+        borrow config,
+        PutCondition.None,
+    )!;
+    askReplication(mut s, "compact--table-s3".bytes(), COMPACT_ID.bytes())!;
+    Check.isTrue(
+        readRecord(borrow s, "compact--table-s3".bytes(), replicationAskKey(COMPACT_ID.bytes())!.view())!.isSome(),
+        "asked",
+    )?;
+    return Ok();
+}
+
+/// After the loop's pass: the ask answered; the status `completed` with the replica's ARN and metadata; the replica
+/// marked in GetTable, refused a commit, disassociated once (then a table of its own, and not again).
+fn checkAskedReplica(dir: Slice<u8>) -> Result<void, TestFailure> {
+    var s = ObjectStore.open(StringView.fromUtf8(dir) ?? "", storeConfig())!;
+    Check.isTrue(
+        readRecord(borrow s, "compact--table-s3".bytes(), replicationAskKey(COMPACT_ID.bytes())!.view())!.isNull(),
+        "the ask answered",
+    )?;
+    var source = copyBytes("arn:aws:s3tables:us-east-1:000000000000:bucket/compact/table/".bytes())!;
+    source.extend(COMPACT_ID.bytes())!;
+    let sourceArn = StringView.fromUtf8(source.view()) ?? "";
+    let status = parseJson(
+        tablesCall(mut s, Method.Get, "/replication-status", ["tableArn", sourceArn][..])!.body.view(),
+    )!!;
+    let destinations = memberItems(borrow status, "destinations")!;
+    let first = borrow destinations[0];
+    Check.equalBytes("completed".bytes(), jsonMemberText(first, "replicationStatus")!)?;
+    Check.isTrue(jsonMemberText(first, "destinationTableArn").isSome(), "the replica's ARN")?;
+    Check.isTrue(jsonMember(first, "lastSuccessfulReplicatedUpdate").isSome(), "its last update")?;
+    let byName = [
+        "tableBucketARN",
+        "arn:aws:s3tables:us-east-1:000000000000:bucket/dst",
+        "namespace",
+        "ns",
+        "name",
+        "t",
+    ];
+    let got = parseJson(tablesCall(mut s, Method.Get, "/get-table", byName[..])!.body.view())!!;
+    Check.equalBytes(REPLICATION_SERVICE.bytes(), jsonMemberText(borrow got, "managedByService")!)?;
+    let info = jsonMember(jsonMember(borrow got, "managedTableInformation")!, "replicationInformation")!;
+    Check.equalBytes(source.view(), jsonMemberText(info, "sourceTableARN")!)?;
+    // A commit to the replica: refused.
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let update =
+        "{\"requirements\":[],\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"k\":\"v\"}}]}".bytes();
+    Check.isTrue(
+        match (icebergCommit(mut s, "dst".bytes(), "ns".bytes(), "t".bytes(), update, borrow noKeys)) {
+            Err(TablesError.Forbidden) => true,
+            Ok(a) => a.status == 403,
+            _ => false,
+        },
+        "a commit to the replica refused",
+    )?;
+    // Disassociated: a table of its own, once.
+    let replicaArn = copyBytes(jsonMemberText(borrow got, "tableARN")!)!;
+    let byArn = ["tableArn", StringView.fromUtf8(replicaArn.view()) ?? ""];
+    Check.isTrue(tablesCall(mut s, Method.Put, "/table-replication/disassociate", byArn[..]).isOk(), "disassociated")?;
+    let after = parseJson(tablesCall(mut s, Method.Get, "/get-table", byName[..])!.body.view())!!;
+    Check.isTrue(jsonMemberText(borrow after, "managedByService").isNull(), "no longer managed")?;
+    Check.isTrue(
+        match (tablesCall(mut s, Method.Put, "/table-replication/disassociate", byArn[..])) {
+            Err(TablesError.BadRequest) => true,
+            _ => false,
+        },
+        "not a replica now",
+    )?;
+    let committed = icebergCommit(mut s, "dst".bytes(), "ns".bytes(), "t".bytes(), update, borrow noKeys)!;
+    Check.equalU64(200, committed.status as u64)?;
+    return Ok();
+}
+
+/// A commit's ask copied by the replication loop's pass (ADR-0138 §3), as `serve` runs it, then the status, the
+/// replica's marks, its refusal of commits, and its disassociation (§2, §5).
+@test
+async fn replicationAskedAndAnswered() -> Result<void, TestFailure> {
+    let base = await Async.blocking(() => scratchDirectory("replica-asked"));
+    let d = base.view();
+    await Async.blocking(() => askedReplicaStore(d.bytes()))?;
+    let store = await Async.blocking(() => ObjectStore.open(d, storeConfig()))!;
+    {
+        let locked = AsyncMutex<ObjectStore>.create(store)!;
+        let shared = Arc<AsyncMutex<ObjectStore>>.create(locked)!;
+        let keys = await Async.blocking(() => noTableKeys())!;
+        await replicateAsked(borrow shared, borrow keys)!;
+    }
+    await Async.blocking(() => checkAskedReplica(d.bytes()))?;
+    await Async.blocking(() => removeTree(d));
     return Ok();
 }

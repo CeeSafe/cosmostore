@@ -6651,3 +6651,34 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
     a file outside the source's warehouse refused.
 - **Tests:** `replicaPathsSwapped`, `replicaManifestsSwapped`, `replicaPuffinSwapped`, `replicaPositionDeletesSwapped`
   (mutation-checked: the bounds' swap, the footer's length).
+
+### 26 Nov 2026: M36 slice 2, part 2: the copy, its asks, its status and the replica's marks (ADR-0138 §2, §3, §5)
+
+- **Asks** (`src/s3/table_replication.cee`): a replicated table's ask (`.s3tables/replication/asks/<id>`) is written
+  before its record changes: in `swapMetadata` (commits, compaction, snapshot management), the creates and
+  `UpdateTableMetadataLocation`. An ask for a commit that then failed copies nothing new.
+- **The copy,** per destination of the table's configuration, on `serve` (both table buckets on one store):
+  - the replica at the source's namespace (made there if missing) and name, its id kept in the destination's
+    status, so a copy cut short is taken up again under it and a file the replica has is not copied again; its
+    configuration made from the destination bucket's encryption and storage class;
+  - files first: data, equality delete and statistics files streamed a megabyte at a time off the store's hold,
+    opened with the source's encryption and sealed with the replica's; position delete files and deletion vectors
+    rewritten; then manifests and manifest lists (rewritten in their own codec, with the rewritten files' sizes),
+    the metadata (its log starting at this file), and the record last (made `IfAbsent`, or moved on `IfGeneration`);
+  - a path not under the source's warehouse, or not `s3://`, fails the copy with its reason;
+  - a table at the name that is not this source's replica (a disassociated one, another table, a view) fails it.
+- **The loop:** each second on `serve`, beside table maintenance: each ask copied to each destination, then removed
+  unless asked again since.
+- **`GetTableReplicationStatus`:** per destination, `completed` when the replica is of the source's current metadata,
+  `failed` with its message when its last copy of it failed, else `pending`; the replica's ARN and its last update.
+- **The replica:** GetTable and ListTables give `managedByService` (`replication.s3tables.amazonaws.com`), GetTable
+  `managedTableInformation.replicationInformation.sourceTableARN`. A commit (either API, and so compaction and
+  snapshot management) and `UpdateTableMetadataLocation` are Forbidden on it. `DisassociateTableReplication` makes it a
+  table of its own, once (again: BadRequest).
+- **Not yet:** S3 writes into a replica's warehouse are not refused; a pass that reconciles a missed ask; a cluster's
+  destinations on other shards (slice 3).
+- **Tests:** `replicaCopied` (the compaction fixture's table with its position and equality deletes copied twice:
+  every path its own, every file there at its size, its delete file naming its own data files; mutation-checked),
+  `replicationAskedAndAnswered` (the loop's pass, the status, the marks, a commit refused and then, disassociated,
+  taken; mutation-checked).
+- **Checks:** 568 unit tests, the S3 smoke, the cluster S3 smoke (214) and the Java check.

@@ -1,0 +1,991 @@
+// A table's replicas, copied (ADR-0138 §2, §3, §5): what a commit asks for, the copy that makes a replica its source's
+// as of its current metadata, and the status of each destination.
+// - An ask (`.s3tables/replication/asks/<id>`) is written before a replicated table's record changes, so a commit's
+//   ask is as durable as the commit (an ask for a commit that then failed copies nothing new).
+// - A copy, for each destination of the table's configuration (its own, else its bucket's):
+//   - its replica is at the source's namespace and name, with an id of its own kept in its status, so a copy cut short
+//     is taken up again under the same id, and a file the replica has is not copied again;
+//   - files first, bottom up: data, equality delete and statistics files copied as they are, a part at a time,
+//     opened with the source's encryption and sealed with the replica's; position delete files and deletion vectors
+//     rewritten (`replica_files.cee`); then manifests, manifest lists and the metadata, each naming the replica's
+//     paths and the sizes of what was rewritten;
+//   - the replica's record last, conditional on what was read, marked as its source's replica;
+//   - a path the copy cannot place in the source's warehouse fails it, with its reason: a replica never names its
+//     source's files.
+// - On `serve` the destination is a table bucket of the same store; a cluster's other shards are slice 3's.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+const REPLICATION_ASKS: StringView = ".s3tables/replication/asks/";
+const REPLICATION_STATUS: StringView = ".s3tables/replication/status/";
+/// A file streamed a piece at a time: its piece.
+const REPLICA_COPY_PIECE: usize = 1048576;
+
+fn replicationAskKey(id: Slice<u8>) -> Result<Vector<u8>, AllocError> => catalogKey(REPLICATION_ASKS, id, "".bytes());
+
+fn replicationStatusKey(id: Slice<u8>, destination: Slice<u8>) -> Result<Vector<u8>, AllocError> =>
+    catalogKey(REPLICATION_STATUS, id, destination);
+
+/// A replicated table's ask for a copy, before its record changes (ADR-0138 §3); nothing for one not replicated.
+fn askReplication(store: borrow mut ObjectStore, hidden: Slice<u8>, id: Slice<u8>) -> Result<void, TablesError> {
+    if (replicationOf(store, hidden, id)?.isNull()) { return Ok(); }
+    var ask = jsonObject();
+    jsonSet(mut ask, "at", jsonInteger(Clock.unixMillis())?)?;
+    let _ = writeRecord(store, hidden, replicationAskKey(id)?.view(), borrow ask, PutCondition.None)?;
+    return Ok();
+}
+
+/// The table buckets a configuration names, each once.
+fn replicationDestinations(config: borrow Json) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    match (jsonMember(config, "rules")) {
+        Some(Json.Array(rules)) => {
+            for (r in 0..rules.length) {
+                match (jsonMember(borrow rules[r], "destinations")) {
+                    Some(Json.Array(dests)) => {
+                        for (d in 0..dests.length) {
+                            let arn = jsonMemberText(borrow dests[d], "destinationTableBucketARN") ?? "".bytes();
+                            var id = Vector<u8>.create();
+                            match (tableBucketOfArn(arn, mut id)?) {
+                                Some(b) => {
+                                    var seen = false;
+                                    for (k in 0..out.length) {
+                                        if (out[k].view() == b.view()) { seen = true; }
+                                    }
+                                    if (!seen) { out.push(b)?; }
+                                }
+                                null => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    return Ok(out);
+}
+
+/// A destination's status written (ADR-0138 §5): `completed` with the replica's metadata, or `failed` with why; the
+/// source's metadata it was of, and the replica's id, kept.
+fn writeReplicationStatus(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    id: Slice<u8>,
+    destination: Slice<u8>,
+    status: StringView,
+    sourceLocation: Slice<u8>,
+    replicaId: Slice<u8>,
+    replicaLocation: Slice<u8>,
+    failure: Slice<u8>,
+) -> Result<void, TablesError> {
+    let key = replicationStatusKey(id, destination)?;
+    var rec = match (readRecord(store, hidden, key.view())?) {
+        Some(r) => r.json,
+        null => jsonObject(),
+    };
+    jsonSet(mut rec, "status", jsonString(status.bytes())?)?;
+    jsonSet(mut rec, "sourceLocation", jsonString(sourceLocation)?)?;
+    if (replicaId.length > 0) { jsonSet(mut rec, "replicaId", jsonString(replicaId)?)?; }
+    jsonSet(mut rec, "at", jsonInteger(Clock.unixMillis())?)?;
+    if (status.bytes() == "completed".bytes()) {
+        jsonSet(mut rec, "replicaLocation", jsonString(replicaLocation)?)?;
+        jsonSet(mut rec, "completedAt", jsonInteger(Clock.unixMillis())?)?;
+        jsonRemove(mut rec, "failure".bytes());
+    } else {
+        jsonSet(mut rec, "failure", jsonString(failure)?)?;
+    }
+    let _ = writeRecord(store, hidden, key.view(), borrow rec, PutCondition.None)?;
+    return Ok();
+}
+
+/// What a copy reads to start, under the store.
+struct ReplicaCopy {
+    srcBucket: Vector<u8>;
+    srcHidden: Vector<u8>;
+    srcId: Vector<u8>;
+    ns: Vector<u8>;
+    name: Vector<u8>;
+    srcLocation: Vector<u8>;
+    metadata: Json;
+    dstBucket: Vector<u8>;
+    dstHidden: Vector<u8>;
+    dstId: Vector<u8>;
+    dstEncryption: Json?;
+    /// The replica's files' object metadata (its storage class).
+    objectMetadata: Vector<u8>;
+    swap: PathSwap;
+    /// Set when the copy fails: its reason.
+    failure: Vector<u8>;
+}
+
+fn failCopy(c: borrow mut ReplicaCopy, why: StringView) -> Result<void, AllocError> {
+    if (c.failure.length == 0) { c.failure.extend(why.bytes())?; }
+    return Ok();
+}
+
+/// A copy's start, under the store: the source as it is now, and its replica in `dstBucket` (its id kept from an
+/// earlier copy, else a new one with its configuration made). Null when the source is gone; a copy with its failure
+/// set when it cannot be made.
+fn replicaCopyStart(
+    store: borrow mut ObjectStore,
+    srcBucket: Slice<u8>,
+    srcId: Slice<u8>,
+    dstBucket: Slice<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<ReplicaCopy?, TablesError> {
+    let srcHidden = tableWarehouseBucket(srcBucket)?;
+    let key = match (tableKeyOfId(store, srcHidden.view(), srcId)) {
+        Ok(k) => k,
+        Err(TablesError.NotFound) => { return Ok(null); }
+        Err(e) => { return Err(e); }
+    };
+    let rec = readRecord(store, srcHidden.view(), key.view())? ?? { return Ok(null); };
+    let rest = key.view()[CATALOG_TABLES.bytes().length..];
+    let slash = pieceEnd(rest, 0, '/');
+    let srcLocation = copyBytes(jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes())?;
+    let dstHidden = tableWarehouseBucket(dstBucket)?;
+    var c = ReplicaCopy {
+        srcBucket: copyBytes(srcBucket)?,
+        srcHidden: copyBytes(srcHidden.view())?,
+        srcId: copyBytes(srcId)?,
+        ns: copyBytes(rest[0..slash])?,
+        name: copyBytes(rest[slash + 1..])?,
+        srcLocation: srcLocation,
+        metadata: Json.Null,
+        dstBucket: copyBytes(dstBucket)?,
+        dstHidden: copyBytes(dstHidden.view())?,
+        dstId: Vector<u8>.create(),
+        dstEncryption: null,
+        objectMetadata: Vector<u8>.create(),
+        swap: pathSwapOf("".bytes(), "".bytes(), "".bytes(), "".bytes())?,
+        failure: Vector<u8>.create(),
+    };
+    if (c.srcLocation.length == 0) {
+        failCopy(mut c, "The table has no metadata yet.")?;
+        return Ok(Some(c));
+    }
+    let there = match (store.bucketExists(catalogText(dstHidden.view()))) {
+        Ok(t) => t,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    if (!there) {
+        failCopy(mut c, "The destination table bucket is not there.")?;
+        return Ok(Some(c));
+    }
+    c.metadata = match (readMetadataWith(store, srcHidden.view(), c.srcLocation.view(), keys)) {
+        Ok(m) => m,
+        Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
+        Err(_) => {
+            failCopy(mut c, "The table's metadata could not be read.")?;
+            return Ok(Some(c));
+        }
+    };
+    // The replica: a table at the source's name there must be this source's replica.
+    let dstKey = catalogKey(CATALOG_TABLES, c.ns.view(), c.name.view())?;
+    match (readRecord(store, dstHidden.view(), dstKey.view())?) {
+        Some(r) => {
+            if (!replicaOfSource(borrow r.json, srcBucket, srcId)) {
+                failCopy(mut c, "The destination has a table at its name that is not its replica.")?;
+                return Ok(Some(c));
+            }
+            c.dstId.extend(jsonMemberText(borrow r.json, "id") ?? "".bytes())?;
+        }
+        null => {
+            if (viewExists(store, dstHidden.view(), c.ns.view(), c.name.view())?) {
+                failCopy(mut c, "The destination has a view at its name.")?;
+                return Ok(Some(c));
+            }
+        }
+    }
+    // An id kept from an earlier copy cut short, else a new one.
+    if (c.dstId.length == 0) {
+        match (readRecord(store, srcHidden.view(), replicationStatusKey(srcId, dstBucket)?.view())?) {
+            Some(s) => { c.dstId.extend(jsonMemberText(borrow s.json, "replicaId") ?? "".bytes())?; }
+            null => {}
+        }
+    }
+    if (c.dstId.length == 0) {
+        if (!newUuid(mut c.dstId)?) { return Err(TablesError.Internal); }
+    }
+    // Its configuration, at its id: the destination bucket's encryption and storage class, made once.
+    let configKey = tableConfigKey(c.dstId.view())?;
+    if (readRecord(store, dstHidden.view(), configKey.view())?.isNull()) {
+        match (writeCreatedTableConfig(store, dstHidden.view(), c.dstId.view(), c.ns.view(), c.name.view(), keys)) {
+            Ok(e) => { c.dstEncryption = e; }
+            Err(TablesError.BadRequest) => {
+                failCopy(mut c, "The destination's encryption names a key this server does not hold.")?;
+                return Ok(Some(c));
+            }
+            Err(e) => { return Err(e); }
+        }
+    } else {
+        c.dstEncryption = tableEncryption(store, dstHidden.view(), c.dstId.view())?;
+    }
+    let storageClass = tableStorageClass(store, dstHidden.view(), c.dstId.view())?;
+    if (storageClass.length > 0 && storageClass.view() != "STANDARD".bytes()) {
+        metadataAdd(mut c.objectMetadata, STORAGE_CLASS_FIELD.bytes(), storageClass.view())?;
+    }
+    c.swap = pathSwapOf(srcHidden.view(), srcId, dstHidden.view(), c.dstId.view())?;
+    // Its namespace, made when the destination does not have it.
+    let nsKey = catalogKey(CATALOG_NAMESPACES, c.ns.view(), "".bytes())?;
+    if (readRecord(store, dstHidden.view(), nsKey.view())?.isNull()) {
+        var nsRec = jsonObject();
+        var nsId = Vector<u8>.create();
+        if (!newUuid(mut nsId)?) { return Err(TablesError.Internal); }
+        jsonSet(mut nsRec, "id", Json.Text(nsId))?;
+        jsonSet(mut nsRec, "createdAt", jsonInteger(Clock.unixMillis())?)?;
+        let _ = writeRecord(store, dstHidden.view(), nsKey.view(), borrow nsRec, PutCondition.IfAbsent);
+    }
+    return Ok(Some(c));
+}
+
+/// Whether a table record is the replica of `srcBucket`'s table `srcId`.
+fn replicaOfSource(rec: borrow Json, srcBucket: Slice<u8>, srcId: Slice<u8>) -> bool {
+    let of = jsonMember(rec, "replicaOf") ?? { return false; };
+    return jsonMemberText(of, "bucket") == Some(srcBucket) && jsonMemberText(of, "id") == Some(srcId);
+}
+
+/// A file a copy makes: its source path, and how.
+struct ReplicaFile {
+    path: Vector<u8>;
+    /// 0: copied as it is; 1: a position delete file, rewritten; 2: a deletion vector's Puffin file, rewritten.
+    kind: u8;
+}
+
+/// The key in the replica's warehouse of a source path, when the copy can place it; else its failure set.
+fn replicaKeyOf(c: borrow mut ReplicaCopy, path: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
+    if (!inTable(path, c.srcHidden.view(), c.srcId.view())) {
+        failCopy(c, "A file the table names is outside its warehouse.")?;
+        return Ok(null);
+    }
+    let swapped = swappedPath(borrow c.swap, path)? ?? {
+        failCopy(c, "A file the table names is not an s3:// path.")?;
+        return Ok(null);
+    };
+    return Ok(Some(copyBytes(refKey(swapped.view()))?));
+}
+
+/// The manifest lists of the source's snapshots, and its statistics files, from its metadata.
+fn replicaTopFiles(
+    m: borrow Json,
+    lists: borrow mut Vector<Vector<u8>>,
+    plain: borrow mut Vector<ReplicaFile>,
+) -> Result<void, AllocError> {
+    match (jsonMember(m, "snapshots")) {
+        Some(Json.Array(snaps)) => {
+            for (i in 0..snaps.length) {
+                match (jsonMemberText(borrow snaps[i], "manifest-list")) {
+                    Some(p) => { lists.push(copyBytes(p)?)?; }
+                    null => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    for (head in ["statistics", "partition-statistics"]) {
+        match (jsonMember(m, head)) {
+            Some(Json.Array(items)) => {
+                for (i in 0..items.length) {
+                    match (jsonMemberText(borrow items[i], "statistics-path")) {
+                        Some(p) => { plain.push(ReplicaFile { path: copyBytes(p)?, kind: 0 })?; }
+                        null => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    return Ok();
+}
+
+/// The files a manifest's entries name, by kind.
+fn replicaEntryFiles(records: borrow Vector<Json>, files: borrow mut Vector<ReplicaFile>) -> Result<void, AllocError> {
+    for (i in 0..records.length) {
+        let f = jsonMember(borrow records[i], "data_file") ?? { continue; };
+        let path = jsonMemberText(f, "file_path") ?? { continue; };
+        let content = jsonMemberI64(f, "content") ?? 0;
+        let format = jsonMemberText(f, "file_format") ?? "".bytes();
+        let kind: u8 = if (content == 1 && equalsIgnoreCase(format, "PUFFIN".bytes())) 2
+            else if (content == 1) 1
+            else 0;
+        files.push(ReplicaFile { path: copyBytes(path)?, kind: kind })?;
+    }
+    return Ok();
+}
+
+/// An Avro file's codec, from its header (`avro.codec`).
+fn avroCodecOfHeader(metadata: Slice<JsonMember>) -> AvroCodec {
+    for (i in 0..metadata.length) {
+        if (metadata[i].key.view() == "avro.codec".bytes()) {
+            let name = match (borrow metadata[i].value) {
+                Json.Text(t) => t.view(),
+                _ => "".bytes(),
+            };
+            let kind = if (name == "deflate".bytes()) AVRO_WRITE_DEFLATE
+                else if (name == "snappy".bytes()) AVRO_WRITE_SNAPPY
+                else if (name == "zstandard".bytes()) AVRO_WRITE_ZSTANDARD
+                else AVRO_WRITE_NULL;
+            return AvroCodec { kind: kind, level: 0 };
+        }
+    }
+    return AvroCodec { kind: AVRO_WRITE_NULL, level: 0 };
+}
+
+/// The size of the replica's object at `key`; null when it has none.
+fn replicaObjectSize(store: borrow ObjectStore, c: borrow ReplicaCopy, key: Slice<u8>) -> Result<i64?, TablesError> {
+    return match (store.headObject(catalogText(c.dstHidden.view()), catalogText(key))) {
+        Ok(info) => Ok(Some(truncate<i64>(info.size))),
+        Err(StoreError.NoSuchKey) => Ok(null),
+        Err(e) => Err(tablesStoreFail(e)),
+    };
+}
+
+/// `bytes` put whole as the replica's file at `key`, sealed with its encryption; false when its key is not held.
+fn putReplicaFile(
+    store: borrow mut ObjectStore,
+    c: borrow ReplicaCopy,
+    key: Slice<u8>,
+    contentType: StringView,
+    bytes: Slice<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<bool, TablesError> {
+    return match (putTableFile(
+        store,
+        catalogText(c.dstHidden.view()),
+        catalogText(key),
+        contentType,
+        bytes,
+        c.dstEncryption.asBorrow(),
+        keys,
+        PutCondition.IfAbsent,
+    )) {
+        Ok(put) => Ok(put),
+        Err(StoreError.PreconditionFailed) => Ok(true),
+        Err(e) => Err(tablesStoreFail(e)),
+    };
+}
+
+/// A small file rewritten and put (a position delete file, a Puffin file), under the store; its new size, or null
+/// with the copy's failure set.
+fn rewriteReplicaFile(
+    store: borrow mut ObjectStore,
+    c: borrow mut ReplicaCopy,
+    f: borrow ReplicaFile,
+    key: Slice<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<i64?, TablesError> {
+    match (replicaObjectSize(store, c, key)?) {
+        Some(n) => { return Ok(Some(n)); }
+        null => {}
+    }
+    let srcKey = copyBytes(refKey(f.path.view()))?;
+    let bytes = match (warehouseObjectWith(store, c.srcHidden.view(), srcKey.view(), keys)) {
+        Ok(Some(b)) => b,
+        Ok(null) => {
+            failCopy(c, "A file the table names is not there.")?;
+            return Ok(null);
+        }
+        Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
+        Err(_) => {
+            failCopy(c, "A delete file could not be read.")?;
+            return Ok(null);
+        }
+    };
+    let rewritten = if (f.kind == 2) swapPuffin(
+        bytes.view(),
+        borrow c.swap,
+    )? else swapPositionDeletes(bytes.view(), borrow c.swap)?;
+    let out = rewritten ?? {
+        failCopy(c, "A delete file is not one this server rewrites.")?;
+        return Ok(null);
+    };
+    if (!putReplicaFile(store, c, key, "application/octet-stream", out.view(), keys)?) {
+        failCopy(c, "The destination's encryption names a key this server does not hold.")?;
+        return Ok(null);
+    }
+    return Ok(Some(truncate<i64>(out.length as u64)));
+}
+
+/// A file to copy as it is, prepared under the store: its source's plaintext pinned, and a writer sealed with the
+/// replica's encryption. Null when the replica has it already.
+struct ReplicaPlainCopy {
+    reader: PlainReader;
+    writer: SealedWriter;
+}
+
+fn prepareReplicaPlain(
+    store: borrow mut ObjectStore,
+    c: borrow mut ReplicaCopy,
+    path: Slice<u8>,
+    key: Slice<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<ReplicaPlainCopy?, TablesError> {
+    // Already there (a copy taken up again): done.
+    if (replicaObjectSize(store, c, key)?.isSome()) { return Ok(null); }
+    let srcKey = refKey(path);
+    let info = match (store.headObject(catalogText(c.srcHidden.view()), catalogText(srcKey))) {
+        Ok(i) => i,
+        Err(StoreError.NoSuchKey) => {
+            failCopy(c, "A file the table names is not there.")?;
+            return Ok(null);
+        }
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    let reader = match (preparePlain(store, catalogText(c.srcHidden.view()), catalogText(srcKey), 0, info.size, keys)) {
+        Ok(Some(r)) => r,
+        Ok(null) => {
+            failCopy(c, "A file the table names could not be opened.")?;
+            return Ok(null);
+        }
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    let w = match (store.newWriter()) {
+        Ok(w) => w,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    let writer = sealedWriter(w, c.dstEncryption.asBorrow(), keys)? ?? {
+        failCopy(c, "The destination's encryption names a key this server does not hold.")?;
+        return Ok(null);
+    };
+    return Ok(Some(ReplicaPlainCopy { reader: reader, writer: writer }));
+}
+
+/// A prepared file's plaintext read and sealed a piece at a time, off the store: the finished object, or null when it
+/// could not be read whole.
+fn streamReplicaPlain(p: borrow mut ReplicaPlainCopy) -> Result<FinishedObject?, StoreError> {
+    var stream = p.reader.open()? ?? { return Ok(null); };
+    var piece = Vector<u8>.create();
+    piece.resize(REPLICA_COPY_PIECE, 0)?;
+    while (true) {
+        let n = stream.read(mut piece[..])? ?? { return Ok(null); };
+        if (n == 0) { break; }
+        p.writer.write(piece.view()[0..n])?;
+    }
+    return Ok(Some(p.writer.finish()?));
+}
+
+/// A streamed file put as the replica's, under the store.
+fn putReplicaPlain(
+    store: borrow mut ObjectStore,
+    c: borrow ReplicaCopy,
+    key: Slice<u8>,
+    p: borrow ReplicaPlainCopy,
+    obj: borrow FinishedObject,
+) -> Result<void, TablesError> {
+    let metadata = p.writer.metadataWith(c.objectMetadata.view())?;
+    return match (store.putFinishedWith(
+        catalogText(c.dstHidden.view()),
+        catalogText(key),
+        "application/octet-stream",
+        metadata.view(),
+        "".bytes(),
+        obj,
+        PutCondition.IfAbsent,
+    )) {
+        Ok(_) => Ok(),
+        Err(StoreError.PreconditionFailed) => Ok(),
+        Err(e) => Err(tablesStoreFail(e)),
+    };
+}
+
+/// A file copied as it is: prepared and put under the store, its bytes read and sealed off it (ADR-0138 §3).
+async fn copyReplicaPlain(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    c: borrow mut ReplicaCopy,
+    path: Slice<u8>,
+    key: Slice<u8>,
+    tableKeys: borrow TableKeys,
+) -> Result<void, NetError> {
+    var prepared: ReplicaPlainCopy? = null;
+    {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let cr = c;
+        let keys = tableKeys.share();
+        prepared = match (await Async.blocking(() => prepareReplicaPlain(st, cr, path, key, borrow keys.keys()))) {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = failCopy(c, "A file could not be copied.");
+                null
+            }
+        };
+    }
+    var p = prepared ?? { return Ok(); };
+    let pr = borrow mut p;
+    let obj = match (await Async.blocking(() => streamReplicaPlain(pr))) {
+        Ok(Some(o)) => o,
+        _ => {
+            let _ = failCopy(c, "A file the table names could not be read.");
+            return Ok();
+        }
+    };
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NetError.Closed); }
+    };
+    let st = guard.data();
+    let cr = c;
+    let pb = borrow p;
+    let ob = borrow obj;
+    match (await Async.blocking(() => putReplicaPlain(st, cr, key, pb, ob))) {
+        Ok() => {}
+        Err(_) => { let _ = failCopy(c, "A file could not be copied."); }
+    }
+    return Ok();
+}
+
+/// A manifest or manifest list rewritten and put, under the store: its new length, or null with the failure set.
+fn rewriteReplicaAvro(
+    store: borrow mut ObjectStore,
+    c: borrow mut ReplicaCopy,
+    path: Slice<u8>,
+    key: Slice<u8>,
+    isList: bool,
+    sizes: Slice<RewrittenSize>,
+    keys: borrow WarehouseKeys,
+) -> Result<i64?, TablesError> {
+    match (replicaObjectSize(store, c, key)?) {
+        Some(n) => { return Ok(Some(n)); }
+        null => {}
+    }
+    var file = match (readableAvro(readWarehouseAvroWith(store, c.srcHidden.view(), path, keys))?) {
+        Some(f) => f,
+        null => {
+            failCopy(c, "A manifest could not be read.")?;
+            return Ok(null);
+        }
+    };
+    if (isList) {
+        swapManifestList(mut file.records, borrow c.swap, sizes)?;
+    } else {
+        swapManifest(mut file.records, borrow c.swap, sizes)?;
+    }
+    let codec = avroCodecOfHeader(file.metadata.view());
+    let bytes = writeAvroIn(file.metadata.view(), file.records.view(), codec)? ?? {
+        failCopy(c, "A manifest could not be written again.")?;
+        return Ok(null);
+    };
+    if (!putReplicaFile(store, c, key, "application/octet-stream", bytes.view(), keys)?) {
+        failCopy(c, "The destination's encryption names a key this server does not hold.")?;
+        return Ok(null);
+    }
+    return Ok(Some(truncate<i64>(bytes.length as u64)));
+}
+
+/// The copy's end, under the store: the replica's metadata written, then its record (made, or moved on from what it
+/// was), and the destination's status. The replica's metadata location.
+fn finishReplicaCopy(
+    store: borrow mut ObjectStore,
+    c: borrow mut ReplicaCopy,
+    keys: borrow WarehouseKeys,
+) -> Result<Vector<u8>?, TablesError> {
+    var m = cloneJson(borrow c.metadata)?;
+    swapEveryPath(mut m, borrow c.swap)?;
+    // The source's earlier metadata files are not copied: the replica's log starts at this one.
+    jsonSet(mut m, "metadata-log", jsonArray())?;
+    let version = metadataVersion(c.srcLocation.view());
+    let location = writeMetadataSealedBy(
+        store,
+        c.dstHidden.view(),
+        c.dstId.view(),
+        if (version >= 0) version else 0,
+        borrow m,
+        keys,
+        c.dstEncryption.asBorrow(),
+    )?;
+    let dstKey = catalogKey(CATALOG_TABLES, c.ns.view(), c.name.view())?;
+    let now = Clock.unixMillis();
+    match (readRecord(store, c.dstHidden.view(), dstKey.view())?) {
+        Some(r) => {
+            if (!replicaOfSource(borrow r.json, c.srcBucket.view(), c.srcId.view()) ||
+                jsonMemberText(borrow r.json, "id") != Some(c.dstId.view())) {
+                removeMetadataFile(store, c.dstHidden.view(), location.view());
+                failCopy(c, "The destination has a table at its name that is not its replica.")?;
+                return Ok(null);
+            }
+            var next = cloneJson(borrow r.json)?;
+            jsonSet(mut next, "metadataLocation", jsonString(location.view())?)?;
+            jsonSet(mut next, "modifiedAt", jsonInteger(now)?)?;
+            match (writeRecord(
+                store,
+                c.dstHidden.view(),
+                dstKey.view(),
+                borrow next,
+                PutCondition.IfGeneration(r.generation),
+            )) {
+                Ok(_) => {}
+                Err(TablesError.Conflict) => {
+                    removeMetadataFile(store, c.dstHidden.view(), location.view());
+                    failCopy(c, "The replica changed while it was copied.")?;
+                    return Ok(null);
+                }
+                Err(e) => { return Err(e); }
+            }
+        }
+        null => {
+            var rec = jsonObject();
+            jsonSet(mut rec, "id", jsonString(c.dstId.view())?)?;
+            jsonSet(mut rec, "createdAt", jsonInteger(now)?)?;
+            jsonSet(mut rec, "modifiedAt", jsonInteger(now)?)?;
+            jsonSet(mut rec, "metadataLocation", jsonString(location.view())?)?;
+            var of = jsonObject();
+            jsonSet(mut of, "bucket", jsonString(c.srcBucket.view())?)?;
+            jsonSet(mut of, "id", jsonString(c.srcId.view())?)?;
+            jsonSet(mut rec, "replicaOf", of)?;
+            match (writeRecord(store, c.dstHidden.view(), dstKey.view(), borrow rec, PutCondition.IfAbsent)) {
+                Ok(_) => {}
+                Err(TablesError.Conflict) => {
+                    removeMetadataFile(store, c.dstHidden.view(), location.view());
+                    failCopy(c, "The destination has a table at its name that is not its replica.")?;
+                    return Ok(null);
+                }
+                Err(e) => { return Err(e); }
+            }
+        }
+    }
+    return Ok(Some(location));
+}
+
+/// A manifest list's manifests, under the store: each once, into `manifests`.
+fn replicaListManifests(
+    store: borrow ObjectStore,
+    c: borrow mut ReplicaCopy,
+    list: Slice<u8>,
+    manifests: borrow mut Vector<Vector<u8>>,
+    keys: borrow WarehouseKeys,
+) -> Result<void, TablesError> {
+    let file = readableAvro(readWarehouseAvroWith(store, c.srcHidden.view(), list, keys))? ?? {
+        failCopy(c, "A manifest list could not be read.")?;
+        return Ok();
+    };
+    for (i in 0..file.records.length) {
+        let p = jsonMemberText(borrow file.records[i], "manifest_path") ?? { continue; };
+        var seen = false;
+        for (k in 0..manifests.length) {
+            if (manifests[k].view() == p) { seen = true; }
+        }
+        if (!seen) { manifests.push(copyBytes(p)?)?; }
+    }
+    return Ok();
+}
+
+/// A manifest's files, under the store, into `files`.
+fn replicaManifestFiles(
+    store: borrow ObjectStore,
+    c: borrow mut ReplicaCopy,
+    manifest: Slice<u8>,
+    files: borrow mut Vector<ReplicaFile>,
+    keys: borrow WarehouseKeys,
+) -> Result<void, TablesError> {
+    let file = readableAvro(readWarehouseAvroWith(store, c.srcHidden.view(), manifest, keys))? ?? {
+        failCopy(c, "A manifest could not be read.")?;
+        return Ok();
+    };
+    replicaEntryFiles(borrow file.records, files)?;
+    return Ok();
+}
+
+/// A rewritten file's replica path and new size noted.
+fn noteRewritten(
+    c: borrow ReplicaCopy,
+    path: Slice<u8>,
+    size: i64,
+    sizes: borrow mut Vector<RewrittenSize>,
+) -> Result<void, AllocError> {
+    match (swappedPath(borrow c.swap, path)?) {
+        Some(p) => { sizes.push(RewrittenSize { path: p, size: size })?; }
+        null => {}
+    }
+    return Ok();
+}
+
+/// The copy's last step, under the store: the replica's metadata and record when nothing failed, then the
+/// destination's status.
+fn endReplicaCopy(
+    store: borrow mut ObjectStore,
+    c: borrow mut ReplicaCopy,
+    keys: borrow WarehouseKeys,
+) -> Result<void, TablesError> {
+    var replicaLocation = Vector<u8>.create();
+    if (c.failure.length == 0) {
+        match (finishReplicaCopy(store, c, keys)) {
+            Ok(Some(l)) => { replicaLocation = l; }
+            Ok(null) => {}
+            Err(TablesError.OutOfMemory(e)) => { return Err(TablesError.OutOfMemory(e)); }
+            Err(_) => { failCopy(c, "The replica could not be written.")?; }
+        }
+    }
+    let status = if (c.failure.length == 0) "completed" else "failed";
+    return writeReplicationStatus(
+        store,
+        c.srcHidden.view(),
+        c.srcId.view(),
+        c.dstBucket.view(),
+        status,
+        c.srcLocation.view(),
+        c.dstId.view(),
+        replicaLocation.view(),
+        c.failure.view(),
+    );
+}
+
+/// One source table copied to one destination (ADR-0138 §3): its reads and small writes each under the store, its
+/// data files streamed off it, its record last; its status written whatever happened.
+async fn copyReplica(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    srcBucket: Slice<u8>,
+    srcId: Slice<u8>,
+    dstBucket: Slice<u8>,
+    tableKeys: borrow TableKeys,
+) -> Result<void, NetError> {
+    let keys = tableKeys.share();
+    var started: ReplicaCopy? = null;
+    {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let kr = borrow keys;
+        started = match (await Async.blocking(
+            () => replicaCopyStart(st, srcBucket, srcId, dstBucket, borrow kr.keys()),
+        )) {
+            Ok(c) => c,
+            Err(_) => { return Ok(); }
+        };
+    }
+    var c = started ?? { return Ok(); };
+    var lists = Vector<Vector<u8>>.create();
+    var files = Vector<ReplicaFile>.create();
+    var manifests = Vector<Vector<u8>>.create();
+    if (c.failure.length == 0 && replicaTopFiles(borrow c.metadata, mut lists, mut files).isErr()) { return Ok(); }
+    // Each manifest list's manifests, and each manifest's files: one file read at each hold of the store.
+    for (l in 0..lists.length) {
+        if (c.failure.length > 0) { break; }
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let cr = borrow mut c;
+        let list = lists[l].view();
+        let mr = borrow mut manifests;
+        let kr = borrow keys;
+        if ((await Async.blocking(() => replicaListManifests(st, cr, list, mr, borrow kr.keys()))).isErr()) {
+            let _ = failCopy(mut c, "A manifest list could not be read.");
+        }
+    }
+    for (i in 0..manifests.length) {
+        if (c.failure.length > 0) { break; }
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let cr = borrow mut c;
+        let manifest = manifests[i].view();
+        let fr = borrow mut files;
+        let kr = borrow keys;
+        if ((await Async.blocking(() => replicaManifestFiles(st, cr, manifest, fr, borrow kr.keys()))).isErr()) {
+            let _ = failCopy(mut c, "A manifest could not be read.");
+        }
+    }
+    // Files first: each copied as it is, or rewritten, once (a file several manifests name).
+    var done = Vector<Vector<u8>>.create();
+    var sizes = Vector<RewrittenSize>.create();
+    for (i in 0..files.length) {
+        if (c.failure.length > 0) { break; }
+        var already = false;
+        for (k in 0..done.length) {
+            if (done[k].view() == files[i].path.view()) { already = true; }
+        }
+        if (already) { continue; }
+        if (done.push(copyBytes(files[i].path.view()).ok() ?? Vector<u8>.create()).isErr()) { return Ok(); }
+        let key = match (replicaKeyOf(mut c, files[i].path.view())) {
+            Ok(Some(k)) => k,
+            _ => { break; }
+        };
+        if (files[i].kind == 0) {
+            await copyReplicaPlain(store, mut c, files[i].path.view(), key.view(), borrow keys)?;
+            continue;
+        }
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let cr = borrow mut c;
+        let f = borrow files[i];
+        let k = key.view();
+        let kr = borrow keys;
+        match (await Async.blocking(() => rewriteReplicaFile(st, cr, f, k, borrow kr.keys()))) {
+            Ok(Some(n)) => {
+                if (noteRewritten(borrow c, files[i].path.view(), n, mut sizes).isErr()) { return Ok(); }
+            }
+            Ok(null) => {}
+            Err(_) => { let _ = failCopy(mut c, "A delete file could not be rewritten."); }
+        }
+    }
+    // Then the manifests, the lists, the metadata and the record: each under the store.
+    var manifestSizes = Vector<RewrittenSize>.create();
+    for (i in 0..manifests.length) {
+        if (c.failure.length > 0) { break; }
+        let key = match (replicaKeyOf(mut c, manifests[i].view())) {
+            Ok(Some(k)) => k,
+            _ => { break; }
+        };
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let cr = borrow mut c;
+        let path = manifests[i].view();
+        let k = key.view();
+        let sz = sizes.view();
+        let kr = borrow keys;
+        match (await Async.blocking(() => rewriteReplicaAvro(st, cr, path, k, false, sz, borrow kr.keys()))) {
+            Ok(Some(n)) => {
+                if (noteRewritten(borrow c, manifests[i].view(), n, mut manifestSizes).isErr()) { return Ok(); }
+            }
+            Ok(null) => {}
+            Err(_) => { let _ = failCopy(mut c, "A manifest could not be rewritten."); }
+        }
+    }
+    for (l in 0..lists.length) {
+        if (c.failure.length > 0) { break; }
+        let key = match (replicaKeyOf(mut c, lists[l].view())) {
+            Ok(Some(k)) => k,
+            _ => { break; }
+        };
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let cr = borrow mut c;
+        let path = lists[l].view();
+        let k = key.view();
+        let sz = manifestSizes.view();
+        let kr = borrow keys;
+        if ((await Async.blocking(() => rewriteReplicaAvro(st, cr, path, k, true, sz, borrow kr.keys()))).isErr()) {
+            let _ = failCopy(mut c, "A manifest list could not be rewritten.");
+        }
+    }
+    var guard = match (await store.get().lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NetError.Closed); }
+    };
+    let st = guard.data();
+    let cr = borrow mut c;
+    let kr = borrow keys;
+    let _ = await Async.blocking(() => endReplicaCopy(st, cr, borrow kr.keys()));
+    return Ok();
+}
+
+/// A replicated table's asks, taken under the store: each table bucket's, its ids and when they were asked.
+struct ReplicationAsk {
+    bucket: Vector<u8>;
+    id: Vector<u8>;
+    generation: u64;
+    destinations: Vector<Vector<u8>>;
+}
+
+fn replicationAsks(store: borrow ObjectStore) -> Result<Vector<ReplicationAsk>, TablesError> {
+    var out = Vector<ReplicationAsk>.create();
+    let warehouses = tableWarehouses(store)?;
+    for (w in 0..warehouses.length) {
+        let hidden = warehouses[w].view();
+        let bucket = hidden[0..hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
+        let keys = catalogKeys(store, hidden, REPLICATION_ASKS.bytes(), "".bytes(), 0)?;
+        for (k in 0..keys.length) {
+            let id = keys[k].view()[REPLICATION_ASKS.bytes().length..];
+            let ask = readRecord(store, hidden, keys[k].view())? ?? { continue; };
+            let config = replicationOf(store, hidden, id)?;
+            let destinations = match (config) {
+                Some(c) => replicationDestinations(borrow c)?,
+                null => Vector<Vector<u8>>.create(),
+            };
+            out.push(ReplicationAsk {
+                bucket: copyBytes(bucket)?,
+                id: copyBytes(id)?,
+                generation: ask.generation,
+                destinations: destinations,
+            })?;
+        }
+    }
+    return Ok(out);
+}
+
+/// An ask answered, under the store: removed unless it was asked again since it was taken.
+fn answerReplicationAsk(store: borrow mut ObjectStore, ask: borrow ReplicationAsk) -> Result<void, TablesError> {
+    let hidden = tableWarehouseBucket(ask.bucket.view())?;
+    let key = replicationAskKey(ask.id.view())?;
+    let now = match (store.currentGeneration(catalogText(hidden.view()), catalogText(key.view()))) {
+        Ok(g) => g,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    if (now == Some(ask.generation)) { removeCatalogObject(store, hidden.view(), key.view())?; }
+    return Ok();
+}
+
+/// Every ask copied to each of its destinations, then answered (ADR-0138 §3): a pass of the replication loop on
+/// `serve`.
+async fn replicateAsked(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    tableKeys: borrow TableKeys,
+) -> Result<void, NetError> {
+    var asks = Vector<ReplicationAsk>.create();
+    {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        asks = match (await Async.blocking(() => replicationAsks(st))) {
+            Ok(a) => a,
+            Err(_) => { return Ok(); }
+        };
+    }
+    for (i in 0..asks.length) {
+        for (d in 0..asks[i].destinations.length) {
+            await copyReplica(
+                store,
+                asks[i].bucket.view(),
+                asks[i].id.view(),
+                asks[i].destinations[d].view(),
+                tableKeys,
+            )?;
+        }
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let a = borrow asks[i];
+        let _ = await Async.blocking(() => answerReplicationAsk(st, a));
+    }
+    return Ok();
+}
+
+/// How often `serve` looks for asks to copy, in milliseconds.
+const REPLICATION_PAUSE_MS: u64 = 1000;
+
+/// Each second, every ask copied (ADR-0138 §3), on `serve`.
+async fn tablesReplicationForever(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    w: borrow TablesMaintainer,
+) -> Result<ServerReport, NetError> {
+    while (true) {
+        await deliveryPause(REPLICATION_PAUSE_MS)?;
+        await replicateAsked(store, borrow w.keys)?;
+    }
+    return Err(NetError.Closed);
+}
