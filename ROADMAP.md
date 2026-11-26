@@ -6571,3 +6571,24 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **A replica:** "A copy": its own warehouse, every file copied and rewritten.
 - **Destinations:** "This server only": a table bucket here, on `serve` or across a cluster's shards.
 - **Precedence:** "Table's replaces": a table's own configuration replaces its bucket's.
+
+### 26 Nov 2026: M36 slice 0, the orphan sweep's reads off the hold (ADR-0138 §0, M35's B1)
+
+- **The sweep in three parts** (`src/s3/table_orphans.cee`):
+  - its start, one short hold: the maintenance setting, the notes, the warehouse's ids and the catalog's keys listed;
+  - its reads, 256 records at each hold: tables, views, staged creates, pins and run statuses, each with the
+    generation it was read at; then each view's objects, one view at each hold;
+  - its finish, one hold (on a cluster, one gated step, the reads off the gate): the catalog's keys listed again and
+    their generations looked up in the index. Only a key new or changed since it was read is read again. An id one
+    names lives, a status not `Successful` holds every id, and a changed view keeps its files that pass. Then the
+    deletes and the notes, as before.
+- **Measured** on a table bucket of 10,000 tables (each with metadata and a status), three runs on this machine
+  under another session's load (load average about 40), so the times vary:
+  - the whole sweep in one hold, as it was: 192, 435 and 387 ms;
+  - after: the finish 43, 74 and 38 ms in one hold, the reads 158, 260 and 107 ms in 79 short holds.
+- **Tests:** `orphanFinishSeesChangesSinceItsReads` (a record naming an orphan made between the reads and the finish,
+  a run failing between them, a view committed between them; mutation-checked), and `orphanSweepHoldMeasured`
+  (2,000 tables in CI: the finish's hold shorter than the reads; `--show-output` prints the times).
+- **Checks:** 561 unit tests (`snapshotsFaultsCrash` and `snapshotsFaultsOnce` timed out at 60 s with the machine at a
+  load average of 40 to 60, and passed alone), the S3 smoke, the cluster maintenance smoke and the cluster S3 smoke
+  (214).

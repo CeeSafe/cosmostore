@@ -288,8 +288,8 @@ async fn removeOnShard(
     return Ok();
 }
 
-/// Orphaned files on the shard this replica leads (ADR-0136 §3): its table buckets listed off the gate; each one's
-/// sweep a gated step.
+/// Orphaned files on the shard this replica leads (ADR-0136 §3): its table buckets listed, and each one's records read,
+/// off the gate, a few at each hold of the store (ADR-0138 §0); each one's finish a gated step.
 async fn orphansOnShard(shared: borrow NodeShared, at: usize) -> Result<void, NodeFault> {
     let slot = borrow shared.slots[at];
     let dayMs = truncate<i64>(shared.tablesDayMs);
@@ -306,6 +306,11 @@ async fn orphansOnShard(shared: borrow NodeShared, at: usize) -> Result<void, No
         };
     }
     for (i in 0..warehouses.length) {
+        var read = match (await readOrphans(borrow slot.store, warehouses[i].view(), dayMs)) {
+            Ok(Some(r)) => r,
+            Ok(null) => { continue; }
+            Err(_) => { return Err(NodeFault.Net); }
+        };
         var term: u64 = 0;
         var gate = match (await slot.gate.lock()) {
             Ok(g) => g,
@@ -319,8 +324,8 @@ async fn orphansOnShard(shared: borrow NodeShared, at: usize) -> Result<void, No
                 Err(_) => { return Err(NodeFault.Net); }
             };
             let st = guard.data();
-            let hidden = warehouses[i].view();
-            let _ = await Async.blocking(() => sweepOrphans(st, hidden, Clock.unixMillis(), dayMs));
+            let r = borrow mut read;
+            let _ = await Async.blocking(() => finishOrphans(st, r, Clock.unixMillis()));
         }
         let _ = await stepCommit(shared, slot)?;
     }

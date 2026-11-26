@@ -5,6 +5,8 @@ import web_http;
 const ORPHAN_ID: StringView = "0f0f0f0f-0000-4000-8000-000000000001";
 const PINNED_ID: StringView = "0f0f0f0f-0000-4000-8000-000000000002";
 const STAGED_ID: StringView = "0f0f0f0f-0000-4000-8000-000000000003";
+/// The tables `orphanSweepHoldMeasured` makes.
+const ORPHAN_HOLD_TABLES: i32 = 2000;
 
 fn putIn(s: borrow mut ObjectStore, hidden: Slice<u8>, key: StringView) {
     let _ = s.putObject(catalogText(hidden), key, "application/octet-stream", "x".bytes(), PutCondition.None)!;
@@ -133,6 +135,149 @@ fn orphansSwept() -> Result<void, TestFailure> {
             borrow noKeys,
         )!.status as u64,
     )?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// A sweep's finish sees what changed between its reads and itself (M35's B1, ADR-0138 §0): a record made since that
+/// names an orphaned id keeps it, a table's run failing since holds every id, and a view committed since keeps its
+/// files that pass.
+@test
+fn orphanFinishSeesChangesSinceItsReads() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("orphans-changed");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let caller = tablesCaller("AKIAORPHANS");
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let _ = icebergCreateTable(
+        mut s,
+        "cat".bytes(),
+        "ns".bytes(),
+        "{\"name\":\"t\",\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+        borrow noKeys,
+    )!;
+    let table = currentTable(borrow s, "cat".bytes(), "ns".bytes(), "t".bytes())!!;
+    let tableId = copyBytes(jsonMemberText(borrow table.json, "id")!)!;
+    let views = viewSegments(["views"][..]);
+    let one = viewSegments(["views", "v"][..]);
+    let _ = icebergViews(
+        mut s,
+        Method.Post,
+        "cat".bytes(),
+        "ns".bytes(),
+        views.view(),
+        VIEW_BODY.bytes(),
+        borrow caller,
+        borrow noKeys,
+    )!;
+    let props = "{\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"k\":\"1\"}}]}";
+    let _ = icebergViews(
+        mut s,
+        Method.Post,
+        "cat".bytes(),
+        "ns".bytes(),
+        one.view(),
+        props.bytes(),
+        borrow caller,
+        borrow noKeys,
+    )!;
+    let view = readRecord(borrow s, hidden.view(), viewKey("ns".bytes(), "v".bytes())!.view())!!;
+    let viewId = copyBytes(jsonMemberText(borrow view.json, "id")!)!;
+    putIn(mut s, hidden.view(), "0f0f0f0f-0000-4000-8000-000000000001/metadata/00000-a.metadata.json");
+    putIn(mut s, hidden.view(), "0f0f0f0f-0000-4000-8000-000000000002/metadata/00000-b.metadata.json");
+    writeJobStatus(mut s, hidden.view(), tableId.view(), UNREFERENCED_REMOVAL, "Successful", "", 0)!;
+    let day: i64 = 86400000;
+    let t0: i64 = 1000 * day;
+    Check.equalU64(0, sweepOrphans(mut s, hidden.view(), t0, day)! as u64)?;
+    let due = t0 + 13 * day;
+    // Read, then a record naming the first orphan made, and the view committed, before the finish.
+    var read = orphanReadStart(borrow s, hidden.view(), day)!!;
+    while (!orphanReadSome(borrow s, mut read)!) {}
+    var late = jsonObject();
+    jsonSet(mut late, "id", jsonString(ORPHAN_ID.bytes())!)!;
+    let lateKey = catalogKey(CATALOG_TABLES, "ns".bytes(), "late".bytes())!;
+    let _ = writeRecord(mut s, hidden.view(), lateKey.view(), borrow late, PutCondition.None)!;
+    let again = "{\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"k\":\"2\"}}]}";
+    let _ = icebergViews(
+        mut s,
+        Method.Post,
+        "cat".bytes(),
+        "ns".bytes(),
+        one.view(),
+        again.bytes(),
+        borrow caller,
+        borrow noKeys,
+    )!;
+    // The second orphan goes; the first, named since, stays; the view's files stay this pass.
+    Check.equalU64(1, finishOrphans(mut s, mut read, due)! as u64)?;
+    Check.equalU64(1, underId(borrow s, hidden.view(), ORPHAN_ID.bytes()) as u64)?;
+    Check.equalU64(0, underId(borrow s, hidden.view(), PINNED_ID.bytes()) as u64)?;
+    Check.equalU64(3, underId(borrow s, hidden.view(), viewId.view()) as u64)?;
+    removeCatalogObject(mut s, hidden.view(), lateKey.view())!;
+    // Read, then the table's run failing before the finish: no id goes.
+    putIn(mut s, hidden.view(), "0f0f0f0f-0000-4000-8000-000000000002/metadata/00000-b.metadata.json");
+    let _ = sweepOrphans(mut s, hidden.view(), due, day)!;
+    var held = orphanReadStart(borrow s, hidden.view(), day)!!;
+    while (!orphanReadSome(borrow s, mut held)!) {}
+    writeJobStatus(mut s, hidden.view(), tableId.view(), UNREFERENCED_REMOVAL, "Failed", "a manifest", 0)!;
+    let _ = finishOrphans(mut s, mut held, due + 13 * day)!;
+    Check.equalU64(1, underId(borrow s, hidden.view(), ORPHAN_ID.bytes()) as u64)?;
+    Check.equalU64(1, underId(borrow s, hidden.view(), PINNED_ID.bytes()) as u64)?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// The sweep's hold on a table bucket of many tables (M35's B1, ADR-0138 §0): its reads, a few records at each
+/// hold, against its finish, the one hold left, and against the whole sweep in one hold, as it was. 2,000 tables
+/// here, to stay within a test's time; ADR-0138 §0's 10,000 were measured with ORPHAN_HOLD_TABLES raised. Printed for the record (`--show-output`); the finish must take less
+/// than the reads.
+@test
+fn orphanSweepHoldMeasured() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("orphans-hold");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    for (i in 0..ORPHAN_HOLD_TABLES) {
+        var name = copyBytes("t".bytes())!;
+        appendDecimal(mut name, truncate<u64>(i))!;
+        var id = Vector<u8>.create();
+        newUuid(mut id)!;
+        var rec = jsonObject();
+        jsonSet(mut rec, "id", jsonString(id.view())!)!;
+        jsonSet(
+            mut rec,
+            "metadataLocation",
+            jsonString("s3://cat--table-s3/x/metadata/00000-a.metadata.json".bytes())!,
+        )!;
+        let key = catalogKey(CATALOG_TABLES, "ns".bytes(), name.view())!;
+        let _ = writeRecord(mut s, hidden.view(), key.view(), borrow rec, PutCondition.None)!;
+        writeJobStatus(mut s, hidden.view(), id.view(), UNREFERENCED_REMOVAL, "Successful", "", 0)!;
+    }
+    let day: i64 = 86400000;
+    let started = Clock.monotonicNanos();
+    var read = orphanReadStart(borrow s, hidden.view(), day)!!;
+    var holds: u64 = 1;
+    while (!orphanReadSome(borrow s, mut read)!) { holds += 1; }
+    let readNs = Clock.monotonicNanos() - started;
+    let finishing = Clock.monotonicNanos();
+    let _ = finishOrphans(mut s, mut read, 1000 * day)!;
+    let finishNs = Clock.monotonicNanos() - finishing;
+    var line = copyBytes("reads: ".bytes())!;
+    appendDecimal(mut line, readNs / 1000000)!;
+    line.extend(" ms in ".bytes())!;
+    appendDecimal(mut line, holds)!;
+    line.extend(" holds; finish: ".bytes())!;
+    appendDecimal(mut line, finishNs / 1000000)!;
+    line.extend(" ms in one hold; all in one hold, as before: ".bytes())!;
+    let whole = Clock.monotonicNanos();
+    let _ = sweepOrphans(mut s, hidden.view(), 1000 * day, day)!;
+    appendDecimal(mut line, (Clock.monotonicNanos() - whole) / 1000000)!;
+    line.extend(" ms".bytes())!;
+    Console.writeLine(StringView.fromUtf8(line.view()) ?? "");
+    Check.isTrue(finishNs < readNs, "the finish's hold is shorter than the reads")?;
     removeTree(dir.view());
     return Ok();
 }

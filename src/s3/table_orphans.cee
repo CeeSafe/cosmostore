@@ -17,6 +17,16 @@ import web_server;
 const MAINTENANCE_ORPHANS: StringView = ".s3tables/maintenance/orphans";
 /// Objects one sweep of a table bucket deletes at most, the store held; the rest go on the next pass.
 const ORPHAN_DELETES_MAX: usize = 10000;
+/// Records one hold of the store reads, while a sweep reads off the hold (M35's B1, ADR-0138 §0).
+const ORPHAN_READS_PER_HOLD: usize = 256;
+/// The catalog's prefixes whose records a sweep reads, and whose changes its finish looks for.
+const ORPHAN_PREFIXES: [StringView; 5] = [
+    ".s3tables/tables/",
+    ".s3tables/views/",
+    ".s3tables/staged/",
+    ".s3tables/maintenance/shared/",
+    ".s3tables/maintenance/status/",
+];
 
 /// The hidden buckets of this store's table buckets.
 fn tableWarehouses(store: borrow ObjectStore) -> Result<Vector<Vector<u8>>, TablesError> {
@@ -33,59 +43,6 @@ fn tableWarehouses(store: borrow ObjectStore) -> Result<Vector<Vector<u8>>, Tabl
 
 /// Whether `keys`, sorted, holds `key`.
 fn holdsSorted(keys: borrow Vector<Vector<u8>>, key: Slice<u8>) -> bool => !sortedHolds(keys, key);
-
-/// The ids each record under `head` names (`id`), into `out`.
-fn idsOfRecords(
-    store: borrow ObjectStore,
-    hidden: Slice<u8>,
-    head: StringView,
-    out: borrow mut Vector<Vector<u8>>,
-) -> Result<void, TablesError> {
-    let keys = catalogKeys(store, hidden, head.bytes(), "".bytes(), 0)?;
-    for (i in 0..keys.length) {
-        match (readRecord(store, hidden, keys[i].view())?) {
-            Some(r) => {
-                match (jsonMemberText(borrow r.json, "id")) {
-                    Some(id) => { out.push(copyBytes(id)?)?; }
-                    null => {}
-                }
-            }
-            null => {}
-        }
-    }
-    return Ok();
-}
-
-/// The ids a live table's pin names: their files are referenced by that table (`shared/<of>/<by>`, ADR-0086 §3).
-fn pinnedIds(
-    store: borrow ObjectStore,
-    hidden: Slice<u8>,
-    out: borrow mut Vector<Vector<u8>>,
-) -> Result<void, TablesError> {
-    let bucket = hidden[0..hidden.length - TABLE_BUCKET_SUFFIX.bytes().length];
-    let head = MAINTENANCE_SHARED.bytes().length;
-    let pins = catalogKeys(store, hidden, MAINTENANCE_SHARED.bytes(), "".bytes(), 0)?;
-    for (i in 0..pins.length) {
-        let rest = pins[i].view()[head..];
-        let slash = pieceEnd(rest, 0, '/');
-        if (slash >= rest.length) { continue; }
-        let of = rest[0..slash];
-        let by = rest[slash + 1..];
-        let pin = match (readRecord(store, hidden, pins[i].view())?) {
-            Some(p) => p,
-            null => { continue; }
-        };
-        let ns = jsonMemberText(borrow pin.json, "namespace") ?? "".bytes();
-        let name = jsonMemberText(borrow pin.json, "name") ?? "".bytes();
-        let live = match (tableRecord(store, bucket, ns, name)) {
-            Ok(rec) => jsonMemberText(borrow rec.json, "id") == Some(by),
-            Err(TablesError.NotFound) => false,
-            Err(e) => { return Err(e); }
-        };
-        if (live) { out.push(copyBytes(of)?)?; }
-    }
-    return Ok();
-}
 
 /// The top-level ids of the warehouse: its prefixes of a UUID's form (never the catalog's `.s3tables/`).
 fn warehouseIds(store: borrow ObjectStore, hidden: Slice<u8>) -> Result<Vector<Vector<u8>>, TablesError> {
@@ -172,64 +129,254 @@ fn deleteOrphans(
     return Ok(n == keys.length && !failed);
 }
 
-/// Whether every table with metadata has had its unreferenced-file run succeed (its status `Successful`): a run
-/// pins each id whose files its table references (`shared/`), so only then are its references all known. A table
-/// whose run failed, or has not run, holds the deletion of ids (the M35 exit review's M2: a table's metadata written
-/// by its engine, its `write.*.path` under another id).
-fn tablesReferencesKnown(store: borrow ObjectStore, hidden: Slice<u8>) -> Result<bool, TablesError> {
-    let keys = catalogKeys(store, hidden, CATALOG_TABLES.bytes(), "".bytes(), 0)?;
-    for (i in 0..keys.length) {
-        let rec = match (readRecord(store, hidden, keys[i].view())?) {
-            Some(r) => r,
-            null => { continue; }
-        };
-        if ((jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes()).length == 0) { continue; }
-        let id = jsonMemberText(borrow rec.json, "id") ?? { return Ok(false); };
-        let status = readRecord(
-            store,
-            hidden,
-            jobStatusKey(id, UNREFERENCED_REMOVAL)?.view(),
-        )? ?? { return Ok(false); };
-        if (jsonMemberText(borrow status.json, "status") != Some("Successful".bytes())) { return Ok(false); }
+/// A table as a sweep read it: its record's key, its id, and whether it has metadata.
+struct OrphanTable {
+    key: Vector<u8>;
+    id: Vector<u8>;
+    hasMetadata: bool;
+}
+
+/// A view as a sweep read it: its record's key, its id, its current file, and its objects.
+struct OrphanView {
+    key: Vector<u8>;
+    id: Vector<u8>;
+    current: Vector<u8>;
+    objects: Vector<Vector<u8>>;
+}
+
+/// A pin as a sweep read it: the id it keeps, and the table (`by`, at its namespace and name) that keeps it.
+struct OrphanPin {
+    of: Vector<u8>;
+    by: Vector<u8>;
+    tableKey: Vector<u8>;
+}
+
+/// A catalog key a sweep read, and its generation then.
+struct SeenKey {
+    key: Vector<u8>;
+    generation: u64;
+}
+
+/// What a sweep of one table bucket read, a few records at each hold of the store (M35's B1, ADR-0138 §0): each
+/// record's generation as read, so that its finish, under one hold, reads again only what changed since.
+struct OrphanRead {
+    hidden: Vector<u8>;
+    ageMs: i64;
+    notes: Json;
+    /// The warehouse's top-level ids, as listed at the start.
+    ids: Vector<Vector<u8>>;
+    /// The catalog's keys still to read.
+    pending: Vector<Vector<u8>>;
+    /// Each key read, with its generation as read.
+    seen: Vector<SeenKey>;
+    /// Set when a record changed since it was read says a table's references are not all known.
+    held: bool;
+    tables: Vector<OrphanTable>;
+    views: Vector<OrphanView>;
+    pins: Vector<OrphanPin>;
+    staged: Vector<Vector<u8>>;
+    /// The ids whose unreferenced-file run's last status is `Successful`.
+    succeeded: Vector<Vector<u8>>;
+    /// The next view whose objects are to be listed.
+    nextView: usize;
+}
+
+/// A sweep's start, under the store: null when its table bucket's unreferenced-file removal is disabled. Lists the
+/// warehouse's ids and the catalog's keys, and reads the notes.
+fn orphanReadStart(store: borrow ObjectStore, hidden: Slice<u8>, dayMs: i64) -> Result<OrphanRead?, TablesError> {
+    let document = maintenanceDocument(store, hidden, MAINTENANCE_BUCKET_KEY.bytes())?;
+    let value = maintenanceValue(borrow document, UNREFERENCED_REMOVAL)?;
+    if (!maintenanceEnabled(borrow value)) { return Ok(null); }
+    let days = (maintenanceSetting(borrow value, UNREFERENCED_REMOVAL, "unreferencedDays") ?? 3) +
+        (maintenanceSetting(borrow value, UNREFERENCED_REMOVAL, "nonCurrentDays") ?? 10);
+    var pending = Vector<Vector<u8>>.create();
+    for (prefix in ORPHAN_PREFIXES) {
+        let keys = catalogKeys(store, hidden, prefix.bytes(), "".bytes(), 0)?;
+        for (k in 0..keys.length) { pending.push(copyBytes(keys[k].view())?)?; }
+    }
+    return Ok(Some(OrphanRead {
+        hidden: copyBytes(hidden)?,
+        ageMs: days * dayMs,
+        notes: maintenanceDocument(store, hidden, MAINTENANCE_ORPHANS.bytes())?,
+        ids: warehouseIds(store, hidden)?,
+        pending: pending,
+        seen: Vector<SeenKey>.create(),
+        held: false,
+        tables: Vector<OrphanTable>.create(),
+        views: Vector<OrphanView>.create(),
+        pins: Vector<OrphanPin>.create(),
+        staged: Vector<Vector<u8>>.create(),
+        succeeded: Vector<Vector<u8>>.create(),
+        nextView: 0,
+    }));
+}
+
+/// What one catalog record says to a sweep, taken into `read`.
+fn takeOrphanRecord(
+    read: borrow mut OrphanRead,
+    key: Slice<u8>,
+    rec: borrow CatalogRecord,
+) -> Result<void, AllocError> {
+    let id = jsonMemberText(borrow rec.json, "id");
+    if (startsWithBytes(key, CATALOG_TABLES.bytes())) {
+        let has = (jsonMemberText(borrow rec.json, "metadataLocation") ?? "".bytes()).length > 0;
+        read.tables.push(OrphanTable { key: copyBytes(key)?, id: copyBytes(id ?? "".bytes())?, hasMetadata: has })?;
+    } else if (startsWithBytes(key, CATALOG_VIEWS.bytes())) {
+        // Not knowing its current file: an empty one, and none of its files go.
+        let current = viewCurrentKey(borrow rec.json, read.hidden.view())? ?? Vector<u8>.create();
+        read.views.push(OrphanView {
+            key: copyBytes(key)?,
+            id: copyBytes(id ?? "".bytes())?,
+            current: current,
+            objects: Vector<Vector<u8>>.create(),
+        })?;
+    } else if (startsWithBytes(key, CATALOG_STAGED.bytes())) {
+        match (id) {
+            Some(i) => { read.staged.push(copyBytes(i)?)?; }
+            null => {}
+        }
+    } else if (startsWithBytes(key, MAINTENANCE_SHARED.bytes())) {
+        let rest = key[MAINTENANCE_SHARED.bytes().length..];
+        let slash = pieceEnd(rest, 0, '/');
+        if (slash < rest.length) {
+            let ns = jsonMemberText(borrow rec.json, "namespace") ?? "".bytes();
+            let name = jsonMemberText(borrow rec.json, "name") ?? "".bytes();
+            read.pins.push(OrphanPin {
+                of: copyBytes(rest[0..slash])?,
+                by: copyBytes(rest[slash + 1..])?,
+                tableKey: catalogKey(CATALOG_TABLES, ns, name)?,
+            })?;
+        }
+    } else if (startsWithBytes(key, MAINTENANCE_STATUS.bytes())) {
+        // `status/<id>/<kind>`: the unreferenced-file run's only.
+        let rest = key[MAINTENANCE_STATUS.bytes().length..];
+        let slash = pieceEnd(rest, 0, '/');
+        if (slash < rest.length && rest[slash + 1..] == UNREFERENCED_REMOVAL.bytes() &&
+            jsonMemberText(borrow rec.json, "status") == Some("Successful".bytes())) {
+            read.succeeded.push(copyBytes(rest[0..slash])?)?;
+        }
+    }
+    return Ok();
+}
+
+/// A few of a sweep's reads, under the store: up to ORPHAN_READS_PER_HOLD records, then a view's objects listed.
+/// Whether all are read.
+fn orphanReadSome(store: borrow ObjectStore, read: borrow mut OrphanRead) -> Result<bool, TablesError> {
+    var n: usize = 0;
+    while (read.pending.length > 0 && n < ORPHAN_READS_PER_HOLD) {
+        let key = read.pending.pop()!;
+        n += 1;
+        match (readRecord(store, read.hidden.view(), key.view())?) {
+            Some(rec) => {
+                read.seen.push(SeenKey { key: copyBytes(key.view())?, generation: rec.generation })?;
+                takeOrphanRecord(read, key.view(), borrow rec)?;
+            }
+            null => {}
+        }
+    }
+    if (read.pending.length > 0) { return Ok(false); }
+    if (read.nextView < read.views.length) {
+        let at = read.nextView;
+        read.nextView += 1;
+        var prefix = copyBytes(read.views[at].id.view())?;
+        prefix.push('/')?;
+        if (uuidShaped(read.views[at].id.view())) {
+            read.views[at].objects = catalogKeys(store, read.hidden.view(), prefix.view(), "".bytes(), 0)?;
+        }
+        return Ok(read.nextView >= read.views.length);
     }
     return Ok(true);
 }
 
-/// One table bucket's orphans swept, under the store (on a cluster, one gated step): nothing when its unreferenced
-/// file removal is disabled. The number of objects deleted.
-fn sweepOrphans(
-    store: borrow mut ObjectStore,
-    hidden: Slice<u8>,
-    nowMs: i64,
-    dayMs: i64,
-) -> Result<usize, TablesError> {
-    let document = maintenanceDocument(store, hidden, MAINTENANCE_BUCKET_KEY.bytes())?;
-    let value = maintenanceValue(borrow document, UNREFERENCED_REMOVAL)?;
-    if (!maintenanceEnabled(borrow value)) { return Ok(0); }
-    let days = (maintenanceSetting(borrow value, UNREFERENCED_REMOVAL, "unreferencedDays") ?? 3) +
-        (maintenanceSetting(borrow value, UNREFERENCED_REMOVAL, "nonCurrentDays") ?? 10);
+/// The generation a sweep read `key` at, its keys sorted; null if it did not read it.
+fn seenGeneration(seen: borrow Vector<SeenKey>, key: Slice<u8>) -> u64? {
+    var low: usize = 0;
+    var high = seen.length;
+    while (low < high) {
+        let mid = low + (high - low) / 2;
+        let c = compareBytes(seen[mid].key.view(), key);
+        if (c == 0) { return Some(seen[mid].generation); }
+        if (c < 0) { low = mid + 1; } else { high = mid; }
+    }
+    return null;
+}
+
+/// A sweep's finish, under the store (on a cluster, one gated step): the catalog's keys looked at again, and those new
+/// or changed since they were read, read again; then what is still orphaned and due deleted, and the notes written.
+/// The number of objects deleted.
+fn finishOrphans(store: borrow mut ObjectStore, read: borrow mut OrphanRead, nowMs: i64) -> Result<usize, TablesError> {
+    let hidden = copyBytes(read.hidden.view())?;
+    // Changed since read: taken in (so an id they name lives, a status they set counts), and a changed view's files
+    // kept this pass. A record gone since only makes more orphans, and is left for the next pass to find.
+    read.seen.sortBy((a, b) => compareBytes(a.key.view(), b.key.view()));
+    var changedViews = Vector<Vector<u8>>.create();
+    for (prefix in ORPHAN_PREFIXES) {
+        let keys = catalogKeys(store, hidden.view(), prefix.bytes(), "".bytes(), 0)?;
+        for (k in 0..keys.length) {
+            let key = keys[k].view();
+            let now = match (store.currentGeneration(catalogText(hidden.view()), catalogText(key))) {
+                Ok(g) => g,
+                Err(e) => { return Err(tablesStoreFail(e)); }
+            };
+            let same = now.isSome() && seenGeneration(borrow read.seen, key) == now;
+            if (same) { continue; }
+            match (readRecord(store, hidden.view(), key)?) {
+                Some(rec) => {
+                    takeOrphanRecord(read, key, borrow rec)?;
+                    if (startsWithBytes(key, CATALOG_VIEWS.bytes())) { changedViews.push(copyBytes(key)?)?; }
+                    // A status written since: its table's references are known only if it says `Successful`, which
+                    // `succeeded` now holds; a run under way is not, so any other holds the ids.
+                    if (startsWithBytes(key, MAINTENANCE_STATUS.bytes()) &&
+                        jsonMemberText(borrow rec.json, "status") != Some("Successful".bytes())) {
+                        read.held = true;
+                    }
+                }
+                null => {}
+            }
+        }
+    }
+    sortKeys(mut changedViews);
     // What records name: tables (in any namespace), views, staged creates, and what live tables' pins name.
     var live = Vector<Vector<u8>>.create();
-    idsOfRecords(store, hidden, CATALOG_TABLES, mut live)?;
-    idsOfRecords(store, hidden, CATALOG_VIEWS, mut live)?;
-    idsOfRecords(store, hidden, CATALOG_STAGED, mut live)?;
-    pinnedIds(store, hidden, mut live)?;
+    for (i in 0..read.tables.length) {
+        if (read.tables[i].id.length > 0) { live.push(copyBytes(read.tables[i].id.view())?)?; }
+    }
+    for (i in 0..read.views.length) { live.push(copyBytes(read.views[i].id.view())?)?; }
+    for (i in 0..read.staged.length) { live.push(copyBytes(read.staged[i].view())?)?; }
+    for (i in 0..read.pins.length) {
+        // A pin keeps its id while its table is there with the id it names, as read or as changed since.
+        var kept = false;
+        for (t in 0..read.tables.length) {
+            if (read.tables[t].key.view() == read.pins[i].tableKey.view() &&
+                read.tables[t].id.view() == read.pins[i].by.view()) {
+                kept = true;
+            }
+        }
+        if (kept) { live.push(copyBytes(read.pins[i].of.view())?)?; }
+    }
     sortKeys(mut live);
+    // Every table with metadata has had its own run succeed (the M35 exit review's M2): only then are its
+    // references, its pins, all known.
+    sortKeys(mut read.succeeded);
+    var known = !read.held;
+    for (i in 0..read.tables.length) {
+        if (read.tables[i].hasMetadata && !holdsSorted(borrow read.succeeded, read.tables[i].id.view())) {
+            known = false;
+        }
+    }
     var sweep = OrphanSweep {
-        hidden: copyBytes(hidden)?,
-        notes: maintenanceDocument(store, hidden, MAINTENANCE_ORPHANS.bytes())?,
+        hidden: copyBytes(hidden.view())?,
+        notes: replace(mut read.notes, jsonObject()),
         kept: Vector<JsonMember>.create(),
         budget: ORPHAN_DELETES_MAX,
         nowMs: nowMs,
-        ageMs: days * dayMs,
+        ageMs: read.ageMs,
         deleted: 0,
     };
     // Ids no record names: all their objects, once due, and once every table's references are known. Held, or past
     // the budget, they stay noted as due, and are not listed (the M35 exit review's M3).
-    let known = tablesReferencesKnown(store, hidden)?;
-    let ids = warehouseIds(store, hidden)?;
-    for (i in 0..ids.length) {
-        let id = ids[i].view();
+    for (i in 0..read.ids.length) {
+        let id = read.ids[i].view();
         if (holdsSorted(borrow live, id)) { continue; }
         if (!orphanDue(mut sweep, id)?) { continue; }
         if (!known || sweep.budget == 0) {
@@ -239,35 +386,27 @@ fn sweepOrphans(
         }
         var prefix = copyBytes(id)?;
         prefix.push('/')?;
-        let objects = catalogKeys(store, hidden, prefix.view(), "".bytes(), 0)?;
+        let objects = catalogKeys(store, hidden.view(), prefix.view(), "".bytes(), 0)?;
         if (!deleteOrphans(store, mut sweep, objects.view())?) {
             // Not all of it this pass: still due on the next.
             let first = jsonMemberI64(borrow sweep.notes, textOfRef(id)) ?? nowMs;
             sweep.kept.push(JsonMember { key: copyBytes(id)?, value: jsonInteger(first)? })?;
         }
     }
-    // Each view's metadata files other than its current one.
-    let views = catalogKeys(store, hidden, CATALOG_VIEWS.bytes(), "".bytes(), 0)?;
-    for (i in 0..views.length) {
-        let rec = match (readRecord(store, hidden, views[i].view())?) {
-            Some(r) => r,
-            null => { continue; }
-        };
-        let current = viewCurrentKey(borrow rec.json, hidden)? ?? { continue; };
-        let id = jsonMemberText(borrow rec.json, "id") ?? { continue; };
-        var prefix = copyBytes(id)?;
-        prefix.push('/')?;
-        let objects = catalogKeys(store, hidden, prefix.view(), "".bytes(), 0)?;
+    // Each view's metadata files other than its current one, as listed off the hold: a view changed since keeps its.
+    for (i in 0..read.views.length) {
+        let v = borrow read.views[i];
+        if (v.current.length == 0 || holdsSorted(borrow changedViews, v.key.view())) { continue; }
         var due = Vector<Vector<u8>>.create();
-        for (k in 0..objects.length) {
-            let key = objects[k].view();
-            if (key == current.view()) { continue; }
+        for (k in 0..v.objects.length) {
+            let key = v.objects[k].view();
+            if (key == v.current.view()) { continue; }
             if (orphanDue(mut sweep, key)?) { due.push(copyBytes(key)?)?; }
         }
         if (!deleteOrphans(store, mut sweep, due.view())?) {
             // What the budget left: noted as due, for the next pass.
             for (k in 0..due.length) {
-                let gone = store.headObject(catalogText(hidden), catalogText(due[k].view())).isErr();
+                let gone = store.headObject(catalogText(hidden.view()), catalogText(due[k].view())).isErr();
                 if (!gone) {
                     let first = jsonMemberI64(borrow sweep.notes, textOfRef(due[k].view())) ?? nowMs;
                     sweep.kept.push(JsonMember { key: copyBytes(due[k].view())?, value: jsonInteger(first)? })?;
@@ -277,16 +416,66 @@ fn sweepOrphans(
     }
     let deleted = sweep.deleted;
     if (sweep.kept.length == 0) {
-        removeCatalogObject(store, hidden, MAINTENANCE_ORPHANS.bytes())?;
+        removeCatalogObject(store, hidden.view(), MAINTENANCE_ORPHANS.bytes())?;
     } else {
         let kept = replace(mut sweep.kept, Vector<JsonMember>.create());
         let notes = Json.Object(kept);
-        let _ = writeRecord(store, hidden, MAINTENANCE_ORPHANS.bytes(), borrow notes, PutCondition.None)?;
+        let _ = writeRecord(store, hidden.view(), MAINTENANCE_ORPHANS.bytes(), borrow notes, PutCondition.None)?;
     }
     return Ok(deleted);
 }
 
-/// Each table bucket's orphans on `serve` (ADR-0136 §3), the store held for one table bucket at a time.
+/// One table bucket's orphans swept at once, under one hold of the store: the start, every read and the finish.
+/// Nothing when its unreferenced-file removal is disabled. The number of objects deleted.
+fn sweepOrphans(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    nowMs: i64,
+    dayMs: i64,
+) -> Result<usize, TablesError> {
+    var read = orphanReadStart(store, hidden, dayMs)? ?? { return Ok(0); };
+    while (!orphanReadSome(store, mut read)?) {}
+    return finishOrphans(store, mut read, nowMs);
+}
+
+/// A sweep's reads, a few at each hold of the store (M35's B1, ADR-0138 §0); null when there is nothing to sweep, or
+/// a read failed (the next pass tries again).
+async fn readOrphans(
+    store: borrow Arc<AsyncMutex<ObjectStore>>,
+    hidden: Slice<u8>,
+    dayMs: i64,
+) -> Result<OrphanRead?, NetError> {
+    var started: OrphanRead? = null;
+    {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        started = match (await Async.blocking(() => orphanReadStart(st, hidden, dayMs))) {
+            Ok(r) => r,
+            Err(_) => { return Ok(null); }
+        };
+    }
+    var read = started ?? { return Ok(null); };
+    while (true) {
+        var guard = match (await store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NetError.Closed); }
+        };
+        let st = guard.data();
+        let r = borrow mut read;
+        let done = match (await Async.blocking(() => orphanReadSome(st, r))) {
+            Ok(d) => d,
+            Err(_) => { return Ok(null); }
+        };
+        if (done) { break; }
+    }
+    return Ok(Some(read));
+}
+
+/// Each table bucket's orphans on `serve` (ADR-0136 §3): its reads a few at each hold of the store, its finish under
+/// one (ADR-0138 §0).
 async fn sweepAllOrphans(store: borrow Arc<AsyncMutex<ObjectStore>>, dayMs: i64) -> Result<void, NetError> {
     var warehouses = Vector<Vector<u8>>.create();
     {
@@ -301,13 +490,14 @@ async fn sweepAllOrphans(store: borrow Arc<AsyncMutex<ObjectStore>>, dayMs: i64)
         };
     }
     for (i in 0..warehouses.length) {
+        var read = await readOrphans(store, warehouses[i].view(), dayMs)? ?? { continue; };
         var guard = match (await store.get().lock()) {
             Ok(g) => g,
             Err(_) => { return Err(NetError.Closed); }
         };
         let st = guard.data();
-        let hidden = warehouses[i].view();
-        let _ = await Async.blocking(() => sweepOrphans(st, hidden, Clock.unixMillis(), dayMs));
+        let r = borrow mut read;
+        let _ = await Async.blocking(() => finishOrphans(st, r, Clock.unixMillis()));
     }
     return Ok();
 }
