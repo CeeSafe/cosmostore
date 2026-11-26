@@ -1,6 +1,7 @@
 # ADR-0136: M34's recorded items (M35)
 
-**Status:** proposed, 26 Nov 2026, with the owner's choices made:
+**Status:** accepted, 26 Nov 2026 (the owner: "Yes", to accepting ADR-0136 and closing M35). Proposed the same day,
+with the owner's choices made:
 - B2 is kept, with the hold made explicit and checked ("B2: keep + check");
 - B3's sweep reaches every orphaned id ("Every orphaned id").
 

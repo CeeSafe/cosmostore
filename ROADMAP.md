@@ -6532,3 +6532,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   2's leniencies, other missing tests).
 - **Checks:** 559 unit tests, the S3 smoke, the Java check and the cluster S3 smoke (214).
 - **Waiting:** ADR-0136's acceptance and M35's close, the owner's.
+
+### 26 Nov 2026: M35 closed
+
+- **The owner:** "Yes", to accepting ADR-0136 and closing M35. ADR-0136 is accepted, and M35's B1 to B5 are recorded
+  in `docs/m35-exit-review.md`.
+- **Next:** M36, when the owner asks. The candidates on record:
+  - table replication (ADR-0133's B, ADR-0135's B);
+  - Iceberg v3's remaining parts (their C);
+  - M35's recorded B1 to B5, the first the sweep's reads under the hold.

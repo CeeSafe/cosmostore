@@ -1,5 +1,7 @@
 # M35 exit review: M34's recorded items (26 Nov 2026)
 
+**M35 closed, 26 Nov 2026** (the owner: "Yes"), with ADR-0136 accepted and B1 to B5 recorded below.
+
 **M35's exit (ADR-0135 item A; ADR-0136, with the owner's choices):** M34's B1 to B4 each closed or kept with its
 reason, and M34's review's missing tests written.
 
