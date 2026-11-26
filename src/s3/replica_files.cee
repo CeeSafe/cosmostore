@@ -1,0 +1,233 @@
+// A replica's files (ADR-0138 §2): its source's, with every path they name in the source's warehouse made the
+// replica's. Each path starts with the source's warehouse, `s3://<src>--table-s3/<srcId>/`, so a rewrite is that
+// prefix swapped for the replica's. Here only the rewrites themselves, of bytes and JSON; the copy that reads and
+// writes the files is `table_replication.cee`'s.
+// - The metadata JSON: every string (its location, metadata log, manifest lists, statistics files, `write.*.path`).
+// - Manifest lists and manifests: `manifest_path`, `data_file.file_path` and `referenced_data_file`; a position delete
+//   file's `file_path` bounds (readers match a delete file to its data file by them); and the sizes of the files a
+//   rewrite changed (`manifest_length`, `file_size_in_bytes`). Never another column's bounds.
+// - A position delete file (Parquet): its `file_path` column.
+// - A deletion vector's Puffin file: its footer's `referenced-data-file`. Its blobs name no path, and stay where they
+//   are, so their offsets hold.
+import web_core;
+
+const PUFFIN_MAGIC: StringView = "PFA1";
+
+/// The source's warehouse and the replica's: `s3://<hidden>/<id>/`, and each without its last `/`.
+struct PathSwap {
+    from: Vector<u8>;
+    to: Vector<u8>;
+}
+
+fn pathSwapOf(
+    fromHidden: Slice<u8>,
+    fromId: Slice<u8>,
+    toHidden: Slice<u8>,
+    toId: Slice<u8>,
+) -> Result<PathSwap, AllocError> {
+    var from = copyBytes("s3://".bytes())?;
+    from.extend(fromHidden)?;
+    from.push('/')?;
+    from.extend(fromId)?;
+    var to = copyBytes("s3://".bytes())?;
+    to.extend(toHidden)?;
+    to.push('/')?;
+    to.extend(toId)?;
+    return Ok(PathSwap { from: from, to: to });
+}
+
+/// `path` in the replica's warehouse: the swap's `to` and what follows its `from`; null when it is not in the source's
+/// (its warehouse itself, or under it).
+fn swappedPath(swap: borrow PathSwap, path: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
+    if (!startsWithBytes(path, swap.from.view())) { return Ok(null); }
+    let rest = path[swap.from.length..];
+    if (rest.length > 0 && rest[0] != '/') { return Ok(null); }
+    var out = copyBytes(swap.to.view())?;
+    out.extend(rest)?;
+    return Ok(Some(out));
+}
+
+/// Every string of `j` in the source's warehouse made the replica's (the metadata JSON).
+fn swapEveryPath(j: borrow mut Json, swap: borrow PathSwap) -> Result<void, AllocError> {
+    match (j) {
+        Json.Text(t) => {
+            match (swappedPath(swap, t.view())?) {
+                Some(p) => { *t = p; }
+                null => {}
+            }
+        }
+        Json.Array(items) => {
+            for (i in 0..items.length) { swapEveryPath(mut items[i], swap)?; }
+        }
+        Json.Object(ms) => {
+            for (i in 0..ms.length) { swapEveryPath(mut ms[i].value, swap)?; }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// A text member of `j` named `key` swapped, when it is in the source's warehouse.
+fn swapMember(j: borrow mut Json, key: StringView, swap: borrow PathSwap) -> Result<void, AllocError> {
+    match (jsonMemberMut(j, key)) {
+        Some(v) => {
+            match (v) {
+                Json.Text(t) => {
+                    match (swappedPath(swap, t.view())?) {
+                        Some(p) => { *t = p; }
+                        null => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    return Ok();
+}
+
+/// A file's new size, when the copy rewrote it: its replica path and its length.
+struct RewrittenSize {
+    path: Vector<u8>;
+    size: i64;
+}
+
+fn rewrittenSize(sizes: Slice<RewrittenSize>, path: Slice<u8>) -> i64? {
+    for (i in 0..sizes.length) {
+        if (sizes[i].path.view() == path) { return Some(sizes[i].size); }
+    }
+    return null;
+}
+
+/// A bound of `key` in a `lower_bounds`/`upper_bounds` list (`[{key, value}]`) swapped.
+fn swapBound(bounds: borrow mut Json, key: i64, swap: borrow PathSwap) -> Result<void, AllocError> {
+    match (bounds) {
+        Json.Array(items) => {
+            for (i in 0..items.length) {
+                if (jsonMemberI64(borrow items[i], "key") == Some(key)) { swapMember(mut items[i], "value", swap)?; }
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// A manifest list's records: each `manifest_path` swapped, its `manifest_length` the rewritten manifest's.
+fn swapManifestList(
+    records: borrow mut Vector<Json>,
+    swap: borrow PathSwap,
+    sizes: Slice<RewrittenSize>,
+) -> Result<void, AllocError> {
+    for (i in 0..records.length) {
+        swapMember(mut records[i], "manifest_path", swap)?;
+        let path = copyBytes(jsonMemberText(borrow records[i], "manifest_path") ?? "".bytes())?;
+        match (rewrittenSize(sizes, path.view())) {
+            Some(n) => { jsonSet(mut records[i], "manifest_length", jsonInteger(n)?)?; }
+            null => {}
+        }
+    }
+    return Ok();
+}
+
+/// A manifest's entries: each data or delete file's `file_path` and `referenced_data_file` swapped, a position delete
+/// file's `file_path` bounds too, and its `file_size_in_bytes` the rewritten file's.
+fn swapManifest(
+    records: borrow mut Vector<Json>,
+    swap: borrow PathSwap,
+    sizes: Slice<RewrittenSize>,
+) -> Result<void, AllocError> {
+    for (i in 0..records.length) {
+        match (jsonMemberMut(mut records[i], "data_file")) {
+            Some(f) => {
+                swapMember(f, "file_path", swap)?;
+                swapMember(f, "referenced_data_file", swap)?;
+                if (jsonMemberI64(f, "content") == Some(1)) {
+                    match (jsonMemberMut(f, "lower_bounds")) {
+                        Some(b) => { swapBound(b, ICEBERG_DELETE_FILE_PATH, swap)?; }
+                        null => {}
+                    }
+                    match (jsonMemberMut(f, "upper_bounds")) {
+                        Some(b) => { swapBound(b, ICEBERG_DELETE_FILE_PATH, swap)?; }
+                        null => {}
+                    }
+                }
+                let path = copyBytes(jsonMemberText(f, "file_path") ?? "".bytes())?;
+                match (rewrittenSize(sizes, path.view())) {
+                    Some(n) => { jsonSet(f, "file_size_in_bytes", jsonInteger(n)?)?; }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+    }
+    return Ok();
+}
+
+/// A little-endian u32 at `at`.
+fn u32At(b: Slice<u8>, at: usize) -> u32 =>
+    (b[at] as u32) | ((b[at + 1] as u32) << 8) | ((b[at + 2] as u32) << 16) | ((b[at + 3] as u32) << 24);
+
+/// A Puffin file with its footer's paths swapped (`referenced-data-file` of each blob, and any other string in the
+/// source's warehouse); null when it is not a Puffin file, or its footer is compressed (not written here).
+fn swapPuffin(bytes: Slice<u8>, swap: borrow PathSwap) -> Result<Vector<u8>?, AllocError> {
+    let magic = PUFFIN_MAGIC.bytes();
+    // Magic, blobs, then the footer: magic, its JSON, the JSON's length (u32), flags (4 bytes), magic.
+    if (bytes.length < 20 || bytes[0..4] != magic || bytes[bytes.length - 4..] != magic) { return Ok(null); }
+    let flags = bytes[bytes.length - 8..bytes.length - 4];
+    if ((flags[0] & 1) != 0) { return Ok(null); }
+    let size = u32At(bytes, bytes.length - 12) as usize;
+    if (size + 20 > bytes.length) { return Ok(null); }
+    let footerAt = bytes.length - 12 - size - 4;
+    if (footerAt < 4 || bytes[footerAt..footerAt + 4] != magic) { return Ok(null); }
+    var footer = parseJson(bytes[footerAt + 4..footerAt + 4 + size])? ?? { return Ok(null); };
+    swapEveryPath(mut footer, swap)?;
+    var json = Vector<u8>.create();
+    writeJson(mut json, borrow footer)?;
+    let n = checkedTruncate<u32>(json.length) ?? { return Ok(null); };
+    var out = copyBytes(bytes[0..footerAt])?;
+    out.extend(magic)?;
+    out.extend(json.view())?;
+    for (shift in [0u32, 8, 16, 24]) { out.push(truncate<u8>(n >> shift))?; }
+    out.extend(flags)?;
+    out.extend(magic)?;
+    return Ok(Some(out));
+}
+
+/// A position delete file with its `file_path` column swapped, as one row group, uncompressed, in its own schema;
+/// null when it is not one read here (only `file_path` and `pos`), or names a file outside the source's warehouse.
+fn swapPositionDeletes(bytes: Slice<u8>, swap: borrow PathSwap) -> Result<Vector<u8>?, AllocError> {
+    let footer = deleteFooterOf(bytes)? ?? { return Ok(null); };
+    if (footer.leaves.length != 2) { return Ok(null); }
+    let pathAt = leafOfId(footer.leaves.view(), ICEBERG_DELETE_FILE_PATH) ?? { return Ok(null); };
+    let posAt = leafOfId(footer.leaves.view(), ICEBERG_DELETE_POS) ?? { return Ok(null); };
+    let deletes = readPositionDeletes(bytes)? ?? { return Ok(null); };
+    var columns = Vector<ColumnValues>.create();
+    columns.push(emptyValues())?;
+    columns.push(emptyValues())?;
+    var rows: i64 = 0;
+    // The rows as read: by path, each path's positions sorted, as Iceberg orders them.
+    var order = Vector<usize>.create();
+    for (p in 0..deletes.paths.length) { order.push(p)?; }
+    let paths = deletes.paths.view();
+    order.sortBy((a, b) => compareBytes(paths[a].view(), paths[b].view()));
+    for (o in 0..order.length) {
+        let p = order[o];
+        let swapped = swappedPath(swap, deletes.paths[p].view())? ?? { return Ok(null); };
+        for (pos in deletes.positions[p].view()) {
+            let pathLeaf = borrow footer.leaves[pathAt];
+            let posLeaf = borrow footer.leaves[posAt];
+            columns[pathAt].reps.push(0)?;
+            columns[pathAt].defs.push(truncate<u8>(pathLeaf.maxDef))?;
+            if (!(pushValue(mut columns[pathAt], pathLeaf, swapped.view())?)) { return Ok(null); }
+            var le = Vector<u8>.create();
+            let bits = truncate<u64>(pos);
+            for (shift in [0u64, 8, 16, 24, 32, 40, 48, 56]) { le.push(truncate<u8>(bits >> shift))?; }
+            columns[posAt].reps.push(0)?;
+            columns[posAt].defs.push(truncate<u8>(posLeaf.maxDef))?;
+            if (!(pushValue(mut columns[posAt], posLeaf, le.view())?)) { return Ok(null); }
+            rows += 1;
+        }
+    }
+    if (truncate<usize>(rows) != deletes.rows) { return Ok(null); }
+    return writeParquetFile(borrow footer.meta, footer.leaves.view(), columns.view(), rows, PQ_CODEC_UNCOMPRESSED, 0);
+}

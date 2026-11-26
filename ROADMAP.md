@@ -6637,3 +6637,17 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   loop.
 - **The replica's marks:** `tableView` gives `managedByService` and `managedTableInformation` for a record marked
   as a replica.
+
+### 26 Nov 2026: M36 slice 2, part 1: a replica's files' rewrites (ADR-0138 §2)
+
+- **`src/s3/replica_files.cee`,** the rewrites alone (no store): a path in the source's warehouse swapped for the
+  replica's (its warehouse itself, or under it; another id that starts alike is not);
+  - every string of the metadata JSON;
+  - manifest lists' `manifest_path` and `manifest_length`;
+  - manifests' `file_path`, `referenced_data_file`, a position delete file's `file_path` bounds (readers match a
+    delete file to its data file by them), and a rewritten file's `file_size_in_bytes`; a data column's bounds kept;
+  - a Puffin file's footer (a compressed one refused), its blobs where they were;
+  - a position delete file's `file_path` column, written as one uncompressed row group in its own schema; one naming
+    a file outside the source's warehouse refused.
+- **Tests:** `replicaPathsSwapped`, `replicaManifestsSwapped`, `replicaPuffinSwapped`, `replicaPositionDeletesSwapped`
+  (mutation-checked: the bounds' swap, the footer's length).

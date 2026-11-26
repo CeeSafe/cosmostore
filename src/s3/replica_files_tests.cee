@@ -1,0 +1,117 @@
+// A replica's files' rewrites (ADR-0138 §2).
+import web_core;
+
+fn testSwap() -> PathSwap => pathSwapOf("b".bytes(), "x".bytes(), "dst--table-s3".bytes(), "y".bytes())!;
+
+/// Paths swapped only when they are the source's warehouse or under it; every string of the metadata JSON.
+@test
+fn replicaPathsSwapped() -> Result<void, TestFailure> {
+    let swap = testSwap();
+    Check.equalBytes(
+        "s3://dst--table-s3/y/data/a.parquet".bytes(),
+        swappedPath(borrow swap, "s3://b/x/data/a.parquet".bytes())!!.view(),
+    )?;
+    Check.equalBytes("s3://dst--table-s3/y".bytes(), swappedPath(borrow swap, "s3://b/x".bytes())!!.view())?;
+    Check.isTrue(swappedPath(borrow swap, "s3://b/xy/a".bytes())!.isNull(), "another id that starts alike")?;
+    Check.isTrue(swappedPath(borrow swap, "s3://elsewhere/a".bytes())!.isNull(), "outside")?;
+    var m = parseJson(
+        "{\"location\":\"s3://b/x\",\"metadata-log\":[{\"metadata-file\":\"s3://b/x/metadata/0.json\"}],\"snapshots\":[{\"manifest-list\":\"s3://b/x/metadata/snap.avro\"}],\"properties\":{\"write.data.path\":\"s3://b/x/d\",\"comment\":\"kept\"}}".bytes(),
+    )!!;
+    swapEveryPath(mut m, borrow swap)!;
+    Check.equalBytes("s3://dst--table-s3/y".bytes(), jsonMemberText(borrow m, "location")!)?;
+    Check.equalBytes(
+        "s3://dst--table-s3/y/d".bytes(),
+        jsonMemberText(jsonMember(borrow m, "properties")!, "write.data.path")!,
+    )?;
+    Check.equalBytes("kept".bytes(), jsonMemberText(jsonMember(borrow m, "properties")!, "comment")!)?;
+    var out = Vector<u8>.create();
+    writeJson(mut out, borrow m)!;
+    Check.isTrue(findBytes(out.view(), "s3://b/x".bytes(), 0).isNull(), "no source path left")?;
+    return Ok();
+}
+
+/// A manifest's entries: paths and a position delete file's `file_path` bounds swapped, a rewritten file's size
+/// taken; a data file's bounds left as they are. A manifest list's paths and lengths.
+@test
+fn replicaManifestsSwapped() -> Result<void, TestFailure> {
+    let swap = testSwap();
+    var records = Vector<Json>.create();
+    records.push(parseJson(
+        "{\"status\":1,\"data_file\":{\"content\":0,\"file_path\":\"s3://b/x/data/a.parquet\",\"file_size_in_bytes\":10,\"lower_bounds\":[{\"key\":1,\"value\":\"s3://b/x/as-data\"}]}}".bytes(),
+    )!!)!;
+    records.push(parseJson(
+        "{\"status\":1,\"data_file\":{\"content\":1,\"file_path\":\"s3://b/x/data/d.parquet\",\"file_size_in_bytes\":20,\"referenced_data_file\":\"s3://b/x/data/a.parquet\",\"lower_bounds\":[{\"key\":2147483546,\"value\":\"s3://b/x/data/a.parquet\"}],\"upper_bounds\":[{\"key\":2147483546,\"value\":\"s3://b/x/data/a.parquet\"}]}}".bytes(),
+    )!!)!;
+    var sizes = Vector<RewrittenSize>.create();
+    sizes.push(RewrittenSize { path: copyBytes("s3://dst--table-s3/y/data/d.parquet".bytes())!, size: 33 })!;
+    swapManifest(mut records, borrow swap, sizes.view())!;
+    let data = jsonMember(borrow records[0], "data_file")!;
+    Check.equalBytes("s3://dst--table-s3/y/data/a.parquet".bytes(), jsonMemberText(data, "file_path")!)?;
+    Check.isTrue(jsonMemberI64(data, "file_size_in_bytes") == Some(10), "a copied file's size kept")?;
+    var dataJson = Vector<u8>.create();
+    writeJson(mut dataJson, data)!;
+    Check.isTrue(findBytes(dataJson.view(), "s3://b/x/as-data".bytes(), 0).isSome(), "a data column's bound kept")?;
+    let delete = jsonMember(borrow records[1], "data_file")!;
+    Check.isTrue(jsonMemberI64(delete, "file_size_in_bytes") == Some(33), "the rewritten size")?;
+    Check.equalBytes("s3://dst--table-s3/y/data/a.parquet".bytes(), jsonMemberText(delete, "referenced_data_file")!)?;
+    var deleteJson = Vector<u8>.create();
+    writeJson(mut deleteJson, delete)!;
+    Check.isTrue(findBytes(deleteJson.view(), "s3://b/x".bytes(), 0).isNull(), "its bounds swapped")?;
+    var list = Vector<Json>.create();
+    list.push(parseJson("{\"manifest_path\":\"s3://b/x/metadata/m0.avro\",\"manifest_length\":5}".bytes())!!)!;
+    var listSizes = Vector<RewrittenSize>.create();
+    listSizes.push(RewrittenSize { path: copyBytes("s3://dst--table-s3/y/metadata/m0.avro".bytes())!, size: 7 })!;
+    swapManifestList(mut list, borrow swap, listSizes.view())!;
+    Check.equalBytes(
+        "s3://dst--table-s3/y/metadata/m0.avro".bytes(),
+        jsonMemberText(borrow list[0], "manifest_path")!,
+    )?;
+    Check.isTrue(jsonMemberI64(borrow list[0], "manifest_length") == Some(7), "its new length")?;
+    return Ok();
+}
+
+/// A Puffin file's footer swapped, its blob where it was; a compressed footer, or a file that is not Puffin, refused.
+@test
+fn replicaPuffinSwapped() -> Result<void, TestFailure> {
+    let swap = testSwap();
+    let footer =
+        "{\"blobs\":[{\"type\":\"deletion-vector-v1\",\"fields\":[],\"snapshot-id\":1,\"sequence-number\":1,\"offset\":4,\"length\":6,\"properties\":{\"referenced-data-file\":\"s3://b/x/data/a.parquet\",\"cardinality\":\"2\"}}]}";
+    var file = copyBytes("PFA1blob!!PFA1".bytes())!;
+    file.extend(footer.bytes())!;
+    let n = truncate<u32>(footer.bytes().length);
+    for (shift in [0u32, 8, 16, 24]) { file.push(truncate<u8>(n >> shift))!; }
+    file.extend([0u8, 0, 0, 0][..])!;
+    file.extend("PFA1".bytes())!;
+    let swapped = swapPuffin(file.view(), borrow swap)!!;
+    Check.equalBytes("blob!!".bytes(), swapped.view()[4..10])?;
+    Check.isTrue(findBytes(swapped.view(), "s3://dst--table-s3/y/data/a.parquet".bytes(), 0).isSome(), "swapped")?;
+    Check.isTrue(findBytes(swapped.view(), "s3://b/x".bytes(), 0).isNull(), "none left")?;
+    // Read again as Puffin: its footer's length right.
+    Check.isTrue(swapPuffin(swapped.view(), borrow swap)!.isSome(), "still a Puffin file")?;
+    var compressed = copyBytes(file.view())!;
+    let at = compressed.length - 8;
+    compressed[at] = 1;
+    Check.isTrue(swapPuffin(compressed.view(), borrow swap)!.isNull(), "a compressed footer")?;
+    Check.isTrue(swapPuffin("not puffin at all, no".bytes(), borrow swap)!.isNull(), "not Puffin")?;
+    return Ok();
+}
+
+/// A position delete file's `file_path` column swapped: read again, the same positions under the replica's paths;
+/// one naming a file outside the source's warehouse refused.
+@test
+fn replicaPositionDeletesSwapped() -> Result<void, TestFailure> {
+    let swap = testSwap();
+    let bytes = fixtureBytes(PAGES_DELETES_POSITION[..]);
+    let out = swapPositionDeletes(bytes.view(), borrow swap)!!;
+    let d = readPositionDeletes(out.view())!!;
+    Check.equalU64(3, d.rows as u64)?;
+    let a = positionsOf(borrow d, "s3://dst--table-s3/y/a.parquet".bytes())!!;
+    Check.equalU64(2, a.length as u64)?;
+    Check.equalU64(1, truncate<u64>(a[0]))?;
+    Check.equalU64(3, truncate<u64>(a[1]))?;
+    Check.isTrue(positionsOf(borrow d, "s3://dst--table-s3/y/b.parquet".bytes())!.isSome(), "b's too")?;
+    Check.isTrue(positionsOf(borrow d, "s3://b/x/a.parquet".bytes())!.isNull(), "no source path left")?;
+    let elsewhere = pathSwapOf("other".bytes(), "z".bytes(), "dst--table-s3".bytes(), "y".bytes())!;
+    Check.isTrue(swapPositionDeletes(bytes.view(), borrow elsewhere)!.isNull(), "a file outside its warehouse")?;
+    return Ok();
+}
