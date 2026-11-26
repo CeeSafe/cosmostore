@@ -6343,3 +6343,11 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Checks:** 547 unit tests, the cluster smoke (214), the maintenance smoke and the S3 smoke. Slice 3's perf gate
   failed once on noise and passed on its rerun.
 - **Next:** the owner's word on ADR-0132 and on closing M33.
+
+### 26 Nov 2026: the cluster smoke's key files written atomically
+
+- **CI failed on a88348c** in the cluster smoke's key rotation check, not in M33's code. "The key in use removed"
+  expected each running node to log its wait once, and one logged it twice.
+- **The cause:** the smoke wrote the key files in place while the nodes ran. A node that polled between the
+  truncate and the write saw two changes, an empty file and then the new one, and logged a wait for each.
+- **Fixed:** each key file is written whole and moved into place. The smoke passes locally (214).

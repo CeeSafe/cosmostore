@@ -612,7 +612,9 @@ on "$survivor" s3api create-bucket --bucket rotate > /dev/null 2>&1
 printf 'rotated on a cluster' > rotate.txt
 check "an SSE-S3 object before the rotation" "$(on "$survivor" s3api put-object --bucket rotate --key a --body rotate.txt --server-side-encryption AES256 --query ServerSideEncryption --output text 2>&1)" AES256
 cp sse.keys sse.keys.kept
-{ printf 'sse2 %s\n' "$(head -c 32 /dev/urandom | base64)"; cat sse.keys.kept; } > sse.keys
+# Each key file written whole and moved into place: a node that read one half-written would see two changes, and say
+# each (a flake CI found on a88348c).
+{ printf 'sse2 %s\n' "$(head -c 32 /dev/urandom | base64)"; cat sse.keys.kept; } > sse.keys.next && mv sse.keys.next sse.keys
 pause 4
 running() { for n in 1 2 3; do [ -n "${PIDS[$n]}" ] && grep -c "$1" "log$n"; done | sort -u; }
 check "a key put first: the running nodes take it" "$(running "SSE key file reloaded: 2 keys")" 1
@@ -632,7 +634,7 @@ for n in 1 2 3; do
     check "the object reads through node $n, the old key gone" "$(on "$n" s3 cp s3://rotate/a - 2>&1)" "rotated on a cluster"
 done
 cp sse.keys sse.keys.sse2
-printf 'sse3 %s\n' "$(head -c 32 /dev/urandom | base64)" > sse.keys
+printf 'sse3 %s\n' "$(head -c 32 /dev/urandom | base64)" > sse.keys.next && mv sse.keys.next sse.keys
 pause 4
 # Not taken: every node has sse2 first, so it waits (and, were it not, versions are sealed under it: refused).
 check "the key in use removed: the running nodes do not take it" "$(running "SSE key file reload waits: .*node has the key first\|SSE key file reload waits: [0-9]* versions.*(sse2)")" 1
@@ -643,7 +645,7 @@ kmscode() { on "$@" 2>&1 | sed -n 's/.*error occurred (\([A-Za-z0-9.]*\)).*/\1/p
 on "$survivor" s3api create-bucket --bucket retire > /dev/null 2>&1
 check "an SSE-KMS object under orders" "$(on "$survivor" s3api put-object --bucket retire --key a --body rotate.txt --server-side-encryption aws:kms --ssekms-key-id orders --query SSEKMSKeyId --output text 2>&1)" orders
 cp kms.keys kms.keys.kept
-grep '^app-default ' kms.keys.kept > kms.keys
+grep '^app-default ' kms.keys.kept > kms.keys.next && mv kms.keys.next kms.keys
 for i in $(seq 1 30); do [ "$(running "KMS key file reload: orders retiring")" = 1 ] && break; pause 0.5; done
 check "orders removed from the file: the running nodes retire it" "$(running "KMS key file reload: orders retiring")" 1
 for n in 1 2 3; do
