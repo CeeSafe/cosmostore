@@ -159,6 +159,34 @@ public class V3Check {
             table.refresh();
             System.out.println("first-row-id " + table.currentSnapshot().firstRowId());
             System.out.println("after-append " + ((HasTableOperations) table).operations().current().nextRowId());
+        } else if (args[2].equals("views")) {
+            // Views and nested namespaces (ADR-0134), with Iceberg Java's view builder.
+            TableIdentifier v = TableIdentifier.of(Namespace.of("javans"), "jview");
+            c.buildView(v).withSchema(SCHEMA).withDefaultNamespace(Namespace.of("javans"))
+                .withQuery("spark", "select id from javans.v3").withProperty("comment", "one").create();
+            var view = c.loadView(v);
+            System.out.println("view-sql " + view.sqlFor("spark").sql().replace(' ', '_'));
+            c.buildView(v).withSchema(SCHEMA).withDefaultNamespace(Namespace.of("javans"))
+                .withQuery("spark", "select id from javans.v3 where id > 1").replace();
+            view = c.loadView(v);
+            System.out.println("view-versions " + view.history().size());
+            System.out.println("view-current " + view.currentVersion().versionId());
+            System.out.println("views-listed " + c.listViews(Namespace.of("javans")).size());
+            TableIdentifier moved = TableIdentifier.of(Namespace.of("javans"), "jview2");
+            c.renameView(v, moved);
+            System.out.println("view-renamed " + (c.viewExists(moved) && !c.viewExists(v)));
+            System.out.println("view-dropped " + c.dropView(moved));
+            Namespace nested = Namespace.of("jdeep", "er");
+            c.createNamespace(Namespace.of("jdeep"));
+            c.createNamespace(nested);
+            TableIdentifier nt = TableIdentifier.of(nested, "t");
+            Table table = c.createTable(nt, SCHEMA, PartitionSpec.unpartitioned(), Map.of("format-version", "2"));
+            table.newAppend().appendFile(writeFileIn(table, 0, 3)).commit();
+            System.out.println("nested-rows " + count(c.loadTable(nt)));
+            System.out.println("nested-listed " + c.listNamespaces(Namespace.of("jdeep")).size());
+            c.dropTable(nt, true);
+            c.dropNamespace(nested);
+            c.dropNamespace(Namespace.of("jdeep"));
         } else if (args[2].equals("ctas")) {
             // CREATE TABLE AS SELECT's way (ADR-0124): a staged create, its rows appended in the transaction, and the
             // table made by the transaction's one commit.

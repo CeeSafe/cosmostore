@@ -109,6 +109,16 @@ for name, result in sorted(calls.items()):
             check("Java's %s refused" % name[5:], result.startswith("UnsupportedOperationException"), True)
         else:
             check("Java's %s" % name[5:], result, "ok")
+# Views and nested namespaces (ADR-0134), by Iceberg Java's own builder.
+views, _, _ = java("views")
+check("Java's view made, its SQL read back", views.get("view-sql"), "select_id_from_javans.v3")
+check("Java's view replaced: a second version, current", (views.get("view-versions"), views.get("view-current")),
+      ("2", "2"))
+check("Java's views listed", views.get("views-listed"), "1")
+check("Java's view renamed", views.get("view-renamed"), "true")
+check("Java's view dropped", views.get("view-dropped"), "true")
+check("Java's table in a nested namespace, its rows", views.get("nested-rows"), "3")
+check("Java's nested namespace listed under its parent", views.get("nested-listed"), "1")
 before, rows, _ = java("write")
 check("still v3 after its appends", before.get("format"), "3")
 check("its deletion vector committed", before.get("deletes"), "1")

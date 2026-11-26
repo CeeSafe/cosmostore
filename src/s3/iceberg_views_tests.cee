@@ -1,0 +1,171 @@
+// Iceberg views (ADR-0134 §2, §3).
+import web_core;
+import web_http;
+
+fn viewSegments(names: Slice<StringView>) -> Vector<Vector<u8>> {
+    var out = Vector<Vector<u8>>.create();
+    for (n in names) { out.push(copyBytes(n.bytes())!)!; }
+    return out;
+}
+
+const VIEW_BODY: StringView =
+    "{\"name\":\"v\",\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]},\"view-version\":{\"version-id\":1,\"schema-id\":0,\"timestamp-ms\":1000,\"summary\":{},\"default-namespace\":[\"ns\"],\"representations\":[{\"type\":\"sql\",\"sql\":\"select a from t\",\"dialect\":\"spark\"}]},\"properties\":{\"comment\":\"one\"}}";
+
+/// A view made, loaded, listed, replaced by a commit (a new version made current), refused a commit whose
+/// requirement does not hold, its name refused to a table and a table's to it, renamed, and dropped.
+@test
+fn icebergViewsLifecycle() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("iceberg-views");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let caller = tablesCaller("AKIAVIEWS");
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let views = viewSegments(["views"][..]);
+    let made = icebergViews(
+        mut s,
+        Method.Post,
+        "cat".bytes(),
+        "ns".bytes(),
+        views.view(),
+        VIEW_BODY.bytes(),
+        borrow caller,
+        borrow noKeys,
+    )!;
+    Check.equalU64(200, made.status as u64)?;
+    let first = parseJson(made.body.view())!!;
+    let uuid = copyBytes(jsonMemberText(jsonMember(borrow first, "metadata")!, "view-uuid")!)!;
+    // Its name is taken: a view again, or a table.
+    Check.equalU64(
+        409,
+        icebergViews(
+            mut s,
+            Method.Post,
+            "cat".bytes(),
+            "ns".bytes(),
+            views.view(),
+            VIEW_BODY.bytes(),
+            borrow caller,
+            borrow noKeys,
+        )!.status as u64,
+    )?;
+    let table = icebergCreateTable(
+        mut s,
+        "cat".bytes(),
+        "ns".bytes(),
+        "{\"name\":\"v\",\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+        borrow noKeys,
+    )!;
+    Check.equalU64(409, table.status as u64)?;
+    // Listed and loaded.
+    let listed = parseJson(
+        icebergViews(
+            mut s,
+            Method.Get,
+            "cat".bytes(),
+            "ns".bytes(),
+            views.view(),
+            "".bytes(),
+            borrow caller,
+            borrow noKeys,
+        )!.body.view(),
+    )!!;
+    Check.equalU64(1, arrayLength(borrow listed, "identifiers") as u64)?;
+    let one = viewSegments(["views", "v"][..]);
+    let loaded = parseJson(
+        icebergViews(
+            mut s,
+            Method.Get,
+            "cat".bytes(),
+            "ns".bytes(),
+            one.view(),
+            "".bytes(),
+            borrow caller,
+            borrow noKeys,
+        )!.body.view(),
+    )!!;
+    Check.equalBytes(uuid.view(), jsonMemberText(jsonMember(borrow loaded, "metadata")!, "view-uuid")!)?;
+    // A new version, made current.
+    var commit = copyBytes("{\"requirements\":[{\"type\":\"assert-view-uuid\",\"uuid\":\"".bytes())!;
+    commit.extend(uuid.view())!;
+    commit.extend(
+        "\"}],\"updates\":[{\"action\":\"add-view-version\",\"view-version\":{\"version-id\":-1,\"schema-id\":0,\"timestamp-ms\":2000,\"summary\":{},\"default-namespace\":[\"ns\"],\"representations\":[{\"type\":\"sql\",\"sql\":\"select a from t where a > 1\",\"dialect\":\"spark\"}]}},{\"action\":\"set-current-view-version\",\"view-version-id\":-1},{\"action\":\"set-properties\",\"updates\":{\"comment\":\"two\"}}]}".bytes(),
+    )!;
+    let committed = icebergViews(
+        mut s,
+        Method.Post,
+        "cat".bytes(),
+        "ns".bytes(),
+        one.view(),
+        commit.view(),
+        borrow caller,
+        borrow noKeys,
+    )!;
+    Check.equalU64(200, committed.status as u64)?;
+    let after = parseJson(committed.body.view())!!;
+    let meta = jsonMember(borrow after, "metadata")!;
+    Check.equalU64(2, truncate<u64>(jsonMemberI64(meta, "current-version-id")!))?;
+    Check.equalU64(2, arrayLength(meta, "versions") as u64)?;
+    Check.equalU64(2, arrayLength(meta, "version-log") as u64)?;
+    Check.equalBytes("two".bytes(), jsonMemberText(jsonMember(meta, "properties")!, "comment")!)?;
+    Check.isTrue(
+        findBytes(jsonMemberText(borrow after, "metadata-location")!, "/metadata/00001-".bytes(), 0).isSome(),
+        "version 1",
+    )?;
+    // A requirement that does not hold.
+    let stale =
+        "{\"requirements\":[{\"type\":\"assert-view-uuid\",\"uuid\":\"00000000-0000-4000-8000-000000000000\"}],\"updates\":[]}";
+    Check.equalU64(
+        409,
+        icebergViews(
+            mut s,
+            Method.Post,
+            "cat".bytes(),
+            "ns".bytes(),
+            one.view(),
+            stale.bytes(),
+            borrow caller,
+            borrow noKeys,
+        )!.status as u64,
+    )?;
+    // A namespace with a view is not dropped.
+    match (deleteNamespace(mut s, "cat".bytes(), "ns".bytes())) {
+        Err(TablesError.Conflict) => {}
+        _ => { return Err(TestFailure.create("a namespace with a view dropped")); }
+    }
+    // Renamed, then dropped.
+    let rename =
+        "{\"source\":{\"namespace\":[\"ns\"],\"name\":\"v\"},\"destination\":{\"namespace\":[\"ns\"],\"name\":\"w\"}}";
+    Check.equalU64(204, icebergRenameView(mut s, "cat".bytes(), rename.bytes(), borrow caller)!.status as u64)?;
+    Check.isFalse(viewExists(borrow s, hidden.view(), "ns".bytes(), "v".bytes())!, "the old name gone")?;
+    let renamed = viewSegments(["views", "w"][..]);
+    let dropped = icebergViews(
+        mut s,
+        Method.Delete,
+        "cat".bytes(),
+        "ns".bytes(),
+        renamed.view(),
+        "".bytes(),
+        borrow caller,
+        borrow noKeys,
+    )!;
+    Check.equalU64(204, dropped.status as u64)?;
+    Check.isTrue(dropped.purgeId.length > 0, "its files purged after")?;
+    Check.equalU64(
+        404,
+        icebergViews(
+            mut s,
+            Method.Get,
+            "cat".bytes(),
+            "ns".bytes(),
+            renamed.view(),
+            "".bytes(),
+            borrow caller,
+            borrow noKeys,
+        )!.status as u64,
+    )?;
+    removeTree(dir.view());
+    return Ok();
+}

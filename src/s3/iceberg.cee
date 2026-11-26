@@ -53,7 +53,7 @@ fn encodedSegment(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, A
 
 /// The endpoints this catalog has, as `GET /v1/config` lists them.
 const ICEBERG_ENDPOINTS: StringView =
-    "GET /v1/{prefix}/namespaces,POST /v1/{prefix}/namespaces,GET /v1/{prefix}/namespaces/{namespace},HEAD /v1/{prefix}/namespaces/{namespace},DELETE /v1/{prefix}/namespaces/{namespace},GET /v1/{prefix}/namespaces/{namespace}/tables,POST /v1/{prefix}/namespaces/{namespace}/tables,GET /v1/{prefix}/namespaces/{namespace}/tables/{table},HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table},POST /v1/{prefix}/namespaces/{namespace}/tables/{table},DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table},POST /v1/{prefix}/tables/rename";
+    "GET /v1/{prefix}/namespaces,POST /v1/{prefix}/namespaces,GET /v1/{prefix}/namespaces/{namespace},HEAD /v1/{prefix}/namespaces/{namespace},DELETE /v1/{prefix}/namespaces/{namespace},GET /v1/{prefix}/namespaces/{namespace}/tables,POST /v1/{prefix}/namespaces/{namespace}/tables,GET /v1/{prefix}/namespaces/{namespace}/tables/{table},HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table},POST /v1/{prefix}/namespaces/{namespace}/tables/{table},DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table},POST /v1/{prefix}/tables/rename,GET /v1/{prefix}/namespaces/{namespace}/views,POST /v1/{prefix}/namespaces/{namespace}/views,GET /v1/{prefix}/namespaces/{namespace}/views/{view},HEAD /v1/{prefix}/namespaces/{namespace}/views/{view},POST /v1/{prefix}/namespaces/{namespace}/views/{view},DELETE /v1/{prefix}/namespaces/{namespace}/views/{view},POST /v1/{prefix}/views/rename";
 
 fn icebergConfig(
     store: borrow ObjectStore,
@@ -1258,7 +1258,8 @@ fn icebergCreateTable(
     let hidden = tableWarehouseBucket(bucket)?;
     if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
     let key = catalogKey(CATALOG_TABLES, ns, name.view())?;
-    if (readRecord(store, hidden.view(), key.view())?.isSome()) {
+    // Nor a view's name (ADR-0134 §2).
+    if (readRecord(store, hidden.view(), key.view())?.isSome() || viewExists(store, hidden.view(), ns, name.view())?) {
         return icebergError(409, "AlreadyExistsException", "The table already exists.");
     }
     var id = Vector<u8>.create();
@@ -1762,6 +1763,11 @@ fn icebergRoute(
         isMethod(m, Method.Post)) {
         return icebergRename(store, b, body, caller);
     }
+    // Views (ADR-0134 §3).
+    if (rest.length == 2 && rest[0].view() == "views".bytes() && rest[1].view() == "rename".bytes() &&
+        isMethod(m, Method.Post)) {
+        return icebergRenameView(store, b, body, caller);
+    }
     if (rest.length == 0 || rest[0].view() != "namespaces".bytes()) { return icebergUnsupported(); }
     if (rest.length == 1) {
         if (isMethod(m, Method.Get)) {
@@ -1782,6 +1788,7 @@ fn icebergRoute(
         checkTables(store, caller, action, b, "".bytes())?;
         return icebergNamespace(store, m, b, ns);
     }
+    if (rest[2].view() == "views".bytes()) { return icebergViews(store, m, b, ns, rest[2..], body, caller, sealing); }
     if (rest[2].view() != "tables".bytes()) { return icebergUnsupported(); }
     if (rest.length == 3) {
         if (isMethod(m, Method.Get)) {

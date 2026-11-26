@@ -312,6 +312,38 @@ delete_table_bucket(log_arn)
 for o in s3.list_objects_v2(Bucket="tlog-target").get("Contents", []):
     s3.delete_object(Bucket="tlog-target", Key=o["Key"])
 s3.delete_bucket(Bucket="tlog-target")
+# Iceberg views and nested namespaces (ADR-0134), beyond S3 Tables: PyIceberg's own calls.
+from pyiceberg.view.metadata import SQLViewRepresentation, ViewVersion
+version = ViewVersion(schema_id=0, default_namespace=("sales",),
+                      representations=[SQLViewRepresentation(type="sql", sql="select id from sales.orders", dialect="spark")])
+catalog.create_view("sales.recent", schema=schema, view_version=version, properties={"comment": "recent orders"})
+check("create_view, view_exists", catalog.view_exists("sales.recent"), True)
+check("list_views", catalog.list_views("sales"), [("sales", "recent")])
+# PyIceberg 0.12 parses a representation into its base class, which keeps the fields in its dump.
+check("load_view: its SQL", catalog.load_view("sales.recent").metadata.versions[0].representations[0].model_dump()
+      .get("sql"), "select id from sales.orders")
+try:
+    catalog.create_table("sales.recent", schema=schema)
+    check("a table at a view's name refused", "made", "refused")
+except TableAlreadyExistsError:
+    check("a table at a view's name refused", "refused", "refused")
+catalog.drop_view("sales.recent")
+check("drop_view", catalog.view_exists("sales.recent"), False)
+catalog.create_namespace(("deep",))
+catalog.create_namespace(("deep", "er"))
+check("a nested namespace, listed under its parent", catalog.list_namespaces(("deep",)), [("deep", "er")])
+nested = catalog.create_table(("deep", "er", "t"), schema=schema)
+nested.append(pa.table({"id": [42], "item": ["fig"]}, schema=schema))
+check("a table in a nested namespace", catalog.list_tables(("deep", "er")), [("deep", "er", "t")])
+check("its rows", catalog.load_table(("deep", "er", "t")).scan().to_arrow().column("id").to_pylist(), [42])
+try:
+    catalog.drop_namespace(("deep",))
+    check("a namespace with a child not dropped", "dropped", "kept")
+except Exception as e:
+    check("a namespace with a child not dropped", type(e).__name__, "NamespaceNotEmptyError")
+catalog.purge_table(("deep", "er", "t"))
+catalog.drop_namespace(("deep", "er"))
+catalog.drop_namespace(("deep",))
 catalog.rename_table("sales.orders", "sales.orders_v2")
 check("rename_table", catalog.list_tables("sales"), [("sales", "orders_v2")])
 check("rows after the rename", catalog.load_table("sales.orders_v2").scan().to_arrow().num_rows, 4)

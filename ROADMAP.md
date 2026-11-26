@@ -6395,3 +6395,28 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   nested namespaces and their tables.
 - **Tests:** `nestedNamespaces`.
 - **Checks:** 548 unit tests, the S3 smoke and the cluster smoke (214).
+
+### 26 Nov 2026: M34 slices 2 to 4, Iceberg views and the checks (ADR-0134 §2 to §5)
+
+- **Views' records and files** (`src/s3/iceberg_views.cee`):
+  - a view's record is `.s3tables/views/<namespace>/<name>`: its id, metadata location, times, and the encryption
+    it was made under;
+  - its metadata files (format version 1) are in the warehouse under its id, versioned and sealed with that
+    encryption;
+  - its name may not be a table's, nor a table's a view's, through either API and on renames;
+  - a namespace holding a view is not dropped;
+  - a dropped view's files are purged after the answer, as a table's are.
+- **The calls:** create, load, exists, list, commit (`assert-view-uuid` and the spec's eight updates, a version
+  checked as Iceberg Java checks it), drop, and rename within its table bucket. `config` lists the view endpoints.
+  `register-view` stays unserved.
+- **Authorization** (the owner's "Actions of their own"): `s3tables:CreateView`, `GetView`, `ListViews`,
+  `UpdateView`, `RenameView` and `DeleteView`, on `<bucket>/view/<id>`. Table bucket policies take that resource,
+  and the actions are named in the log records.
+- **The checks:**
+  - `icebergViewsLifecycle`;
+  - PyIceberg (`iceberg_check.py`, 65 on `serve` and through a cluster's node): `create_view`, `view_exists`,
+    `list_views`, `load_view` and `drop_view`, a table refused at a view's name, and a nested namespace's table
+    appended and read;
+  - Iceberg Java (`V3Check` phase `views`, in CI): its view builder's create, replace (a second version), list,
+    rename and drop, and a nested namespace's table.
+- **Checks:** 549 unit tests, the S3 smoke, the cluster smoke (214), and the Java check, plain and on a KMS table.
