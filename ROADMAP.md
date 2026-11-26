@@ -6464,3 +6464,10 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - orphan files swept (B3);
   - B2 kept with the hold made explicit, or closed by name reservations as well.
 - **For the owner:** B2's choice; how far B3's sweep reaches (every orphaned id, tables' too, recommended).
+
+### 26 Nov 2026: ADR-0136, the owner's choices
+
+- **B2:** "B2: keep + check": kept, with the store's hold named where it is taken, and a check that races a view and
+  a table at one name, and a namespace against its parent's drop, on `serve` and a cluster.
+- **B3:** "Every orphaned id": the sweep removes any warehouse id that no table, view or staged create names, and a
+  view's earlier metadata files.

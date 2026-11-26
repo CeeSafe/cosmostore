@@ -1,6 +1,8 @@
 # ADR-0136: M34's recorded items (M35)
 
-**Status:** proposed, 26 Nov 2026.
+**Status:** proposed, 26 Nov 2026, with the owner's choices made:
+- B2 is kept, with the hold made explicit and checked ("B2: keep + check");
+- B3's sweep reaches every orphaned id ("Every orphaned id").
 
 M35 is ADR-0135's item A (the owner: "A.").
 
@@ -56,8 +58,10 @@ M34's exit review (`docs/m34-exit-review.md`) recorded B1 to B4 and three missin
    - each update's test, the CommitFailed test, and a view created, replaced and loaded in a KMS table bucket;
    - Iceberg Java's view replace in `V3Check` asserts the schema id reused, and a replace past the history size
      expires the oldest.
-3. **Orphan files swept** (slice 3, B3), per the owner's choice below.
-4. **B2,** per the owner's choice below (slice 4).
+3. **Orphan files swept** (slice 3, B3): every orphaned id in a table bucket's warehouse, and a view's earlier
+   metadata files, as the owner chose below.
+4. **B2 kept** (slice 4), as the owner chose below: the comment where the hold is taken, and the parallel check on
+   `serve` and a cluster.
 5. **The exit review** (slice 5).
 
 ## For the owner to decide
