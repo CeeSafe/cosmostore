@@ -104,6 +104,20 @@ fn signRemote(
     query: Slice<u8>,
     amzDate: Slice<u8>,
     headers: borrow mut Vector<HeaderPair>,
+) -> Result<void, AllocError> =>
+    signRemoteAs(t, "s3", method, path, query, amzDate, "UNSIGNED-PAYLOAD".bytes(), headers);
+
+/// `signRemote` for `service`'s scope: `s3`, or `s3tables` for a table bucket's catalog (ADR-0138 §4), whose payload
+/// is signed by its hash (S3 Tables takes no `UNSIGNED-PAYLOAD`).
+fn signRemoteAs(
+    t: borrow ReplicationTarget,
+    service: StringView,
+    method: Slice<u8>,
+    path: Slice<u8>,
+    query: Slice<u8>,
+    amzDate: Slice<u8>,
+    payload: Slice<u8>,
+    headers: borrow mut Vector<HeaderPair>,
 ) -> Result<void, AllocError> {
     headers.sortBy((a, b) => compareBytes(a.name.view(), b.name.view()));
     var signed = Vector<u8>.create();
@@ -118,15 +132,17 @@ fn signRemote(
         query,
         headers.view(),
         signed.view(),
-        "UNSIGNED-PAYLOAD".bytes(),
+        payload,
         mut canonical,
     )?;
     var scope = Vector<u8>.create();
     scope.extend(amzDate[0..8])?;
     scope.push('/')?;
     scope.extend(t.region.view())?;
-    scope.extend("/s3/aws4_request".bytes())?;
-    let key = signingKey(t.secret.view(), amzDate[0..8], t.region.view(), "s3".bytes())?;
+    scope.push('/')?;
+    scope.extend(service.bytes())?;
+    scope.extend("/aws4_request".bytes())?;
+    let key = signingKey(t.secret.view(), amzDate[0..8], t.region.view(), service.bytes())?;
     var signature = Vector<u8>.create();
     seedSignature(borrow key, amzDate, scope.view(), canonical.view(), mut signature)?;
     var auth = Vector<u8>.create();
@@ -162,6 +178,20 @@ async fn remoteCall(
     query: Slice<u8>,
     extra: Slice<HeaderPair>,
     body: borrow mut dyn BodySource,
+) -> Result<RemoteAnswer, AllocError> =>
+    await remoteCallAs(client, t, "s3", "UNSIGNED-PAYLOAD".bytes(), method, path, query, extra, body);
+
+/// `remoteCall` signed for `service` (`s3`, or `s3tables`), its payload's hash `payload` (or `UNSIGNED-PAYLOAD`).
+async fn remoteCallAs(
+    client: borrow Client,
+    t: borrow ReplicationTarget,
+    service: StringView,
+    payload: Slice<u8>,
+    method: Method,
+    path: Slice<u8>,
+    query: Slice<u8>,
+    extra: Slice<HeaderPair>,
+    body: borrow mut dyn BodySource,
 ) -> Result<RemoteAnswer, AllocError> {
     var answer = RemoteAnswer { status: 0, etag: Vector<u8>.create(), body: Vector<u8>.create() };
     let host = match (endpointAuthority(t.url.view())) {
@@ -173,9 +203,9 @@ async fn remoteCall(
     var headers = Vector<HeaderPair>.create();
     headers.push(remotePair("host".bytes(), host)?)?;
     headers.push(remotePair("x-amz-date".bytes(), amzDate.view())?)?;
-    headers.push(remotePair("x-amz-content-sha256".bytes(), "UNSIGNED-PAYLOAD".bytes())?)?;
+    headers.push(remotePair("x-amz-content-sha256".bytes(), payload)?)?;
     for (i in 0..extra.length) { headers.push(remotePair(extra[i].name.view(), extra[i].value.view())?)?; }
-    signRemote(t, Methods.text(method).bytes(), path, query, amzDate.view(), mut headers)?;
+    signRemoteAs(t, service, Methods.text(method).bytes(), path, query, amzDate.view(), payload, mut headers)?;
     var url = copyBytes(t.url.view())?;
     url.extend(path)?;
     if (query.length > 0) {

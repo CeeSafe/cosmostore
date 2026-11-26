@@ -409,7 +409,8 @@ catalog.drop_namespace("sales")
 delete_table_bucket(arn)
 check("cleaned up", "iceberg-check" in [b["name"] for b in tables.list_table_buckets()["tableBuckets"]], False)
 # Table replication (ADR-0138): a table bucket replicated to another, its table's appends and deletes read from the
-# replica, which is read-only until it is disassociated. Not yet on a cluster (`--no-replication`, M36 slice 3).
+# replica, which is read-only until it is disassociated (on `serve`, and through a cluster's node; `--no-replication`
+# leaves it out).
 if "--no-replication" in sys.argv:
     sys.exit(1 if failed else 0)
 src_arn = tables.create_table_bucket(name="repl-source")["arn"]
@@ -437,7 +438,7 @@ def replicated(location):
 
 
 status = replicated(source.metadata_location)
-check("replication: completed", status["replicationStatus"], "completed")
+check("replication: completed", (status["replicationStatus"], status.get("failureMessage")), ("completed", None))
 check("its replica's rows", sorted(dst_cat.load_table("rs.t").scan().to_arrow().column("id").to_pylist()), [1, 2, 3])
 replica = tables.get_table(tableBucketARN=dst_arn, namespace="rs", name="t")
 check("the replica managed by replication", replica.get("managedByService"), "replication.s3tables.amazonaws.com")

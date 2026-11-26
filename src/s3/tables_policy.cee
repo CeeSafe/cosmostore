@@ -494,9 +494,11 @@ fn tableDataCheck(
     action: StringView,
     name: Slice<u8>,
     id: Slice<u8>,
+    replicating: bool,
 ) -> Result<void, TablesError> {
     checkTables(store, caller, action, name, id)?;
-    if (action.bytes() == "s3tables:PutTableData".bytes() && id.length > 0) {
+    // A cluster's own copy writes the replica's files (ADR-0138 §4).
+    if (action.bytes() == "s3tables:PutTableData".bytes() && id.length > 0 && !replicating) {
         let hidden = tableWarehouseBucket(name)?;
         let config = readTablesConfig(store, hidden.view(), tableConfigKey(id)?.view())?;
         if (jsonMember(borrow config, "replica").isSome()) { return Err(TablesError.Forbidden); }
@@ -520,7 +522,14 @@ async fn tableDataAllowed(
     let callerRef = borrow caller;
     var guard = await lockStore(app)?;
     let store = guard.data();
-    return match (await Async.blocking(() => tableDataCheck(store, callerRef, action, name, id))) {
+    // A cluster's own copy (ADR-0138 §4): the account's long-term key, not a user's or a session's, its field signed.
+    let accountKey = match (who.key) {
+        Some(k) => !who.session && app.credentials.get().view()[k].user.length == 0,
+        null => false,
+    };
+    let replicating = app.cluster && accountKey && headerOf(req, REPLICA_TABLE_FIELD).isSome() &&
+        headerSigned(req, REPLICA_TABLE_FIELD);
+    return match (await Async.blocking(() => tableDataCheck(store, callerRef, action, name, id, replicating))) {
         Ok() => Ok(true),
         Err(TablesError.Forbidden) => Ok(false),
         Err(TablesError.OutOfMemory(e)) => Err(S3Fail.OutOfMemory(e)),

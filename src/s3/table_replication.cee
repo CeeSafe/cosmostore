@@ -120,6 +120,8 @@ struct ReplicaCopy {
     swap: PathSwap;
     /// Set when the copy fails: its reason.
     failure: Vector<u8>;
+    /// The replica's id an earlier copy kept, from the source's status.
+    given: Vector<u8>;
 }
 
 fn failCopy(c: borrow mut ReplicaCopy, why: StringView) -> Result<void, AllocError> {
@@ -132,6 +134,39 @@ fn failCopy(c: borrow mut ReplicaCopy, why: StringView) -> Result<void, AllocErr
 /// set when it cannot be made.
 fn replicaCopyStart(
     store: borrow mut ObjectStore,
+    srcBucket: Slice<u8>,
+    srcId: Slice<u8>,
+    dstBucket: Slice<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<ReplicaCopy?, TablesError> {
+    var c = replicaSourceRead(store, srcBucket, srcId, dstBucket, keys)? ?? { return Ok(null); };
+    if (c.failure.length > 0) { return Ok(Some(c)); }
+    let d = replicaDestinationStart(
+        store,
+        dstBucket,
+        srcBucket,
+        srcId,
+        c.ns.view(),
+        c.name.view(),
+        c.given.view(),
+        keys,
+    )?;
+    if (d.failure.length > 0) {
+        c.failure = d.failure;
+        return Ok(Some(c));
+    }
+    c.dstId = d.id;
+    c.dstEncryption = d.encryption;
+    c.objectMetadata = d.objectMetadata;
+    c.swap = pathSwapOf(c.srcHidden.view(), srcId, c.dstHidden.view(), c.dstId.view())?;
+    return Ok(Some(c));
+}
+
+/// A copy's start on its source's side, under the source's store: the table as it is now (its record, its metadata),
+/// and the replica's id an earlier copy kept (`given`). Null when the source is gone; its failure set when it cannot be
+/// copied.
+fn replicaSourceRead(
+    store: borrow ObjectStore,
     srcBucket: Slice<u8>,
     srcId: Slice<u8>,
     dstBucket: Slice<u8>,
@@ -163,17 +198,10 @@ fn replicaCopyStart(
         objectMetadata: Vector<u8>.create(),
         swap: pathSwapOf("".bytes(), "".bytes(), "".bytes(), "".bytes())?,
         failure: Vector<u8>.create(),
+        given: Vector<u8>.create(),
     };
     if (c.srcLocation.length == 0) {
         failCopy(mut c, "The table has no metadata yet.")?;
-        return Ok(Some(c));
-    }
-    let there = match (store.bucketExists(catalogText(dstHidden.view()))) {
-        Ok(t) => t,
-        Err(e) => { return Err(tablesStoreFail(e)); }
-    };
-    if (!there) {
-        failCopy(mut c, "The destination table bucket is not there.")?;
         return Ok(Some(c));
     }
     c.metadata = match (readMetadataWith(store, srcHidden.view(), c.srcLocation.view(), keys)) {
@@ -184,58 +212,116 @@ fn replicaCopyStart(
             return Ok(Some(c));
         }
     };
-    // The replica: a table at the source's name there must be this source's replica.
-    let dstKey = catalogKey(CATALOG_TABLES, c.ns.view(), c.name.view())?;
+    // An id kept from an earlier copy cut short, if there was one.
+    match (readRecord(store, srcHidden.view(), replicationStatusKey(srcId, dstBucket)?.view())?) {
+        Some(st) => { c.given.extend(jsonMemberText(borrow st.json, "replicaId") ?? "".bytes())?; }
+        null => {}
+    }
+    return Ok(Some(c));
+}
+
+/// A copy's destination, made ready (ADR-0138 §2, §4): the replica's id, its encryption and its files' object
+/// metadata; or why it cannot be.
+struct ReplicaDestination {
+    id: Vector<u8>;
+    encryption: Json?;
+    objectMetadata: Vector<u8>;
+    failure: Vector<u8>;
+}
+
+fn destinationFailed(why: StringView) -> Result<ReplicaDestination, AllocError> =>
+    Ok(ReplicaDestination {
+        id: Vector<u8>.create(),
+        encryption: null,
+        objectMetadata: Vector<u8>.create(),
+        failure: copyBytes(why.bytes())?,
+    });
+
+/// A replica's table configuration, made once at its id with its mark (ADR-0138 §2): its bucket's encryption and
+/// storage class, its name, and `replica`, in one write (a cluster's step does not read its own writes, ADR-0058).
+/// Its encryption; BadRequest for a key this server does not hold.
+fn writeReplicaConfig(
+    store: borrow mut ObjectStore,
+    hidden: Slice<u8>,
+    id: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<Json?, TablesError> {
+    var config = jsonObject();
+    jsonSet(mut config, "namespace", jsonString(ns)?)?;
+    jsonSet(mut config, "name", jsonString(name)?)?;
+    jsonSet(mut config, "storageClass", Json.Text(bucketStorageClass(store, hidden)?))?;
+    jsonSet(mut config, "replica", Json.Bool(true))?;
+    let encryption = bucketEncryption(store, hidden)?;
+    match (encryption.asBorrow()) {
+        Some(e) => {
+            if (!encryptionHeld(e, keys)) { return Err(TablesError.BadRequest); }
+            jsonSet(mut config, "encryption", cloneJson(e)?)?;
+        }
+        null => {}
+    }
+    writeTablesConfig(store, hidden, tableConfigKey(id)?.view(), borrow config)?;
+    return Ok(encryption);
+}
+
+/// The destination half of a copy's start, under the destination's store (on a cluster, its shard's request): a table
+/// at the source's name must be its replica, and a view may not be there; its id is the record's, else `given` (an
+/// earlier copy's), else a new one; its configuration and its namespace made when they are not there.
+fn replicaDestinationStart(
+    store: borrow mut ObjectStore,
+    dstBucket: Slice<u8>,
+    srcBucket: Slice<u8>,
+    srcId: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+    given: Slice<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<ReplicaDestination, TablesError> {
+    let dstHidden = tableWarehouseBucket(dstBucket)?;
+    let there = match (store.bucketExists(catalogText(dstHidden.view()))) {
+        Ok(t) => t,
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    if (!there) { return Ok(destinationFailed("The destination table bucket is not there.")?); }
+    var id = Vector<u8>.create();
+    let dstKey = catalogKey(CATALOG_TABLES, ns, name)?;
     match (readRecord(store, dstHidden.view(), dstKey.view())?) {
         Some(r) => {
             if (!replicaOfSource(borrow r.json, srcBucket, srcId)) {
-                failCopy(mut c, "The destination has a table at its name that is not its replica.")?;
-                return Ok(Some(c));
+                return Ok(destinationFailed("The destination has a table at its name that is not its replica.")?);
             }
-            c.dstId.extend(jsonMemberText(borrow r.json, "id") ?? "".bytes())?;
+            id.extend(jsonMemberText(borrow r.json, "id") ?? "".bytes())?;
         }
         null => {
-            if (viewExists(store, dstHidden.view(), c.ns.view(), c.name.view())?) {
-                failCopy(mut c, "The destination has a view at its name.")?;
-                return Ok(Some(c));
+            if (viewExists(store, dstHidden.view(), ns, name)?) {
+                return Ok(destinationFailed("The destination has a view at its name.")?);
             }
         }
     }
-    // An id kept from an earlier copy cut short, else a new one.
-    if (c.dstId.length == 0) {
-        match (readRecord(store, srcHidden.view(), replicationStatusKey(srcId, dstBucket)?.view())?) {
-            Some(s) => { c.dstId.extend(jsonMemberText(borrow s.json, "replicaId") ?? "".bytes())?; }
-            null => {}
-        }
+    if (id.length == 0 && uuidShaped(given)) { id.extend(given)?; }
+    if (id.length == 0) {
+        if (!newUuid(mut id)?) { return Err(TablesError.Internal); }
     }
-    if (c.dstId.length == 0) {
-        if (!newUuid(mut c.dstId)?) { return Err(TablesError.Internal); }
-    }
-    // Its configuration, at its id: the destination bucket's encryption and storage class, made once.
-    let configKey = tableConfigKey(c.dstId.view())?;
+    var encryption: Json? = null;
+    let configKey = tableConfigKey(id.view())?;
     if (readRecord(store, dstHidden.view(), configKey.view())?.isNull()) {
-        match (writeCreatedTableConfig(store, dstHidden.view(), c.dstId.view(), c.ns.view(), c.name.view(), keys)) {
-            Ok(e) => {
-                c.dstEncryption = e;
-                // Marked as a replica, so that S3's writes into its warehouse are refused (ADR-0138 §2).
-                markReplicaConfig(store, dstHidden.view(), c.dstId.view(), true)?;
-            }
+        encryption = match (writeReplicaConfig(store, dstHidden.view(), id.view(), ns, name, keys)) {
+            Ok(e) => e,
             Err(TablesError.BadRequest) => {
-                failCopy(mut c, "The destination's encryption names a key this server does not hold.")?;
-                return Ok(Some(c));
+                return Ok(destinationFailed("The destination's encryption names a key this server does not hold.")?);
             }
             Err(e) => { return Err(e); }
-        }
+        };
     } else {
-        c.dstEncryption = tableEncryption(store, dstHidden.view(), c.dstId.view())?;
+        encryption = tableEncryption(store, dstHidden.view(), id.view())?;
     }
-    let storageClass = tableStorageClass(store, dstHidden.view(), c.dstId.view())?;
+    var objectMetadata = Vector<u8>.create();
+    let storageClass = tableStorageClass(store, dstHidden.view(), id.view())?;
     if (storageClass.length > 0 && storageClass.view() != "STANDARD".bytes()) {
-        metadataAdd(mut c.objectMetadata, STORAGE_CLASS_FIELD.bytes(), storageClass.view())?;
+        metadataAdd(mut objectMetadata, STORAGE_CLASS_FIELD.bytes(), storageClass.view())?;
     }
-    c.swap = pathSwapOf(srcHidden.view(), srcId, dstHidden.view(), c.dstId.view())?;
-    // Its namespace, made when the destination does not have it.
-    let nsKey = catalogKey(CATALOG_NAMESPACES, c.ns.view(), "".bytes())?;
+    let nsKey = catalogKey(CATALOG_NAMESPACES, ns, "".bytes())?;
     if (readRecord(store, dstHidden.view(), nsKey.view())?.isNull()) {
         var nsRec = jsonObject();
         var nsId = Vector<u8>.create();
@@ -244,7 +330,14 @@ fn replicaCopyStart(
         jsonSet(mut nsRec, "createdAt", jsonInteger(Clock.unixMillis())?)?;
         let _ = writeRecord(store, dstHidden.view(), nsKey.view(), borrow nsRec, PutCondition.IfAbsent);
     }
-    return Ok(Some(c));
+    return Ok(
+        ReplicaDestination {
+            id: id,
+            encryption: encryption,
+            objectMetadata: objectMetadata,
+            failure: Vector<u8>.create(),
+        },
+    );
 }
 
 /// Whether a table record is the replica of `srcBucket`'s table `srcId`.
@@ -386,6 +479,21 @@ fn rewriteReplicaFile(
         Some(n) => { return Ok(Some(n)); }
         null => {}
     }
+    let out = rewrittenReplicaBytes(store, c, f, keys)? ?? { return Ok(null); };
+    if (!putReplicaFile(store, c, key, "application/octet-stream", out.view(), keys)?) {
+        failCopy(c, "The destination's encryption names a key this server does not hold.")?;
+        return Ok(null);
+    }
+    return Ok(Some(truncate<i64>(out.length as u64)));
+}
+
+/// A position delete file or Puffin file of the source, read under its store and rewritten; null with the failure set.
+fn rewrittenReplicaBytes(
+    store: borrow ObjectStore,
+    c: borrow mut ReplicaCopy,
+    f: borrow ReplicaFile,
+    keys: borrow WarehouseKeys,
+) -> Result<Vector<u8>?, TablesError> {
     let srcKey = copyBytes(refKey(f.path.view()))?;
     let bytes = match (warehouseObjectWith(store, c.srcHidden.view(), srcKey.view(), keys)) {
         Ok(Some(b)) => b,
@@ -407,11 +515,7 @@ fn rewriteReplicaFile(
         failCopy(c, "A delete file is not one this server rewrites.")?;
         return Ok(null);
     };
-    if (!putReplicaFile(store, c, key, "application/octet-stream", out.view(), keys)?) {
-        failCopy(c, "The destination's encryption names a key this server does not hold.")?;
-        return Ok(null);
-    }
-    return Ok(Some(truncate<i64>(out.length as u64)));
+    return Ok(Some(out));
 }
 
 /// A file to copy as it is, prepared under the store: its source's plaintext pinned, and a writer sealed with the
@@ -559,6 +663,24 @@ fn rewriteReplicaAvro(
         Some(n) => { return Ok(Some(n)); }
         null => {}
     }
+    let bytes = rewrittenReplicaAvro(store, c, path, isList, sizes, keys)? ?? { return Ok(null); };
+    if (!putReplicaFile(store, c, key, "application/octet-stream", bytes.view(), keys)?) {
+        failCopy(c, "The destination's encryption names a key this server does not hold.")?;
+        return Ok(null);
+    }
+    return Ok(Some(truncate<i64>(bytes.length as u64)));
+}
+
+/// A manifest or manifest list of the source, read under its store and rewritten in its own codec; null with the
+/// failure set.
+fn rewrittenReplicaAvro(
+    store: borrow ObjectStore,
+    c: borrow mut ReplicaCopy,
+    path: Slice<u8>,
+    isList: bool,
+    sizes: Slice<RewrittenSize>,
+    keys: borrow WarehouseKeys,
+) -> Result<Vector<u8>?, TablesError> {
     var file = match (readableAvro(readWarehouseAvroWith(store, c.srcHidden.view(), path, keys))?) {
         Some(f) => f,
         null => {
@@ -576,15 +698,11 @@ fn rewriteReplicaAvro(
         failCopy(c, "A manifest could not be written again.")?;
         return Ok(null);
     };
-    if (!putReplicaFile(store, c, key, "application/octet-stream", bytes.view(), keys)?) {
-        failCopy(c, "The destination's encryption names a key this server does not hold.")?;
-        return Ok(null);
-    }
-    return Ok(Some(truncate<i64>(bytes.length as u64)));
+    return Ok(Some(bytes));
 }
 
-/// The copy's end, under the store: the replica's metadata written, then its record (made, or moved on from what it
-/// was), and the destination's status. The replica's metadata location.
+/// The copy's end, under the store: the replica's metadata, naming its own paths, and its record
+/// (`replicaDestinationFinish`). The replica's metadata location, or null with the failure set.
 fn finishReplicaCopy(
     store: borrow mut ObjectStore,
     c: borrow mut ReplicaCopy,
@@ -595,23 +713,51 @@ fn finishReplicaCopy(
     // The source's earlier metadata files are not copied: the replica's log starts at this one.
     jsonSet(mut m, "metadata-log", jsonArray())?;
     let version = metadataVersion(c.srcLocation.view());
-    let location = writeMetadataSealedBy(
+    var failure = Vector<u8>.create();
+    let location = replicaDestinationFinish(
         store,
-        c.dstHidden.view(),
+        c.dstBucket.view(),
+        c.srcBucket.view(),
+        c.srcId.view(),
+        c.ns.view(),
+        c.name.view(),
         c.dstId.view(),
         if (version >= 0) version else 0,
         borrow m,
         keys,
-        c.dstEncryption.asBorrow(),
+        mut failure,
     )?;
-    let dstKey = catalogKey(CATALOG_TABLES, c.ns.view(), c.name.view())?;
+    if (failure.length > 0) { c.failure = failure; }
+    return Ok(location);
+}
+
+/// The destination half of a copy's end, under the destination's store (on a cluster, its shard's request): the
+/// replica's metadata `m` (its paths its own already) written sealed with its encryption, then its record, made
+/// (`IfAbsent`) or moved on from what it was, conditional on it. Its metadata location; null with `failure` set when a
+/// table at its name is not its replica, or it changed meanwhile.
+fn replicaDestinationFinish(
+    store: borrow mut ObjectStore,
+    dstBucket: Slice<u8>,
+    srcBucket: Slice<u8>,
+    srcId: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+    id: Slice<u8>,
+    version: i64,
+    m: borrow Json,
+    keys: borrow WarehouseKeys,
+    failure: borrow mut Vector<u8>,
+) -> Result<Vector<u8>?, TablesError> {
+    let dstHidden = tableWarehouseBucket(dstBucket)?;
+    let encryption = tableEncryption(store, dstHidden.view(), id)?;
+    let location = writeMetadataSealedBy(store, dstHidden.view(), id, version, m, keys, encryption.asBorrow())?;
+    let dstKey = catalogKey(CATALOG_TABLES, ns, name)?;
     let now = Clock.unixMillis();
-    match (readRecord(store, c.dstHidden.view(), dstKey.view())?) {
+    match (readRecord(store, dstHidden.view(), dstKey.view())?) {
         Some(r) => {
-            if (!replicaOfSource(borrow r.json, c.srcBucket.view(), c.srcId.view()) ||
-                jsonMemberText(borrow r.json, "id") != Some(c.dstId.view())) {
-                removeMetadataFile(store, c.dstHidden.view(), location.view());
-                failCopy(c, "The destination has a table at its name that is not its replica.")?;
+            if (!replicaOfSource(borrow r.json, srcBucket, srcId) || jsonMemberText(borrow r.json, "id") != Some(id)) {
+                removeMetadataFile(store, dstHidden.view(), location.view());
+                failure.extend("The destination has a table at its name that is not its replica.".bytes())?;
                 return Ok(null);
             }
             var next = cloneJson(borrow r.json)?;
@@ -619,15 +765,15 @@ fn finishReplicaCopy(
             jsonSet(mut next, "modifiedAt", jsonInteger(now)?)?;
             match (writeRecord(
                 store,
-                c.dstHidden.view(),
+                dstHidden.view(),
                 dstKey.view(),
                 borrow next,
                 PutCondition.IfGeneration(r.generation),
             )) {
                 Ok(_) => {}
                 Err(TablesError.Conflict) => {
-                    removeMetadataFile(store, c.dstHidden.view(), location.view());
-                    failCopy(c, "The replica changed while it was copied.")?;
+                    removeMetadataFile(store, dstHidden.view(), location.view());
+                    failure.extend("The replica changed while it was copied.".bytes())?;
                     return Ok(null);
                 }
                 Err(e) => { return Err(e); }
@@ -635,19 +781,19 @@ fn finishReplicaCopy(
         }
         null => {
             var rec = jsonObject();
-            jsonSet(mut rec, "id", jsonString(c.dstId.view())?)?;
+            jsonSet(mut rec, "id", jsonString(id)?)?;
             jsonSet(mut rec, "createdAt", jsonInteger(now)?)?;
             jsonSet(mut rec, "modifiedAt", jsonInteger(now)?)?;
             jsonSet(mut rec, "metadataLocation", jsonString(location.view())?)?;
             var of = jsonObject();
-            jsonSet(mut of, "bucket", jsonString(c.srcBucket.view())?)?;
-            jsonSet(mut of, "id", jsonString(c.srcId.view())?)?;
+            jsonSet(mut of, "bucket", jsonString(srcBucket)?)?;
+            jsonSet(mut of, "id", jsonString(srcId)?)?;
             jsonSet(mut rec, "replicaOf", of)?;
-            match (writeRecord(store, c.dstHidden.view(), dstKey.view(), borrow rec, PutCondition.IfAbsent)) {
+            match (writeRecord(store, dstHidden.view(), dstKey.view(), borrow rec, PutCondition.IfAbsent)) {
                 Ok(_) => {}
                 Err(TablesError.Conflict) => {
-                    removeMetadataFile(store, c.dstHidden.view(), location.view());
-                    failCopy(c, "The destination has a table at its name that is not its replica.")?;
+                    removeMetadataFile(store, dstHidden.view(), location.view());
+                    failure.extend("The destination has a table at its name that is not its replica.".bytes())?;
                     return Ok(null);
                 }
                 Err(e) => { return Err(e); }

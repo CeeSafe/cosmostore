@@ -1,0 +1,552 @@
+// Table replication on a cluster (ADR-0138 §4): the copy runs on its source's shard's leader, which reads the source
+// from its own store and writes the replica through its node's own front, as S3's replicas into the cluster go
+// (ADR-0078 §4), so the replica's table bucket may be any shard's.
+// - The replica's start and finish (its id, namespace and configuration; its metadata and record) are tables calls,
+//   `POST /_replica/start` and `/_replica/finish`, signed for `s3tables` and routed by the destination's ARN.
+// - Its files are S3 PUTs into its warehouse, `If-None-Match: *`, sealed there by the shard with the replica's
+//   encryption (ADR-0126 §4). A file already there (a copy taken up again) is answered 412, and is done.
+// - Every request carries `x-cosmo-replica-table`, signed, and the node's stamp: the front passes it only then, and only
+//   with it does a replica's shard take a write into its warehouse, or a `_replica` call (ADR-0138 §4).
+// - The source's status and its ask are written behind its shard's gate, as one step each.
+// - A file over the front's 64 MiB request limit fails the copy, with its reason, for now (its parts are not sent yet).
+import web_core;
+import web_transport;
+import web_http;
+import web_client;
+
+/// A file the front takes in one request, at most.
+const REPLICA_CLUSTER_FILE_MAX: u64 = 67108864;
+
+/// A source file's plaintext as a request's body, read a piece at a time off the store.
+struct PlainBody {
+    stream: PlainStream;
+    size: u64;
+    buffer: Vector<u8>;
+    filled: usize;
+    at: usize;
+}
+
+fn readPlainPiece(stream: borrow mut PlainStream, buffer: borrow mut Vector<u8>) -> Result<usize?, StoreError> {
+    buffer.resize(REPLICA_COPY_PIECE, 0)?;
+    return stream.read(buffer.viewMut());
+}
+
+impl BodySource for PlainBody {
+    @effects()
+    fn length(borrow this) -> u64? => Some(this.size);
+
+    async fn read(borrow mut this, into: SliceMut<u8>) -> Result<usize, NetError> {
+        if (into.length == 0) { return Ok(0); }
+        if (this.at == this.filled) {
+            let n = match (await Async.blocking(() => readPlainPiece(mut this.stream, mut this.buffer))) {
+                Ok(Some(n)) => n,
+                _ => { return Err(NetError.Closed); }
+            };
+            if (n == 0) { return Ok(0); }
+            this.filled = n;
+            this.at = 0;
+        }
+        var n = this.filled - this.at;
+        if (n > into.length) { n = into.length; }
+        let dest = borrow mut into[0..n];
+        dest.copyFrom(this.buffer.view()[this.at..this.at + n]);
+        this.at += n;
+        return Ok(n);
+    }
+
+    @effects()
+    fn rewind(borrow mut this) -> bool => false;
+
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> => Ok();
+}
+
+/// The headers of a copy's request: its field, and for a PUT `If-None-Match: *`.
+fn replicaCopyHeaders(put: bool) -> Result<Vector<HeaderPair>, AllocError> {
+    var out = Vector<HeaderPair>.create();
+    out.push(remotePair(REPLICA_TABLE_FIELD.bytes(), "1".bytes())?)?;
+    if (put) { out.push(remotePair("if-none-match".bytes(), "*".bytes())?)?; }
+    return Ok(out);
+}
+
+/// A replica's file PUT through the front: done when written (200) or already there (412).
+async fn putReplicaThroughFront(
+    client: borrow Client,
+    t: borrow ReplicationTarget,
+    hidden: Slice<u8>,
+    key: Slice<u8>,
+    body: borrow mut dyn BodySource,
+) -> Result<bool, AllocError> {
+    var path = Vector<u8>.create();
+    remotePath(hidden, key, mut path)?;
+    let headers = replicaCopyHeaders(true)?;
+    let a = await remoteCall(client, t, Method.Put, path.view(), "".bytes(), headers.view(), body)?;
+    return Ok(a.status == 200 || a.status == 412);
+}
+
+/// A `_replica` call to the destination's shard through the front: its answer's JSON, or null when it did not answer.
+async fn replicaCallThroughFront(
+    client: borrow Client,
+    t: borrow ReplicationTarget,
+    what: StringView,
+    dstBucket: Slice<u8>,
+    body: borrow Json,
+) -> Result<Json?, AllocError> {
+    var path = copyBytes("/_replica/".bytes())?;
+    path.extend(what.bytes())?;
+    var query = copyBytes("tableBucketARN=".bytes())?;
+    var arn = copyBytes("arn:aws:s3tables:us-east-1:".bytes())?;
+    arn.extend(TABLES_ACCOUNT.bytes())?;
+    arn.extend(":bucket/".bytes())?;
+    arn.extend(dstBucket)?;
+    appendUriEncoded(mut query, arn.view(), true)?;
+    var text = Vector<u8>.create();
+    writeJson(mut text, body)?;
+    var b = match (BytesBody.of(text.view())) {
+        Ok(b) => b,
+        Err(_) => { return Ok(null); }
+    };
+    let headers = replicaCopyHeaders(false)?;
+    var hash = Vector<u8>.create();
+    appendHexBytes(mut hash, Sha256.of(text.view())[..])?;
+    let a = await remoteCallAs(
+        client,
+        t,
+        "s3tables",
+        hash.view(),
+        Method.Post,
+        path.view(),
+        query.view(),
+        headers.view(),
+        mut b,
+    )?;
+    if (a.status == 200) { return parseJson(a.body.view()); }
+    // Its status and the start of its answer, as the copy's failure.
+    var why = copyBytes("The destination's shard answered ".bytes())?;
+    appendDecimal(mut why, a.status as u64)?;
+    if (a.body.length > 0) {
+        why.extend(": ".bytes())?;
+        why.extend(a.body.view()[0..(if (a.body.length > 200) 200 else a.body.length)])?;
+    }
+    var answer = jsonObject();
+    jsonSet(mut answer, "failure", Json.Text(why))?;
+    return Ok(Some(answer));
+}
+
+/// The copy's identity in a `_replica` call's body.
+fn replicaCallBody(c: borrow ReplicaCopy) -> Result<Json, AllocError> {
+    var j = jsonObject();
+    jsonSet(mut j, "sourceBucket", jsonString(c.srcBucket.view())?)?;
+    jsonSet(mut j, "sourceId", jsonString(c.srcId.view())?)?;
+    jsonSet(mut j, "namespace", jsonString(c.ns.view())?)?;
+    jsonSet(mut j, "name", jsonString(c.name.view())?)?;
+    return Ok(j);
+}
+
+/// A source file to send as it is, prepared under its store: its plaintext pinned, and its size.
+fn prepareSourcePlain(
+    store: borrow mut ObjectStore,
+    c: borrow mut ReplicaCopy,
+    path: Slice<u8>,
+    keys: borrow WarehouseKeys,
+) -> Result<PlainReader?, TablesError> {
+    let srcKey = refKey(path);
+    let info = match (store.headObject(catalogText(c.srcHidden.view()), catalogText(srcKey))) {
+        Ok(i) => i,
+        Err(StoreError.NoSuchKey) => {
+            failCopy(c, "A file the table names is not there.")?;
+            return Ok(null);
+        }
+        Err(e) => { return Err(tablesStoreFail(e)); }
+    };
+    if (info.size > REPLICA_CLUSTER_FILE_MAX) {
+        failCopy(c, "A file is larger than a cluster's copy sends yet (64 MiB).")?;
+        return Ok(null);
+    }
+    return match (preparePlain(store, catalogText(c.srcHidden.view()), catalogText(srcKey), 0, info.size, keys)) {
+        Ok(Some(r)) => Ok(Some(r)),
+        Ok(null) => {
+            failCopy(c, "A file the table names could not be opened.")?;
+            Ok(null)
+        }
+        Err(e) => Err(tablesStoreFail(e)),
+    };
+}
+
+/// One source table copied to one destination on a cluster (ADR-0138 §4): the source read from this shard's store,
+/// the replica written through the front, the status written behind the shard's gate.
+async fn copyReplicaOnCluster(
+    shared: borrow NodeShared,
+    at: usize,
+    client: borrow Client,
+    t: borrow ReplicationTarget,
+    srcBucket: Slice<u8>,
+    srcId: Slice<u8>,
+    dstBucket: Slice<u8>,
+) -> Result<void, NodeFault> {
+    let slot = borrow shared.slots[at];
+    let tableKeys = TableKeys { sse: shared.replication.sseKeys.clone(), kms: shared.replication.kmsKeys.clone() };
+    var started: ReplicaCopy? = null;
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let kr = borrow tableKeys;
+        started = match (await Async.blocking(
+            () => replicaSourceRead(st, srcBucket, srcId, dstBucket, borrow kr.keys()),
+        )) {
+            Ok(c) => c,
+            Err(_) => { return Ok(); }
+        };
+    }
+    var c = started ?? { return Ok(); };
+    // The replica's start on its shard.
+    if (c.failure.length == 0) {
+        var body = match (replicaCallBody(borrow c)) {
+            Ok(b) => b,
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        };
+        if (jsonSet(mut body, "replicaId", Json.Text(copyBytes(c.given.view()).ok() ?? Vector<u8>.create())).isErr()) {
+            return Err(NodeFault.OutOfMemory);
+        }
+        match (await replicaCallThroughFront(client, t, "start", dstBucket, borrow body)) {
+            Ok(Some(answer)) => {
+                match (jsonMemberText(borrow answer, "replicaId")) {
+                    Some(id) => { c.dstId = copyBytes(id).ok() ?? Vector<u8>.create(); }
+                    null => {
+                        let why = copyBytes(
+                            jsonMemberText(borrow answer, "failure") ?? "The replica could not be started.".bytes(),
+                        ).ok() ?? Vector<u8>.create();
+                        c.failure = why;
+                    }
+                }
+            }
+            _ => { let _ = failCopy(mut c, "The destination's shard did not answer."); }
+        }
+    }
+    if (c.failure.length == 0) {
+        c.swap = match (pathSwapOf(c.srcHidden.view(), c.srcId.view(), c.dstHidden.view(), c.dstId.view())) {
+            Ok(sw) => sw,
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        };
+    }
+    var lists = Vector<Vector<u8>>.create();
+    var files = Vector<ReplicaFile>.create();
+    var manifests = Vector<Vector<u8>>.create();
+    if (c.failure.length == 0 && replicaTopFiles(borrow c.metadata, mut lists, mut files).isErr()) {
+        return Err(NodeFault.OutOfMemory);
+    }
+    for (l in 0..lists.length) {
+        if (c.failure.length > 0) { break; }
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let cr = borrow mut c;
+        let list = lists[l].view();
+        let mr = borrow mut manifests;
+        let kr = borrow tableKeys;
+        if ((await Async.blocking(() => replicaListManifests(st, cr, list, mr, borrow kr.keys()))).isErr()) {
+            let _ = failCopy(mut c, "A manifest list could not be read.");
+        }
+    }
+    for (i in 0..manifests.length) {
+        if (c.failure.length > 0) { break; }
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let cr = borrow mut c;
+        let manifest = manifests[i].view();
+        let fr = borrow mut files;
+        let kr = borrow tableKeys;
+        if ((await Async.blocking(() => replicaManifestFiles(st, cr, manifest, fr, borrow kr.keys()))).isErr()) {
+            let _ = failCopy(mut c, "A manifest could not be read.");
+        }
+    }
+    // Files first, each once: sent as they are, or rewritten here and sent.
+    var done = Vector<Vector<u8>>.create();
+    var sizes = Vector<RewrittenSize>.create();
+    for (i in 0..files.length) {
+        if (c.failure.length > 0) { break; }
+        var already = false;
+        for (k in 0..done.length) {
+            if (done[k].view() == files[i].path.view()) { already = true; }
+        }
+        if (already) { continue; }
+        if (done.push(copyBytes(files[i].path.view()).ok() ?? Vector<u8>.create()).isErr()) {
+            return Err(NodeFault.OutOfMemory);
+        }
+        let key = match (replicaKeyOf(mut c, files[i].path.view())) {
+            Ok(Some(k)) => k,
+            _ => { break; }
+        };
+        var reader: PlainReader? = null;
+        var bytes: Vector<u8>? = null;
+        {
+            var guard = match (await slot.store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let st = guard.data();
+            let cr = borrow mut c;
+            let f = borrow files[i];
+            let kr = borrow tableKeys;
+            if (files[i].kind == 0) {
+                let path = files[i].path.view();
+                reader = match (await Async.blocking(() => prepareSourcePlain(st, cr, path, borrow kr.keys()))) {
+                    Ok(r) => r,
+                    Err(_) => null,
+                };
+            } else {
+                bytes = match (await Async.blocking(() => rewrittenReplicaBytes(st, cr, f, borrow kr.keys()))) {
+                    Ok(b) => b,
+                    Err(_) => null,
+                };
+            }
+        }
+        if (files[i].kind == 0) {
+            var r = reader ?? {
+                let _ = failCopy(mut c, "A file could not be copied.");
+                break;
+            };
+            let size = r.length;
+            let rr = borrow mut r;
+            let stream = match (await Async.blocking(() => rr.open())) {
+                Ok(Some(s)) => s,
+                _ => {
+                    let _ = failCopy(mut c, "A file the table names could not be opened.");
+                    break;
+                }
+            };
+            var body = PlainBody { stream: stream, size: size, buffer: Vector<u8>.create(), filled: 0, at: 0 };
+            match (await putReplicaThroughFront(client, t, c.dstHidden.view(), key.view(), mut body)) {
+                Ok(true) => {}
+                _ => { let _ = failCopy(mut c, "A file could not be copied to the replica."); }
+            }
+            continue;
+        }
+        let rewritten = bytes ?? {
+            let _ = failCopy(mut c, "A delete file could not be rewritten.");
+            break;
+        };
+        var body = match (BytesBody.of(rewritten.view())) {
+            Ok(b) => b,
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        };
+        match (await putReplicaThroughFront(client, t, c.dstHidden.view(), key.view(), mut body)) {
+            Ok(true) => {
+                if (noteRewritten(
+                    borrow c,
+                    files[i].path.view(),
+                    truncate<i64>(rewritten.length as u64),
+                    mut sizes,
+                ).isErr()) {
+                    return Err(NodeFault.OutOfMemory);
+                }
+            }
+            _ => { let _ = failCopy(mut c, "A delete file could not be copied to the replica."); }
+        }
+    }
+    // Then the manifests and the lists, rewritten here and sent.
+    var manifestSizes = Vector<RewrittenSize>.create();
+    for (pass in 0..2) {
+        let isList = pass == 1;
+        let paths = if (isList) lists.view() else manifests.view();
+        for (i in 0..paths.length) {
+            if (c.failure.length > 0) { break; }
+            let key = match (replicaKeyOf(mut c, paths[i].view())) {
+                Ok(Some(k)) => k,
+                _ => { break; }
+            };
+            var read: Vector<u8>? = null;
+            {
+                var guard = match (await slot.store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NodeFault.Net); }
+                };
+                let st = guard.data();
+                let cr = borrow mut c;
+                let path = paths[i].view();
+                let sz = if (isList) manifestSizes.view() else sizes.view();
+                let kr = borrow tableKeys;
+                read = match (await Async.blocking(
+                    () => rewrittenReplicaAvro(st, cr, path, isList, sz, borrow kr.keys()),
+                )) {
+                    Ok(b) => b,
+                    Err(_) => null,
+                };
+            }
+            let bytes = read ?? {
+                let _ = failCopy(mut c, "A manifest could not be rewritten.");
+                break;
+            };
+            var body = match (BytesBody.of(bytes.view())) {
+                Ok(b) => b,
+                Err(_) => { return Err(NodeFault.OutOfMemory); }
+            };
+            match (await putReplicaThroughFront(client, t, c.dstHidden.view(), key.view(), mut body)) {
+                Ok(true) => {
+                    if (!isList &&
+                        noteRewritten(
+                            borrow c,
+                            paths[i].view(),
+                            truncate<i64>(bytes.length as u64),
+                            mut manifestSizes,
+                        ).isErr()) {
+                        return Err(NodeFault.OutOfMemory);
+                    }
+                }
+                _ => { let _ = failCopy(mut c, "A manifest could not be copied to the replica."); }
+            }
+        }
+    }
+    // The replica's metadata and record on its shard.
+    var replicaLocation = Vector<u8>.create();
+    if (c.failure.length == 0) {
+        var m = match (cloneJson(borrow c.metadata)) {
+            Ok(m) => m,
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        };
+        if (swapEveryPath(mut m, borrow c.swap).isErr() || jsonSet(mut m, "metadata-log", jsonArray()).isErr()) {
+            return Err(NodeFault.OutOfMemory);
+        }
+        var body = match (replicaCallBody(borrow c)) {
+            Ok(b) => b,
+            Err(_) => { return Err(NodeFault.OutOfMemory); }
+        };
+        let version = metadataVersion(c.srcLocation.view());
+        let added = jsonSet(
+            mut body,
+            "replicaId",
+            Json.Text(copyBytes(c.dstId.view()).ok() ?? Vector<u8>.create()),
+        ).isOk() &&
+            jsonSet(mut body, "version", jsonInteger(if (version >= 0) version else 0).ok() ?? Json.Null).isOk() &&
+            jsonSet(mut body, "metadata", m).isOk();
+        if (!added) { return Err(NodeFault.OutOfMemory); }
+        match (await replicaCallThroughFront(client, t, "finish", dstBucket, borrow body)) {
+            Ok(Some(answer)) => {
+                match (jsonMemberText(borrow answer, "metadataLocation")) {
+                    Some(l) => { replicaLocation = copyBytes(l).ok() ?? Vector<u8>.create(); }
+                    null => {
+                        c.failure = copyBytes(
+                            jsonMemberText(borrow answer, "failure") ?? "The replica could not be written.".bytes(),
+                        ).ok() ?? Vector<u8>.create();
+                    }
+                }
+            }
+            _ => { let _ = failCopy(mut c, "The destination's shard did not answer."); }
+        }
+    }
+    // Its status, behind the source shard's gate.
+    var term: u64 = 0;
+    var gate = match (await slot.gate.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let _held = gate.data();
+    if (!(await stepReady(slot, mut term)?)) { return Ok(); }
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let cr = borrow c;
+        let rl = replicaLocation.view();
+        let status = if (c.failure.length == 0) "completed" else "failed";
+        let _ = await Async.blocking(() => writeReplicationStatus(
+            st,
+            cr.srcHidden.view(),
+            cr.srcId.view(),
+            cr.dstBucket.view(),
+            status,
+            cr.srcLocation.view(),
+            cr.dstId.view(),
+            rl,
+            cr.failure.view(),
+        ));
+    }
+    let _ = await stepCommit(shared, slot)?;
+    return Ok();
+}
+
+/// Each ask of the shard this replica leads copied to each of its destinations, then answered behind its gate
+/// (ADR-0138 §4).
+async fn replicationOnShard(shared: borrow NodeShared, at: usize, client: borrow Client) -> Result<void, NodeFault> {
+    let slot = borrow shared.slots[at];
+    let t = match (selfTarget(shared)) {
+        Ok(Some(t)) => t,
+        Ok(null) => { return Ok(); }
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
+    var asks = Vector<ReplicationAsk>.create();
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        asks = match (await Async.blocking(() => replicationAsks(st))) {
+            Ok(a) => a,
+            Err(_) => { return Ok(); }
+        };
+    }
+    for (i in 0..asks.length) {
+        for (d in 0..asks[i].destinations.length) {
+            await copyReplicaOnCluster(
+                shared,
+                at,
+                client,
+                borrow t,
+                asks[i].bucket.view(),
+                asks[i].id.view(),
+                asks[i].destinations[d].view(),
+            )?;
+        }
+        var term: u64 = 0;
+        var gate = match (await slot.gate.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let _held = gate.data();
+        if (!(await stepReady(slot, mut term)?)) { return Ok(); }
+        {
+            var guard = match (await slot.store.get().lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(NodeFault.Net); }
+            };
+            let st = guard.data();
+            let a = borrow asks[i];
+            let _ = await Async.blocking(() => answerReplicationAsk(st, a));
+        }
+        let _ = await stepCommit(shared, slot)?;
+    }
+    return Ok();
+}
+
+/// A replicated table asked for again when a copy was lost (`reconcileReplication`), behind its shard's gate.
+async fn reconcileOnShard(shared: borrow NodeShared, at: usize, t: borrow MaintainedTable) -> Result<void, NodeFault> {
+    let slot = borrow shared.slots[at];
+    var term: u64 = 0;
+    var gate = match (await slot.gate.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(NodeFault.Net); }
+    };
+    let _held = gate.data();
+    if (!(await stepReady(slot, mut term)?)) { return Ok(); }
+    {
+        var guard = match (await slot.store.get().lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(NodeFault.Net); }
+        };
+        let st = guard.data();
+        let _ = await Async.blocking(() => reconcileReplication(st, t));
+    }
+    let _ = await stepCommit(shared, slot)?;
+    return Ok();
+}

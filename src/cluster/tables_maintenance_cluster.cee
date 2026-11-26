@@ -1,6 +1,10 @@
 // Table maintenance on a cluster (ADR-0086 §5, ADR-0110, ADR-0128): every hour of a day, each shard this node leads
 // lists its tables from its store and runs each one's jobs as the leader's gated steps (`tables_steps.cee`), not as
 // requests to its own front; the runs a client asked for (`maintenance-run`) within a second. A loop per shard.
+import web_core;
+import web_transport;
+import web_http;
+import web_client;
 
 /// The asks kept in a shard's store (ADR-0128 §3), queued for its new leader's loop, each once.
 async fn queueKeptAsks(slot: borrow ShardSlot) -> Result<void, NodeFault> {
@@ -44,6 +48,14 @@ async fn tablesMaintenanceShardForever(shared: borrow NodeShared, i: usize) -> R
     let every = if (shared.tablesDayMs / 24 > 0) shared.tablesDayMs / 24 else 1;
     var sincePass: u64 = 0;
     let tick: u64 = if (every < 1000) every else 1000;
+    // Table replication's copies go through the node's front (ADR-0138 §4).
+    var options = ClientOptions.defaults();
+    options.totalMs = 60000;
+    options.retry = RetryPolicy.never();
+    let client = match (Client.create(options, deliveryConnector())) {
+        Ok(c) => c,
+        Err(_) => { return Err(NodeFault.OutOfMemory); }
+    };
     // The term this node last queued the shard's kept asks in as its leader (0: none): a term it leads in anew, once
     // it has applied what its log holds, has them queued (the M31 exit review: a term, not whether it led, so that a
     // leadership lost and regained within a long run counts; and caught up, so that an ask the last leader committed
@@ -100,6 +112,8 @@ async fn tablesMaintenanceShardForever(shared: borrow NodeShared, i: usize) -> R
                 }
             }
         }
+        // Each tick, the asks of a shard this node leads copied (ADR-0138 §4).
+        if (leads) { let _ = await replicationOnShard(shared, i, borrow client); }
         if (!pass) { continue; }
         var tables = Vector<MaintainedTable>.create();
         {
@@ -114,10 +128,23 @@ async fn tablesMaintenanceShardForever(shared: borrow NodeShared, i: usize) -> R
             };
         }
         for (k in 0..tables.length) {
+            // A replica's snapshots and files are its source's (ADR-0138 §2): only its unreferenced files removed.
+            var replica = false;
+            {
+                var guard = match (await slot.store.get().lock()) {
+                    Ok(g) => g,
+                    Err(_) => { return Err(NodeFault.Net); }
+                };
+                let st = guard.data();
+                let t = borrow tables[k];
+                replica = (await Async.blocking(() => isReplicaTable(st, t))).ok() ?? false;
+            }
             // Compaction between them, as `serve` runs it (ADR-0098 §4).
             for (kind in [SNAPSHOT_MANAGEMENT, COMPACTION, UNREFERENCED_REMOVAL]) {
+                if (replica && kind.bytes() != UNREFERENCED_REMOVAL.bytes()) { continue; }
                 await maintainOnShard(shared, i, borrow tables[k], kind.bytes())?;
             }
+            if (leads) { await reconcileOnShard(shared, i, borrow tables[k])?; }
         }
         // Then each table bucket's orphaned files (ADR-0136 §3).
         await orphansOnShard(shared, i)?;

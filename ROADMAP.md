@@ -6697,3 +6697,26 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   own, an append to the replica refused, `disassociate_table_replication` (boto3), then an append taken. A cluster's
   run passes `--no-replication` until slice 3.
 - **Checks:** 568 unit tests, the S3 smoke (PyIceberg 77) and the cluster S3 smoke (214).
+
+### 26 Nov 2026: M36 slice 3, replication on a cluster (ADR-0138 §4)
+
+- **The copy runs on its source's shard's leader** (`src/cluster/tables_replication_cluster.cee`), each second of
+  its shard's loop: the source read from its own store, the replica written through the node's own front (as S3's
+  replicas into the cluster go, ADR-0078 §4), so the replica's table bucket may be any shard's.
+  - The replica's start and finish are tables calls on its shard, `POST /_replica/start` and `/_replica/finish`,
+    routed by the destination's ARN. They run the same destination half as `serve` (`replicaDestinationStart`,
+    `replicaDestinationFinish`, now shared): the replica's configuration written once with its mark, as a shard's
+    step does not read its own writes (ADR-0058).
+  - Its files are S3 PUTs into its warehouse (`If-None-Match: *`; 412 is done), sealed there with the replica's
+    encryption. A file over the front's 64 MiB is refused with its reason for now.
+  - Each request carries `x-cosmo-replica-table`, signed, with the node's stamp: the front passes it only then. A
+    shard takes a write into a replica's warehouse, or a `_replica` call, only with it, from the account's long-term
+    key.
+  - A tables call's payload is signed by its hash: S3 Tables takes no `UNSIGNED-PAYLOAD` (`signRemoteAs`,
+    `remoteCallAs`, which now take the service and the payload).
+  - The source's status and its ask are written behind its shard's gate, one step each; a lost ask is reconciled as
+    a step of each pass; a replica's snapshot management and compaction are skipped there too.
+- **Checks:** the cluster S3 smoke (214) runs PyIceberg's replication through node 2 (77), its source table bucket on
+  shard 2 and its replica's on shard 1 of 8; 568 unit tests; the S3 smoke.
+- **Not yet:** a file over 64 MiB on a cluster (its parts); Iceberg Java's read of a v3 table's replica with deletion
+  vectors.

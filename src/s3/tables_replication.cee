@@ -373,3 +373,69 @@ fn markReplicaConfig(
     }
     return writeTablesConfig(store, hidden, key.view(), borrow config);
 }
+
+/// The field a cluster's own copy sets on its requests into a replica's table bucket (ADR-0138 §4): its front lets it
+/// through only with the node's stamp (`x-cosmo-replica-` fields, ADR-0078 §4).
+const REPLICA_TABLE_FIELD: StringView = "x-cosmo-replica-table";
+
+/// Whether a tables call is a cluster's own copy: on a cluster, by the account's long-term key (not a user's or a
+/// session's), with `x-cosmo-replica-table` signed.
+fn replicaCopyCall(req: borrow S3Request, caller: borrow TablesCaller) -> bool =>
+    caller.cluster && caller.user.length == 0 && !caller.role && headerOf(req, REPLICA_TABLE_FIELD).isSome() &&
+        headerSigned(req, REPLICA_TABLE_FIELD);
+
+/// A cluster's copy's call on its destination's shard (`POST /_replica/start` or `/_replica/finish`, ADR-0138 §4):
+/// `replicaDestinationStart` or `replicaDestinationFinish`, for the source table and replica its body names.
+fn replicaDestinationCall(
+    store: borrow mut ObjectStore,
+    req: borrow S3Request,
+    what: Slice<u8>,
+    body: Slice<u8>,
+    caller: borrow TablesCaller,
+    keys: borrow WarehouseKeys,
+) -> Result<TablesAnswer, TablesError> {
+    if (!replicaCopyCall(req, caller)) { return Err(TablesError.Forbidden); }
+    var none = Vector<u8>.create();
+    let arn = paramOf(req, "tableBucketARN") ?? { return Err(TablesError.BadRequest); };
+    let dst = tableBucketOfArn(arn, mut none)? ?? { return Err(TablesError.BadRequest); };
+    let j = tablesObject(body)?;
+    let srcBucket = jsonMemberText(borrow j, "sourceBucket") ?? { return Err(TablesError.BadRequest); };
+    let srcId = jsonMemberText(borrow j, "sourceId") ?? { return Err(TablesError.BadRequest); };
+    let ns = jsonMemberText(borrow j, "namespace") ?? { return Err(TablesError.BadRequest); };
+    let name = jsonMemberText(borrow j, "name") ?? { return Err(TablesError.BadRequest); };
+    var answer = jsonObject();
+    if (what == "start".bytes()) {
+        let given = jsonMemberText(borrow j, "replicaId") ?? "".bytes();
+        let d = replicaDestinationStart(store, dst.view(), srcBucket, srcId, ns, name, given, keys)?;
+        if (d.failure.length > 0) {
+            jsonSet(mut answer, "failure", Json.Text(d.failure))?;
+        } else {
+            jsonSet(mut answer, "replicaId", Json.Text(d.id))?;
+        }
+        return tablesJson(borrow answer);
+    }
+    if (what == "finish".bytes()) {
+        let id = jsonMemberText(borrow j, "replicaId") ?? { return Err(TablesError.BadRequest); };
+        let version = jsonMemberI64(borrow j, "version") ?? 0;
+        let m = jsonMember(borrow j, "metadata") ?? { return Err(TablesError.BadRequest); };
+        var failure = Vector<u8>.create();
+        match (replicaDestinationFinish(
+            store,
+            dst.view(),
+            srcBucket,
+            srcId,
+            ns,
+            name,
+            id,
+            version,
+            m,
+            keys,
+            mut failure,
+        )?) {
+            Some(l) => { jsonSet(mut answer, "metadataLocation", Json.Text(l))?; }
+            null => { jsonSet(mut answer, "failure", Json.Text(failure))?; }
+        }
+        return tablesJson(borrow answer);
+    }
+    return Err(TablesError.BadRequest);
+}
