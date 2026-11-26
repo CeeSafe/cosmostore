@@ -341,7 +341,9 @@ try:
     check("a namespace with a child not dropped", "dropped", "kept")
 except Exception as e:
     check("a namespace with a child not dropped", type(e).__name__, "NamespaceNotEmptyError")
-catalog.purge_table(("deep", "er", "t"))
+catalog.rename_table(("deep", "er", "t"), ("deep", "er", "t2"))
+check("a nested namespace's table renamed", catalog.list_tables(("deep", "er")), [("deep", "er", "t2")])
+catalog.purge_table(("deep", "er", "t2"))
 catalog.drop_namespace(("deep", "er"))
 catalog.drop_namespace(("deep",))
 catalog.rename_table("sales.orders", "sales.orders_v2")

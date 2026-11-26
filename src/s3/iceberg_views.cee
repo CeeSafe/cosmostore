@@ -208,8 +208,9 @@ fn applyViewUpdates(m: borrow mut Json, updates: borrow Json?, now: i64) -> Resu
             appendTo(m, "schemas", s)?;
             lastSchema = sid;
         } else if (action == "set-location".bytes()) {
+            // A view's location is its warehouse, as at its create (the M34 exit review's L3).
             let location = jsonMemberText(u, "location") ?? { return Ok(false); };
-            jsonSet(m, "location", jsonString(location)?)?;
+            if (Some(location) != jsonMemberText(m, "location")) { return Ok(false); }
         } else if (action == "set-properties".bytes()) {
             var props = match (jsonMember(m, "properties")) {
                 Some(p) => cloneJson(p)?,
@@ -222,11 +223,9 @@ fn applyViewUpdates(m: borrow mut Json, updates: borrow Json?, now: i64) -> Resu
                             Json.Text(_) => {}
                             _ => { return Ok(false); }
                         }
-                        jsonSet(
-                            mut props,
-                            StringView.fromUtf8(ms[k].key.view()) ?? "",
-                            cloneJson(borrow ms[k].value)?,
-                        )?;
+                        // A key that is not UTF-8 is refused, not kept as "" (the M34 exit review's L6).
+                        let key = StringView.fromUtf8(ms[k].key.view()) ?? { return Ok(false); };
+                        jsonSet(mut props, key, cloneJson(borrow ms[k].value)?)?;
                     }
                 }
                 _ => { return Ok(false); }
@@ -269,6 +268,8 @@ fn applyViewUpdates(m: borrow mut Json, updates: borrow Json?, now: i64) -> Resu
             var vid = jsonMemberI64(u, "view-version-id") ?? { return Ok(false); };
             if (vid == -1) { vid = lastVersion; }
             if (vid < 1 || !holdsMember(m, "versions", "version-id", vid)) { return Ok(false); }
+            // The current version again is no change, and no entry in the log (the M34 exit review's L2).
+            if (jsonMemberI64(m, "current-version-id") == Some(vid)) { continue; }
             jsonSet(m, "current-version-id", jsonInteger(vid)?)?;
             var entry = jsonObject();
             jsonSet(mut entry, "timestamp-ms", jsonInteger(now)?)?;
@@ -295,14 +296,16 @@ fn icebergViews(
     sealing: borrow WarehouseKeys,
 ) -> Result<TablesAnswer, TablesError> {
     let hidden = tableWarehouseBucket(b)?;
-    if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
+    // Authorized before a namespace's existence is told (the M34 exit review's L1).
     if (rest.length == 1) {
         if (isMethod(m, Method.Get)) {
             checkTablesView(store, caller, "s3tables:ListViews", b, "".bytes())?;
+            if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
             return listViews(store, hidden.view(), ns);
         }
         if (isMethod(m, Method.Post)) {
             checkTablesView(store, caller, "s3tables:CreateView", b, "".bytes())?;
+            if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
             return createView(store, b, ns, body, sealing);
         }
         return icebergUnsupported();
@@ -313,6 +316,7 @@ fn icebergViews(
     let rec = readRecord(store, hidden.view(), key.view())? ?? {
         // Not one: refused as its action would be, so that a caller learns nothing it may not ask.
         checkTablesView(store, caller, "s3tables:GetView", b, "".bytes())?;
+        if (!namespaceExists(store, hidden.view(), ns)?) { return noSuchNamespace(); }
         return noSuchView();
     };
     let id = copyBytes(jsonMemberText(borrow rec.json, "id") ?? "".bytes())?;
@@ -448,6 +452,12 @@ fn commitView(
     if (!applyViewUpdates(mut m, jsonMember(borrow request, "updates"), now)?) {
         return badRequest("An update is not valid here, or not one this catalog applies.");
     }
+    // No updates: no new metadata file (the M34 exit review's L2).
+    let changes = match (jsonMember(borrow request, "updates")) {
+        Some(Json.Array(items)) => items.length,
+        _ => 0,
+    };
+    if (changes == 0) { return loadViewResult(previous.view(), m); }
     let version = metadataVersion(previous.view());
     let encryption: Json? = match (jsonMember(borrow rec.json, "encryption")) {
         Some(e) => Some(cloneJson(e)?),

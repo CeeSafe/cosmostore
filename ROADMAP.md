@@ -6420,3 +6420,15 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - Iceberg Java (`V3Check` phase `views`, in CI): its view builder's create, replace (a second version), list,
     rename and drop, and a nested namespace's table.
 - **Checks:** 549 unit tests, the S3 smoke, the cluster smoke (214), and the Java check, plain and on a KMS table.
+
+### 26 Nov 2026: M34 slice 5, the exit review (`docs/m34-exit-review.md`)
+
+- **The review:** an independent agent, reading only. It found no High.
+- **Fixed, each with a test (both Mediums mutation-checked):**
+  - Medium: a nested namespace's table could not be renamed;
+  - Medium: S3 Tables' own API reached nested namespaces, against "One level, as AWS";
+  - Lows: the view calls told a namespace's existence before authorizing; empty commits wrote a file; the current
+    version made current again was logged; `set-location` took any location; a key that is not UTF-8 became `""`.
+- **Recorded:** B1 to B4.
+- **Checks:** 552 unit tests, the S3 smoke, the cluster smoke (214), PyIceberg (66) and the Java check.
+- **Waiting:** ADR-0134's acceptance and M34's close, the owner's.

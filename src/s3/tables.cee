@@ -913,7 +913,7 @@ fn getTable(
             };
             ns.extend(paramOf(req, "namespace") ?? "".bytes())?;
             name.extend(paramOf(req, "name") ?? "".bytes())?;
-            if (ns.length == 0 || name.length == 0) { return Err(TablesError.BadRequest); }
+            if (ns.length == 0 || name.length == 0 || !oneLevel(ns.view())) { return Err(TablesError.BadRequest); }
         }
     }
     let hidden = tableWarehouseBucket(bucketName.view())?;
@@ -927,6 +927,8 @@ fn getTable(
                     if (jsonMemberText(borrow r.json, "id") == Some(tableId.view())) {
                         let rest = keys[i].view()[CATALOG_TABLES.bytes().length..];
                         let slash = pieceEnd(rest, 0, '/');
+                        // A nested namespace's table is the Iceberg catalog's alone.
+                        if (!oneLevel(rest[0..slash])) { return Err(TablesError.NotFound); }
                         ns.extend(rest[0..slash])?;
                         name.extend(rest[slash + 1..])?;
                         break;
@@ -1107,12 +1109,30 @@ fn deleteTable(
     return Ok(answer);
 }
 
+/// Whether a namespace is of one level, as S3 Tables' own API names one.
+fn oneLevel(ns: Slice<u8>) -> bool {
+    for (c in ns) {
+        if (c == 0x1F) { return false; }
+    }
+    return true;
+}
+
 fn renameTable(
     store: borrow mut ObjectStore,
     bucketName: Slice<u8>,
     ns: Slice<u8>,
     name: Slice<u8>,
     body: Slice<u8>,
+) -> Result<TablesAnswer, TablesError> => renameTableIn(store, bucketName, ns, name, body, false);
+
+/// A rename; `nested` when the Iceberg catalog asks, whose namespaces are 1 to 8 levels (the M34 exit review's M1).
+fn renameTableIn(
+    store: borrow mut ObjectStore,
+    bucketName: Slice<u8>,
+    ns: Slice<u8>,
+    name: Slice<u8>,
+    body: Slice<u8>,
+    nested: bool,
 ) -> Result<TablesAnswer, TablesError> {
     let j = tablesObject(body)?;
     // A rename names a new name, a new namespace or both.
@@ -1121,7 +1141,8 @@ fn renameTable(
     }
     let newName = copyBytes(jsonMemberText(borrow j, "newName") ?? name)?;
     let newNs = copyBytes(jsonMemberText(borrow j, "newNamespaceName") ?? ns)?;
-    if (!tableNameOk(newName.view(), false) || !tableNameOk(newNs.view(), true)) { return Err(TablesError.BadRequest); }
+    let nsOk = if (nested) levelsOk(newNs.view()) else tableNameOk(newNs.view(), true);
+    if (!tableNameOk(newName.view(), false) || !nsOk) { return Err(TablesError.BadRequest); }
     let hidden = tableWarehouseBucket(bucketName)?;
     let rec = tableRecord(store, bucketName, ns, name)?;
     match (jsonMemberText(borrow j, "versionToken")) {
@@ -1400,6 +1421,8 @@ fn routeTablesSync(
         }
         if (segs.length > 3) { return Err(TablesError.NotImplemented); }
         let ns = segs[2].view();
+        // One level, as AWS (ADR-0134, the owner's choice; the M34 exit review's M2).
+        if (!oneLevel(ns)) { return Err(TablesError.BadRequest); }
         if (isMethod(m, Method.Get)) {
             checkTables(store, caller, "s3tables:GetNamespace", bucket.view(), "".bytes())?;
             return getNamespace(store, req, bucket.view(), ns);
@@ -1420,6 +1443,7 @@ fn routeTablesSync(
             return Err(TablesError.BadRequest);
         }
         let ns = segs[2].view();
+        if (!oneLevel(ns)) { return Err(TablesError.BadRequest); }
         if (segs.length == 3) {
             if (isMethod(m, Method.Put)) {
                 checkTables(store, caller, "s3tables:CreateTable", bucket.view(), "".bytes())?;

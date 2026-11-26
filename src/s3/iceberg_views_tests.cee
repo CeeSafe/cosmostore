@@ -169,3 +169,184 @@ fn icebergViewsLifecycle() -> Result<void, TestFailure> {
     removeTree(dir.view());
     return Ok();
 }
+
+/// Views are authorized on `<bucket>/view/<id>` by their own actions (ADR-0134 §4): a Deny on views refuses them and
+/// not tables, a table's Deny does not reach a view, and a user's Allow of tables is not one of views.
+@test
+fn viewsAuthorizedOnTheirOwn() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("views-authorized");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    s.createBucket("sales--table-s3")!;
+    let view = "11111111-2222-4333-8444-555555555555";
+    let one = tablesCaller("AKIAONE");
+    Check.isTrue(
+        checkTablesView(borrow s, borrow one, "s3tables:GetView", "sales".bytes(), view.bytes()).isOk(),
+        "no policy",
+    )?;
+    putPolicy(
+        mut s,
+        TABLE_BUCKET_POLICY_KEY,
+        "{\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:*\",\"Resource\":\"arn:aws:s3tables:us-east-1:0:bucket/sales/view/*\"},{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:GetTable\",\"Resource\":\"arn:aws:s3tables:us-east-1:0:bucket/sales/table/*\"}]}",
+    );
+    Check.isFalse(
+        checkTablesView(borrow s, borrow one, "s3tables:GetView", "sales".bytes(), view.bytes()).isOk(),
+        "a view's Deny",
+    )?;
+    Check.isTrue(
+        checkTables(borrow s, borrow one, "s3tables:GetTableMetadataLocation", "sales".bytes(), view.bytes()).isOk(),
+        "not a table's",
+    )?;
+    putPolicy(
+        mut s,
+        TABLE_BUCKET_POLICY_KEY,
+        "{\"Statement\":{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3tables:*\",\"Resource\":\"arn:aws:s3tables:us-east-1:0:bucket/sales/table/*\"}}",
+    );
+    Check.isTrue(
+        checkTablesView(borrow s, borrow one, "s3tables:GetView", "sales".bytes(), view.bytes()).isOk(),
+        "a table's Deny is not a view's",
+    )?;
+    let _ = s.deleteObject("sales--table-s3", TABLE_BUCKET_POLICY_KEY)!;
+    let tables = identityCaller(
+        "analyst",
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3tables:*\",\"Resource\":\"arn:aws:s3tables:*:*:bucket/sales/table/*\"}}",
+        false,
+        "",
+    );
+    Check.isFalse(
+        checkTablesView(borrow s, borrow tables, "s3tables:GetView", "sales".bytes(), view.bytes()).isOk(),
+        "a tables' Allow",
+    )?;
+    let views = identityCaller(
+        "analyst",
+        "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3tables:GetView\",\"Resource\":\"arn:aws:s3tables:*:*:bucket/sales/view/*\"}}",
+        false,
+        "",
+    );
+    Check.isTrue(
+        checkTablesView(borrow s, borrow views, "s3tables:GetView", "sales".bytes(), view.bytes()).isOk(),
+        "a views' Allow",
+    )?;
+    removeTree(dir.view());
+    return Ok();
+}
+
+fn tablesPathRequest(path: StringView) -> S3Request {
+    var req = bareRequest();
+    req.rawPath = copyBytes(path.bytes())!;
+    return req;
+}
+
+/// A nested namespace's table is renamed by the catalog, within it and out of it (the M34 exit review's M1); S3
+/// Tables' own API names one level only, as AWS (its M2).
+@test
+fn nestedNamespacesAtTheEdges() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("nested-edges");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let caller = tablesCaller("AKIANESTED");
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"a\"]}".bytes())!;
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"a\",\"b\"]}".bytes())!;
+    let made = icebergCreateTable(
+        mut s,
+        "cat".bytes(),
+        [0x61u8, 0x1F, 0x62][..],
+        "{\"name\":\"t\",\"schema\":{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":true,\"type\":\"long\"}]}}".bytes(),
+        borrow noKeys,
+    )!;
+    Check.equalU64(200, made.status as u64)?;
+    let within =
+        "{\"source\":{\"namespace\":[\"a\",\"b\"],\"name\":\"t\"},\"destination\":{\"namespace\":[\"a\",\"b\"],\"name\":\"u\"}}";
+    Check.equalU64(204, icebergRename(mut s, "cat".bytes(), within.bytes(), borrow caller)!.status as u64)?;
+    let out =
+        "{\"source\":{\"namespace\":[\"a\",\"b\"],\"name\":\"u\"},\"destination\":{\"namespace\":[\"a\"],\"name\":\"u\"}}";
+    Check.equalU64(204, icebergRename(mut s, "cat".bytes(), out.bytes(), borrow caller)!.status as u64)?;
+    let tableKey = catalogKey(CATALOG_TABLES, "a".bytes(), "u".bytes())!;
+    Check.isTrue(readRecord(borrow s, hidden.view(), tableKey.view())!.isSome(), "renamed into a")?;
+    // S3 Tables' API: a nested namespace's name is BadRequest.
+    let creds = Vector<Credential>.create();
+    let arn = "arn%3Aaws%3As3tables%3Aus-east-1%3A000000000000%3Abucket%2Fcat";
+    for (path in ["/namespaces/", "/tables/"]) {
+        var p = copyBytes(path.bytes())!;
+        p.extend(arn.bytes())!;
+        p.extend("/a%1Fb".bytes())!;
+        let req = tablesPathRequest(StringView.fromUtf8(p.view()) ?? "");
+        match (routeTablesSync(mut s, borrow req, "".bytes(), borrow caller, creds.view(), borrow noKeys)) {
+            Err(TablesError.BadRequest) => {}
+            _ => { return Err(TestFailure.create("a nested namespace through S3 Tables' API")); }
+        }
+    }
+    removeTree(dir.view());
+    return Ok();
+}
+
+/// A view commit's edges (the M34 exit review's L2, L3): no updates write no file, the current version made current
+/// again logs nothing, and its location stays its warehouse.
+@test
+fn viewCommitEdges() -> Result<void, TestFailure> {
+    let dir = scratchDirectory("view-commits");
+    var s = ObjectStore.open(dir.view(), storeConfig())!;
+    let hidden = tableWarehouseBucket("cat".bytes())!;
+    s.createBucket(catalogText(hidden.view()))!;
+    let none = Vector<MasterKey>.create();
+    let noKeys = WarehouseKeys { sse: none.view(), kms: none.view() };
+    let caller = tablesCaller("AKIAEDGES");
+    let _ = icebergCreateNamespace(mut s, "cat".bytes(), "{\"namespace\":[\"ns\"]}".bytes())!;
+    let views = viewSegments(["views"][..]);
+    let made = icebergViews(
+        mut s,
+        Method.Post,
+        "cat".bytes(),
+        "ns".bytes(),
+        views.view(),
+        VIEW_BODY.bytes(),
+        borrow caller,
+        borrow noKeys,
+    )!;
+    let first = parseJson(made.body.view())!!;
+    let location = copyBytes(jsonMemberText(borrow first, "metadata-location")!)!;
+    let one = viewSegments(["views", "v"][..]);
+    let empty = icebergViews(
+        mut s,
+        Method.Post,
+        "cat".bytes(),
+        "ns".bytes(),
+        one.view(),
+        "{\"updates\":[]}".bytes(),
+        borrow caller,
+        borrow noKeys,
+    )!;
+    Check.equalBytes(location.view(), jsonMemberText(borrow parseJson(empty.body.view())!!, "metadata-location")!)?;
+    let again = "{\"updates\":[{\"action\":\"set-current-view-version\",\"view-version-id\":1}]}";
+    let same = parseJson(
+        icebergViews(
+            mut s,
+            Method.Post,
+            "cat".bytes(),
+            "ns".bytes(),
+            one.view(),
+            again.bytes(),
+            borrow caller,
+            borrow noKeys,
+        )!.body.view(),
+    )!!;
+    Check.equalU64(1, arrayLength(jsonMember(borrow same, "metadata")!, "version-log") as u64)?;
+    let moved = "{\"updates\":[{\"action\":\"set-location\",\"location\":\"s3://elsewhere/x\"}]}";
+    Check.equalU64(
+        400,
+        icebergViews(
+            mut s,
+            Method.Post,
+            "cat".bytes(),
+            "ns".bytes(),
+            one.view(),
+            moved.bytes(),
+            borrow caller,
+            borrow noKeys,
+        )!.status as u64,
+    )?;
+    removeTree(dir.view());
+    return Ok();
+}
