@@ -1,6 +1,11 @@
 # ADR-0134: Iceberg views and nested namespaces (M34)
 
-**Status:** proposed, 26 Nov 2026. M34 is ADR-0133's item A (the owner: "A: views, nested namespaces").
+**Status:** proposed, 26 Nov 2026, with the owner's choices made:
+- views have actions of their own ("Actions of their own");
+- namespaces nest up to 8 levels ("Up to 8 levels");
+- S3 Tables' API stays one level, as AWS ("One level, as AWS").
+
+M34 is ADR-0133's item A (the owner: "A: views, nested namespaces").
 
 ## Context
 
