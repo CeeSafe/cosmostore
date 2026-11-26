@@ -1,6 +1,9 @@
 # ADR-0133: M34, after hardening (proposed)
 
-**Status:** proposed, 26 Nov 2026, after M33 was closed the same day (the owner: "continue").
+**Status:** decided, 26 Nov 2026. The owner chose A, Iceberg views and nested namespaces ("A: views, nested
+namespaces").
+
+Proposed the same day, after M33 was closed (the owner: "continue").
 
 ## Context
 

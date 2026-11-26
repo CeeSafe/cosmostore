@@ -6371,3 +6371,13 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - **C,** v3's remaining parts;
   - **D,** M33's recorded Lows.
 - **Next:** the owner's choice.
+
+### 26 Nov 2026: M34 decided, ADR-0134 proposed (Iceberg views and nested namespaces)
+
+- **The owner:** "A: views, nested namespaces".
+- **ADR-0134 proposes:**
+  - nested namespaces;
+  - views' records and versioned, sealed metadata files;
+  - the view calls (create, load, exists, list, commit, rename, drop), authorized;
+  - the checks by Iceberg Java and PyIceberg.
+- **For the owner:** views' actions; namespaces' depth; S3 Tables' API and nested namespaces.
