@@ -6351,3 +6351,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **The cause:** the smoke wrote the key files in place while the nodes ran. A node that polled between the
   truncate and the write saw two changes, an empty file and then the new one, and logged a wait for each.
 - **Fixed:** each key file is written whole and moved into place. The smoke passes locally (214).
+
+### 26 Nov 2026: M33 closed (ADR-0132 accepted)
+
+- **The owner's decision:** "Accept and close". ADR-0132 is accepted as built.
+- **M33 is closed.** M30's to M32's recorded Lows are each closed: fourteen fixed, six kept with their reasons. The
+  exit review's B1 to B5 are recorded in `docs/m33-exit-review.md`.
+- **Next:** M34, when the owner asks. Candidates on record:
+  - ADR-0131's B (Iceberg views and nested namespaces), C (table replication) and D (v3's remaining parts);
+  - M33's recorded Lows.

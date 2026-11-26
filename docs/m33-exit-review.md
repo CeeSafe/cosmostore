@@ -1,5 +1,7 @@
 # M33 exit review: hardening, M30's to M32's recorded Lows (26 Nov 2026)
 
+**M33 closed, 26 Nov 2026** (the owner: "Accept and close"), with ADR-0132 accepted and B1 to B5 recorded below.
+
 **M33's exit (ADR-0131 item A; ADR-0132, with the owner's choices):** each of the twenty Lows M30, M31 and M32
 recorded is fixed with a test, or kept with its reason.
 

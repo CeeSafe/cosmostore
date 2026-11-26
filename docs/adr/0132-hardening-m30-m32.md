@@ -1,6 +1,7 @@
 # ADR-0132: Hardening, M30's to M32's recorded Lows (M33)
 
-**Status:** proposed, 25 Nov 2026, with the owner's choices made:
+**Status:** accepted, 26 Nov 2026, as built (the owner: "Accept and close", after M33's exit review,
+`docs/m33-exit-review.md`). Proposed 25 Nov 2026, with the owner's choices made:
 - tag keys differing only in case refused ("Refused");
 - `aws:ResourceTag` kept refused in identity policies ("Keep refused").
 
@@ -11,7 +12,7 @@ M33 is ADR-0131's item A (the owner: "A: hardening").
 The Lows below are each exit review's B items: `docs/m30-exit-review.md`, `m31-exit-review.md` and
 `m32-exit-review.md`. Each is decided here: fixed with a test, or kept with its reason.
 
-## Decision (proposed)
+## Decision
 
 ### Slice 1: tags and configuration (M30's B2–B9)
 
