@@ -6432,3 +6432,12 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
 - **Recorded:** B1 to B4.
 - **Checks:** 552 unit tests, the S3 smoke, the cluster smoke (214), PyIceberg (66) and the Java check.
 - **Waiting:** ADR-0134's acceptance and M34's close, the owner's.
+
+### 26 Nov 2026: M34 closed
+
+- **The owner:** "Yes I accept ADR-0134 and close M34". ADR-0134 is accepted, and M34's B1 to B4 are recorded in
+  `docs/m34-exit-review.md`.
+- **Next:** M35, when the owner asks. The candidates on record:
+  - table replication (ADR-0133's B);
+  - Iceberg v3's remaining parts (its C);
+  - M34's recorded B1 to B4.

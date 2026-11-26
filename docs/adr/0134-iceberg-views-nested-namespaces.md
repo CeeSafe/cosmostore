@@ -1,6 +1,7 @@
 # ADR-0134: Iceberg views and nested namespaces (M34)
 
-**Status:** proposed, 26 Nov 2026, with the owner's choices made:
+**Status:** accepted, 26 Nov 2026 (the owner: "Yes I accept ADR-0134 and close M34"). Proposed the same day, with
+the owner's choices made:
 - views have actions of their own ("Actions of their own");
 - namespaces nest up to 8 levels ("Up to 8 levels");
 - S3 Tables' API stays one level, as AWS ("One level, as AWS").
@@ -33,7 +34,7 @@ M34 is ADR-0133's item A (the owner: "A: views, nested namespaces").
   - **S3 Tables' authorization** by action and resource (ADR-0084).
   - **The engines' clients in CI:** Iceberg Java 1.10 (`V3Check`) and PyIceberg 0.12, which both have the view calls.
 
-## Decision (proposed)
+## Decision
 
 1. **Nested namespaces** (slice 1):
    - a namespace is one to N levels (the owner's choice of N), kept as its levels joined by `\x1f` in its record's

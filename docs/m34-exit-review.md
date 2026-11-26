@@ -1,5 +1,8 @@
 # M34 exit review: Iceberg views and nested namespaces (26 Nov 2026)
 
+**M34 closed, 26 Nov 2026** (the owner: "Yes I accept ADR-0134 and close M34"), with ADR-0134 accepted and B1 to B4
+recorded below.
+
 **M34's exit (ADR-0133 item A; ADR-0134, with the owner's choices):** Iceberg Java and PyIceberg make, read, replace,
 rename and drop a view, and make tables in a nested namespace, in CI, on `serve` and on a cluster.
 
