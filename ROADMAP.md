@@ -6441,3 +6441,14 @@ All are fixed here except the ones `docs/m19-exit-review.md` records.
   - table replication (ADR-0133's B);
   - Iceberg v3's remaining parts (its C);
   - M34's recorded B1 to B4.
+
+### 26 Nov 2026: M35 proposed (ADR-0135)
+
+- **The owner:** "continue", after M34 was closed.
+- **ADR-0135 proposes three items:**
+  - **A, M34's recorded B1 to B4** (recommended): the races of a view and a table at one name and of a namespace
+    with its parent's drop, views' orphan files, S3 Tables' short list pages, and view metadata as Iceberg Java's
+    builder makes it;
+  - **B,** table replication;
+  - **C,** v3's remaining parts.
+- **Next:** the owner's choice.
